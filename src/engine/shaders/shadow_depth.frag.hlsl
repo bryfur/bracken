@@ -14,7 +14,11 @@ struct PSInput {
 [[vk::binding(0, 3)]]
 cbuffer ShadowFragUniforms {
     int hasTexture;
-    float _pad[3];
+    // Scalars (not a float array) so the declared block is 16 bytes and
+    // matches gpu::ShadowFragUniforms — HLSL cbuffer arrays stride at 16 B.
+    float _pad0;
+    float _pad1;
+    float _pad2;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]

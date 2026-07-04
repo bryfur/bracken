@@ -5,6 +5,7 @@
 #include "../gpu/gpu_texture.hpp"
 #include "../gpu/pipeline_registry.hpp"
 #include "engine/render/environment.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <memory>
@@ -56,6 +57,24 @@ struct alignas(16) GrassVertexUniforms {
     glm::vec3 camera_forward;       // 12 world-space camera forward (vec4 boundary)
 };
 
+// Layout pins against grass.vert.hlsl GrassUniforms. camera_forward matches
+// HLSL only because a float3 at 148 exactly fits the last 12 bytes of the
+// register starting at 144 — inserting any scalar before it silently
+// desynchronizes the two sides. Update the shader in the same change.
+static_assert(sizeof(GrassVertexUniforms) == 160, "must match grass.vert.hlsl GrassUniforms (160 B)");
+static_assert(offsetof(GrassVertexUniforms, view_projection) == 0);
+static_assert(offsetof(GrassVertexUniforms, camera_pos) == 64);
+static_assert(offsetof(GrassVertexUniforms, time) == 76);
+static_assert(offsetof(GrassVertexUniforms, splat_world_size) == 80);
+static_assert(offsetof(GrassVertexUniforms, grass_view_distance) == 92);
+static_assert(offsetof(GrassVertexUniforms, wind_direction) == 96);
+static_assert(offsetof(GrassVertexUniforms, chunk_size) == 108);
+static_assert(offsetof(GrassVertexUniforms, blades_per_chunk_side) == 116);
+static_assert(offsetof(GrassVertexUniforms, heightmap_origin_x) == 128);
+static_assert(offsetof(GrassVertexUniforms, heightmap_max_height) == 144);
+static_assert(offsetof(GrassVertexUniforms, camera_forward) == 148,
+              "camera_forward must pack into the last 12 bytes of the register at 144");
+
 /**
  * Grass fragment uniforms - matches grass.frag.hlsl cbuffer.
  * Each vec3+float pair fills one 16-byte cbuffer register.
@@ -76,6 +95,17 @@ struct alignas(16) GrassLightingUniforms {
     glm::vec3 ambient_ground;    // offset 96
     float _pad1;                 // offset 108 — struct ends 16-byte aligned (112)
 };
+
+// Layout pins against grass.frag.hlsl GrassLightingUniforms.
+static_assert(sizeof(GrassLightingUniforms) == 112, "must match grass.frag.hlsl GrassLightingUniforms (112 B)");
+static_assert(offsetof(GrassLightingUniforms, camera_pos) == 0);
+static_assert(offsetof(GrassLightingUniforms, fog_start) == 12);
+static_assert(offsetof(GrassLightingUniforms, fog_color_horizon) == 16);
+static_assert(offsetof(GrassLightingUniforms, fog_color_sun) == 32);
+static_assert(offsetof(GrassLightingUniforms, light_dir) == 48);
+static_assert(offsetof(GrassLightingUniforms, sun_color) == 64);
+static_assert(offsetof(GrassLightingUniforms, ambient_sky) == 80);
+static_assert(offsetof(GrassLightingUniforms, ambient_ground) == 96);
 
 /**
  * GPU chunked grass renderer (SDL3 GPU API)

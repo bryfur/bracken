@@ -1631,10 +1631,7 @@ void SceneRenderer::render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_
 
             int has_tex = (mesh.has_texture && mesh.texture) ? 1 : 0;
             if (has_tex != last_has_tex) {
-                struct {
-                    int hasTexture;
-                    float _pad[3];
-                } shadow_frag = {};
+                gpu::ShadowFragUniforms shadow_frag = {};
                 shadow_frag.hasTexture = has_tex;
                 SDL_PushGPUFragmentUniformData(cmd, 0, &shadow_frag, sizeof(shadow_frag));
                 last_has_tex = has_tex;
@@ -1954,12 +1951,8 @@ void SceneRenderer::render_shadow_passes(const RenderScene& scene, const CameraS
         dummy_binding = {dummy_white_texture_->handle(), default_sampler_};
     }
 
-    struct ShadowFragConst {
-        int hasTexture;
-        float _pad[3];
-    };
-    const ShadowFragConst frag_notex = {0, {}};
-    const ShadowFragConst frag_tex = {1, {}};
+    const gpu::ShadowFragUniforms frag_notex = {.hasTexture = 0};
+    const gpu::ShadowFragUniforms frag_tex = {.hasTexture = 1};
 
     auto cascade_label = [](int c) -> const char* {
         switch (c & 3) {
@@ -2034,7 +2027,7 @@ void SceneRenderer::render_shadow_passes(const RenderScene& scene, const CameraS
                         int has_tex = (mesh.has_texture && mesh.texture) ? 1 : 0;
                         if (has_tex != last_has_tex) {
                             SDL_PushGPUFragmentUniformData(cmd, 0, has_tex ? &frag_tex : &frag_notex,
-                                                           sizeof(ShadowFragConst));
+                                                           sizeof(gpu::ShadowFragUniforms));
                             last_has_tex = has_tex;
                         }
 
