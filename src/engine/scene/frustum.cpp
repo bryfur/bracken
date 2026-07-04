@@ -20,8 +20,14 @@ void Frustum::extract_from_matrix(const glm::mat4& vp) {
     set_plane(planes_[1], vpt[3] - vpt[0]); // Right
     set_plane(planes_[2], vpt[3] + vpt[1]); // Bottom
     set_plane(planes_[3], vpt[3] - vpt[1]); // Top
-    set_plane(planes_[4], vpt[2]);          // Near (depth [0,1] with GLM_FORCE_DEPTH_ZERO_TO_ONE)
-    set_plane(planes_[5], vpt[3] - vpt[2]); // Far
+    // Depth planes for [0,1] clip depth (GLM_FORCE_DEPTH_ZERO_TO_ONE):
+    // vpt[2] bounds clip.z >= 0 and vpt[3]-vpt[2] bounds clip.z <= w. Under a
+    // standard-Z projection these are the near and far planes respectively;
+    // under the engine's reversed-Z projection their roles swap (vpt[2] is the
+    // far plane). Every test below treats all six planes symmetrically, so the
+    // frustum stays closed and correct for both conventions.
+    set_plane(planes_[4], vpt[2]);
+    set_plane(planes_[5], vpt[3] - vpt[2]);
 }
 
 bool Frustum::intersects_aabb(const glm::vec3& min_point, const glm::vec3& max_point) const {

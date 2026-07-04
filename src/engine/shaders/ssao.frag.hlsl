@@ -56,10 +56,10 @@ float interleavedGradientNoise(float2 pos) {
 float PSMain(PSInput input) : SV_Target {
     float depth = depthTexture.SampleLevel(depthSampler, input.texCoord, 0);
 
-    // Sky never gets AO: cleared/skybox depth is exactly 1.0 (same test as
-    // volumetric_fog.frag). The old `depth >= 0.9999` test was really a hidden
-    // far-field cutoff whose world distance moved with the camera's near plane.
-    if (depth >= 1.0) {
+    // Sky never gets AO: reversed-Z cleared/skybox depth is exactly 0.0 (same
+    // test as volumetric_fog.frag). The explicit maxDistance cutoff below is
+    // the real far-field fade; this only skips true sky pixels.
+    if (depth <= 0.0) {
         return 1.0;
     }
 

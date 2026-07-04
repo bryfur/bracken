@@ -156,9 +156,11 @@ target_link_libraries(my_game PRIVATE mmo_engine)
 mmo_engine_copy_shaders(my_game)
 ```
 
-Conventions consumers inherit: **Y-up** coordinates, **zero-to-one depth**
-(`GLM_FORCE_DEPTH_ZERO_TO_ONE` propagates from the engine target), linear-space
-lighting, `.glb` models (no Draco).
+Conventions consumers inherit: **Y-up** coordinates, **reversed-Z zero-to-one
+depth** (`GLM_FORCE_DEPTH_ZERO_TO_ONE` propagates from the engine target;
+scene projections swap near/far so near→1, far→0 — see
+[docs/architecture.md](docs/architecture.md)), linear-space lighting, `.glb`
+models (no Draco).
 
 ## Documentation
 

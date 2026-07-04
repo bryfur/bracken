@@ -346,6 +346,10 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_instanced_shadow_model_pip
     // (clip off) pancakes casters in front of the cascade near plane.
     config.with_vertex3d().opaque().cull_front().with_depth_bias(1.25f, 1.75f);
     config.enable_depth_clip = false;
+    // Shadow cascades stay standard-Z (ortho projections have no reversed-Z
+    // precision problem); the atlas clear, compare sampler and receiver math
+    // all assume near=0/far=1.
+    config.depth_compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
     config.color_format = SDL_GPU_TEXTUREFORMAT_INVALID; // depth-only
     config.depth_format = depth_format_;
 
@@ -455,9 +459,12 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_skybox_pipeline() {
         {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0}, // position only
     };
 
+    // Reversed-Z: the skybox vertex shader emits z = 0.0 (the far plane) and
+    // GREATER_OR_EQUAL passes only where the depth buffer still holds the
+    // 0.0 clear value, i.e. where no geometry was drawn.
     config.opaque().no_cull();
     config.depth_write_enable = false;
-    config.depth_compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+    config.depth_compare_op = SDL_GPU_COMPAREOP_GREATER_OR_EQUAL;
     config.color_format = scene_color_format_;
     config.depth_format = depth_format_;
 
@@ -566,8 +573,8 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_particle_pipeline() {
     // Instanced: per-particle transforms + colors come from a per-frame
     // storage buffer (one draw per emitter/mesh batch); fragment is a cheap
     // unlit additive shader writing into the HDR scene target. Depth test
-    // LESS_OR_EQUAL with depth writes off so particles occlude correctly
-    // against opaques but not against each other.
+    // GREATER_OR_EQUAL (reversed-Z) with depth writes off so particles occlude
+    // correctly against opaques but not against each other.
     ShaderResources vs_resources;
     vs_resources.num_uniform_buffers = 2; // camera (b0) + batch instance offset (b1)
     vs_resources.num_storage_buffers = 1; // per-particle instance data
@@ -590,7 +597,7 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_particle_pipeline() {
     // so the effective color blend is exactly (ONE, ONE). Back-face culling
     // stays on (PipelineConfig default).
     config.with_vertex3d().additive();
-    config.depth_compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+    config.depth_compare_op = SDL_GPU_COMPAREOP_GREATER_OR_EQUAL; // reversed-Z
     config.color_format = scene_color_format_;
     config.depth_format = depth_format_;
 
@@ -647,6 +654,7 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_shadow_model_pipeline() {
     config.fragment_shader = fs->handle();
     config.with_vertex3d().opaque().cull_front().with_depth_bias(1.25f, 1.75f);
     config.enable_depth_clip = false; // pancake casters in front of the near plane
+    config.depth_compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL; // shadow cascades stay standard-Z
     config.color_format = SDL_GPU_TEXTUREFORMAT_INVALID; // depth-only
     config.depth_format = depth_format_;
 
@@ -674,6 +682,7 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_shadow_skinned_model_pipel
     config.fragment_shader = fs->handle();
     config.with_skinned_vertex().opaque().cull_front().with_depth_bias(1.25f, 1.75f);
     config.enable_depth_clip = false; // pancake casters in front of the near plane
+    config.depth_compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL; // shadow cascades stay standard-Z
     config.color_format = SDL_GPU_TEXTUREFORMAT_INVALID;
     config.depth_format = depth_format_;
 
@@ -716,6 +725,7 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_shadow_terrain_pipeline() 
     // to ensure terrain triangles are written to the shadow map.
     config.opaque().no_cull().with_depth_bias(1.25f, 1.75f);
     config.enable_depth_clip = false; // pancake casters in front of the near plane
+    config.depth_compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL; // shadow cascades stay standard-Z
     config.color_format = SDL_GPU_TEXTUREFORMAT_INVALID;
     config.depth_format = depth_format_;
 

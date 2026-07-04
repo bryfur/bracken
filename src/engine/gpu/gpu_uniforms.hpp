@@ -285,8 +285,9 @@ struct alignas(16) GTAOUniforms {
 /**
  * Bilateral blur pass fragment uniforms (set 3, b0)
  * depthA/depthB linearize the non-linear depth buffer in the shader:
- * viewZ = depthB / (depth + depthA) with depthA = proj[2][2], depthB = proj[3][2]
- * (glm RH_ZO). Weighting on relative linear view-Z keeps edge rejection
+ * viewZ = |depthB / (depth + depthA)| with depthA = proj[2][2], depthB =
+ * proj[3][2] (glm RH_ZO; the formula holds for the engine's reversed-Z
+ * projection too). Weighting on relative linear view-Z keeps edge rejection
  * consistent at distance (raw depth differences collapse far away -> halos).
  */
 struct alignas(16) BlurUniforms {
@@ -314,8 +315,9 @@ struct alignas(16) CompositeUniforms {
     float saturation = 1.0f;
     // Depth-aware (joint bilateral) upsample of the half-res AO/fog textures:
     // lowResTexelSize = 1 / half-res target size; depthA/depthB linearize the
-    // depth buffer (viewZ = depthB / (depth + depthA), glm RH_ZO). depthA/B of
-    // 0 degrade gracefully to plain bilinear weights in-shader.
+    // depth buffer (viewZ = |depthB / (depth + depthA)|, glm RH_ZO, standard
+    // or reversed-Z). depthA/B of 0 degrade gracefully to plain bilinear
+    // weights in-shader.
     glm::vec2 lowResTexelSize{0.0f, 0.0f};
     float depthA = 0.0f;
     float depthB = 0.0f;

@@ -59,6 +59,20 @@ blending with depth writes off. The MASK alpha test is driven by the
 `alphaCutoff` field of the lighting cbuffer (0 = no discard, so OPAQUE/BLEND
 draws skip it).
 
+## Depth convention
+
+The scene renders **reversed-Z** (glm `RH_ZO` projection with near/far
+swapped): the near plane is device depth **1.0**, the far plane / cleared
+background is **0.0**, and scene pipelines depth-test `GREATER_OR_EQUAL`. The
+skybox vertex shader emits z = 0.0 so it passes only where nothing was drawn.
+Depth-reading shaders (`ssao`, `gtao`, `blur_ao`, `volumetric_fog`) test
+`depth <= 0.0` for sky; linearization/reconstruction goes through the (inverse)
+projection matrix and needs no convention-specific math.
+**Exception:** the shadow cascade passes stay standard-Z — atlas cleared to
+1.0, `LESS_OR_EQUAL` compares (pipeline + `SampleCmpLevelZero` sampler), light
+`orthoRH_ZO` projections — because orthographic depth is linear and gains
+nothing from reversal.
+
 ## Shader notes
 
 **Scene** — `model.*`: static models, PBR + clustered lights + CSM + fog.

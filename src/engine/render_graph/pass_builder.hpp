@@ -22,8 +22,10 @@ public:
                                        glm::vec4 clear_color = glm::vec4(0.0f));
 
     // Create a transient depth target attached to this pass as a write.
+    // Default clear 0.0 matches the engine's reversed-Z scene convention
+    // (far plane = 0); pass 1.0 explicitly for standard-Z (e.g. shadow) passes.
     ResourceHandle create_depth_target(const std::string& name, const TextureDesc& desc,
-                                       SDL_GPULoadOp loadop = SDL_GPU_LOADOP_CLEAR, float clear_depth = 1.0f);
+                                       SDL_GPULoadOp loadop = SDL_GPU_LOADOP_CLEAR, float clear_depth = 0.0f);
 
     // Bring an externally-owned texture into the graph.
     ResourceHandle import_texture(const std::string& name, SDL_GPUTexture* tex, uint32_t width, uint32_t height,
@@ -43,7 +45,8 @@ public:
                       glm::vec4 clear_color = glm::vec4(0.0f));
 
     // Attach an existing resource as the depth RT for this pass (write).
-    void attach_depth(ResourceHandle h, SDL_GPULoadOp loadop = SDL_GPU_LOADOP_CLEAR, float clear_depth = 1.0f);
+    // Default clear 0.0 matches the engine's reversed-Z scene convention.
+    void attach_depth(ResourceHandle h, SDL_GPULoadOp loadop = SDL_GPU_LOADOP_CLEAR, float clear_depth = 0.0f);
 
     // If true, the graph will SDL_BeginGPURenderPass / SDL_EndGPURenderPass for you.
     void set_managed_render_pass(bool managed) noexcept;

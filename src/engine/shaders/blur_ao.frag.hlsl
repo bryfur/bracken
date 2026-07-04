@@ -19,8 +19,10 @@ cbuffer BlurUniforms : register(b0, space3) {
     float2 direction;       // (1, 0) for horizontal, (0, 1) for vertical
     float2 invScreenSize;
     float sharpness;
-    // Projection constants for depth linearization (glm RH_ZO):
-    // viewZ = depthB / (depth + depthA), depthA = proj[2][2], depthB = proj[3][2]
+    // Projection constants for depth linearization (glm RH_ZO, standard or
+    // reversed-Z — the formula holds for both as long as depthA/depthB come
+    // from the actual projection matrix):
+    // viewZ = |depthB / (depth + depthA)|, depthA = proj[2][2], depthB = proj[3][2]
     float depthA;
     float depthB;
     float maxDistance; // view-space far cutoff, matches the AO passes
@@ -45,10 +47,11 @@ float PSMain(PSInput input) : SV_Target {
     float centerAO = aoTexture.SampleLevel(aoSampler, input.texCoord, 0);
     float centerDepth = depthTexture.SampleLevel(depthSampler, input.texCoord, 0);
 
-    // Sky: cleared/skybox depth is exactly 1.0 (same test as the AO passes and
-    // volumetric_fog.frag). Pass the AO value through (it is 1.0 there) rather
-    // than returning a constant that could disagree with the AO pass.
-    if (centerDepth >= 1.0) {
+    // Sky: reversed-Z cleared/skybox depth is exactly 0.0 (same test as the AO
+    // passes and volumetric_fog.frag). Pass the AO value through (it is 1.0
+    // there) rather than returning a constant that could disagree with the AO
+    // pass.
+    if (centerDepth <= 0.0) {
         return centerAO;
     }
 

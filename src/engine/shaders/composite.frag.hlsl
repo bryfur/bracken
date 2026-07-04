@@ -23,7 +23,8 @@ cbuffer CompositeUniforms : register(b0, space3) {
     float saturation;
     // Joint bilateral upsample of the half-res AO/fog textures:
     // lowResTexelSize = 1 / half-res target size; depthA/depthB linearize the
-    // depth buffer (viewZ = depthB / (depth + depthA), glm RH_ZO).
+    // depth buffer (viewZ = |depthB / (depth + depthA)|, glm RH_ZO — holds for
+    // standard and reversed-Z projections alike).
     float2 lowResTexelSize;
     float depthA;
     float depthB;
@@ -60,7 +61,8 @@ float3 reinhard(float3 c) {
     return c / (c + 1.0);
 }
 
-// Positive linear view depth from non-linear [0,1] depth (glm RH_ZO).
+// Positive linear view depth from non-linear [0,1] depth (glm RH_ZO,
+// standard or reversed-Z — depthA/depthB come from the live projection).
 float linearizeDepth(float depth) {
     return abs(depthB / (depth + depthA));
 }

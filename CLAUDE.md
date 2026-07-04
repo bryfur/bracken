@@ -73,8 +73,11 @@ override `on_init`/`on_update`/`on_render`/`on_shutdown`.
 
 ### Key patterns
 - **Y-up** coordinate system (x,z = ground plane, y = height) and
-  **zero-to-one depth** (`GLM_FORCE_DEPTH_ZERO_TO_ONE` is PUBLIC on the
-  engine target — all projection math is glm `RH_ZO`).
+  **reversed-Z zero-to-one depth** (`GLM_FORCE_DEPTH_ZERO_TO_ONE` is PUBLIC on
+  the engine target — all projection math is glm `RH_ZO`, with near/far
+  swapped in the scene `glm::perspective` call so near→depth 1, far→depth 0;
+  scene pipelines compare `GREATER_OR_EQUAL` and clear depth to 0.0. The
+  shadow-cascade passes deliberately stay standard-Z — see architecture.md).
 - `RenderScene` accumulates draw commands; `SceneRenderer` consumes them.
   It's passed by **non-const ref** (the renderer drains particle spawns), and
   `SkinnedModelCommand::bone_matrices` is a non-owning `std::span` over host

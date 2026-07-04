@@ -4,8 +4,8 @@
  * Screen-space ray marching through height-based fog volume.
  * For each pixel, marches from camera toward the world position,
  * sampling the shadow map to determine lit vs shadowed fog. Sky pixels
- * (depth == 1) are marched to maxDist so shafts silhouette against the
- * sky instead of cutting off at the horizon. God rays sample the whole
+ * (reversed-Z depth == 0) are marched to maxDist so shafts silhouette against
+ * the sky instead of cutting off at the horizon. God rays sample the whole
  * CSM atlas: the cascade is selected per march sample from its camera
  * distance. Produces inscattered light (god rays) and fog extinction.
  *
@@ -109,7 +109,8 @@ float4 PSMain(PSInput input) : SV_Target {
 
     // Sky pixels have no surface hit: march the full fog range instead of
     // early-outing so god rays and haze cross the horizon silhouette.
-    bool isSky = depth >= 1.0;
+    // Reversed-Z: the cleared/skybox far-plane depth is exactly 0.0.
+    bool isSky = depth <= 0.0;
     float3 worldPos = reconstructWorldPos(input.texCoord, depth);
     float3 rayDir = worldPos - cameraPos;
     float rayLength = length(rayDir);

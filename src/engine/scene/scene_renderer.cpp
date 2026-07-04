@@ -418,7 +418,7 @@ void SceneRenderer::begin_main_pass() {
     // Explicit CLEAR: zero-init would silently mean LOADOP_LOAD (== 0).
     depth_target.load_op = SDL_GPU_LOADOP_CLEAR;
     depth_target.store_op = SDL_GPU_STOREOP_STORE;
-    depth_target.clear_depth = 1.0f;
+    depth_target.clear_depth = 0.0f; // reversed-Z: 0.0 is the far plane
     depth_target.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
     depth_target.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
 
@@ -551,10 +551,11 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
         // and use them to cull shadow casters per cascade in build_instance_batches.
         const bool shadows_on = shadow_map_->is_ready() && gfx.shadow_mode > 0;
         if (shadows_on) {
-            // Near plane recovered from the RH_ZO projection (n = m32/m22).
+            // Near plane recovered from the reversed-Z RH_ZO projection
+            // (n = m32 / (m22 + 1); under standard-Z it was m32/m22).
             // Shadow range is capped well below draw distance; the shader
             // fades shadows out over the tail instead of popping them off.
-            const float cam_near = std::max(camera.projection[3][2] / camera.projection[2][2], 0.1f);
+            const float cam_near = std::max(camera.projection[3][2] / (camera.projection[2][2] + 1.0f), 0.1f);
             const float shadow_far = std::min(gfx.get_draw_distance(), 1200.0f);
             shadow_map_->update(camera.view, camera.projection, light_dir_, cam_near, shadow_far);
             const int active = shadow_map_->active_cascades();
@@ -738,7 +739,9 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
                 composite_params.contrast = gfx.contrast;
                 composite_params.saturation = gfx.saturation;
                 // Depth linearization constants for the joint bilateral AO/fog
-                // upsample in the composite shader (glm RH_ZO).
+                // upsample in the composite shader. viewZ = |B / (depth + A)|
+                // holds for both standard and reversed-Z RH_ZO projections as
+                // long as A/B come from the actual projection matrix.
                 composite_params.depth_a = camera.projection[2][2];
                 composite_params.depth_b = camera.projection[3][2];
 

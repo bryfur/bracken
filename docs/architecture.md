@@ -38,11 +38,35 @@ Root namespace `mmo::engine`, one sub-namespace per module.
 
 - **Y-up**, right-handed: x/z is the ground plane, y is height. glTF assets are
   `+Y up` / `-Z forward` (standard glTF), loaded with no rotation.
-- **Zero-to-one depth**: `GLM_FORCE_DEPTH_ZERO_TO_ONE` is a PUBLIC compile
-  definition on the `mmo_engine` target (`src/engine/CMakeLists.txt`) — it
-  propagates to consumers. All projection math assumes glm `RH_ZO`; e.g.
-  `SceneRenderer` recovers the near plane as `m[3][2]/m[2][2]`
-  (`scene_renderer.cpp`). Never mix in `-1..1`-depth projection helpers.
+- **Reversed-Z, zero-to-one depth**: `GLM_FORCE_DEPTH_ZERO_TO_ONE` is a PUBLIC
+  compile definition on the `mmo_engine` target (`src/engine/CMakeLists.txt`) —
+  it propagates to consumers. All projection math assumes glm `RH_ZO`, and the
+  scene projection is **reversed-Z**: near/far are swapped in the
+  `glm::perspective` call (`systems/camera_system.cpp`), so the near plane maps
+  to device depth **1** and the far plane to **0**. This spreads float32 depth
+  precision near-uniformly over MMO-scale view distances instead of burning it
+  all within a few meters of the camera. Consequences, wired through the code:
+  - Scene depth targets clear to **0.0** (`scene_renderer.cpp`,
+    `ambient_occlusion.cpp`); the `PipelineConfig` default depth compare is
+    `GREATER_OR_EQUAL` (`gpu/gpu_pipeline.hpp`).
+  - The skybox draws at z = 0.0 with `GREATER_OR_EQUAL` (`skybox.vert.hlsl` +
+    the skybox pipeline), passing only where nothing was drawn.
+  - Depth-reading shaders treat device depth **0.0 as sky/far**
+    (`ssao`/`gtao`/`blur_ao`/`volumetric_fog`). The linearization
+    `viewZ = |B / (depth + A)|` with `A = proj[2][2]`, `B = proj[3][2]` holds
+    for standard and reversed matrices alike, so `blur_ao`/`composite` needed
+    no math change.
+  - `SceneRenderer` recovers the near plane as `m[3][2]/(m[2][2] + 1)`
+    (under standard-Z it was `m[3][2]/m[2][2]`).
+  - `Frustum::extract_from_matrix` is convention-agnostic: the two depth-plane
+    rows swap near/far roles under reversed-Z but the extracted plane set (and
+    thus culling) is identical (`scene/frustum.cpp`).
+  - **Exception: shadow cascades stay standard-Z** (clear 1.0,
+    `LESS_OR_EQUAL` pipelines + compare sampler, `orthoRH_ZO` light
+    projections). Their orthographic depth is already linear, so reversed-Z
+    buys nothing, and all receiver bias/PCF/PCSS math assumes near=0/far=1.
+  Never mix in `-1..1`-depth projection helpers, and never build a
+  depth-tested scene pass with a standard (non-reversed) projection.
 - **Linear-space lighting**: all colors in `render::EnvironmentState`
   (`render/environment.hpp`) are linear. The scene renders into a linear HDR
   target; the composite pass tonemaps (ACES et al.) + gamma-corrects to the

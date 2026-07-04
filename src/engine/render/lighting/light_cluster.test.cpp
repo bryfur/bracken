@@ -273,9 +273,15 @@ TEST(ClusterGrid, ShaderScreenLookupMatchesCpuBinningOrientation) {
         << "a bottom-of-screen light must not be visible through the top-row (unflipped) lookup";
 }
 
-TEST(ClusterGrid, BinnedClustersCoverAllLitFragments) {
-    // Contract of the per-light cluster-range insertion: any fragment within a
-    // light's radius must find that light via the shader-side cluster lookup.
+namespace {
+
+// Contract of the per-light cluster-range insertion: any fragment within a
+// light's radius must find that light via the shader-side cluster lookup.
+// Parameterized on the camera so both depth conventions are pinned: cluster
+// binning consumes the LINEAR near/far passed to begin_frame and only uses
+// invProjection for frustum rays, so it must behave identically whether the
+// projection is standard-Z or reversed-Z.
+void check_binned_clusters_cover_lit_fragments(const CameraState& cam, float near_plane, float far_plane) {
     std::mt19937 rng(2024);
     std::uniform_real_distribution<float> px(-30.0f, 30.0f);
     std::uniform_real_distribution<float> py(-10.0f, 10.0f);
@@ -291,9 +297,6 @@ TEST(ClusterGrid, BinnedClustersCoverAllLitFragments) {
         lights.push_back(p);
     }
 
-    const float near_plane = 0.1f;
-    const float far_plane = 100.0f;
-    CameraState cam = make_camera(1920, 1080, 60.0f, 16.0f / 9.0f, near_plane, far_plane);
     CpuOnlyClusterGrid cg;
     cg.run(cam, 1920, 1080, near_plane, far_plane, lights, {});
 
@@ -330,6 +333,29 @@ TEST(ClusterGrid, BinnedClustersCoverAllLitFragments) {
     }
     // The sample set must actually have exercised lit fragments.
     EXPECT_GT(checked, 0);
+}
+
+} // namespace
+
+TEST(ClusterGrid, BinnedClustersCoverAllLitFragments) {
+    const float near_plane = 0.1f;
+    const float far_plane = 100.0f;
+    CameraState cam = make_camera(1920, 1080, 60.0f, 16.0f / 9.0f, near_plane, far_plane);
+    check_binned_clusters_cover_lit_fragments(cam, near_plane, far_plane);
+}
+
+TEST(ClusterGrid, BinnedClustersCoverAllLitFragmentsReversedZ) {
+    // Same scene under the engine's runtime reversed-Z projection (near/far
+    // swapped in the perspective call). begin_frame still receives the linear
+    // near/far distances — those are z-slice parameters, not device depths.
+    const float near_plane = 0.1f;
+    const float far_plane = 100.0f;
+    CameraState cam;
+    cam.view = glm::mat4(1.0f);
+    cam.projection = glm::perspective(glm::radians(60.0f), 16.0f / 9.0f, far_plane, near_plane);
+    cam.view_projection = cam.projection * cam.view;
+    cam.position = glm::vec3(0.0f);
+    check_binned_clusters_cover_lit_fragments(cam, near_plane, far_plane);
 }
 
 TEST(ClusterGrid, PerClusterCountNeverExceedsCap) {

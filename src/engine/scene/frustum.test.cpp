@@ -178,6 +178,80 @@ TEST_F(OrthoFrustumTest, AABBOutsideOrthoIsNotVisible) {
 }
 
 // ============================================================================
+// Reversed-Z projection frustum (the engine's runtime convention: near/far
+// swapped in the RH_ZO perspective call, near -> depth 1, far -> depth 0).
+// Extraction must still yield a closed frustum — the depth-plane rows swap
+// roles (vpt[2] becomes the far plane) but the plane SET is unchanged.
+// ============================================================================
+
+class ReversedZFrustumTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Same camera as FrustumTest, but with the reversed-Z projection:
+        // camera at Z=5 looking down -Z, near 0.1, far 100.
+        glm::mat4 view = glm::lookAt(glm::vec3(0, 0, 5), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+        glm::mat4 proj = glm::perspective(glm::radians(90.0f), 1.0f, 100.0f, 0.1f); // reversed: far, near
+        frustum.extract_from_matrix(proj * view);
+    }
+
+    Frustum frustum{};
+};
+
+TEST_F(ReversedZFrustumTest, SphereInFrontOfCameraIsVisible) {
+    EXPECT_TRUE(frustum.intersects_sphere(glm::vec3(0, 0, 0), 1.0f));
+}
+
+TEST_F(ReversedZFrustumTest, SphereBehindCameraIsNotVisible) {
+    EXPECT_FALSE(frustum.intersects_sphere(glm::vec3(0, 0, 10), 1.0f));
+}
+
+TEST_F(ReversedZFrustumTest, PointBetweenCameraAndNearPlaneIsNotVisible) {
+    // Camera at Z=5, near plane at Z=4.9: a point at Z=4.95 is in the gap.
+    EXPECT_FALSE(frustum.intersects_sphere(glm::vec3(0, 0, 4.95f), 0.0f));
+}
+
+TEST_F(ReversedZFrustumTest, SphereBeyondFarPlaneIsNotVisible) {
+    // Far plane is 100 units from the camera at Z=5 -> world Z=-95.
+    EXPECT_FALSE(frustum.intersects_sphere(glm::vec3(0, 0, -200), 1.0f));
+}
+
+TEST_F(ReversedZFrustumTest, SphereJustInsideFarPlaneIsVisible) {
+    EXPECT_TRUE(frustum.intersects_sphere(glm::vec3(0, 0, -90), 1.0f));
+}
+
+TEST_F(ReversedZFrustumTest, SphereOutsideSidePlanesIsNotVisible) {
+    EXPECT_FALSE(frustum.intersects_sphere(glm::vec3(100, 0, 0), 1.0f));
+    EXPECT_FALSE(frustum.intersects_sphere(glm::vec3(-100, 0, 0), 1.0f));
+}
+
+TEST_F(ReversedZFrustumTest, AABBInFrontIsVisible) {
+    EXPECT_TRUE(frustum.intersects_aabb(glm::vec3(-1, -1, -1), glm::vec3(1, 1, 1)));
+}
+
+TEST_F(ReversedZFrustumTest, AABBBehindCameraIsNotVisible) {
+    EXPECT_FALSE(frustum.intersects_aabb(glm::vec3(-1, -1, 10), glm::vec3(1, 1, 12)));
+}
+
+TEST_F(ReversedZFrustumTest, MatchesStandardZFrustumOnSamplePoints) {
+    // The reversed-Z frustum must accept/reject exactly the same volume as a
+    // standard-Z frustum built from the same camera and clip planes.
+    Frustum standard;
+    glm::mat4 view = glm::lookAt(glm::vec3(0, 0, 5), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+    glm::mat4 proj = glm::perspective(glm::radians(90.0f), 1.0f, 0.1f, 100.0f);
+    standard.extract_from_matrix(proj * view);
+
+    const glm::vec3 samples[] = {
+        {0, 0, 0},    {0, 0, 4.5f},  {0, 0, 4.95f}, {0, 0, 6},   {0, 0, -50},
+        {0, 0, -96},  {0, 0, -200},  {3, 0, 0},     {8, 0, 0},   {0, 3, 0},
+        {0, -8, 0},   {40, 0, -50},  {80, 0, -50},  {0, 0, 5},
+    };
+    for (const glm::vec3& p : samples) {
+        EXPECT_EQ(frustum.intersects_sphere(p, 0.5f), standard.intersects_sphere(p, 0.5f))
+            << "disagreement at (" << p.x << ", " << p.y << ", " << p.z << ")";
+    }
+}
+
+// ============================================================================
 // AABB edge cases
 // ============================================================================
 

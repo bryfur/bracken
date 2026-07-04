@@ -247,7 +247,7 @@ SDL_GPURenderPass* AmbientOcclusion::begin_offscreen_pass(SDL_GPUCommandBuffer* 
     depth_target.texture = offscreen_depth_->handle();
     depth_target.load_op = SDL_GPU_LOADOP_CLEAR;
     depth_target.store_op = SDL_GPU_STOREOP_STORE;
-    depth_target.clear_depth = 1.0f;
+    depth_target.clear_depth = 0.0f; // reversed-Z: 0.0 is the far plane
     depth_target.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
     depth_target.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
 

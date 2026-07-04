@@ -119,6 +119,9 @@ void ShadowMap::fit_cascade(int cascade_index, const glm::mat4& camera_view, con
     ENGINE_PROFILE_ZONE_COLOR("ShadowMap::fit_cascade", 0xE67E22);
     glm::mat4 slice_proj = camera_proj;
 
+    // The z-row is rewritten with a self-consistent STANDARD RH_ZO mapping for
+    // [near_split, far_split]; only inv_vp below consumes it (never the GPU),
+    // so it works unchanged whether camera_proj itself is reversed-Z or not.
     float n = near_split;
     float f = far_split;
     slice_proj[2][2] = f / (n - f);
@@ -198,6 +201,10 @@ SDL_GPURenderPass* ShadowMap::begin_shadow_pass(SDL_GPUCommandBuffer* cmd) {
     depth_target.texture = atlas_texture_->handle();
     depth_target.load_op = SDL_GPU_LOADOP_CLEAR;
     depth_target.store_op = SDL_GPU_STOREOP_STORE;
+    // Shadow cascades deliberately stay standard-Z (clear 1.0, LESS_OR_EQUAL)
+    // while the main scene is reversed-Z: the cascades' orthographic
+    // projections distribute depth linearly, so they have no precision problem
+    // to fix, and receiver bias/PCF math is calibrated for near=0/far=1.
     depth_target.clear_depth = 1.0f;
     depth_target.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
     depth_target.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;

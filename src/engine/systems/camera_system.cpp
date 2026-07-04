@@ -356,9 +356,14 @@ void CameraSystem::compute_matrices() {
     // View matrix
     view_matrix_ = glm::lookAt(final_camera_pos_, current_look_at_, glm::vec3(0.0f, 1.0f, 0.0f));
 
-    // Projection matrix
+    // Projection matrix. Reversed-Z: near/far are deliberately swapped in the
+    // RH_ZO perspective call so the near plane (5) maps to depth 1 and the far
+    // plane (15000) to depth 0 — this spreads float32 depth precision evenly
+    // across the huge view range (scene pipelines test GREATER_OR_EQUAL and
+    // clear depth to 0.0; see docs/architecture.md "Coordinate, depth, and
+    // color conventions").
     float aspect = static_cast<float>(screen_width_) / static_cast<float>(screen_height_);
-    projection_matrix_ = glm::perspective(glm::radians(current_fov_), aspect, 5.0f, 15000.0f);
+    projection_matrix_ = glm::perspective(glm::radians(current_fov_), aspect, 15000.0f, 5.0f);
 }
 
 // === Smooth damping functions (critically-damped spring) ===

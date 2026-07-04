@@ -101,14 +101,18 @@ TEST(CameraState, ViewMatrixRotationIsOrthonormal) {
 }
 
 // ---------------------------------------------------------------------------
-// Projection is right-handed with zero-to-one depth (GLM_FORCE_DEPTH_ZERO_TO_ONE)
+// Projection is right-handed with reversed zero-to-one depth
+// (GLM_FORCE_DEPTH_ZERO_TO_ONE + the engine's reversed-Z convention: the
+// near/far arguments are swapped in the glm::perspective call, mapping the
+// near plane to depth 1 and the far plane to depth 0).
 // ---------------------------------------------------------------------------
 
-TEST(CameraState, ProjectionIsRightHandedZeroToOneDepth) {
+TEST(CameraState, ProjectionIsRightHandedReversedZeroToOneDepth) {
     constexpr float near_plane = 0.1f;
     constexpr float far_plane = 100.0f;
     CameraState cam{};
-    cam.projection = glm::perspective(glm::radians(60.0f), 16.0f / 9.0f, near_plane, far_plane);
+    // Engine reversed-Z idiom: swap near/far in the RH_ZO perspective call.
+    cam.projection = glm::perspective(glm::radians(60.0f), 16.0f / 9.0f, far_plane, near_plane);
 
     // Right-handed: the camera looks down -Z, so view-space points in front of
     // the camera (negative z) must project to positive clip w.
@@ -117,9 +121,9 @@ TEST(CameraState, ProjectionIsRightHandedZeroToOneDepth) {
     EXPECT_GT(clip_near.w, 0.0f);
     EXPECT_GT(clip_far.w, 0.0f);
 
-    // Zero-to-one depth: the near plane maps to NDC z == 0, the far plane to 1.
-    EXPECT_NEAR(clip_near.z / clip_near.w, 0.0f, 1e-6f);
-    EXPECT_NEAR(clip_far.z / clip_far.w, 1.0f, 1e-5f);
+    // Reversed zero-to-one depth: near plane maps to NDC z == 1, far to 0.
+    EXPECT_NEAR(clip_near.z / clip_near.w, 1.0f, 1e-5f);
+    EXPECT_NEAR(clip_far.z / clip_far.w, 0.0f, 1e-6f);
 
     // A point between the planes stays strictly inside (0, 1).
     glm::vec4 clip_mid = cam.projection * glm::vec4(0.0f, 0.0f, -10.0f, 1.0f);
@@ -130,6 +134,41 @@ TEST(CameraState, ProjectionIsRightHandedZeroToOneDepth) {
     // A point behind the camera (positive view-space z) lands at negative w.
     glm::vec4 clip_behind = cam.projection * glm::vec4(0.0f, 0.0f, near_plane, 1.0f);
     EXPECT_LT(clip_behind.w, 0.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Reversed-Z depth precision: with the engine camera range (near 5, far
+// 15000), two distant surfaces one unit apart must still land on distinct
+// float32 device depths, with the nearer one at GREATER depth (the reversed-Z
+// ordering the scene pipelines test against).
+// ---------------------------------------------------------------------------
+
+TEST(CameraState, ReversedZKeepsDistantDepthsDistinct) {
+    // The engine camera projection (systems/camera_system.cpp): reversed-Z
+    // via swapped near/far.
+    glm::mat4 proj = glm::perspective(glm::radians(60.0f), 16.0f / 9.0f, 15000.0f, 5.0f);
+
+    auto device_depth = [&](float view_z) {
+        glm::vec4 clip = proj * glm::vec4(0.0f, 0.0f, view_z, 1.0f);
+        return clip.z / clip.w;
+    };
+
+    const float d_near = device_depth(-10000.0f);
+    const float d_far = device_depth(-10001.0f);
+
+    // Both are valid device depths...
+    EXPECT_GT(d_near, 0.0f);
+    EXPECT_LT(d_near, 1.0f);
+    EXPECT_GT(d_far, 0.0f);
+    // ...and strictly ordered: the nearer surface has the GREATER device
+    // depth, and the two do not collapse onto the same float32 value (under
+    // standard-Z at this range both round to the same value near 1.0 — the
+    // exact artifact reversed-Z exists to fix).
+    EXPECT_GT(d_near, d_far);
+
+    // Recovering the near plane from the reversed-Z matrix uses
+    // n = m32 / (m22 + 1) (scene_renderer.cpp); pin that formula here.
+    EXPECT_NEAR(proj[3][2] / (proj[2][2] + 1.0f), 5.0f, 1e-3f);
 }
 
 // ---------------------------------------------------------------------------

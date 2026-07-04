@@ -38,10 +38,13 @@ struct PipelineConfig {
     bool enable_depth_bias = false;
     bool enable_depth_clip = true;
 
-    // Depth/stencil state
+    // Depth/stencil state. The engine renders the scene with reversed-Z
+    // (near -> depth 1, far -> depth 0, clear 0.0), so the default compare is
+    // GREATER_OR_EQUAL. Shadow-cascade pipelines override this back to
+    // LESS_OR_EQUAL: their orthographic light projections stay standard-Z.
     bool depth_test_enable = true;
     bool depth_write_enable = true;
-    SDL_GPUCompareOp depth_compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+    SDL_GPUCompareOp depth_compare_op = SDL_GPU_COMPAREOP_GREATER_OR_EQUAL;
     bool stencil_test_enable = false;
 
     // Color targets

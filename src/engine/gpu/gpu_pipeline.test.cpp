@@ -20,7 +20,9 @@ TEST(PipelineConfigDefaults, InitialState) {
     EXPECT_EQ(config.front_face, SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE);
     EXPECT_TRUE(config.depth_test_enable);
     EXPECT_TRUE(config.depth_write_enable);
-    EXPECT_EQ(config.depth_compare_op, SDL_GPU_COMPAREOP_LESS_OR_EQUAL);
+    // Reversed-Z scene convention: near -> depth 1, far -> depth 0, so the
+    // default compare is GREATER_OR_EQUAL (shadow pipelines override it).
+    EXPECT_EQ(config.depth_compare_op, SDL_GPU_COMPAREOP_GREATER_OR_EQUAL);
     EXPECT_FALSE(config.stencil_test_enable);
     EXPECT_EQ(config.blend_mode, BlendMode::None);
     EXPECT_TRUE(config.has_depth_target);

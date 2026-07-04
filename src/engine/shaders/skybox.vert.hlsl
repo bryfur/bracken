@@ -18,7 +18,10 @@ struct VSOutput {
 
 VSOutput VSMain(VSInput input) {
     VSOutput output;
-    output.position = float4(input.position.xy, 1.0, 1.0);
+    // Reversed-Z: emit z = 0.0 (the far plane) so the GREATER_OR_EQUAL depth
+    // test passes only where the buffer still holds the 0.0 clear value —
+    // i.e. wherever no geometry was drawn.
+    output.position = float4(input.position.xy, 0.0, 1.0);
     output.clipPos = input.position.xy;
     return output;
 }
