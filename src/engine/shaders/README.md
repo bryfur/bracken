@@ -39,7 +39,6 @@ particles reuse `model.vert`, and every post-process pass reuses
 | Grid | `grid.vert` | `grid.frag` |
 | UI | `ui.vert` | `ui.frag` |
 | Text | `text.vert` | `text.frag` |
-| Billboard | `billboard.vert` | `billboard.frag` |
 | ShadowModel | `shadow_depth.vert` | `shadow_depth.frag` |
 | InstancedShadowModel | `shadow_depth_instanced.vert` | `shadow_depth.frag` |
 | ShadowSkinnedModel | `shadow_skinned.vert` | `shadow_depth_opaque.frag` |
@@ -77,8 +76,9 @@ atlas), `composite` (scene × AO + bloom + fog, exposure + tonemap + gamma →
 LDR), `fxaa` (FXAA 3.11 on the tonemapped LDR image).
 
 **Effects/UI** — `particle.frag`: unlit additive HDR particles. `ui`/`text`:
-2D pipelines targeting the swapchain. `billboard.*`: camera-facing quads.
-`grid.*`: debug grid overlay.
+2D pipelines targeting the swapchain (3D billboards are projected on the CPU
+and drawn as UI rects — there is no billboard pipeline). `grid.*`: debug grid
+overlay.
 
 **Includes** — `pbr.hlsli` (GGX/Smith/Schlick/Burley BRDF, ACES tonemap,
 `ambientPBR`), `lighting.hlsli`, `cluster_lighting.hlsli` + `clusters.hlsli`

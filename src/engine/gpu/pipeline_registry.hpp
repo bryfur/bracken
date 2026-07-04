@@ -29,9 +29,8 @@ enum class PipelineType {
     Grid,         ///< Debug grid overlay
 
     // 2D/UI pipelines
-    UI,        ///< 2D UI elements
-    Text,      ///< Text rendering with font atlas
-    Billboard, ///< Camera-facing billboards
+    UI,   ///< 2D UI elements
+    Text, ///< Text rendering with font atlas
 
     // Effect pipelines
     Particle, ///< HDR particles (model.vert + particle.frag, ONE/ONE additive)
@@ -79,8 +78,6 @@ inline const char* pipeline_type_to_string(PipelineType type) {
             return "UI";
         case PipelineType::Text:
             return "Text";
-        case PipelineType::Billboard:
-            return "Billboard";
         case PipelineType::Particle:
             return "Particle";
         case PipelineType::Grass:
@@ -187,7 +184,6 @@ public:
     GPUPipeline* get_terrain_pipeline() { return get_pipeline(PipelineType::Terrain); }
     GPUPipeline* get_skybox_pipeline() { return get_pipeline(PipelineType::Skybox); }
     GPUPipeline* get_ui_pipeline() { return get_pipeline(PipelineType::UI); }
-    GPUPipeline* get_billboard_pipeline() { return get_pipeline(PipelineType::Billboard); }
     GPUPipeline* get_grass_pipeline() { return get_pipeline(PipelineType::Grass); }
     GPUPipeline* get_particle_pipeline() { return get_pipeline(PipelineType::Particle); }
     GPUPipeline* get_text_pipeline() { return get_pipeline(PipelineType::Text); }
@@ -234,7 +230,7 @@ public:
      *
      * Must be called before pipelines are created. If called after pipelines
      * exist, only the pipelines that actually target the swapchain format
-     * (UI, Text, Billboard, Composite, Fxaa) are invalidated; scene/HDR/post
+     * (UI, Text, Composite, Fxaa) are invalidated; scene/HDR/post
      * pipelines render to fixed-format offscreen targets and stay cached.
      */
     void set_swapchain_format(SDL_GPUTextureFormat format);
@@ -279,7 +275,6 @@ private:
     std::unique_ptr<GPUPipeline> create_grid_pipeline();
     std::unique_ptr<GPUPipeline> create_ui_pipeline();
     std::unique_ptr<GPUPipeline> create_text_pipeline();
-    std::unique_ptr<GPUPipeline> create_billboard_pipeline();
     std::unique_ptr<GPUPipeline> create_particle_pipeline();
     std::unique_ptr<GPUPipeline> create_grass_pipeline();
     std::unique_ptr<GPUPipeline> create_instanced_model_pipeline();

@@ -96,9 +96,6 @@ GPUPipeline* PipelineRegistry::get_pipeline(PipelineType type) {
         case PipelineType::Text:
             pipeline = create_text_pipeline();
             break;
-        case PipelineType::Billboard:
-            pipeline = create_billboard_pipeline();
-            break;
         case PipelineType::Particle:
             pipeline = create_particle_pipeline();
             break;
@@ -195,7 +192,7 @@ void PipelineRegistry::set_swapchain_format(SDL_GPUTextureFormat format) {
     // else renders to fixed-format offscreen targets (HDR scene, R8 AO, depth)
     // and would be rebuilt for nothing.
     static constexpr PipelineType swapchain_dependent[] = {
-        PipelineType::UI, PipelineType::Text, PipelineType::Billboard, PipelineType::Composite, PipelineType::Fxaa,
+        PipelineType::UI, PipelineType::Text, PipelineType::Composite, PipelineType::Fxaa,
     };
     size_t invalidated = 0;
     for (PipelineType type : swapchain_dependent) {
@@ -517,30 +514,6 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_text_pipeline() {
 
     config.alpha_blended().no_depth().no_cull();
     config.color_format = swapchain_format_;
-
-    return GPUPipeline::create(*device_, config);
-}
-
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_billboard_pipeline() {
-    ShaderResources vs_resources;
-    vs_resources.num_uniform_buffers = 1;
-
-    ShaderResources fs_resources;
-    fs_resources.num_samplers = 1;
-
-    auto* vs = shader_manager_->get(shader_path_ + "billboard.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
-    auto* fs = shader_manager_->get(shader_path_ + "billboard.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
-
-    if (!vs || !fs) {
-        return nullptr;
-    }
-
-    PipelineConfig config;
-    config.vertex_shader = vs->handle();
-    config.fragment_shader = fs->handle();
-    config.with_vertex3d().alpha_blended().no_cull();
-    config.color_format = swapchain_format_;
-    config.depth_format = depth_format_;
 
     return GPUPipeline::create(*device_, config);
 }
