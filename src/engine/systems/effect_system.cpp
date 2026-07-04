@@ -213,8 +213,9 @@ void EffectSystem::update_particle(Particle& particle, const EmitterDefinition& 
         // Standard velocity-based motion
         particle.position += particle.velocity * dt;
 
-        // Apply gravity
-        if (glm::length(vel_def.gravity) > 0) {
+        // Apply gravity (squared-magnitude test: dot > 0 iff length > 0,
+        // without the per-particle sqrt on an emitter constant)
+        if (glm::dot(vel_def.gravity, vel_def.gravity) > 0.0f) {
             particle.velocity += vel_def.gravity * dt;
         }
 
@@ -224,11 +225,11 @@ void EffectSystem::update_particle(Particle& particle, const EmitterDefinition& 
         }
     }
 
-    // Update rotation
-    if (emitter_def.rotation.face_velocity && glm::length(particle.velocity) > 0.01f) {
+    // Update rotation (squared-magnitude test, 0.01^2 = 1e-4; atan2 is
+    // scale-invariant so the old normalize was a redundant second sqrt)
+    if (emitter_def.rotation.face_velocity && glm::dot(particle.velocity, particle.velocity) > 1e-4f) {
         // Face the direction of movement
-        glm::vec3 vel_norm = glm::normalize(particle.velocity);
-        particle.rotation.y = std::atan2(vel_norm.x, vel_norm.z);
+        particle.rotation.y = std::atan2(particle.velocity.x, particle.velocity.z);
     } else {
         // Apply rotation rate
         particle.rotation += particle.rotation_rate * dt;
