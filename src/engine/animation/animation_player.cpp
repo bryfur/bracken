@@ -17,6 +17,7 @@ void AnimationPlayer::reset() {
     prev_cursors_.clear();
     for (auto& m : bone_matrices_) m = glm::mat4(1.0f);
     for (auto& m : world_transforms_) m = glm::mat4(1.0f);
+    used_joint_count_ = 0;
 }
 
 void AnimationPlayer::crossfade_to(int clip_index, float duration) {
@@ -207,10 +208,15 @@ void AnimationPlayer::compute_bone_matrices(const Skeleton& skeleton, const std:
         bone_matrices_[i] = world_transforms_[i] * skeleton.joints[i].inverse_bind_matrix;
     }
 
-    for (size_t i = count; i < MAX_BONES; i++) {
+    // Slots at/beyond the skeleton's joint count stay identity: reset() fills
+    // both arrays once, and only the slots exposed by a *shrinking* joint
+    // count are re-identitied here. The old per-update tail rewrite of both
+    // MAX_BONES arrays was ~8 KB of dead stores per instance per frame.
+    for (size_t i = count; i < used_joint_count_; i++) {
         bone_matrices_[i] = glm::mat4(1.0f);
         world_transforms_[i] = glm::mat4(1.0f);
     }
+    used_joint_count_ = count;
 }
 
 } // namespace mmo::engine::animation

@@ -8,6 +8,7 @@
 #include "engine/render/environment.hpp"
 #include "engine/render/lighting/light_cluster.hpp"
 #include "engine/render_stats.hpp"
+#include "engine/scene/bone_palette_table.hpp"
 #include "engine/scene/camera_state.hpp"
 #include "engine/scene/frustum.hpp"
 #include "engine/scene/render_scene.hpp"
@@ -142,7 +143,7 @@ private:
     void render_3d_scene(const RenderScene& scene, const CameraState& camera);
     void render_model_command(const ModelCommand& cmd, const CameraState& camera);
     void render_model_command_inner(const ModelCommand& cmd, const CameraState& camera);
-    void render_skinned_model_command_inner(const SkinnedModelCommand& cmd, const CameraState& camera,
+    void render_skinned_model_command_inner(const SkinnedModelCommand& cmd, Model& model, const CameraState& camera,
                                             uint32_t palette_offset);
     void build_instance_batches(const RenderScene& scene, const CameraState& camera, const Frustum& frustum);
     void upload_instance_buffers(SDL_GPUCopyPass* copy_pass);
@@ -232,37 +233,34 @@ private:
     // Per-cascade light frustums extracted from cascade.light_view_projection.
     std::array<Frustum, 4> shadow_cascade_frustums_{};
 
-    // Per-frame packing scratch (cleared each frame, capacity preserved).
-    std::vector<gpu::InstanceData> packed_instances_;
-    std::vector<gpu::ShadowInstanceData> packed_shadow_instances_;
-
     // ========== Bone Palettes ==========
     // All skinned commands' bone matrices packed tightly (joint_count matrices
     // each, not MAX_BONES) into one storage buffer, uploaded once per frame and
     // shared by the main pass and every shadow cascade. Draws carry only a
     // uint palette offset instead of an 8 KB uniform push per pass.
     static constexpr uint32_t MAX_BONE_PALETTES = 1024;       // per-frame cap; draws beyond are dropped + logged
-    static constexpr uint32_t INVALID_PALETTE_OFFSET = 0xFFFFFFFFu;
     std::unique_ptr<gpu::GPUBuffer> bone_palette_buffer_;
     size_t bone_palette_capacity_ = 0;                        // bytes; grown geometrically
-    std::vector<glm::mat4> bone_palette_scratch_;             // CPU pack scratch, reused per frame
-    std::vector<uint32_t> skinned_palette_offsets_;           // parallel to scene.skinned_commands()
-    // Dedupe shared bone arrays (e.g. the static identity palette submitted for
-    // unbound skeletons): bone-array pointer -> (offset, packed joint count).
-    // Flat vector with linear lookup: skinned counts are small and clear()
-    // keeps capacity, so the per-frame path stays allocation-free (a
-    // node-based map would re-allocate one node per palette every frame).
-    struct PaletteDedupeEntry {
-        const void* key;
-        uint32_t offset;
-        uint32_t joint_count;
+    // Palette copy plan built by pack_bone_palettes(): each range is memcpy'd
+    // straight from host bone storage into the mapped transfer buffer at
+    // upload time (no intermediate CPU pack scratch). Destination offsets are
+    // the running matrix total in range order.
+    struct PaletteCopyRange {
+        const glm::mat4* src;
+        uint32_t count;
     };
-    std::vector<PaletteDedupeEntry> palette_dedupe_;
+    std::vector<PaletteCopyRange> palette_copy_ranges_;
+    size_t bone_palette_matrix_count_ = 0;                    // total matrices to upload this frame
+    // Dedupe shared bone arrays (e.g. the static identity palette submitted
+    // for unbound skeletons): open-addressing hash keyed on the palette data
+    // pointer, O(1)-cleared per frame and allocation-free on the frame path.
+    BonePaletteTable palette_dedupe_{MAX_BONE_PALETTES};
 
-    // Per-frame scratch for shadow-pass entity resolution. Cleared per
-    // render_shadow_passes call but capacity is preserved across frames.
-    // Held as members rather than thread_local locals so they participate
-    // in normal object lifetime / can be reset by tests.
+    // Skinned commands resolved once per frame by pack_bone_palettes():
+    // Model*, world bounds and palette offset, shared by the main view and
+    // every shadow cascade. Commands without a model/skeleton/bone data (or
+    // dropped over the palette cap) are excluded. Cleared per frame,
+    // capacity preserved.
     struct ResolvedSkinnedEntry {
         const SkinnedModelCommand* cmd;
         Model* model;
@@ -270,11 +268,16 @@ private:
         float world_radius;
         uint32_t palette_offset;
     };
+    std::vector<ResolvedSkinnedEntry> skinned_resolved_;
+
+    // Per-frame scratch for shadow-pass static entity resolution. Cleared per
+    // render_shadow_passes call but capacity is preserved across frames.
+    // Held as a member rather than a thread_local local so it participates
+    // in normal object lifetime / can be reset by tests.
     struct ResolvedStaticEntry {
         const ModelCommand* cmd;
         Model* model;
     };
-    std::vector<ResolvedSkinnedEntry> shadow_skinned_scratch_;
     std::vector<ResolvedStaticEntry> shadow_static_scratch_;
 
     // ========== Render State ==========

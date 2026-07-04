@@ -1,11 +1,10 @@
 #pragma once
 
-#include "engine/animation/animation_types.hpp" // MAX_BONES
 #include "engine/model_loader.hpp" // ModelHandle
 #include "engine/render/lighting/light.hpp"
-#include <array>
 #include <cstdint>
 #include <glm/glm.hpp>
+#include <span>
 #include <vector>
 
 namespace mmo::engine {
@@ -33,13 +32,14 @@ struct ModelCommand {
 
 /**
  * Skinned/animated model render command data.
- * Bone matrices are stored as a const pointer to avoid copying 4KB per entity.
- * The pointed-to data must remain valid until the frame is rendered.
+ * Bone matrices are referenced through a non-owning span (pointer + real
+ * length) to avoid copying 4KB+ per entity; the referenced storage must
+ * remain valid until the frame is rendered (through render_frame).
  */
 struct SkinnedModelCommand {
     mmo::engine::ModelHandle model_handle = mmo::engine::INVALID_MODEL_HANDLE;
     glm::mat4 transform;
-    const std::array<glm::mat4, mmo::engine::animation::MAX_BONES>* bone_matrices = nullptr;
+    std::span<const glm::mat4> bone_matrices;
     glm::vec4 tint = {1.0f, 1.0f, 1.0f, 1.0f};
 };
 
@@ -105,10 +105,12 @@ public:
 
     /**
      * Add a skinned/animated model (handle-based, zero string alloc).
-     * bone_matrices must remain valid until the frame is rendered.
+     * bone_matrices is non-owning and must remain valid until the frame is
+     * rendered; pass AnimationPlayer::bone_matrices() or any right-sized
+     * matrix storage (the renderer packs min(model joints, span size)).
      */
     void add_skinned_model(mmo::engine::ModelHandle handle, const glm::mat4& transform,
-                           const std::array<glm::mat4, mmo::engine::animation::MAX_BONES>& bone_matrices,
+                           std::span<const glm::mat4> bone_matrices,
                            const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f});
 
     /**

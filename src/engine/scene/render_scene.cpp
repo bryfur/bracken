@@ -2,9 +2,9 @@
 #include "glm/ext/matrix_float4x4.hpp"
 #include "glm/ext/vector_float3.hpp"
 #include "glm/ext/vector_float4.hpp"
-#include <array>
 #include <cmath>
 #include <cstdint>
+#include <span>
 
 namespace mmo::engine::scene {
 
@@ -37,12 +37,11 @@ void RenderScene::add_model(mmo::engine::ModelHandle handle, const glm::mat4& tr
 }
 
 void RenderScene::add_skinned_model(mmo::engine::ModelHandle handle, const glm::mat4& transform,
-                                    const std::array<glm::mat4, mmo::engine::animation::MAX_BONES>& bone_matrices,
-                                    const glm::vec4& tint) {
+                                    std::span<const glm::mat4> bone_matrices, const glm::vec4& tint) {
     SkinnedModelCommand cmd;
     cmd.model_handle = handle;
     cmd.transform = transform;
-    cmd.bone_matrices = &bone_matrices;
+    cmd.bone_matrices = bone_matrices;
     cmd.tint = tint;
     skinned_commands_.push_back(cmd);
 }

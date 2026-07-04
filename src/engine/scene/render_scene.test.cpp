@@ -1,7 +1,10 @@
 #include "engine/scene/render_scene.hpp"
+#include "engine/animation/animation_types.hpp" // MAX_BONES
+#include <array>
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>
 #include <type_traits>
+#include <vector>
 
 using namespace mmo::engine::scene;
 
@@ -63,7 +66,7 @@ TEST(RenderScene, AddModelHandleVersion) {
     EXPECT_EQ(scene.model_commands()[0].model_handle, 42u);
 }
 
-TEST(RenderScene, SkinnedModelStoresBonePointer) {
+TEST(RenderScene, SkinnedModelStoresBoneSpan) {
     RenderScene scene;
     std::array<glm::mat4, mmo::engine::animation::MAX_BONES> bones{};
     bones.fill(glm::mat4(1.0f));
@@ -74,8 +77,24 @@ TEST(RenderScene, SkinnedModelStoresBonePointer) {
     ASSERT_EQ(scene.skinned_commands().size(), 1u);
     const auto& cmd = scene.skinned_commands()[0];
     EXPECT_EQ(cmd.model_handle, 3u);
-    EXPECT_EQ(cmd.bone_matrices, &bones);
-    EXPECT_EQ((*cmd.bone_matrices)[0], glm::mat4(2.0f));
+    // Non-owning view over the caller's storage: same pointer, real length.
+    EXPECT_EQ(cmd.bone_matrices.data(), bones.data());
+    EXPECT_EQ(cmd.bone_matrices.size(), bones.size());
+    EXPECT_EQ(cmd.bone_matrices[0], glm::mat4(2.0f));
+}
+
+TEST(RenderScene, SkinnedModelAcceptsRightSizedStorage) {
+    // The command no longer bakes MAX_BONES into its type: hosts may submit
+    // exactly the number of matrices their skeleton uses.
+    RenderScene scene;
+    std::vector<glm::mat4> bones(17, glm::mat4(1.0f));
+
+    scene.add_skinned_model(4u, glm::mat4(1.0f), bones);
+
+    ASSERT_EQ(scene.skinned_commands().size(), 1u);
+    const auto& cmd = scene.skinned_commands()[0];
+    EXPECT_EQ(cmd.bone_matrices.data(), bones.data());
+    EXPECT_EQ(cmd.bone_matrices.size(), 17u);
 }
 
 TEST(RenderScene, Billboard3D) {
