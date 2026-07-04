@@ -97,9 +97,10 @@ debug lines, particle-effect spawn commands, and per-frame draw toggles
 (skybox/ground/grass/…). It is passed to `render_frame` by **non-const
 reference** — the renderer drains the particle-spawn queue.
 
-**Lifetime contract**: `SkinnedModelCommand::bone_matrices` stores a *pointer*
-to the host's `AnimationPlayer::bone_matrix_array()`. That storage must stay
-valid and unmodified until `render_frame` returns.
+**Lifetime contract**: `SkinnedModelCommand::bone_matrices` is a *non-owning*
+`std::span<const glm::mat4>` over host storage (e.g. the host's
+`AnimationPlayer::bone_matrices()`). That storage must stay valid and
+unmodified until `render_frame` returns.
 
 ### Pass order inside `SceneRenderer::render_frame`
 
@@ -109,9 +110,10 @@ timer label, so RenderDoc captures read in this order.)
 1. **CPU prep** — propagate `EnvironmentState` to sub-renderers, advance sky
    and effect-system time, drain `RenderScene` particle spawns, pre-upload any
    effect models (uploads can't run inside a render pass), update CSM cascade
-   matrices, cull + build instance batches per cascade and main view, pack all
-   skinned bone palettes into one tight CPU scratch array, build the cluster
-   light grid on the CPU (skipped when the scene has zero dynamic lights).
+   matrices, cull + build instance batches per cascade and main view, resolve
+   skinned commands (model, bounds, deduped palette offset) and plan the
+   palette copy ranges, build the cluster light grid on the CPU (skipped when
+   the scene has zero dynamic lights).
 2. **`FrameUploads`** — one `SDL_GPUCopyPass` for every per-frame upload:
    instances, shadow instances, bone palettes, particle instances, debug
    lines, grass chunks, cluster light buffers.
@@ -229,17 +231,20 @@ Per-instance, host-driven. Types and constants in
 `animation/animation_types.hpp`:
 
 - `MAX_BONES = 128` (line 15) — CPU-side cap on joints per skinned mesh; sizes
-  `std::array<glm::mat4, MAX_BONES>` in `AnimationPlayer` and the
-  scene plumbing. `MAX_BONE_INFLUENCES = 4`.
+  `std::array<glm::mat4, MAX_BONES>` in `AnimationPlayer` (the scene layer
+  passes bone matrices as a length-carrying `std::span`).
+  `MAX_BONE_INFLUENCES = 4`.
 - `AnimationPlayer` (`animation_player.hpp`): `update(skeleton, clips, dt)`,
   `crossfade_to(clip_index, duration)`, speed/loop/seek. Keyframe cursors are
   per-player (clips are shared, players are not — thread-hazard lesson, see
   design notes).
 - `AnimationStateMachine` (`animation_state_machine.hpp`): data-driven states
   + transitions; the host feeds parameters (`set_float("speed", …)`,
-  `set_bool("attacking", …)`). Conditions are a tagged union supporting AND
-  and `any_of` (OR). Clip binding is by **string name** → see the format doc's
-  clip-naming section.
+  `set_bool("attacking", …)` — or, on per-frame paths, resolve the name once
+  with `param_index()` and use the int-indexed `set_float`/`set_bool`
+  overloads to skip the per-call string hash). Conditions are a tagged union
+  supporting AND and `any_of` (OR). Clip binding is by **string name** → see
+  the format doc's clip-naming section.
 - **IK is applied by the host after the state-machine/player update**, before
   render submission: `solve_two_bone_ik`, `apply_foot_ik`, `apply_body_lean`
   (`ik_solver.hpp`). `FootIKBoneNames` defaults to the standard rig names
@@ -266,7 +271,7 @@ The engine is single-threaded by design; the exceptions are explicit:
   costs dispatch overhead.
 - **`Logger`** sinks are thread-safe.
 - **`render_frame` mutates the `RenderScene`** (drains particle spawns), and
-  skinned-command bone-matrix pointers must outlive the call (see above).
+  skinned-command bone-matrix spans must outlive the call (see above).
 - GPU resource owners (`PipelineRegistry`, buffers, textures) are
   non-copyable/non-movable and must be destroyed before the `GPUDevice`.
 

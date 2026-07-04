@@ -232,6 +232,27 @@ private:
     std::vector<TerrainTile> tiles_;
     std::vector<TerrainTile> shadow_tiles_;
 
+    // Row-level acceleration for tile culling: tiles are generated row-major,
+    // so each z-row is a contiguous slice of the tile vector with a merged
+    // AABB. Culling tests one row AABB first and only tests per-tile AABBs
+    // inside rows that intersect the frustum, turning the per-pass linear
+    // scan of every tile into row tests + a handful of intersecting rows.
+    struct TileRow {
+        size_t first_tile = 0;
+        size_t tile_count = 0;
+        glm::vec3 aabb_min = glm::vec3(0.0f);
+        glm::vec3 aabb_max = glm::vec3(0.0f);
+    };
+    std::vector<TileRow> tile_rows_;
+    std::vector<TileRow> shadow_tile_rows_;
+
+    // Rebuilds `rows` from row-major `tiles` (grouped by shared min-z band).
+    static void build_tile_rows(const std::vector<TerrainTile>& tiles, std::vector<TileRow>& rows);
+    // Frustum-culled tile draw shared by the main and shadow passes: rows are
+    // AABB-tested first; visible tiles merge into contiguous index-range runs.
+    static void draw_culled_tiles(SDL_GPURenderPass* pass, const scene::Frustum& frustum,
+                                  const std::vector<TerrainTile>& tiles, const std::vector<TileRow>& rows);
+
     // Sun/ambient/fog environment, fed per frame by the scene renderer.
     EnvironmentState env_{};
 

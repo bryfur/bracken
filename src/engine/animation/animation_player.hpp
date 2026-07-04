@@ -42,9 +42,9 @@ public:
         return std::span<const glm::mat4>(bone_matrices_.data(), bone_matrices_.size());
     }
 
-    // Direct array reference for APIs that require the fixed-size std::array type
-    // (e.g. the render-scene command stores a pointer to this exact storage).
-    const std::array<glm::mat4, MAX_BONES>& bone_matrix_array() const { return bone_matrices_; }
+    // Joints written by the last update(); slots at/beyond this index hold
+    // identity. Consumers packing palettes should read only this prefix.
+    size_t used_joint_count() const { return used_joint_count_; }
 
     // IK/lean integrators need to read (and occasionally patch) world transforms
     // together with the bone matrices. Exposed as spans so callers never own the
@@ -75,6 +75,7 @@ private:
 
     std::array<glm::mat4, MAX_BONES> bone_matrices_;
     std::array<glm::mat4, MAX_BONES> world_transforms_;
+    size_t used_joint_count_ = 0; // slots at/beyond this index are identity
 
     std::vector<const AnimationChannel*> channel_lookup_;
     std::vector<const AnimationChannel*> prev_channel_lookup_;

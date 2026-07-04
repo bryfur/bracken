@@ -1,4 +1,5 @@
 #include "scene_renderer.hpp"
+#include "engine/animation/animation_types.hpp" // MAX_BONES
 #include "engine/core/assert.hpp"
 #include "engine/core/jobs/job_system.hpp"
 #include "engine/core/profiler.hpp"
@@ -953,22 +954,16 @@ void SceneRenderer::render_3d_scene(const RenderScene& scene, const CameraState&
         }
     }
 
-    // Render skinned models individually (they have per-instance bone data)
-    // Bind pipeline, shadow data and the bone-palette SSBO once before the loop
+    // Render skinned models individually (they have per-instance bone data).
+    // pack_bone_palettes() already resolved Model*, world bounds and palette
+    // offset per drawable command (commands without a model/skeleton/palette
+    // were excluded there), so nothing is re-resolved here. Pipeline, shadow
+    // data and the bone-palette SSBO bind once before the loop.
     {
         bool skinned_pipeline_bound = false;
 
-        const auto& skinned_cmds = scene.skinned_commands();
-        for (size_t i = 0; i < skinned_cmds.size(); ++i) {
-            const SkinnedModelCommand& data = skinned_cmds[i];
-            // Palettes were packed in command order by pack_bone_palettes();
-            // INVALID means no model/skeleton or dropped over the palette cap.
-            const uint32_t palette_offset =
-                i < skinned_palette_offsets_.size() ? skinned_palette_offsets_[i] : INVALID_PALETTE_OFFSET;
-            if (palette_offset == INVALID_PALETTE_OFFSET) {
-                continue;
-            }
-
+        for (const auto& rs : skinned_resolved_) {
+            const SkinnedModelCommand& data = *rs.cmd;
             const glm::mat4& t = data.transform;
             glm::vec3 world_pos(t[3][0], t[3][1], t[3][2]);
 
@@ -981,18 +976,11 @@ void SceneRenderer::render_3d_scene(const RenderScene& scene, const CameraState&
                 continue;
             }
 
-            if (do_frustum_cull) {
-                Model* model = model_manager_->get_model(data.model_handle);
-                if (model) {
-                    glm::vec3 world_center = glm::vec3(t * glm::vec4(model->bounding_center, 1.0f));
-                    float max_scale = max_scale_factor(t);
-                    if (!frustum.intersects_sphere(world_center, model->bounding_half_diag * max_scale)) {
-                        if (collect_stats_) {
-                            render_stats_.entities_frustum_culled++;
-                        }
-                        continue;
-                    }
+            if (do_frustum_cull && !frustum.intersects_sphere(rs.world_center, rs.world_radius)) {
+                if (collect_stats_) {
+                    render_stats_.entities_frustum_culled++;
                 }
+                continue;
             }
 
             if (collect_stats_) {
@@ -1007,7 +995,7 @@ void SceneRenderer::render_3d_scene(const RenderScene& scene, const CameraState&
                 skinned_pipeline_bound = true;
             }
 
-            render_skinned_model_command_inner(data, camera, palette_offset);
+            render_skinned_model_command_inner(data, *rs.model, camera, rs.palette_offset);
         }
     }
 
@@ -1375,14 +1363,20 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
 
         if (instance_storage_buffer_) {
             // Pack in ascending handle order — must match the iteration order in
-            // render_instanced_models so base_instance offsets line up.
-            packed_instances_.clear();
-            packed_instances_.reserve(total_instances);
-            for (const auto& instances : instance_batches_) {
-                packed_instances_.insert(packed_instances_.end(), instances.begin(), instances.end());
+            // render_instanced_models so base_instance offsets line up. Bins are
+            // written straight into the mapped transfer buffer (one pass over
+            // the data instead of bin -> pack scratch -> transfer buffer).
+            if (gpu::GPUBuffer::Mapping mapping = instance_storage_buffer_->map()) {
+                auto* dst = static_cast<gpu::InstanceData*>(mapping.data());
+                for (const auto& instances : instance_batches_) {
+                    if (instances.empty()) {
+                        continue;
+                    }
+                    std::memcpy(dst, instances.data(), instances.size() * sizeof(gpu::InstanceData));
+                    dst += instances.size();
+                }
+                mapping.upload(copy_pass, required_size);
             }
-
-            instance_storage_buffer_->update(copy_pass, packed_instances_.data(), required_size);
         }
     }
 
@@ -1410,16 +1404,24 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
             }
         }
 
-        packed_shadow_instances_.clear();
-        packed_shadow_instances_.reserve(total_shadow);
-        for (int c = 0; c < 4; ++c) {
-            shadow_cascade_base_instance_[c] = static_cast<uint32_t>(packed_shadow_instances_.size());
-            for (const auto& instances : shadow_instance_batches_[c]) {
-                packed_shadow_instances_.insert(packed_shadow_instances_.end(), instances.begin(), instances.end());
+        // Cascade sections packed contiguously, straight into the mapped
+        // transfer buffer (same single-pass packing as the main instances).
+        if (gpu::GPUBuffer::Mapping mapping = shadow_instance_storage_buffer_->map()) {
+            auto* dst = static_cast<gpu::ShadowInstanceData*>(mapping.data());
+            uint32_t packed = 0;
+            for (int c = 0; c < 4; ++c) {
+                shadow_cascade_base_instance_[c] = packed;
+                for (const auto& instances : shadow_instance_batches_[c]) {
+                    if (instances.empty()) {
+                        continue;
+                    }
+                    std::memcpy(dst, instances.data(), instances.size() * sizeof(gpu::ShadowInstanceData));
+                    dst += instances.size();
+                    packed += static_cast<uint32_t>(instances.size());
+                }
             }
+            mapping.upload(copy_pass, required_size);
         }
-
-        shadow_instance_storage_buffer_->update(copy_pass, packed_shadow_instances_.data(), required_size);
     } else {
         shadow_cascade_base_instance_ = {0, 0, 0, 0};
     }
@@ -1432,13 +1434,14 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
 void SceneRenderer::pack_bone_palettes(const RenderScene& scene) {
     ENGINE_PROFILE_ZONE_COLOR("SceneRenderer::pack_bone_palettes", 0x8E44AD);
     const auto& cmds = scene.skinned_commands();
-    skinned_palette_offsets_.clear();
-    bone_palette_scratch_.clear();
+    skinned_resolved_.clear();
+    palette_copy_ranges_.clear();
     palette_dedupe_.clear();
+    bone_palette_matrix_count_ = 0;
     if (cmds.empty()) {
         return;
     }
-    skinned_palette_offsets_.reserve(cmds.size());
+    skinned_resolved_.reserve(cmds.size());
 
     uint32_t palette_count = 0;
     uint32_t dropped = 0;
@@ -1446,47 +1449,46 @@ void SceneRenderer::pack_bone_palettes(const RenderScene& scene) {
         Model* model = model_manager_->get_model(cmd.model_handle);
         uint32_t joint_count = 0;
         if (model && model->has_skeleton) {
-            joint_count = std::min(static_cast<uint32_t>(model->skeleton.joints.size()),
-                                   static_cast<uint32_t>(mmo::engine::animation::MAX_BONES));
+            joint_count = std::min({static_cast<uint32_t>(model->skeleton.joints.size()),
+                                    static_cast<uint32_t>(cmd.bone_matrices.size()),
+                                    static_cast<uint32_t>(mmo::engine::animation::MAX_BONES)});
         }
-        if (joint_count == 0 || !cmd.bone_matrices) {
-            skinned_palette_offsets_.push_back(INVALID_PALETTE_OFFSET);
-            continue;
+        if (joint_count == 0) {
+            continue; // no model/skeleton/bone data: not drawable as skinned
         }
+
+        // Resolve world bounds once here; the main view and every shadow
+        // cascade reuse them instead of re-fetching the model per pass.
+        const glm::mat4& t = cmd.transform;
+        const glm::vec3 world_center = glm::vec3(t * glm::vec4(model->bounding_center, 1.0f));
+        const float world_radius = model->bounding_half_diag * max_scale_factor(t);
 
         // Dedupe shared bone arrays (notably the static identity palette used
         // for unbound skeletons): reuse the packed palette when it covers at
-        // least this model's joint count. Linear scan — skinned counts are
-        // small and this avoids per-frame map-node allocations.
-        PaletteDedupeEntry* found = nullptr;
-        for (auto& entry : palette_dedupe_) {
-            if (entry.key == cmd.bone_matrices) {
-                found = &entry;
-                break;
-            }
-        }
+        // least this model's joint count. Open-addressing hash keyed on the
+        // palette pointer — O(1) expected, allocation-free per frame.
+        BonePaletteTable::Entry* found = palette_dedupe_.find(cmd.bone_matrices.data());
         if (found && found->joint_count >= joint_count) {
-            skinned_palette_offsets_.push_back(found->offset);
+            skinned_resolved_.push_back({&cmd, model, world_center, world_radius, found->offset});
             continue;
         }
 
         if (palette_count >= MAX_BONE_PALETTES) {
             ++dropped;
-            skinned_palette_offsets_.push_back(INVALID_PALETTE_OFFSET);
             continue;
         }
 
-        const uint32_t offset = static_cast<uint32_t>(bone_palette_scratch_.size());
-        bone_palette_scratch_.insert(bone_palette_scratch_.end(), cmd.bone_matrices->begin(),
-                                     cmd.bone_matrices->begin() + joint_count);
+        const uint32_t offset = static_cast<uint32_t>(bone_palette_matrix_count_);
+        palette_copy_ranges_.push_back({cmd.bone_matrices.data(), joint_count});
+        bone_palette_matrix_count_ += joint_count;
         if (found) {
             // Repacked with more joints: point the entry at the new copy.
             found->offset = offset;
             found->joint_count = joint_count;
         } else {
-            palette_dedupe_.push_back({cmd.bone_matrices, offset, joint_count});
+            palette_dedupe_.insert(cmd.bone_matrices.data(), offset, joint_count);
         }
-        skinned_palette_offsets_.push_back(offset);
+        skinned_resolved_.push_back({&cmd, model, world_center, world_radius, offset});
         ++palette_count;
     }
 
@@ -1497,11 +1499,11 @@ void SceneRenderer::pack_bone_palettes(const RenderScene& scene) {
 }
 
 void SceneRenderer::upload_bone_palettes(SDL_GPUCopyPass* copy_pass) {
-    if (!copy_pass || bone_palette_scratch_.empty()) {
+    if (!copy_pass || bone_palette_matrix_count_ == 0) {
         return;
     }
 
-    const size_t required_size = bone_palette_scratch_.size() * sizeof(glm::mat4);
+    const size_t required_size = bone_palette_matrix_count_ * sizeof(glm::mat4);
     if (!bone_palette_buffer_ || bone_palette_capacity_ < required_size) {
         // Grow geometrically with a floor of 64 KB (~16 palettes of 64 joints).
         bone_palette_capacity_ = std::max(required_size * 2, static_cast<size_t>(64 * 1024));
@@ -1514,7 +1516,20 @@ void SceneRenderer::upload_bone_palettes(SDL_GPUCopyPass* copy_pass) {
         }
     }
 
-    bone_palette_buffer_->update(copy_pass, bone_palette_scratch_.data(), required_size);
+    // Copy each palette straight from host bone storage into the mapped
+    // transfer buffer (no intermediate CPU pack scratch). Range order matches
+    // the offsets handed out by pack_bone_palettes().
+    gpu::GPUBuffer::Mapping mapping = bone_palette_buffer_->map();
+    if (!mapping) {
+        std::cerr << "[SceneRenderer] Failed to map bone palette transfer buffer" << '\n';
+        return;
+    }
+    auto* dst = static_cast<glm::mat4*>(mapping.data());
+    for (const auto& range : palette_copy_ranges_) {
+        std::memcpy(dst, range.src, range.count * sizeof(glm::mat4));
+        dst += range.count;
+    }
+    mapping.upload(copy_pass, required_size);
 }
 
 void SceneRenderer::render_instanced_models(const CameraState& camera) {
@@ -1747,10 +1762,10 @@ void SceneRenderer::render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_
     }
 }
 
-void SceneRenderer::render_skinned_model_command_inner(const SkinnedModelCommand& cmd, const CameraState& camera,
-                                                       uint32_t palette_offset) {
-    Model* model = model_manager_->get_model(cmd.model_handle);
-    if (!model || !main_render_pass_) {
+void SceneRenderer::render_skinned_model_command_inner(const SkinnedModelCommand& cmd, Model& model,
+                                                       const CameraState& camera, uint32_t palette_offset) {
+    // Model was resolved once in pack_bone_palettes(); no per-draw lookup.
+    if (!main_render_pass_) {
         return;
     }
 
@@ -1777,7 +1792,7 @@ void SceneRenderer::render_skinned_model_command_inner(const SkinnedModelCommand
 
     SDL_PushGPUVertexUniformData(gpu_cmd, 0, &transform_uniforms, sizeof(transform_uniforms));
 
-    for (auto& mesh : model->meshes) {
+    for (auto& mesh : model.meshes) {
         if (mesh.shadow_only) {
             continue;
         }
@@ -2100,30 +2115,10 @@ void SceneRenderer::render_shadow_passes(const RenderScene& scene, const CameraS
     // Note: shadow_map_->update() was already called in render_frame() so that the
     // per-cascade light frustums could be used during build_instance_batches.
 
-    // Pre-resolve Model* + world bounds once per skinned entity (outside the cascade loop).
-    // Avoids N cascades * M entities hash lookups per frame. Palette offsets
-    // come from pack_bone_palettes() (parallel to skinned_commands order);
-    // entities without a palette (no skeleton / dropped over cap) are skipped.
-    auto& skinned_scratch = shadow_skinned_scratch_;
-    skinned_scratch.clear();
-    const auto& skinned_cmds = scene.skinned_commands();
-    skinned_scratch.reserve(skinned_cmds.size());
-    for (size_t i = 0; i < skinned_cmds.size(); ++i) {
-        const auto& skinned_cmd = skinned_cmds[i];
-        const uint32_t palette_offset =
-            i < skinned_palette_offsets_.size() ? skinned_palette_offsets_[i] : INVALID_PALETTE_OFFSET;
-        if (palette_offset == INVALID_PALETTE_OFFSET) {
-            continue;
-        }
-        Model* model = model_manager_->get_model(skinned_cmd.model_handle);
-        if (!model) {
-            continue;
-        }
-        const glm::mat4& t = skinned_cmd.transform;
-        glm::vec3 wc = glm::vec3(t * glm::vec4(model->bounding_center, 1.0f));
-        float wr = model->bounding_half_diag * max_scale_factor(t);
-        skinned_scratch.push_back({&skinned_cmd, model, wc, wr, palette_offset});
-    }
+    // Skinned entities were already resolved (Model*, world bounds, palette
+    // offset) by pack_bone_palettes(); the cascade loops below reuse that
+    // scratch directly instead of re-resolving per shadow pass.
+    const auto& skinned_scratch = skinned_resolved_;
 
     // Pre-resolve Model* for non-instanced static commands too.
     auto& static_scratch = shadow_static_scratch_;

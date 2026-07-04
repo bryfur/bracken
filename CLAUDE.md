@@ -77,8 +77,8 @@ override `on_init`/`on_update`/`on_render`/`on_shutdown`.
   engine target — all projection math is glm `RH_ZO`).
 - `RenderScene` accumulates draw commands; `SceneRenderer` consumes them.
   It's passed by **non-const ref** (the renderer drains particle spawns), and
-  `SkinnedModelCommand::bone_matrices` is a pointer into host storage that
-  must stay valid through `render_frame`.
+  `SkinnedModelCommand::bone_matrices` is a non-owning `std::span` over host
+  storage that must stay valid through `render_frame`.
 - All lighting is **linear-space**; `render::EnvironmentState` colors are
   linear, the composite pass tonemaps to the swapchain.
 - Animation is per-instance: an `AnimationPlayer` + `AnimationStateMachine`.

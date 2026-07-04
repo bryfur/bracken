@@ -48,10 +48,25 @@ public:
 
     bool bind_clips(const std::vector<AnimationClip>& clips);
 
+    // Resolve a parameter name to a stable index, creating the parameter if
+    // needed. Resolve once at setup and use the index overloads below on the
+    // per-frame path — the string overloads hash the name on every call.
+    int param_index(const std::string& name);
+    // Lookup without creating; returns -1 when the parameter doesn't exist.
+    int find_param_index(const std::string& name) const;
+
+    // String-keyed convenience API (thin wrappers over the index overloads).
     void set_float(const std::string& name, float v);
     void set_bool(const std::string& name, bool v);
     float get_float(const std::string& name) const;
     bool get_bool(const std::string& name) const;
+
+    // Index-keyed API for per-entity-per-frame updates (no hashing).
+    // Out-of-range indices are ignored on set and return defaults on get.
+    void set_float(int param_index, float v);
+    void set_bool(int param_index, bool v);
+    float get_float(int param_index) const;
+    bool get_bool(int param_index) const;
 
     void update(AnimationPlayer& player);
 

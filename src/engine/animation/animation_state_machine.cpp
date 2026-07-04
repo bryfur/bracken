@@ -110,28 +110,56 @@ bool AnimationStateMachine::bind_clips(const std::vector<AnimationClip>& clips) 
     return all_found;
 }
 
+int AnimationStateMachine::param_index(const std::string& name) {
+    return ensure_param(name);
+}
+
+int AnimationStateMachine::find_param_index(const std::string& name) const {
+    return find_param(name);
+}
+
 void AnimationStateMachine::set_float(const std::string& name, float v) {
-    int idx = ensure_param(name);
-    params_[idx] = ParamValue{v};
+    set_float(ensure_param(name), v);
 }
 
 void AnimationStateMachine::set_bool(const std::string& name, bool v) {
-    int idx = ensure_param(name);
-    params_[idx] = ParamValue{v};
+    set_bool(ensure_param(name), v);
 }
 
 float AnimationStateMachine::get_float(const std::string& name) const {
-    int idx = find_param(name);
-    if (idx >= 0 && params_[idx].type == ParamType::Float) {
-        return params_[idx].f;
+    return get_float(find_param(name));
+}
+
+bool AnimationStateMachine::get_bool(const std::string& name) const {
+    return get_bool(find_param(name));
+}
+
+void AnimationStateMachine::set_float(int param_index, float v) {
+    if (param_index < 0 || param_index >= static_cast<int>(params_.size())) {
+        return;
+    }
+    params_[param_index] = ParamValue{v};
+}
+
+void AnimationStateMachine::set_bool(int param_index, bool v) {
+    if (param_index < 0 || param_index >= static_cast<int>(params_.size())) {
+        return;
+    }
+    params_[param_index] = ParamValue{v};
+}
+
+float AnimationStateMachine::get_float(int param_index) const {
+    if (param_index >= 0 && param_index < static_cast<int>(params_.size()) &&
+        params_[param_index].type == ParamType::Float) {
+        return params_[param_index].f;
     }
     return 0.0f;
 }
 
-bool AnimationStateMachine::get_bool(const std::string& name) const {
-    int idx = find_param(name);
-    if (idx >= 0 && params_[idx].type == ParamType::Bool) {
-        return params_[idx].b;
+bool AnimationStateMachine::get_bool(int param_index) const {
+    if (param_index >= 0 && param_index < static_cast<int>(params_.size()) &&
+        params_[param_index].type == ParamType::Bool) {
+        return params_[param_index].b;
     }
     return false;
 }

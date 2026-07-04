@@ -278,6 +278,34 @@ TEST_F(AnimationPlayerTest, BoneMatricesIdentityBeyondJointCount) {
     }
 }
 
+TEST_F(AnimationPlayerTest, UsedJointCountTracksSkeleton) {
+    AnimationPlayer player;
+    EXPECT_EQ(player.used_joint_count(), 0u);
+
+    player.update(skeleton, clips, 0.5f);
+    EXPECT_EQ(player.used_joint_count(), 2u);
+
+    player.reset();
+    EXPECT_EQ(player.used_joint_count(), 0u);
+}
+
+TEST_F(AnimationPlayerTest, ShrinkingSkeletonReidentitiesExposedTail) {
+    // The identity tail is no longer rewritten every update; it must still be
+    // restored when a rebind to a smaller skeleton exposes previously-used
+    // slots.
+    AnimationPlayer player;
+    player.update(skeleton, clips, 0.5f);
+    ASSERT_NE(player.bone_matrices()[1], glm::mat4(1.0f)); // slot 1 was written
+
+    Skeleton small;
+    small.joints.push_back(skeleton.joints[0]);
+    player.update(small, clips, 0.1f);
+
+    EXPECT_EQ(player.used_joint_count(), 1u);
+    EXPECT_EQ(player.bone_matrices()[1], glm::mat4(1.0f));
+    EXPECT_EQ(player.world_transforms()[1], glm::mat4(1.0f));
+}
+
 TEST_F(AnimationPlayerTest, CrossfadeBlendsBoneMatrices) {
     AnimationPlayer player;
     player.crossfade_to(1, 1.0f);
