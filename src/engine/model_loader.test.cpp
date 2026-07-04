@@ -4,6 +4,10 @@
 
 // Declarations only — the tinygltf implementation is compiled into
 // model_loader.cpp (TINYGLTF_IMPLEMENTATION); this TU just builds test GLBs.
+// The NO_STB defines must match model_loader.cpp or the inline TinyGLTF
+// constructor references stb-based image callbacks that were never compiled.
+#define TINYGLTF_NO_STB_IMAGE
+#define TINYGLTF_NO_STB_IMAGE_WRITE
 #include "tiny_gltf.h"
 
 #include <cstdint>

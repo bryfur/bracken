@@ -1811,7 +1811,7 @@ void SceneRenderer::render_skinned_model_command_inner(const SkinnedModelCommand
         // glTF alphaMode BLEND: defer to the sorted transparent pass.
         if (mesh.material.alpha_mode == AlphaMode::Blend) {
             queue_transparent_mesh(mesh, model_mat, transform_uniforms.normalMatrix, cmd.tint, /*no_fog=*/false,
-                                   palette_offset, *model, camera);
+                                   palette_offset, model, camera);
             continue;
         }
 

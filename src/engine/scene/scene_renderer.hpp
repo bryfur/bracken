@@ -260,6 +260,7 @@ private:
         float view_dist_sq;
     };
     std::vector<TransparentDraw> transparent_draws_;
+    static constexpr uint32_t INVALID_PALETTE_OFFSET = 0xFFFFFFFFu;
     // Cull variant currently bound for the model / skinned pipeline families
     // (only meaningful while that family is the active pipeline).
     bool model_pipeline_double_sided_ = false;
