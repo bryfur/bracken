@@ -47,22 +47,26 @@ const std::array<glm::vec4, gpu::GTAOUniforms::KERNEL_SIZE>& ssao_hemisphere_ker
     return kernel;
 }
 
-// GTAO base directions: evenly spaced unit-circle directions in xy. The shader
-// rotates them per-pixel via IGN (one sincos per pixel total).
-const std::array<glm::vec4, gpu::GTAOUniforms::KERNEL_SIZE>& gtao_direction_kernel(int num_directions) {
-    static const auto kernel = [num_directions] {
-        std::array<glm::vec4, gpu::GTAOUniforms::KERNEL_SIZE> k{};
-        const int dirs = std::max(num_directions, 1);
-        for (int i = 0; i < gpu::GTAOUniforms::KERNEL_SIZE; ++i) {
-            const float angle = (static_cast<float>(i % dirs) / static_cast<float>(dirs)) * TWO_PI;
-            k[i] = glm::vec4(std::cos(angle), std::sin(angle), 0.0f, 0.0f);
-        }
-        return k;
-    }();
-    return kernel;
+} // namespace
+
+namespace detail {
+
+// "GTAO"-pass base directions: evenly spaced unit-circle directions in xy. The
+// shader rotates them per-pixel via IGN (one sincos per pixel total). Built
+// fresh on every call (24 sincos, trivial) so a changed num_directions takes
+// effect immediately — this used to be a function-local static that latched
+// the first call's count forever.
+std::array<glm::vec4, gpu::GTAOUniforms::KERNEL_SIZE> gtao_direction_kernel(int num_directions) {
+    std::array<glm::vec4, gpu::GTAOUniforms::KERNEL_SIZE> k{};
+    const int dirs = std::max(num_directions, 1);
+    for (int i = 0; i < gpu::GTAOUniforms::KERNEL_SIZE; ++i) {
+        const float angle = (static_cast<float>(i % dirs) / static_cast<float>(dirs)) * TWO_PI;
+        k[i] = glm::vec4(std::cos(angle), std::sin(angle), 0.0f, 0.0f);
+    }
+    return k;
 }
 
-} // namespace
+} // namespace detail
 
 AmbientOcclusion::AmbientOcclusion() = default;
 
@@ -74,8 +78,9 @@ bool AmbientOcclusion::init(gpu::GPUDevice& device, int width, int height) {
     device_ = &device;
     width_ = width;
     height_ = height;
-    // Run AO at half resolution: 4x less fragment work for GTAO compute + blur.
-    // Upsample happens for free in the composite pass via bilinear sampling.
+    // Run AO at half resolution: 4x less fragment work for AO compute + blur.
+    // The composite pass upsamples depth-aware (joint bilateral) to avoid
+    // silhouette halos from mixing foreground/background AO.
     ao_width_ = std::max(1, width / 2);
     ao_height_ = std::max(1, height / 2);
 
@@ -318,7 +323,7 @@ void AmbientOcclusion::render_gtao_pass(SDL_GPUCommandBuffer* cmd, gpu::Pipeline
     uniforms.screenSize = glm::vec2(static_cast<float>(ao_width_), static_cast<float>(ao_height_));
     uniforms.invScreenSize = glm::vec2(1.0f / ao_width_, 1.0f / ao_height_);
     uniforms.radiusScale = radius_scale;
-    const auto& kernel = gtao_direction_kernel(uniforms.numDirections);
+    const auto kernel = detail::gtao_direction_kernel(uniforms.numDirections);
     std::copy(kernel.begin(), kernel.end(), uniforms.sampleKernel);
 
     SDL_GPUColorTargetInfo color_target = {};
@@ -435,6 +440,11 @@ void AmbientOcclusion::render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::Pip
     uniforms.tonemapMode = params.tonemap_mode;
     uniforms.contrast = params.contrast;
     uniforms.saturation = params.saturation;
+    // AO and volumetric fog share the same half-res grid (both width/2 x
+    // height/2), so one texel size drives the joint bilateral upsample.
+    uniforms.lowResTexelSize = glm::vec2(1.0f / ao_width_, 1.0f / ao_height_);
+    uniforms.depthA = params.depth_a;
+    uniforms.depthB = params.depth_b;
 
     SDL_GPUColorTargetInfo color_target = {};
     color_target.texture = target;
@@ -454,7 +464,7 @@ void AmbientOcclusion::render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::Pip
     // Bind fog texture (or AO texture as fallback for slot 3 - shader checks enabled flag)
     SDL_GPUTexture* fog_tex = fog_texture ? fog_texture : ao_texture_->handle();
 
-    SDL_GPUTextureSamplerBinding bindings[4] = {};
+    SDL_GPUTextureSamplerBinding bindings[5] = {};
     bindings[0].texture = offscreen_color_->handle();
     bindings[0].sampler = linear_clamp_sampler_;
     bindings[1].texture = ao_texture_->handle(); // After blur, result is back in ao_texture_
@@ -463,7 +473,10 @@ void AmbientOcclusion::render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::Pip
     bindings[2].sampler = linear_clamp_sampler_;
     bindings[3].texture = fog_tex;
     bindings[3].sampler = linear_clamp_sampler_;
-    SDL_BindGPUFragmentSamplers(pass, 0, bindings, 4);
+    // Full-res depth drives the joint bilateral upsample of AO + fog.
+    bindings[4].texture = offscreen_depth_->handle();
+    bindings[4].sampler = nearest_clamp_sampler_;
+    SDL_BindGPUFragmentSamplers(pass, 0, bindings, 5);
 
     SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
     SDL_EndGPURenderPass(pass);

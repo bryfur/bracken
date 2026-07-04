@@ -70,11 +70,14 @@ corona / gradient / horizon glow) on a fullscreen triangle.
 terrain casters.
 
 **Post-processing** — all sample the HDR offscreen scene target via
-`fullscreen.vert` (fullscreen triangle, no vertex input): `ssao` / `gtao` +
-`blur_ao` (bilateral), `bloom_downsample` (13-tap) / `bloom_upsample` (9-tap
-tent, additive), `volumetric_fog` (ray march with god rays from the shadow
-atlas), `composite` (scene × AO + bloom + fog, exposure + tonemap + gamma →
-LDR), `fxaa` (FXAA 3.11 on the tonemapped LDR image).
+`fullscreen.vert` (fullscreen triangle, no vertex input): `ssao` / `gtao`
+(despite the name, an HBAO-style directional variant, not true GTAO) +
+`blur_ao` (bilateral), `bloom_downsample` (13-tap, threshold in post-exposure
+luminance) / `bloom_upsample` (9-tap tent, additive), `volumetric_fog` (ray
+march with god rays from the shadow atlas), `composite` (depth-aware
+joint-bilateral upsample of half-res AO + fog, scene × AO + bloom + fog,
+exposure + tonemap + gamma → LDR), `fxaa` (FXAA 3.11 on the tonemapped LDR
+image).
 
 **Effects/UI** — `particle.frag`: unlit additive HDR particles. `ui`/`text`:
 2D pipelines targeting the swapchain. `billboard.*`: camera-facing quads.

@@ -193,9 +193,10 @@ TEST(SkyboxFragmentUniformsLayout, FieldOffsets) {
 // CompositeUniforms - matches composite.frag.hlsl
 // =============================================================================
 
-TEST(CompositeUniformsLayout, SizeIs32Bytes) {
-    // 8 floats = 32 bytes (2 16-byte blocks: ao/bloom/fog + exposure/tonemap/contrast/saturation)
-    EXPECT_EQ(sizeof(CompositeUniforms), 32u);
+TEST(CompositeUniformsLayout, SizeIs48Bytes) {
+    // 8 floats (ao/bloom/fog + exposure/tonemap/contrast/saturation) +
+    // vec2 lowResTexelSize + depthA + depthB = 48 bytes (3 16-byte blocks)
+    EXPECT_EQ(sizeof(CompositeUniforms), 48u);
 }
 
 TEST(CompositeUniformsLayout, FieldOffsets) {
@@ -206,6 +207,9 @@ TEST(CompositeUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(CompositeUniforms, tonemapMode), 20u);
     EXPECT_EQ(offsetof(CompositeUniforms, contrast), 24u);
     EXPECT_EQ(offsetof(CompositeUniforms, saturation), 28u);
+    EXPECT_EQ(offsetof(CompositeUniforms, lowResTexelSize), 32u);
+    EXPECT_EQ(offsetof(CompositeUniforms, depthA), 40u);
+    EXPECT_EQ(offsetof(CompositeUniforms, depthB), 44u);
 }
 
 TEST(CompositeUniformsLayout, DefaultValues) {
@@ -217,6 +221,9 @@ TEST(CompositeUniformsLayout, DefaultValues) {
     EXPECT_EQ(u.tonemapMode, 0);
     EXPECT_FLOAT_EQ(u.contrast, 1.0f);
     EXPECT_FLOAT_EQ(u.saturation, 1.0f);
+    // depthA/depthB of 0 degrade to plain bilinear weights in the shader.
+    EXPECT_FLOAT_EQ(u.depthA, 0.0f);
+    EXPECT_FLOAT_EQ(u.depthB, 0.0f);
 }
 
 // =============================================================================
@@ -294,6 +301,7 @@ TEST(GTAOUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(GTAOUniforms, numDirections), 152u);
     EXPECT_EQ(offsetof(GTAOUniforms, numSteps), 156u);
     EXPECT_EQ(offsetof(GTAOUniforms, radiusScale), 160u);
+    EXPECT_EQ(offsetof(GTAOUniforms, maxDistance), 164u);
     EXPECT_EQ(offsetof(GTAOUniforms, sampleKernel), 176u);
 }
 
@@ -308,6 +316,9 @@ TEST(GTAOUniformsLayout, DefaultValues) {
     EXPECT_FLOAT_EQ(u.radiusScale, 1.0f);
     EXPECT_EQ(u.numDirections, 6);
     EXPECT_EQ(u.numSteps, 3);
+    EXPECT_FLOAT_EQ(u.maxDistance, 12000.0f);
+    // The blur pass must agree with the AO passes on the far cutoff.
+    EXPECT_FLOAT_EQ(u.maxDistance, BlurUniforms{}.maxDistance);
 }
 
 // =============================================================================
@@ -324,6 +335,7 @@ TEST(BlurUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(BlurUniforms, sharpness), 16u);
     EXPECT_EQ(offsetof(BlurUniforms, depthA), 20u);
     EXPECT_EQ(offsetof(BlurUniforms, depthB), 24u);
+    EXPECT_EQ(offsetof(BlurUniforms, maxDistance), 28u);
 }
 
 // =============================================================================
@@ -359,4 +371,28 @@ TEST(ParticleFragmentUniformsLayout, DefaultValues) {
     EXPECT_FLOAT_EQ(u.tintColor.a, 1.0f);
     EXPECT_FLOAT_EQ(u.emissiveBoost, 1.0f);
     EXPECT_FLOAT_EQ(u.opacity, 1.0f);
+}
+
+// =============================================================================
+// BloomDownsampleUniforms - matches bloom_downsample.frag.hlsl
+// =============================================================================
+
+TEST(BloomDownsampleUniformsLayout, SizeIs32Bytes) {
+    // vec2 + threshold + isFirstPass (16) + exposure + pad[3] (16) = 32
+    EXPECT_EQ(sizeof(BloomDownsampleUniforms), 32u);
+}
+
+TEST(BloomDownsampleUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(BloomDownsampleUniforms, srcTexelSize), 0u);
+    EXPECT_EQ(offsetof(BloomDownsampleUniforms, threshold), 8u);
+    EXPECT_EQ(offsetof(BloomDownsampleUniforms, isFirstPass), 12u);
+    EXPECT_EQ(offsetof(BloomDownsampleUniforms, exposure), 16u);
+}
+
+TEST(BloomDownsampleUniformsLayout, DefaultValues) {
+    BloomDownsampleUniforms u;
+    // exposure defaults to neutral: post-exposure thresholding is then
+    // byte-identical to the old pre-exposure behavior.
+    EXPECT_FLOAT_EQ(u.exposure, 1.0f);
+    EXPECT_FLOAT_EQ(u.isFirstPass, 1.0f);
 }

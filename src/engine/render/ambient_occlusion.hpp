@@ -4,6 +4,7 @@
 #include "engine/gpu/gpu_texture.hpp"
 #include "engine/gpu/gpu_uniforms.hpp"
 #include "engine/gpu/pipeline_registry.hpp"
+#include <array>
 #include <glm/glm.hpp>
 #include <memory>
 
@@ -11,12 +12,29 @@ namespace mmo::engine::render {
 
 namespace gpu = mmo::engine::gpu;
 
+namespace detail {
+
 /**
- * Ambient Occlusion manager (supports SSAO and GTAO).
+ * Base directions for the "GTAO" pass (ao_mode == 2): evenly spaced
+ * unit-circle directions in xy, entry i at angle (i % num_directions) /
+ * num_directions * 2π (num_directions is clamped to >= 1). Rebuilt on every
+ * call so a changed num_directions takes effect immediately — a previous
+ * version latched the first call's count in a function-local static.
+ * Exposed here for testing.
+ */
+std::array<glm::vec4, gpu::GTAOUniforms::KERNEL_SIZE> gtao_direction_kernel(int num_directions);
+
+} // namespace detail
+
+/**
+ * Ambient Occlusion manager (ao_mode 1 = SSAO, 2 = "GTAO" — the latter is an
+ * HBAO-style directional variant, not true ground-truth AO; the mode name is
+ * kept for settings compatibility).
  *
  * When enabled, the scene is rendered to an offscreen color+depth target.
- * AO is computed from the depth buffer at half resolution, bilaterally blurred,
- * then composited with the scene color onto the swapchain.
+ * AO is computed from the depth buffer at half resolution, bilaterally
+ * blurred, then upsampled depth-aware (joint bilateral) and composited with
+ * the scene color onto the swapchain.
  */
 class AmbientOcclusion {
 public:
@@ -55,6 +73,11 @@ public:
         int tonemap_mode = 0;
         float contrast = 1.0f;
         float saturation = 1.0f;
+        // Projection constants for the depth-aware AO/fog upsample
+        // (viewZ = depth_b / (depth + depth_a), glm RH_ZO): depth_a =
+        // proj[2][2], depth_b = proj[3][2]. Zeros degrade to plain bilinear.
+        float depth_a = 0.0f;
+        float depth_b = 0.0f;
     };
 
     /**

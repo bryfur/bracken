@@ -52,7 +52,11 @@ struct GraphicsSettings {
     float sun_intensity = 3.0f;     // multiplier on directional sun light (HDR: >1 so bloom/tonemap have headroom)
 
     // Bloom
-    float bloom_threshold = 1.1f; // HDR luminance above which bloom contributes
+    // POST-exposure HDR luminance above which bloom contributes: the prefilter
+    // thresholds scene luminance * exposure, so what blooms stays stable when
+    // exposure changes (identical to the old pre-exposure behavior at
+    // exposure = 1.0).
+    float bloom_threshold = 1.1f;
 
     // AO
     float ao_strength = 1.0f; // AO darkening intensity (0..1+, 1 = stock)

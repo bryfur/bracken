@@ -120,7 +120,7 @@ SDL_GPUTexture* Bloom::bloom_texture() const {
 }
 
 void Bloom::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, SDL_GPUTexture* scene_color,
-                   float threshold) {
+                   float threshold, float exposure) {
     ENGINE_PROFILE_ZONE_COLOR("Bloom::render", 0x16A085);
     if (!is_ready() || !cmd || !scene_color) {
         return;
@@ -145,6 +145,7 @@ void Bloom::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, S
         uniforms.srcTexelSize = glm::vec2(1.0f / src_w, 1.0f / src_h);
         uniforms.threshold = threshold;
         uniforms.isFirstPass = (i == 0) ? 1.0f : 0.0f;
+        uniforms.exposure = exposure; // prefilter thresholds post-exposure luminance
 
         SDL_GPUColorTargetInfo color_target = {};
         color_target.texture = mip_textures_[i]->handle();

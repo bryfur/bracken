@@ -1,9 +1,9 @@
 /**
  * Bloom Downsample Fragment Shader
  *
- * Extracts bright pixels above a luminance threshold and downsamples
- * using a 13-tap filter for high quality (Jimenez 2014 / Call of Duty).
- * Each mip level reads from the previous level.
+ * Extracts bright pixels above a post-exposure luminance threshold and
+ * downsamples using a 13-tap filter for high quality (Jimenez 2014 / Call of
+ * Duty). Each mip level reads from the previous level.
  */
 
 struct PSInput {
@@ -14,8 +14,9 @@ struct PSInput {
 [[vk::binding(0, 3)]]
 cbuffer BloomDownsampleUniforms : register(b0, space3) {
     float2 srcTexelSize;   // 1.0 / source resolution
-    float threshold;       // luminance threshold (first pass only)
+    float threshold;       // post-exposure luminance threshold (first pass only)
     float isFirstPass;     // 1.0 for first pass (apply threshold), 0.0 otherwise
+    float exposure;        // composite-pass exposure, applied before thresholding
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
@@ -34,8 +35,13 @@ float karisWeight(float3 c) {
 
 // Soft threshold: smooth knee around the threshold value, then keep only the
 // part above the threshold (max-component cut for HDR robustness).
+// The threshold decision is made in POST-exposure luminance so "what blooms"
+// tracks what will actually be bright after the composite pass applies
+// exposure (an exposure-dropped night scene stops blooming mid-grey surfaces).
+// The returned color stays in pre-exposure scene units — composite multiplies
+// bloom by exposure later, so exposure must not be baked in twice.
 float3 applyThreshold(float3 color) {
-    float lum = bloomLuminance(color);
+    float lum = bloomLuminance(color) * exposure;
     float knee = threshold * 0.5;
     float soft = lum - threshold + knee;
     soft = clamp(soft, 0.0, 2.0 * knee);
