@@ -118,8 +118,9 @@ timer label, so RenderDoc captures read in this order.)
 3. **`ShadowPass`** — cascades rendered into the 2×2-quadrant D32 atlas
    (`ShadowPass:Cascade0..3`), only when `shadow_mode > 0`.
 4. **`AOOffscreen`** (the normal path whenever the AO subsystem initialized) —
-   the whole 3D scene renders into the linear-HDR offscreen target: skybox,
-   terrain, grass, static/instanced/skinned models, particles, debug lines.
+   the whole 3D scene renders into the linear-HDR offscreen target: terrain,
+   grass, static/instanced/skinned models, skybox, sorted transparent
+   (alphaMode `BLEND`) meshes, particles, debug lines.
    The offscreen clear color tracks `env.fog_color_horizon`.
 5. **Post chain** (all offscreen, swapchain not yet acquired):
    `SSAO`/`GTAO` (per `ao_mode`) → `BlurAO` (bilateral) → `Bloom`
@@ -158,7 +159,8 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
 ## GPU layer
 
 - **`PipelineRegistry`** (`gpu/pipeline_registry.hpp`) lazily creates and
-  caches one `GPUPipeline` per `PipelineType` (23 types). Scene pipelines
+  caches one `GPUPipeline` per `PipelineType` (30 types, including the
+  model-family `DoubleSided`/`Blend` material variants). Scene pipelines
   target the HDR format; UI/Text/Billboard/Composite/Fxaa target the swapchain
   format and are the only ones invalidated when the swapchain format changes.
   `preload_all_pipelines()` avoids first-use hitches.
@@ -197,6 +199,17 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
   `near_only` (declared but **not yet enforced** by the renderer),
   `has_packed_occlusion` (ORM-packed occlusion in the metallic-roughness
   texture).
+- **Material alpha/cull flags** (`PBRMaterial`): glTF `alphaMode` /
+  `alphaCutoff` / `doubleSided` are honored by the renderer. `OPAQUE`
+  materials never alpha-test (base-color alpha is ignored, per spec); `MASK`
+  discards below the material's cutoff (`alphaCutoff` uniform); `BLEND`
+  meshes are drawn in a sorted transparent pass after all opaque content and
+  the skybox — back-to-front by camera distance, depth test on, depth writes
+  off. `doubleSided` selects a no-cull pipeline variant. Limitations: no OIT,
+  and the sort granularity is one mesh per submitted command/instance (using
+  the model's bounding-sphere center), so intersecting or mutually enclosing
+  transparent geometry can still sort wrong. `BLEND` meshes inside instanced
+  batches fall back to one non-instanced draw per instance.
 - **`model_utils`**: `build_model_transform` (translation/rotation/scale →
   mat4 with engine conventions), `compute_tangents_from_uvs` (for meshes
   missing tangents).
@@ -286,6 +299,11 @@ debugging "why is this value zero / where did my draw go":
   ignores it.
 - **`EmitterDefinition::particle_type` "sprite" is not implemented** — only
   `"mesh"` particles render (`render/effect_renderer.cpp`).
+- **Transparency has no OIT** — glTF `BLEND` meshes are sorted back-to-front
+  per queued draw (one entry per mesh per command/instance, keyed on the
+  model's bounding-sphere center); overlapping transparent geometry can still
+  blend in the wrong order. Shadow passes still alpha-test `BLEND` casters at
+  0.5 rather than rendering translucent shadows.
 - **Cluster light SSBOs keep stale contents** when a frame has zero dynamic
   lights — correctness is preserved by zeroed `ClusterParams`
   (`gridDim.w == 0` short-circuits the shader path), not by clearing buffers.

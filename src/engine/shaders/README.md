@@ -29,9 +29,9 @@ particles reuse `model.vert`, and every post-process pass reuses
 
 | Pipeline | Vertex | Fragment |
 |---|---|---|
-| Model | `model.vert` | `model.frag` |
-| SkinnedModel | `skinned_model.vert` | `model.frag` |
-| InstancedModel | `model_instanced.vert` | `model_instanced.frag` |
+| Model (+ DoubleSided/Blend variants) | `model.vert` | `model.frag` |
+| SkinnedModel (+ DoubleSided/Blend variants) | `skinned_model.vert` | `model.frag` |
+| InstancedModel (+ DoubleSided variant) | `model_instanced.vert` | `model_instanced.frag` |
 | Terrain | `terrain.vert` | `terrain.frag` |
 | Grass | `grass.vert` | `grass.frag` |
 | Skybox | `skybox.vert` | `skybox.frag` |
@@ -52,6 +52,14 @@ particles reuse `model.vert`, and every post-process pass reuses
 | VolumetricFog | `fullscreen.vert` | `volumetric_fog.frag` |
 | Composite | `fullscreen.vert` | `composite.frag` |
 | Fxaa | `fullscreen.vert` | `fxaa.frag` |
+
+The model-family material variants (`ModelDoubleSided`, `ModelBlend`,
+`ModelBlendDoubleSided`, `SkinnedModel*`, `InstancedModelDoubleSided`) load
+the same shader pair as their base pipeline and differ only in fixed-function
+state: `doubleSided` disables back-face culling, `BLEND` enables alpha
+blending with depth writes off. The MASK alpha test is driven by the
+`alphaCutoff` field of the lighting cbuffer (0 = no discard, so OPAQUE/BLEND
+draws skip it).
 
 ## Shader notes
 

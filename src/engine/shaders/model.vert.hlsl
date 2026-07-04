@@ -2,7 +2,7 @@
  * Model Vertex Shader - SDL3 GPU API
  *
  * Transforms 3D model vertices with lighting support.
- * Outputs world position, normal, texture coordinates, and fog data.
+ * Outputs world position, normal, texture coordinates, and view depth.
  */
 
 // Vertex input - locations match get_vertex3d_attributes() in gpu_types.hpp
@@ -21,9 +21,8 @@ struct VSOutput {
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
     float4 vertexColor : TEXCOORD3;
-    float fogDistance : TEXCOORD4;
-    float viewDepth : TEXCOORD5;
-    float4 tangent : TEXCOORD6;  // xyz = world-space tangent, w = bitangent sign
+    float viewDepth : TEXCOORD4;
+    float4 tangent : TEXCOORD5;  // xyz = world-space tangent, w = bitangent sign
 };
 
 // Uniform buffer - SDL3 GPU SPIR-V requires vertex uniforms in set 1
@@ -57,7 +56,6 @@ VSOutput VSMain(VSInput input) {
 
     output.texCoord = input.texCoord;
     output.vertexColor = input.color;
-    output.fogDistance = length(worldPos.xyz - cameraPos);
 
     float4 viewPos = mul(view, worldPos);
     output.viewDepth = -viewPos.z;

@@ -20,11 +20,10 @@ struct VSOutput {
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
     float4 vertexColor : TEXCOORD3;
-    float fogDistance : TEXCOORD4;
-    float viewDepth : TEXCOORD5;
-    float4 instanceTint : TEXCOORD6;
-    float noFog : TEXCOORD7;
-    float4 tangent : TEXCOORD8;  // xyz = world-space tangent, w = bitangent sign
+    float viewDepth : TEXCOORD4;
+    float4 instanceTint : TEXCOORD5;
+    float noFog : TEXCOORD6;
+    float4 tangent : TEXCOORD7;  // xyz = world-space tangent, w = bitangent sign
 };
 
 // Shared camera uniforms (pushed once per frame)
@@ -68,7 +67,6 @@ VSOutput VSMain(VSInput input, uint instanceID : SV_InstanceID) {
     output.vertexColor = input.color;
     output.instanceTint = inst.tint;
     output.noFog = inst.noFog;
-    output.fogDistance = length(worldPos.xyz - cameraPos);
 
     float4 viewPos = mul(view, worldPos);
     output.viewDepth = -viewPos.z;

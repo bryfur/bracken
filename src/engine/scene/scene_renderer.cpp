@@ -64,6 +64,9 @@ static inline void apply_mesh_material(U& u, const Mesh& mesh) {
     u.emissiveFactor = mat.emissive_factor;
     u.hasEmissiveMap = mat.emissive_texture ? 1.0f : 0.0f;
     u.hasPackedOcclusion = mat.has_packed_occlusion ? 1.0f : 0.0f;
+    // glTF alphaMode: only MASK materials alpha-test; OPAQUE/BLEND must not
+    // discard, which a cutoff of 0 guarantees in the shader.
+    u.alphaCutoff = (mat.alpha_mode == AlphaMode::Mask) ? mat.alpha_cutoff : 0.0f;
 }
 
 SceneRenderer::SceneRenderer()
@@ -902,6 +905,10 @@ void SceneRenderer::render_3d_scene(const RenderScene& scene, const CameraState&
     const GraphicsSettings& gfx = graphics_ ? *graphics_ : default_graphics_;
     SDL_GPUCommandBuffer* cmd = context_->current_command_buffer();
 
+    // BLEND meshes are queued by the opaque walks below and drawn sorted after
+    // the skybox; drop anything stale from an aborted previous pass.
+    transparent_draws_.clear();
+
     // Prepare shadow bindings for terrain/grass: the atlas bound twice —
     // comparison sampler (hardware PCF) then raw sampler (PCSS blocker search).
     SDL_GPUTextureSamplerBinding shadow_bindings[2] = {};
@@ -934,16 +941,9 @@ void SceneRenderer::render_3d_scene(const RenderScene& scene, const CameraState&
     render_instanced_models(camera);
 
     // Render non-instanced static models (attack animations, no-fog, etc.)
-    if (!non_instanced_commands_.empty()) {
-        gpu::GPUPipeline* model_pipeline = pipeline_registry_->get_model_pipeline();
-        if (model_pipeline && main_render_pass_) {
-            model_pipeline->bind(main_render_pass_);
-            reset_model_bind_state();
-            bind_shadow_data(main_render_pass_, context_->current_command_buffer(), 1);
-            bind_cluster_lights(main_render_pass_, context_->current_command_buffer(), 2);
-            for (const auto* cmd : non_instanced_commands_) {
-                render_model_command_inner(*cmd, camera);
-            }
+    if (!non_instanced_commands_.empty() && main_render_pass_ && bind_model_pipeline(false)) {
+        for (const auto* cmd : non_instanced_commands_) {
+            render_model_command_inner(*cmd, camera);
         }
     }
 
@@ -995,16 +995,9 @@ void SceneRenderer::render_3d_scene(const RenderScene& scene, const CameraState&
 
             // Bind pipeline + shadow data + bone palettes once for all skinned models
             if (!skinned_pipeline_bound) {
-                gpu::GPUPipeline* skinned_pipeline = pipeline_registry_->get_skinned_model_pipeline();
-                if (!skinned_pipeline || !bone_palette_buffer_) {
+                if (!bind_skinned_pipeline(false)) {
                     break;
                 }
-                skinned_pipeline->bind(main_render_pass_);
-                reset_model_bind_state();
-                bind_shadow_data(main_render_pass_, context_->current_command_buffer(), 1);
-                bind_cluster_lights(main_render_pass_, context_->current_command_buffer(), 2);
-                SDL_GPUBuffer* palette_buf = bone_palette_buffer_->handle();
-                SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);
                 skinned_pipeline_bound = true;
             }
 
@@ -1018,6 +1011,11 @@ void SceneRenderer::render_3d_scene(const RenderScene& scene, const CameraState&
     if (scene.should_draw_skybox() && gfx.skybox_enabled) {
         world_->render_skybox(main_render_pass_, cmd, camera.view, camera.projection);
     }
+
+    // Sorted transparent pass: glTF alphaMode BLEND meshes queued by the
+    // opaque walks, drawn back-to-front over opaques + sky with depth-test on
+    // and depth-write off.
+    render_transparent_models(camera);
 
     // Particle effects after the skybox: additive HDR with depth-test-on /
     // depth-write-off, so they composite over sky + opaques in any order.
@@ -1039,15 +1037,46 @@ void SceneRenderer::render_model_command(const ModelCommand& cmd, const CameraSt
     if (!main_render_pass_) {
         return;
     }
-    gpu::GPUPipeline* pipeline = pipeline_registry_->get_model_pipeline();
-    if (!pipeline) {
+    if (!bind_model_pipeline(false)) {
         return;
+    }
+    render_model_command_inner(cmd, camera);
+    // Flush any BLEND meshes queued by the command right away (this path runs
+    // outside render_3d_scene's sorted transparent phase).
+    render_transparent_models(camera);
+}
+
+bool SceneRenderer::bind_model_pipeline(bool double_sided) {
+    gpu::GPUPipeline* pipeline = pipeline_registry_->get_pipeline(
+        double_sided ? gpu::PipelineType::ModelDoubleSided : gpu::PipelineType::Model);
+    if (!pipeline || !main_render_pass_) {
+        return false;
     }
     pipeline->bind(main_render_pass_);
     reset_model_bind_state();
     bind_shadow_data(main_render_pass_, context_->current_command_buffer(), 1);
     bind_cluster_lights(main_render_pass_, context_->current_command_buffer(), 2);
-    render_model_command_inner(cmd, camera);
+    model_pipeline_double_sided_ = double_sided;
+    return true;
+}
+
+bool SceneRenderer::bind_skinned_pipeline(bool double_sided) {
+    if (!main_render_pass_ || !bone_palette_buffer_) {
+        return false;
+    }
+    gpu::GPUPipeline* pipeline = pipeline_registry_->get_pipeline(
+        double_sided ? gpu::PipelineType::SkinnedModelDoubleSided : gpu::PipelineType::SkinnedModel);
+    if (!pipeline) {
+        return false;
+    }
+    pipeline->bind(main_render_pass_);
+    reset_model_bind_state();
+    bind_shadow_data(main_render_pass_, context_->current_command_buffer(), 1);
+    bind_cluster_lights(main_render_pass_, context_->current_command_buffer(), 2);
+    SDL_GPUBuffer* palette_buf = bone_palette_buffer_->handle();
+    SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);
+    skinned_pipeline_double_sided_ = double_sided;
+    return true;
 }
 
 void SceneRenderer::reset_model_bind_state() {
@@ -1144,6 +1173,21 @@ void SceneRenderer::render_model_command_inner(const ModelCommand& cmd, const Ca
             continue;
         }
         if (mesh.index_count() == 0) {
+            continue;
+        }
+
+        // glTF alphaMode BLEND: defer to the sorted transparent pass.
+        if (mesh.material.alpha_mode == AlphaMode::Blend) {
+            queue_transparent_mesh(mesh, model_mat, transform_uniforms.normalMatrix, cmd.tint, cmd.no_fog,
+                                   INVALID_PALETTE_OFFSET, *model, camera);
+            continue;
+        }
+
+        // glTF doubleSided: switch to the no-cull variant (and back). Pushed
+        // uniform data survives pipeline binds; sampler/uniform tracking is
+        // conservatively reset by bind_model_pipeline.
+        if (mesh.material.double_sided != model_pipeline_double_sided_ &&
+            !bind_model_pipeline(mesh.material.double_sided)) {
             continue;
         }
 
@@ -1522,6 +1566,9 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
     gpu::InstancedLightingUniforms last_pushed = {};
     bool lighting_pushed = false;
 
+    // Cull variant currently bound (glTF doubleSided selects the no-cull one).
+    bool double_sided_bound = false;
+
     // Draw each model type as a single instanced draw call per mesh.
     // Ascending handle order matches the packing order in upload_instance_buffers.
     uint32_t base_instance = 0;
@@ -1549,6 +1596,37 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
             }
             if (!mesh.vertex_buffer || !mesh.index_buffer || mesh.index_count() == 0) {
                 continue;
+            }
+
+            // glTF alphaMode BLEND: one instanced draw can't be depth-sorted
+            // per instance, so route each instance through the sorted
+            // per-draw transparent path instead.
+            if (mesh.material.alpha_mode == AlphaMode::Blend) {
+                for (const auto& inst : instances) {
+                    queue_transparent_mesh(mesh, inst.model, inst.normalMatrix, inst.tint, inst.noFog > 0.5f,
+                                           INVALID_PALETTE_OFFSET, *model, camera);
+                }
+                continue;
+            }
+
+            // glTF doubleSided: switch to the no-cull variant (and back),
+            // re-establishing the pass state that follows a pipeline bind.
+            if (mesh.material.double_sided != double_sided_bound) {
+                gpu::GPUPipeline* variant =
+                    pipeline_registry_->get_pipeline(mesh.material.double_sided
+                                                         ? gpu::PipelineType::InstancedModelDoubleSided
+                                                         : gpu::PipelineType::InstancedModel);
+                if (!variant) {
+                    continue;
+                }
+                variant->bind(main_render_pass_);
+                reset_model_bind_state();
+                SDL_PushGPUVertexUniformData(gpu_cmd, 0, &camera_uniforms, sizeof(camera_uniforms));
+                SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &storage_buf, 1);
+                bind_shadow_data(main_render_pass_, gpu_cmd, 1);
+                bind_cluster_lights(main_render_pass_, gpu_cmd, 2);
+                lighting_pushed = false;
+                double_sided_bound = mesh.material.double_sided;
             }
 
             apply_mesh_material(lighting_uniforms, mesh);
@@ -1711,6 +1789,19 @@ void SceneRenderer::render_skinned_model_command_inner(const SkinnedModelCommand
             continue;
         }
 
+        // glTF alphaMode BLEND: defer to the sorted transparent pass.
+        if (mesh.material.alpha_mode == AlphaMode::Blend) {
+            queue_transparent_mesh(mesh, model_mat, transform_uniforms.normalMatrix, cmd.tint, /*no_fog=*/false,
+                                   palette_offset, *model, camera);
+            continue;
+        }
+
+        // glTF doubleSided: switch to the no-cull skinned variant (and back).
+        if (mesh.material.double_sided != skinned_pipeline_double_sided_ &&
+            !bind_skinned_pipeline(mesh.material.double_sided)) {
+            continue;
+        }
+
         apply_mesh_material(lighting_uniforms, mesh);
         if (!model_lighting_valid_ ||
             std::memcmp(&last_model_lighting_, &lighting_uniforms, sizeof(lighting_uniforms)) != 0) {
@@ -1728,6 +1819,98 @@ void SceneRenderer::render_skinned_model_command_inner(const SkinnedModelCommand
         }
         SDL_DrawGPUIndexedPrimitives(main_render_pass_, mesh.index_count(), 1, 0, 0, 0);
     }
+}
+
+// ============================================================================
+// Transparent (glTF alphaMode BLEND) Rendering
+// ============================================================================
+
+void SceneRenderer::queue_transparent_mesh(const Mesh& mesh, const glm::mat4& transform,
+                                           const glm::mat4& normal_matrix, const glm::vec4& tint, bool no_fog,
+                                           uint32_t palette_offset, const Model& model, const CameraState& camera) {
+    const glm::vec3 world_center = glm::vec3(transform * glm::vec4(model.bounding_center, 1.0f));
+    const glm::vec3 d = world_center - camera.position;
+    transparent_draws_.push_back(
+        {&mesh, transform, normal_matrix, tint, palette_offset, no_fog, d.x * d.x + d.y * d.y + d.z * d.z});
+}
+
+// Draws the queued BLEND meshes back-to-front (per queued draw — the model's
+// bounding-sphere center stands in for each of its meshes) with depth test on
+// and depth writes off. Limitations: no OIT, no intra-mesh sorting; see
+// docs/architecture.md.
+void SceneRenderer::render_transparent_models(const CameraState& camera) {
+    if (transparent_draws_.empty()) {
+        return;
+    }
+    SDL_GPUCommandBuffer* gpu_cmd = context_->current_command_buffer();
+    if (!main_render_pass_ || !gpu_cmd) {
+        transparent_draws_.clear();
+        return;
+    }
+
+    std::sort(transparent_draws_.begin(), transparent_draws_.end(),
+              [](const TransparentDraw& a, const TransparentDraw& b) { return a.view_dist_sq > b.view_dist_sq; });
+
+    bool pipeline_bound = false;
+    gpu::PipelineType bound_type = gpu::PipelineType::Count;
+    for (const TransparentDraw& draw : transparent_draws_) {
+        const Mesh& mesh = *draw.mesh;
+        const bool skinned = draw.palette_offset != INVALID_PALETTE_OFFSET;
+        const gpu::PipelineType want =
+            skinned ? (mesh.material.double_sided ? gpu::PipelineType::SkinnedModelBlendDoubleSided
+                                                  : gpu::PipelineType::SkinnedModelBlend)
+                    : (mesh.material.double_sided ? gpu::PipelineType::ModelBlendDoubleSided
+                                                  : gpu::PipelineType::ModelBlend);
+        if (!pipeline_bound || want != bound_type) {
+            if (skinned && !bone_palette_buffer_) {
+                continue;
+            }
+            gpu::GPUPipeline* pipeline = pipeline_registry_->get_pipeline(want);
+            if (!pipeline) {
+                continue;
+            }
+            pipeline->bind(main_render_pass_);
+            reset_model_bind_state();
+            bind_shadow_data(main_render_pass_, gpu_cmd, 1);
+            bind_cluster_lights(main_render_pass_, gpu_cmd, 2);
+            if (skinned) {
+                SDL_GPUBuffer* palette_buf = bone_palette_buffer_->handle();
+                SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);
+            }
+            bound_type = want;
+            pipeline_bound = true;
+        }
+
+        gpu::ModelTransformUniforms transform_uniforms = {};
+        transform_uniforms.model = draw.transform;
+        transform_uniforms.view = camera.view;
+        transform_uniforms.projection = camera.projection;
+        transform_uniforms.cameraPos = camera.position;
+        transform_uniforms.normalMatrix = draw.normal_matrix;
+        transform_uniforms.useSkinning = skinned ? 1 : 0;
+        transform_uniforms.paletteOffset = skinned ? draw.palette_offset : 0;
+        SDL_PushGPUVertexUniformData(gpu_cmd, 0, &transform_uniforms, sizeof(transform_uniforms));
+
+        gpu::ModelLightingUniforms lighting_uniforms =
+            make_model_lighting(camera, !draw.no_fog && frame_fog_active_);
+        lighting_uniforms.tintColor = draw.tint;
+        apply_mesh_material(lighting_uniforms, mesh);
+        if (!model_lighting_valid_ ||
+            std::memcmp(&last_model_lighting_, &lighting_uniforms, sizeof(lighting_uniforms)) != 0) {
+            SDL_PushGPUFragmentUniformData(gpu_cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));
+            last_model_lighting_ = lighting_uniforms;
+            model_lighting_valid_ = true;
+        }
+
+        bind_mesh_material_textures(mesh);
+        mesh.bind_buffers(main_render_pass_);
+        if (collect_stats_) {
+            render_stats_.draw_calls++;
+            render_stats_.triangle_count += mesh.index_count() / 3;
+        }
+        SDL_DrawGPUIndexedPrimitives(main_render_pass_, mesh.index_count(), 1, 0, 0, 0);
+    }
+    transparent_draws_.clear();
 }
 
 // ============================================================================

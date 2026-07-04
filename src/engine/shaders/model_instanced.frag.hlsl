@@ -7,11 +7,10 @@ struct PSInput {
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
     float4 vertexColor : TEXCOORD3;
-    float fogDistance : TEXCOORD4;
-    float viewDepth : TEXCOORD5;
-    float4 instanceTint : TEXCOORD6;
-    float noFog : TEXCOORD7;
-    float4 tangent : TEXCOORD8;  // xyz = world-space tangent, w = bitangent sign
+    float viewDepth : TEXCOORD4;
+    float4 instanceTint : TEXCOORD5;
+    float noFog : TEXCOORD6;
+    float4 tangent : TEXCOORD7;  // xyz = world-space tangent, w = bitangent sign
 };
 
 [[vk::binding(0, 3)]]
@@ -44,7 +43,7 @@ cbuffer LightingUniforms {
     float hasMRMap;
     float hasEmissiveMap;
     float hasPackedOcclusion;
-    float _padding4;
+    float alphaCutoff;      // glTF MASK cutoff; 0 disables alpha test (OPAQUE/BLEND)
 };
 
 [[vk::binding(1, 3)]]
@@ -117,10 +116,12 @@ float4 PSMain(PSInput input) : SV_Target {
     float4 baseColor;
     if (hasTexture == 1) {
         baseColor = baseColorTexture.Sample(baseColorSampler, input.texCoord) * baseColorFactor * input.instanceTint;
-        if (baseColor.a < 0.5) discard;
     } else {
         baseColor = input.vertexColor * input.instanceTint;
     }
+    // glTF alphaMode: the CPU sends alphaCutoff > 0 only for MASK materials,
+    // so OPAQUE/BLEND draws never take the discard.
+    if (baseColor.a < alphaCutoff) discard;
 
     // Metallic-roughness: scalar factors modulated by the MR texture when present
     // (glTF convention: G = roughness, B = metallic, R = packed AO for ORM maps).

@@ -11,9 +11,8 @@ struct PSInput {
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
     float4 vertexColor : TEXCOORD3;
-    float fogDistance : TEXCOORD4;
-    float viewDepth : TEXCOORD5;
-    float4 tangent : TEXCOORD6;  // xyz = world-space tangent, w = bitangent sign
+    float viewDepth : TEXCOORD4;
+    float4 tangent : TEXCOORD5;  // xyz = world-space tangent, w = bitangent sign
 };
 
 [[vk::binding(0, 3)]]
