@@ -73,7 +73,8 @@ terrain casters.
 (despite the name, an HBAO-style directional variant, not true GTAO) +
 `blur_ao` (bilateral), `bloom_downsample` (13-tap, threshold in post-exposure
 luminance) / `bloom_upsample` (9-tap tent, additive), `volumetric_fog` (ray
-march with god rays from the shadow atlas), `composite` (depth-aware
+march with god rays from the shadow atlas — cascade picked per sample by
+camera distance; sky pixels march too), `composite` (depth-aware
 joint-bilateral upsample of half-res AO + fog, scene × AO + bloom + fog,
 exposure + tonemap + gamma → LDR), `fxaa` (FXAA 3.11 on the tonemapped LDR
 image).

@@ -26,6 +26,18 @@ struct EnvironmentState {
     float fog_start = 1000.0f;         // world units; fog factor 0 at/below this view distance
     float fog_end = 8000.0f;           // world units; fog factor saturates approaching this
     float fog_height_falloff = 0.002f; // exp falloff on world Y (thinner fog at altitude)
+
+    // Volumetric fog / god rays (render/volumetric_fog.hpp, half-res ray march).
+    // The ambient fog tint reuses fog_color_horizon; sun direction reuses
+    // sun_dir. Defaults reproduce the pass's original built-in look.
+    glm::vec3 fog_volumetric_sun_color{1.0f, 0.9f, 0.7f}; // linear god-ray inscatter color; sun_intensity is NOT
+                                                          // applied — day/night hosts should track their sun tint here
+    float fog_volumetric_scatter = 0.25f;   // inscatter strength along the forward-scatter phase lobe
+    float fog_volumetric_density = 0.0015f; // base extinction per world unit at ground level (y = 0)
+    float fog_volumetric_height = 100.0f;   // height scale of the fog volume (world Y units)
+    float fog_volumetric_falloff = 0.005f;  // exponential falloff shaping with height
+    float fog_volumetric_start = 100.0f;    // near dead zone: the ray march starts at this camera distance
+    float fog_volumetric_end = 3000.0f;     // ray-march distance cap (world units)
 };
 
 } // namespace mmo::engine

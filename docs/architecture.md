@@ -126,8 +126,12 @@ timer label, so RenderDoc captures read in this order.)
    an HBAO-style directional variant — no horizon search/arc integration) →
    `BlurAO` (bilateral) → `Bloom` (13-tap downsample / 9-tap tent upsample;
    the prefilter thresholds post-exposure luminance) → `VolumetricFog` (ray
-   march against depth + shadow atlas; god rays force-disabled when shadows
-   are off because the atlas would contain garbage).
+   march against depth + shadow atlas; all parameters come from
+   `EnvironmentState` — sun_dir, fog_color_horizon, and the
+   `fog_volumetric_*` fields; god rays select a cascade per march sample
+   and sky pixels are marched too, so shafts silhouette against the sky;
+   god rays force-disabled when shadows are off because the atlas would
+   contain garbage).
 6. **Late swapchain acquire** → **`Composite`** (depth-aware joint-bilateral
    upsample of the half-res AO + fog, scene × AO + bloom + fog,
    exposure/tonemap/contrast/saturation). With `aa_mode == 1` composite goes
