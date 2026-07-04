@@ -33,7 +33,7 @@ enum class PipelineType {
     Text, ///< Text rendering with font atlas
 
     // Effect pipelines
-    Particle, ///< HDR particles (model.vert + particle.frag, ONE/ONE additive)
+    Particle, ///< HDR particles (instanced; particle.vert + particle.frag, ONE/ONE additive)
     Grass,    ///< Instanced grass rendering
 
     // Instanced rendering pipelines

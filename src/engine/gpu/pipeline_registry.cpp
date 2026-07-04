@@ -563,18 +563,20 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_text_pipeline() {
 }
 
 std::unique_ptr<GPUPipeline> PipelineRegistry::create_particle_pipeline() {
-    // Same vertex stage as the Model pipeline (Vertex3D + ModelTransformUniforms
-    // push), fragment is a cheap unlit additive shader writing into the HDR
-    // scene target. Depth test LESS_OR_EQUAL with depth writes off so particles
-    // occlude correctly against opaques but not against each other.
+    // Instanced: per-particle transforms + colors come from a per-frame
+    // storage buffer (one draw per emitter/mesh batch); fragment is a cheap
+    // unlit additive shader writing into the HDR scene target. Depth test
+    // LESS_OR_EQUAL with depth writes off so particles occlude correctly
+    // against opaques but not against each other.
     ShaderResources vs_resources;
-    vs_resources.num_uniform_buffers = 1;
+    vs_resources.num_uniform_buffers = 2; // camera (b0) + batch instance offset (b1)
+    vs_resources.num_storage_buffers = 1; // per-particle instance data
 
     ShaderResources fs_resources;
     fs_resources.num_uniform_buffers = 1; // ParticleFragmentUniforms
     fs_resources.num_samplers = 1;        // baseColor (bind 1x1 white when untextured)
 
-    auto* vs = shader_manager_->get(shader_path_ + "model.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* vs = shader_manager_->get(shader_path_ + "particle.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
     auto* fs = shader_manager_->get(shader_path_ + "particle.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
 
     if (!vs || !fs) {

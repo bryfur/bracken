@@ -28,6 +28,7 @@ TEST(UniformAlignment, AllStructsAre16ByteAligned) {
     EXPECT_EQ(alignof(CompositeUniforms), 16u);
     EXPECT_EQ(alignof(FxaaUniforms), 16u);
     EXPECT_EQ(alignof(ParticleFragmentUniforms), 16u);
+    EXPECT_EQ(alignof(ParticleBatchUniforms), 16u);
     EXPECT_EQ(alignof(BloomDownsampleUniforms), 16u);
     EXPECT_EQ(alignof(BloomUpsampleUniforms), 16u);
     EXPECT_EQ(alignof(VolumetricFogUniforms), 16u);
@@ -58,6 +59,7 @@ TEST(UniformSizes, SizesAreMultiplesOf16) {
     EXPECT_EQ(sizeof(CompositeUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(FxaaUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(ParticleFragmentUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(ParticleBatchUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(BloomDownsampleUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(BloomUpsampleUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(VolumetricFogUniforms) % 16, 0u);
@@ -392,23 +394,45 @@ TEST(FxaaUniformsLayout, FieldOffsets) {
 // ParticleFragmentUniforms - matches particle.frag.hlsl
 // =============================================================================
 
-TEST(ParticleFragmentUniformsLayout, SizeIs32Bytes) {
-    // vec4 (16) + 4 scalars (16) = 32
-    EXPECT_EQ(sizeof(ParticleFragmentUniforms), 32u);
+TEST(ParticleFragmentUniformsLayout, SizeIs16Bytes) {
+    // 4 scalars (16); per-particle tint/opacity live in ParticleInstanceData
+    EXPECT_EQ(sizeof(ParticleFragmentUniforms), 16u);
 }
 
 TEST(ParticleFragmentUniformsLayout, FieldOffsets) {
-    EXPECT_EQ(offsetof(ParticleFragmentUniforms, tintColor), 0u);
-    EXPECT_EQ(offsetof(ParticleFragmentUniforms, emissiveBoost), 16u);
-    EXPECT_EQ(offsetof(ParticleFragmentUniforms, opacity), 20u);
+    EXPECT_EQ(offsetof(ParticleFragmentUniforms, emissiveBoost), 0u);
 }
 
 TEST(ParticleFragmentUniformsLayout, DefaultValues) {
     ParticleFragmentUniforms u;
-    EXPECT_FLOAT_EQ(u.tintColor.r, 1.0f);
-    EXPECT_FLOAT_EQ(u.tintColor.a, 1.0f);
     EXPECT_FLOAT_EQ(u.emissiveBoost, 1.0f);
-    EXPECT_FLOAT_EQ(u.opacity, 1.0f);
+}
+
+// =============================================================================
+// ParticleBatchUniforms - matches particle.vert.hlsl BatchUniforms
+// =============================================================================
+
+TEST(ParticleBatchUniformsLayout, SizeIs16Bytes) {
+    EXPECT_EQ(sizeof(ParticleBatchUniforms), 16u);
+}
+
+TEST(ParticleBatchUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(ParticleBatchUniforms, instanceOffset), 0u);
+}
+
+// =============================================================================
+// ParticleInstanceData - matches particle.vert.hlsl ParticleInstance (storage
+// buffer record; tight std430-compatible packing, no cbuffer padding rules)
+// =============================================================================
+
+TEST(ParticleInstanceDataLayout, SizeIs80Bytes) {
+    // mat4 (64) + vec4 (16) = 80
+    EXPECT_EQ(sizeof(ParticleInstanceData), 80u);
+}
+
+TEST(ParticleInstanceDataLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(ParticleInstanceData, model), 0u);
+    EXPECT_EQ(offsetof(ParticleInstanceData, color), 64u);
 }
 
 // =============================================================================

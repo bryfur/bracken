@@ -1,27 +1,42 @@
 #pragma once
 
+#include "../gpu/gpu_buffer.hpp"
 #include "../gpu/gpu_device.hpp"
 #include "../gpu/gpu_texture.hpp"
+#include "../gpu/gpu_uniforms.hpp"
 #include "../gpu/pipeline_registry.hpp"
 #include "../model_loader.hpp"
 #include "engine/systems/effect_system.hpp"
+#include <cstdint>
 #include <glm/glm.hpp>
 #include <memory>
 #include <SDL3/SDL_gpu.h>
 #include <unordered_map>
+#include <vector>
 
 namespace mmo::engine::render {
 
 namespace gpu = mmo::engine::gpu;
 
+/// Compose a particle's world transform: translate(position) * rotY * rotX *
+/// rotZ * scale * translate(-center_offset). The rotation is built directly
+/// from the Euler angles (one sin/cos pair per axis) instead of chained
+/// glm::rotate 4x4 multiplies; exposed as a free function so tests can pin
+/// equivalence with the naive glm chain.
+glm::mat4 build_particle_transform(const mmo::engine::systems::Particle& particle, const glm::vec3& center_offset);
+
 /**
  * EffectRenderer draws particle-based spell/attack effects.
  *
- * Particles are small meshes drawn through the dedicated Particle pipeline:
- * unlit additive HDR (ONE, ONE), depth test LESS_OR_EQUAL against opaques,
- * depth write off. Opacity fades by scaling the emitted RGB, and the
- * emissive boost pushes bright particles over the bloom threshold so spell
- * glow feeds the bloom chain.
+ * Particles are small meshes drawn instanced through the dedicated Particle
+ * pipeline: per-particle {transform, tint+opacity} records are packed into a
+ * per-frame storage buffer (uploaded in SceneRenderer's consolidated
+ * FrameUploads copy pass), then each (emitter, mesh) batch is ONE instanced
+ * draw with a small instance-offset uniform. Shading is unlit additive HDR
+ * (ONE, ONE), depth test LESS_OR_EQUAL against opaques, depth write off.
+ * Opacity fades by scaling the emitted RGB, and the emissive boost pushes
+ * bright particles over the bloom threshold so spell glow feeds the bloom
+ * chain.
  */
 class EffectRenderer {
 public:
@@ -54,19 +69,30 @@ public:
     void ensure_models_uploaded(const mmo::engine::systems::EffectSystem& effect_system);
 
     /**
-     * Draw all particles from an effect system through the Particle pipeline.
-     * Particles are grouped per emitter (all particles of an emitter share one
-     * model) so buffers/textures bind once per group. Models that missed the
-     * pre-upload window are skipped (never uploaded mid-pass).
+     * Pack per-particle instance data ({model matrix, tint+opacity}) for
+     * every active emitter into the per-frame instance storage buffer and
+     * record its upload. Particles of one emitter share the emitter's model,
+     * so each emitter becomes one contiguous batch. Models that missed the
+     * ensure_models_uploaded window are skipped (never uploaded from here).
+     * Must be called from the frame's consolidated copy pass before
+     * draw_particle_effects — the draw consumes the batches built here.
+     * @param copy_pass Open copy pass to record the upload into
+     * @param effect_system Effect system containing all active effects and particles
+     */
+    void upload_particle_instances(SDL_GPUCopyPass* copy_pass,
+                                   const mmo::engine::systems::EffectSystem& effect_system);
+
+    /**
+     * Draw the particle batches packed by upload_particle_instances() through
+     * the Particle pipeline: camera + fragment uniforms are pushed once per
+     * pass, then each (emitter batch, mesh) pair is a single instanced draw.
      * @param pass Active render pass
      * @param cmd Command buffer for uniform uploads
-     * @param effect_system Effect system containing all active effects and particles
      * @param view View matrix
      * @param projection Projection matrix
      * @param camera_pos Camera position
      */
-    void draw_particle_effects(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
-                               const mmo::engine::systems::EffectSystem& effect_system, const glm::mat4& view,
+    void draw_particle_effects(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view,
                                const glm::mat4& projection, const glm::vec3& camera_pos);
 
 private:
@@ -76,6 +102,14 @@ private:
     /// pointer-hash lookup per emitter.
     ModelHandle resolve_emitter_model(const mmo::engine::EmitterDefinition& def);
 
+    /// One instanced draw group: all particles of one emitter (they share the
+    /// emitter's model), packed contiguously into the instance buffer.
+    struct ParticleBatch {
+        const Model* model = nullptr;
+        uint32_t first_instance = 0;
+        uint32_t instance_count = 0;
+    };
+
     gpu::GPUDevice* device_ = nullptr;
     gpu::PipelineRegistry* pipeline_registry_ = nullptr;
     ModelManager* model_manager_ = nullptr;
@@ -84,6 +118,14 @@ private:
 
     // EmitterDefinition* -> ModelHandle, resolved once per definition.
     std::unordered_map<const mmo::engine::EmitterDefinition*, ModelHandle> emitter_model_cache_;
+
+    // Per-frame instancing state, rebuilt by upload_particle_instances().
+    // Model pointers stay valid frame-locally (same contract as the bone
+    // palette scratch in SceneRenderer). Vectors keep capacity across frames.
+    std::vector<ParticleBatch> batches_;
+    std::vector<gpu::ParticleInstanceData> instance_scratch_;
+    std::unique_ptr<gpu::GPUBuffer> instance_buffer_;
+    size_t instance_buffer_capacity_ = 0;
 };
 
 } // namespace mmo::engine::render

@@ -1,5 +1,6 @@
 #include "engine/systems/effect_system.hpp"
 #include <cmath>
+#include <glm/gtc/constants.hpp>
 #include <gtest/gtest.h>
 
 using namespace mmo::engine::systems;
@@ -529,4 +530,55 @@ TEST_F(EffectSystemTest, GravityAffectsParticleVelocity) {
     EXPECT_LT(p.position.y, 100.0f);
     // Velocity should be negative in y
     EXPECT_LT(p.velocity.y, 0.0f);
+}
+
+// Pins the face_velocity fast path (squared-magnitude test + normalize-free
+// atan2): a moving particle must yaw toward its velocity, not integrate its
+// rotation rate.
+TEST_F(EffectSystemTest, FaceVelocityYawsTowardMovementDirection) {
+    EffectDefinition def;
+    def.name = "face_velocity";
+    EmitterDefinition emitter_def = make_burst_emitter(1, 5.0f);
+    emitter_def.velocity.speed = 10.0f;
+    emitter_def.velocity.direction = {1, 0, 1}; // velocity (10, 0, 10)
+    emitter_def.rotation.face_velocity = true;
+    emitter_def.rotation.rotation_rate = {0, 90.0f, 0}; // must NOT be applied
+    def.emitters.push_back(emitter_def);
+
+    system.spawn_effect(&def, {0, 0, 0});
+    system.update(0.016f);
+
+    const auto& effects = system.get_effects();
+    ASSERT_FALSE(effects.empty());
+    ASSERT_FALSE(effects[0].emitters[0].particles.empty());
+
+    const auto& p = effects[0].emitters[0].particles[0];
+    // Yaw is atan2(vel.x, vel.z) = atan2(10, 10) = pi/4, independent of speed.
+    EXPECT_NEAR(p.rotation.y, glm::quarter_pi<float>(), 1e-4f);
+    EXPECT_FLOAT_EQ(p.rotation.x, 0.0f);
+    EXPECT_FLOAT_EQ(p.rotation.z, 0.0f);
+}
+
+// Below the 0.01 speed threshold (length^2 <= 1e-4), face_velocity must fall
+// back to rotation-rate integration exactly as before.
+TEST_F(EffectSystemTest, FaceVelocityIgnoresNearZeroVelocity) {
+    EffectDefinition def;
+    def.name = "face_velocity_slow";
+    EmitterDefinition emitter_def = make_burst_emitter(1, 5.0f);
+    emitter_def.velocity.speed = 0.005f; // below the 0.01 facing threshold
+    emitter_def.velocity.direction = {1, 0, 0};
+    emitter_def.rotation.face_velocity = true;
+    emitter_def.rotation.rotation_rate = {0, 90.0f, 0}; // degrees/sec
+    def.emitters.push_back(emitter_def);
+
+    system.spawn_effect(&def, {0, 0, 0});
+    system.update(0.5f);
+
+    const auto& effects = system.get_effects();
+    ASSERT_FALSE(effects.empty());
+    ASSERT_FALSE(effects[0].emitters[0].particles.empty());
+
+    const auto& p = effects[0].emitters[0].particles[0];
+    // 90 deg/s for 0.5 s = 45 degrees = pi/4, from the rotation-rate branch.
+    EXPECT_NEAR(p.rotation.y, glm::quarter_pi<float>(), 1e-4f);
 }

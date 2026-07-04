@@ -113,8 +113,8 @@ timer label, so RenderDoc captures read in this order.)
    skinned bone palettes into one tight CPU scratch array, build the cluster
    light grid on the CPU (skipped when the scene has zero dynamic lights).
 2. **`FrameUploads`** — one `SDL_GPUCopyPass` for every per-frame upload:
-   instances, shadow instances, bone palettes, debug lines, grass chunks,
-   cluster light buffers.
+   instances, shadow instances, bone palettes, particle instances, debug
+   lines, grass chunks, cluster light buffers.
 3. **`ShadowPass`** — cascades rendered into the 2×2-quadrant D32 atlas
    (`ShadowPass:Cascade0..3`), only when `shadow_mode > 0`.
 4. **`AOOffscreen`** (the normal path whenever the AO subsystem initialized) —
