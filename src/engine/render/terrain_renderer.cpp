@@ -428,6 +428,7 @@ void TerrainRenderer::generate_terrain_mesh() {
             }
         }
     }
+    build_tile_rows(tiles_, tile_rows_);
 
     index_count_ = static_cast<uint32_t>(index_count);
 
@@ -527,33 +528,74 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
     SDL_GPUBufferBinding ib_binding = {index_buffer_->handle(), 0};
     SDL_BindGPUIndexBuffer(pass, &ib_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
 
-    // Tile-culled draw: iterate tiles, skip those outside the view frustum.
-    // Visible tiles with contiguous index ranges (tiles are stored row-major,
-    // back-to-back in the index buffer) merge into a single draw — typically
-    // collapsing 90-260 per-tile draws into ~10-30 row runs.
+    // Tile-culled draw: whole rows are AABB-rejected first, then surviving
+    // tiles are tested individually. Visible tiles with contiguous index
+    // ranges (tiles are stored row-major, back-to-back in the index buffer)
+    // merge into a single draw — typically collapsing 90-260 per-tile draws
+    // into ~10-30 row runs.
     // Fallback: if no frustum provided or no tiles, draw the whole mesh.
     if (frustum && !tiles_.empty()) {
-        uint32_t run_first = 0;
-        uint32_t run_count = 0;
-        for (const auto& tile : tiles_) {
-            if (!frustum->intersects_aabb(tile.aabb_min, tile.aabb_max)) {
-                continue;
-            }
-            if (run_count > 0 && tile.first_index == run_first + run_count) {
-                run_count += tile.index_count;
-            } else {
-                if (run_count > 0) {
-                    SDL_DrawGPUIndexedPrimitives(pass, run_count, 1, run_first, 0, 0);
-                }
-                run_first = tile.first_index;
-                run_count = tile.index_count;
-            }
-        }
-        if (run_count > 0) {
-            SDL_DrawGPUIndexedPrimitives(pass, run_count, 1, run_first, 0, 0);
-        }
+        draw_culled_tiles(pass, *frustum, tiles_, tile_rows_);
     } else {
         SDL_DrawGPUIndexedPrimitives(pass, index_count_, 1, 0, 0, 0);
+    }
+}
+
+void TerrainRenderer::build_tile_rows(const std::vector<TerrainTile>& tiles, std::vector<TileRow>& rows) {
+    rows.clear();
+    float row_z = 0.0f;
+    for (size_t i = 0; i < tiles.size(); ++i) {
+        const TerrainTile& tile = tiles[i];
+        // Tiles are generated row-major, so tiles sharing a min-z band are
+        // contiguous; a z change starts a new row.
+        if (rows.empty() || tile.aabb_min.z != row_z) {
+            rows.push_back({i, 0, tile.aabb_min, tile.aabb_max});
+            row_z = tile.aabb_min.z;
+        }
+        TileRow& row = rows.back();
+        ++row.tile_count;
+        row.aabb_min = glm::min(row.aabb_min, tile.aabb_min);
+        row.aabb_max = glm::max(row.aabb_max, tile.aabb_max);
+    }
+}
+
+void TerrainRenderer::draw_culled_tiles(SDL_GPURenderPass* pass, const scene::Frustum& frustum,
+                                        const std::vector<TerrainTile>& tiles, const std::vector<TileRow>& rows) {
+    uint32_t run_first = 0;
+    uint32_t run_count = 0;
+    auto cull_and_merge_tile = [&](const TerrainTile& tile) {
+        if (!frustum.intersects_aabb(tile.aabb_min, tile.aabb_max)) {
+            return;
+        }
+        if (run_count > 0 && tile.first_index == run_first + run_count) {
+            run_count += tile.index_count;
+        } else {
+            if (run_count > 0) {
+                SDL_DrawGPUIndexedPrimitives(pass, run_count, 1, run_first, 0, 0);
+            }
+            run_first = tile.first_index;
+            run_count = tile.index_count;
+        }
+    };
+    if (!rows.empty()) {
+        for (const auto& row : rows) {
+            // One AABB test skips the row's whole tile span when it lies
+            // outside the frustum (the common case: 80-95% of the world).
+            if (!frustum.intersects_aabb(row.aabb_min, row.aabb_max)) {
+                continue;
+            }
+            const size_t row_end = row.first_tile + row.tile_count;
+            for (size_t i = row.first_tile; i < row_end; ++i) {
+                cull_and_merge_tile(tiles[i]);
+            }
+        }
+    } else {
+        for (const auto& tile : tiles) {
+            cull_and_merge_tile(tile);
+        }
+    }
+    if (run_count > 0) {
+        SDL_DrawGPUIndexedPrimitives(pass, run_count, 1, run_first, 0, 0);
     }
 }
 
@@ -616,28 +658,12 @@ void TerrainRenderer::render_shadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffe
     SDL_BindGPUIndexBuffer(pass, &ib_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
 
     // Per-cascade tile culling: cascade 0 (tight near) draws maybe 2-5 tiles,
-    // cascade 3 (far) draws many but still skips half the world. Contiguous
-    // visible runs merge into single draws (same as the main pass).
+    // cascade 3 (far) draws many but still skips half the world. Rows are
+    // AABB-rejected before their tiles; contiguous visible runs merge into
+    // single draws (same as the main pass).
     if (frustum && !tile_list->empty()) {
-        uint32_t run_first = 0;
-        uint32_t run_count = 0;
-        for (const auto& tile : *tile_list) {
-            if (!frustum->intersects_aabb(tile.aabb_min, tile.aabb_max)) {
-                continue;
-            }
-            if (run_count > 0 && tile.first_index == run_first + run_count) {
-                run_count += tile.index_count;
-            } else {
-                if (run_count > 0) {
-                    SDL_DrawGPUIndexedPrimitives(pass, run_count, 1, run_first, 0, 0);
-                }
-                run_first = tile.first_index;
-                run_count = tile.index_count;
-            }
-        }
-        if (run_count > 0) {
-            SDL_DrawGPUIndexedPrimitives(pass, run_count, 1, run_first, 0, 0);
-        }
+        const std::vector<TileRow>& rows = using_shadow_mesh ? shadow_tile_rows_ : tile_rows_;
+        draw_culled_tiles(pass, *frustum, *tile_list, rows);
     } else {
         SDL_DrawGPUIndexedPrimitives(pass, idx_count, 1, 0, 0, 0);
     }
@@ -757,6 +783,7 @@ void TerrainRenderer::generate_shadow_terrain_mesh() {
             }
         }
     }
+    build_tile_rows(shadow_tiles_, shadow_tile_rows_);
 
     shadow_vertex_buffer_ = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Vertex, vertices.data(),
                                                           vertices.size() * sizeof(TerrainVertex));
