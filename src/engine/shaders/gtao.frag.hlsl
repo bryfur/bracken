@@ -1,8 +1,14 @@
 /**
- * GTAO (Ground Truth Ambient Occlusion) Fragment Shader
+ * "GTAO" Fragment Shader (ao_mode == 2)
+ *
+ * Naming note: despite the settings name, this is NOT GTAO (Jimenez et al.) —
+ * there is no per-direction horizon search or arc integration. It accumulates
+ * cosine-weighted, distance-attenuated point samples along rotated
+ * screen-space directions, i.e. an HBAO-style directional variant. The mode
+ * name is kept for settings-file compatibility.
  *
  * Reads the depth buffer, reconstructs view-space positions, estimates normals
- * from screen-space derivatives, and performs spiral sampling to compute AO.
+ * from screen-space derivatives, and marches the precomputed directions.
  * Outputs a single-channel AO value (1.0 = no occlusion, 0.0 = full occlusion).
  */
 
@@ -24,11 +30,11 @@ cbuffer GTAOUniforms : register(b0, space3) {
     int numDirections;
     int numSteps;
     float radiusScale;
+    float maxDistance; // view-space far cutoff for AO (fades over the last 10%)
     // Scalars (not a float array) so the kernel lands at byte 176, matching
-    // the CPU struct: HLSL would pad float[3] to one register per element.
+    // the CPU struct: HLSL would pad float[2] to one register per element.
     float _padding0;
     float _padding1;
-    float _padding2;
     // xy = evenly spaced unit-circle direction (first numDirections entries used)
     float4 sampleKernel[KERNEL_SIZE];
 };
@@ -56,12 +62,22 @@ float interleavedGradientNoise(float2 pos) {
 float PSMain(PSInput input) : SV_Target {
     float depth = depthTexture.SampleLevel(depthSampler, input.texCoord, 0);
 
-    // Skip skybox
-    if (depth >= 0.9999) {
+    // Sky never gets AO: cleared/skybox depth is exactly 1.0 (same test as
+    // volumetric_fog.frag). The old `depth >= 0.9999` test was really a hidden
+    // far-field cutoff whose world distance moved with the camera's near plane.
+    if (depth >= 1.0) {
         return 1.0;
     }
 
     float3 viewPos = viewPosFromDepth(input.texCoord, depth);
+
+    // Explicit far-field cutoff in linear view distance: past maxDistance the
+    // AO footprint is subpixel at half resolution anyway. Fade over the last
+    // 10% so the boundary doesn't pop.
+    float distanceFade = saturate((maxDistance - (-viewPos.z)) / max(0.1 * maxDistance, 1e-3));
+    if (distanceFade <= 0.0) {
+        return 1.0;
+    }
 
     // Reconstruct normal from screen-space derivatives of view position
     float3 dpdx = ddx(viewPos);
@@ -125,5 +141,5 @@ float PSMain(PSInput input) : SV_Target {
     }
 
     float ao = saturate(1.0 - occlusion);
-    return ao;
+    return lerp(1.0, ao, distanceFade);
 }

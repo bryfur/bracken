@@ -752,7 +752,7 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_composite_pipeline() {
 
     ShaderResources fs_resources;
     fs_resources.num_uniform_buffers = 1; // CompositeUniforms
-    fs_resources.num_samplers = 4;        // color + AO + bloom + volumetric fog
+    fs_resources.num_samplers = 5;        // color + AO + bloom + volumetric fog + depth
 
     auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
     auto* fs = shader_manager_->get(shader_path_ + "composite.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);

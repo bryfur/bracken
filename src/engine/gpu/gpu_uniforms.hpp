@@ -270,7 +270,12 @@ struct alignas(16) GTAOUniforms {
     int numDirections = 6;
     int numSteps = 3;
     float radiusScale = 1.0f;
-    float _padding[3] = {0.0f, 0.0f, 0.0f};
+    // Explicit far cutoff (linear view distance) for AO, faded over the last
+    // 10% in-shader. Replaces the old `depth >= 0.9999` "sky skip" whose
+    // world-space cutoff moved with the camera's near plane; 12000 roughly
+    // matches where that test landed with the built-in near=5/far=15000 camera.
+    float maxDistance = 12000.0f;
+    float _padding[2] = {0.0f, 0.0f};
     glm::vec4 sampleKernel[KERNEL_SIZE]{};
 };
 
@@ -287,7 +292,9 @@ struct alignas(16) BlurUniforms {
     float sharpness = 40.0f;
     float depthA = 0.0f;
     float depthB = 0.0f;
-    float _padding = 0.0f;
+    // Linear view-distance far cutoff; must match GTAOUniforms::maxDistance
+    // (past it the AO passes faded to 1.0 and the blur passes through).
+    float maxDistance = 12000.0f;
 };
 
 /**
@@ -302,6 +309,13 @@ struct alignas(16) CompositeUniforms {
     int tonemapMode = 0;
     float contrast = 1.0f;
     float saturation = 1.0f;
+    // Depth-aware (joint bilateral) upsample of the half-res AO/fog textures:
+    // lowResTexelSize = 1 / half-res target size; depthA/depthB linearize the
+    // depth buffer (viewZ = depthB / (depth + depthA), glm RH_ZO). depthA/B of
+    // 0 degrade gracefully to plain bilinear weights in-shader.
+    glm::vec2 lowResTexelSize{0.0f, 0.0f};
+    float depthA = 0.0f;
+    float depthB = 0.0f;
 };
 
 /**
@@ -329,11 +343,17 @@ struct alignas(16) ParticleFragmentUniforms {
 
 /**
  * Bloom downsample pass fragment uniforms (set 3, b0)
+ * threshold is compared against POST-exposure luminance (the shader multiplies
+ * scene luminance by `exposure` before thresholding), so what blooms is stable
+ * when the exposure setting changes; the extracted color stays in pre-exposure
+ * scene units because the composite pass applies exposure to the summed bloom.
  */
 struct alignas(16) BloomDownsampleUniforms {
     glm::vec2 srcTexelSize;
     float threshold = 0.8f;
     float isFirstPass = 1.0f;
+    float exposure = 1.0f;
+    float _padding[3] = {0.0f, 0.0f, 0.0f};
 };
 
 /**

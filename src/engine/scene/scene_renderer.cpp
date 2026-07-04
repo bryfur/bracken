@@ -698,7 +698,7 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
                     ENGINE_PROFILE_ZONE_COLOR("Bloom", 0x16A085);
                     ENGINE_GPU_SCOPE(cmd, "Bloom");
                     ENGINE_GPU_TIMER(gpu_timer_pool_, cmd, "Bloom");
-                    bloom_->render(cmd, *pipeline_registry_, scene_in, gfx.bloom_threshold);
+                    bloom_->render(cmd, *pipeline_registry_, scene_in, gfx.bloom_threshold, gfx.exposure);
                 }
                 bloom_tex = bloom_->bloom_texture();
             }
@@ -731,6 +731,10 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
                 composite_params.tonemap_mode = gfx.tonemap_mode;
                 composite_params.contrast = gfx.contrast;
                 composite_params.saturation = gfx.saturation;
+                // Depth linearization constants for the joint bilateral AO/fog
+                // upsample in the composite shader (glm RH_ZO).
+                composite_params.depth_a = camera.projection[2][2];
+                composite_params.depth_b = camera.projection[3][2];
 
                 // FXAA runs on the tonemapped LDR image: composite into the
                 // intermediate LDR target, then FXAA resolves to the swapchain.

@@ -43,9 +43,15 @@ public:
      * @param cmd         Active command buffer (no render pass should be active)
      * @param registry    Pipeline registry for bloom pipelines
      * @param scene_color The offscreen scene color texture to extract bloom from
+     * @param threshold   POST-exposure luminance above which pixels bloom: the
+     *                    prefilter thresholds scene luminance * exposure, so
+     *                    what blooms stays stable as exposure changes
+     * @param exposure    The composite pass's exposure setting; only the
+     *                    threshold decision uses it (bloom output stays in
+     *                    pre-exposure scene units — composite applies exposure)
      */
     void render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, SDL_GPUTexture* scene_color,
-                float threshold = 1.0f);
+                float threshold = 1.0f, float exposure = 1.0f);
 
     /**
      * Get the final bloom result texture for the composite pass.

@@ -122,11 +122,14 @@ timer label, so RenderDoc captures read in this order.)
    terrain, grass, static/instanced/skinned models, particles, debug lines.
    The offscreen clear color tracks `env.fog_color_horizon`.
 5. **Post chain** (all offscreen, swapchain not yet acquired):
-   `SSAO`/`GTAO` (per `ao_mode`) → `BlurAO` (bilateral) → `Bloom`
-   (13-tap downsample / 9-tap tent upsample) → `VolumetricFog` (ray march
-   against depth + shadow atlas; god rays force-disabled when shadows are off
-   because the atlas would contain garbage).
-6. **Late swapchain acquire** → **`Composite`** (scene × AO + bloom + fog,
+   `SSAO`/`GTAO` (per `ao_mode`; despite the setting name, the "GTAO" mode is
+   an HBAO-style directional variant — no horizon search/arc integration) →
+   `BlurAO` (bilateral) → `Bloom` (13-tap downsample / 9-tap tent upsample;
+   the prefilter thresholds post-exposure luminance) → `VolumetricFog` (ray
+   march against depth + shadow atlas; god rays force-disabled when shadows
+   are off because the atlas would contain garbage).
+6. **Late swapchain acquire** → **`Composite`** (depth-aware joint-bilateral
+   upsample of the half-res AO + fog, scene × AO + bloom + fog,
    exposure/tonemap/contrast/saturation). With `aa_mode == 1` composite goes
    to an LDR intermediate and **`FXAA`** resolves to the swapchain; otherwise
    composite writes the swapchain directly.

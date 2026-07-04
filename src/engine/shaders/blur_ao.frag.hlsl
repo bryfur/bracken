@@ -23,7 +23,7 @@ cbuffer BlurUniforms : register(b0, space3) {
     // viewZ = depthB / (depth + depthA), depthA = proj[2][2], depthB = proj[3][2]
     float depthA;
     float depthB;
-    float _padding;
+    float maxDistance; // view-space far cutoff, matches the AO passes
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
@@ -45,12 +45,22 @@ float PSMain(PSInput input) : SV_Target {
     float centerAO = aoTexture.SampleLevel(aoSampler, input.texCoord, 0);
     float centerDepth = depthTexture.SampleLevel(depthSampler, input.texCoord, 0);
 
-    // Skip skybox
-    if (centerDepth >= 0.9999) {
-        return 1.0;
+    // Sky: cleared/skybox depth is exactly 1.0 (same test as the AO passes and
+    // volumetric_fog.frag). Pass the AO value through (it is 1.0 there) rather
+    // than returning a constant that could disagree with the AO pass.
+    if (centerDepth >= 1.0) {
+        return centerAO;
     }
 
     float centerZ = linearizeDepth(centerDepth);
+
+    // Same explicit far cutoff as the AO passes: past maxDistance AO has been
+    // faded to 1.0, so pass it through instead of blurring. The old
+    // `depth >= 0.9999` test put this boundary at a near-plane-dependent
+    // distance and returned a constant across it.
+    if (centerZ > maxDistance) {
+        return centerAO;
+    }
 
     static const int KERNEL_RADIUS = 3;
     static const float weights[7] = {0.03125, 0.109375, 0.21875, 0.28125, 0.21875, 0.109375, 0.03125};
