@@ -607,6 +607,7 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
             if (copy_pass) {
                 upload_instance_buffers(copy_pass);
                 upload_bone_palettes(copy_pass);
+                effects_->upload_particle_instances(copy_pass, *effect_system_);
                 upload_debug_lines(scene, copy_pass);
                 if (grass_active) {
                     grass_renderer_->upload_chunks(copy_pass, camera.position, &frame_frustum_);
@@ -1021,8 +1022,9 @@ void SceneRenderer::render_3d_scene(const RenderScene& scene, const CameraState&
 
     // Particle effects after the skybox: additive HDR with depth-test-on /
     // depth-write-off, so they composite over sky + opaques in any order.
-    // Spawn commands were consumed pre-pass in render_frame.
-    effects_->draw_particle_effects(main_render_pass_, context_->current_command_buffer(), *effect_system_, camera.view,
+    // Spawn commands were consumed pre-pass in render_frame; instance data
+    // was packed + uploaded in the consolidated frame copy pass.
+    effects_->draw_particle_effects(main_render_pass_, context_->current_command_buffer(), camera.view,
                                     camera.projection, camera.position);
 
     // Debug line rendering (only if game submitted any; vertex data was

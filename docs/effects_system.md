@@ -98,10 +98,13 @@ Introspection: `effect_count()`, `particle_count()`, `clear()`.
 
 ## Rendering
 
-`EffectRenderer` draws each particle as a model instance through the
-`Particle` pipeline — `model.vert` + `particle.frag`, unlit additive
-(ONE/ONE) into the HDR scene target, so bright particles bloom naturally.
-Each particle is one draw; keep counts modest (no GPU instancing yet).
+`EffectRenderer` draws particles GPU-instanced through the `Particle`
+pipeline — `particle.vert` + `particle.frag`, unlit additive (ONE/ONE) into
+the HDR scene target, so bright particles bloom naturally. Per-particle
+`{transform, tint+opacity}` records are packed into a per-frame storage
+buffer (uploaded in `SceneRenderer`'s consolidated `FrameUploads` copy pass),
+then each (emitter, mesh) batch is a single instanced draw with a small
+instance-offset uniform — camera uniforms are pushed once per pass.
 
 ## Effect files
 

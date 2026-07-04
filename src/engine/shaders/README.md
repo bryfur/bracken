@@ -24,8 +24,7 @@ changes.
 
 Which shaders each `PipelineType` (`gpu/pipeline_registry.cpp`) actually
 loads. Note the shared shaders: the skinned pipeline reuses `model.frag`,
-particles reuse `model.vert`, and every post-process pass reuses
-`fullscreen.vert`.
+and every post-process pass reuses `fullscreen.vert`.
 
 | Pipeline | Vertex | Fragment |
 |---|---|---|
@@ -35,7 +34,7 @@ particles reuse `model.vert`, and every post-process pass reuses
 | Terrain | `terrain.vert` | `terrain.frag` |
 | Grass | `grass.vert` | `grass.frag` |
 | Skybox | `skybox.vert` | `skybox.frag` |
-| Particle | `model.vert` | `particle.frag` |
+| Particle | `particle.vert` | `particle.frag` |
 | Grid | `grid.vert` | `grid.frag` |
 | UI | `ui.vert` | `ui.frag` |
 | Text | `text.vert` | `text.frag` |
@@ -76,7 +75,10 @@ tent, additive), `volumetric_fog` (ray march with god rays from the shadow
 atlas), `composite` (scene × AO + bloom + fog, exposure + tonemap + gamma →
 LDR), `fxaa` (FXAA 3.11 on the tonemapped LDR image).
 
-**Effects/UI** — `particle.frag`: unlit additive HDR particles. `ui`/`text`:
+**Effects/UI** — `particle.*`: unlit additive HDR particles, instanced —
+per-particle transform + color come from a per-frame
+`StructuredBuffer<ParticleInstance>` (vertex set 0, binding 0) indexed by an
+`instanceOffset` uniform, one draw per (emitter, mesh) batch. `ui`/`text`:
 2D pipelines targeting the swapchain. `billboard.*`: camera-facing quads.
 `grid.*`: debug grid overlay.
 

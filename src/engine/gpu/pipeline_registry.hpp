@@ -34,7 +34,7 @@ enum class PipelineType {
     Billboard, ///< Camera-facing billboards
 
     // Effect pipelines
-    Particle, ///< HDR particles (model.vert + particle.frag, ONE/ONE additive)
+    Particle, ///< HDR particles (instanced; particle.vert + particle.frag, ONE/ONE additive)
     Grass,    ///< Instanced grass rendering
 
     // Instanced rendering pipelines

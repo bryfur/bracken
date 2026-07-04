@@ -8,7 +8,7 @@ namespace mmo::engine::gpu {
 /**
  * Model vertex shader uniforms - matches model.vert.hlsl /
  * skinned_model.vert.hlsl TransformUniforms (set 1, b0).
- * Used by: renderer.cpp, world_renderer.cpp, effect_renderer.cpp
+ * Used by: scene_renderer.cpp
  * paletteOffset indexes the frame's bone-palette SSBO (in matrices); it is
  * only read by skinned_model.vert.hlsl.
  */
@@ -26,7 +26,7 @@ struct alignas(16) ModelTransformUniforms {
 
 /**
  * Model fragment shader uniforms - matches model.frag.hlsl LightingUniforms (set 3, b0)
- * Used by: scene_renderer.cpp, effect_renderer.cpp
+ * Used by: scene_renderer.cpp
  * Field order mirrors the HLSL cbuffer exactly; every vec3 is followed by a
  * scalar so no field straddles a 16-byte register boundary.
  */
@@ -110,7 +110,8 @@ struct alignas(16) UIFragmentUniforms {
 };
 
 /**
- * Instanced model vertex shader camera uniforms - matches model_instanced.vert.hlsl (set 1, b0)
+ * Instanced model vertex shader camera uniforms - matches the CameraUniforms
+ * cbuffer of model_instanced.vert.hlsl and particle.vert.hlsl (set 1, b0)
  */
 struct alignas(16) InstancedCameraUniforms {
     glm::mat4 view;
@@ -299,15 +300,38 @@ struct alignas(16) FxaaUniforms {
 
 /**
  * Particle fragment shader uniforms - matches particle.frag.hlsl (set 3, b0).
- * Additive (ONE, ONE) blending: fade is encoded by scaling rgb via opacity,
- * the alpha output is unused.
+ * Pushed once per pass; per-particle tint/opacity ride in the instance
+ * storage buffer (ParticleInstanceData). Additive (ONE, ONE) blending: fade
+ * is encoded by scaling rgb, the alpha output is unused.
  */
 struct alignas(16) ParticleFragmentUniforms {
-    glm::vec4 tintColor{1.0f, 1.0f, 1.0f, 1.0f};
     float emissiveBoost = 1.0f;
-    float opacity = 1.0f;
     float _pad0 = 0.0f;
     float _pad1 = 0.0f;
+    float _pad2 = 0.0f;
+};
+
+/**
+ * Particle batch vertex uniforms - matches particle.vert.hlsl BatchUniforms
+ * (set 1, b1). instanceOffset is the batch's first record in the per-frame
+ * particle instance storage buffer; camera data goes through
+ * InstancedCameraUniforms (set 1, b0), pushed once per pass.
+ */
+struct alignas(16) ParticleBatchUniforms {
+    uint32_t instanceOffset = 0;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+    uint32_t _pad2 = 0;
+};
+
+/**
+ * Per-particle data for instanced particle rendering (storage buffer).
+ * Matches particle.vert.hlsl ParticleInstance: color.rgb tints, color.a is
+ * opacity (folded into rgb by the vertex stage - additive blending).
+ */
+struct ParticleInstanceData {
+    glm::mat4 model;
+    glm::vec4 color;
 };
 
 /**
