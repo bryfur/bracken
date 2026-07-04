@@ -191,6 +191,11 @@ void PlaygroundGame::setup_state_machine() {
     anim_sm_.add_state(std::move(attack));
     anim_sm_.set_default_state("Idle");
     anim_sm_.bind_clips(models().get_model(player_model_)->animations);
+
+    // Resolve per-frame parameter names to indices once; update_player uses
+    // the index overloads so no name is hashed per frame.
+    param_speed_ = anim_sm_.param_index("speed");
+    param_attacking_ = anim_sm_.param_index("attacking");
 }
 
 void PlaygroundGame::setup_effects() {
@@ -398,8 +403,8 @@ void PlaygroundGame::update_player(float dt) {
     player_transform_ = glm::rotate(glm::translate(glm::mat4(1.0f), player_pos_), facing_.current, glm::vec3(0, 1, 0));
 
     attack_timer_ = std::max(0.0f, attack_timer_ - dt);
-    anim_sm_.set_float("speed", player_speed_);
-    anim_sm_.set_bool("attacking", attack_timer_ > 0.0f);
+    anim_sm_.set_float(param_speed_, player_speed_);
+    anim_sm_.set_bool(param_attacking_, attack_timer_ > 0.0f);
     anim_sm_.update(anim_player_);
 
     Model* model = models().get_model(player_model_);
@@ -466,7 +471,7 @@ void PlaygroundGame::on_render() {
     scene_.set_draw_ground(true);
     scene_.set_draw_grass(gs.grass_enabled);
 
-    scene_.add_skinned_model(player_model_, player_transform_, anim_player_.bone_matrix_array());
+    scene_.add_skinned_model(player_model_, player_transform_, anim_player_.bone_matrices());
 
     for (const auto& prop : props_) {
         scene_.add_model(prop.model, prop.transform);

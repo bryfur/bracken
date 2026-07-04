@@ -107,6 +107,65 @@ TEST_F(StateMachineTest, GetUnsetParamReturnsDefault) {
     EXPECT_FALSE(sm.get_bool("nonexistent"));
 }
 
+// ============================================================================
+// Index-based parameter API (perf: hosts resolve names once at setup)
+// ============================================================================
+
+TEST_F(StateMachineTest, ParamIndexIsStableAndSharedWithStringApi) {
+    // "speed" was registered by bind_clips (transition conditions).
+    const int speed_idx = sm.param_index("speed");
+    ASSERT_GE(speed_idx, 0);
+    EXPECT_EQ(sm.param_index("speed"), speed_idx);
+    EXPECT_EQ(sm.find_param_index("speed"), speed_idx);
+
+    sm.set_float(speed_idx, 2.5f);
+    EXPECT_FLOAT_EQ(sm.get_float(speed_idx), 2.5f);
+    // Index and string APIs address the same parameter storage.
+    EXPECT_FLOAT_EQ(sm.get_float("speed"), 2.5f);
+    sm.set_float("speed", 0.25f);
+    EXPECT_FLOAT_EQ(sm.get_float(speed_idx), 0.25f);
+}
+
+TEST_F(StateMachineTest, FindParamIndexDoesNotCreate) {
+    EXPECT_EQ(sm.find_param_index("never_set"), -1);
+    EXPECT_EQ(sm.find_param_index("never_set"), -1); // still absent
+    int created = sm.param_index("never_set");
+    EXPECT_EQ(sm.find_param_index("never_set"), created);
+}
+
+TEST_F(StateMachineTest, IndexBasedParamsDriveTransitions) {
+    const int speed_idx = sm.param_index("speed");
+    AnimationPlayer player;
+
+    sm.set_float(speed_idx, 0.0f);
+    sm.update(player);
+    EXPECT_EQ(sm.current_state(), "idle");
+
+    sm.set_float(speed_idx, 1.0f);
+    sm.update(player);
+    EXPECT_EQ(sm.current_state(), "walk");
+}
+
+TEST_F(StateMachineTest, IndexBasedBoolParam) {
+    const int idx = sm.param_index("attacking");
+    sm.set_bool(idx, true);
+    EXPECT_TRUE(sm.get_bool(idx));
+    EXPECT_TRUE(sm.get_bool("attacking"));
+    sm.set_bool(idx, false);
+    EXPECT_FALSE(sm.get_bool(idx));
+}
+
+TEST_F(StateMachineTest, OutOfRangeIndexIsSafe) {
+    sm.set_float(-1, 5.0f);
+    sm.set_float(9999, 5.0f);
+    sm.set_bool(-1, true);
+    sm.set_bool(9999, true);
+    EXPECT_FLOAT_EQ(sm.get_float(-1), 0.0f);
+    EXPECT_FLOAT_EQ(sm.get_float(9999), 0.0f);
+    EXPECT_FALSE(sm.get_bool(-1));
+    EXPECT_FALSE(sm.get_bool(9999));
+}
+
 TEST_F(StateMachineTest, TransitionsWhenConditionMet) {
     sm.set_float("speed", 0.0f);
     AnimationPlayer player;

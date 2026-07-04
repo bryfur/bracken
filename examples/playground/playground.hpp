@@ -80,6 +80,8 @@ private:
     glm::vec3 move_dir_{0.0f}; // set by handle_input / smoke driver
     mmo::engine::animation::AnimationPlayer anim_player_;
     mmo::engine::animation::AnimationStateMachine anim_sm_;
+    int param_speed_ = -1;     // anim_sm_ parameter indices, resolved once in
+    int param_attacking_ = -1; // setup_state_machine (no per-frame name hashing)
     mmo::engine::animation::RotationSmoother facing_;
     mmo::engine::animation::FootIKSmoother foot_smoother_;
     glm::mat4 player_transform_{1.0f};
