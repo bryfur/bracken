@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mmo::engine::render {
@@ -534,16 +535,11 @@ void UIRenderer::draw_line(float x1, float y1, float x2, float y2, uint32_t colo
     vertex_batch_.push_back(v3);
 }
 
-void UIRenderer::draw_text(const std::string& text, float x, float y, uint32_t color, float scale) {
+void UIRenderer::draw_text(std::string_view text, float x, float y, uint32_t color, float scale) {
     if (!text.empty()) {
-        // Queue text draw for later execution (during execute() phase)
-        QueuedTextDraw td;
-        td.text = text;
-        td.x = x;
-        td.y = y;
-        td.color = color;
-        td.scale = scale;
-        queued_text_draws_.push_back(td);
+        // Queue text draw for later execution (during execute() phase).
+        // Stores a view — the caller keeps the string alive until execute().
+        queued_text_draws_.push_back({text, x, y, color, scale});
     }
 }
 

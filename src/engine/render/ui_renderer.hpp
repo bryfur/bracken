@@ -5,6 +5,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Forward declarations
@@ -92,10 +93,11 @@ public:
                              int segments = 24);
     void draw_line(float x1, float y1, float x2, float y2, uint32_t color, float line_width = 2.0f);
 
-    // Text drawing
-    void draw_text(const std::string& text, float x, float y, uint32_t color, float scale = 1.0f);
+    // Text drawing. The referenced characters are NOT copied: `text` must stay
+    // valid until execute() runs (UIScene command storage satisfies this).
+    void draw_text(std::string_view text, float x, float y, uint32_t color, float scale = 1.0f);
 
-    // Composite UI elements
+    // Composite UI elements. `label` must stay valid until execute() (see draw_text).
     void draw_button(float x, float y, float w, float h, const std::string& label, uint32_t color, bool selected);
     // Access text renderer for advanced usage
     TextRenderer* text_renderer() { return text_renderer_.get(); }
@@ -137,9 +139,10 @@ private:
     };
     std::vector<UIVertex> vertex_batch_;
 
-    // Queued text draws (executed during execute() phase)
+    // Queued text draws (executed during execute() phase). Views into
+    // caller-owned strings that must stay valid until execute() — no copies.
     struct QueuedTextDraw {
-        std::string text;
+        std::string_view text;
         float x{}, y{};
         uint32_t color{};
         float scale{};

@@ -1,13 +1,15 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
 #include <glm/glm.hpp>
 #include <memory>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
 #include <SDL3_ttf/SDL_ttf.h>
 #include <string>
+#include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 // Forward declarations
@@ -23,11 +25,115 @@ namespace mmo::engine::render {
 namespace gpu = mmo::engine::gpu;
 
 /**
+ * Decode a single UTF-8 codepoint from `text` starting at byte index `i`.
+ * Advances `i` past the decoded sequence. Malformed input yields U+FFFD and
+ * advances by one byte so decoding always makes progress.
+ */
+inline uint32_t decode_utf8(std::string_view text, size_t& i) {
+    const uint8_t b0 = static_cast<uint8_t>(text[i]);
+    if (b0 < 0x80) {
+        i += 1;
+        return b0;
+    }
+
+    uint32_t cp = 0;
+    size_t len = 0;
+    if ((b0 & 0xE0) == 0xC0) {
+        cp = b0 & 0x1F;
+        len = 2;
+    } else if ((b0 & 0xF0) == 0xE0) {
+        cp = b0 & 0x0F;
+        len = 3;
+    } else if ((b0 & 0xF8) == 0xF0) {
+        cp = b0 & 0x07;
+        len = 4;
+    } else {
+        // Stray continuation byte or invalid lead byte
+        i += 1;
+        return 0xFFFD;
+    }
+
+    if (len > text.size() - i) {
+        // Truncated sequence at end of string
+        i = text.size();
+        return 0xFFFD;
+    }
+    for (size_t k = 1; k < len; ++k) {
+        const uint8_t bk = static_cast<uint8_t>(text[i + k]);
+        if ((bk & 0xC0) != 0x80) {
+            i += 1;
+            return 0xFFFD;
+        }
+        cp = (cp << 6) | (bk & 0x3F);
+    }
+    i += len;
+    return cp;
+}
+
+/**
+ * Left-to-right shelf packer for a fixed-size texture atlas.
+ *
+ * Rects are placed on horizontal shelves; a new shelf opens below the current
+ * one when a rect no longer fits on the row. This is a good fit for font
+ * glyphs, which all share (roughly) the same height.
+ */
+class ShelfPacker {
+public:
+    ShelfPacker(int width, int height) : width_(width), height_(height) {}
+
+    /**
+     * Try to place a w x h rect. On success returns true and writes the
+     * top-left corner to out_x/out_y. Returns false when the atlas is full
+     * (or the rect can never fit).
+     */
+    bool pack(int w, int h, int& out_x, int& out_y) {
+        if (w <= 0 || h <= 0 || w > width_ || h > height_) {
+            return false;
+        }
+        if (cursor_x_ + w > width_) {
+            // Open a new shelf below the current one
+            shelf_y_ += shelf_height_;
+            cursor_x_ = 0;
+            shelf_height_ = 0;
+        }
+        if (shelf_y_ + h > height_) {
+            return false;
+        }
+        out_x = cursor_x_;
+        out_y = shelf_y_;
+        cursor_x_ += w;
+        shelf_height_ = std::max(shelf_height_, h);
+        return true;
+    }
+
+    void reset() {
+        cursor_x_ = 0;
+        shelf_y_ = 0;
+        shelf_height_ = 0;
+    }
+
+    int width() const { return width_; }
+    int height() const { return height_; }
+
+private:
+    int width_ = 0;
+    int height_ = 0;
+    int cursor_x_ = 0;
+    int shelf_y_ = 0;
+    int shelf_height_ = 0;
+};
+
+/**
  * TextRenderer handles text rendering using SDL_ttf and SDL3 GPU API.
  *
- * SDL3 GPU Migration: This renderer now uses GPUBuffer for vertex data,
- * GPUTexture for font rendering, and the text pipeline from PipelineRegistry.
- * Text is rendered by creating temporary textures from TTF surfaces.
+ * Glyphs are rasterized on demand via TTF_RenderGlyph_Blended into a single
+ * fixed-size shelf-packed atlas texture (one atlas for the one font size this
+ * renderer uses). Strings are drawn as runs of per-glyph quads with atlas UVs
+ * through the shared batch vertex buffer, so steady-state text costs pure
+ * vertex generation — no per-string textures, no per-frame rasterization, and
+ * no one-frame latency for new strings. If the atlas ever fills up, all
+ * glyphs are evicted and re-rasterized on demand (logged; may glitch text for
+ * a single frame).
  */
 class TextRenderer {
 public:
@@ -46,7 +152,9 @@ public:
     void set_projection(const glm::mat4& projection);
 
     /**
-     * Draw text at the specified position.
+     * Draw text at the specified position (legacy immediate path).
+     * Only draws if every glyph is already resident in the atlas; otherwise
+     * the glyphs are rasterized CPU-side and drawn from the next frame on.
      * @param cmd Command buffer for the frame
      * @param render_pass Active render pass to draw into
      * @param text The text string to render
@@ -55,81 +163,109 @@ public:
      * @param color Text color in ABGR format
      * @param scale Text scale factor
      */
-    void draw_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, const std::string& text, float x, float y,
+    void draw_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::string_view text, float x, float y,
                    uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
 
-    void draw_text_centered(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, const std::string& text, float x,
+    void draw_text_centered(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::string_view text, float x,
                             float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
 
     /**
      * Queue a text draw for batched rendering.
      * Call this instead of draw_text during recording phase.
+     * Missing glyphs are rasterized into the CPU-side atlas immediately and
+     * uploaded by the next copy-pass flush (create_pending_textures /
+     * upload_queued_text), so new strings render the same frame.
      */
-    void queue_text_draw(const std::string& text, float x, float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
+    void queue_text_draw(std::string_view text, float x, float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
 
     /**
-     * Upload all queued text vertex data. Call BEFORE starting render pass.
-     * This performs copy pass operations.
+     * Upload all queued text vertex data (and any new glyphs) to the GPU.
+     * Call BEFORE starting the render pass. This performs copy pass operations.
      */
     void upload_queued_text(SDL_GPUCommandBuffer* cmd);
 
     /**
      * Draw all queued text. Call DURING render pass, after upload_queued_text.
+     * Binds the atlas once and issues one draw per color change.
      */
     void draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass);
 
     /**
      * Draw text immediately without uploading vertex data.
      * Used during execute phase when vertex buffer is already uploaded.
-     * Uses push uniforms for quad transform instead of vertex buffer updates.
+     * Note: only renders correctly if the vertex data happens to be resident;
+     * prefer queue_text_draw + upload_queued_text + draw_queued_text.
      */
-    void draw_text_immediate(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, const std::string& text,
-                             float x, float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
+    void draw_text_immediate(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::string_view text, float x,
+                             float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
 
-    int get_text_width(const std::string& text, float scale = 1.0f);
+    int get_text_width(std::string_view text, float scale = 1.0f);
     int get_text_height(float scale = 1.0f);
 
     bool is_ready() const { return initialized_ && font_ != nullptr; }
 
     /**
-     * Release GPU resources from previous frames.
-     * Call this at the beginning of each frame to clean up resources
-     * that are no longer in use by the GPU.
+     * Frame-boundary housekeeping. Call at the beginning of each frame.
      */
     void release_pending_resources();
 
     /**
-     * Prepare text textures for rendering. Call BEFORE starting a render pass.
-     * This creates and uploads any textures needed for the given text strings.
-     * @param cmd Command buffer for copy operations
-     * @param texts Vector of text strings that will be drawn this frame
+     * Pre-rasterize the glyphs of the given strings and upload the atlas.
+     * Call BEFORE starting a render pass (performs a copy pass when new
+     * glyphs were added).
      */
     void prepare_text_textures(SDL_GPUCommandBuffer* cmd, const std::vector<std::string>& texts);
 
     /**
-     * Create textures for any text that was requested but not cached.
-     * Call AFTER render passes end (e.g., at end of frame).
-     * @param cmd Command buffer for copy operations
+     * Upload any newly rasterized glyphs to the atlas texture.
+     * Call outside of render passes (performs a copy pass).
      */
     void create_pending_textures(SDL_GPUCommandBuffer* cmd);
 
-    /**
-     * Get or create a cached texture for the given text.
-     * If called during a render pass and texture doesn't exist, returns nullptr.
-     * @param cmd Command buffer (for upload if not in render pass)
-     * @param text The text string
-     * @param in_render_pass Whether we're currently in a render pass
-     * @return Texture pointer and dimensions, or nullptr if unavailable
-     */
-    struct CachedText {
-        SDL_GPUTexture* texture = nullptr;
-        int width = 0;
-        int height = 0;
-        uint64_t last_used_frame = 0;
-    };
-    CachedText* get_or_create_text_texture(SDL_GPUCommandBuffer* cmd, const std::string& text, bool in_render_pass);
-
 private:
+    // A rasterized glyph cell in the atlas. Glyph bitmaps from
+    // TTF_RenderGlyph_Blended are full line-height cells whose origin is the
+    // pen position at the top of the line box, so layout is: quad at
+    // (x + pen * scale, y), then pen += advance (+ kerning).
+    struct Glyph {
+        uint16_t atlas_x = 0;
+        uint16_t atlas_y = 0;
+        uint16_t width = 0;      // cell width in pixels
+        uint16_t height = 0;     // cell height in pixels (== font line height)
+        int advance = 0;         // pen advance in pixels
+        bool has_bitmap = false; // false: advance-only (e.g. space)
+    };
+
+    // A contiguous range of quads in batch_vertices_ sharing one color.
+    struct TextRun {
+        size_t first_vertex = 0;
+        uint32_t vertex_count = 0;
+        uint32_t color = 0;
+    };
+
+    /// Look up a glyph, rasterizing it into the CPU atlas on first use.
+    /// Returns nullptr only when no font is loaded or rasterization failed.
+    const Glyph* ensure_glyph(uint32_t codepoint);
+
+    /// Copy an RGBA32 glyph surface into the CPU atlas pixels at (x, y).
+    void blit_glyph_to_atlas(const SDL_Surface* rgba, int x, int y);
+
+    /// Evict every glyph and reset the packer (atlas overflow handling).
+    void evict_all_glyphs();
+
+    /// Extend the dirty row band to cover rows [y0, y1).
+    void mark_dirty_rows(int y0, int y1);
+
+    /// Upload the dirty atlas row band to the GPU (copy pass). No-op if clean.
+    void flush_atlas(SDL_GPUCommandBuffer* cmd);
+
+    /// Append one textured quad per visible glyph of `text` to `out`
+    /// (screen-space positions + atlas UVs), stopping before `max_floats` is
+    /// exceeded. Rasterizes missing glyphs into the CPU atlas as a side
+    /// effect. Returns the number of quads appended.
+    size_t build_string_quads(std::string_view text, float x, float y, float scale, std::vector<float>& out,
+                              size_t max_floats);
+
     TTF_Font* font_ = nullptr;
     int font_size_ = 18;
     bool initialized_ = false;
@@ -138,42 +274,34 @@ private:
     gpu::PipelineRegistry* pipeline_registry_ = nullptr;
     glm::mat4 projection_;
 
-    // Dynamic vertex buffer for text quads (legacy, used by draw_text)
+    // Dynamic vertex buffer shared by all text quads
     std::unique_ptr<gpu::GPUBuffer> vertex_buffer_;
 
-    // Static unit quad vertex buffer for draw_text_immediate
-    // Contains a 0-1 unit quad that gets transformed via push uniforms
-    std::unique_ptr<gpu::GPUBuffer> unit_quad_buffer_;
-
-    // Sampler for text textures
+    // Sampler for the glyph atlas
     SDL_GPUSampler* sampler_ = nullptr;
 
-    // Pending GPU resources to be released after GPU has finished using them
-    // We use double-buffering: resources go to pending_*, then released next frame
-    std::vector<SDL_GPUTexture*> pending_textures_;
-    std::vector<SDL_GPUTransferBuffer*> pending_transfers_;
+    // Glyph atlas: one fixed-size texture for the single font size.
+    // atlas_pixels_ is the CPU-side mirror; dirty rows are uploaded through a
+    // persistent transfer buffer before the UI render pass.
+    static constexpr int ATLAS_SIZE = 512;
+    static constexpr int GLYPH_PADDING = 1; // gap between cells (linear filter bleed)
+    SDL_GPUTexture* atlas_texture_ = nullptr;
+    SDL_GPUTransferBuffer* atlas_transfer_ = nullptr;
+    std::vector<uint8_t> atlas_pixels_; // RGBA8, ATLAS_SIZE x ATLAS_SIZE
+    ShelfPacker packer_{ATLAS_SIZE, ATLAS_SIZE};
+    std::unordered_map<uint32_t, Glyph> glyphs_;
+    int dirty_y0_ = 0; // dirty row band [dirty_y0_, dirty_y1_); empty when y0 >= y1
+    int dirty_y1_ = 0;
 
-    // Text texture cache - maps text string to cached texture info
-    std::unordered_map<std::string, CachedText> text_cache_;
     uint64_t current_frame_ = 0;
-    static constexpr uint64_t CACHE_EXPIRY_FRAMES = 300; // Remove unused textures after ~5 seconds at 60fps
-
-    // Texts that were requested but not in cache - created at end of frame
-    std::unordered_set<std::string> pending_text_creates_;
+    bool batch_full_warned_ = false; // throttles the quad-budget warning per frame
 
     // Batched text rendering data
-    struct QueuedText {
-        CachedText* cached; // cached pointer into text_cache_ (pointer stable per frame)
-        float x, y;
-        uint32_t color;
-        float scale;
-        size_t vertex_offset; // Offset into batch vertex buffer
-    };
-    std::vector<QueuedText> queued_texts_;
+    std::vector<TextRun> queued_runs_;
     std::vector<float> batch_vertices_; // All vertex data for queued texts
     static constexpr size_t VERTICES_PER_QUAD = 6;
     static constexpr size_t FLOATS_PER_VERTEX = 4; // x, y, u, v
-    static constexpr size_t MAX_QUEUED_TEXTS = 4096;
+    static constexpr size_t MAX_TEXT_QUADS = 4096; // one quad per visible glyph
 };
 
 } // namespace mmo::engine::render
