@@ -18,7 +18,7 @@ struct ClusterParams {
     float4 screenSize;     // (w, h, 1/w, 1/h)
     float4 zPlanes;        // (near, far, log(far/near), 1/log(far/near))
     uint4 gridDim;         // (X, Y, Z, totalLightCount)
-    uint4 maxPerCluster;   // (max_lights_per_cluster, _, _, _)
+    uint4 maxPerCluster;   // (max_lights_per_cluster, light buffer capacity, _, _)
 };
 
 struct PointLightGPU {
@@ -47,8 +47,13 @@ uint clusterZSlice(float view_depth, ClusterParams cp) {
 }
 
 uint clusterIndexFromScreen(float2 uv, float view_depth, ClusterParams cp) {
+    // uv comes from SV_Position * screenSize.zw, so uv.y = 0 is the TOP of the
+    // screen. CPU binning (light_cluster.cpp, unproject_corner) maps cluster
+    // row cy = 0 to NDC y = -1 — the BOTTOM of the screen — so flip Y here to
+    // match that convention. X needs no flip (cx = 0 is NDC x = -1 = left on
+    // both sides).
     uint cx = (uint)clamp(floor(uv.x * (float)cp.gridDim.x), 0.0, (float)cp.gridDim.x - 1.0);
-    uint cy = (uint)clamp(floor(uv.y * (float)cp.gridDim.y), 0.0, (float)cp.gridDim.y - 1.0);
+    uint cy = (uint)clamp(floor((1.0 - uv.y) * (float)cp.gridDim.y), 0.0, (float)cp.gridDim.y - 1.0);
     uint cz = clusterZSlice(view_depth, cp);
     return (cz * cp.gridDim.y + cy) * cp.gridDim.x + cx;
 }

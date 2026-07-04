@@ -31,9 +31,17 @@ StructuredBuffer<uint2> clusterOffsetsBuf;
 [[vk::binding(CLUSTER_SSBO_BINDING_BASE + 2, 2)]]
 StructuredBuffer<uint> lightIndicesBuf;
 
+// Light-data buffer section offsets. ClusterGrid::upload() (light_cluster.cpp)
+// packs the buffer as:
+//   [LightDataHeader 16B][LightHeader * cap][PointLight * cap][SpotLight * cap]
+// where cap = clusterParams.maxPerCluster.y — the CPU-side buffer capacity
+// (ClusterGrid max_lights_) — so the offsets follow the CPU layout instead of
+// hardcoding a light count. Strides: LightHeader 8B, PointLight 32B, SpotLight 64B.
+uint pointLightsBase() { return 16u + clusterParams.maxPerCluster.y * 8u; }
+uint spotLightsBase()  { return 16u + clusterParams.maxPerCluster.y * (8u + 32u); }
+
 LightHeader loadLightHeader(uint i) {
-    // Layout: [LightDataHeader 16B][LightHeader * 256][PointLight * 256][SpotLight * 256]
-    uint base = 16 + i * 8;
+    uint base = 16u + i * 8u; // headers start right after the 16B LightDataHeader
     uint2 raw = lightDataBuf.Load2(base);
     LightHeader h;
     h.type = raw.x;
@@ -42,7 +50,7 @@ LightHeader loadLightHeader(uint i) {
 }
 
 PointLightGPU loadPointLight(uint i) {
-    uint base = 16 + 256 * 8 + i * 32;
+    uint base = pointLightsBase() + i * 32;
     uint4 a = lightDataBuf.Load4(base);
     uint4 b = lightDataBuf.Load4(base + 16);
     PointLightGPU p;
@@ -54,7 +62,7 @@ PointLightGPU loadPointLight(uint i) {
 }
 
 SpotLightGPU loadSpotLight(uint i) {
-    uint base = 16 + 256 * 8 + 256 * 32 + i * 64;
+    uint base = spotLightsBase() + i * 64;
     uint4 a = lightDataBuf.Load4(base);
     uint4 b = lightDataBuf.Load4(base + 16);
     uint4 c = lightDataBuf.Load4(base + 32);
@@ -78,7 +86,10 @@ float3 accumulateClusterLights(float3 P, float3 N, float3 V,
     uint cidx = clusterIndexFromScreen(screen_uv, view_depth, clusterParams);
     uint2 oc = clusterOffsetsBuf[cidx];
     uint offset = oc.x;
-    uint count  = oc.y;
+    // Never trust the SSBO count alone: clamp to the CPU-enforced per-cluster
+    // cap (MAX_LIGHTS_PER_CLUSTER) so a stale or partially-uploaded offsets
+    // buffer cannot spin this loop for up to 2^32 iterations.
+    uint count  = min(oc.y, clusterParams.maxPerCluster.x);
     float3 acc = float3(0, 0, 0);
     for (uint i = 0; i < count; ++i) {
         uint header_idx = lightIndicesBuf[offset + i];

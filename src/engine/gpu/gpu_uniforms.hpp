@@ -363,7 +363,7 @@ struct alignas(16) ClusterParamsUniforms {
     glm::vec4 screenSize;     // (width, height, 1/width, 1/height)
     glm::vec4 zPlanes;        // (near, far, log(far/near), 1/log(far/near))
     glm::uvec4 gridDim;       // (X, Y, Z, totalLightCount)
-    glm::uvec4 maxPerCluster; // (max_lights_per_cluster, _, _, _)
+    glm::uvec4 maxPerCluster; // (max_lights_per_cluster, light buffer capacity, _, _)
 };
 
 } // namespace mmo::engine::gpu

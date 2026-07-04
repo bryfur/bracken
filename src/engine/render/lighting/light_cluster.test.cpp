@@ -7,6 +7,8 @@
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/ext/matrix_transform.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <random>
 
 namespace {
@@ -53,6 +55,31 @@ struct CpuOnlyClusterGrid {
         g.build();
     }
 };
+
+// Replicates the shader-side lookup in clusters.hlsli (clusterZSlice +
+// clusterIndexFromScreen, INCLUDING the `1 - uv.y` flip) so the CPU<->shader
+// screen-orientation contract is pinned by a CPU test. screen_uv is
+// SV_Position-style: (0,0) = top-left of the screen.
+uint32_t shader_cluster_index(glm::vec2 screen_uv, float view_depth, const ClusterParams& cp) {
+    auto clamp_dim = [](float v, uint32_t dim) {
+        return static_cast<uint32_t>(std::clamp(v, 0.0f, static_cast<float>(dim - 1)));
+    };
+    float depth = std::max(view_depth, cp.zPlanes.x);
+    float t = std::log(depth / cp.zPlanes.x) * cp.zPlanes.w;
+    uint32_t cz = clamp_dim(std::floor(t * static_cast<float>(cp.gridDim.z)), cp.gridDim.z);
+    uint32_t cx = clamp_dim(std::floor(screen_uv.x * static_cast<float>(cp.gridDim.x)), cp.gridDim.x);
+    uint32_t cy = clamp_dim(std::floor((1.0f - screen_uv.y) * static_cast<float>(cp.gridDim.y)), cp.gridDim.y);
+    return (cz * cp.gridDim.y + cy) * cp.gridDim.x + cx;
+}
+
+// Unprojects an NDC (x, y) + positive forward depth to a view-space position,
+// mirroring light_cluster.cpp's unproject_corner().
+glm::vec3 view_pos_from_ndc(const glm::mat4& inv_proj, float ndc_x, float ndc_y, float depth) {
+    glm::vec4 v = inv_proj * glm::vec4(ndc_x, ndc_y, 0.0f, 1.0f);
+    v /= v.w;
+    float t = -depth / v.z;
+    return {v.x * t, v.y * t, -depth};
+}
 
 } // namespace
 
@@ -165,9 +192,8 @@ TEST(ClusterGrid, LightLimitTruncatesPastMaxLights) {
     EXPECT_EQ(cg.g.total_lights(), MAX_LIGHTS);
 }
 
-TEST(ClusterGrid, ParallelBuildIsDeterministic) {
+TEST(ClusterGrid, BuildIsDeterministic) {
     // Build twice with identical inputs; offsets and indices must match exactly.
-    // Verifies the cluster-parallel implementation has no race-induced nondeterminism.
     std::mt19937 rng(987654);
     std::uniform_real_distribution<float> px(-30.0f, 30.0f);
     std::uniform_real_distribution<float> py(-10.0f, 10.0f);
@@ -196,4 +222,138 @@ TEST(LightStruct, SizesMatchSpec) {
     EXPECT_EQ(sizeof(PointLight), 32u);
     EXPECT_EQ(sizeof(SpotLight), 64u);
     EXPECT_EQ(sizeof(LightHeader), 8u);
+}
+
+TEST(ClusterGrid, ParamsCarryShaderContract) {
+    // cluster_lighting.hlsli clamps its per-cluster loop with maxPerCluster.x
+    // and derives the light-payload section offsets from maxPerCluster.y (the
+    // light-data buffer capacity). Pin both here so the uniform the shader
+    // depends on is always populated.
+    CpuOnlyClusterGrid cg;
+    cg.run(make_camera(1920, 1080), 1920, 1080, 0.1f, 100.0f, {}, {});
+    const auto& mp = cg.g.params().maxPerCluster;
+    EXPECT_EQ(mp.x, MAX_LIGHTS_PER_CLUSTER);
+    EXPECT_EQ(mp.y, MAX_LIGHTS); // default capacity when init() wasn't given one
+}
+
+TEST(ClusterGrid, ShaderScreenLookupMatchesCpuBinningOrientation) {
+    // Regression for the vertical flip between CPU binning (cy = 0 <=> NDC
+    // y = -1 <=> BOTTOM of screen) and the shader's SV_Position-derived uv
+    // (y = 0 = TOP of screen): clusterIndexFromScreen must flip Y.
+    CameraState cam = make_camera(1920, 1080); // near 0.1, far 100
+    const glm::mat4 inv_proj = glm::inverse(cam.projection);
+
+    // A point light near the BOTTOM of the screen: NDC y = -0.9 at depth 10.
+    const float ndc_x = 0.0f;
+    const float ndc_y = -0.9f;
+    const float depth = 10.0f;
+    PointLight p{};
+    p.position = view_pos_from_ndc(inv_proj, ndc_x, ndc_y, depth); // view == world (identity view)
+    p.radius = 0.5f;
+    p.color = glm::vec3(1.0f);
+    p.intensity = 1.0f;
+
+    CpuOnlyClusterGrid cg;
+    cg.run(cam, 1920, 1080, 0.1f, 100.0f, {p}, {});
+    const auto& offsets = cg.g.cluster_offsets();
+    ASSERT_EQ(offsets.size(), CLUSTER_COUNT * 2u);
+
+    // A fragment at the light's center: SV_Position uv has y = 0 at the top,
+    // so NDC y = -0.9 (bottom) is uv.y = 0.95.
+    const glm::vec2 screen_uv(ndc_x * 0.5f + 0.5f, 1.0f - (ndc_y * 0.5f + 0.5f));
+    const uint32_t cidx = shader_cluster_index(screen_uv, depth, cg.g.params());
+    ASSERT_LT(cidx, CLUSTER_COUNT);
+    EXPECT_GE(offsets[cidx * 2 + 1], 1u)
+        << "shader-side screen lookup must land in the cluster the CPU binned the light into";
+
+    // The pre-fix (unflipped) lookup mirrored the row to the TOP of the screen;
+    // feeding the vertically mirrored uv reproduces it and must find nothing.
+    const uint32_t cidx_mirrored = shader_cluster_index({screen_uv.x, 1.0f - screen_uv.y}, depth, cg.g.params());
+    EXPECT_EQ(offsets[cidx_mirrored * 2 + 1], 0u)
+        << "a bottom-of-screen light must not be visible through the top-row (unflipped) lookup";
+}
+
+TEST(ClusterGrid, BinnedClustersCoverAllLitFragments) {
+    // Contract of the per-light cluster-range insertion: any fragment within a
+    // light's radius must find that light via the shader-side cluster lookup.
+    std::mt19937 rng(2024);
+    std::uniform_real_distribution<float> px(-30.0f, 30.0f);
+    std::uniform_real_distribution<float> py(-10.0f, 10.0f);
+    std::uniform_real_distribution<float> pz(-80.0f, -1.0f);
+    std::uniform_real_distribution<float> pr(0.5f, 6.0f);
+    std::vector<PointLight> lights;
+    for (int i = 0; i < 64; ++i) {
+        PointLight p{};
+        p.position = glm::vec3(px(rng), py(rng), pz(rng));
+        p.radius = pr(rng);
+        p.color = glm::vec3(1.0f);
+        p.intensity = 1.0f;
+        lights.push_back(p);
+    }
+
+    const float near_plane = 0.1f;
+    const float far_plane = 100.0f;
+    CameraState cam = make_camera(1920, 1080, 60.0f, 16.0f / 9.0f, near_plane, far_plane);
+    CpuOnlyClusterGrid cg;
+    cg.run(cam, 1920, 1080, near_plane, far_plane, lights, {});
+
+    const glm::mat4 inv_proj = glm::inverse(cam.projection);
+    const auto& offsets = cg.g.cluster_offsets();
+    const auto& indices = cg.g.light_indices();
+
+    std::uniform_real_distribution<float> ndc(-0.9f, 0.9f);
+    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+    int checked = 0;
+    for (int s = 0; s < 2000; ++s) {
+        const float nx = ndc(rng);
+        const float ny = ndc(rng);
+        // Log-uniform depth strictly inside [near, far].
+        const float depth = near_plane * 1.5f * std::pow(far_plane * 0.9f / (near_plane * 1.5f), unit(rng));
+        const glm::vec3 frag = view_pos_from_ndc(inv_proj, nx, ny, depth);
+
+        const glm::vec2 screen_uv(nx * 0.5f + 0.5f, 1.0f - (ny * 0.5f + 0.5f));
+        const uint32_t cidx = shader_cluster_index(screen_uv, depth, cg.g.params());
+        const uint32_t off = offsets[cidx * 2 + 0];
+        const uint32_t cnt = offsets[cidx * 2 + 1];
+
+        for (uint32_t j = 0; j < lights.size(); ++j) {
+            // Strictly-inside margin avoids FP disagreement at the exact radius.
+            if (glm::distance(frag, lights[j].position) >= lights[j].radius * 0.95f) {
+                continue;
+            }
+            const auto begin = indices.begin() + off;
+            const bool found = std::find(begin, begin + cnt, j) != begin + cnt;
+            EXPECT_TRUE(found) << "light " << j << " lights fragment at ndc(" << nx << ", " << ny << ") depth "
+                               << depth << " but is missing from cluster " << cidx;
+            ++checked;
+        }
+    }
+    // The sample set must actually have exercised lit fragments.
+    EXPECT_GT(checked, 0);
+}
+
+TEST(ClusterGrid, PerClusterCountNeverExceedsCap) {
+    // 150 identical overlapping lights: every touched cluster must truncate at
+    // MAX_LIGHTS_PER_CLUSTER, keeping the lowest light indices.
+    std::vector<PointLight> lights;
+    for (int i = 0; i < 150; ++i) {
+        PointLight p{};
+        p.position = glm::vec3(0.0f, 0.0f, -10.0f);
+        p.radius = 3.0f;
+        p.color = glm::vec3(1.0f);
+        p.intensity = 1.0f;
+        lights.push_back(p);
+    }
+
+    CpuOnlyClusterGrid cg;
+    cg.run(make_camera(1920, 1080), 1920, 1080, 0.1f, 100.0f, lights, {});
+
+    const auto& offsets = cg.g.cluster_offsets();
+    uint32_t max_count = 0;
+    for (uint32_t c = 0; c < CLUSTER_COUNT; ++c) {
+        const uint32_t cnt = offsets[c * 2 + 1];
+        EXPECT_LE(cnt, MAX_LIGHTS_PER_CLUSTER);
+        max_count = std::max(max_count, cnt);
+    }
+    EXPECT_EQ(max_count, MAX_LIGHTS_PER_CLUSTER);
 }

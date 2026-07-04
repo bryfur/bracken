@@ -22,7 +22,10 @@ struct alignas(16) ClusterParams {
     glm::vec4 screenSize;     // (width, height, 1/width, 1/height)
     glm::vec4 zPlanes;        // (near, far, log(far/near), 1/log(far/near))
     glm::uvec4 gridDim;       // (X, Y, Z, totalLightCount)
-    glm::uvec4 maxPerCluster; // (max_lights_per_cluster, _, _, _)
+    // .x = per-cluster light cap (shader clamps its loop with it);
+    // .y = light-data buffer capacity in lights (max_lights_) — the shader
+    //      derives its payload section offsets from it (cluster_lighting.hlsli).
+    glm::uvec4 maxPerCluster;
 };
 
 class ClusterGrid {
@@ -44,7 +47,8 @@ public:
     void add_spot_light(const SpotLight& l);
 
     // CPU-side bin lights into clusters; populates the per-cluster offset/count
-    // table and concatenated light index list.
+    // table and concatenated light index list. Per-light cluster-range
+    // insertion: O(lights x touched clusters), not O(lights x CLUSTER_COUNT).
     void build();
 
     // Upload light data + cluster offsets + light indices SSBOs in one shared
@@ -104,16 +108,19 @@ private:
     std::vector<uint8_t> light_staging_;        // scratch for upload() packing
 
     ClusterParams params_{};
-    glm::mat4 last_inv_projection_{0.0f};
+    glm::mat4 last_projection_{0.0f};
     float last_near_ = 0.0f;
     float last_far_ = 0.0f;
     bool bounds_valid_ = false;
     bool warned_truncation_ = false;
 
-    // FNV-1a hash of cluster_offsets_ at last upload — skips the ~27KB offsets
-    // transfer when bin layout is unchanged frame-over-frame.
-    uint64_t last_offsets_hash_ = 0;
-    bool offsets_uploaded_ = false;
+    // Dirty flag for cluster_offsets_, set while build() packs the table —
+    // skips the ~27KB offsets transfer when bin layout is unchanged
+    // frame-over-frame. Cleared by upload().
+    bool offsets_dirty_ = true;
+    // True when cluster_offsets_ is known to be all zeros — lets the no-lights
+    // build() skip re-zeroing (and re-uploading) an already-zero table.
+    bool offsets_all_zero_ = false;
 
     // GPU buffers (storage buffers, dynamic).
     std::unique_ptr<gpu::GPUBuffer> light_data_buf_;

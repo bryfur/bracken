@@ -1,13 +1,12 @@
 #include "engine/render/lighting/light_cluster.hpp"
 
-#include "engine/core/jobs/parallel_for.hpp"
 #include "engine/core/profiler.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <glm/gtc/matrix_inverse.hpp>
+#include <limits>
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_log.h>
 
@@ -47,7 +46,10 @@ constexpr size_t light_indices_buffer_size() {
 
 // View-space frustum corner for cluster (cx,cy,cz) at the given Z slice.
 glm::vec3 unproject_corner(uint32_t cx, uint32_t cy, float view_z, const glm::mat4& invProj) {
-    // Cluster (cx,cy) maps to NDC tile [-1..1] in X and Y.
+    // Cluster (cx,cy) maps to NDC tile [-1..1] in X and Y: cy = 0 is NDC
+    // y = -1, the BOTTOM of the screen. The shader lookup starts from a
+    // top-left-origin SV_Position uv, so clusterIndexFromScreen
+    // (clusters.hlsli) flips Y to land in this row convention.
     float ndc_x = (static_cast<float>(cx) / CLUSTER_DIM_X) * 2.0f - 1.0f;
     float ndc_y = (static_cast<float>(cy) / CLUSTER_DIM_Y) * 2.0f - 1.0f;
     glm::vec4 clip(ndc_x, ndc_y, 0.0f, 1.0f);
@@ -68,16 +70,6 @@ float exp_z_slice(uint32_t z, float near_z, float far_z) {
     return near_z * std::pow(far_z / near_z, static_cast<float>(z) / CLUSTER_DIM_Z);
 }
 
-uint64_t fnv1a64(const void* data, size_t size) {
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    uint64_t hash = 14695981039346656037ull;
-    for (size_t i = 0; i < size; ++i) {
-        hash ^= bytes[i];
-        hash *= 1099511628211ull;
-    }
-    return hash;
-}
-
 } // namespace
 
 ClusterGrid::~ClusterGrid() {
@@ -93,6 +85,8 @@ bool ClusterGrid::init(gpu::GPUDevice& device, uint32_t max_lights) {
     headers_.reserve(max_lights_);
     cluster_bounds_.assign(CLUSTER_COUNT, ClusterBounds{});
     cluster_offsets_.assign(CLUSTER_COUNT * 2, 0u);
+    offsets_all_zero_ = true;
+    offsets_dirty_ = true;
     light_indices_.reserve(CLUSTER_COUNT * 4);
     bins_.assign(CLUSTER_COUNT, {});
     for (auto& b : bins_) b.reserve(8);
@@ -124,8 +118,8 @@ void ClusterGrid::shutdown() {
     bins_.clear();
     view_lights_.clear();
     light_staging_.clear();
-    last_offsets_hash_ = 0;
-    offsets_uploaded_ = false;
+    offsets_dirty_ = true;
+    offsets_all_zero_ = false;
     device_ = nullptr;
 }
 
@@ -138,6 +132,8 @@ void ClusterGrid::begin_frame(const scene::CameraState& camera, uint32_t screen_
     }
     if (cluster_offsets_.size() != CLUSTER_COUNT * 2) {
         cluster_offsets_.assign(CLUSTER_COUNT * 2, 0u);
+        offsets_all_zero_ = true;
+        offsets_dirty_ = true;
     }
     if (bins_.size() != CLUSTER_COUNT) {
         bins_.assign(CLUSTER_COUNT, {});
@@ -147,12 +143,19 @@ void ClusterGrid::begin_frame(const scene::CameraState& camera, uint32_t screen_
     spots_.clear();
     headers_.clear();
     light_indices_.clear();
-    std::fill(cluster_offsets_.begin(), cluster_offsets_.end(), 0u);
+    // cluster_offsets_ is NOT cleared here: it keeps last build()'s packing so
+    // build() can diff against it (the upload dirty check) and rewrites it.
     for (auto& bin : bins_) bin.clear();
     warned_truncation_ = false;
 
     params_.view = camera.view;
-    params_.invProjection = glm::inverse(camera.projection);
+    // The 4x4 inverse (~80 flops) only depends on the projection — recompute it
+    // when the matrix actually changes, not every frame.
+    const bool projection_changed = camera.projection != last_projection_;
+    if (projection_changed) {
+        params_.invProjection = glm::inverse(camera.projection);
+        last_projection_ = camera.projection;
+    }
     params_.screenSize = glm::vec4(static_cast<float>(screen_w), static_cast<float>(screen_h),
                                    screen_w > 0 ? 1.0f / static_cast<float>(screen_w) : 0.0f,
                                    screen_h > 0 ? 1.0f / static_cast<float>(screen_h) : 0.0f);
@@ -161,15 +164,14 @@ void ClusterGrid::begin_frame(const scene::CameraState& camera, uint32_t screen_
     float log_ratio = std::log(far_safe / near_safe);
     params_.zPlanes = glm::vec4(near_safe, far_safe, log_ratio, log_ratio > 0.0f ? 1.0f / log_ratio : 0.0f);
     params_.gridDim = glm::uvec4(CLUSTER_DIM_X, CLUSTER_DIM_Y, CLUSTER_DIM_Z, 0u);
-    params_.maxPerCluster = glm::uvec4(MAX_LIGHTS_PER_CLUSTER, 0u, 0u, 0u);
+    // .x caps the shader's per-cluster loop; .y is the light-data buffer
+    // capacity the shader derives payload offsets from (cluster_lighting.hlsli).
+    params_.maxPerCluster = glm::uvec4(MAX_LIGHTS_PER_CLUSTER, max_lights_, 0u, 0u);
 
-    // Cluster AABBs only depend on the projection. Recompute when it changes;
-    // otherwise the previous frame's bounds are still valid.
-    const bool projection_changed = !bounds_valid_ || params_.invProjection != last_inv_projection_ ||
-                                    near_safe != last_near_ || far_safe != last_far_;
-    if (projection_changed) {
+    // Cluster AABBs only depend on the projection + near/far. Recompute when
+    // they change; otherwise the previous frame's bounds are still valid.
+    if (!bounds_valid_ || projection_changed || near_safe != last_near_ || far_safe != last_far_) {
         compute_cluster_bounds();
-        last_inv_projection_ = params_.invProjection;
         last_near_ = near_safe;
         last_far_ = far_safe;
         bounds_valid_ = true;
@@ -247,9 +249,14 @@ void ClusterGrid::build() {
 
     const std::size_t light_count = headers_.size();
     if (light_count == 0) {
-        // No dynamic lights: bins are already empty from begin_frame(). Skip the
-        // 3456-cluster parallel walk entirely — it would just be empty inner loops
-        // but the dispatch overhead is real.
+        // No dynamic lights: bins/indices are already empty from begin_frame().
+        // The offsets table persists across frames for the upload dirty check —
+        // it only needs (re)zeroing if the previous build wrote any counts.
+        if (!offsets_all_zero_) {
+            std::fill(cluster_offsets_.begin(), cluster_offsets_.end(), 0u);
+            offsets_all_zero_ = true;
+            offsets_dirty_ = true;
+        }
         return;
     }
     view_lights_.resize(light_count);
@@ -270,46 +277,125 @@ void ClusterGrid::build() {
         view_lights_[i].radius = radius;
     }
 
-    std::atomic<bool> truncated{false};
+    bool truncated = false;
 
-    // Parallelize over clusters. Each cluster owns its bins_[c] vector exclusively.
-    core::jobs::parallel_for(0u, static_cast<std::size_t>(CLUSTER_COUNT), [&](std::size_t begin, std::size_t end) {
-        for (std::size_t c = begin; c < end; ++c) {
-            const auto& cb = cluster_bounds_[c];
-            auto& bin = bins_[c];
-            for (std::size_t i = 0; i < light_count; ++i) {
-                const auto& vl = view_lights_[i];
-                if (vl.radius <= 0.0f) {
-                    continue;
+    // Per-light cluster-range insertion: instead of testing every one of the
+    // CLUSTER_COUNT clusters against every light (O(clusters x lights)),
+    // compute each light's conservative cluster-index box — Z slices from the
+    // inverse of exp_z_slice, X/Y tiles from the projected NDC extent of the
+    // sphere's view-space AABB — then run the exact sphere/AABB refine only
+    // inside it: O(lights x touched clusters). Lights insert in ascending index
+    // order, so per-cluster lists keep the same ordering the previous
+    // per-cluster scan produced.
+    const float near_z = params_.zPlanes.x;
+    const float far_z = params_.zPlanes.y;
+    const float dim_z = static_cast<float>(CLUSTER_DIM_Z);
+    auto z_slice_of = [&](float depth) {
+        float t = std::log(std::max(depth, near_z) / near_z) * params_.zPlanes.w;
+        return static_cast<uint32_t>(std::clamp(std::floor(t * dim_z), 0.0f, dim_z - 1.0f));
+    };
+    // NDC -> tile index, matching unproject_corner(): index 0 starts at NDC -1
+    // (left / bottom of screen).
+    auto tile_of = [](float ndc, uint32_t dim) {
+        float t = std::floor((ndc * 0.5f + 0.5f) * static_cast<float>(dim));
+        return static_cast<uint32_t>(std::clamp(t, 0.0f, static_cast<float>(dim - 1)));
+    };
+
+    for (std::size_t i = 0; i < light_count; ++i) {
+        const auto& vl = view_lights_[i];
+        if (vl.radius <= 0.0f) {
+            continue;
+        }
+        // Depth range covered by the sphere (positive distance forward of camera).
+        const float depth_min = -vl.view_pos.z - vl.radius;
+        const float depth_max = -vl.view_pos.z + vl.radius;
+        if (depth_max < near_z || depth_min > far_z) {
+            continue; // entirely in front of the near or beyond the far plane
+        }
+        const uint32_t z0 = z_slice_of(depth_min);
+        const uint32_t z1 = z_slice_of(depth_max);
+
+        // X/Y tile range from the NDC bounds of the sphere's view-space AABB
+        // corners (the projective image of a convex box is the hull of its
+        // projected corners, so this bounds every lit point). If the sphere
+        // reaches the near plane its projection is unbounded — fall back to the
+        // full range and let the sphere/AABB refine reject clusters.
+        uint32_t x0 = 0, x1 = CLUSTER_DIM_X - 1;
+        uint32_t y0 = 0, y1 = CLUSTER_DIM_Y - 1;
+        if (depth_min >= near_z) {
+            const glm::vec3 bb_min = vl.view_pos - glm::vec3(vl.radius);
+            const glm::vec3 bb_max = vl.view_pos + glm::vec3(vl.radius);
+            glm::vec2 ndc_min(std::numeric_limits<float>::max());
+            glm::vec2 ndc_max(std::numeric_limits<float>::lowest());
+            bool projected = true;
+            for (int corner = 0; corner < 8; ++corner) {
+                const glm::vec4 clip = last_projection_ * glm::vec4((corner & 1) ? bb_max.x : bb_min.x,
+                                                                    (corner & 2) ? bb_max.y : bb_min.y,
+                                                                    (corner & 4) ? bb_max.z : bb_min.z, 1.0f);
+                if (clip.w <= 1e-6f) {
+                    projected = false; // degenerate projection — keep full range
+                    break;
                 }
-                if (sphere_intersects_aabb(vl.view_pos, vl.radius, cb.view_min, cb.view_max)) {
+                const glm::vec2 ndc = glm::vec2(clip) / clip.w;
+                ndc_min = glm::min(ndc_min, ndc);
+                ndc_max = glm::max(ndc_max, ndc);
+            }
+            if (projected) {
+                if (ndc_max.x < -1.0f || ndc_min.x > 1.0f || ndc_max.y < -1.0f || ndc_min.y > 1.0f) {
+                    continue; // fully outside the frustum sideways
+                }
+                x0 = tile_of(ndc_min.x, CLUSTER_DIM_X);
+                x1 = tile_of(ndc_max.x, CLUSTER_DIM_X);
+                y0 = tile_of(ndc_min.y, CLUSTER_DIM_Y);
+                y1 = tile_of(ndc_max.y, CLUSTER_DIM_Y);
+            }
+        }
+
+        for (uint32_t z = z0; z <= z1; ++z) {
+            for (uint32_t y = y0; y <= y1; ++y) {
+                for (uint32_t x = x0; x <= x1; ++x) {
+                    const uint32_t c = (z * CLUSTER_DIM_Y + y) * CLUSTER_DIM_X + x;
+                    const auto& cb = cluster_bounds_[c];
+                    if (!sphere_intersects_aabb(vl.view_pos, vl.radius, cb.view_min, cb.view_max)) {
+                        continue;
+                    }
+                    auto& bin = bins_[c];
                     if (bin.size() < MAX_LIGHTS_PER_CLUSTER) {
                         bin.push_back(static_cast<uint32_t>(i));
                     } else {
-                        truncated.store(true, std::memory_order_relaxed);
-                        break;
+                        truncated = true;
                     }
                 }
             }
         }
-    });
+    }
 
-    if (truncated.load(std::memory_order_relaxed) && !warned_truncation_) {
+    if (truncated && !warned_truncation_) {
         SDL_Log("ClusterGrid: at least one cluster exceeded MAX_LIGHTS_PER_CLUSTER=%u, truncating",
                 MAX_LIGHTS_PER_CLUSTER);
         warned_truncation_ = true;
     }
 
-    // Pack offsets + indices (serial, deterministic order across clusters).
+    // Pack offsets + indices (serial, deterministic order across clusters),
+    // detecting changes in-place — this dirty flag replaces the old byte-wise
+    // FNV hash over the whole ~27KB table.
     light_indices_.clear();
     uint32_t offset = 0;
+    bool offsets_changed = false;
     for (uint32_t c = 0; c < CLUSTER_COUNT; ++c) {
-        uint32_t count = static_cast<uint32_t>(bins_[c].size());
-        cluster_offsets_[c * 2 + 0] = offset;
-        cluster_offsets_[c * 2 + 1] = count;
+        const uint32_t count = static_cast<uint32_t>(bins_[c].size());
+        if (cluster_offsets_[c * 2 + 0] != offset || cluster_offsets_[c * 2 + 1] != count) {
+            cluster_offsets_[c * 2 + 0] = offset;
+            cluster_offsets_[c * 2 + 1] = count;
+            offsets_changed = true;
+        }
         light_indices_.insert(light_indices_.end(), bins_[c].begin(), bins_[c].end());
         offset += count;
     }
+    if (offsets_changed) {
+        offsets_dirty_ = true;
+    }
+    offsets_all_zero_ = light_indices_.empty();
 
     params_.gridDim.w = static_cast<uint32_t>(headers_.size());
 }
@@ -336,7 +422,8 @@ void ClusterGrid::upload(SDL_GPUCopyPass* copy_pass) {
     }
 
     // Pack the light data buffer into reusable member scratch. Section offsets
-    // stay capacity-based (GPU layout unchanged — shaders untouched); only the
+    // are capacity-based; the shader derives the same offsets from the capacity
+    // in ClusterParams::maxPerCluster.y (cluster_lighting.hlsli). Only the
     // transfer shrinks to the last used byte of the farthest populated section.
     // Bytes between a section's used prefix and its capacity end are stale but
     // never read: the shader bounds every access by the counts in the header.
@@ -371,16 +458,13 @@ void ClusterGrid::upload(SDL_GPUCopyPass* copy_pass) {
         upload_size = spots_off + spots_.size() * sizeof(SpotLight);
     }
 
-    // Offsets only need re-uploading when bin layout moved.
-    const uint64_t offsets_hash = fnv1a64(cluster_offsets_.data(), cluster_offsets_.size() * sizeof(uint32_t));
-    const bool offsets_dirty = !offsets_uploaded_ || offsets_hash != last_offsets_hash_;
-
     light_data_buf_->update(copy_pass, staging, upload_size);
 
-    if (offsets_dirty) {
+    // Offsets only need re-uploading when bin layout moved (build() sets the
+    // dirty flag while packing the table).
+    if (offsets_dirty_) {
         cluster_offsets_buf_->update(copy_pass, cluster_offsets_.data(), cluster_offsets_.size() * sizeof(uint32_t));
-        last_offsets_hash_ = offsets_hash;
-        offsets_uploaded_ = true;
+        offsets_dirty_ = false;
     }
 
     // Upload the used index prefix; with zero indices every cluster's count is 0
