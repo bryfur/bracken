@@ -223,37 +223,41 @@ TEST(CompositeUniformsLayout, DefaultValues) {
 // VolumetricFogUniforms - matches volumetric_fog.frag.hlsl
 // =============================================================================
 
-TEST(VolumetricFogUniformsLayout, SizeIs224Bytes) {
-    // 2 mat4 (128) + 4 * vec3+float (64) + 8 floats (32) = 224
-    EXPECT_EQ(sizeof(VolumetricFogUniforms), 224u);
+TEST(VolumetricFogUniformsLayout, SizeIs448Bytes) {
+    // 5 mat4 (320) + 2 vec4 (32) + 4 * vec3+float (64) + 8 floats (32) = 448
+    EXPECT_EQ(sizeof(VolumetricFogUniforms), 448u);
 }
 
 TEST(VolumetricFogUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(VolumetricFogUniforms, invViewProjection), 0u);
     EXPECT_EQ(offsetof(VolumetricFogUniforms, shadowLightViewProjection), 64u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, lightDir), 128u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, fogDensity), 140u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, lightColor), 144u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, scatterStrength), 156u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, fogColor), 160u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, fogHeight), 172u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, cameraPos), 176u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, fogFalloff), 188u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, nearPlane), 192u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, farPlane), 196u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, godRaysEnabled), 200u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, shadowAtlasTexel), 208u);
-    EXPECT_EQ(offsetof(VolumetricFogUniforms, shadowBias), 212u);
+    // 4 mat4 = 256 bytes
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, cascadeSplits), 320u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, shadowBias), 336u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, lightDir), 352u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, fogDensity), 364u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, lightColor), 368u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, scatterStrength), 380u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, fogColor), 384u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, fogHeight), 396u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, cameraPos), 400u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, fogFalloff), 412u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, startDist), 416u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, maxDist), 420u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, godRaysEnabled), 424u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, densityMultiplier), 428u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, shadowAtlasTexel), 432u);
+    EXPECT_EQ(offsetof(VolumetricFogUniforms, lastActiveSplit), 436u);
 }
 
 TEST(VolumetricFogUniformsLayout, DefaultValues) {
     VolumetricFogUniforms u;
-    EXPECT_FLOAT_EQ(u.fogDensity, 0.02f);
-    EXPECT_FLOAT_EQ(u.scatterStrength, 0.3f);
-    EXPECT_FLOAT_EQ(u.fogHeight, 50.0f);
-    EXPECT_FLOAT_EQ(u.fogFalloff, 0.01f);
-    EXPECT_FLOAT_EQ(u.nearPlane, 0.1f);
-    EXPECT_FLOAT_EQ(u.farPlane, 5000.0f);
+    EXPECT_FLOAT_EQ(u.fogDensity, 0.0015f);
+    EXPECT_FLOAT_EQ(u.scatterStrength, 0.25f);
+    EXPECT_FLOAT_EQ(u.fogHeight, 100.0f);
+    EXPECT_FLOAT_EQ(u.fogFalloff, 0.005f);
+    EXPECT_FLOAT_EQ(u.startDist, 100.0f);
+    EXPECT_FLOAT_EQ(u.maxDist, 3000.0f);
     EXPECT_FLOAT_EQ(u.godRaysEnabled, 1.0f);
 }
 

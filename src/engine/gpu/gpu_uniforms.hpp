@@ -330,24 +330,29 @@ struct alignas(16) BloomUpsampleUniforms {
 
 /**
  * Volumetric fog pass fragment uniforms (set 3, b0)
+ * God rays sample the whole CSM atlas: the shader picks a cascade per
+ * ray-march sample from its camera distance (atlas quadrant i%2, i/2).
+ * Defaults mirror the EnvironmentState volumetric-fog defaults.
  */
 struct alignas(16) VolumetricFogUniforms {
     glm::mat4 invViewProjection{};
-    glm::mat4 shadowLightViewProjection{};
+    glm::mat4 shadowLightViewProjection[4]{}; // per-cascade light-space matrices
+    glm::vec4 cascadeSplits{};                // view-space far distance per cascade
+    glm::vec4 shadowBias{};                   // per-cascade depth compare bias in light-space [0,1] units
     glm::vec3 lightDir{};
-    float fogDensity = 0.02f;
-    glm::vec3 lightColor{};
-    float scatterStrength = 0.3f;
-    glm::vec3 fogColor{};
-    float fogHeight = 50.0f;
+    float fogDensity = 0.0015f;
+    glm::vec3 lightColor{1.0f, 0.9f, 0.7f};
+    float scatterStrength = 0.25f;
+    glm::vec3 fogColor{0.45f, 0.56f, 0.74f};
+    float fogHeight = 100.0f;
     glm::vec3 cameraPos{};
-    float fogFalloff = 0.01f;
-    float nearPlane = 0.1f;
-    float farPlane = 5000.0f;
+    float fogFalloff = 0.005f;
+    float startDist = 100.0f;      // near dead zone: no volumetric fog closer than this
+    float maxDist = 3000.0f;       // ray-march distance cap in world units
     float godRaysEnabled = 1.0f;
     float densityMultiplier = 1.0f;
-    float shadowAtlasTexel = 0.0f; // 1 / shadow atlas width (cascade 0 = top-left quadrant)
-    float shadowBias = 0.001f;     // depth compare bias in light-space [0,1] units
+    float shadowAtlasTexel = 0.0f; // 1 / shadow atlas width
+    float lastActiveSplit = 0.0f;  // far distance of the last active cascade (lit beyond it)
     float _padding0 = 0.0f;
     float _padding1 = 0.0f;
 };

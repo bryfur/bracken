@@ -73,7 +73,8 @@ terrain casters.
 `fullscreen.vert` (fullscreen triangle, no vertex input): `ssao` / `gtao` +
 `blur_ao` (bilateral), `bloom_downsample` (13-tap) / `bloom_upsample` (9-tap
 tent, additive), `volumetric_fog` (ray march with god rays from the shadow
-atlas), `composite` (scene × AO + bloom + fog, exposure + tonemap + gamma →
+atlas — cascade picked per sample by camera distance; sky pixels march too),
+`composite` (scene × AO + bloom + fog, exposure + tonemap + gamma →
 LDR), `fxaa` (FXAA 3.11 on the tonemapped LDR image).
 
 **Effects/UI** — `particle.frag`: unlit additive HDR particles. `ui`/`text`:

@@ -91,8 +91,49 @@ SDL_GPUTexture* VolumetricFog::fog_texture() const {
     return nullptr;
 }
 
+gpu::VolumetricFogUniforms VolumetricFog::build_uniforms(const ShadowMap& shadow_map,
+                                                         const scene::CameraState& camera,
+                                                         const EnvironmentState& env, bool god_rays_enabled,
+                                                         bool fog_enabled, float density_multiplier) {
+    gpu::VolumetricFogUniforms uniforms = {};
+    if (camera.view_projection != cached_view_projection_) {
+        cached_view_projection_ = camera.view_projection;
+        cached_inv_view_projection_ = glm::inverse(camera.view_projection);
+    }
+    uniforms.invViewProjection = cached_inv_view_projection_;
+
+    // God rays sample every cascade; the shader picks one per march sample by
+    // camera distance. Inactive cascades clone the last active one (same
+    // scheme as ShadowMap::get_shadow_uniforms) so selection never reaches
+    // them past the lastActiveSplit early-out.
+    const auto& cascades = shadow_map.cascades();
+    const int last = std::max(shadow_map.active_cascades() - 1, 0);
+    for (int i = 0; i < CSM_MAX_CASCADES; ++i) {
+        const CascadeData& src = cascades[std::min(i, last)];
+        uniforms.shadowLightViewProjection[i] = src.light_view_projection;
+        uniforms.cascadeSplits[i] = src.split_depth;
+        uniforms.shadowBias[i] = 1.5f * src.texel_world / std::max(src.depth_range, 1e-6f);
+    }
+    uniforms.lastActiveSplit = cascades[last].split_depth;
+    uniforms.shadowAtlasTexel = 0.5f / static_cast<float>(shadow_map.resolution());
+
+    uniforms.lightDir = env.sun_dir;
+    uniforms.fogDensity = fog_enabled ? env.fog_volumetric_density : 0.0f;
+    uniforms.lightColor = env.fog_volumetric_sun_color;
+    uniforms.scatterStrength = env.fog_volumetric_scatter;
+    uniforms.fogColor = env.fog_color_horizon;
+    uniforms.fogHeight = env.fog_volumetric_height;
+    uniforms.cameraPos = camera.position;
+    uniforms.fogFalloff = env.fog_volumetric_falloff;
+    uniforms.startDist = env.fog_volumetric_start;
+    uniforms.maxDist = env.fog_volumetric_end;
+    uniforms.godRaysEnabled = god_rays_enabled ? 1.0f : 0.0f;
+    uniforms.densityMultiplier = density_multiplier;
+    return uniforms;
+}
+
 void VolumetricFog::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, SDL_GPUTexture* depth_texture,
-                           const ShadowMap& shadow_map, const scene::CameraState& camera, const glm::vec3& light_dir,
+                           const ShadowMap& shadow_map, const scene::CameraState& camera, const EnvironmentState& env,
                            bool god_rays_enabled, bool fog_enabled, float density_multiplier) {
     ENGINE_PROFILE_ZONE_COLOR("VolumetricFog::render", 0x16A085);
     if (!is_ready() || !cmd || !depth_texture) {
@@ -104,35 +145,8 @@ void VolumetricFog::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& reg
         return;
     }
 
-    // Build uniforms
-    gpu::VolumetricFogUniforms uniforms = {};
-    if (camera.view_projection != cached_view_projection_) {
-        cached_view_projection_ = camera.view_projection;
-        cached_inv_view_projection_ = glm::inverse(camera.view_projection);
-    }
-    uniforms.invViewProjection = cached_inv_view_projection_;
-    // Use cascade 0 (top-left atlas quadrant) for god rays
-    if (shadow_map.is_ready()) {
-        const auto& cascade0 = shadow_map.cascades()[0];
-        uniforms.shadowLightViewProjection = cascade0.light_view_projection;
-        uniforms.shadowAtlasTexel = 0.5f / static_cast<float>(shadow_map.resolution());
-        uniforms.shadowBias = 1.5f * cascade0.texel_world / cascade0.depth_range;
-    }
-    uniforms.lightDir = light_dir;
-    uniforms.fogDensity = 0.0015f;
-    uniforms.lightColor = glm::vec3(1.0f, 0.9f, 0.7f);
-    uniforms.scatterStrength = 0.25f;
-    uniforms.fogColor = glm::vec3(0.5f, 0.6f, 0.7f);
-    uniforms.fogHeight = 100.0f;
-    uniforms.cameraPos = camera.position;
-    uniforms.fogFalloff = 0.005f;
-    uniforms.nearPlane = 0.1f;
-    uniforms.farPlane = 5000.0f;
-    uniforms.godRaysEnabled = god_rays_enabled ? 1.0f : 0.0f;
-    uniforms.densityMultiplier = density_multiplier;
-    if (!fog_enabled) {
-        uniforms.fogDensity = 0.0f;
-    }
+    gpu::VolumetricFogUniforms uniforms =
+        build_uniforms(shadow_map, camera, env, god_rays_enabled, fog_enabled, density_multiplier);
 
     // Begin render pass to fog texture
     SDL_GPUColorTargetInfo color_target = {};

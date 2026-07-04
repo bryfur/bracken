@@ -4,6 +4,7 @@
 #include "engine/gpu/gpu_texture.hpp"
 #include "engine/gpu/gpu_uniforms.hpp"
 #include "engine/gpu/pipeline_registry.hpp"
+#include "engine/render/environment.hpp"
 #include "engine/render/shadow_map.hpp"
 #include "engine/scene/camera_state.hpp"
 #include <glm/glm.hpp>
@@ -45,16 +46,33 @@ public:
      * Must be called after the offscreen scene render and shadow passes,
      * but before the composite pass. No render pass should be active.
      *
+     * Sun direction/color, fog color, base density, and the height-falloff /
+     * march-range parameters all come from the EnvironmentState
+     * (fog_volumetric_* fields + sun_dir + fog_color_horizon). God rays
+     * sample every CSM cascade — the shader selects one per march sample by
+     * camera distance — and sky pixels are marched too, so shafts silhouette
+     * against the sky. Cost knob: the fixed step count in
+     * volumetric_fog.frag.hlsl (numSteps, 24) — every half-res pixel pays it,
+     * plus one shadow tap per step when god rays are on.
+     *
      * @param cmd         Active command buffer
      * @param registry    Pipeline registry
      * @param depth_texture  Offscreen scene depth texture
-     * @param shadow_map  Shadow map manager (uses cascade 0's atlas quadrant)
+     * @param shadow_map  Shadow map manager (all cascade atlas quadrants)
      * @param camera      Camera state for the frame
-     * @param light_dir   Directional light direction (normalized)
+     * @param env         Environment (sun, fog colors, volumetric fog params)
      */
     void render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, SDL_GPUTexture* depth_texture,
-                const ShadowMap& shadow_map, const scene::CameraState& camera, const glm::vec3& light_dir,
+                const ShadowMap& shadow_map, const scene::CameraState& camera, const EnvironmentState& env,
                 bool god_rays_enabled = true, bool fog_enabled = true, float density_multiplier = 1.0f);
+
+    /**
+     * Build the uniform block render() pushes. Pure CPU (no GPU state
+     * touched); public so the environment plumbing is unit-testable.
+     */
+    gpu::VolumetricFogUniforms build_uniforms(const ShadowMap& shadow_map, const scene::CameraState& camera,
+                                              const EnvironmentState& env, bool god_rays_enabled, bool fog_enabled,
+                                              float density_multiplier);
 
     /**
      * Get the fog result texture for the composite pass.

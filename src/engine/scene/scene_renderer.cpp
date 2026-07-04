@@ -714,10 +714,11 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
                 ENGINE_PROFILE_ZONE_COLOR("VolumetricFog", 0x16A085);
                 ENGINE_GPU_SCOPE(cmd, "VolumetricFog");
                 ENGINE_GPU_TIMER(gpu_timer_pool_, cmd, "VolumetricFog");
-                // Default fog_density is 0.05; treat as a multiplier on the renderer's base density.
+                // Default fog_density is 0.05; treat as a multiplier on the
+                // environment's base density (env_.fog_volumetric_density).
                 float fog_density_mul = gfx.fog_density / 0.05f;
                 volumetric_fog_->render(cmd, *pipeline_registry_, ao_->offscreen_depth()->handle(), *shadow_map_,
-                                        camera, light_dir_, god_rays_active, gfx.volumetric_fog, fog_density_mul);
+                                        camera, env_, god_rays_active, gfx.volumetric_fog, fog_density_mul);
                 fog_tex = volumetric_fog_->fog_texture();
             }
 
