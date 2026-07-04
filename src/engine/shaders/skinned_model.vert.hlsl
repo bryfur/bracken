@@ -1,0 +1,87 @@
+/**
+ * Skinned Model Vertex Shader - SDL3 GPU API
+ *
+ * Transforms 3D model vertices with skeletal animation.
+ * Bone matrices are read from a frame-global storage buffer of tightly packed
+ * palettes (joint_count matrices per entity, uploaded once per frame);
+ * paletteOffset selects this draw's palette.
+ */
+
+// Vertex input - locations match get_skinned_vertex_attributes() in gpu_types.hpp
+struct VSInput {
+    [[vk::location(0)]] float3 position : POSITION;
+    [[vk::location(1)]] float3 normal : NORMAL;
+    [[vk::location(2)]] float2 texCoord : TEXCOORD0;
+    [[vk::location(3)]] float4 color : COLOR0;
+    [[vk::location(4)]] float4 tangent : TANGENT;
+    [[vk::location(5)]] uint4 joints : BLENDINDICES;  // uint4 matches UBYTE4 vertex format
+    [[vk::location(6)]] float4 weights : BLENDWEIGHT;
+};
+
+// Vertex output / Fragment input
+struct VSOutput {
+    float4 position : SV_Position;
+    float3 fragPos : TEXCOORD0;
+    float3 normal : TEXCOORD1;
+    float2 texCoord : TEXCOORD2;
+    float4 vertexColor : TEXCOORD3;
+    float fogDistance : TEXCOORD4;
+    float viewDepth : TEXCOORD5;
+    float4 tangent : TEXCOORD6;  // xyz = world-space tangent, w = bitangent sign
+};
+
+// Uniform buffer - SDL3 GPU SPIR-V requires vertex uniforms in set 1
+[[vk::binding(0, 1)]]
+cbuffer TransformUniforms {
+    float4x4 model;
+    float4x4 view;
+    float4x4 projection;
+    float3 cameraPos;
+    float _padding0;
+    float4x4 normalMatrix;  // Pre-computed inverse-transpose of model matrix (CPU-side)
+    int useSkinning;
+    uint paletteOffset;     // start of this draw's palette in bonePalettes, in matrices
+    float2 _padding1;
+};
+
+// All skinned draws' bone palettes this frame, tightly packed
+// (vertex storage buffers live in set 0; matches model_instanced.vert.hlsl)
+[[vk::binding(0, 0)]]
+StructuredBuffer<float4x4> bonePalettes;
+
+VSOutput VSMain(VSInput input) {
+    VSOutput output;
+
+    // Always apply skeletal animation (this pipeline is only used for skinned models)
+    float4x4 skinMatrix =
+        input.weights.x * bonePalettes[paletteOffset + input.joints.x] +
+        input.weights.y * bonePalettes[paletteOffset + input.joints.y] +
+        input.weights.z * bonePalettes[paletteOffset + input.joints.z] +
+        input.weights.w * bonePalettes[paletteOffset + input.joints.w];
+
+    float4 localPos = mul(skinMatrix, float4(input.position, 1.0));
+    float4 localNormal = mul(skinMatrix, float4(input.normal, 0.0));
+    // Skinning a tangent uses the same linear-blended bone matrix as the normal;
+    // bitangent sign (input.tangent.w) is preserved from the source asset.
+    float4 localTangent = mul(skinMatrix, float4(input.tangent.xyz, 0.0));
+
+    float4 worldPos = mul(model, localPos);
+    output.fragPos = worldPos.xyz;
+
+    // Transform normal to world space using pre-computed normal matrix
+    float3x3 normalMat3x3 = (float3x3)normalMatrix;
+    output.normal = normalize(mul(normalMat3x3, localNormal.xyz));
+
+    float3 tangentWS = normalize(mul((float3x3)model, localTangent.xyz));
+    output.tangent = float4(tangentWS, input.tangent.w);
+
+    output.texCoord = input.texCoord;
+    output.vertexColor = input.color;
+    output.fogDistance = length(worldPos.xyz - cameraPos);
+
+    float4 viewPos = mul(view, worldPos);
+    output.viewDepth = -viewPos.z;
+    output.position = mul(projection, viewPos);
+
+    return output;
+}

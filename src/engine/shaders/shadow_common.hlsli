@@ -1,0 +1,144 @@
+/**
+ * Common Shadow Functions - Cascaded Shadow Map atlas (hardware PCF + PCSS)
+ *
+ * All cascades live in one depth atlas laid out as a 2x2 quadrant grid;
+ * cascade i occupies quadrant (i%2, i/2), each shadowMapResolution texels.
+ *
+ * Shared by all fragment shaders that receive shadows. Include AFTER declaring:
+ *  - ShadowUniforms cbuffer: shadowLightViewProjection[4], cascadeSplits,
+ *    cascadeTexelWorld, cascadeDepthRange, shadowMapResolution, lightSize,
+ *    shadowEnabled, lastActiveSplit, fadeStart, fadeEnd.
+ *  - shadowAtlas + shadowCmpSampler (SamplerComparisonState, LESS_EQUAL,
+ *    linear: each SampleCmpLevelZero tap is a free 2x2 hardware PCF).
+ *  - shadowAtlasRaw + shadowRawSampler (SamplerState, nearest) for the PCSS
+ *    blocker search.
+ */
+
+static const float2 shadowPoissonDisk[12] = {
+    float2(-0.326212, -0.405805), float2(-0.840144, -0.073580),
+    float2(-0.695914,  0.457137), float2(-0.203345,  0.620716),
+    float2( 0.962340, -0.194983), float2( 0.473434, -0.480026),
+    float2( 0.519456,  0.767022), float2( 0.185461, -0.893124),
+    float2( 0.507431,  0.064425), float2( 0.896420,  0.412458),
+    float2(-0.321940, -0.932615), float2(-0.791559, -0.597705)
+};
+
+// Local copy of interleavedGradientNoise (lighting.hlsli is included after this file).
+float shadowIGN(float2 screenPos) {
+    return frac(52.9829189 * frac(dot(screenPos, float2(0.06711056, 0.00583715))));
+}
+
+int selectShadowCascade(float depth) {
+    if (depth < cascadeSplits.x) return 0;
+    if (depth < cascadeSplits.y) return 1;
+    if (depth < cascadeSplits.z) return 2;
+    return 3;
+}
+
+// Visibility [0,1] for one cascade. screenPos drives the per-pixel poisson rotation.
+float sampleShadowCascade(int cascade, float3 worldPos, float3 N, float NdotL, float2 screenPos) {
+    float texelWorld = cascadeTexelWorld[cascade];
+    float depthRange = cascadeDepthRange[cascade];
+
+    // Normal-offset bias: push the receiver one texel along the surface
+    // normal so the projected sample lands off its own depth ramp.
+    float4 lightSpacePos = mul(shadowLightViewProjection[cascade], float4(worldPos + N * texelWorld, 1.0));
+    float3 sc = lightSpacePos.xyz / lightSpacePos.w;
+    sc.x = sc.x * 0.5 + 0.5;
+    sc.y = 1.0 - (sc.y * 0.5 + 0.5);
+
+    if (sc.x < 0.0 || sc.x > 1.0 ||
+        sc.y < 0.0 || sc.y > 1.0 ||
+        sc.z < 0.0 || sc.z > 1.0)
+        return 1.0;
+
+    // Slope-scaled receiver bias in light-depth units. texelWorld/depthRange
+    // converts one world texel to this cascade's [0,1] depth range, so the
+    // bias is exactly as large as the geometry it must hide - no peter-panning.
+    float tanTheta = min(sqrt(1.0 - NdotL * NdotL) / max(NdotL, 1e-3), 3.0);
+    float refZ = sc.z - (0.5 + 1.5 * tanTheta) * texelWorld / depthRange;
+
+    // Atlas addressing: quadrant origin + half-scale UV. Every tap clamps to
+    // one texel inside the quadrant so filtering never bleeds across cascades.
+    float atlasTexel = 0.5 / shadowMapResolution;
+    float2 quadOrigin = float2((cascade & 1) * 0.5, (cascade >> 1) * 0.5);
+    float2 uv = quadOrigin + sc.xy * 0.5;
+    float2 uvMin = quadOrigin + atlasTexel;
+    float2 uvMax = quadOrigin + 0.5 - atlasTexel;
+
+    // PCF (mode 1): 3x3 tent of hardware-PCF compares
+    if (shadowEnabled < 1.5) {
+        static const float tentWeights[9] = { 1, 2, 1, 2, 4, 2, 1, 2, 1 };
+        float shadow = 0.0;
+        [unroll]
+        for (int i = 0; i < 9; i++) {
+            float2 offset = float2(i % 3 - 1, i / 3 - 1) * atlasTexel;
+            shadow += tentWeights[i] * shadowAtlas.SampleCmpLevelZero(shadowCmpSampler, clamp(uv + offset, uvMin, uvMax), refZ);
+        }
+        return shadow / 16.0;
+    }
+
+    // PCSS (mode 2): poisson disk rotated per pixel to trade banding for noise
+    float angle = shadowIGN(screenPos) * 6.2831853;
+    float sinA = sin(angle);
+    float cosA = cos(angle);
+    float2x2 rot = float2x2(cosA, -sinA, sinA, cosA);
+
+    // Blocker search (raw taps): search width = worst-case penumbra at this
+    // receiver, i.e. tan(sun angle) * light-space distance to the near plane.
+    float searchTexels = clamp(sc.z * depthRange * lightSize / texelWorld, 2.0, 12.0);
+    float blockerSum = 0.0;
+    int blockerCount = 0;
+    [unroll]
+    for (int j = 0; j < 8; j++) {
+        float2 tapUV = clamp(uv + mul(rot, shadowPoissonDisk[j]) * searchTexels * atlasTexel, uvMin, uvMax);
+        float d = shadowAtlasRaw.SampleLevel(shadowRawSampler, tapUV, 0).r;
+        if (d < refZ) {
+            blockerSum += d;
+            blockerCount++;
+        }
+    }
+    if (blockerCount == 0) return 1.0;
+
+    // Directional-light penumbra: width grows with the world-space gap
+    // between receiver and average blocker times tan(sun angular radius).
+    float avgBlocker = blockerSum / float(blockerCount);
+    float penumbraTexels = (sc.z - avgBlocker) * depthRange * lightSize / texelWorld;
+    float filterTexels = clamp(penumbraTexels, 1.0, 16.0);
+
+    float shadow = 0.0;
+    [unroll]
+    for (int k = 0; k < 12; k++) {
+        float2 tapUV = clamp(uv + mul(rot, shadowPoissonDisk[k]) * filterTexels * atlasTexel, uvMin, uvMax);
+        shadow += shadowAtlas.SampleCmpLevelZero(shadowCmpSampler, tapUV, refZ);
+    }
+    return shadow / 12.0;
+}
+
+// returns raw [0,1] visibility, ambient applied by caller.
+// N = geometric surface normal, L = surface-to-light direction,
+// screenPos = SV_Position.xy (per-pixel filter rotation).
+float calcShadow(float3 worldPos, float3 N, float3 L, float viewDepth, float2 screenPos) {
+    if (shadowEnabled < 0.5) return 1.0;
+    if (viewDepth >= lastActiveSplit) return 1.0;
+
+    int cascade = selectShadowCascade(viewDepth);
+    float NdotL = saturate(dot(N, L));
+    float shadow = sampleShadowCascade(cascade, worldPos, N, NdotL, screenPos);
+
+    // Blend into the next cascade over the last 15% of this cascade's range
+    // so the resolution step never shows as a hard seam.
+    float splitFar = cascadeSplits[cascade];
+    float splitNear = (cascade == 0) ? 0.0 : cascadeSplits[cascade - 1];
+    float blendStart = splitFar - 0.15 * (splitFar - splitNear);
+    if (viewDepth > blendStart && splitFar < lastActiveSplit) {
+        float t = saturate((viewDepth - blendStart) / max(splitFar - blendStart, 1e-4));
+        float next = sampleShadowCascade(cascade + 1, worldPos, N, NdotL, screenPos);
+        shadow = lerp(shadow, next, t);
+    }
+
+    // Distance fade: shadows dissolve over the tail of the shadow range
+    // instead of popping off at lastActiveSplit.
+    float fade = saturate((viewDepth - fadeStart) / max(fadeEnd - fadeStart, 1e-4));
+    return lerp(shadow, 1.0, fade);
+}
