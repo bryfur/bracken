@@ -6,6 +6,7 @@
 #include "engine/gpu/pipeline_registry.hpp"
 #include "engine/heightmap.hpp"
 #include "engine/render/environment.hpp"
+#include <cstddef>
 #include <glm/glm.hpp>
 #include <memory>
 #include <vector>
@@ -43,6 +44,11 @@ struct alignas(16) TerrainTransformUniforms {
     float _padding0;
 };
 
+// Layout pins against terrain.vert.hlsl TransformUniforms.
+static_assert(sizeof(TerrainTransformUniforms) == 144, "must match terrain.vert.hlsl TransformUniforms (144 B)");
+static_assert(offsetof(TerrainTransformUniforms, projection) == 64);
+static_assert(offsetof(TerrainTransformUniforms, cameraPos) == 128);
+
 /**
  * Terrain lighting uniforms - matches terrain.frag.hlsl cbuffer.
  * Each vec3+float pair fills one 16-byte cbuffer register.
@@ -63,6 +69,17 @@ struct alignas(16) TerrainLightingUniforms {
     glm::vec3 sunColor;        // offset 96
     float _padding0;           // offset 108 — struct ends 16-byte aligned (112)
 };
+
+// Layout pins against terrain.frag.hlsl LightingUniforms.
+static_assert(sizeof(TerrainLightingUniforms) == 112, "must match terrain.frag.hlsl LightingUniforms (112 B)");
+static_assert(offsetof(TerrainLightingUniforms, fogColorHorizon) == 0);
+static_assert(offsetof(TerrainLightingUniforms, fogColorSun) == 16);
+static_assert(offsetof(TerrainLightingUniforms, lightDir) == 32);
+static_assert(offsetof(TerrainLightingUniforms, cameraPos) == 48);
+static_assert(offsetof(TerrainLightingUniforms, world_size) == 60);
+static_assert(offsetof(TerrainLightingUniforms, ambientSky) == 64);
+static_assert(offsetof(TerrainLightingUniforms, ambientGround) == 80);
+static_assert(offsetof(TerrainLightingUniforms, sunColor) == 96);
 
 /**
  * TerrainRenderer handles terrain rendering using server-provided heightmaps.

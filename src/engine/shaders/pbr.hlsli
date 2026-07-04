@@ -58,13 +58,17 @@ float3 evaluatePBR(float3 normal, float3 view, float3 light, float3 lightColor,
     float3 N = normal;
     float3 V = view;
     float3 L = light;
-    float3 H = normalize(V + L);
 
     float NdotV = max(dot(N, V), 1e-4);
     float NdotL = max(dot(N, L), 0.0);
     if (NdotL <= 0.0) {
         return float3(0, 0, 0);
     }
+    // Keep H after the NdotL early-out: V == -L is the only normalize(0)
+    // input, and the rejected path must never form it. Guard the length for
+    // the (measure-zero) exact V == -L case that survives the early-out.
+    float3 sum = V + L;
+    float3 H = sum / max(length(sum), 1e-5);
     float NdotH = max(dot(N, H), 0.0);
     float LdotH = max(dot(L, H), 0.0);
 

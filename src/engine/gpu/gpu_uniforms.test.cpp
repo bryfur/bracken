@@ -21,6 +21,7 @@ TEST(UniformAlignment, AllStructsAre16ByteAligned) {
     EXPECT_EQ(alignof(ShadowTransformUniforms), 16u);
     EXPECT_EQ(alignof(ShadowSkinnedTransformUniforms), 16u);
     EXPECT_EQ(alignof(ShadowTerrainUniforms), 16u);
+    EXPECT_EQ(alignof(ShadowFragUniforms), 16u);
     EXPECT_EQ(alignof(ShadowDataUniforms), 16u);
     EXPECT_EQ(alignof(GTAOUniforms), 16u);
     EXPECT_EQ(alignof(BlurUniforms), 16u);
@@ -50,6 +51,7 @@ TEST(UniformSizes, SizesAreMultiplesOf16) {
     EXPECT_EQ(sizeof(ShadowTransformUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(ShadowSkinnedTransformUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(ShadowTerrainUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(ShadowFragUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(ShadowDataUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(GTAOUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(BlurUniforms) % 16, 0u);
@@ -93,6 +95,36 @@ TEST(ShadowSkinnedTransformUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(ShadowSkinnedTransformUniforms, lightViewProjection), 0u);
     EXPECT_EQ(offsetof(ShadowSkinnedTransformUniforms, model), 64u);
     EXPECT_EQ(offsetof(ShadowSkinnedTransformUniforms, paletteOffset), 128u);
+}
+
+// =============================================================================
+// ShadowFragUniforms - matches shadow_depth.frag.hlsl ShadowFragUniforms
+// =============================================================================
+
+TEST(ShadowFragUniformsLayout, SizeIs16Bytes) {
+    // int + 3 named scalar pads = 16. The HLSL side must pad with scalars too:
+    // a cbuffer float[3] array would stride at 16 bytes and declare a 52-byte
+    // block that no longer matches this struct.
+    EXPECT_EQ(sizeof(ShadowFragUniforms), 16u);
+}
+
+TEST(ShadowFragUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(ShadowFragUniforms, hasTexture), 0u);
+    EXPECT_EQ(offsetof(ShadowFragUniforms, _pad0), 4u);
+}
+
+// =============================================================================
+// UIFragmentUniforms - matches ui.frag.hlsl UIFragmentUniforms
+// =============================================================================
+
+TEST(UIFragmentUniformsLayout, SizeIs16Bytes) {
+    // int + 3 named scalar pads = 16 (see ShadowFragUniformsLayout.SizeIs16Bytes).
+    EXPECT_EQ(sizeof(UIFragmentUniforms), 16u);
+}
+
+TEST(UIFragmentUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(UIFragmentUniforms, hasTexture), 0u);
+    EXPECT_EQ(offsetof(UIFragmentUniforms, _padding0), 4u);
 }
 
 // =============================================================================

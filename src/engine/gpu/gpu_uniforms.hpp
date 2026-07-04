@@ -103,10 +103,14 @@ struct alignas(16) UIScreenUniforms {
 
 /**
  * UI fragment shader uniforms (set 3, b0)
+ * Padding is three named scalars to mirror ui.frag.hlsl byte-for-byte (an
+ * array would stride at 16 bytes on the HLSL side).
  */
 struct alignas(16) UIFragmentUniforms {
     int hasTexture{};
-    int _padding[3] = {0, 0, 0};
+    int _padding0 = 0;
+    int _padding1 = 0;
+    int _padding2 = 0;
 };
 
 /**
@@ -206,6 +210,19 @@ struct alignas(16) ShadowSkinnedTransformUniforms {
  */
 struct alignas(16) ShadowTerrainUniforms {
     glm::mat4 lightViewProjection;
+};
+
+/**
+ * Shadow depth pass - fragment uniforms for alpha-tested casters (set 3, b0)
+ * Matches shadow_depth.frag.hlsl ShadowFragUniforms. Padding is three named
+ * scalars to mirror the HLSL cbuffer byte-for-byte (an array would stride at
+ * 16 bytes on the HLSL side).
+ */
+struct alignas(16) ShadowFragUniforms {
+    int hasTexture = 0;
+    float _pad0 = 0.0f;
+    float _pad1 = 0.0f;
+    float _pad2 = 0.0f;
 };
 
 /**

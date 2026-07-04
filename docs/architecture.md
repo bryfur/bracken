@@ -158,8 +158,8 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
 ## GPU layer
 
 - **`PipelineRegistry`** (`gpu/pipeline_registry.hpp`) lazily creates and
-  caches one `GPUPipeline` per `PipelineType` (23 types). Scene pipelines
-  target the HDR format; UI/Text/Billboard/Composite/Fxaa target the swapchain
+  caches one `GPUPipeline` per `PipelineType` (22 types). Scene pipelines
+  target the HDR format; UI/Text/Composite/Fxaa target the swapchain
   format and are the only ones invalidated when the swapchain format changes.
   `preload_all_pipelines()` avoids first-use hitches.
   The full pipeline → shader-pair table lives in

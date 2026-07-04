@@ -19,7 +19,11 @@ struct PSInput {
 [[vk::binding(0, 3)]]
 cbuffer UIFragmentUniforms {
     int has_texture;
-    int _padding[3];
+    // Scalars (not an int array) so the declared block is 16 bytes and
+    // matches gpu::UIFragmentUniforms — HLSL cbuffer arrays stride at 16 B.
+    int _padding0;
+    int _padding1;
+    int _padding2;
 };
 
 // Texture and sampler in set 2 (fragment textures/samplers)
