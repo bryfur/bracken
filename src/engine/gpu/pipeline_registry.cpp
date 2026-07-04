@@ -141,6 +141,27 @@ GPUPipeline* PipelineRegistry::get_pipeline(PipelineType type) {
         case PipelineType::Fxaa:
             pipeline = create_fxaa_pipeline();
             break;
+        case PipelineType::ModelDoubleSided:
+            pipeline = create_model_pipeline(false, true);
+            break;
+        case PipelineType::ModelBlend:
+            pipeline = create_model_pipeline(true, false);
+            break;
+        case PipelineType::ModelBlendDoubleSided:
+            pipeline = create_model_pipeline(true, true);
+            break;
+        case PipelineType::SkinnedModelDoubleSided:
+            pipeline = create_skinned_model_pipeline(false, true);
+            break;
+        case PipelineType::SkinnedModelBlend:
+            pipeline = create_skinned_model_pipeline(true, false);
+            break;
+        case PipelineType::SkinnedModelBlendDoubleSided:
+            pipeline = create_skinned_model_pipeline(true, true);
+            break;
+        case PipelineType::InstancedModelDoubleSided:
+            pipeline = create_instanced_model_pipeline(true);
+            break;
         default:
             SDL_Log("PipelineRegistry: Unknown pipeline type %d", static_cast<int>(type));
             return nullptr;
@@ -231,7 +252,7 @@ void PipelineRegistry::reload_all_pipelines() {
 // Pipeline Creation Methods
 // =============================================================================
 
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_model_pipeline() {
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_model_pipeline(bool alpha_blend, bool double_sided) {
     ShaderResources vs_resources;
     vs_resources.num_uniform_buffers = 1;
 
@@ -250,14 +271,24 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_model_pipeline() {
     PipelineConfig config;
     config.vertex_shader = vs->handle();
     config.fragment_shader = fs->handle();
-    config.with_vertex3d().opaque();
+    config.with_vertex3d();
+    if (alpha_blend) {
+        // glTF alphaMode BLEND: depth test on, depth write off; draws are
+        // sorted back-to-front by SceneRenderer after all opaque content.
+        config.alpha_blended();
+    } else {
+        config.opaque();
+    }
+    if (double_sided) {
+        config.no_cull(); // glTF doubleSided
+    }
     config.color_format = scene_color_format_;
     config.depth_format = depth_format_;
 
     return GPUPipeline::create(*device_, config);
 }
 
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_instanced_model_pipeline() {
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_instanced_model_pipeline(bool double_sided) {
     ShaderResources vs_resources;
     vs_resources.num_uniform_buffers = 1; // camera uniforms
     vs_resources.num_storage_buffers = 1; // instance data
@@ -280,6 +311,9 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_instanced_model_pipeline()
     config.vertex_shader = vs->handle();
     config.fragment_shader = fs->handle();
     config.with_vertex3d().opaque();
+    if (double_sided) {
+        config.no_cull(); // glTF doubleSided
+    }
     config.color_format = scene_color_format_;
     config.depth_format = depth_format_;
 
@@ -318,7 +352,7 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_instanced_shadow_model_pip
     return GPUPipeline::create(*device_, config);
 }
 
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_skinned_model_pipeline() {
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_skinned_model_pipeline(bool alpha_blend, bool double_sided) {
     ShaderResources vs_resources;
     vs_resources.num_uniform_buffers = 1; // transform (incl. palette offset)
     vs_resources.num_storage_buffers = 1; // tightly packed bone palettes
@@ -339,7 +373,17 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_skinned_model_pipeline() {
     PipelineConfig config;
     config.vertex_shader = vs->handle();
     config.fragment_shader = fs->handle();
-    config.with_skinned_vertex().opaque();
+    config.with_skinned_vertex();
+    if (alpha_blend) {
+        // glTF alphaMode BLEND: depth test on, depth write off; draws are
+        // sorted back-to-front by SceneRenderer after all opaque content.
+        config.alpha_blended();
+    } else {
+        config.opaque();
+    }
+    if (double_sided) {
+        config.no_cull(); // glTF doubleSided
+    }
     config.color_format = scene_color_format_;
     config.depth_format = depth_format_;
 

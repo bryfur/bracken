@@ -151,6 +151,18 @@ private:
     void render_instanced_models(const CameraState& camera);
     void render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
                                         const glm::mat4& light_view_projection, int cascade);
+
+    // Transparent (glTF alphaMode BLEND) path: meshes queued during the opaque
+    // walks, then drawn back-to-front after the skybox with depth writes off.
+    void queue_transparent_mesh(const Mesh& mesh, const glm::mat4& transform, const glm::mat4& normal_matrix,
+                                const glm::vec4& tint, bool no_fog, uint32_t palette_offset, const Model& model,
+                                const CameraState& camera);
+    void render_transparent_models(const CameraState& camera);
+
+    // Bind the (double-sided or default-cull) model/skinned pipeline variant
+    // and re-establish the pass-level fragment state that follows a bind.
+    bool bind_model_pipeline(bool double_sided);
+    bool bind_skinned_pipeline(bool double_sided);
     void render_ui_commands(const UIScene& ui_scene, const CameraState& camera);
     void draw_billboard_3d(const Billboard3DCommand& cmd, const CameraState& camera);
     void upload_debug_lines(const RenderScene& scene, SDL_GPUCopyPass* copy_pass);
@@ -235,6 +247,26 @@ private:
     // Per-frame packing scratch (cleared each frame, capacity preserved).
     std::vector<gpu::InstanceData> packed_instances_;
     std::vector<gpu::ShadowInstanceData> packed_shadow_instances_;
+
+    // ========== Transparent Queue ==========
+    // glTF alphaMode BLEND meshes collected during the opaque walks (instanced
+    // draws fall back to one queued entry per instance) and drawn sorted
+    // back-to-front after the skybox. No OIT; sort granularity is one mesh per
+    // command/instance (see docs/architecture.md).
+    struct TransparentDraw {
+        const Mesh* mesh;
+        glm::mat4 transform;
+        glm::mat4 normal_matrix;
+        glm::vec4 tint;
+        uint32_t palette_offset; // INVALID_PALETTE_OFFSET => static (Vertex3D) draw
+        bool no_fog;
+        float view_dist_sq;
+    };
+    std::vector<TransparentDraw> transparent_draws_;
+    // Cull variant currently bound for the model / skinned pipeline families
+    // (only meaningful while that family is the active pipeline).
+    bool model_pipeline_double_sided_ = false;
+    bool skinned_pipeline_double_sided_ = false;
 
     // ========== Bone Palettes ==========
     // All skinned commands' bone matrices packed tightly (joint_count matrices

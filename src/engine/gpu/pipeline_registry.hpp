@@ -55,6 +55,17 @@ enum class PipelineType {
     VolumetricFog,   ///< Volumetric fog with god rays
     Fxaa,            ///< FXAA 3.11 on the LDR composite output -> swapchain
 
+    // Model-family material variants for glTF flags: DoubleSided disables
+    // back-face culling; Blend enables alpha blending (depth test on, depth
+    // write off — drawn back-to-front after opaques by SceneRenderer).
+    ModelDoubleSided,             ///< Static models, doubleSided
+    ModelBlend,                   ///< Static models, alphaMode BLEND
+    ModelBlendDoubleSided,        ///< Static models, BLEND + doubleSided
+    SkinnedModelDoubleSided,      ///< Skinned models, doubleSided
+    SkinnedModelBlend,            ///< Skinned models, alphaMode BLEND
+    SkinnedModelBlendDoubleSided, ///< Skinned models, BLEND + doubleSided
+    InstancedModelDoubleSided,    ///< Instanced static models, doubleSided
+
     // Count for iteration
     Count
 };
@@ -108,6 +119,20 @@ inline const char* pipeline_type_to_string(PipelineType type) {
             return "VolumetricFog";
         case PipelineType::Fxaa:
             return "Fxaa";
+        case PipelineType::ModelDoubleSided:
+            return "ModelDoubleSided";
+        case PipelineType::ModelBlend:
+            return "ModelBlend";
+        case PipelineType::ModelBlendDoubleSided:
+            return "ModelBlendDoubleSided";
+        case PipelineType::SkinnedModelDoubleSided:
+            return "SkinnedModelDoubleSided";
+        case PipelineType::SkinnedModelBlend:
+            return "SkinnedModelBlend";
+        case PipelineType::SkinnedModelBlendDoubleSided:
+            return "SkinnedModelBlendDoubleSided";
+        case PipelineType::InstancedModelDoubleSided:
+            return "InstancedModelDoubleSided";
         default:
             return "Unknown";
     }
@@ -267,9 +292,11 @@ public:
     const std::string& shader_path() const { return shader_path_; }
 
 private:
-    // Pipeline creation methods
-    std::unique_ptr<GPUPipeline> create_model_pipeline();
-    std::unique_ptr<GPUPipeline> create_skinned_model_pipeline();
+    // Pipeline creation methods. The model-family creators take the glTF
+    // material variant flags (alphaMode BLEND -> alpha_blend, doubleSided ->
+    // no back-face culling).
+    std::unique_ptr<GPUPipeline> create_model_pipeline(bool alpha_blend = false, bool double_sided = false);
+    std::unique_ptr<GPUPipeline> create_skinned_model_pipeline(bool alpha_blend = false, bool double_sided = false);
     std::unique_ptr<GPUPipeline> create_terrain_pipeline();
     std::unique_ptr<GPUPipeline> create_skybox_pipeline();
     std::unique_ptr<GPUPipeline> create_grid_pipeline();
@@ -277,7 +304,7 @@ private:
     std::unique_ptr<GPUPipeline> create_text_pipeline();
     std::unique_ptr<GPUPipeline> create_particle_pipeline();
     std::unique_ptr<GPUPipeline> create_grass_pipeline();
-    std::unique_ptr<GPUPipeline> create_instanced_model_pipeline();
+    std::unique_ptr<GPUPipeline> create_instanced_model_pipeline(bool double_sided = false);
     std::unique_ptr<GPUPipeline> create_instanced_shadow_model_pipeline();
     std::unique_ptr<GPUPipeline> create_shadow_model_pipeline();
     std::unique_ptr<GPUPipeline> create_shadow_skinned_model_pipeline();

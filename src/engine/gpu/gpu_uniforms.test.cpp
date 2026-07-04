@@ -162,6 +162,7 @@ TEST(ModelLightingUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(ModelLightingUniforms, hasMRMap), 192u);
     EXPECT_EQ(offsetof(ModelLightingUniforms, hasEmissiveMap), 196u);
     EXPECT_EQ(offsetof(ModelLightingUniforms, hasPackedOcclusion), 200u);
+    EXPECT_EQ(offsetof(ModelLightingUniforms, alphaCutoff), 204u);
 }
 
 // =============================================================================
@@ -198,6 +199,7 @@ TEST(InstancedLightingUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(InstancedLightingUniforms, hasMRMap), 176u);
     EXPECT_EQ(offsetof(InstancedLightingUniforms, hasEmissiveMap), 180u);
     EXPECT_EQ(offsetof(InstancedLightingUniforms, hasPackedOcclusion), 184u);
+    EXPECT_EQ(offsetof(InstancedLightingUniforms, alphaCutoff), 188u);
 }
 
 // =============================================================================

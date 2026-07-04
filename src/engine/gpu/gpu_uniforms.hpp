@@ -60,7 +60,8 @@ struct alignas(16) ModelLightingUniforms {
     float hasMRMap = 0.0f;
     float hasEmissiveMap = 0.0f;
     float hasPackedOcclusion = 0.0f;
-    float _padding4 = 0.0f;
+    // glTF alphaMode MASK cutoff; 0 disables the alpha test (OPAQUE/BLEND).
+    float alphaCutoff = 0.0f;
 };
 
 /**
@@ -156,7 +157,8 @@ struct alignas(16) InstancedLightingUniforms {
     float hasMRMap = 0.0f;
     float hasEmissiveMap = 0.0f;
     float hasPackedOcclusion = 0.0f;
-    float _padding4 = 0.0f;
+    // glTF alphaMode MASK cutoff; 0 disables the alpha test (OPAQUE/BLEND).
+    float alphaCutoff = 0.0f;
 };
 
 /**
