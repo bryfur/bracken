@@ -249,4 +249,75 @@ void GPUBuffer::update(SDL_GPUCopyPass* copy_pass, const void* data, size_t size
     SDL_UploadToGPUBuffer(copy_pass, &src, &dst, true); // cycle=true
 }
 
+GPUBuffer::Mapping GPUBuffer::map() {
+    if (!transfer_buffer_) {
+        SDL_Log("GPUBuffer::map: Not a dynamic buffer");
+        return {};
+    }
+    void* mapped = device_->map_transfer_buffer(transfer_buffer_, true); // cycle=true, matching update()
+    if (!mapped) {
+        SDL_Log("GPUBuffer::map: Failed to map transfer buffer: %s", SDL_GetError());
+        return {};
+    }
+    return Mapping(this, mapped);
+}
+
+GPUBuffer::Mapping::~Mapping() {
+    release();
+}
+
+GPUBuffer::Mapping::Mapping(Mapping&& other) noexcept : buffer_(other.buffer_), data_(other.data_) {
+    other.buffer_ = nullptr;
+    other.data_ = nullptr;
+}
+
+GPUBuffer::Mapping& GPUBuffer::Mapping::operator=(Mapping&& other) noexcept {
+    if (this != &other) {
+        release();
+        buffer_ = other.buffer_;
+        data_ = other.data_;
+        other.buffer_ = nullptr;
+        other.data_ = nullptr;
+    }
+    return *this;
+}
+
+void GPUBuffer::Mapping::release() {
+    if (buffer_ && data_) {
+        buffer_->device_->unmap_transfer_buffer(buffer_->transfer_buffer_);
+    }
+    buffer_ = nullptr;
+    data_ = nullptr;
+}
+
+void GPUBuffer::Mapping::upload(SDL_GPUCopyPass* copy_pass, size_t size, size_t offset) {
+    if (!buffer_ || !data_) {
+        SDL_Log("GPUBuffer::Mapping::upload: Not mapped");
+        return;
+    }
+    GPUBuffer* buffer = buffer_;
+    release(); // unmap before recording the copy
+
+    if (!copy_pass) {
+        SDL_Log("GPUBuffer::Mapping::upload: Invalid copy pass");
+        return;
+    }
+    if (offset + size > buffer->size_) {
+        SDL_Log("GPUBuffer::Mapping::upload: Data exceeds buffer size (data=%zu + offset=%zu = %zu > buffer=%zu)",
+                size, offset, offset + size, buffer->size_);
+        return;
+    }
+
+    SDL_GPUTransferBufferLocation src = {};
+    src.transfer_buffer = buffer->transfer_buffer_;
+    src.offset = static_cast<Uint32>(offset);
+
+    SDL_GPUBufferRegion dst = {};
+    dst.buffer = buffer->buffer_;
+    dst.offset = static_cast<Uint32>(offset);
+    dst.size = static_cast<Uint32>(size);
+
+    SDL_UploadToGPUBuffer(copy_pass, &src, &dst, true); // cycle=true
+}
+
 } // namespace mmo::engine::gpu

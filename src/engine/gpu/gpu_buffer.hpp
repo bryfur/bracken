@@ -93,6 +93,59 @@ public:
     void update(SDL_GPUCopyPass* copy_pass, const void* data, size_t size, size_t offset = 0);
 
     /**
+     * @brief RAII mapping of a dynamic buffer's persistent transfer buffer
+     *
+     * Lets callers write upload data directly into the mapped transfer memory
+     * (no intermediate CPU staging vector), then record the GPU copy:
+     *
+     *   auto mapping = buffer->map();
+     *   if (mapping) {
+     *       std::memcpy(mapping.data(), src, size);
+     *       mapping.upload(copy_pass, size);
+     *   }
+     *
+     * upload() unmaps before recording the copy. If upload() is never called
+     * (e.g. an early error exit), the destructor unmaps without recording a
+     * copy. The mapping must not outlive the buffer.
+     */
+    class Mapping {
+    public:
+        Mapping() = default;
+        ~Mapping();
+        Mapping(Mapping&& other) noexcept;
+        Mapping& operator=(Mapping&& other) noexcept;
+        Mapping(const Mapping&) = delete;
+        Mapping& operator=(const Mapping&) = delete;
+
+        /// Mapped write pointer (nullptr if the map failed / already uploaded)
+        void* data() const { return data_; }
+        explicit operator bool() const { return data_ != nullptr; }
+
+        /**
+         * @brief Unmap and record the upload into an open copy pass
+         * @param copy_pass Open copy pass to record the upload into
+         * @param size Bytes to upload
+         * @param offset Byte offset (applies to transfer and GPU buffer alike)
+         */
+        void upload(SDL_GPUCopyPass* copy_pass, size_t size, size_t offset = 0);
+
+    private:
+        friend class GPUBuffer;
+        Mapping(GPUBuffer* buffer, void* data) : buffer_(buffer), data_(data) {}
+        void release(); // unmap without uploading
+        GPUBuffer* buffer_ = nullptr;
+        void* data_ = nullptr;
+    };
+
+    /**
+     * @brief Map the transfer buffer for direct writes (dynamic buffers only)
+     *
+     * Maps with cycle=true — the same double-buffering semantics as update() —
+     * so a full per-frame rewrite is safe. Returns an empty Mapping on failure.
+     */
+    Mapping map();
+
+    /**
      * @brief Get the raw SDL GPU buffer handle
      */
     SDL_GPUBuffer* handle() const { return buffer_; }
