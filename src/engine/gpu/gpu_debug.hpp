@@ -37,6 +37,10 @@ public:
     bool init(GPUDevice& device, size_t pair_count);
     void shutdown();
 
+    // `pass_name` is stored as a raw pointer (no per-frame string alloc):
+    // it must be a string literal or otherwise outlive the frame (i.e. stay
+    // valid until the next begin_frame()/read_results). Every ENGINE_GPU_TIMER
+    // call site passes a literal.
     int reserve_pair(const char* pass_name);
     void write_begin(SDL_GPUCommandBuffer* cb, int pair_idx);
     void write_end(SDL_GPUCommandBuffer* cb, int pair_idx);
@@ -51,7 +55,7 @@ public:
 private:
     bool supported_ = false;
     size_t capacity_ = 0;
-    std::vector<std::string> pass_names_;
+    std::vector<const char*> pass_names_; // interned literals, cleared per frame
 };
 
 class GPUTimerScope {

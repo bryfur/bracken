@@ -53,7 +53,7 @@ void GPUTimestampPool::write_end(SDL_GPUCommandBuffer* /*cb*/, int /*pair_idx*/)
 void GPUTimestampPool::read_results(std::vector<std::pair<std::string, float>>& ms_out) {
     ms_out.clear();
     ms_out.reserve(pass_names_.size());
-    for (const auto& name : pass_names_) {
+    for (const char* name : pass_names_) {
         ms_out.emplace_back(name, 0.0f);
     }
 }
