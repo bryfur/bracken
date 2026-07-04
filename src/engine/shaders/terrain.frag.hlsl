@@ -82,8 +82,23 @@ static const float DETAIL_SCALE_RATIO = 0.23;  // second anti-tiling scale (non-
 static const float SPLAT_EPSILON = 0.005;      // skip layers below this splat weight
 static const float FLAT_NORMAL_Y = 0.8;        // above this, single-plane fast path
 
+// Integer (murmur-finalizer) hash, same as grass.vert.hlsl — stable across
+// the whole world. A sin-based hash loses its mantissa to fp32 argument
+// reduction ~10^4 units from the origin and bands/plateaus at world scale.
+uint murmurHash2D(int2 p) {
+    uint seed = asuint(p.x) ^ (asuint(p.y) * 0x9e3779b9u);
+    seed ^= seed >> 16;
+    seed *= 0x85ebca6bu;
+    seed ^= seed >> 13;
+    seed *= 0xc2b2ae35u;
+    seed ^= seed >> 16;
+    return seed;
+}
+
+// p arrives integer-valued (a floor'ed lattice coordinate from valueNoise).
 float hash2D(float2 p) {
-    return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
+    uint h = murmurHash2D(int2(p));
+    return float(h & 0x00FFFFFFu) / float(0x01000000u);
 }
 
 // Cheap low-frequency value noise; drives the anti-tiling scale blend and

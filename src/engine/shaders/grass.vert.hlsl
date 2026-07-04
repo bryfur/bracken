@@ -211,7 +211,10 @@ VSOutput VSMain(VSInput input) {
     // === BLADE CURVE ===
     float heightT = input.position.y;
     float curveMagnitude = 0.15 * bladeHeight;
-    float2 curveDir = normalize(hashFloat2(seed + int2(5, 7)) - 0.5);
+    // Length-guarded normalize: the hash can land exactly on (0.5, 0.5),
+    // and normalize(0) would NaN the whole blade.
+    float2 curveDirRaw = hashFloat2(seed + int2(5, 7)) - 0.5;
+    float2 curveDir = curveDirRaw / max(length(curveDirRaw), 1e-4);
     float curveAmount = heightT * heightT * curveMagnitude;
     float3 curveOffset = float3(curveDir.x, 0.0, curveDir.y) * curveAmount;
 

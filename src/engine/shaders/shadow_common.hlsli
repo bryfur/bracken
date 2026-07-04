@@ -14,6 +14,8 @@
  *    blocker search.
  */
 
+#include "lighting.hlsli" // interleavedGradientNoise (per-pixel filter rotation/dither)
+
 static const float2 shadowPoissonDisk[12] = {
     float2(-0.326212, -0.405805), float2(-0.840144, -0.073580),
     float2(-0.695914,  0.457137), float2(-0.203345,  0.620716),
@@ -23,11 +25,6 @@ static const float2 shadowPoissonDisk[12] = {
     float2(-0.321940, -0.932615), float2(-0.791559, -0.597705)
 };
 
-// Local copy of interleavedGradientNoise (lighting.hlsli is included after this file).
-float shadowIGN(float2 screenPos) {
-    return frac(52.9829189 * frac(dot(screenPos, float2(0.06711056, 0.00583715))));
-}
-
 int selectShadowCascade(float depth) {
     if (depth < cascadeSplits.x) return 0;
     if (depth < cascadeSplits.y) return 1;
@@ -36,7 +33,10 @@ int selectShadowCascade(float depth) {
 }
 
 // Visibility [0,1] for one cascade. screenPos drives the per-pixel poisson rotation.
-float sampleShadowCascade(int cascade, float3 worldPos, float3 N, float NdotL, float2 screenPos) {
+// filterMode: 0 = single hardware-PCF tap (cheap path for fragments whose sun
+// contribution is already known to be zero), 1 = 3x3 PCF tent, 2 = PCSS.
+float sampleShadowCascade(int cascade, float3 worldPos, float3 N, float NdotL, float2 screenPos,
+                          float filterMode) {
     float texelWorld = cascadeTexelWorld[cascade];
     float depthRange = cascadeDepthRange[cascade];
 
@@ -66,8 +66,13 @@ float sampleShadowCascade(int cascade, float3 worldPos, float3 N, float NdotL, f
     float2 uvMin = quadOrigin + atlasTexel;
     float2 uvMax = quadOrigin + 0.5 - atlasTexel;
 
+    // Single tap (mode 0): one hardware-PCF compare (free 2x2 filter).
+    if (filterMode < 0.5) {
+        return shadowAtlas.SampleCmpLevelZero(shadowCmpSampler, clamp(uv, uvMin, uvMax), refZ);
+    }
+
     // PCF (mode 1): 3x3 tent of hardware-PCF compares
-    if (shadowEnabled < 1.5) {
+    if (filterMode < 1.5) {
         static const float tentWeights[9] = { 1, 2, 1, 2, 4, 2, 1, 2, 1 };
         float shadow = 0.0;
         [unroll]
@@ -79,7 +84,7 @@ float sampleShadowCascade(int cascade, float3 worldPos, float3 N, float NdotL, f
     }
 
     // PCSS (mode 2): poisson disk rotated per pixel to trade banding for noise
-    float angle = shadowIGN(screenPos) * 6.2831853;
+    float angle = interleavedGradientNoise(screenPos) * 6.2831853;
     float sinA = sin(angle);
     float cosA = cos(angle);
     float2x2 rot = float2x2(cosA, -sinA, sinA, cosA);
@@ -123,22 +128,50 @@ float calcShadow(float3 worldPos, float3 N, float3 L, float viewDepth, float2 sc
     if (viewDepth >= lastActiveSplit) return 1.0;
 
     int cascade = selectShadowCascade(viewDepth);
-    float NdotL = saturate(dot(N, L));
-    float shadow = sampleShadowCascade(cascade, worldPos, N, NdotL, screenPos);
+    float rawNdotL = dot(N, L);
+    float NdotL = saturate(rawNdotL);
+
+    // Distance fade: shadows dissolve over the tail of the shadow range
+    // instead of popping off at lastActiveSplit.
+    float fade = saturate((viewDepth - fadeStart) / max(fadeEnd - fadeStart, 1e-4));
+
+    // Back-facing fragments get no direct sun anyway (evaluatePBR rejects
+    // NdotL <= 0); the result only nudges the caller's ambientLift (and the
+    // faint wrap-lit tail in grass.frag), so a single tap replaces the full
+    // filter (saves up to 20 atlas taps on roughly half of all geometry).
+    if (rawNdotL <= 0.0) {
+        float shadow = sampleShadowCascade(cascade, worldPos, N, NdotL, screenPos, 0.0);
+        return lerp(shadow, 1.0, fade);
+    }
 
     // Blend into the next cascade over the last 15% of this cascade's range
     // so the resolution step never shows as a hard seam.
     float splitFar = cascadeSplits[cascade];
     float splitNear = (cascade == 0) ? 0.0 : cascadeSplits[cascade - 1];
     float blendStart = splitFar - 0.15 * (splitFar - splitNear);
+    float blend = 0.0;
     if (viewDepth > blendStart && splitFar < lastActiveSplit) {
-        float t = saturate((viewDepth - blendStart) / max(splitFar - blendStart, 1e-4));
-        float next = sampleShadowCascade(cascade + 1, worldPos, N, NdotL, screenPos);
-        shadow = lerp(shadow, next, t);
+        blend = saturate((viewDepth - blendStart) / max(splitFar - blendStart, 1e-4));
     }
 
-    // Distance fade: shadows dissolve over the tail of the shadow range
-    // instead of popping off at lastActiveSplit.
-    float fade = saturate((viewDepth - fadeStart) / max(fadeEnd - fadeStart, 1e-4));
+    float shadow;
+    if (shadowEnabled >= 1.5) {
+        // PCSS: dither the blend with IGN and filter one cascade per pixel
+        // instead of two — the band would otherwise double the PCSS cost
+        // (2 x (8 blocker + 12 filter) taps). The offset decorrelates the
+        // dither from the poisson rotation angle above.
+        if (blend > 0.0 && interleavedGradientNoise(screenPos + float2(17.0, 59.0)) < blend) {
+            cascade += 1;
+        }
+        shadow = sampleShadowCascade(cascade, worldPos, N, NdotL, screenPos, shadowEnabled);
+    } else {
+        // PCF is cheap enough to sample both cascades and lerp.
+        shadow = sampleShadowCascade(cascade, worldPos, N, NdotL, screenPos, shadowEnabled);
+        if (blend > 0.0) {
+            float next = sampleShadowCascade(cascade + 1, worldPos, N, NdotL, screenPos, shadowEnabled);
+            shadow = lerp(shadow, next, blend);
+        }
+    }
+
     return lerp(shadow, 1.0, fade);
 }
