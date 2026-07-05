@@ -100,6 +100,12 @@ Side effects worth knowing:
 - If the env var `BRACKEN_HOT_RELOAD=1` is set, `init_engine` starts the global
   `FileWatcher` and `init_renderer` wires model + shader-SPIR-V hot-reload to
   it (`application.cpp`). Default: off, no watcher thread.
+- `init_dev_ui()` (protected; optional, call after `init_renderer`) brings up
+  the Dear ImGui developer overlay (`dev::DevUI`, `dev_ui()` accessor): it
+  binds the built-in panels, **claims the `SceneRenderer` post-UI callback
+  slot**, and feeds SDL events to the overlay before game input. When
+  `BRACKEN_ENABLE_DEV_UI=OFF` it returns `false` and every `DevUI` call is a
+  safe no-op.
 
 ---
 
@@ -168,7 +174,9 @@ timer label, so RenderDoc captures read in this order.)
    composite writes the swapchain directly.
 7. **`UI`** — `UIScene` commands + 3D billboards, straight to swapchain.
    **`PostUICallback`** — optional host hook that renders into the swapchain
-   after UI (`SceneRenderer::set_post_ui_callback`).
+   after UI (`SceneRenderer::set_post_ui_callback`). There is a single slot:
+   `Application::init_dev_ui()` claims it for the dev overlay's ImGui draw,
+   so a host can't use both the overlay and its own post-UI callback.
 8. Fallback: if the AO subsystem isn't ready, step 4–6 collapse to a single
    **`MainScene`** pass direct to swapchain. Minimized windows skip all
    recording but still submit, keeping the frame lifecycle balanced.

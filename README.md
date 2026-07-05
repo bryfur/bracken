@@ -47,6 +47,7 @@ code. It builds as a static library (`bracken`) plus its unit-test suite
 | **glm** | Fetched (header-only math). |
 | **tinygltf** | Fetched (header-only glTF loader — no Draco support). |
 | **GoogleTest** | Fetched when `BRACKEN_BUILD_TESTS=ON` (default). |
+| **Dear ImGui** | Fetched when `BRACKEN_ENABLE_DEV_UI=ON` (default). |
 | **Tracy** | Fetched only when `BRACKEN_ENABLE_TRACY=ON` (default OFF). |
 
 All non-system dependencies are pulled by CMake `FetchContent` — no manual
@@ -73,6 +74,7 @@ cmake --build build
 | `BRACKEN_BUILD_BENCHMARKS` | `ON` | Build `bracken_benchmarks` (Google Benchmark). |
 | `BRACKEN_BUILD_EXAMPLES` | `ON` | Build the example apps (`examples/playground`). |
 | `BRACKEN_PLAYGROUND_SMOKE_TEST` | `OFF` | Register `playground --smoke` as a ctest (needs a GPU + display). |
+| `BRACKEN_ENABLE_DEV_UI` | `ON` | Build the Dear ImGui developer overlay (`bracken::dev::DevUI`). `OFF` compiles it to a no-op stub and skips fetching ImGui. |
 | `BRACKEN_ENABLE_TRACY` | `OFF` | Compile in Tracy profiler instrumentation. |
 
 ### Tests
@@ -127,6 +129,18 @@ verifies it isn't black or solid-color — a broken renderer that still hits
 60 fps can't pass. In the interactive game, F12 saves a screenshot; the
 underlying API is `Application::request_screenshot(path)` (final swapchain
 image, UI included, saved as PNG).
+
+### Developer overlay
+
+The engine ships an immediate-mode developer overlay (`bracken::dev::DevUI`,
+Dear ImGui on the SDL3 GPU backend) with built-in panels for render stats,
+environment/fog, graphics settings, and the camera. In the playground, **F10**
+toggles it. Consumer usage is one call — `init_dev_ui()` after
+`init_renderer()` — then `dev_ui().add_panel(name, draw)` for game panels;
+note it claims the `SceneRenderer` post-UI callback slot for itself. With
+`BRACKEN_ENABLE_DEV_UI=OFF` everything compiles to a no-op stub, so host code
+needs no `#ifdef`s (only panel bodies, which include `imgui.h` directly, need
+a `BRACKEN_DEV_UI` guard).
 
 ## Layout & include convention
 
