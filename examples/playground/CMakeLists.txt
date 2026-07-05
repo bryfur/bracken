@@ -5,13 +5,13 @@ add_executable(playground
     playground.cpp
     character.cpp
 )
-target_link_libraries(playground PRIVATE mmo_engine)
-mmo_engine_copy_shaders(playground)
+target_link_libraries(playground PRIVATE bracken)
+bracken_copy_shaders(playground)
 
 # Optional ctest registration: needs a GPU + display, so OFF by default.
-# Enable with -DMMO_PLAYGROUND_SMOKE_TEST=ON where a GPU is available.
-option(MMO_PLAYGROUND_SMOKE_TEST "Register 'playground --smoke' as a ctest (requires GPU/display)" OFF)
-if(MMO_PLAYGROUND_SMOKE_TEST)
+# Enable with -DBRACKEN_PLAYGROUND_SMOKE_TEST=ON where a GPU is available.
+option(BRACKEN_PLAYGROUND_SMOKE_TEST "Register 'playground --smoke' as a ctest (requires GPU/display)" OFF)
+if(BRACKEN_PLAYGROUND_SMOKE_TEST)
     add_test(NAME playground_smoke
              COMMAND playground --smoke 240
              WORKING_DIRECTORY $<TARGET_FILE_DIR:playground>)

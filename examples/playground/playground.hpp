@@ -1,14 +1,14 @@
 #pragma once
 
-#include "engine/animation/animation_player.hpp"
-#include "engine/animation/animation_state_machine.hpp"
-#include "engine/animation/animation_types.hpp"
-#include "engine/application.hpp"
-#include "engine/effect_definition.hpp"
-#include "engine/heightmap.hpp"
-#include "engine/model_loader.hpp"
-#include "engine/scene/render_scene.hpp"
-#include "engine/scene/ui_scene.hpp"
+#include "bracken/animation/animation_player.hpp"
+#include "bracken/animation/animation_state_machine.hpp"
+#include "bracken/animation/animation_types.hpp"
+#include "bracken/application.hpp"
+#include "bracken/effect_definition.hpp"
+#include "bracken/heightmap.hpp"
+#include "bracken/model_loader.hpp"
+#include "bracken/scene/render_scene.hpp"
+#include "bracken/scene/ui_scene.hpp"
 #include <glm/glm.hpp>
 #include <vector>
 
@@ -22,7 +22,7 @@ namespace playground {
  * point/spot lights, particle effects, billboards, debug lines, UI, graphics
  * settings). Run with --smoke N to self-drive for N frames and exit.
  */
-class PlaygroundGame : public mmo::engine::Application {
+class PlaygroundGame : public bracken::Application {
 public:
     explicit PlaygroundGame(int smoke_frames = -1) : smoke_frames_(smoke_frames) {}
 
@@ -45,7 +45,7 @@ private:
         float bob_phase;
     };
     struct Prop {
-        mmo::engine::ModelHandle model;
+        bracken::ModelHandle model;
         glm::mat4 transform;
     };
 
@@ -66,29 +66,29 @@ private:
     glm::vec3 random_ground_pos(float margin);
 
     // World
-    mmo::engine::Heightmap heightmap_;
+    bracken::Heightmap heightmap_;
     std::vector<Prop> props_;
     std::vector<Orb> orbs_;
     uint32_t rng_ = 0x2f6e2b1u;
 
     // Player
-    mmo::engine::ModelHandle player_model_ = mmo::engine::INVALID_MODEL_HANDLE;
+    bracken::ModelHandle player_model_ = bracken::INVALID_MODEL_HANDLE;
     glm::vec3 player_pos_{0.0f};
     glm::vec3 player_vel_{0.0f};
     float player_speed_ = 0.0f;
     bool running_input_ = false;
     glm::vec3 move_dir_{0.0f}; // set by handle_input / smoke driver
-    mmo::engine::animation::AnimationPlayer anim_player_;
-    mmo::engine::animation::AnimationStateMachine anim_sm_;
+    bracken::animation::AnimationPlayer anim_player_;
+    bracken::animation::AnimationStateMachine anim_sm_;
     int param_speed_ = -1;     // anim_sm_ parameter indices, resolved once in
     int param_attacking_ = -1; // setup_state_machine (no per-frame name hashing)
-    mmo::engine::animation::RotationSmoother facing_;
-    mmo::engine::animation::FootIKSmoother foot_smoother_;
+    bracken::animation::RotationSmoother facing_;
+    bracken::animation::FootIKSmoother foot_smoother_;
     glm::mat4 player_transform_{1.0f};
     float attack_timer_ = 0.0f;
 
     // Game state
-    mmo::engine::ModelHandle orb_model_ = mmo::engine::INVALID_MODEL_HANDLE;
+    bracken::ModelHandle orb_model_ = bracken::INVALID_MODEL_HANDLE;
     int orbs_collected_ = 0;
     bool flashlight_ = false;
     bool debug_draw_ = false;
@@ -96,12 +96,12 @@ private:
     bool pending_attack_arc_ = false;
 
     // Effect definitions (must outlive all spawned instances)
-    mmo::engine::EffectDefinition pickup_burst_;
-    mmo::engine::EffectDefinition attack_arc_;
+    bracken::EffectDefinition pickup_burst_;
+    bracken::EffectDefinition attack_arc_;
 
     // Frame scenes (members so vector capacity persists across frames)
-    mmo::engine::scene::RenderScene scene_;
-    mmo::engine::scene::UIScene ui_;
+    bracken::scene::RenderScene scene_;
+    bracken::scene::UIScene ui_;
 
     float time_ = 0.0f;
     float last_dt_ = 0.0f;

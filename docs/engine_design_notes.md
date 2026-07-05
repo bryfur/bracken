@@ -125,10 +125,10 @@ foundation is stable:
    v1, but for >>100 lights, GPU-driven is the way.
 
 ### Tooling
-- **Tracy-by-default in dev builds** — make `MMO_ENABLE_TRACY=ON` the default for
-  a `MMO_DEV` build so there's a measurement surface before adding any infra.
+- **Tracy-by-default in dev builds** — make `BRACKEN_ENABLE_TRACY=ON` the default for
+  a `BRACKEN_DEV` build so there's a measurement surface before adding any infra.
 - **Per-pass GPU timestamp telemetry** for a frame budget baseline.
-- **CI**: run `mmo_engine_tests` on every push.
+- **CI**: run `bracken_tests` on every push.
 
 ---
 

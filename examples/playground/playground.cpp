@@ -1,11 +1,11 @@
 #include "playground.hpp"
 
 #include "character.hpp"
-#include "engine/animation/ik_solver.hpp"
-#include "engine/procedural/rock_generator.hpp"
-#include "engine/procedural/tree_generator.hpp"
-#include "engine/render/lighting/light.hpp"
-#include "engine/systems/camera_controller.hpp"
+#include "bracken/animation/ik_solver.hpp"
+#include "bracken/procedural/rock_generator.hpp"
+#include "bracken/procedural/tree_generator.hpp"
+#include "bracken/render/lighting/light.hpp"
+#include "bracken/systems/camera_controller.hpp"
 #include <algorithm>
 #include <cmath>
 #include <format>
@@ -15,9 +15,9 @@
 
 namespace playground {
 
-using namespace mmo::engine;
-namespace anim = mmo::engine::animation;
-namespace lighting = mmo::engine::render::lighting;
+using namespace bracken;
+namespace anim = bracken::animation;
+namespace lighting = bracken::render::lighting;
 
 namespace {
 constexpr float WORLD = 8000.0f;
@@ -40,7 +40,7 @@ glm::vec3 forward_from_yaw(float yaw) {
 // ---------------------------------------------------------------------------
 
 bool PlaygroundGame::on_init() {
-    if (!init_renderer(1600, 900, "mmo_engine playground", WORLD, WORLD)) {
+    if (!init_renderer(1600, 900, "bracken playground", WORLD, WORLD)) {
         return false;
     }
 
@@ -532,7 +532,7 @@ void PlaygroundGame::on_render() {
 
 void PlaygroundGame::build_ui() {
     ui_.add_filled_rect(10, 10, 280, 122, 0xB0101418);
-    ui_.add_text("mmo_engine playground", 22, 20, 1.0f, 0xFFFFD080);
+    ui_.add_text("bracken playground", 22, 20, 1.0f, 0xFFFFD080);
     ui_.add_text(std::format("FPS {:.0f}", fps()), 22, 44, 0.9f, 0xFFB8C4D0);
     ui_.add_text(std::format("Orbs collected: {}", orbs_collected_), 22, 64, 0.9f, 0xFFFFC040);
     ui_.add_text(std::format("Anim state: {}", anim_sm_.current_state()), 22, 84, 0.9f, 0xFFB8C4D0);

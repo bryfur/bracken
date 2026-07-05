@@ -1,5 +1,10 @@
 # Audit Resolutions — 2026-07-05
 
+> The engine was renamed **mmo_engine → Bracken** after this campaign; the
+> four dated audit reports are unmodified historical records, so their file
+> paths (`src/engine/...`), namespaces (`mmo::engine`), and `MMO_*`/`ENGINE_*`
+> identifiers refer to the pre-rename layout.
+
 Outcome of the fix campaign for the four 2026-07-03 audits. Executed as
 eight parallel worktree branches (merged to master) plus two sequential
 main-tree passes (reversed-Z, modernization). Every wave was verified with a
@@ -60,11 +65,11 @@ Legend: ✅ fixed · 🟡 partially fixed (remainder listed under Follow-ups) ·
 
 | Finding | Status | Notes |
 |---|---|---|
-| H1 stale `.clang-tidy` header filter | ✅ | Points at `src/engine`; header diagnostics live again |
+| H1 stale `.clang-tidy` header filter | ✅ | Points at `src/bracken`; header diagnostics live again |
 | H2 `get_draw_distance` OOB | ✅ | Clamped + `clamp_to_valid_ranges()` after `load()` + corrupt-file tests |
 | H3 `Result` unused, two conventions | ✅ | `[[nodiscard]]` Result + `Result<void,E>`; policy written into CLAUDE.md (no mass conversion, by design) |
 | M1 zero `[[nodiscard]]` | ✅ | Sweep over fallible bools + factories |
-| M2 unasserted threading contracts | ✅ | `core::bind_main_thread()` + `ENGINE_ASSERT_MAIN_THREAD()` at documented boundaries |
+| M2 unasserted threading contracts | ✅ | `core::bind_main_thread()` + `BRACKEN_ASSERT_MAIN_THREAD()` at documented boundaries |
 | M3 rule-of-five gaps | ✅ | Explicit deleted moves on resource owners |
 | M4 raw bone-matrix pointer | ✅ | `std::span<const glm::mat4>` (done in the perf wave) |
 | M5 `SDL.h` umbrella includes | ✅ | Narrowed to specific SDL3 headers |

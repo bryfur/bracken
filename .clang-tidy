@@ -52,9 +52,9 @@ Checks: >
 
 WarningsAsErrors: ''
 
-# Only project headers — anchor on 'src/engine/' so dep paths like
+# Only project headers — anchor on 'src/bracken/' so dep paths like
 # `_deps/glm-src/` don't match the trailing 'src/' substring.
-HeaderFilterRegex: '.*/src/engine/.*'
+HeaderFilterRegex: '.*/src/bracken/.*'
 ExcludeHeaderFilterRegex: '.*/_deps/.*'
 
 CheckOptions:

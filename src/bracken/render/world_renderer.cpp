@@ -1,0 +1,243 @@
+#include "bracken/render/world_renderer.hpp"
+#include "bracken/gpu/gpu_texture.hpp"
+#include "bracken/gpu/gpu_uniforms.hpp"
+#include "bracken/core/logger.hpp"
+#include "bracken/core/profiler.hpp"
+#include "bracken/gpu/gpu_buffer.hpp"
+#include "bracken/gpu/gpu_device.hpp"
+#include "bracken/gpu/pipeline_registry.hpp"
+#include "bracken/model_loader.hpp"
+#include "glm/ext/matrix_float3x3.hpp"
+#include "glm/ext/matrix_float4x4.hpp"
+#include "glm/ext/matrix_transform.hpp"
+#include "glm/ext/vector_float3.hpp"
+#include "glm/ext/vector_float4.hpp"
+#include "glm/matrix.hpp"
+#include "glm/trigonometric.hpp"
+#include "SDL3/SDL_error.h"
+#include "SDL3/SDL_gpu.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+
+namespace bracken::render {
+
+namespace gpu = bracken::gpu;
+
+WorldRenderer::WorldRenderer() = default;
+
+WorldRenderer::~WorldRenderer() {
+    shutdown();
+}
+
+bool WorldRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, float world_width,
+                         float world_height, ModelManager* model_manager) {
+    device_ = &device;
+    pipeline_registry_ = &pipeline_registry;
+    world_width_ = world_width;
+    world_height_ = world_height;
+    model_manager_ = model_manager;
+
+    // Create sampler for textures
+    SDL_GPUSamplerCreateInfo sampler_info = {};
+    sampler_info.min_filter = SDL_GPU_FILTER_LINEAR;
+    sampler_info.mag_filter = SDL_GPU_FILTER_LINEAR;
+    sampler_info.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+    sampler_info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    sampler_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    sampler_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    sampler_info.max_anisotropy = 16.0f;
+    sampler_info.enable_anisotropy = true;
+    // Keep mip chains reachable (max_lod = 0 clamps sampling to mip 0).
+    sampler_info.max_lod = 1000.0f;
+    sampler_ = SDL_CreateGPUSampler(device_->handle(), &sampler_info);
+    if (!sampler_) {
+        BRACKEN_LOG_ERROR("render", "Failed to create sampler: {}", SDL_GetError());
+        return false;
+    }
+
+    create_skybox_mesh();
+    create_grid_mesh();
+
+    return true;
+}
+
+void WorldRenderer::shutdown() {
+    skybox_vertex_buffer_.reset();
+    grid_vertex_buffer_.reset();
+
+    if (sampler_ && device_) {
+        SDL_ReleaseGPUSampler(device_->handle(), sampler_);
+        sampler_ = nullptr;
+    }
+
+    device_ = nullptr;
+    pipeline_registry_ = nullptr;
+}
+
+void WorldRenderer::update(float dt) {
+    skybox_time_ += dt;
+}
+
+float WorldRenderer::get_terrain_height(float x, float z) const {
+    if (terrain_height_func_) {
+        return terrain_height_func_(x, z);
+    }
+    return 0.0f;
+}
+
+void WorldRenderer::create_skybox_mesh() {
+    if (!device_) {
+        return;
+    }
+
+    // Fullscreen triangle in clip space (3 vertices that cover the entire screen)
+    // z component is unused by shader but included for float3 vertex format
+    float vertices[] = {
+        -1.0f, -1.0f, 0.0f, 3.0f, -1.0f, 0.0f, -1.0f, 3.0f, 0.0f,
+    };
+
+    skybox_vertex_buffer_ =
+        gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Vertex, vertices, sizeof(vertices));
+
+    if (!skybox_vertex_buffer_) {
+        BRACKEN_LOG_ERROR("render", "Failed to create skybox vertex buffer");
+    }
+}
+
+void WorldRenderer::create_grid_mesh() {
+    if (!device_) {
+        return;
+    }
+
+    std::vector<float> grid_data;
+    float grid_step = 100.0f;
+
+    // Pre-calculate vertex count: 2 verts per grid line + 8 boundary verts, 7 floats each
+    int grid_lines_x = static_cast<int>(world_width_ / grid_step) + 1;
+    int grid_lines_z = static_cast<int>(world_height_ / grid_step) + 1;
+    int total_verts = (grid_lines_x + grid_lines_z) * 2 + 8;
+    grid_data.reserve(total_verts * 7);
+
+    auto push_vertex = [&](float x, float y, float z, float r, float g, float b, float a) {
+        grid_data.push_back(x);
+        grid_data.push_back(y);
+        grid_data.push_back(z);
+        grid_data.push_back(r);
+        grid_data.push_back(g);
+        grid_data.push_back(b);
+        grid_data.push_back(a);
+    };
+
+    // Grid lines. Iterate with integer counters to avoid float-accumulation
+    // drift dropping the last grid line.
+    const int x_steps = static_cast<int>(world_width_ / grid_step);
+    for (int i = 0; i <= x_steps; ++i) {
+        float x = static_cast<float>(i) * grid_step;
+        push_vertex(x, 0.0f, 0.0f, 0.15f, 0.15f, 0.2f, 0.8f);
+        push_vertex(x, 0.0f, world_height_, 0.15f, 0.15f, 0.2f, 0.8f);
+    }
+    const int z_steps = static_cast<int>(world_height_ / grid_step);
+    for (int i = 0; i <= z_steps; ++i) {
+        float z = static_cast<float>(i) * grid_step;
+        push_vertex(0.0f, 0.0f, z, 0.15f, 0.15f, 0.2f, 0.8f);
+        push_vertex(world_width_, 0.0f, z, 0.15f, 0.15f, 0.2f, 0.8f);
+    }
+
+    // World boundary
+    push_vertex(0.0f, 0.0f, 0.0f, 0.4f, 0.4f, 0.5f, 1.0f);
+    push_vertex(world_width_, 0.0f, 0.0f, 0.4f, 0.4f, 0.5f, 1.0f);
+    push_vertex(world_width_, 0.0f, 0.0f, 0.4f, 0.4f, 0.5f, 1.0f);
+    push_vertex(world_width_, 0.0f, world_height_, 0.4f, 0.4f, 0.5f, 1.0f);
+    push_vertex(world_width_, 0.0f, world_height_, 0.4f, 0.4f, 0.5f, 1.0f);
+    push_vertex(0.0f, 0.0f, world_height_, 0.4f, 0.4f, 0.5f, 1.0f);
+    push_vertex(0.0f, 0.0f, world_height_, 0.4f, 0.4f, 0.5f, 1.0f);
+    push_vertex(0.0f, 0.0f, 0.0f, 0.4f, 0.4f, 0.5f, 1.0f);
+
+    grid_vertex_count_ = static_cast<uint32_t>(grid_data.size() / 7);
+
+    grid_vertex_buffer_ = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Vertex, grid_data.data(),
+                                                        grid_data.size() * sizeof(float));
+
+    if (!grid_vertex_buffer_) {
+        BRACKEN_LOG_ERROR("render", "Failed to create grid vertex buffer");
+    }
+}
+
+void WorldRenderer::render_skybox(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view,
+                                  const glm::mat4& projection) {
+    BRACKEN_PROFILE_ZONE_COLOR("WorldRenderer::render_skybox", 0xC0392B);
+    if (!skybox_vertex_buffer_ || !pipeline_registry_ || !pass || !cmd) {
+        return;
+    }
+
+    auto* pipeline = pipeline_registry_->get_skybox_pipeline();
+    if (!pipeline) {
+        return;
+    }
+
+    pipeline->bind(pass);
+
+    // Cache the inverse view-projection: glm::inverse is not free per-frame
+    // and the camera rotation/projection are stable across many frames.
+    const glm::mat4 view_no_translation = glm::mat4(glm::mat3(view));
+    if (view_no_translation != cached_sky_view_ || projection != cached_sky_projection_) {
+        cached_sky_view_ = view_no_translation;
+        cached_sky_projection_ = projection;
+        cached_sky_inv_vp_ = glm::inverse(projection * view_no_translation);
+    }
+
+    // Push fragment uniforms - invVP for per-pixel ray, time, and atmosphere
+    gpu::SkyboxFragmentUniforms fs_uniforms = {};
+    fs_uniforms.invViewProjection = cached_sky_inv_vp_;
+    fs_uniforms.sunDirection = -env_.sun_dir; // shader expects direction TO the sun
+    fs_uniforms.time = skybox_time_;
+    fs_uniforms.sunColor = env_.sun_color;
+    fs_uniforms.zenithColor = env_.sky_zenith;
+    fs_uniforms.horizonColor = env_.sky_horizon;
+    fs_uniforms.groundColor = env_.ground_color;
+    fs_uniforms.fogHorizonColor = env_.fog_color_horizon;
+    fs_uniforms.fogSunColor = env_.fog_color_sun;
+    SDL_PushGPUFragmentUniformData(cmd, 0, &fs_uniforms, sizeof(fs_uniforms));
+
+    // Bind vertex buffer
+    SDL_GPUBufferBinding vb_binding = {};
+    vb_binding.buffer = skybox_vertex_buffer_->handle();
+    vb_binding.offset = 0;
+    SDL_BindGPUVertexBuffers(pass, 0, &vb_binding, 1);
+
+    // Draw fullscreen triangle (3 vertices)
+    SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+}
+
+void WorldRenderer::render_grid(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view,
+                                const glm::mat4& projection) {
+    BRACKEN_PROFILE_ZONE_COLOR("WorldRenderer::render_grid", 0xC0392B);
+    if (!grid_vertex_buffer_ || !pipeline_registry_ || !pass || !cmd) {
+        return;
+    }
+
+    auto* pipeline = pipeline_registry_->get_grid_pipeline();
+    if (!pipeline) {
+        return;
+    }
+
+    pipeline->bind(pass);
+
+    // Push uniforms
+    gpu::GridVertexUniforms uniforms = {};
+    uniforms.viewProjection = projection * view;
+    SDL_PushGPUVertexUniformData(cmd, 0, &uniforms, sizeof(uniforms));
+
+    // Bind vertex buffer
+    SDL_GPUBufferBinding vb_binding = {};
+    vb_binding.buffer = grid_vertex_buffer_->handle();
+    vb_binding.offset = 0;
+    SDL_BindGPUVertexBuffers(pass, 0, &vb_binding, 1);
+
+    // Draw grid lines
+    SDL_DrawGPUPrimitives(pass, grid_vertex_count_, 1, 0, 0);
+}
+
+} // namespace bracken::render

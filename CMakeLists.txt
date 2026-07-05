@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mmo_engine VERSION 0.1.0 LANGUAGES C CXX)
+project(bracken VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,8 +11,8 @@ include(FetchContent)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 # Tracy profiler (opt-in; OFF means zero overhead)
-option(MMO_ENABLE_TRACY "Enable Tracy profiler instrumentation" OFF)
-if(MMO_ENABLE_TRACY)
+option(BRACKEN_ENABLE_TRACY "Enable Tracy profiler instrumentation" OFF)
+if(BRACKEN_ENABLE_TRACY)
     FetchContent_Declare(
         tracy
         GIT_REPOSITORY https://github.com/wolfpld/tracy.git
@@ -24,8 +24,8 @@ if(MMO_ENABLE_TRACY)
 endif()
 
 # Unit tests
-option(MMO_BUILD_TESTS "Build unit tests" ON)
-if(MMO_BUILD_TESTS)
+option(BRACKEN_BUILD_TESTS "Build unit tests" ON)
+if(BRACKEN_BUILD_TESTS)
     enable_testing()
 
     FetchContent_Declare(
@@ -39,8 +39,8 @@ if(MMO_BUILD_TESTS)
 endif()
 
 # Google Benchmark (micro-benchmarks for CPU-side systems)
-option(MMO_BUILD_BENCHMARKS "Build mmo_engine_benchmarks (Google Benchmark)" ON)
-if(MMO_BUILD_BENCHMARKS)
+option(BRACKEN_BUILD_BENCHMARKS "Build bracken_benchmarks (Google Benchmark)" ON)
+if(BRACKEN_BUILD_BENCHMARKS)
     FetchContent_Declare(
         benchmark
         GIT_REPOSITORY https://github.com/google/benchmark.git
@@ -55,10 +55,10 @@ endif()
 # The engine library, its shader-compilation pipeline, and its third-party
 # dependencies (SDL3, glm, tinygltf, SDL_shadercross) are self-contained in
 # this subdirectory.
-add_subdirectory(src/engine)
+add_subdirectory(src/bracken)
 
 # Example apps (playground — the example game / integration test)
-option(MMO_BUILD_EXAMPLES "Build example apps" ON)
-if(MMO_BUILD_EXAMPLES)
+option(BRACKEN_BUILD_EXAMPLES "Build example apps" ON)
+if(BRACKEN_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()

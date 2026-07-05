@@ -6,9 +6,9 @@ otherwise) is the host's job** — the engine never does file I/O for effects.
 
 | Layer | Files | Namespace |
 |---|---|---|
-| Definitions (pure data) | `src/engine/effect_definition.hpp` | `mmo::engine` |
-| Runtime simulation | `src/engine/systems/effect_system.hpp/.cpp` | `mmo::engine::systems` |
-| Rendering | `src/engine/render/effect_renderer.hpp/.cpp` | `mmo::engine::render` |
+| Definitions (pure data) | `src/bracken/effect_definition.hpp` | `bracken` |
+| Runtime simulation | `src/bracken/systems/effect_system.hpp/.cpp` | `bracken::systems` |
+| Rendering | `src/bracken/render/effect_renderer.hpp/.cpp` | `bracken::render` |
 
 When using `Application`/`SceneRenderer`, the host only touches the first
 layer: build `EffectDefinition`s, then queue spawns on the `RenderScene`. The
@@ -18,11 +18,11 @@ it updates, terrain-clamps, and draws particles as part of `render_frame`.
 ## Spawning effects (host side)
 
 ```cpp
-#include "engine/effect_definition.hpp"
+#include "bracken/effect_definition.hpp"
 
 // Definitions must outlive every effect spawned from them — the runtime
 // stores raw pointers into them. Keep them in a long-lived registry.
-mmo::engine::EffectDefinition fireball = make_fireball_definition();
+bracken::EffectDefinition fireball = make_fireball_definition();
 
 // Per frame, in on_render():
 scene.add_particle_effect_spawn(&fireball, position, direction, range);

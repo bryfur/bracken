@@ -5,8 +5,8 @@ This is the **engine-side contract** — how to *author/rig* a character (DCC to
 choices, auto-riggers, retargeting) is a host/asset-pipeline concern and lives
 with whatever project consumes the engine, not here.
 
-The reference implementation is `src/engine/model_loader.cpp` (loading) and
-`src/engine/animation/` (playback).
+The reference implementation is `src/bracken/model_loader.cpp` (loading) and
+`src/bracken/animation/` (playback).
 
 ## Format
 
@@ -24,7 +24,7 @@ The reference implementation is `src/engine/model_loader.cpp` (loading) and
 
 - **`MAX_BONES = 128`.** Joint count per skinned mesh must stay ≤ 128. This cap
   is a single CPU-side constant in
-  `src/engine/animation/animation_types.hpp:15` (`constexpr int MAX_BONES`); it
+  `src/bracken/animation/animation_types.hpp:15` (`constexpr int MAX_BONES`); it
   sizes the per-instance bone-matrix arrays in `AnimationPlayer` and the
   `RenderScene`/`SceneRenderer` plumbing. At ≤ 128 joints the glb's joint indices
   fit in 8-bit integers. Don't raise it without auditing every
@@ -80,5 +80,5 @@ the host must supply a matching `FootIKBoneNames` instead of the defaults.
 - [ ] Each clip has non-constant frames (`np.diff(quats, axis=0).max() > 0`)
 - [ ] Materials and textures preserved (`materials > 0`, `textures > 0`)
 - [ ] Feet at the origin plane in the source scene
-- [ ] Loads with `mmo_engine_tests` green and the model_loader logging the
+- [ ] Loads with `bracken_tests` green and the model_loader logging the
       expected joint/animation counts

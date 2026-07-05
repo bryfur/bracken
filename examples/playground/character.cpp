@@ -1,6 +1,6 @@
 #include "character.hpp"
 
-#include "engine/animation/animation_types.hpp"
+#include "bracken/animation/animation_types.hpp"
 #include <cmath>
 #include <functional>
 #include <glm/glm.hpp>
@@ -10,11 +10,11 @@
 
 namespace playground {
 
-using mmo::engine::Mesh;
-using mmo::engine::Model;
-using mmo::engine::gpu::SkinnedVertex;
-using mmo::engine::gpu::Vertex3D;
-namespace anim = mmo::engine::animation;
+using bracken::Mesh;
+using bracken::Model;
+using bracken::gpu::SkinnedVertex;
+using bracken::gpu::Vertex3D;
+namespace anim = bracken::animation;
 
 namespace {
 

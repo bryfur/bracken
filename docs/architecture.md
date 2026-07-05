@@ -12,13 +12,13 @@ one of the cited facts, update this file in the same change.
 
 ## Module map
 
-Include root is `src/`; headers are included as `engine/<module>/<file>.hpp`.
-Root namespace `mmo::engine`, one sub-namespace per module.
+Include root is `src/`; headers are included as `bracken/<module>/<file>.hpp`.
+Root namespace `bracken`, one sub-namespace per module.
 
 | Path | Namespace | Contents |
 |---|---|---|
-| `src/engine/` (root) | `mmo::engine` | `Application`, `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `GraphicsSettings`, `Heightmap`, `RenderStats`, `effect_definition.hpp` |
-| `core/` | `core` | `Logger` (+`ENGINE_LOG_*`), `assert.hpp`, `Result<T,E>`, `Handle` pools, `hash.hpp` (`StringId`, FNV-1a), `profiler.hpp` (Tracy macros) |
+| `src/bracken/` (root) | `bracken` | `Application`, `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `GraphicsSettings`, `Heightmap`, `RenderStats`, `effect_definition.hpp` |
+| `core/` | `core` | `Logger` (+`BRACKEN_LOG_*`), `assert.hpp`, `Result<T,E>`, `Handle` pools, `hash.hpp` (`StringId`, FNV-1a), `profiler.hpp` (Tracy macros) |
 | `core/jobs/` | `core::jobs` | `JobSystem` (work-stealing singleton), `parallel_for`, `TaskHandle` |
 | `core/asset/` | `core::asset` | `AssetRegistry` (typed, stable handles, hot-reload), `FileWatcher` |
 | `memory/` | `memory` | `Arena` (bump + destructor registration), `FrameAllocator` |
@@ -30,7 +30,7 @@ Root namespace `mmo::engine`, one sub-namespace per module.
 | `animation/` | `animation` | `animation_types.hpp` (skeleton/clips/constants), `AnimationPlayer`, `AnimationStateMachine`, `ik_solver` |
 | `systems/` | `systems` | `CameraController` / `CameraSystem`, `EffectSystem` |
 | `procedural/` | `procedural` | `tree_generator` (ez-tree algorithm), `rock_generator` (SDF + marching cubes) |
-| `shaders/` | — | HLSL sources → SPIR-V at build time; see [shaders/README.md](../src/engine/shaders/README.md) |
+| `shaders/` | — | HLSL sources → SPIR-V at build time; see [shaders/README.md](../src/bracken/shaders/README.md) |
 
 ---
 
@@ -39,7 +39,7 @@ Root namespace `mmo::engine`, one sub-namespace per module.
 - **Y-up**, right-handed: x/z is the ground plane, y is height. glTF assets are
   `+Y up` / `-Z forward` (standard glTF), loaded with no rotation.
 - **Reversed-Z, zero-to-one depth**: `GLM_FORCE_DEPTH_ZERO_TO_ONE` is a PUBLIC
-  compile definition on the `mmo_engine` target (`src/engine/CMakeLists.txt`) —
+  compile definition on the `bracken` target (`src/bracken/CMakeLists.txt`) —
   it propagates to consumers. All projection math assumes glm `RH_ZO`, and the
   scene projection is **reversed-Z**: near/far are swapped in the
   `glm::perspective` call (`systems/camera_system.cpp`), so the near plane maps
@@ -78,7 +78,7 @@ Root namespace `mmo::engine`, one sub-namespace per module.
 
 ## `Application` lifecycle
 
-`Application` (`src/engine/application.hpp`) owns SDL, the main loop, frame
+`Application` (`src/bracken/application.hpp`) owns SDL, the main loop, frame
 timing, input, and the renderer facade. Consumers subclass it:
 
 - Pure virtual: `on_init()`, `on_update(float dt)`, `on_render()`.
@@ -92,12 +92,12 @@ The main loop (`application.cpp::run()`): nanosecond `dt` from
 `SDL_GetTicksNS()` clamped to 0.1 s; `FileWatcher::poll_main_thread()` when
 hot-reload is on; input edge-clearing + `SDL_PollEvent` (quit → stop, else
 `on_event` then `InputHandler::process_event`); `on_update(dt)`;
-`on_render()`; `ENGINE_PROFILE_FRAME()`.
+`on_render()`; `BRACKEN_PROFILE_FRAME()`.
 
 Side effects worth knowing:
 - `init_renderer` auto-loads `GraphicsSettings` from `settings_file_path()`
   (platform pref path) and `shutdown_renderer` auto-saves them.
-- If the env var `MMO_HOT_RELOAD=1` is set, `init_engine` starts the global
+- If the env var `BRACKEN_HOT_RELOAD=1` is set, `init_engine` starts the global
   `FileWatcher` and `init_renderer` wires model + shader-SPIR-V hot-reload to
   it (`application.cpp`). Default: off, no watcher thread.
 
@@ -200,7 +200,7 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
   format and are the only ones invalidated when the swapchain format changes.
   `preload_all_pipelines()` avoids first-use hitches.
   The full pipeline → shader-pair table lives in
-  [shaders/README.md](../src/engine/shaders/README.md).
+  [shaders/README.md](../src/bracken/shaders/README.md).
 - **Uniform contract**: every HLSL cbuffer has an `alignas(16)` CPU mirror in
   `gpu/gpu_uniforms.hpp`, annotated with its `(set, binding)`. They must match
   **byte-for-byte** — this is the most common way to break rendering silently.
@@ -211,8 +211,8 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
   bone matrices into a single per-frame `StructuredBuffer<float4x4>` (vertex
   set 0, binding 0); the skinned vertex shader indexes it with a
   `paletteOffset` uniform. There is **no GPU-side bone-count constant**.
-- **Debug tooling**: `ENGINE_GPU_SCOPE` (SDL debug groups) labels every pass.
-  `GPUTimestampPool` / `ENGINE_GPU_TIMER` exist but are **stubs** — SDL3 has
+- **Debug tooling**: `BRACKEN_GPU_SCOPE` (SDL debug groups) labels every pass.
+  `GPUTimestampPool` / `BRACKEN_GPU_TIMER` exist but are **stubs** — SDL3 has
   no per-pass timestamp queries, so `read_results` returns zeroed durations
   and any per-pass GPU times in `RenderStats` are placeholders
   (`gpu/gpu_debug.hpp`). Use RenderDoc/Nsight for real GPU timing.
@@ -221,7 +221,7 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
 
 ## Assets & models
 
-- **`ModelLoader`** (`src/engine/model_loader.hpp`): static
+- **`ModelLoader`** (`src/bracken/model_loader.hpp`): static
   `load_glb` / `upload_to_gpu` / `free_gpu_resources`. glTF binary only, no
   Draco (bundled tinygltf has no decoder). Bounds come from the POSITION
   accessor min/max. See [skinned_mesh_format.md](skinned_mesh_format.md) for
@@ -287,7 +287,7 @@ Per-instance, host-driven. Types and constants in
 The engine is single-threaded by design; the exceptions are explicit. The
 main-thread contracts are asserted, not just documented:
 `core::bind_main_thread()` runs in `Application::init_engine`, and
-`ENGINE_ASSERT_MAIN_THREAD()` (`core/assert.hpp`) guards the boundaries below
+`BRACKEN_ASSERT_MAIN_THREAD()` (`core/assert.hpp`) guards the boundaries below
 (FileWatcher entry points, swapchain acquire, `render_frame`) in debug builds.
 
 - **`FileWatcher`** (`core/asset/file_watcher.hpp`): polls on a background

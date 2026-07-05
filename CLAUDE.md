@@ -1,13 +1,14 @@
-# Project: mmo_engine
+# Project: Bracken
 
-A standalone **C++23** real-time rendering engine, extracted from the `mmo-4`
+A standalone **C++23** real-time rendering engine (library/target name
+`bracken`, formerly `mmo_engine`), extracted from the `mmo-4`
 game project. Built on **SDL3 GPU** (Vulkan/Metal/D3D12 backends) with
 HLSL→SPIR-V shader compilation, glTF model loading, skeletal animation, and a
 clustered-forward renderer.
 
 This repo contains **only the engine** — no game, server, networking, ECS, or
-physics. It builds as a static library (`mmo_engine`) plus a GoogleTest suite
-(`mmo_engine_tests`), and one example app: `examples/playground`, an
+physics. It builds as a static library (`bracken`) plus a GoogleTest suite
+(`bracken_tests`), and one example app: `examples/playground`, an
 orb-collector demo that doubles as the integration test (all assets built in
 code; `--smoke N` self-drives for N frames and exits — run it after changes
 that could affect rendering). See [README.md](README.md) for the user-facing
@@ -21,7 +22,7 @@ In short: **no full clean rebuilds.** Always `cmake --build build` (or
 `ninja -C build`). The first configure fetches and builds SDL_shadercross
 (bundling DXC + SPIRV-Tools) — that's the slow part of a cold build; never
 throw it away with a clean rebuild. New `.cpp`/`.hpp`/`.test.cpp` files under
-`src/engine/` are picked up automatically by the CMake `GLOB_RECURSE`, so an
+`src/bracken/` are picked up automatically by the CMake `GLOB_RECURSE`, so an
 incremental build is all that's needed after adding a file.
 
 ---
@@ -40,7 +41,7 @@ Read the doc that matches the task before diving into code:
   authoring contract (bones, channels, clip naming, IK bone names).
 - [docs/effects_system.md](docs/effects_system.md) — particle effects:
   definitions / runtime / rendering split, host responsibilities.
-- [src/engine/shaders/README.md](src/engine/shaders/README.md) — shader
+- [src/bracken/shaders/README.md](src/bracken/shaders/README.md) — shader
   naming, the pipeline→shader map, SDL3 GPU binding order, uniform contract.
 
 Keep these accurate: if a change invalidates a documented fact, update the doc
@@ -48,26 +49,26 @@ in the same change.
 
 ## Architecture
 
-The include root is `src/`; engine headers are included with an `engine/`-rooted
-path (`#include "engine/render/world_renderer.hpp"`). Everything lives under the
-`mmo::engine` namespace, with sub-namespaces per module.
+The include root is `src/`; engine headers are included with a `bracken/`-rooted
+path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under the
+`bracken` namespace, with sub-namespaces per module.
 
 | Module | Namespace | What's there |
 |---|---|---|
-| `core/` | `mmo::engine::core` | logger, asserts, `Result`, `Handle`, `hash`/`StringId`, Tracy profiler hooks |
+| `core/` | `bracken::core` | logger, asserts, `Result`, `Handle`, `hash`/`StringId`, Tracy profiler hooks |
 | `core/jobs/` | `core::jobs` | `JobSystem`, `parallel_for`, task handles — **kept serial/idle by design** |
-| `core/asset/` | `core::asset` | asset registry + `FileWatcher` (hot-reload; opt-in via `MMO_HOT_RELOAD=1`) |
-| `memory/` | `mmo::engine::memory` | arena allocator, frame allocator |
-| `gpu/` | `mmo::engine::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, pipelines, `PipelineRegistry`, `gpu_uniforms.hpp` (CPU↔GPU contract) |
-| `render/` | `mmo::engine::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), SSAO/GTAO, bloom, volumetric fog, effects, text, UI; `lighting/` = clustered light binning |
+| `core/asset/` | `core::asset` | asset registry + `FileWatcher` (hot-reload; opt-in via `BRACKEN_HOT_RELOAD=1`) |
+| `memory/` | `bracken::memory` | arena allocator, frame allocator |
+| `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, pipelines, `PipelineRegistry`, `gpu_uniforms.hpp` (CPU↔GPU contract) |
+| `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), SSAO/GTAO, bloom, volumetric fog, effects, text, UI; `lighting/` = clustered light binning |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
-| `scene/` | `mmo::engine::scene` | cameras, frustum culling, transforms, `RenderScene` command buffer, `SceneRenderer` (frame orchestrator), `UIScene` |
-| `animation/` | `mmo::engine::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
-| `systems/` | `mmo::engine::systems` | camera controller/system, particle `EffectSystem` |
-| `procedural/` | `mmo::engine::procedural` | tree + rock generators |
+| `scene/` | `bracken::scene` | cameras, frustum culling, transforms, `RenderScene` command buffer, `SceneRenderer` (frame orchestrator), `UIScene` |
+| `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
+| `systems/` | `bracken::systems` | camera controller/system, particle `EffectSystem` |
+| `procedural/` | `bracken::procedural` | tree + rock generators |
 | `shaders/` | — | HLSL sources, compiled to SPIR-V at build time |
 
-`Application` (`src/engine/application.hpp`) is the base class that owns the SDL
+`Application` (`src/bracken/application.hpp`) is the base class that owns the SDL
 lifecycle, main loop, frame timing, and input. Consumers subclass it and
 override `on_init`/`on_update`/`on_render`/`on_shutdown`.
 
@@ -128,18 +129,18 @@ override `on_init`/`on_update`/`on_render`/`on_shutdown`.
   has **no Draco** support — never feed it Draco-compressed glb. See
   [docs/skinned_mesh_format.md](docs/skinned_mesh_format.md).
 - Tests live next to their unit as `*.test.cpp` and are auto-globbed into
-  `mmo_engine_tests`. Add a test for new logic.
+  `bracken_tests`. Add a test for new logic.
 - **Error handling**: new fallible engine APIs return `core::Result<T, E>`
   (`Result<void, E>` for no-payload operations) or `bool`, marked
   `[[nodiscard]]` either way. Prefer `Result` when the error payload is
   actionable data (parse/compile errors at the asset/IO boundary — hot-reload
-  wants to display them); `bool` + `ENGINE_LOG_*` is fine for boot-time
+  wants to display them); `bool` + `BRACKEN_LOG_*` is fine for boot-time
   `init()` chains where failure is fatal and the log is the diagnostic.
   Existing `bool`+log APIs stay as they are until touched — do not
   mass-convert.
 - Shaders are `{name}.vert.hlsl` / `{name}.frag.hlsl` (entry points `VSMain` /
   `PSMain`), `.hlsli` for shared includes. See
-  [src/engine/shaders/README.md](src/engine/shaders/README.md).
+  [src/bracken/shaders/README.md](src/bracken/shaders/README.md).
 
 ## Building & testing
 
@@ -149,12 +150,12 @@ cmake --build build            # incremental — use this every time
 ctest --test-dir build --output-on-failure
 ```
 
-Options: `MMO_BUILD_TESTS` (default ON), `MMO_BUILD_BENCHMARKS` (default ON —
-Google Benchmark, `*.bench.cpp` next to units, auto-globbed), `MMO_BUILD_EXAMPLES`
-(default ON), `MMO_PLAYGROUND_SMOKE_TEST` (default OFF — registers the
-playground smoke run as a ctest; needs GPU + display), `MMO_ENABLE_TRACY`
+Options: `BRACKEN_BUILD_TESTS` (default ON), `BRACKEN_BUILD_BENCHMARKS` (default ON —
+Google Benchmark, `*.bench.cpp` next to units, auto-globbed), `BRACKEN_BUILD_EXAMPLES`
+(default ON), `BRACKEN_PLAYGROUND_SMOKE_TEST` (default OFF — registers the
+playground smoke run as a ctest; needs GPU + display), `BRACKEN_ENABLE_TRACY`
 (default OFF).
-Env: `MMO_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.
+Env: `BRACKEN_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.
 
 Integration test: `build/examples/playground/playground --smoke` (self-drives
 240 frames, prints `[smoke] OK ...` with render stats, exit code 0). It also
@@ -163,7 +164,7 @@ Read that PNG to visually inspect what the renderer actually produced.** The
 API is `Application::request_screenshot(path)` (captures the next frame's
 final swapchain image, UI included; the capturing frame blocks on the GPU).
 
-Benchmarks: `build/src/engine/mmo_engine_benchmarks` (add
+Benchmarks: `build/src/bracken/bracken_benchmarks` (add
 `--benchmark_filter=<regex>` for a subset). Audit reports live in
 `docs/audits/`.
 
@@ -171,8 +172,8 @@ Benchmarks: `build/src/engine/mmo_engine_benchmarks` (add
 
 ```cmake
 add_subdirectory(path/to/engine)
-target_link_libraries(my_game PRIVATE mmo_engine)
-mmo_engine_copy_shaders(my_game)   # stages compiled SPIR-V next to the exe
+target_link_libraries(my_game PRIVATE bracken)
+bracken_copy_shaders(my_game)   # stages compiled SPIR-V next to the exe
 ```
 
 ## What you must not do
