@@ -13,6 +13,9 @@
 
 namespace bracken {
 
+namespace dev {
+class DevUI;
+}
 namespace render {
 class RenderContext;
 }
@@ -99,6 +102,22 @@ protected:
     /** Apply all graphics settings (scene renderer, vsync, anisotropic, window mode). */
     void apply_all_graphics_settings(const GraphicsSettings& settings);
 
+    // ========== Dev overlay ==========
+
+    /** Create the developer overlay and, if the renderer is up, initialize it
+     *  bound to the engine subsystems (scene renderer, camera, graphics
+     *  settings, fps). On success this claims the SceneRenderer's single
+     *  post-UI callback slot to draw the overlay — hosts that call
+     *  init_dev_ui() must not set their own post-UI callback. Call after
+     *  init_renderer(). Returns false when the dev UI is compiled out
+     *  (BRACKEN_ENABLE_DEV_UI=OFF) or backend init fails; dev_ui() remains
+     *  safe to use either way. */
+    bool init_dev_ui();
+
+    /** Access the dev overlay (toggle visibility, add host panels).
+     *  Valid after init_dev_ui() — including when it returned false. */
+    dev::DevUI& dev_ui();
+
     /** Access the persisted graphics settings. */
     GraphicsSettings& graphics_settings() { return graphics_settings_; }
     const GraphicsSettings& graphics_settings() const { return graphics_settings_; }
@@ -144,6 +163,7 @@ private:
     std::unique_ptr<render::RenderContext> context_;
     std::unique_ptr<scene::SceneRenderer> scene_renderer_;
     std::unique_ptr<systems::CameraSystem> camera_;
+    std::unique_ptr<dev::DevUI> dev_ui_; // created by init_dev_ui(); destroyed before the renderer
 
     GraphicsSettings graphics_settings_;
 

@@ -4,6 +4,7 @@
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
+#include "bracken/dev/dev_ui.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/render/render_context.hpp"
 #include "bracken/scene/scene_renderer.hpp"
@@ -86,7 +87,12 @@ void Application::run() {
                     running_ = false;
                     break;
                 }
-                // Let subclass consume the event (e.g. for ImGui)
+                // Dev overlay sees events first (ImGui tracks state even
+                // while hidden; consumes only when visible + wants input).
+                if (dev_ui_ && dev_ui_->process_event(event)) {
+                    continue;
+                }
+                // Let subclass consume the event
                 if (!on_event(event)) {
                     input_.process_event(event);
                 }
@@ -156,6 +162,12 @@ void Application::shutdown_renderer() {
         if (!graphics_settings_.save(path)) {
             BRACKEN_LOG_ERROR("settings", "Failed to save settings to {}", path);
         }
+    }
+
+    // Dev overlay owns GPU resources — it must die before the device.
+    if (dev_ui_) {
+        dev_ui_->shutdown();
+        dev_ui_.reset();
     }
 
     camera_.reset();
@@ -254,6 +266,39 @@ void Application::apply_all_graphics_settings(const GraphicsSettings& settings) 
     }
     last_applied_settings_ = settings;
     has_applied_settings_ = true;
+}
+
+// ========== Dev overlay ==========
+
+bool Application::init_dev_ui() {
+    // Always construct, even when the renderer is down or the overlay is
+    // compiled out: dev_ui() and process_event()/render() stay safe to call.
+    dev_ui_ = std::make_unique<dev::DevUI>();
+    if (!context_ || !scene_renderer_ || !camera_) {
+        return false;
+    }
+
+    dev::DevUI::Bindings bindings{
+        scene_renderer_.get(),
+        &camera(),
+        &graphics_settings_,
+        [this](const GraphicsSettings& s) { apply_all_graphics_settings(s); },
+        &fps_,
+    };
+    if (!dev_ui_->init(*context_, std::move(bindings))) {
+        return false; // compiled out (stub) or backend init failed
+    }
+
+    // init_dev_ui() claims the SceneRenderer's single post-UI callback slot;
+    // hosts using the dev UI must not install their own.
+    scene_renderer_->set_post_ui_callback(
+        [this](SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain) { dev_ui_->render(cmd, swapchain); });
+    return true;
+}
+
+dev::DevUI& Application::dev_ui() {
+    BRACKEN_ASSERT(dev_ui_ != nullptr, "dev_ui() requires init_dev_ui() to have been called");
+    return *dev_ui_;
 }
 
 std::string Application::settings_file_path() const {
