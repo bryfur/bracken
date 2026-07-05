@@ -125,6 +125,15 @@ public:
     gpu::PipelineRegistry* pipeline_registry() { return pipeline_registry_.get(); }
     float get_terrain_height(float x, float z);
 
+    /** Live-editable environment (sun/sky/fog — single source of truth).
+     *  Mutations take effect next frame: render_frame re-propagates env_ to
+     *  every sub-renderer at the top of each frame. */
+    EnvironmentState& environment() { return env_; }
+
+    /** Read-only view of the particle system (e.g. dev-overlay stats).
+     *  Null until init() succeeds. */
+    const bracken::systems::EffectSystem* effect_system() const { return effect_system_.get(); }
+
     // Post-UI callback: called after UI rendering, before end_frame.
     // Receives (command_buffer, swapchain_texture) for additional render passes (e.g. ImGui).
     using PostUICallback = std::function<void(SDL_GPUCommandBuffer*, SDL_GPUTexture*)>;
