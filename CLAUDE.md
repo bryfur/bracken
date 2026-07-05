@@ -66,6 +66,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
 | `systems/` | `bracken::systems` | camera controller/system, particle `EffectSystem` |
 | `procedural/` | `bracken::procedural` | tree + rock generators |
+| `dev/` | `bracken::dev` | `DevUI` Dear ImGui developer overlay (F10 in the playground; no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`) |
 | `shaders/` | — | HLSL sources, compiled to SPIR-V at build time |
 
 `Application` (`src/bracken/application.hpp`) is the base class that owns the SDL
@@ -153,7 +154,9 @@ ctest --test-dir build --output-on-failure
 Options: `BRACKEN_BUILD_TESTS` (default ON), `BRACKEN_BUILD_BENCHMARKS` (default ON —
 Google Benchmark, `*.bench.cpp` next to units, auto-globbed), `BRACKEN_BUILD_EXAMPLES`
 (default ON), `BRACKEN_PLAYGROUND_SMOKE_TEST` (default OFF — registers the
-playground smoke run as a ctest; needs GPU + display), `BRACKEN_ENABLE_TRACY`
+playground smoke run as a ctest; needs GPU + display), `BRACKEN_ENABLE_DEV_UI`
+(default ON — Dear ImGui developer overlay; OFF compiles `bracken::dev::DevUI`
+to a no-op stub and skips fetching ImGui), `BRACKEN_ENABLE_TRACY`
 (default OFF).
 Env: `BRACKEN_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.
 

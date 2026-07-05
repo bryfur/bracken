@@ -2,6 +2,8 @@
 
 #include "character.hpp"
 #include "bracken/animation/ik_solver.hpp"
+#include "bracken/core/logger.hpp"
+#include "bracken/dev/dev_ui.hpp"
 #include "bracken/procedural/rock_generator.hpp"
 #include "bracken/procedural/tree_generator.hpp"
 #include "bracken/render/lighting/light.hpp"
@@ -12,6 +14,9 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <iostream>
 #include <SDL3/SDL.h>
+#ifdef BRACKEN_DEV_UI
+#include <imgui.h> // panel bodies only — DevUI itself needs no #ifdef
+#endif
 
 namespace playground {
 
@@ -43,6 +48,26 @@ bool PlaygroundGame::on_init() {
     if (!init_renderer(1600, 900, "bracken playground", WORLD, WORLD)) {
         return false;
     }
+
+    // Dear ImGui developer overlay (F10). In stub builds
+    // (BRACKEN_ENABLE_DEV_UI=OFF) init_dev_ui() returns false and every DevUI
+    // call is a harmless no-op, so nothing here needs guarding except the
+    // panel body, which calls ImGui:: directly.
+    const bool dev_ui_ok = init_dev_ui();
+    BRACKEN_LOG_INFO("playground", "Dev UI {}",
+                     dev_ui_ok ? "initialized (F10 toggles it)" : "unavailable (stub build or init failed)");
+#ifdef BRACKEN_DEV_UI
+    dev_ui().add_panel("Playground", [this] {
+        ImGui::Text("Orbs collected: %d", orbs_collected_);
+        ImGui::Text("Player pos: %.1f, %.1f, %.1f", player_pos_.x, player_pos_.y, player_pos_.z);
+        ImGui::Text("Anim state: %s", anim_sm_.current_state().c_str());
+        if (ImGui::Button("Spawn pickup burst")) {
+            pending_pickup_bursts_.push_back(player_pos_);
+        }
+        ImGui::Checkbox("Flashlight", &flashlight_);
+        ImGui::Checkbox("Debug draw", &debug_draw_);
+    });
+#endif
 
     build_heightmap();
     set_heightmap(heightmap_);
@@ -273,6 +298,9 @@ void PlaygroundGame::handle_input(float dt) {
     if (in.was_key_just_pressed(SDL_SCANCODE_F3)) {
         debug_draw_ = !debug_draw_;
     }
+    if (in.was_key_just_pressed(SDL_SCANCODE_F10)) {
+        dev_ui().toggle();
+    }
     if (in.was_key_just_pressed(SDL_SCANCODE_F12)) {
         request_screenshot(std::format("screenshot_{:03d}.png", screenshot_counter_++));
     }
@@ -365,6 +393,11 @@ void PlaygroundGame::update_smoke_driver(float dt) {
     if (frame_ == 140) {
         gs.ao_mode = AOMode::GTAO;
         apply_all_graphics_settings(gs);
+    }
+    if (frame_ == 170) {
+        // Show the dev overlay so the end-of-run screenshot proves it renders.
+        // Harmless no-op in stub builds (the hidden UI never initialized).
+        dev_ui().set_visible(true);
     }
     if (frame_ == 200) {
         gs.shadow_mode = ShadowMode::PCF;
@@ -541,7 +574,8 @@ void PlaygroundGame::build_ui() {
         ui_.add_text(std::format("SMOKE {}/{}", frame_, smoke_frames_), 22, 124, 0.9f, 0xFFFF8060);
     }
     ui_.add_text_wrapped("WASD move | Shift run | mouse-drag orbit | wheel zoom | LMB attack | F flashlight | "
-                         "F1 AO | F2 bloom | F4 fog | F5 shadows | F6 FXAA | F3 debug | F12 screenshot | Esc quit",
+                         "F1 AO | F2 bloom | F4 fog | F5 shadows | F6 FXAA | F3 debug | F12 screenshot | Esc quit | "
+                         "F10 dev overlay",
                          10, static_cast<float>(screen_height()) - 56.0f, static_cast<float>(screen_width()) - 20.0f,
                          0.9f, 0xFFC8D0DC);
 }
