@@ -43,8 +43,10 @@ public:
 
     AmbientOcclusion(const AmbientOcclusion&) = delete;
     AmbientOcclusion& operator=(const AmbientOcclusion&) = delete;
+    AmbientOcclusion(AmbientOcclusion&&) = delete;
+    AmbientOcclusion& operator=(AmbientOcclusion&&) = delete;
 
-    bool init(gpu::GPUDevice& device, int width, int height);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, int width, int height);
     void shutdown();
     void resize(int width, int height);
 

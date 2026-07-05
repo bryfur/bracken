@@ -190,7 +190,9 @@ void PlaygroundGame::setup_state_machine() {
     anim_sm_.add_state(std::move(run));
     anim_sm_.add_state(std::move(attack));
     anim_sm_.set_default_state("Idle");
-    anim_sm_.bind_clips(models().get_model(player_model_)->animations);
+    if (!anim_sm_.bind_clips(models().get_model(player_model_)->animations)) {
+        std::cout << "[playground] warning: state machine has states with unbound clips\n";
+    }
 
     // Resolve per-frame parameter names to indices once; update_player uses
     // the index overloads so no name is hashed per frame.
@@ -280,7 +282,7 @@ void PlaygroundGame::handle_input(float dt) {
     auto& gs = graphics_settings();
     bool gs_dirty = false;
     if (in.was_key_just_pressed(SDL_SCANCODE_F1)) {
-        gs.ao_mode = (gs.ao_mode + 1) % 3;
+        gs.ao_mode = static_cast<AOMode>((static_cast<int>(gs.ao_mode) + 1) % 3);
         gs_dirty = true;
     }
     if (in.was_key_just_pressed(SDL_SCANCODE_F2)) {
@@ -293,11 +295,11 @@ void PlaygroundGame::handle_input(float dt) {
         gs_dirty = true;
     }
     if (in.was_key_just_pressed(SDL_SCANCODE_F5)) {
-        gs.shadow_mode = (gs.shadow_mode + 1) % 3;
+        gs.shadow_mode = static_cast<ShadowMode>((static_cast<int>(gs.shadow_mode) + 1) % 3);
         gs_dirty = true;
     }
     if (in.was_key_just_pressed(SDL_SCANCODE_F6)) {
-        gs.aa_mode = gs.aa_mode == 0 ? 1 : 0;
+        gs.aa_mode = gs.aa_mode == AAMode::Off ? AAMode::FXAA : AAMode::Off;
         gs_dirty = true;
     }
     if (gs_dirty) {
@@ -361,11 +363,11 @@ void PlaygroundGame::update_smoke_driver(float dt) {
         apply_all_graphics_settings(gs);
     }
     if (frame_ == 140) {
-        gs.ao_mode = 2; // GTAO
+        gs.ao_mode = AOMode::GTAO;
         apply_all_graphics_settings(gs);
     }
     if (frame_ == 200) {
-        gs.shadow_mode = 1; // PCF
+        gs.shadow_mode = ShadowMode::PCF;
         apply_all_graphics_settings(gs);
     }
 

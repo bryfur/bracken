@@ -11,6 +11,10 @@ class AnimationPlayer {
 public:
     AnimationPlayer() { reset(); }
 
+    // Move-only by design: a copied player sharing keyframe cursors with the
+    // original was a historical source of animation glitches.
+    AnimationPlayer(const AnimationPlayer&) = delete;
+    AnimationPlayer& operator=(const AnimationPlayer&) = delete;
     AnimationPlayer(AnimationPlayer&&) noexcept = default;
     AnimationPlayer& operator=(AnimationPlayer&&) noexcept = default;
 

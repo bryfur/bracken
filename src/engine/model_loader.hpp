@@ -10,12 +10,12 @@
 #include <vector>
 
 // Include GPU abstraction headers for proper type definitions
-#include "gpu/gpu_buffer.hpp"
-#include "gpu/gpu_texture.hpp"
-#include "gpu/gpu_types.hpp"
+#include "engine/gpu/gpu_buffer.hpp"
+#include "engine/gpu/gpu_texture.hpp"
+#include "engine/gpu/gpu_types.hpp"
 
 // Animation types from the dedicated animation module
-#include "animation/animation_types.hpp"
+#include "engine/animation/animation_types.hpp"
 
 // Forward declarations for SDL3 GPU types
 struct SDL_GPUDevice;
@@ -167,7 +167,7 @@ struct Model {
 
 class ModelLoader {
 public:
-    static bool load_glb(const std::string& path, Model& model);
+    [[nodiscard]] static bool load_glb(const std::string& path, Model& model);
     static void upload_to_gpu(gpu::GPUDevice& device, Model& model);
     static void free_gpu_resources(Model& model);
 };
@@ -176,6 +176,13 @@ class ModelManager {
 public:
     ModelManager();
     ~ModelManager();
+
+    // Non-copyable, non-movable: owns GPU-backed models; handles and raw
+    // Model* handed to callers must stay stable.
+    ModelManager(const ModelManager&) = delete;
+    ModelManager& operator=(const ModelManager&) = delete;
+    ModelManager(ModelManager&&) = delete;
+    ModelManager& operator=(ModelManager&&) = delete;
 
     void set_device(gpu::GPUDevice* device) { device_ = device; }
 
@@ -198,7 +205,7 @@ public:
     /// Re-parse the source file and swap GPU buffers in place; the existing
     /// ModelHandle keeps pointing at the same slot. Returns false if the file
     /// failed to load (the existing model is left untouched).
-    bool reload_model(ModelHandle handle);
+    [[nodiscard]] bool reload_model(ModelHandle handle);
 
     /// Enable hot-reload: re-load any model whose source file (.glb/.gltf) is
     /// modified on disk.

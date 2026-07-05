@@ -43,8 +43,10 @@ public:
 
     ShadowMap(const ShadowMap&) = delete;
     ShadowMap& operator=(const ShadowMap&) = delete;
+    ShadowMap(ShadowMap&&) = delete;
+    ShadowMap& operator=(ShadowMap&&) = delete;
 
-    bool init(gpu::GPUDevice& device, int resolution = 2048);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, int resolution = 2048);
     void shutdown();
 
     /// Reinitialize with a new per-cascade resolution (recreates the atlas)

@@ -66,7 +66,7 @@ public:
         return it == name_to_handle_.end() ? Handle::invalid() : it->second;
     }
 
-    bool reload(Handle h) {
+    [[nodiscard]] bool reload(Handle h) {
         auto* entry = entry_at(h);
         if (!entry) {
             return false;
@@ -150,7 +150,8 @@ private:
 
     void install_watch(Entry& entry) {
         Handle h = entry.handle;
-        entry.watch = watcher_->watch_file(entry.path, [this, h](const std::filesystem::path&) { reload(h); });
+        // reload() logs success/failure itself; nothing further to do here.
+        entry.watch = watcher_->watch_file(entry.path, [this, h](const std::filesystem::path&) { (void)reload(h); });
     }
 
     LoadFn load_fn_;

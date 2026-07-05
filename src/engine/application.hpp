@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <SDL3/SDL.h>
+#include <SDL3/SDL_events.h>
 #include <string>
 #include <vector>
 
@@ -43,7 +43,7 @@ public:
     virtual ~Application();
 
     /** Initialize SDL subsystems. Call before on_init(). */
-    bool init_engine();
+    [[nodiscard]] bool init_engine();
 
     /** Run the main loop until quit() is called. */
     void run();
@@ -79,7 +79,7 @@ protected:
     // ========== Rendering facade ==========
 
     /** Initialize the rendering subsystems (window, GPU, scene renderer, camera). */
-    bool init_renderer(int width, int height, const std::string& title, float world_width = 32000.0f,
+    [[nodiscard]] bool init_renderer(int width, int height, const std::string& title, float world_width = 32000.0f,
                        float world_height = 32000.0f);
 
     /** Shut down all rendering subsystems. */

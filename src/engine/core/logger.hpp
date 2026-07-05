@@ -25,7 +25,15 @@ const char* to_string(LogLevel level) noexcept;
 
 class LogSink {
 public:
+    LogSink() = default;
     virtual ~LogSink() = default;
+
+    // Polymorphic base: copying/moving through the base slices derived sinks.
+    LogSink(const LogSink&) = delete;
+    LogSink& operator=(const LogSink&) = delete;
+    LogSink(LogSink&&) = delete;
+    LogSink& operator=(LogSink&&) = delete;
+
     virtual void write(LogLevel level, const char* category, std::string_view msg) = 0;
 };
 

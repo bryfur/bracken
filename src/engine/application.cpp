@@ -1,4 +1,5 @@
 #include "application.hpp"
+#include "engine/core/assert.hpp"
 #include "engine/core/asset/file_watcher.hpp"
 #include "engine/core/jobs/job_system.hpp"
 #include "engine/core/logger.hpp"
@@ -27,6 +28,9 @@ Application::Application() = default;
 Application::~Application() = default;
 
 bool Application::init_engine() {
+    // Record the engine main thread for ENGINE_ASSERT_MAIN_THREAD() checks
+    // (FileWatcher entry points, swapchain acquire, render_frame).
+    core::bind_main_thread();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         ENGINE_LOG_FATAL("app", "Failed to initialize SDL: {}", SDL_GetError());
         return false;
@@ -35,8 +39,9 @@ bool Application::init_engine() {
     // getenv is single-threaded at engine boot, before any worker thread is spawned.
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
     if (const char* env = std::getenv("MMO_HOT_RELOAD"); env && env[0] == '1') {
-        core::asset::FileWatcher::instance().init();
-        ENGINE_LOG_INFO("app", "Hot-reload enabled (MMO_HOT_RELOAD=1)");
+        if (core::asset::FileWatcher::instance().init()) {
+            ENGINE_LOG_INFO("app", "Hot-reload enabled (MMO_HOT_RELOAD=1)");
+        }
     }
     return true;
 }
@@ -135,8 +140,9 @@ bool Application::init_renderer(int width, int height, const std::string& title,
 
     // Auto-load settings from disk
     auto path = settings_file_path();
-    if (!path.empty()) {
-        graphics_settings_.load(path);
+    if (!path.empty() && !graphics_settings_.load(path)) {
+        // Normal on first run: no settings file yet, defaults apply.
+        ENGINE_LOG_INFO("app", "No graphics settings at '{}'; using defaults", path);
     }
     apply_all_graphics_settings(graphics_settings_);
 

@@ -192,8 +192,8 @@ TEST_F(FileWatcherFixture, MultipleWatchersOnSameFileBothFire) {
     std::this_thread::sleep_for(150ms);
 
     std::atomic<int> a{0}, b{0};
-    watcher.watch_file(file, [&](const fs::path&) { a.fetch_add(1); });
-    watcher.watch_file(file, [&](const fs::path&) { b.fetch_add(1); });
+    EXPECT_NE(watcher.watch_file(file, [&](const fs::path&) { a.fetch_add(1); }), FileWatcher::k_invalid_handle);
+    EXPECT_NE(watcher.watch_file(file, [&](const fs::path&) { b.fetch_add(1); }), FileWatcher::k_invalid_handle);
 
     std::this_thread::sleep_for(150ms);
     watcher.poll_main_thread();

@@ -53,7 +53,7 @@ TEST(HandlePool, GenerationalReuseDetectsStale) {
     HandlePool<MeshTag, int> pool;
     auto h1 = pool.acquire(10);
     auto idx1 = h1.index;
-    pool.release(h1);
+    EXPECT_TRUE(pool.release(h1));
 
     auto h2 = pool.acquire(20);
     EXPECT_EQ(h2.index, idx1);               // index recycled
@@ -74,7 +74,7 @@ TEST(HandlePool, MultipleAcquireAndContains) {
     EXPECT_TRUE(pool.contains(b));
     EXPECT_TRUE(pool.contains(c));
     EXPECT_EQ(pool.size(), 3u);
-    pool.release(b);
+    EXPECT_TRUE(pool.release(b));
     EXPECT_FALSE(pool.contains(b));
     EXPECT_EQ(pool.size(), 2u);
 }

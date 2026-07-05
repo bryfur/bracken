@@ -2,8 +2,8 @@
 
 #include "engine/gpu/gpu_device.hpp"
 #include <glm/glm.hpp>
-#include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
+#include <SDL3/SDL_video.h>
 #include <string>
 #include <vector>
 
@@ -30,7 +30,7 @@ public:
      * Initialize SDL window and GPU device.
      * @return true on success
      */
-    bool init(int width, int height, const std::string& title);
+    [[nodiscard]] bool init(int width, int height, const std::string& title);
 
     /**
      * Clean up all resources.
@@ -71,7 +71,7 @@ public:
      * Stalls the pipeline — readback paths only (screenshots).
      * @return false if submission failed.
      */
-    bool end_frame_and_wait();
+    [[nodiscard]] bool end_frame_and_wait();
 
     /**
      * Get the current frame's command buffer (only valid between begin_frame and end_frame)

@@ -27,7 +27,7 @@ public:
     RenderGraph(const RenderGraph&) = delete;
     RenderGraph& operator=(const RenderGraph&) = delete;
 
-    bool init(gpu::GPUDevice& device);
+    [[nodiscard]] bool init(gpu::GPUDevice& device);
     void shutdown();
 
     // Begin a new frame. cb may be null for tests; execute() is then a no-op for managed render passes.
@@ -53,7 +53,7 @@ public:
 
     // Compile: topo-sort, resolve transient resources from the pool, compute lifetimes.
     // Returns false on cycle (which is logged and skipped).
-    bool compile();
+    [[nodiscard]] bool compile();
 
     // Execute compiled order. begin_frame() must have set the command buffer first.
     void execute();

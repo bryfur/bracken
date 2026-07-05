@@ -170,8 +170,9 @@ std::unique_ptr<GPUShader> GPUShader::create_from_spirv(GPUDevice& device, const
 // =============================================================================
 
 ShaderManager::ShaderManager(GPUDevice& device) : device_(device) {
-    // Initialize the cross-compilation system
-    GPUShader::init_compiler();
+    // Initialize the cross-compilation system. Failure is logged inside and
+    // every subsequent shader load fails (and logs) individually.
+    (void)GPUShader::init_compiler();
 }
 
 ShaderManager::~ShaderManager() {

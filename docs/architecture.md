@@ -142,7 +142,9 @@ timer label, so RenderDoc captures read in this order.)
    instances, shadow instances, bone palettes, particle instances, debug
    lines, grass chunks, cluster light buffers.
 3. **`ShadowPass`** — cascades rendered into the 2×2-quadrant D32 atlas
-   (`ShadowPass:Cascade0..3`), only when `shadow_mode > 0`.
+   (`ShadowPass:Cascade0..3`), only when `shadow_mode != ShadowMode::Off`
+   (settings modes are `enum class`es in `graphics_settings.hpp`; the on-disk
+   settings format stays numeric).
 4. **`AOOffscreen`** (the normal path whenever the AO subsystem initialized) —
    the whole 3D scene renders into the linear-HDR offscreen target: terrain,
    grass, static/instanced/skinned models, skybox, sorted transparent
@@ -282,7 +284,11 @@ Per-instance, host-driven. Types and constants in
 
 ## Threading & lifetime contracts
 
-The engine is single-threaded by design; the exceptions are explicit:
+The engine is single-threaded by design; the exceptions are explicit. The
+main-thread contracts are asserted, not just documented:
+`core::bind_main_thread()` runs in `Application::init_engine`, and
+`ENGINE_ASSERT_MAIN_THREAD()` (`core/assert.hpp`) guards the boundaries below
+(FileWatcher entry points, swapchain acquire, `render_frame`) in debug builds.
 
 - **`FileWatcher`** (`core/asset/file_watcher.hpp`): polls on a background
   `std::jthread`, but callbacks fire only from `poll_main_thread()` on the

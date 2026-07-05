@@ -4,8 +4,8 @@
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <memory>
-#include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
+#include <SDL3/SDL_surface.h>
 #include <SDL3_ttf/SDL_ttf.h>
 #include <string>
 #include <string_view>
@@ -145,7 +145,7 @@ public:
      * @param device GPU device for creating resources
      * @param pipeline_registry Registry for accessing text pipeline
      */
-    bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry);
     void shutdown();
 
     // Set projection matrix before drawing

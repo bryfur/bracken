@@ -93,6 +93,8 @@ public:
     // Non-copyable
     TerrainRenderer(const TerrainRenderer&) = delete;
     TerrainRenderer& operator=(const TerrainRenderer&) = delete;
+    TerrainRenderer(TerrainRenderer&&) = delete;
+    TerrainRenderer& operator=(TerrainRenderer&&) = delete;
 
     /**
      * Initialize terrain resources.
@@ -101,7 +103,7 @@ public:
      * @param world_width World X dimension
      * @param world_height World Z dimension
      */
-    bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, float world_width, float world_height);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, float world_width, float world_height);
 
     /**
      * Set heightmap from server data. Uploads to GPU texture.

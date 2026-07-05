@@ -135,7 +135,9 @@ void RenderContext::set_vsync_mode(int mode) {
             present_mode = SDL_GPU_PRESENTMODE_IMMEDIATE;
             break;
     }
-    device_.set_swapchain_parameters(present_mode);
+    if (!device_.set_swapchain_parameters(present_mode)) {
+        SDL_Log("RenderContext::set_vsync_mode: failed to set present mode %d", mode);
+    }
 }
 
 void RenderContext::query_display_modes() {

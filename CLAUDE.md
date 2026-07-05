@@ -129,6 +129,14 @@ override `on_init`/`on_update`/`on_render`/`on_shutdown`.
   [docs/skinned_mesh_format.md](docs/skinned_mesh_format.md).
 - Tests live next to their unit as `*.test.cpp` and are auto-globbed into
   `mmo_engine_tests`. Add a test for new logic.
+- **Error handling**: new fallible engine APIs return `core::Result<T, E>`
+  (`Result<void, E>` for no-payload operations) or `bool`, marked
+  `[[nodiscard]]` either way. Prefer `Result` when the error payload is
+  actionable data (parse/compile errors at the asset/IO boundary — hot-reload
+  wants to display them); `bool` + `ENGINE_LOG_*` is fine for boot-time
+  `init()` chains where failure is fatal and the log is the diagnostic.
+  Existing `bool`+log APIs stay as they are until touched — do not
+  mass-convert.
 - Shaders are `{name}.vert.hlsl` / `{name}.frag.hlsl` (entry points `VSMain` /
   `PSMain`), `.hlsli` for shared includes. See
   [src/engine/shaders/README.md](src/engine/shaders/README.md).

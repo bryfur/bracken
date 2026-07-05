@@ -1,5 +1,6 @@
 #include "engine/core/asset/file_watcher.hpp"
 
+#include "engine/core/assert.hpp"
 #include "engine/core/logger.hpp"
 #include "engine/core/profiler.hpp"
 
@@ -30,6 +31,10 @@ FileWatcher& FileWatcher::instance() {
 }
 
 bool FileWatcher::init(std::chrono::milliseconds poll_interval) {
+    // init() is documented main-thread-only; treat it as an (additional)
+    // binding point so a watcher inited before Application::init_engine still
+    // records the right thread.
+    core::bind_main_thread();
     if (initialized_.load(std::memory_order_acquire)) {
         return false;
     }
@@ -43,6 +48,7 @@ bool FileWatcher::init(std::chrono::milliseconds poll_interval) {
 }
 
 void FileWatcher::shutdown() {
+    ENGINE_ASSERT_MAIN_THREAD();
     if (!initialized_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
@@ -67,6 +73,7 @@ void FileWatcher::shutdown() {
 }
 
 FileWatcher::WatchHandle FileWatcher::watch_file(fs::path path, WatchCallback on_change) {
+    ENGINE_ASSERT_MAIN_THREAD();
     if (!initialized_.load(std::memory_order_acquire) || !on_change) {
         return k_invalid_handle;
     }
@@ -85,6 +92,7 @@ FileWatcher::WatchHandle FileWatcher::watch_file(fs::path path, WatchCallback on
 
 FileWatcher::WatchHandle FileWatcher::watch_directory(fs::path dir, std::string extension_filter,
                                                       WatchCallback on_change) {
+    ENGINE_ASSERT_MAIN_THREAD();
     if (!initialized_.load(std::memory_order_acquire) || !on_change) {
         return k_invalid_handle;
     }
@@ -103,6 +111,7 @@ FileWatcher::WatchHandle FileWatcher::watch_directory(fs::path dir, std::string 
 }
 
 void FileWatcher::unwatch(WatchHandle h) {
+    ENGINE_ASSERT_MAIN_THREAD();
     if (h == k_invalid_handle) {
         return;
     }
@@ -112,6 +121,7 @@ void FileWatcher::unwatch(WatchHandle h) {
 }
 
 void FileWatcher::poll_main_thread() {
+    ENGINE_ASSERT_MAIN_THREAD();
     std::vector<PendingEvent> drained;
     {
         std::lock_guard<std::mutex> lk(queue_mutex_);

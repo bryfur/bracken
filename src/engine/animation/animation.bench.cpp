@@ -148,7 +148,7 @@ AnimationStateMachine make_bench_state_machine() {
         clips.push_back(std::move(clip));
     }
     sm.set_default_state("state0");
-    sm.bind_clips(clips);
+    (void)sm.bind_clips(clips); // synthetic clips always bind
     return sm;
 }
 

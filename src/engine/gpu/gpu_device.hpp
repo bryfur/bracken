@@ -1,8 +1,8 @@
 #pragma once
 
 #include <memory>
-#include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
+#include <SDL3/SDL_video.h>
 #include <string>
 
 namespace mmo::engine::gpu {
@@ -46,7 +46,7 @@ public:
      * @param prefer_low_power If true, prefer integrated GPU over discrete
      * @return true on success, false on failure
      */
-    bool init(SDL_Window* window, bool prefer_low_power = false);
+    [[nodiscard]] bool init(SDL_Window* window, bool prefer_low_power = false);
 
     /**
      * @brief Shutdown and release all GPU resources
@@ -80,7 +80,7 @@ public:
      * Stalls the pipeline — readback paths only (screenshots), never the frame
      * loop. @return false if submission failed.
      */
-    bool end_frame_and_wait(SDL_GPUCommandBuffer* cmd);
+    [[nodiscard]] bool end_frame_and_wait(SDL_GPUCommandBuffer* cmd);
 
     /**
      * @brief Acquire the swapchain texture for the current frame
@@ -168,7 +168,7 @@ public:
      * @param present_mode SDL_GPU_PRESENTMODE_VSYNC, IMMEDIATE, or MAILBOX
      * @return true if the mode was set, false if unsupported
      */
-    bool set_swapchain_parameters(SDL_GPUPresentMode present_mode);
+    [[nodiscard]] bool set_swapchain_parameters(SDL_GPUPresentMode present_mode);
 
     SDL_GPUDevice* handle() const { return device_; }
     SDL_Window* window() const { return window_; }

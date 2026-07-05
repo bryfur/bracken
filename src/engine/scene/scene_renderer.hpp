@@ -69,6 +69,8 @@ public:
 
     SceneRenderer(const SceneRenderer&) = delete;
     SceneRenderer& operator=(const SceneRenderer&) = delete;
+    SceneRenderer(SceneRenderer&&) = delete;
+    SceneRenderer& operator=(SceneRenderer&&) = delete;
 
     /**
      * Initialize all rendering subsystems.
@@ -76,7 +78,7 @@ public:
      * @param world_width World width for terrain/world renderers
      * @param world_height World height for terrain/world renderers
      */
-    bool init(render::RenderContext& context, float world_width = 32000.0f, float world_height = 32000.0f);
+    [[nodiscard]] bool init(render::RenderContext& context, float world_width = 32000.0f, float world_height = 32000.0f);
 
     void shutdown();
 
@@ -226,11 +228,15 @@ private:
     // ascending handle order (stable, texture-coherent), skipping empty bins.
     std::vector<std::vector<gpu::InstanceData>> instance_batches_;
     std::vector<ModelHandle> instance_batches_touched_;
+    // Mirror of render::CSM_MAX_CASCADES (render/shadow_map.hpp), duplicated
+    // because this header deliberately only forward-declares ShadowMap; a
+    // static_assert in scene_renderer.cpp keeps the two in lockstep.
+    static constexpr int MAX_SHADOW_CASCADES = 4;
     // Per-cascade shadow batches: each cascade has its own light-frustum-culled set of casters.
     // Only casters inside that cascade's light frustum are added, which dramatically
     // reduces shadow draw work for tight near cascades.
-    std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, 4> shadow_instance_batches_;
-    std::array<std::vector<ModelHandle>, 4> shadow_batches_touched_;
+    std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, MAX_SHADOW_CASCADES> shadow_instance_batches_;
+    std::array<std::vector<ModelHandle>, MAX_SHADOW_CASCADES> shadow_batches_touched_;
     std::vector<const ModelCommand*> non_instanced_commands_;         // individual draw fallback
     std::vector<const SkinnedModelCommand*> shadow_skinned_commands_; // pre-collected for shadow passes
     std::unique_ptr<gpu::GPUBuffer> instance_storage_buffer_;
@@ -240,10 +246,10 @@ private:
 
     // Per-cascade base_instance / count into shadow_instance_storage_buffer_
     // after packing all cascades contiguously in upload_instance_buffers().
-    std::array<uint32_t, 4> shadow_cascade_base_instance_{};
+    std::array<uint32_t, MAX_SHADOW_CASCADES> shadow_cascade_base_instance_{};
 
     // Per-cascade light frustums extracted from cascade.light_view_projection.
-    std::array<Frustum, 4> shadow_cascade_frustums_{};
+    std::array<Frustum, MAX_SHADOW_CASCADES> shadow_cascade_frustums_{};
 
     // ========== Transparent Queue ==========
     // glTF alphaMode BLEND meshes collected during the opaque walks (instanced

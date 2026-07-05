@@ -24,7 +24,7 @@ public:
     TransientAllocator(const TransientAllocator&) = delete;
     TransientAllocator& operator=(const TransientAllocator&) = delete;
 
-    bool init(gpu::GPUDevice& device);
+    [[nodiscard]] bool init(gpu::GPUDevice& device);
     void shutdown();
 
     // Acquire a texture matching desc. If pool has a free one, reuses it.

@@ -180,7 +180,7 @@ public:
      * @param device The GPU device to create pipelines on
      * @return true on success, false on failure
      */
-    bool init(GPUDevice& device);
+    [[nodiscard]] bool init(GPUDevice& device);
 
     /**
      * @brief Shutdown and release all cached pipelines
@@ -235,7 +235,7 @@ public:
      *
      * @return true if all pipelines created successfully
      */
-    bool preload_all_pipelines();
+    [[nodiscard]] bool preload_all_pipelines();
 
     /**
      * @brief Get the number of cached pipelines

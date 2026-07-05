@@ -1,9 +1,9 @@
 #pragma once
 
-#include "../gpu/gpu_buffer.hpp"
-#include "../gpu/gpu_device.hpp"
-#include "../gpu/gpu_texture.hpp"
-#include "../gpu/pipeline_registry.hpp"
+#include "engine/gpu/gpu_buffer.hpp"
+#include "engine/gpu/gpu_device.hpp"
+#include "engine/gpu/gpu_texture.hpp"
+#include "engine/gpu/pipeline_registry.hpp"
 #include "engine/render/environment.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -125,8 +125,10 @@ public:
 
     GrassRenderer(const GrassRenderer&) = delete;
     GrassRenderer& operator=(const GrassRenderer&) = delete;
+    GrassRenderer(GrassRenderer&&) = delete;
+    GrassRenderer& operator=(GrassRenderer&&) = delete;
 
-    bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, float world_width, float world_height);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, float world_width, float world_height);
 
     void update(float delta_time, float current_time);
 

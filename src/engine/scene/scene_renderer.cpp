@@ -107,6 +107,10 @@ float SceneRenderer::get_terrain_height(float x, float z) {
 }
 
 bool SceneRenderer::init(render::RenderContext& context, float world_width, float world_height) {
+    // The local mirror exists because scene_renderer.hpp only forward-declares
+    // ShadowMap; this TU sees both definitions, so keep them in lockstep here.
+    static_assert(MAX_SHADOW_CASCADES == render::CSM_MAX_CASCADES,
+                  "SceneRenderer::MAX_SHADOW_CASCADES must match render::CSM_MAX_CASCADES");
     context_ = &context;
 
     if (!pipeline_registry_->init(context_->device())) {
@@ -155,8 +159,8 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
         std::cerr << "Warning: Some pipelines failed to preload" << '\n';
     }
 
-    if (grass_renderer_) {
-        grass_renderer_->init(context_->device(), *pipeline_registry_, world_width, world_height);
+    if (grass_renderer_ && !grass_renderer_->init(context_->device(), *pipeline_registry_, world_width, world_height)) {
+        std::cerr << "Warning: Failed to initialize grass renderer (grass disabled)" << '\n';
     }
 
     const GraphicsSettings& gfx = graphics_ ? *graphics_ : default_graphics_;
@@ -179,7 +183,8 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
         std::cerr << "Warning: Failed to initialize Volumetric Fog (fog disabled)" << '\n';
     }
 
-    gpu_timer_pool_.init(context_->device(), 64);
+    // Timestamp pool is a documented stub (returns zeros); failure is harmless.
+    (void)gpu_timer_pool_.init(context_->device(), 64);
 
     cluster_grid_ready_ = cluster_grid_.init(context_->device(), render::lighting::MAX_LIGHTS);
     if (!cluster_grid_ready_) {
@@ -473,6 +478,8 @@ void SceneRenderer::end_ui() {
 
 void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, const CameraState& camera, float dt) {
     ENGINE_PROFILE_ZONE("SceneRenderer::render_frame");
+    // Swapchain acquire + every sub-renderer assume the SDL main thread.
+    ENGINE_ASSERT_MAIN_THREAD();
     if (collect_stats_) {
         render_stats_ = {};
         render_stats_.jobs_pending = core::jobs::JobSystem::instance().pending_count();
@@ -549,7 +556,7 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
 
         // Update cascade matrices FIRST so we can extract per-cascade light frustums
         // and use them to cull shadow casters per cascade in build_instance_batches.
-        const bool shadows_on = shadow_map_->is_ready() && gfx.shadow_mode > 0;
+        const bool shadows_on = shadow_map_->is_ready() && gfx.shadow_mode != ShadowMode::Off;
         if (shadows_on) {
             // Near plane recovered from the reversed-Z RH_ZO projection
             // (n = m32 / (m22 + 1); under standard-Z it was m32/m22).
@@ -632,7 +639,7 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
 
         // Cache shadow uniforms (cascade matrices are stable after update()).
         if (shadow_map_->is_ready()) {
-            frame_shadow_uniforms_ = shadow_map_->get_shadow_uniforms(gfx.shadow_mode);
+            frame_shadow_uniforms_ = shadow_map_->get_shadow_uniforms(static_cast<int>(gfx.shadow_mode));
         }
 
         if (cluster_grid_ready_) {
@@ -678,12 +685,12 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
 
             // AO computation + blur + bloom + fog (none of these touch the swapchain)
             glm::mat4 inv_proj = cached_inv_projection_;
-            if (gfx.ao_mode > 0 && cmd) {
+            if (gfx.ao_mode != AOMode::Off && cmd) {
                 ENGINE_PROFILE_ZONE_COLOR("SSAO/GTAO", 0x16A085);
-                const char* ao_name = (gfx.ao_mode == 1) ? "SSAO" : "GTAO";
+                const char* ao_name = (gfx.ao_mode == AOMode::SSAO) ? "SSAO" : "GTAO";
                 ENGINE_GPU_SCOPE(cmd, ao_name);
                 ENGINE_GPU_TIMER(gpu_timer_pool_, cmd, ao_name);
-                if (gfx.ao_mode == 1) {
+                if (gfx.ao_mode == AOMode::SSAO) {
                     ao_->render_ssao_pass(cmd, *pipeline_registry_, camera.projection, inv_proj, gfx.ao_radius);
                 } else {
                     ao_->render_gtao_pass(cmd, *pipeline_registry_, camera.projection, inv_proj, gfx.ao_radius);
@@ -733,9 +740,9 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
             if (current_swapchain_ && cmd) {
                 render::AmbientOcclusion::CompositeParams composite_params;
                 composite_params.bloom_strength = gfx.bloom_enabled ? gfx.bloom_strength : 0.0f;
-                composite_params.ao_strength = gfx.ao_mode > 0 ? gfx.ao_strength : 0.0f;
+                composite_params.ao_strength = gfx.ao_mode != AOMode::Off ? gfx.ao_strength : 0.0f;
                 composite_params.exposure = gfx.exposure;
-                composite_params.tonemap_mode = gfx.tonemap_mode;
+                composite_params.tonemap_mode = static_cast<int>(gfx.tonemap_mode);
                 composite_params.contrast = gfx.contrast;
                 composite_params.saturation = gfx.saturation;
                 // Depth linearization constants for the joint bilateral AO/fog
@@ -748,7 +755,7 @@ void SceneRenderer::render_frame(RenderScene& scene, const UIScene& ui_scene, co
                 // FXAA runs on the tonemapped LDR image: composite into the
                 // intermediate LDR target, then FXAA resolves to the swapchain.
                 // aa_mode == 0 composites straight to the swapchain as before.
-                SDL_GPUTexture* ldr = (gfx.aa_mode == 1) ? ao_->ldr_target() : nullptr;
+                SDL_GPUTexture* ldr = (gfx.aa_mode == AAMode::FXAA) ? ao_->ldr_target() : nullptr;
                 SDL_GPUTexture* composite_target = ldr ? ldr : current_swapchain_;
 
                 {
@@ -1219,7 +1226,7 @@ void SceneRenderer::build_instance_batches(const RenderScene& scene, const Camer
     // for never/rarely used models cost nothing to skip at iteration time.
     for (ModelHandle h : instance_batches_touched_) instance_batches_[h].clear();
     instance_batches_touched_.clear();
-    for (int c = 0; c < 4; ++c) {
+    for (int c = 0; c < MAX_SHADOW_CASCADES; ++c) {
         for (ModelHandle h : shadow_batches_touched_[c]) shadow_instance_batches_[c][h].clear();
         shadow_batches_touched_[c].clear();
     }
@@ -1256,7 +1263,7 @@ void SceneRenderer::build_instance_batches(const RenderScene& scene, const Camer
     // pack, or upload any shadow instances.
     const GraphicsSettings& gfx = graphics_ ? *graphics_ : default_graphics_;
     const int active_cascades =
-        (shadow_map_->is_ready() && gfx.shadow_mode > 0) ? shadow_map_->active_cascades() : 0;
+        (shadow_map_->is_ready() && gfx.shadow_mode != ShadowMode::Off) ? shadow_map_->active_cascades() : 0;
 
     bool do_frustum_cull = frame_do_frustum_cull_;
     float draw_dist_sq = frame_draw_dist_sq_;
@@ -1386,7 +1393,7 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
     // Upload shadow instance buffer (per-cascade sections packed contiguously).
     // Layout: [cascade 0 instances][cascade 1 instances]... each cascade in ascending handle order.
     size_t total_shadow = 0;
-    for (int c = 0; c < 4; ++c) {
+    for (int c = 0; c < MAX_SHADOW_CASCADES; ++c) {
         for (ModelHandle h : shadow_batches_touched_[c]) {
             total_shadow += shadow_instance_batches_[c][h].size();
         }
@@ -1412,7 +1419,7 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
         if (gpu::GPUBuffer::Mapping mapping = shadow_instance_storage_buffer_->map()) {
             auto* dst = static_cast<gpu::ShadowInstanceData*>(mapping.data());
             uint32_t packed = 0;
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < MAX_SHADOW_CASCADES; ++c) {
                 shadow_cascade_base_instance_[c] = packed;
                 for (const auto& instances : shadow_instance_batches_[c]) {
                     if (instances.empty()) {
@@ -1449,6 +1456,10 @@ void SceneRenderer::pack_bone_palettes(const RenderScene& scene) {
     uint32_t palette_count = 0;
     uint32_t dropped = 0;
     for (const auto& cmd : cmds) {
+        // The span is non-owning; a sized span over null storage is a host
+        // bug (e.g. bone storage freed/moved before render_frame).
+        ENGINE_ASSERT(cmd.bone_matrices.empty() || cmd.bone_matrices.data() != nullptr,
+                      "SkinnedModelCommand::bone_matrices refers to null storage");
         Model* model = model_manager_->get_model(cmd.model_handle);
         uint32_t joint_count = 0;
         if (model && model->has_skeleton) {

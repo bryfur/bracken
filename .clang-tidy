@@ -52,9 +52,9 @@ Checks: >
 
 WarningsAsErrors: ''
 
-# Only project headers — anchor on the repo root so dep paths like
+# Only project headers — anchor on 'src/engine/' so dep paths like
 # `_deps/glm-src/` don't match the trailing 'src/' substring.
-HeaderFilterRegex: '.*/mmo-4/src/.*'
+HeaderFilterRegex: '.*/src/engine/.*'
 ExcludeHeaderFilterRegex: '.*/_deps/.*'
 
 CheckOptions:

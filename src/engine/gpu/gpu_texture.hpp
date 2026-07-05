@@ -44,7 +44,7 @@ public:
      *               sampler linearizes, RGBA8 for data masks (default RGBA8)
      * @return Unique pointer to the texture, or nullptr on failure
      */
-    static std::unique_ptr<GPUTexture> load_from_file(GPUDevice& device, const std::string& path,
+    [[nodiscard]] static std::unique_ptr<GPUTexture> load_from_file(GPUDevice& device, const std::string& path,
                                                       bool generate_mipmaps = true,
                                                       TextureFormat format = TextureFormat::RGBA8);
 
@@ -59,7 +59,7 @@ public:
      * @param generate_mipmaps Whether to generate mipmaps
      * @return Unique pointer to the texture, or nullptr on failure
      */
-    static std::unique_ptr<GPUTexture> create_2d(GPUDevice& device, int width, int height, TextureFormat format,
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_2d(GPUDevice& device, int width, int height, TextureFormat format,
                                                  const void* pixels = nullptr, bool generate_mipmaps = false);
 
     /**
@@ -75,7 +75,7 @@ public:
      * @param usage SDL GPU texture usage flags
      * @return Unique pointer to the texture, or nullptr on failure
      */
-    static std::unique_ptr<GPUTexture> create_2d(GPUDevice& device, int width, int height, SDL_GPUTextureFormat format,
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_2d(GPUDevice& device, int width, int height, SDL_GPUTextureFormat format,
                                                  SDL_GPUTextureUsageFlags usage);
 
     /**
@@ -87,7 +87,7 @@ public:
      * @param format Pixel format
      * @return Unique pointer to the texture, or nullptr on failure
      */
-    static std::unique_ptr<GPUTexture> create_render_target(GPUDevice& device, int width, int height,
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_render_target(GPUDevice& device, int width, int height,
                                                             TextureFormat format);
 
     /**
@@ -98,7 +98,7 @@ public:
      * @param height Texture height
      * @return Unique pointer to the texture, or nullptr on failure
      */
-    static std::unique_ptr<GPUTexture> create_depth(GPUDevice& device, int width, int height);
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_depth(GPUDevice& device, int width, int height);
 
     /**
      * @brief Create a 2D array depth texture (e.g., for cascaded shadow maps)
@@ -109,7 +109,7 @@ public:
      * @param layers Number of array layers
      * @return Unique pointer to the texture, or nullptr on failure
      */
-    static std::unique_ptr<GPUTexture> create_depth_array(GPUDevice& device, int width, int height, int layers);
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_depth_array(GPUDevice& device, int width, int height, int layers);
 
     /**
      * @brief Create a 2D array texture (e.g., for terrain material layers)
@@ -123,7 +123,7 @@ public:
      * @param generate_mipmaps Whether to generate mipmaps for all layers
      * @return Unique pointer to the texture, or nullptr on failure
      */
-    static std::unique_ptr<GPUTexture> create_2d_array(GPUDevice& device, int width, int height, int layers,
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_2d_array(GPUDevice& device, int width, int height, int layers,
                                                        TextureFormat format, const void** layer_data = nullptr,
                                                        bool generate_mipmaps = false);
 
@@ -140,7 +140,7 @@ public:
      * @param height Texture height
      * @return Unique pointer to the texture, or nullptr on failure
      */
-    static std::unique_ptr<GPUTexture> create_depth_stencil(GPUDevice& device, int width, int height);
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_depth_stencil(GPUDevice& device, int width, int height);
 
     /**
      * @brief Upload pixel data to the texture
@@ -159,7 +159,7 @@ public:
      * released through the device. Returns false if the file cannot be loaded
      * (existing GPU texture is left untouched).
      */
-    bool reload_from_file(const std::string& path, bool generate_mipmaps = true);
+    [[nodiscard]] bool reload_from_file(const std::string& path, bool generate_mipmaps = true);
 
     /**
      * @brief Get the raw SDL GPU texture handle
@@ -249,7 +249,7 @@ public:
     /**
      * @brief Create a sampler with the given configuration
      */
-    static std::unique_ptr<GPUSampler> create(GPUDevice& device, const SamplerConfig& config);
+    [[nodiscard]] static std::unique_ptr<GPUSampler> create(GPUDevice& device, const SamplerConfig& config);
 
     SDL_GPUSampler* handle() const { return sampler_; }
 

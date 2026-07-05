@@ -47,13 +47,13 @@ public:
 
     static FileWatcher& instance();
 
-    bool init(std::chrono::milliseconds poll_interval = std::chrono::milliseconds{1000});
+    [[nodiscard]] bool init(std::chrono::milliseconds poll_interval = std::chrono::milliseconds{1000});
     void shutdown();
 
     bool is_initialized() const noexcept { return initialized_; }
 
-    WatchHandle watch_file(std::filesystem::path path, WatchCallback on_change);
-    WatchHandle watch_directory(std::filesystem::path dir, std::string extension_filter, WatchCallback on_change);
+    [[nodiscard]] WatchHandle watch_file(std::filesystem::path path, WatchCallback on_change);
+    [[nodiscard]] WatchHandle watch_directory(std::filesystem::path dir, std::string extension_filter, WatchCallback on_change);
     void unwatch(WatchHandle h);
 
     // Drain pending changes, fire callbacks on the calling (main) thread.

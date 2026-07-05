@@ -34,7 +34,7 @@ inline void insert_debug_label(SDL_GPUCommandBuffer* cb, const char* name) noexc
 // read_results currently returns zeroed durations but correct pass names.
 class GPUTimestampPool {
 public:
-    bool init(GPUDevice& device, size_t pair_count);
+    [[nodiscard]] bool init(GPUDevice& device, size_t pair_count);
     void shutdown();
 
     // `pass_name` is stored as a raw pointer (no per-frame string alloc):

@@ -1,4 +1,5 @@
 #include "gpu_device.hpp"
+#include "engine/core/assert.hpp"
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_gpu.h"
 #include "SDL3/SDL_stdinc.h"
@@ -120,6 +121,8 @@ bool GPUDevice::end_frame_and_wait(SDL_GPUCommandBuffer* cmd) {
 
 SDL_GPUTexture* GPUDevice::acquire_swapchain_texture(SDL_GPUCommandBuffer* cmd, uint32_t* out_width,
                                                      uint32_t* out_height) {
+    // SDL contract: must run on the thread that created the window.
+    ENGINE_ASSERT_MAIN_THREAD();
     if (!cmd || !window_) {
         SDL_Log("GPUDevice::acquire_swapchain_texture: cmd=%p window=%p", reinterpret_cast<void*>(cmd),
                 reinterpret_cast<void*>(window_));

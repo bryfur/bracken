@@ -272,7 +272,7 @@ bool InputHandler::was_key_just_pressed(SDL_Scancode scancode) const {
 }
 
 void InputHandler::clear_key_edges() {
-    std::memset(key_just_pressed_, 0, sizeof(key_just_pressed_));
+    key_just_pressed_.fill(false);
 }
 
 void InputHandler::post_process_events() {
@@ -473,10 +473,10 @@ void InputHandler::update_input_from_controller() {
     float right_trigger = SDL_GetGamepadAxis(gamepad_, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) / 32767.0f;
     float left_trigger = SDL_GetGamepadAxis(gamepad_, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) / 32767.0f;
 
-    controller_attack_ = right_trigger > CONTROLLER_TRIGGER_DEADZONE ||
-                         SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_SOUTH); // A button
-    controller_sprint_ = left_trigger > CONTROLLER_TRIGGER_DEADZONE ||
-                         SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER); // LB button
+    controller_primary_ = right_trigger > CONTROLLER_TRIGGER_DEADZONE ||
+                          SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_SOUTH); // A button
+    controller_secondary_ = left_trigger > CONTROLLER_TRIGGER_DEADZONE ||
+                            SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER); // LB button
 
     // Bumpers for zoom
     if (SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) {
@@ -511,8 +511,8 @@ void InputHandler::handle_controller_removed(SDL_JoystickID id) {
         controller_move_y_ = 0.0f;
         controller_camera_x_ = 0.0f;
         controller_camera_y_ = 0.0f;
-        controller_attack_ = false;
-        controller_sprint_ = false;
+        controller_primary_ = false;
+        controller_secondary_ = false;
 
         // Try to find another controller
         int num_joysticks = 0;

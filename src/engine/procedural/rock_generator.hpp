@@ -33,14 +33,14 @@ struct RockParams {
  */
 class RockGenerator {
 public:
-    static std::unique_ptr<Model> generate(const RockParams& params);
+    [[nodiscard]] static std::unique_ptr<Model> generate(const RockParams& params);
 
     // Presets
-    static std::unique_ptr<Model> generate_boulder(uint32_t seed = 0, const std::string& texture_path = "");
-    static std::unique_ptr<Model> generate_slate(uint32_t seed = 0, const std::string& texture_path = "");
-    static std::unique_ptr<Model> generate_spire(uint32_t seed = 0, const std::string& texture_path = "");
-    static std::unique_ptr<Model> generate_cluster(uint32_t seed = 0, const std::string& texture_path = "");
-    static std::unique_ptr<Model> generate_mossy(uint32_t seed = 0, const std::string& texture_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_boulder(uint32_t seed = 0, const std::string& texture_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_slate(uint32_t seed = 0, const std::string& texture_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_spire(uint32_t seed = 0, const std::string& texture_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_cluster(uint32_t seed = 0, const std::string& texture_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_mossy(uint32_t seed = 0, const std::string& texture_path = "");
 };
 
 } // namespace mmo::engine::procedural

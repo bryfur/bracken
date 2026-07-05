@@ -1,11 +1,11 @@
 #pragma once
 
-#include "../gpu/gpu_buffer.hpp"
-#include "../gpu/gpu_device.hpp"
-#include "../gpu/gpu_texture.hpp"
-#include "../gpu/gpu_uniforms.hpp"
-#include "../gpu/pipeline_registry.hpp"
-#include "../model_loader.hpp"
+#include "engine/gpu/gpu_buffer.hpp"
+#include "engine/gpu/gpu_device.hpp"
+#include "engine/gpu/gpu_texture.hpp"
+#include "engine/gpu/gpu_uniforms.hpp"
+#include "engine/gpu/pipeline_registry.hpp"
+#include "engine/model_loader.hpp"
 #include "engine/systems/effect_system.hpp"
 #include <cstdint>
 #include <glm/glm.hpp>
@@ -46,6 +46,8 @@ public:
     // Non-copyable
     EffectRenderer(const EffectRenderer&) = delete;
     EffectRenderer& operator=(const EffectRenderer&) = delete;
+    EffectRenderer(EffectRenderer&&) = delete;
+    EffectRenderer& operator=(EffectRenderer&&) = delete;
 
     /**
      * Initialize effect rendering resources (SDL3 GPU API version).
@@ -53,7 +55,7 @@ public:
      * @param pipeline_registry Pipeline registry for shader pipelines
      * @param model_manager Model manager for effect models
      */
-    bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, ModelManager* model_manager);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, ModelManager* model_manager);
 
     /**
      * Clean up resources.

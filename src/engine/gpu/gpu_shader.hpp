@@ -64,14 +64,14 @@ public:
      * @param resources Shader resource requirements
      * @return Unique pointer to the shader, or nullptr on failure
      */
-    static std::unique_ptr<GPUShader> load_spirv(GPUDevice& device, const std::string& path, ShaderStage stage,
+    [[nodiscard]] static std::unique_ptr<GPUShader> load_spirv(GPUDevice& device, const std::string& path, ShaderStage stage,
                                                  const std::string& entry_point = "main",
                                                  const ShaderResources& resources = {});
 
     /**
      * @brief Create a shader from SPIRV bytecode in memory
      */
-    static std::unique_ptr<GPUShader> create_from_spirv(GPUDevice& device, const std::vector<uint8_t>& spirv_bytecode,
+    [[nodiscard]] static std::unique_ptr<GPUShader> create_from_spirv(GPUDevice& device, const std::vector<uint8_t>& spirv_bytecode,
                                                         ShaderStage stage, const std::string& entry_point = "main",
                                                         const ShaderResources& resources = {});
 
@@ -90,7 +90,7 @@ public:
      * @brief Initialize the shader cross-compilation system
      * Must be called before any shader loading.
      */
-    static bool init_compiler();
+    [[nodiscard]] static bool init_compiler();
 
     /**
      * @brief Shutdown the shader cross-compilation system
@@ -139,6 +139,8 @@ public:
     // Non-copyable
     ShaderManager(const ShaderManager&) = delete;
     ShaderManager& operator=(const ShaderManager&) = delete;
+    ShaderManager(ShaderManager&&) = delete;
+    ShaderManager& operator=(ShaderManager&&) = delete;
 
     /**
      * @brief Load or get a cached vertex shader
@@ -167,7 +169,7 @@ public:
      * @brief Reload a shader (clear from cache, reloads on next get)
      * @return true if shader was in cache
      */
-    bool reload(const std::string& path);
+    [[nodiscard]] bool reload(const std::string& path);
 
     /**
      * @brief Reload all shaders
@@ -201,7 +203,7 @@ public:
     /**
      * @brief Load shader program from pre-compiled SPIRV files
      */
-    static std::unique_ptr<ShaderProgram> load(GPUDevice& device, const std::string& vertex_path,
+    [[nodiscard]] static std::unique_ptr<ShaderProgram> load(GPUDevice& device, const std::string& vertex_path,
                                                const std::string& fragment_path,
                                                const std::string& vertex_entry = "VSMain",
                                                const std::string& fragment_entry = "PSMain");

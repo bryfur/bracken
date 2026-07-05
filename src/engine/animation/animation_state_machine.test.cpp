@@ -80,7 +80,7 @@ protected:
         clip_run.duration = 1.0f;
 
         std::vector<AnimationClip> clips = {clip_idle, clip_walk, clip_run};
-        sm.bind_clips(clips);
+        EXPECT_TRUE(sm.bind_clips(clips));
     }
 
     AnimationStateMachine sm;
@@ -357,7 +357,7 @@ TEST(StateMachineEdgeCases, MultipleConditionsAllPass) {
     AnimationClip c2;
     c2.name = "attack_anim";
     c2.duration = 1.0f;
-    sm.bind_clips({c1, c2});
+    EXPECT_TRUE(sm.bind_clips({c1, c2}));
 
     AnimationPlayer player;
 
@@ -408,7 +408,7 @@ TEST(StateMachineEdgeCases, MultipleConditionsOneFailsNoTransition) {
     AnimationClip c2;
     c2.name = "attack_anim";
     c2.duration = 1.0f;
-    sm.bind_clips({c1, c2});
+    EXPECT_TRUE(sm.bind_clips({c1, c2}));
 
     AnimationPlayer player;
 
@@ -473,7 +473,7 @@ TEST(StateMachineEdgeCases, PriorityOrderingHigherWins) {
     AnimationClip c3;
     c3.name = "run_anim";
     c3.duration = 1.0f;
-    sm.bind_clips({c1, c2, c3});
+    EXPECT_TRUE(sm.bind_clips({c1, c2, c3}));
 
     AnimationPlayer player;
     sm.set_float("speed", 1.0f);
@@ -521,7 +521,7 @@ TEST(StateMachineEdgeCases, BoolParameterTransitionsIsTrueIsFalse) {
     AnimationClip c2;
     c2.name = "attack_anim";
     c2.duration = 1.0f;
-    sm.bind_clips({c1, c2});
+    EXPECT_TRUE(sm.bind_clips({c1, c2}));
 
     AnimationPlayer player;
 
@@ -553,7 +553,7 @@ TEST(StateMachineEdgeCases, SetFloatOverwritesBoolParam) {
     AnimationClip c;
     c.name = "idle_anim";
     c.duration = 1.0f;
-    sm.bind_clips({c});
+    EXPECT_TRUE(sm.bind_clips({c}));
 
     sm.set_bool("param", true);
     EXPECT_TRUE(sm.get_bool("param"));
@@ -646,7 +646,7 @@ TEST(StateMachineEdgeCases, RapidParameterChangesOnlyFinalValueMatters) {
     AnimationClip c2;
     c2.name = "walk_anim";
     c2.duration = 1.0f;
-    sm.bind_clips({c1, c2});
+    EXPECT_TRUE(sm.bind_clips({c1, c2}));
 
     AnimationPlayer player;
 
@@ -710,7 +710,7 @@ TEST(StateMachineEdgeCases, CurrentStateAfterMultipleRapidTransitions) {
     AnimationClip cc;
     cc.name = "clip_c";
     cc.duration = 1.0f;
-    sm.bind_clips({ca, cb, cc});
+    EXPECT_TRUE(sm.bind_clips({ca, cb, cc}));
 
     AnimationPlayer player;
     sm.set_bool("go", true);

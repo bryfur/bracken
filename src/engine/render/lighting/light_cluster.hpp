@@ -35,8 +35,10 @@ public:
 
     ClusterGrid(const ClusterGrid&) = delete;
     ClusterGrid& operator=(const ClusterGrid&) = delete;
+    ClusterGrid(ClusterGrid&&) = delete;
+    ClusterGrid& operator=(ClusterGrid&&) = delete;
 
-    bool init(gpu::GPUDevice& device, uint32_t max_lights = MAX_LIGHTS);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, uint32_t max_lights = MAX_LIGHTS);
     void shutdown();
 
     // Reset per-frame light lists and capture camera state.

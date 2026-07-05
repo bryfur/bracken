@@ -2,7 +2,6 @@
 
 #include <glm/glm.hpp>
 #include <memory>
-#include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
 #include <string>
 #include <string_view>
@@ -43,6 +42,8 @@ public:
     // Non-copyable
     UIRenderer(const UIRenderer&) = delete;
     UIRenderer& operator=(const UIRenderer&) = delete;
+    UIRenderer(UIRenderer&&) = delete;
+    UIRenderer& operator=(UIRenderer&&) = delete;
 
     /**
      * Initialize UI rendering resources.
@@ -51,7 +52,7 @@ public:
      * @param width Screen width
      * @param height Screen height
      */
-    bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, int width, int height);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, int width, int height);
 
     /**
      * Clean up resources.

@@ -126,7 +126,7 @@ public:
      * @param config Pipeline configuration
      * @return Unique pointer to the pipeline, or nullptr on failure
      */
-    static std::unique_ptr<GPUPipeline> create(GPUDevice& device, const PipelineConfig& config);
+    [[nodiscard]] static std::unique_ptr<GPUPipeline> create(GPUDevice& device, const PipelineConfig& config);
 
     /**
      * @brief Bind this pipeline for use in a render pass

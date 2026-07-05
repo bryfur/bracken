@@ -29,8 +29,10 @@ public:
 
     Bloom(const Bloom&) = delete;
     Bloom& operator=(const Bloom&) = delete;
+    Bloom(Bloom&&) = delete;
+    Bloom& operator=(Bloom&&) = delete;
 
-    bool init(gpu::GPUDevice& device, int width, int height);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, int width, int height);
     void shutdown();
     void resize(int width, int height);
 

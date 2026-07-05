@@ -17,6 +17,13 @@ namespace mmo::engine::core::jobs {
 
 class JobSystem {
 public:
+    // Design note: JobSystem is dual-mode — a Meyers singleton (instance())
+    // AND publicly constructible for caller-owned pools (tests). The
+    // singleton is canonical: parallel_for() services JobSystem::instance()
+    // exclusively, so a caller-owned pool never receives parallel_for work.
+    // If the job system is ever put under real load, add a
+    // parallel_for(JobSystem&, ...) overload rather than more singleton
+    // plumbing (see docs/engine_design_notes.md — kept serial/idle by design).
     static JobSystem& instance();
 
     JobSystem() = default;
@@ -24,6 +31,8 @@ public:
 
     JobSystem(const JobSystem&) = delete;
     JobSystem& operator=(const JobSystem&) = delete;
+    JobSystem(JobSystem&&) = delete;
+    JobSystem& operator=(JobSystem&&) = delete;
 
     void init(unsigned thread_count = 0);
     void shutdown();

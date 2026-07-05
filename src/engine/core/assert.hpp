@@ -31,6 +31,22 @@ template<typename... Args>
 
 } // namespace mmo::engine::core::detail
 
+namespace mmo::engine::core {
+
+/**
+ * Record the calling thread as the engine main thread for
+ * ENGINE_ASSERT_MAIN_THREAD(). Called explicitly from the true main thread at
+ * engine boot (Application::init_engine, FileWatcher::init); if never called,
+ * the first is_main_thread() query captures its calling thread instead.
+ */
+void bind_main_thread() noexcept;
+
+/** True when the calling thread is the recorded main thread (captures the
+ *  calling thread on first use if none was bound). */
+bool is_main_thread() noexcept;
+
+} // namespace mmo::engine::core
+
 
 #define ENGINE_VERIFY(cond, ...)                                                                                       \
     do {                                                                                                               \
@@ -45,6 +61,15 @@ template<typename... Args>
 #define ENGINE_ASSERT(cond, ...) ((void)0)
 #else
 #define ENGINE_ASSERT(cond, ...) ENGINE_VERIFY(cond __VA_OPT__(, ) __VA_ARGS__)
+#endif
+
+// Enforces the documented main-thread-only contracts (FileWatcher entry
+// points, swapchain acquire, render_frame). Zero cost in release builds.
+#ifdef NDEBUG
+#define ENGINE_ASSERT_MAIN_THREAD() ((void)0)
+#else
+#define ENGINE_ASSERT_MAIN_THREAD() \
+    ENGINE_VERIFY(::mmo::engine::core::is_main_thread(), "must be called from the main thread")
 #endif
 
 #define ENGINE_UNREACHABLE(...)                                                                                        \

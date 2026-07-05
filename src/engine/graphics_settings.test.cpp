@@ -1,5 +1,6 @@
 #include "engine/graphics_settings.hpp"
 #include <cstdio>
+#include <fstream>
 #include <filesystem>
 #include <gtest/gtest.h>
 
@@ -19,10 +20,10 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
     EXPECT_TRUE(s.fog_enabled);
     EXPECT_TRUE(s.grass_enabled);
     EXPECT_TRUE(s.skybox_enabled);
-    EXPECT_EQ(s.shadow_mode, 2);
+    EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);
     EXPECT_EQ(s.shadow_cascades, 3);
-    EXPECT_EQ(s.ao_mode, 1);
-    EXPECT_EQ(s.aa_mode, 1); // FXAA on by default
+    EXPECT_EQ(s.ao_mode, AOMode::SSAO);
+    EXPECT_EQ(s.aa_mode, AAMode::FXAA); // FXAA on by default
     EXPECT_EQ(s.vsync_mode, 2);
     EXPECT_TRUE(s.bloom_enabled);
     EXPECT_FLOAT_EQ(s.bloom_strength, 0.25f);
@@ -59,7 +60,7 @@ TEST_F(GraphicsSettingsTest, LoadNonexistentFileReturnsFalse) {
     EXPECT_FALSE(s.load("/tmp/does_not_exist_12345.cfg"));
     // Defaults should be preserved
     EXPECT_TRUE(s.fog_enabled);
-    EXPECT_EQ(s.shadow_mode, 2);
+    EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);
 }
 
 TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
@@ -73,10 +74,10 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     original.show_debug_hud = true;
     original.draw_distance = 5;
     original.frustum_culling = false;
-    original.shadow_mode = 1;
+    original.shadow_mode = ShadowMode::PCF;
     original.shadow_cascades = 3;
     original.shadow_resolution = 3;
-    original.ao_mode = 2;
+    original.ao_mode = AOMode::GTAO;
     original.bloom_enabled = false;
     original.bloom_strength = 0.77f;
     original.volumetric_fog = true;
@@ -84,7 +85,7 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     original.vsync_mode = 1;
     original.window_mode = 1;
     original.anisotropic_filter = 3;
-    original.aa_mode = 0;
+    original.aa_mode = AAMode::Off;
 
     ASSERT_TRUE(original.save(TEST_FILE));
 
@@ -100,10 +101,10 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     EXPECT_EQ(loaded.show_debug_hud, true);
     EXPECT_EQ(loaded.draw_distance, 5);
     EXPECT_EQ(loaded.frustum_culling, false);
-    EXPECT_EQ(loaded.shadow_mode, 1);
+    EXPECT_EQ(loaded.shadow_mode, ShadowMode::PCF);
     EXPECT_EQ(loaded.shadow_cascades, 3);
     EXPECT_EQ(loaded.shadow_resolution, 3);
-    EXPECT_EQ(loaded.ao_mode, 2);
+    EXPECT_EQ(loaded.ao_mode, AOMode::GTAO);
     EXPECT_EQ(loaded.bloom_enabled, false);
     EXPECT_NEAR(loaded.bloom_strength, 0.77f, 0.01f);
     EXPECT_EQ(loaded.volumetric_fog, true);
@@ -111,7 +112,7 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     EXPECT_EQ(loaded.vsync_mode, 1);
     EXPECT_EQ(loaded.window_mode, 1);
     EXPECT_EQ(loaded.anisotropic_filter, 3);
-    EXPECT_EQ(loaded.aa_mode, 0);
+    EXPECT_EQ(loaded.aa_mode, AAMode::Off);
     EXPECT_EQ(loaded.settings_version, GraphicsSettings::CURRENT_SETTINGS_VERSION);
 }
 
@@ -140,7 +141,7 @@ TEST_F(GraphicsSettingsTest, LoadFileWithUnknownKeys) {
     GraphicsSettings s;
     ASSERT_TRUE(s.load(TEST_FILE));
     EXPECT_FALSE(s.fog_enabled);
-    EXPECT_EQ(s.shadow_mode, 1);
+    EXPECT_EQ(s.shadow_mode, ShadowMode::PCF);
     // Other fields remain at defaults
     EXPECT_TRUE(s.grass_enabled);
     EXPECT_TRUE(s.bloom_enabled);
@@ -158,10 +159,10 @@ TEST_F(GraphicsSettingsTest, LoadFileWithMalformedValues) {
     }
     GraphicsSettings s;
     ASSERT_TRUE(s.load(TEST_FILE));
-    EXPECT_EQ(s.shadow_mode, 2);              // default, "abc" failed to parse
+    EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);              // default, "abc" failed to parse
     EXPECT_EQ(s.draw_distance, 3);            // default, "!@#" failed to parse
     EXPECT_FLOAT_EQ(s.bloom_strength, 0.25f); // default, "not_a_float" failed
-    EXPECT_EQ(s.ao_mode, 2);                  // successfully parsed
+    EXPECT_EQ(s.ao_mode, AOMode::GTAO);       // successfully parsed
 }
 
 TEST_F(GraphicsSettingsTest, LoadFileWithComments) {
@@ -177,7 +178,7 @@ TEST_F(GraphicsSettingsTest, LoadFileWithComments) {
     GraphicsSettings s;
     ASSERT_TRUE(s.load(TEST_FILE));
     EXPECT_FALSE(s.fog_enabled);
-    EXPECT_EQ(s.shadow_mode, 0);
+    EXPECT_EQ(s.shadow_mode, ShadowMode::Off);
 }
 
 TEST_F(GraphicsSettingsTest, LoadEmptyFileKeepsDefaults) {
@@ -199,11 +200,11 @@ TEST_F(GraphicsSettingsTest, LoadEmptyFileKeepsDefaults) {
     EXPECT_TRUE(s.frustum_culling);
     EXPECT_EQ(s.anisotropic_filter, 4);
     EXPECT_EQ(s.vsync_mode, 2);
-    EXPECT_EQ(s.shadow_mode, 2);
+    EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);
     EXPECT_EQ(s.shadow_cascades, 3);
     EXPECT_EQ(s.shadow_resolution, 2);
-    EXPECT_EQ(s.ao_mode, 1);
-    EXPECT_EQ(s.aa_mode, 1);
+    EXPECT_EQ(s.ao_mode, AOMode::SSAO);
+    EXPECT_EQ(s.aa_mode, AAMode::FXAA);
     EXPECT_TRUE(s.bloom_enabled);
     EXPECT_FLOAT_EQ(s.bloom_strength, 0.25f);
     EXPECT_FALSE(s.volumetric_fog);
@@ -215,20 +216,20 @@ TEST_F(GraphicsSettingsTest, LoadEmptyFileKeepsDefaults) {
 TEST_F(GraphicsSettingsTest, SaveOverwritesExistingFile) {
     // Save once with one set of values
     GraphicsSettings s1;
-    s1.shadow_mode = 0;
+    s1.shadow_mode = ShadowMode::Off;
     s1.fog_enabled = false;
     ASSERT_TRUE(s1.save(TEST_FILE));
 
     // Save again with different values
     GraphicsSettings s2;
-    s2.shadow_mode = 1;
+    s2.shadow_mode = ShadowMode::PCF;
     s2.fog_enabled = true;
     ASSERT_TRUE(s2.save(TEST_FILE));
 
     // Load should reflect the second save
     GraphicsSettings loaded;
     ASSERT_TRUE(loaded.load(TEST_FILE));
-    EXPECT_EQ(loaded.shadow_mode, 1);
+    EXPECT_EQ(loaded.shadow_mode, ShadowMode::PCF);
     EXPECT_TRUE(loaded.fog_enabled);
 }
 
@@ -247,9 +248,9 @@ TEST_F(GraphicsSettingsTest, LoadWithExtraWhitespaceAroundValues) {
     GraphicsSettings s;
     ASSERT_TRUE(s.load(TEST_FILE));
     // stoi(" 1") = 1, stof(" 0.55") = 0.55 - leading space in value is fine
-    EXPECT_EQ(s.shadow_mode, 1);
+    EXPECT_EQ(s.shadow_mode, ShadowMode::PCF);
     EXPECT_NEAR(s.bloom_strength, 0.55f, 0.01f);
-    EXPECT_EQ(s.ao_mode, 2);
+    EXPECT_EQ(s.ao_mode, AOMode::GTAO);
 }
 
 TEST_F(GraphicsSettingsTest, BooleanValuesZeroAndOne) {
@@ -286,7 +287,7 @@ TEST_F(GraphicsSettingsTest, BooleanNonZeroTreatedAsTrue) {
     EXPECT_TRUE(s.show_fps);
 }
 
-TEST_F(GraphicsSettingsTest, NegativeIntegerValues) {
+TEST_F(GraphicsSettingsTest, NegativeIntegerValuesClampedOnLoad) {
     {
         std::ofstream out(TEST_FILE);
         out << "settings_version=2\n";
@@ -295,9 +296,10 @@ TEST_F(GraphicsSettingsTest, NegativeIntegerValues) {
     }
     GraphicsSettings s;
     ASSERT_TRUE(s.load(TEST_FILE));
-    // stoi handles negative numbers; the struct stores them as-is
-    EXPECT_EQ(s.shadow_mode, -1);
-    EXPECT_EQ(s.draw_distance, -5);
+    // load() normalizes at the trust boundary: negative values clamp to the
+    // bottom of each range instead of being stored as-is.
+    EXPECT_EQ(s.shadow_mode, ShadowMode::Off);
+    EXPECT_EQ(s.draw_distance, 0);
 }
 
 // --- Settings-version migration tests ---
@@ -367,7 +369,7 @@ TEST_F(GraphicsSettingsTest, VersionedFileSkipsMigration) {
 
     EXPECT_FLOAT_EQ(s.sun_intensity, 1.7f);
     EXPECT_EQ(s.vsync_mode, 0);
-    EXPECT_EQ(s.shadow_mode, 1);
+    EXPECT_EQ(s.shadow_mode, ShadowMode::PCF);
     EXPECT_EQ(s.settings_version, GraphicsSettings::CURRENT_SETTINGS_VERSION);
 }
 
@@ -389,12 +391,12 @@ TEST_F(GraphicsSettingsTest, SaveAlwaysWritesSettingsVersion) {
 
 TEST_F(GraphicsSettingsTest, AaModeRoundTrips) {
     GraphicsSettings original;
-    original.aa_mode = 0;
+    original.aa_mode = AAMode::Off;
     ASSERT_TRUE(original.save(TEST_FILE));
 
     GraphicsSettings loaded;
     ASSERT_TRUE(loaded.load(TEST_FILE));
-    EXPECT_EQ(loaded.aa_mode, 0);
+    EXPECT_EQ(loaded.aa_mode, AAMode::Off);
 }
 
 TEST_F(GraphicsSettingsTest, SaveToVeryLongFilePath) {
@@ -407,4 +409,72 @@ TEST_F(GraphicsSettingsTest, SaveToVeryLongFilePath) {
 
     GraphicsSettings s;
     EXPECT_FALSE(s.save(long_path));
+}
+
+// --- Corrupt-settings-file robustness (clamp_to_valid_ranges) ---
+
+TEST_F(GraphicsSettingsTest, GetDrawDistanceClampsOutOfRangeIndex) {
+    GraphicsSettings s;
+    // A corrupt file (or a buggy host) can leave the public field out of
+    // range; the accessor must never index out of bounds.
+    s.draw_distance = 9;
+    EXPECT_FLOAT_EQ(s.get_draw_distance(), 32000.0f);
+    s.draw_distance = -3;
+    EXPECT_FLOAT_EQ(s.get_draw_distance(), 500.0f);
+}
+
+TEST_F(GraphicsSettingsTest, LoadClampsOutOfRangeDrawDistance) {
+    {
+        std::ofstream out(TEST_FILE);
+        out << "settings_version=2\n";
+        out << "draw_distance=9\n";
+    }
+    GraphicsSettings s;
+    ASSERT_TRUE(s.load(TEST_FILE));
+    EXPECT_EQ(s.draw_distance, 6);
+    EXPECT_FLOAT_EQ(s.get_draw_distance(), 32000.0f);
+}
+
+TEST_F(GraphicsSettingsTest, LoadClampsOutOfRangeModes) {
+    {
+        std::ofstream out(TEST_FILE);
+        out << "settings_version=2\n";
+        out << "shadow_mode=99\n";
+        out << "ao_mode=77\n";
+        out << "aa_mode=9\n";
+        out << "tonemap_mode=42\n";
+        out << "vsync_mode=9\n";
+        out << "window_mode=5\n";
+        out << "anisotropic_filter=12\n";
+        out << "shadow_resolution=99\n";
+        out << "shadow_cascades=-2\n";
+        out << "resolution_index=-7\n";
+    }
+    GraphicsSettings s;
+    ASSERT_TRUE(s.load(TEST_FILE));
+    EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);
+    EXPECT_EQ(s.ao_mode, AOMode::GTAO);
+    EXPECT_EQ(s.aa_mode, AAMode::FXAA);
+    EXPECT_EQ(s.tonemap_mode, TonemapMode::None);
+    EXPECT_EQ(s.vsync_mode, 2);
+    EXPECT_EQ(s.window_mode, 2);
+    EXPECT_EQ(s.anisotropic_filter, 4);
+    EXPECT_EQ(s.shadow_resolution, 3);
+    EXPECT_EQ(s.shadow_cascades, 0);
+    EXPECT_EQ(s.resolution_index, 0);
+}
+
+TEST_F(GraphicsSettingsTest, ClampToValidRangesNormalizesDirectMutation) {
+    GraphicsSettings s;
+    s.draw_distance = 100;
+    s.shadow_mode = static_cast<ShadowMode>(7);
+    s.ao_mode = static_cast<AOMode>(-1);
+    s.aa_mode = static_cast<AAMode>(3);
+    s.tonemap_mode = static_cast<TonemapMode>(-2);
+    s.clamp_to_valid_ranges();
+    EXPECT_EQ(s.draw_distance, 6);
+    EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);
+    EXPECT_EQ(s.ao_mode, AOMode::Off);
+    EXPECT_EQ(s.aa_mode, AAMode::FXAA);
+    EXPECT_EQ(s.tonemap_mode, TonemapMode::ACESFitted);
 }

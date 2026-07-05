@@ -1,4 +1,4 @@
-#include "model_loader.hpp"
+#include "engine/model_loader.hpp"
 #include "engine/gpu/gpu_types.hpp"
 #include "engine/model_utils.hpp"
 #include "glm/ext/matrix_float4x4.hpp"
@@ -7,9 +7,9 @@
 #include "glm/fwd.hpp"
 #include "glm/geometric.hpp"
 #include "glm/gtc/quaternion.hpp"
-#include "gpu/gpu_buffer.hpp"
-#include "gpu/gpu_device.hpp"
-#include "gpu/gpu_texture.hpp"
+#include "engine/gpu/gpu_buffer.hpp"
+#include "engine/gpu/gpu_device.hpp"
+#include "engine/gpu/gpu_texture.hpp"
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_iostream.h"
 #include "SDL3/SDL_pixels.h"
@@ -848,7 +848,9 @@ ModelHandle ModelManager::load_model(const std::string& name, const std::string&
         name_to_handle_[name] = handle;
 
         if (watcher_) {
-            watcher_->watch_file(path, [this, handle](const std::filesystem::path&) { reload_model(handle); });
+            // Watched for the lifetime of the app (never unwatched); reload logs itself.
+            (void)watcher_->watch_file(path,
+                                       [this, handle](const std::filesystem::path&) { (void)reload_model(handle); });
         }
         return handle;
     }
@@ -916,7 +918,8 @@ void ModelManager::enable_hot_reload(core::asset::FileWatcher& watcher) {
             continue;
         }
         ModelHandle h = static_cast<ModelHandle>(i);
-        watcher_->watch_file(model_paths_[i], [this, h](const std::filesystem::path&) { reload_model(h); });
+        // Watched for the lifetime of the app (never unwatched); reload logs itself.
+        (void)watcher_->watch_file(model_paths_[i], [this, h](const std::filesystem::path&) { (void)reload_model(h); });
     }
 }
 

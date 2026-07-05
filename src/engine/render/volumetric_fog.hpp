@@ -34,8 +34,10 @@ public:
 
     VolumetricFog(const VolumetricFog&) = delete;
     VolumetricFog& operator=(const VolumetricFog&) = delete;
+    VolumetricFog(VolumetricFog&&) = delete;
+    VolumetricFog& operator=(VolumetricFog&&) = delete;
 
-    bool init(gpu::GPUDevice& device, int width, int height);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, int width, int height);
     void shutdown();
     void resize(int width, int height);
 

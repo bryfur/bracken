@@ -65,16 +65,16 @@ struct TreeParams {
  */
 class TreeGenerator {
 public:
-    static std::unique_ptr<Model> generate(const TreeParams& params);
+    [[nodiscard]] static std::unique_ptr<Model> generate(const TreeParams& params);
 
     // Preset generators. texture_base_path = directory containing bark/ and leaves/ subdirs.
-    static std::unique_ptr<Model> generate_oak(uint32_t seed = 0, const std::string& texture_base_path = "");
-    static std::unique_ptr<Model> generate_pine(uint32_t seed = 0, const std::string& texture_base_path = "");
-    static std::unique_ptr<Model> generate_dead(uint32_t seed = 0, const std::string& texture_base_path = "");
-    static std::unique_ptr<Model> generate_willow(uint32_t seed = 0, const std::string& texture_base_path = "");
-    static std::unique_ptr<Model> generate_birch(uint32_t seed = 0, const std::string& texture_base_path = "");
-    static std::unique_ptr<Model> generate_maple(uint32_t seed = 0, const std::string& texture_base_path = "");
-    static std::unique_ptr<Model> generate_aspen(uint32_t seed = 0, const std::string& texture_base_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_oak(uint32_t seed = 0, const std::string& texture_base_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_pine(uint32_t seed = 0, const std::string& texture_base_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_dead(uint32_t seed = 0, const std::string& texture_base_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_willow(uint32_t seed = 0, const std::string& texture_base_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_birch(uint32_t seed = 0, const std::string& texture_base_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_maple(uint32_t seed = 0, const std::string& texture_base_path = "");
+    [[nodiscard]] static std::unique_ptr<Model> generate_aspen(uint32_t seed = 0, const std::string& texture_base_path = "");
 };
 
 } // namespace mmo::engine::procedural

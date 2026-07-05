@@ -3,7 +3,9 @@
 #include "engine/input_state.hpp"
 #include "SDL3/SDL_gamepad.h"
 #include "SDL3/SDL_joystick.h"
-#include <SDL3/SDL.h>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_scancode.h>
+#include <array>
 #include <string>
 
 namespace mmo::engine {
@@ -128,8 +130,11 @@ public:
     // Controller support
     bool has_controller() const { return gamepad_ != nullptr; }
     const char* get_controller_name() const;
-    bool controller_attack() const { return controller_attack_; }
-    bool controller_sprint() const { return controller_sprint_; }
+    // Raw latched pad controls; clients map them to game actions.
+    // Primary  = right trigger or south (A/cross) button.
+    // Secondary = left trigger or left shoulder (LB) button.
+    bool controller_primary() const { return controller_primary_; }
+    bool controller_secondary() const { return controller_secondary_; }
 
     // Camera inversion settings
     bool is_camera_x_inverted() const { return invert_camera_x_; }
@@ -205,7 +210,7 @@ private:
 
     // Per-frame edge flags set on SDL_EVENT_KEY_DOWN (!repeat). Cleared at
     // the top of each event-poll cycle in process_events()/Application.
-    bool key_just_pressed_[SDL_SCANCODE_COUNT] = {};
+    std::array<bool, SDL_SCANCODE_COUNT> key_just_pressed_{};
 
     // Sensitivity settings (configurable)
     float mouse_sensitivity_ = 0.35f;
@@ -226,8 +231,8 @@ private:
     float controller_move_y_ = 0.0f;
     float controller_camera_x_ = 0.0f;
     float controller_camera_y_ = 0.0f;
-    bool controller_attack_ = false;
-    bool controller_sprint_ = false;
+    bool controller_primary_ = false;
+    bool controller_secondary_ = false;
 };
 
 } // namespace mmo::engine

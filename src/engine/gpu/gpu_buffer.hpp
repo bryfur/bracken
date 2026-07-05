@@ -51,7 +51,7 @@ public:
      * @param size Size of the data in bytes
      * @return Unique pointer to the buffer, or nullptr on failure
      */
-    static std::unique_ptr<GPUBuffer> create_static(GPUDevice& device, Type type, const void* data, size_t size);
+    [[nodiscard]] static std::unique_ptr<GPUBuffer> create_static(GPUDevice& device, Type type, const void* data, size_t size);
 
     /**
      * @brief Create a dynamic buffer for frequent updates
@@ -64,7 +64,7 @@ public:
      * @param size Maximum size of the buffer in bytes
      * @return Unique pointer to the buffer, or nullptr on failure
      */
-    static std::unique_ptr<GPUBuffer> create_dynamic(GPUDevice& device, Type type, size_t size);
+    [[nodiscard]] static std::unique_ptr<GPUBuffer> create_dynamic(GPUDevice& device, Type type, size_t size);
 
     /**
      * @brief Update buffer contents (for dynamic buffers)
@@ -143,7 +143,7 @@ public:
      * Maps with cycle=true — the same double-buffering semantics as update() —
      * so a full per-frame rewrite is safe. Returns an empty Mapping on failure.
      */
-    Mapping map();
+    [[nodiscard]] Mapping map();
 
     /**
      * @brief Get the raw SDL GPU buffer handle

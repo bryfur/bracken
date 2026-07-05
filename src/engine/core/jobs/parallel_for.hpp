@@ -18,6 +18,9 @@ inline constexpr std::size_t PARALLEL_MIN_TOTAL = 256;
 
 // Fn signature: void(size_t chunk_begin, size_t chunk_end).
 // Chunk form is used (not per-index) so tight loops avoid per-element call overhead.
+// Note: hardwired to JobSystem::instance() — caller-owned JobSystem instances
+// are never used here. Add a parallel_for(JobSystem&, ...) overload if that
+// is ever needed (see the design note on JobSystem::instance()).
 template<typename Fn> void parallel_for(std::size_t begin, std::size_t end, Fn&& fn, std::size_t grain = 0) {
     if (end <= begin) {
         return;

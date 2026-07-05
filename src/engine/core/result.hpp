@@ -9,7 +9,7 @@
 
 namespace mmo::engine::core {
 
-template<typename E> struct Err {
+template<typename E> struct [[nodiscard]] Err {
     E value;
 };
 
@@ -20,7 +20,7 @@ struct OkTag {};
 struct ErrTag {};
 } // namespace detail
 
-template<typename T, typename E = std::string> class Result {
+template<typename T, typename E = std::string> class [[nodiscard]] Result {
 public:
     using value_type = T;
     using error_type = E;
@@ -113,8 +113,72 @@ private:
     std::variant<T, E> data_;
 };
 
+/**
+ * Result<void, E>: fallible operations with no success payload — the shape
+ * every `bool init()/load()/save()`-style API needs to migrate to Result.
+ */
+template<typename E> class [[nodiscard]] Result<void, E> {
+public:
+    using value_type = void;
+    using error_type = E;
+
+    Result() : data_(std::in_place_index<0>) {}
+
+    Result(const Err<E>& e) : data_(std::in_place_index<1>, e.value) {}
+    // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved): moves the wrapped value out of `e`.
+    Result(Err<E>&& e) : data_(std::in_place_index<1>, std::move(e.value)) {}
+
+    template<typename U>
+    // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved): moves the wrapped value out of `e`.
+    Result(Err<U>&& e)
+        requires(std::is_convertible_v<U, E>)
+        : data_(std::in_place_index<1>, E(std::move(e.value))) {}
+
+    bool is_ok() const noexcept { return data_.index() == 0; }
+    bool is_err() const noexcept { return data_.index() == 1; }
+
+    explicit operator bool() const noexcept { return is_ok(); }
+
+    E& error() & {
+        ENGINE_VERIFY(is_err(), "Result::error() called on ok");
+        return std::get<1>(data_);
+    }
+    const E& error() const& {
+        ENGINE_VERIFY(is_err(), "Result::error() called on ok");
+        return std::get<1>(data_);
+    }
+    E&& error() && {
+        ENGINE_VERIFY(is_err(), "Result::error() called on ok");
+        return std::move(std::get<1>(data_));
+    }
+
+    template<typename Fn> auto and_then(Fn&& fn) const& -> std::invoke_result_t<Fn> {
+        using R = std::invoke_result_t<Fn>;
+        if (is_ok()) {
+            return std::forward<Fn>(fn)();
+        }
+        return R(Err<E>{std::get<1>(data_)});
+    }
+
+    template<typename Fn> auto and_then(Fn&& fn) && -> std::invoke_result_t<Fn> {
+        using R = std::invoke_result_t<Fn>;
+        if (is_ok()) {
+            return std::forward<Fn>(fn)();
+        }
+        return R(Err<E>{std::move(std::get<1>(data_))});
+    }
+
+private:
+    std::variant<std::monostate, E> data_;
+};
+
 template<typename T> inline Result<std::decay_t<T>> Ok(T&& v) {
     return Result<std::decay_t<T>>(std::forward<T>(v));
+}
+
+/// Success value for Result<void>.
+inline Result<void> Ok() {
+    return {};
 }
 
 template<typename E> inline Err<std::decay_t<E>> make_err(E&& e) {

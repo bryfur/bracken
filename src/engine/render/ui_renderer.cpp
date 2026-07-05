@@ -1,9 +1,9 @@
-#include "ui_renderer.hpp"
-#include "../gpu/gpu_buffer.hpp"
-#include "../gpu/gpu_device.hpp"
-#include "../gpu/gpu_pipeline.hpp"
-#include "../gpu/gpu_uniforms.hpp"
-#include "../gpu/pipeline_registry.hpp"
+#include "engine/render/ui_renderer.hpp"
+#include "engine/gpu/gpu_buffer.hpp"
+#include "engine/gpu/gpu_device.hpp"
+#include "engine/gpu/gpu_pipeline.hpp"
+#include "engine/gpu/gpu_uniforms.hpp"
+#include "engine/gpu/pipeline_registry.hpp"
 #include "engine/core/logger.hpp"
 #include "engine/core/profiler.hpp"
 #include "glm/ext/matrix_clip_space.hpp"
@@ -12,7 +12,7 @@
 #include "SDL3/SDL_gpu.h"
 #include "SDL3/SDL_log.h"
 #include "SDL3/SDL_rect.h"
-#include "text_renderer.hpp"
+#include "engine/render/text_renderer.hpp"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

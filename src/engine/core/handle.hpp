@@ -15,7 +15,7 @@ template<typename Tag> struct Handle {
 
     static constexpr Handle invalid() { return Handle{k_invalid_index, 0}; }
 
-    bool is_valid() const noexcept { return index != k_invalid_index; }
+    [[nodiscard]] bool is_valid() const noexcept { return index != k_invalid_index; }
 
     friend bool operator==(const Handle& a, const Handle& b) noexcept {
         return a.index == b.index && a.generation == b.generation;
@@ -27,7 +27,7 @@ template<typename Tag, typename T> class HandlePool {
 public:
     using HandleT = Handle<Tag>;
 
-    HandleT acquire(T value) {
+    [[nodiscard]] HandleT acquire(T value) {
         if (free_head_ != HandleT::k_invalid_index) {
             uint32_t idx = free_head_;
             Slot& slot = slots_[idx];
@@ -45,7 +45,7 @@ public:
         return HandleT{idx, slots_[idx].generation};
     }
 
-    bool release(HandleT h) {
+    [[nodiscard]] bool release(HandleT h) {
         if (!h.is_valid() || h.index >= slots_.size()) {
             return false;
         }

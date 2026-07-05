@@ -46,7 +46,7 @@ public:
     void add_state(AnimState state);
     void set_default_state(const std::string& name);
 
-    bool bind_clips(const std::vector<AnimationClip>& clips);
+    [[nodiscard]] bool bind_clips(const std::vector<AnimationClip>& clips);
 
     // Resolve a parameter name to a stable index, creating the parameter if
     // needed. Resolve once at setup and use the index overloads below on the

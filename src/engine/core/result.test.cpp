@@ -74,3 +74,60 @@ TEST(Result, BoolConversion) {
     EXPECT_TRUE(static_cast<bool>(ok));
     EXPECT_FALSE(static_cast<bool>(err));
 }
+
+// --- Result<void, E> specialization ---
+
+TEST(ResultVoid, DefaultConstructedIsOk) {
+    Result<void> r;
+    EXPECT_TRUE(r.is_ok());
+    EXPECT_FALSE(r.is_err());
+    EXPECT_TRUE(static_cast<bool>(r));
+}
+
+TEST(ResultVoid, OkFactory) {
+    Result<void> r = Ok();
+    EXPECT_TRUE(r.is_ok());
+}
+
+TEST(ResultVoid, ErrPath) {
+    Result<void> r = Err<std::string>{"boom"};
+    EXPECT_TRUE(r.is_err());
+    EXPECT_FALSE(r.is_ok());
+    EXPECT_FALSE(static_cast<bool>(r));
+    EXPECT_EQ(r.error(), "boom");
+}
+
+TEST(ResultVoid, ErrConvertibleErrorType) {
+    Result<void> r = make_err("literal decays to std::string");
+    EXPECT_TRUE(r.is_err());
+    EXPECT_EQ(r.error(), "literal decays to std::string");
+}
+
+TEST(ResultVoid, AndThenChainsOk) {
+    Result<void> r;
+    auto s = r.and_then([]() -> Result<int> { return 7; });
+    EXPECT_TRUE(s.is_ok());
+    EXPECT_EQ(s.value(), 7);
+}
+
+TEST(ResultVoid, AndThenShortCircuitsOnErr) {
+    Result<void> r = Err<std::string>{"stop"};
+    bool called = false;
+    auto s = r.and_then([&]() -> Result<void> {
+        called = true;
+        return {};
+    });
+    EXPECT_TRUE(s.is_err());
+    EXPECT_EQ(s.error(), "stop");
+    EXPECT_FALSE(called);
+}
+
+TEST(ResultVoid, MoveOutError) {
+    Result<void> r = Err<std::string>{"movable"};
+    std::string e = std::move(r).error();
+    EXPECT_EQ(e, "movable");
+}
+
+// The class carries [[nodiscard]]: discarding a Result is a compiler warning.
+// (Compile-time property; exercised implicitly by every test above consuming
+// its Result.)

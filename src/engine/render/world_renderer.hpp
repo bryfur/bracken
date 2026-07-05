@@ -1,11 +1,11 @@
 #pragma once
 
-#include "../gpu/gpu_buffer.hpp"
-#include "../gpu/gpu_device.hpp"
-#include "../gpu/pipeline_registry.hpp"
-#include "../model_loader.hpp"
-#include "../scene/frustum.hpp"
-#include "environment.hpp"
+#include "engine/gpu/gpu_buffer.hpp"
+#include "engine/gpu/gpu_device.hpp"
+#include "engine/gpu/pipeline_registry.hpp"
+#include "engine/model_loader.hpp"
+#include "engine/scene/frustum.hpp"
+#include "engine/render/environment.hpp"
 #include <functional>
 #include <glm/glm.hpp>
 #include <memory>
@@ -36,13 +36,15 @@ public:
     // Non-copyable
     WorldRenderer(const WorldRenderer&) = delete;
     WorldRenderer& operator=(const WorldRenderer&) = delete;
+    WorldRenderer(WorldRenderer&&) = delete;
+    WorldRenderer& operator=(WorldRenderer&&) = delete;
 
     /**
      * Initialize world rendering resources.
      * @param device GPU device for resource creation
      * @param pipeline_registry Pipeline registry for shader pipelines
      */
-    bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, float world_width, float world_height,
+    [[nodiscard]] bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_registry, float world_width, float world_height,
               ModelManager* model_manager);
 
     /**
