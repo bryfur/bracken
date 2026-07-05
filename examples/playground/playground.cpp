@@ -56,6 +56,9 @@ bool PlaygroundGame::on_init() {
     const bool dev_ui_ok = init_dev_ui();
     BRACKEN_LOG_INFO("playground", "Dev UI {}",
                      dev_ui_ok ? "initialized (F10 toggles it)" : "unavailable (stub build or init failed)");
+    // Handled inside DevUI so F10 works even while an ImGui widget has
+    // keyboard focus (InputHandler never sees captured key-downs).
+    dev_ui().set_toggle_key(SDL_SCANCODE_F10);
 #ifdef BRACKEN_DEV_UI
     dev_ui().add_panel("Playground", [this] {
         ImGui::Text("Orbs collected: %d", orbs_collected_);
@@ -297,9 +300,6 @@ void PlaygroundGame::handle_input(float dt) {
     }
     if (in.was_key_just_pressed(SDL_SCANCODE_F3)) {
         debug_draw_ = !debug_draw_;
-    }
-    if (in.was_key_just_pressed(SDL_SCANCODE_F10)) {
-        dev_ui().toggle();
     }
     if (in.was_key_just_pressed(SDL_SCANCODE_F12)) {
         request_screenshot(std::format("screenshot_{:03d}.png", screenshot_counter_++));

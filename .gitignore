@@ -61,4 +61,5 @@ _deps/
 # Temporary files
 *.tmp
 *.temp
-shader_cache/.claude/worktrees/
+shader_cache/
+.claude/worktrees/

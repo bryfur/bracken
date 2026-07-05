@@ -349,11 +349,13 @@ bool InputHandler::process_events() {
 void InputHandler::update_input_from_keyboard() {
     const bool* keys = SDL_GetKeyboardState(nullptr);
 
-    // Keyboard movement axes
-    bool kb_forward = keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_UP];
-    bool kb_backward = keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_DOWN];
-    bool kb_left = keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_LEFT];
-    bool kb_right = keys[SDL_SCANCODE_D] || keys[SDL_SCANCODE_RIGHT];
+    // Keyboard movement axes. Polled state bypasses event consumption, so an
+    // overlay capturing the keyboard mutes these here instead.
+    const bool kb = !keyboard_captured_;
+    bool kb_forward = kb && (keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_UP]);
+    bool kb_backward = kb && (keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_DOWN]);
+    bool kb_left = kb && (keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_LEFT]);
+    bool kb_right = kb && (keys[SDL_SCANCODE_D] || keys[SDL_SCANCODE_RIGHT]);
 
     // Merge with controller digital input (left stick beyond deadzone)
     move_forward_ = kb_forward || (controller_move_y_ < -0.5f);

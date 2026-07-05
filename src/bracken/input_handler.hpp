@@ -109,6 +109,12 @@ public:
     void set_game_input_enabled(bool enabled) { game_input_enabled_ = enabled; }
     bool is_game_input_enabled() const { return game_input_enabled_; }
 
+    // While an overlay (e.g. the dev UI) captures the keyboard, polled
+    // movement keys read as released; controller input is unaffected.
+    // Separate from set_game_input_enabled so the two owners can't stomp
+    // each other. Set every frame by Application::run.
+    void set_keyboard_captured(bool captured) { keyboard_captured_ = captured; }
+
     // Chat text input: when enabled, typed characters accumulate in text_input_buffer_.
     void set_text_input_enabled(bool enabled);
     bool is_text_input_enabled() const { return text_input_enabled_; }
@@ -200,6 +206,7 @@ private:
     bool menu_right_pressed_ = false;
     bool menu_select_pressed_ = false;
     bool game_input_enabled_ = true;
+    bool keyboard_captured_ = false;
 
     // Text input (chat)
     bool text_input_enabled_ = false;

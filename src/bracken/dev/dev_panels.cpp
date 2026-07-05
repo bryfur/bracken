@@ -58,7 +58,9 @@ void draw_stats_tab(const DevUI::Bindings& bindings) {
     if (bindings.scene_renderer != nullptr) {
         // The counters are only accumulated while collection is on; keep it
         // enabled while this tab is drawn so the readouts are live (the cost
-        // is a handful of CPU-side increments per frame).
+        // is a handful of CPU-side increments per frame). Deliberately never
+        // reset: hosts (e.g. the smoke driver) enable collection themselves,
+        // and auto-disabling on overlay close would stomp their setting.
         bindings.scene_renderer->set_collect_stats(true);
         const RenderStats& stats = bindings.scene_renderer->render_stats();
 

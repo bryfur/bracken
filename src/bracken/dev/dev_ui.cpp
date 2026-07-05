@@ -97,7 +97,18 @@ bool DevUI::process_event(const SDL_Event& event) {
     }
     // Always feed the backend: ImGui tracks mouse/keyboard/window state even
     // while the overlay is hidden, so it is coherent the moment it opens.
+    // (render() drains the resulting input queue every frame, visible or not.)
     ImGui_ImplSDL3_ProcessEvent(&event);
+
+    // The toggle key is handled here, not by the host, so the overlay can
+    // always be closed — ImGui's keyboard capture (e.g. a focused InputText)
+    // would otherwise swallow the host's toggle binding.
+    if (toggle_key_ != SDL_SCANCODE_UNKNOWN && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+        event.key.scancode == toggle_key_) {
+        toggle();
+        return true;
+    }
+
     if (!visible_) {
         return false;
     }
@@ -105,22 +116,50 @@ bool DevUI::process_event(const SDL_Event& event) {
     switch (event.type) {
     case SDL_EVENT_MOUSE_MOTION:
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
-    case SDL_EVENT_MOUSE_BUTTON_UP:
     case SDL_EVENT_MOUSE_WHEEL:
         return io.WantCaptureMouse;
     case SDL_EVENT_KEY_DOWN:
-    case SDL_EVENT_KEY_UP:
     case SDL_EVENT_TEXT_INPUT:
     case SDL_EVENT_TEXT_EDITING:
     case SDL_EVENT_TEXT_EDITING_CANDIDATES:
         return io.WantCaptureKeyboard;
+    // Releases are never consumed: WantCapture* lags one frame behind ImGui's
+    // click ownership, and a swallowed KEY_UP / BUTTON_UP would wedge
+    // InputHandler's edge state (e.g. right-mouse relative mode stuck on).
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+    case SDL_EVENT_KEY_UP:
     default:
         return false;
     }
 }
 
+bool DevUI::wants_keyboard() const {
+    if (!impl_ || !visible_) {
+        return false;
+    }
+    return ImGui::GetIO().WantCaptureKeyboard;
+}
+
+bool DevUI::wants_mouse() const {
+    if (!impl_ || !visible_) {
+        return false;
+    }
+    return ImGui::GetIO().WantCaptureMouse;
+}
+
 void DevUI::render(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain) {
-    if (!impl_ || !visible_ || cmd == nullptr || swapchain == nullptr) {
+    if (!impl_) {
+        return;
+    }
+    if (!visible_ || cmd == nullptr || swapchain == nullptr) {
+        // Drain the ImGui input queue even while hidden: process_event feeds
+        // events unconditionally, and only NewFrame consumes them — without
+        // this, hours of hidden-overlay input accumulate unboundedly and
+        // replay as phantom clicks the moment the overlay opens.
+        ImGui_ImplSDLGPU3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+        ImGui::EndFrame(); // legal without Render(); discards the frame
         return;
     }
     BRACKEN_PROFILE_ZONE("DevUI::render");
@@ -185,6 +224,14 @@ bool DevUI::init(render::RenderContext& /*context*/, Bindings /*bindings*/) {
 void DevUI::shutdown() {}
 
 bool DevUI::process_event(const SDL_Event& /*event*/) {
+    return false;
+}
+
+bool DevUI::wants_keyboard() const {
+    return false;
+}
+
+bool DevUI::wants_mouse() const {
     return false;
 }
 

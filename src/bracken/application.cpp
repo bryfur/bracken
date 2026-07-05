@@ -100,6 +100,9 @@ void Application::run() {
             if (!running_) {
                 break;
             }
+            // Polled movement keys bypass event consumption — mute them while
+            // the dev overlay owns the keyboard (e.g. typing in a panel).
+            input_.set_keyboard_captured(dev_ui_ && dev_ui_->wants_keyboard());
             input_.post_process_events();
         }
 

@@ -66,8 +66,20 @@ public:
     [[nodiscard]] bool initialized() const { return impl_ != nullptr; }
 
     /** Feed every SDL event before game input sees it. Returns true when the
-     *  overlay consumed the event (visible and ImGui wants mouse/keyboard). */
+     *  overlay consumed the event (visible and ImGui wants mouse/keyboard).
+     *  Release events (KEY_UP / MOUSE_BUTTON_UP) are never consumed so game
+     *  input edge state can't wedge. */
     bool process_event(const SDL_Event& event);
+
+    /** Key that shows/hides the overlay, handled inside process_event so it
+     *  works even when an ImGui widget has keyboard focus. Default: none. */
+    void set_toggle_key(SDL_Scancode key) { toggle_key_ = key; }
+
+    /** True while the overlay is visible and ImGui wants the keyboard/mouse —
+     *  hosts and the Application loop use these to mute polled game input
+     *  (event consumption alone can't stop SDL_GetKeyboardState polling). */
+    [[nodiscard]] bool wants_keyboard() const;
+    [[nodiscard]] bool wants_mouse() const;
 
     /** Build and render the overlay. Must be called from the SceneRenderer
      *  post-UI callback (command buffer recording, outside any pass). No-op
@@ -89,6 +101,7 @@ private:
     struct Impl; // ImGui/backend state; nullptr until init and in stub builds
     std::unique_ptr<Impl> impl_;
     Bindings bindings_;
+    SDL_Scancode toggle_key_ = SDL_SCANCODE_UNKNOWN;
     bool visible_ = false;
     std::vector<std::pair<std::string, std::function<void()>>> panels_;
 };
