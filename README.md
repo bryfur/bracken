@@ -170,6 +170,6 @@ models (no Draco).
 | [docs/engine_design_notes.md](docs/engine_design_notes.md) | Design rationale and lessons — read before adding cross-cutting infrastructure. |
 | [docs/skinned_mesh_format.md](docs/skinned_mesh_format.md) | The `.glb` authoring contract for skinned meshes (bones, channels, naming, checklist). |
 | [docs/effects_system.md](docs/effects_system.md) | Data-driven particle effects: definitions, runtime, rendering. |
-| [docs/audits/](docs/audits/) | Point-in-time engine audits (2026-07): performance, graphics features, C++23 modernization, shaders. Findings are adversarially verified; each report ends with a prioritized action list. |
+| [docs/audits/](docs/audits/) | Point-in-time engine audits (2026-07): performance, graphics features, C++23 modernization, shaders. Findings are adversarially verified; [RESOLUTIONS.md](docs/audits/RESOLUTIONS.md) records the outcome of each finding (fixed / partial / deferred). |
 | [src/engine/shaders/README.md](src/engine/shaders/README.md) | Shader naming, pipeline→shader map, SDL3 GPU binding order, CPU↔GPU uniform contract. |
 | [CLAUDE.md](CLAUDE.md) | Orientation + house rules for AI coding agents working in this repo. |
