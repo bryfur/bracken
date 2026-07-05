@@ -101,6 +101,30 @@ if(BRACKEN_ENABLE_TRACY)
     target_compile_definitions(bracken PUBLIC BRACKEN_ENABLE_TRACY=1)
 endif()
 
+# Dear ImGui developer overlay: compile ImGui core + SDL3/SDLGPU3 backends into
+# a companion static lib. When OFF, dev/dev_ui.cpp compiles to a no-op stub and
+# nothing here is built or linked.
+if(BRACKEN_ENABLE_DEV_UI)
+    add_library(bracken_imgui STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_demo.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlgpu3.cpp
+    )
+    target_include_directories(bracken_imgui PUBLIC
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
+    )
+    target_link_libraries(bracken_imgui PUBLIC
+        $<IF:$<BOOL:${VENDORED_SDL}>,SDL3::SDL3-static,SDL3::SDL3>
+    )
+    target_link_libraries(bracken PUBLIC bracken_imgui)
+    target_compile_definitions(bracken PUBLIC BRACKEN_DEV_UI=1)
+endif()
+
 # Ensure shaders are compiled before engine
 add_dependencies(bracken compile_shaders)
 

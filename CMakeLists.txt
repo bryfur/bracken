@@ -52,6 +52,21 @@ if(BRACKEN_BUILD_BENCHMARKS)
     FetchContent_MakeAvailable(benchmark)
 endif()
 
+# Dear ImGui developer overlay (bracken::dev::DevUI). ON by default for
+# development; turn OFF for shipping builds — the DevUI class compiles to a
+# no-op stub and ImGui is neither fetched nor linked.
+option(BRACKEN_ENABLE_DEV_UI "Build the Dear ImGui developer overlay" ON)
+if(BRACKEN_ENABLE_DEV_UI)
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG v1.92.2
+    )
+    # ImGui ships no CMakeLists; MakeAvailable just populates imgui_SOURCE_DIR
+    # and src/bracken/CMakeLists.txt compiles the sources it needs.
+    FetchContent_MakeAvailable(imgui)
+endif()
+
 # The engine library, its shader-compilation pipeline, and its third-party
 # dependencies (SDL3, glm, tinygltf, SDL_shadercross) are self-contained in
 # this subdirectory.
