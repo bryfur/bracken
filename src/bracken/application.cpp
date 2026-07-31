@@ -1,6 +1,7 @@
 #include "application.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/core/asset/file_watcher.hpp"
+#include "bracken/core/jobs/job_stage.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
@@ -148,6 +149,11 @@ void Application::kick_sim() {
 
 void Application::run_sim_job() {
     BRACKEN_PROFILE_ZONE("App::simulate");
+    // Root of the sim stage. Every job submitted from here (host parallel_for
+    // fan-outs, the EffectSystem update, Jolt's step jobs) inherits it through
+    // JobNode::stage, so the tier assertions hold on any worker that ends up
+    // running them — and stop holding the moment this scope exits.
+    const core::jobs::StageScope sim_stage(core::jobs::Stage::Sim);
     FrameBuilder& fb = *sim_builder_;
 
     {
@@ -421,6 +427,12 @@ void Application::shutdown_renderer() {
 }
 
 void Application::render_frame(const FramePacket& frame) {
+    // The rendering facade below dereferences scene_renderer_/context_
+    // unconditionally: before init_renderer() every one of these was a null
+    // dereference, and the rule was inferable only by reading application.cpp
+    // (screen_width() null-checks, its neighbours did not). Contracts, not
+    // asserts — a host calls these from ITS release build.
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "render_frame() requires init_renderer() first");
     scene_renderer_->render_frame(frame);
 }
 
@@ -435,30 +447,37 @@ scene::PacketRing& Application::frame_packets() {
 }
 
 void Application::set_heightmap(const Heightmap& heightmap) {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "set_heightmap() requires init_renderer() first");
     scene_renderer_->set_heightmap(heightmap);
 }
 
 void Application::set_graphics_settings(const GraphicsSettings& settings) {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "set_graphics_settings() requires init_renderer() first");
     scene_renderer_->set_graphics_settings(settings);
 }
 
 void Application::set_anisotropic_filter(AnisotropicFilter level) {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "set_anisotropic_filter() requires init_renderer() first");
     scene_renderer_->set_anisotropic_filter(static_cast<int>(level));
 }
 
 void Application::set_vsync_mode(VSyncMode mode) {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "set_vsync_mode() requires init_renderer() first");
     scene_renderer_->set_vsync_mode(static_cast<int>(mode));
 }
 
 int Application::max_vsync_mode() const {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "max_vsync_mode() requires init_renderer() first");
     return scene_renderer_->max_vsync_mode();
 }
 
 void Application::set_window_mode(WindowMode window_mode, int resolution_index) {
+    BRACKEN_CONTRACT(context_ != nullptr, "set_window_mode() requires init_renderer() first");
     context_->set_window_mode(static_cast<int>(window_mode), resolution_index);
 }
 
 std::vector<Application::DisplayMode> Application::available_resolutions() const {
+    BRACKEN_CONTRACT(context_ != nullptr, "available_resolutions() requires init_renderer() first");
     std::vector<DisplayMode> result;
     for (const auto& m : context_->available_resolutions()) {
         result.push_back({m.w, m.h});
@@ -467,10 +486,12 @@ std::vector<Application::DisplayMode> Application::available_resolutions() const
 }
 
 ModelManager& Application::models() {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "models() requires init_renderer() first");
     return scene_renderer_->models();
 }
 
 float Application::get_terrain_height(float x, float z) {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "get_terrain_height() requires init_renderer() first");
     return scene_renderer_->get_terrain_height(x, z);
 }
 
@@ -488,18 +509,22 @@ void Application::set_fixed_timestep(std::optional<float> seconds) {
 }
 
 void Application::set_collect_render_stats(bool enabled) {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "set_collect_render_stats() requires init_renderer() first");
     scene_renderer_->set_collect_stats(enabled);
 }
 
 const RenderStats& Application::render_stats() const {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "render_stats() requires init_renderer() first");
     return scene_renderer_->render_stats();
 }
 
 const FrameDiagnostics& Application::frame_diagnostics() const {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "frame_diagnostics() requires init_renderer() first");
     return scene_renderer_->frame_diagnostics();
 }
 
 std::string Application::gpu_driver_name() const {
+    BRACKEN_CONTRACT(context_ != nullptr, "gpu_driver_name() requires init_renderer() first");
     return context_->device().driver_name();
 }
 
@@ -580,7 +605,7 @@ bool Application::init_dev_ui() {
 }
 
 dev::DevUI& Application::dev_ui() {
-    BRACKEN_ASSERT(dev_ui_ != nullptr, "dev_ui() requires init_dev_ui() to have been called");
+    BRACKEN_CONTRACT(dev_ui_ != nullptr, "dev_ui() requires init_dev_ui() to have been called");
     return *dev_ui_;
 }
 
@@ -597,10 +622,12 @@ std::string Application::settings_file_path() const {
 // ========== Camera facade ==========
 
 CameraController& Application::camera() {
+    BRACKEN_CONTRACT(camera_ != nullptr, "camera() requires init_renderer() first");
     return *camera_;
 }
 
 const CameraController& Application::camera() const {
+    BRACKEN_CONTRACT(camera_ != nullptr, "camera() requires init_renderer() first");
     return *camera_;
 }
 

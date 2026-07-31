@@ -71,6 +71,38 @@ bool is_main_thread() noexcept;
 #define BRACKEN_ASSERT(cond, ...) BRACKEN_VERIFY(cond __VA_OPT__(, ) __VA_ARGS__)
 #endif
 
+// BRACKEN_CONTRACT — a precondition on the HOST-FACING API boundary, live in
+// release builds too.
+//
+// The distinction from BRACKEN_ASSERT is about who makes the mistake and what
+// happens next. BRACKEN_ASSERT guards internal invariants: if one trips, the
+// engine has a bug, the developer sees it in a debug build, and compiling it
+// out of release costs nothing because a shipped engine is not supposed to
+// violate its own invariants. BRACKEN_CONTRACT guards what a GAME does to the
+// engine — reading a packet before seal, sealing twice, emitting into a lane
+// two threads share, calling models() before init_renderer(). Those are
+// mistakes a host makes in ITS release build, and compiling the check out
+// converts a named abort into a segfault or, worse, silent memory corruption
+// that surfaces three subsystems away.
+//
+// Cost: one compare and one predictable branch. Every use below is on a
+// per-frame or per-call path, never inside a per-item loop — a contract in a
+// 20,000-iteration instance loop is a BRACKEN_ASSERT, not a contract.
+//
+// BRACKEN_CONTRACTS_ENABLED=0 (cmake -DBRACKEN_ENABLE_CONTRACTS=OFF) compiles
+// them out; the condition stays type-checked, exactly like BRACKEN_ASSERT.
+// Defaults to on when the macro is undefined so headers used outside the
+// engine's own build still behave.
+#ifndef BRACKEN_CONTRACTS_ENABLED
+#define BRACKEN_CONTRACTS_ENABLED 1
+#endif
+
+#if BRACKEN_CONTRACTS_ENABLED
+#define BRACKEN_CONTRACT(cond, ...) BRACKEN_VERIFY(cond __VA_OPT__(, ) __VA_ARGS__)
+#else
+#define BRACKEN_CONTRACT(cond, ...) ((void)sizeof(!(cond)))
+#endif
+
 // Enforces the documented main-thread-only contracts (FileWatcher entry
 // points, swapchain acquire, render_frame). Zero cost in release builds.
 #ifdef NDEBUG

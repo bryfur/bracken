@@ -1,5 +1,6 @@
 #include "gpu_device.hpp"
 #include "bracken/core/assert.hpp"
+#include "bracken/core/jobs/job_stage.hpp"
 #include "bracken/core/logger.hpp"
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_gpu.h"
@@ -24,6 +25,7 @@ bool GPUDevice::init(SDL_Window* window, bool prefer_low_power) {
     // GPU device lifecycle is main-thread tier (asserted). Single-threaded
     // test binaries bind "main" on first use — see core::bind_main_thread.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (device_) {
         BRACKEN_LOG_WARN(LOG_TAG, "GPUDevice::init: Already initialized");
         return false;
@@ -86,6 +88,7 @@ void GPUDevice::shutdown() {
     if (device_) {
         // GPU device destruction is main-thread tier.
         BRACKEN_ASSERT_MAIN_THREAD();
+        BRACKEN_ASSERT_NOT_SIM_STAGE();
         // Wait for all GPU operations to complete
         SDL_WaitForGPUIdle(device_);
 
@@ -142,6 +145,7 @@ SDL_GPUTexture* GPUDevice::acquire_swapchain_texture(SDL_GPUCommandBuffer* cmd, 
                                                      uint32_t* out_height) {
     // SDL contract: must run on the thread that created the window.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!cmd || !window_) {
         BRACKEN_LOG_ERROR(LOG_TAG, "GPUDevice::acquire_swapchain_texture: cmd={} window={}",
                           reinterpret_cast<void*>(cmd), reinterpret_cast<void*>(window_));
@@ -186,6 +190,7 @@ SDL_GPUTexture* GPUDevice::acquire_swapchain_texture(SDL_GPUCommandBuffer* cmd, 
 
 SDL_GPUBuffer* GPUDevice::create_buffer(const SDL_GPUBufferCreateInfo& info) {
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!device_) {
         return nullptr;
     }
@@ -194,6 +199,7 @@ SDL_GPUBuffer* GPUDevice::create_buffer(const SDL_GPUBufferCreateInfo& info) {
 
 SDL_GPUTransferBuffer* GPUDevice::create_transfer_buffer(const SDL_GPUTransferBufferCreateInfo& info) {
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!device_) {
         return nullptr;
     }
@@ -202,6 +208,7 @@ SDL_GPUTransferBuffer* GPUDevice::create_transfer_buffer(const SDL_GPUTransferBu
 
 SDL_GPUTexture* GPUDevice::create_texture(const SDL_GPUTextureCreateInfo& info) {
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!device_) {
         return nullptr;
     }
@@ -210,6 +217,7 @@ SDL_GPUTexture* GPUDevice::create_texture(const SDL_GPUTextureCreateInfo& info) 
 
 SDL_GPUSampler* GPUDevice::create_sampler(const SDL_GPUSamplerCreateInfo& info) {
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!device_) {
         return nullptr;
     }
@@ -218,6 +226,7 @@ SDL_GPUSampler* GPUDevice::create_sampler(const SDL_GPUSamplerCreateInfo& info) 
 
 SDL_GPUGraphicsPipeline* GPUDevice::create_graphics_pipeline(const SDL_GPUGraphicsPipelineCreateInfo& info) {
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!device_) {
         return nullptr;
     }
@@ -226,6 +235,7 @@ SDL_GPUGraphicsPipeline* GPUDevice::create_graphics_pipeline(const SDL_GPUGraphi
 
 SDL_GPUShader* GPUDevice::create_shader(const SDL_GPUShaderCreateInfo& info) {
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!device_) {
         return nullptr;
     }
@@ -240,6 +250,7 @@ SDL_GPUShader* GPUDevice::create_shader(const SDL_GPUShaderCreateInfo& info) {
 void GPUDevice::release_buffer(SDL_GPUBuffer* buffer) {
     if (device_ && buffer) {
         BRACKEN_ASSERT_MAIN_THREAD();
+        BRACKEN_ASSERT_NOT_SIM_STAGE();
         SDL_ReleaseGPUBuffer(device_, buffer);
     }
 }
@@ -247,6 +258,7 @@ void GPUDevice::release_buffer(SDL_GPUBuffer* buffer) {
 void GPUDevice::release_transfer_buffer(SDL_GPUTransferBuffer* buffer) {
     if (device_ && buffer) {
         BRACKEN_ASSERT_MAIN_THREAD();
+        BRACKEN_ASSERT_NOT_SIM_STAGE();
         SDL_ReleaseGPUTransferBuffer(device_, buffer);
     }
 }
@@ -254,6 +266,7 @@ void GPUDevice::release_transfer_buffer(SDL_GPUTransferBuffer* buffer) {
 void GPUDevice::release_texture(SDL_GPUTexture* texture) {
     if (device_ && texture) {
         BRACKEN_ASSERT_MAIN_THREAD();
+        BRACKEN_ASSERT_NOT_SIM_STAGE();
         SDL_ReleaseGPUTexture(device_, texture);
     }
 }
@@ -261,6 +274,7 @@ void GPUDevice::release_texture(SDL_GPUTexture* texture) {
 void GPUDevice::release_sampler(SDL_GPUSampler* sampler) {
     if (device_ && sampler) {
         BRACKEN_ASSERT_MAIN_THREAD();
+        BRACKEN_ASSERT_NOT_SIM_STAGE();
         SDL_ReleaseGPUSampler(device_, sampler);
     }
 }
@@ -268,6 +282,7 @@ void GPUDevice::release_sampler(SDL_GPUSampler* sampler) {
 void GPUDevice::release_graphics_pipeline(SDL_GPUGraphicsPipeline* pipeline) {
     if (device_ && pipeline) {
         BRACKEN_ASSERT_MAIN_THREAD();
+        BRACKEN_ASSERT_NOT_SIM_STAGE();
         SDL_ReleaseGPUGraphicsPipeline(device_, pipeline);
     }
 }
@@ -275,6 +290,7 @@ void GPUDevice::release_graphics_pipeline(SDL_GPUGraphicsPipeline* pipeline) {
 void GPUDevice::release_shader(SDL_GPUShader* shader) {
     if (device_ && shader) {
         BRACKEN_ASSERT_MAIN_THREAD();
+        BRACKEN_ASSERT_NOT_SIM_STAGE();
         SDL_ReleaseGPUShader(device_, shader);
     }
 }
@@ -282,6 +298,7 @@ void GPUDevice::release_shader(SDL_GPUShader* shader) {
 void GPUDevice::release_compute_pipeline(SDL_GPUComputePipeline* pipeline) {
     if (device_ && pipeline) {
         BRACKEN_ASSERT_MAIN_THREAD();
+        BRACKEN_ASSERT_NOT_SIM_STAGE();
         SDL_ReleaseGPUComputePipeline(device_, pipeline);
     }
 }

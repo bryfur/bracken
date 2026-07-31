@@ -739,12 +739,49 @@ boundaries in debug builds.
 Every engine API belongs to a tier; violating a tier trips a debug assert,
 not a heisenbug in ship. Current (Phase 4) assignments:
 
+**How each tier is actually enforced** — the table below claims enforcement,
+so here is the mechanism for each claim:
+
+- `main-thread`: `BRACKEN_ASSERT_MAIN_THREAD()` against the thread recorded by
+  `core::bind_main_thread()` at boot. Debug builds only.
+- `sim-stage` / *not* `sim-stage`: `BRACKEN_ASSERT_SIM_STAGE()` and
+  `BRACKEN_ASSERT_NOT_SIM_STAGE()` (`core/jobs/job_stage.hpp`). The stage is
+  **carried on the job node**, not in a thread-local depth counter, and the
+  executor installs it around the invoke: `JobNode::stage` is inherited from
+  the submitting context in `JobSystem::acquire_node_`, and
+  `Application::run_sim_job` sets the root. This is what makes the check
+  correct under work stealing (`parallel_for` chunk bodies run on other
+  threads), under nested fork-join, and — the case a main-thread assert cannot
+  cover at all — when `JobSystem::wait`'s helping executes a **sim-stage job
+  on the main thread** during `join_sim`. Debug builds only.
+  `BRACKEN_ASSERT_NOT_SIM_STAGE()` is applied today to `GPUDevice`
+  create/destroy + swapchain acquire, `PipelineRegistry` creation/reload,
+  `ModelManager` mutation, and every `DevUI` entry point.
+- `worker-safe`: nothing to assert — the tier is the absence of a restriction.
+- `owned`: `Arena`/`FrameAllocator` bind a first-toucher owner thread
+  (`Arena::assert_owner`, re-openable via `reset()`/`rebind_owner()`).
+  `FrameBuilder::Lane` deliberately does **not** bind an owner: a lane
+  legitimately changes threads whenever a fan-out is joined and the root
+  continues emitting (Application's own sim tail does exactly that, and the
+  join is what makes it safe). What it detects instead is genuine **overlap**
+  — two threads inside the lane's chain mutation at once, which is the case
+  that corrupts the chunk chain. Debug builds only.
+- **Host-boundary preconditions** are a separate mechanism and are **live in
+  release**: `BRACKEN_CONTRACT` (`core/assert.hpp`,
+  `-DBRACKEN_ENABLE_CONTRACTS=OFF` to remove). It guards what a *game* does to
+  the engine — reading a `FramePacket` before seal, sealing twice, emitting
+  after seal, an out-of-range lane index, and every `Application` rendering-
+  facade member called before `init_renderer()` (those dereferenced
+  `scene_renderer_`/`context_` unconditionally and segfaulted). Engine-internal
+  invariants and per-item hot-loop checks stay on `BRACKEN_ASSERT` and remain
+  debug-only.
+
 | Tier | Meaning | Members today |
 |---|---|---|
 | `main-thread` | asserted via `BRACKEN_ASSERT_MAIN_THREAD()`; `on_main_frame`/`on_event` and the fence run here with no sim in flight | swapchain acquire, `render_frame`, command submission, ImGui/DevUI, GPU resource creation/destruction (pipeline/shader/model *mutation* paths), `FileWatcher` entry points, the live `InputHandler`, graphics-settings *application* (`apply_all_graphics_settings`/`set_*`) |
 | `sim-stage` | any job within the Simulate stage — `on_simulate` and everything it fans out to; **live**: this tier now runs concurrently with frame i's rendering | `SimFrame` (its `parallel_for`/`run_async`/`set_camera_forward`), `FrameBuilder` emission (multi-lane: `FramePacket::reserve_block` / `take_palette_slot` are safe from any fill-stage thread; singular setters like `set_camera` are single-writer), `AnimationPlayer`/IK as host sim work, `EffectSystem` (sim-stage **owned**: engine-driven from the sim-job tail), `Application::camera()` under `run()`, `request_graphics_settings`, `request_screenshot`, `graphics_settings()` mutation (single writer per phase) |
 | `worker-safe` | callable from any thread, any time | `Logger`, `JobSystem` submit/wait, `TaskGroup`, `parallel_for`, `Application::quit()`, pipeline/shader/model **lookups** (read-only after init-time pre-creation), `get_terrain_height` (const reads of the immutable heightmap), **`FramePacket` reads after seal** (plain loads, no atomics on the read path) |
-| `owned` | single owner; owner-asserted in debug | `Arena`, `FrameAllocator`, per-worker scratch arenas, a `FrameBuilder::Lane` (one thread at a time), a `FramePacket` during fill (per-lane) |
+| `owned` | single owner at a time; debug-asserted (owner binding for arenas, overlap detection for lanes — see above) | `Arena`, `FrameAllocator`, per-worker scratch arenas, a `FrameBuilder::Lane` (one thread at a time), a `FramePacket` during fill (per-lane) |
 
 Facade members safe to *read* from sim code because they are only written
 at the fence / event pump (never while a sim is in flight): `fps()`,

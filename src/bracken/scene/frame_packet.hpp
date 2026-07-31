@@ -552,9 +552,12 @@ private:
 
     void refill_slab(SlabState* observed, std::size_t min_bytes);
 
+    // Contract, not assert: reading an unsealed packet hands the caller spans
+    // that are empty or mid-write, and the corruption surfaces in a renderer
+    // far from the mistake. Host-facing and off every per-item loop.
     void assert_readable() const {
-        BRACKEN_ASSERT(state() == State::Sealed || state() == State::Consuming,
-                       "FramePacket read before seal (state {})", static_cast<uint32_t>(state()));
+        BRACKEN_CONTRACT(state() == State::Sealed || state() == State::Consuming,
+                         "FramePacket read before seal (state {})", static_cast<uint32_t>(state()));
     }
 
     // ---- Arena + shared block allocator ----

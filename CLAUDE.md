@@ -152,7 +152,11 @@ draws it.
   (depth 2; one frame of input latency, documented on `Application`). The
   job-system pool is always on — `init_engine` starts it before SDL; parked
   workers cost ~zero. `on_simulate` is tier **sim-stage**: nothing reachable
-  from it may touch GPU/SDL/main-thread-tier APIs (asserted in debug); the
+  from it may touch GPU/SDL/main-thread-tier APIs — asserted in debug by
+  `BRACKEN_ASSERT_NOT_SIM_STAGE()`, which works because the stage rides the
+  **job node** (`core/jobs/job_stage.hpp`) rather than a thread-local, so it
+  is still correct when a job is stolen or when the main thread executes a
+  sim job inside a helping `wait`; the
   frame **fence** (join → hot-reload poll → deferred settings/screenshot/
   camera-forward → FPS → `on_main_frame`) is the only point where the main
   thread may read live game state. The renderer's **Prepare stage fans out**:
@@ -162,7 +166,12 @@ draws it.
   cache-line writes inside per-item frame loops; grain guards keep small
   scenes effectively serial. Engine APIs carry thread-safety tiers
   (`main-thread` / `sim-stage` / `worker-safe` / `owned`, asserted in debug —
-  see architecture.md "Threading & lifetime contracts"). Every `std::atomic`
+  architecture.md "Threading & lifetime contracts" lists the exact mechanism
+  behind each). Host-boundary preconditions are separate and live **in
+  release too**: `BRACKEN_CONTRACT` (packet-before-seal, seal-once, lane
+  index, every `Application` facade member that needs `init_renderer()`);
+  `-DBRACKEN_ENABLE_CONTRACTS=OFF` removes them. Engine-internal invariants
+  and per-item hot-loop checks stay on `BRACKEN_ASSERT`. Every `std::atomic`
   documents its protocol (what it publishes, ordering, release/acquire
   pairing partner) at its declaration; bare `seq_cst` in a hot path needs a
   justifying comment. Run the TSan lane after touching concurrency code.
@@ -240,7 +249,10 @@ Google Benchmark, `*.bench.cpp` next to units, auto-globbed), `BRACKEN_BUILD_EXA
 (default ON), `BRACKEN_PLAYGROUND_SMOKE_TEST` (default OFF — registers the
 playground smoke run as a ctest; needs GPU + display), `BRACKEN_ENABLE_DEV_UI`
 (default ON — Dear ImGui developer overlay; OFF compiles `bracken::dev::DevUI`
-to a no-op stub and skips fetching ImGui), `BRACKEN_ENABLE_TRACY`
+to a no-op stub and skips fetching ImGui), `BRACKEN_ENABLE_CONTRACTS`
+(default ON — compiles the host-boundary `BRACKEN_CONTRACT` checks into
+release builds; each is one compare and a branch off any per-item loop, so
+turn it OFF only with a measurement), `BRACKEN_ENABLE_TRACY`
 (default OFF), `BRACKEN_WERROR` (default ON at top level, OFF when consumed via
 `add_subdirectory` — warnings are applied PRIVATE so a consuming game never
 inherits them; see `cmake/BrackenWarnings.cmake`).

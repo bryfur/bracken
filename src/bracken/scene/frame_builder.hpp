@@ -3,11 +3,13 @@
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/scene/frame_packet.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <span>
 #include <string_view>
+#include <thread>
 
 namespace bracken::scene {
 
@@ -186,12 +188,60 @@ public:
         // text blocks) and return a packet-lifetime view of it.
         [[nodiscard]] std::string_view store_text(std::string_view text);
 
+        // Every emit path's precondition, and a CONTRACT rather than an
+        // assert: an emit after seal writes into memory the renderer is
+        // concurrently reading, which in a shipped build is a data race, not
+        // a crash a developer will see in debug.
         void assert_filling() const {
-            BRACKEN_ASSERT(packet_ != nullptr && packet_->state() == FramePacket::State::Filling,
-                           "FrameBuilder write outside the Filling state (emit after seal?)");
+            BRACKEN_CONTRACT(packet_ != nullptr && packet_->state() == FramePacket::State::Filling,
+                             "FrameBuilder write outside the Filling state (emit after seal?)");
         }
 
+        /**
+         * Debug-only detector for the one race a lane can have: TWO THREADS
+         * INSIDE AN EMIT AT THE SAME TIME. Concurrent emitters collide on
+         * `chain.tail->count++` and on the chunk-link write, producing a
+         * chunk chain whose shape no reader can detect as wrong — the merge
+         * at seal then copies garbage, or fewer commands than were emitted,
+         * with nothing anywhere pointing at the cause.
+         *
+         * Deliberately NOT a first-toucher owner binding (the memory/arena.hpp
+         * pattern): a lane legitimately changes threads whenever a fan-out is
+         * joined and the root continues emitting — Application's own sim tail
+         * and the documented `submit lanes -> wait -> emit singular tail`
+         * shape both do exactly that, and an owner CAS aborts on it. What
+         * makes those safe is the join's happens-before edge, which an
+         * ownership test cannot see and an overlap test does not need.
+         *
+         * Held only across the chain mutation itself (push_slot/store_text),
+         * so it costs one uncontended relaxed CAS pair per emitted command in
+         * debug builds and nothing at all in release.
+         */
+        class EmitGuard {
+        public:
+#ifdef NDEBUG
+            explicit EmitGuard(const Lane&) noexcept {}
+#else
+            explicit EmitGuard(const Lane& lane) noexcept;
+            ~EmitGuard() noexcept;
+#endif
+            EmitGuard(const EmitGuard&) = delete;
+            EmitGuard& operator=(const EmitGuard&) = delete;
+
+        private:
+#ifndef NDEBUG
+            const Lane* lane_;
+#endif
+        };
+
         FramePacket* packet_ = nullptr;
+#ifndef NDEBUG
+        // emitting_ — thread currently inside this lane's chain mutation, or
+        // a default-constructed id when nobody is. Relaxed throughout: this is
+        // a DETECTOR, not a publish edge; it carries no payload and pairs with
+        // nothing. See EmitGuard.
+        mutable std::atomic<std::thread::id> emitting_{};
+#endif
         uint32_t index_ = 0;
         uint32_t palette_count_ = 0; // lane-local allocations (low bits of fill-time ids)
         Chain<ModelDrawCommand> models_;
@@ -256,8 +306,10 @@ public:
     [[nodiscard]] uint32_t lane_count() const { return lane_count_; }
 
     [[nodiscard]] Lane& lane(uint32_t index) {
-        BRACKEN_ASSERT(index < lane_count_, "FrameBuilder::lane: index {} out of range (lane_count {})", index,
-                       lane_count_);
+        // Contract: an out-of-range lane index is an out-of-bounds read of
+        // packet arena memory that then gets emitted into.
+        BRACKEN_CONTRACT(index < lane_count_, "FrameBuilder::lane: index {} out of range (lane_count {})", index,
+                         lane_count_);
         return lanes_[index];
     }
 

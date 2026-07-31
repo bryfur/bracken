@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bracken/core/jobs/cache_line.hpp"
+#include "bracken/core/jobs/job_stage.hpp"
 #include "bracken/core/jobs/mpsc_queue.hpp"
 #include "bracken/core/jobs/task_handle.hpp"
 
@@ -34,6 +35,13 @@ struct alignas(k_cache_line) JobNode {
     std::function<void()> fn; // the job body; cleared on recycle
     TaskGroup* group = nullptr; // non-owning; groups outlive their member jobs (joined by wait)
     NodePool* pool = nullptr;   // owning pool; set once at slab creation, never changes
+
+    // Pipeline stage this job inherits from its submitter, installed by the
+    // executor around fn() (see core/jobs/job_stage.hpp). Non-atomic: written
+    // once at submit, published to the executor by the queue's release edge
+    // like the rest of the node payload, and read only by the one thread that
+    // won exec_guard.
+    Stage stage = Stage::None;
 
     // done — the completion publish edge (house style: non-atomic payload +
     // one atomic publish edge). The executor writes `error`, then

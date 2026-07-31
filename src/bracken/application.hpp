@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bracken/core/assert.hpp"
 #include "bracken/graphics_settings.hpp"
 #include "bracken/input_handler.hpp"
 #include "bracken/sim_frame.hpp"
@@ -271,13 +272,19 @@ protected:
     int screen_width() const;
     int screen_height() const;
 
-    scene::SceneRenderer& scene_renderer() { return *scene_renderer_; }
+    scene::SceneRenderer& scene_renderer() {
+        BRACKEN_CONTRACT(scene_renderer_ != nullptr, "scene_renderer() requires init_renderer() first");
+        return *scene_renderer_;
+    }
 
     /** The particle system. Tier: sim-stage owned — the engine drives it
      *  from the sim-job tail (spawns from the builder, update, packet
      *  snapshot); hosts normally only spawn via SimFrame::frame()'s
      *  spawn_effect. Touch it only from on_simulate / the fence / init. */
-    systems::EffectSystem& effect_system() { return *effect_system_; }
+    systems::EffectSystem& effect_system() {
+        BRACKEN_CONTRACT(effect_system_ != nullptr, "effect_system() requires init_engine() first");
+        return *effect_system_;
+    }
 
     void set_collect_render_stats(bool enabled);
     const RenderStats& render_stats() const;

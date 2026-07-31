@@ -122,6 +122,11 @@ target_include_directories(bracken SYSTEM PUBLIC ${tinygltf_SOURCE_DIR})
 
 target_compile_definitions(bracken PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)
 
+# PUBLIC: BRACKEN_CONTRACT lives in headers a host includes (frame_packet.hpp,
+# frame_builder.hpp), so engine and host must agree on whether it is compiled.
+target_compile_definitions(bracken PUBLIC
+    BRACKEN_CONTRACTS_ENABLED=$<IF:$<BOOL:${BRACKEN_ENABLE_CONTRACTS}>,1,0>)
+
 target_link_libraries(bracken PUBLIC
     $<IF:$<BOOL:${VENDORED_SDL}>,SDL3::SDL3-static,SDL3::SDL3>
     $<IF:$<BOOL:${VENDORED_SDL}>,SDL3_ttf::SDL3_ttf-static,SDL3_ttf::SDL3_ttf>

@@ -33,6 +33,7 @@
 #include <SDL3_image/SDL_image.h>
 
 #include "bracken/core/assert.hpp"
+#include "bracken/core/jobs/job_stage.hpp"
 #include "bracken/core/asset/file_watcher.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
@@ -872,6 +873,7 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model) {
     BRACKEN_PROFILE_ZONE("ModelLoader::upload_to_gpu");
     // GPU resource creation is main-thread tier (buffers + textures).
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     for (auto& mesh : model.meshes) {
         if (mesh.uploaded) {
             continue;
@@ -975,6 +977,7 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model) {
 void ModelLoader::free_gpu_resources(Model& model) {
     // GPU resource destruction is main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     for (auto& mesh : model.meshes) {
         // Free SDL3 GPU resources
         mesh.vertex_buffer.reset();
@@ -1001,6 +1004,7 @@ ModelManager::~ModelManager() {
 ModelHandle ModelManager::load_model(const std::string& name, const std::string& path) {
     // Mutates the model table (and creates GPU resources): main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     auto model = std::make_unique<Model>();
     if (ModelLoader::load_glb(path, *model)) {
         // Upload to GPU if device is available
@@ -1041,6 +1045,7 @@ Model* ModelManager::get_model(const std::string& name) const {
 ModelHandle ModelManager::register_model(const std::string& name, std::unique_ptr<Model> model) {
     // Mutates the model table (and creates GPU resources): main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (device_) {
         ModelLoader::upload_to_gpu(*device_, *model);
     }
@@ -1054,6 +1059,7 @@ ModelHandle ModelManager::register_model(const std::string& name, std::unique_pt
 bool ModelManager::reload_model(ModelHandle handle) {
     // Hot-reload apply: replaces model contents in place — main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (handle == INVALID_MODEL_HANDLE || handle >= models_.size()) {
         return false;
     }
@@ -1091,6 +1097,7 @@ bool ModelManager::reload_model(ModelHandle handle) {
 void ModelManager::enable_hot_reload(core::asset::FileWatcher& watcher) {
     // FileWatcher entry points are main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     watcher_ = &watcher;
     for (size_t i = 1; i < model_paths_.size(); ++i) {
         if (model_paths_[i].empty()) {
@@ -1110,6 +1117,7 @@ ModelHandle ModelManager::get_handle(const std::string& name) const {
 void ModelManager::unload_all() {
     // Mutates the model table and releases GPU resources: main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     for (size_t i = 1; i < models_.size(); ++i) {
         if (models_[i]) {
             ModelLoader::free_gpu_resources(*models_[i]);

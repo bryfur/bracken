@@ -1,4 +1,5 @@
 #include "bracken/dev/dev_ui.hpp"
+#include "bracken/core/jobs/job_stage.hpp"
 
 #if defined(BRACKEN_DEV_UI) && BRACKEN_DEV_UI
 
@@ -35,6 +36,8 @@ DevUI::~DevUI() {
 }
 
 bool DevUI::init(render::RenderContext& context, Bindings bindings) {
+    // Dear ImGui context + its SDL/GPU backends are main-thread state.
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (impl_) {
         // Re-init is an error, not a rebind: the ImGui context and backends
         // are already tied to the original window/device, so applying new
@@ -78,6 +81,8 @@ bool DevUI::init(render::RenderContext& context, Bindings bindings) {
 }
 
 void DevUI::shutdown() {
+    // Dear ImGui context + its SDL/GPU backends are main-thread state.
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!impl_) {
         return; // never initialized, or already shut down — both fine
     }
@@ -97,6 +102,8 @@ void DevUI::shutdown() {
 }
 
 bool DevUI::process_event(const SDL_Event& event) {
+    // Dear ImGui context + its SDL/GPU backends are main-thread state.
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!impl_) {
         return false;
     }
@@ -157,6 +164,8 @@ bool DevUI::wants_mouse() const {
 }
 
 void DevUI::render(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain) {
+    // Dear ImGui context + its SDL/GPU backends are main-thread state.
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!impl_) {
         return;
     }

@@ -183,10 +183,12 @@ std::span<const SkinnedDrawCommand> FrameBuilder::merge_skinned(const uint32_t* 
 }
 
 void FrameBuilder::seal() {
-    BRACKEN_ASSERT(!sealed_, "FrameBuilder::seal called twice");
+    // Contracts: a second seal re-merges lanes into fresh arena blocks and
+    // republishes them under a packet the renderer may already be consuming.
+    BRACKEN_CONTRACT(!sealed_, "FrameBuilder::seal called twice");
     FramePacket& pkt = *packet_;
-    BRACKEN_ASSERT(pkt.state() == FramePacket::State::Filling, "FrameBuilder::seal: packet not Filling (state {})",
-                   static_cast<uint32_t>(pkt.state()));
+    BRACKEN_CONTRACT(pkt.state() == FramePacket::State::Filling, "FrameBuilder::seal: packet not Filling (state {})",
+                     static_cast<uint32_t>(pkt.state()));
 
     // Palette records first: merged in (lane, allocation) order with matrix
     // prefix sums; palette_base[lane] is the remap base for the skinned merge.
@@ -248,7 +250,27 @@ void FrameBuilder::seal() {
 // Lane
 // ============================================================================
 
+#ifndef NDEBUG
+FrameBuilder::Lane::EmitGuard::EmitGuard(const Lane& lane) noexcept : lane_(&lane) {
+    const std::thread::id self = std::this_thread::get_id();
+    std::thread::id expected{};
+    if (lane.emitting_.compare_exchange_strong(expected, self, std::memory_order_relaxed)) {
+        return;
+    }
+    BRACKEN_ASSERT(false,
+                   "FrameBuilder::lane({}) is being emitted into by two threads AT ONCE (holder {:#x}, caller "
+                   "{:#x}). A lane is thread-safety tier `owned`: key lanes by JOB index so each has one "
+                   "emitter, or join between emitters",
+                   lane.index_, std::hash<std::thread::id>{}(expected), std::hash<std::thread::id>{}(self));
+}
+
+FrameBuilder::Lane::EmitGuard::~EmitGuard() noexcept {
+    lane_->emitting_.store(std::thread::id{}, std::memory_order_relaxed);
+}
+#endif
+
 template<typename T> void* FrameBuilder::Lane::push_slot(Chain<T>& chain) {
+    const EmitGuard guard(*this); // debug: concurrent-emitter detector
     if (chain.tail == nullptr || chain.tail->count == chunk_capacity<T>()) {
         const std::size_t bytes = chunk_payload_offset<T>() + std::size_t{chunk_capacity<T>()} * sizeof(T);
         const std::size_t align = alignof(T) > alignof(ChunkHeader) ? alignof(T) : alignof(ChunkHeader);
@@ -268,6 +290,7 @@ std::string_view FrameBuilder::Lane::store_text(std::string_view text) {
     if (text.empty()) {
         return {};
     }
+    const EmitGuard guard(*this); // same bump-pointer race as push_slot
     if (static_cast<std::size_t>(text_end_ - text_cur_) < text.size()) {
         const std::size_t block = text.size() > k_text_block_bytes ? text.size() : k_text_block_bytes;
         text_cur_ = static_cast<std::byte*>(packet_->reserve_block(block, 1));

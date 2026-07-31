@@ -17,6 +17,15 @@ include(FetchContent)
 # BUILD_SHARED_LIBS choice.
 set(BUILD_SHARED_LIBS OFF)
 
+# Release-live contracts (host-boundary preconditions). ON by default: these
+# guard the API boundary a game calls into — packet state, seal-once, lane
+# index, facade-before-init — where the failure mode without them is a
+# segfault or silent corruption in a shipped build, not a debug-only mistake.
+# Each is one compare and one branch, off any per-item loop; hot per-item
+# checks stay on BRACKEN_ASSERT and remain debug-only. Turn OFF only with a
+# measurement showing a contract on your profile.
+option(BRACKEN_ENABLE_CONTRACTS "Compile host-boundary contracts into release builds" ON)
+
 # Tracy profiler (opt-in; OFF means zero overhead)
 option(BRACKEN_ENABLE_TRACY "Enable Tracy profiler instrumentation" OFF)
 if(BRACKEN_ENABLE_TRACY)

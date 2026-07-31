@@ -1,5 +1,6 @@
 #include "pipeline_registry.hpp"
 #include "bracken/core/assert.hpp"
+#include "bracken/core/jobs/job_stage.hpp"
 #include "bracken/core/asset/file_watcher.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_device.hpp"
@@ -28,6 +29,7 @@ PipelineRegistry::~PipelineRegistry() {
 bool PipelineRegistry::init(GPUDevice& device) {
     // GPU resource creation/destruction is main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (device_) {
         BRACKEN_LOG_WARN(LOG_TAG, "PipelineRegistry: Already initialized");
         return false;
@@ -61,6 +63,7 @@ void PipelineRegistry::shutdown() {
     }
     // GPU resource destruction is main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     pipelines_.clear();
     compute_pipelines_.clear();
     shader_manager_.reset();
@@ -90,6 +93,7 @@ GPUPipeline* PipelineRegistry::create_and_cache_pipeline(PipelineType type) {
     // main-thread tier. From Phase 5 onward (parallel recording) reaching
     // this off the main thread is a contract violation, not just a race.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (preloaded_) {
         BRACKEN_LOG_WARN(LOG_TAG,
                          "PipelineRegistry: lazy creation of {} pipeline after preload — "
@@ -310,6 +314,7 @@ GPUComputePipeline* PipelineRegistry::get_compute_pipeline(ComputePipelineType t
 GPUComputePipeline* PipelineRegistry::create_and_cache_compute_pipeline(ComputePipelineType type) {
     // Same guarded creation contract as create_and_cache_pipeline.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (preloaded_) {
         BRACKEN_LOG_WARN(LOG_TAG,
                          "PipelineRegistry: lazy creation of {} compute pipeline after preload — "
@@ -349,6 +354,7 @@ std::unique_ptr<GPUComputePipeline> PipelineRegistry::create_compute_pipeline_un
 
 bool PipelineRegistry::preload_all_pipelines() {
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!device_) {
         BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: preload_all_pipelines called before init");
         return false;
@@ -387,6 +393,7 @@ bool PipelineRegistry::preload_all_pipelines() {
 void PipelineRegistry::invalidate_all() {
     // Cache mutation + (deferred) GPU pipeline release: main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     pipelines_.clear();
     compute_pipelines_.clear();
     if (shader_manager_) {
@@ -398,6 +405,7 @@ void PipelineRegistry::invalidate_all() {
 
 void PipelineRegistry::set_swapchain_format(SDL_GPUTextureFormat format) {
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (format == swapchain_format_) {
         return;
     }
@@ -437,6 +445,7 @@ void PipelineRegistry::set_swapchain_format(SDL_GPUTextureFormat format) {
 void PipelineRegistry::enable_hot_reload(core::asset::FileWatcher& watcher) {
     // FileWatcher entry points are main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!device_) {
         BRACKEN_LOG_WARN("hot_reload", "PipelineRegistry::enable_hot_reload called before init");
         return;
@@ -466,6 +475,7 @@ void PipelineRegistry::reload_all_pipelines() {
     // Hot-reload apply is main-thread tier (the FileWatcher hands callbacks
     // to the main thread); re-creation is eager, never left to lazy lookup.
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (!device_) {
         return;
     }

@@ -380,6 +380,9 @@ JobNode* JobSystem::acquire_node_(std::function<void()>&& fn, TaskGroup* group) 
     }
     n->fn = std::move(fn);
     n->group = group;
+    // The stage travels with the node: a job submitted from inside the sim
+    // stage IS sim stage, wherever it later executes and whoever steals it.
+    n->stage = current_stage();
     return n;
 }
 
@@ -502,10 +505,16 @@ void JobSystem::execute_(JobNode* n, std::uint32_t source) {
         BRACKEN_ASSERT(false, "job node double-take (see log for sources)");
     }
     std::exception_ptr err;
-    try {
-        n->fn();
-    } catch (...) {
-        err = std::current_exception();
+    {
+        // Install the submitter's stage for the duration of the body and
+        // restore it after — correct under stealing (this may be any worker)
+        // and under helping waits (this may be the main thread mid-join).
+        StageScope stage_scope(n->stage);
+        try {
+            n->fn();
+        } catch (...) {
+            err = std::current_exception();
+        }
     }
     complete_node_(n, std::move(err));
 }
