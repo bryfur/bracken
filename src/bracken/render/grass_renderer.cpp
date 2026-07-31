@@ -3,6 +3,7 @@
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
@@ -15,11 +16,14 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
-#include <SDL3/SDL_log.h>
 #include <span>
 #include <vector>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "grass";
+} // namespace
 
 namespace gpu = bracken::gpu;
 
@@ -35,7 +39,7 @@ bool GrassRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline
         return true;
     }
 
-    SDL_Log("Initializing grass renderer (chunked instanced, AAA-quality)...");
+    BRACKEN_LOG_INFO(LOG_TAG, "Initializing grass renderer (chunked instanced, AAA-quality)...");
 
     device_ = &device;
     pipeline_registry_ = &pipeline_registry;
@@ -45,13 +49,13 @@ bool GrassRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline
     // Heightmap sampler: linear filtering for smooth terrain-height transitions.
     heightmap_sampler_ = gpu::GPUSampler::create(device, gpu::SamplerConfig::linear_clamp());
     if (!heightmap_sampler_) {
-        SDL_Log("GrassRenderer::init: Failed to create heightmap sampler");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GrassRenderer::init: Failed to create heightmap sampler");
         return false;
     }
 
     generate_blade_mesh();
     if (!blade_vertex_buffer_ || !blade_index_buffer_) {
-        SDL_Log("GrassRenderer::init: Failed to create blade mesh");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GrassRenderer::init: Failed to create blade mesh");
         return false;
     }
 
@@ -63,14 +67,14 @@ bool GrassRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline
     chunk_storage_buffer_ =
         gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Storage, chunk_storage_capacity_bytes_);
     if (!chunk_storage_buffer_) {
-        SDL_Log("GrassRenderer::init: Failed to create chunk storage buffer");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GrassRenderer::init: Failed to create chunk storage buffer");
         return false;
     }
     visible_chunks_scratch_.reserve(initial_capacity_chunks);
 
     initialized_ = true;
-    SDL_Log("Grass renderer initialized (blade mesh: %u indices, chunks: %ux%u, blades/chunk: %u)", blade_index_count_,
-            BLADES_PER_CHUNK_SIDE, BLADES_PER_CHUNK_SIDE, BLADES_PER_CHUNK_SQ);
+    BRACKEN_LOG_INFO(LOG_TAG, "Grass renderer initialized (blade mesh: {} indices, chunks: {}x{}, blades/chunk: {})",
+                     blade_index_count_, BLADES_PER_CHUNK_SIDE, BLADES_PER_CHUNK_SIDE, BLADES_PER_CHUNK_SQ);
     return true;
 }
 
@@ -276,7 +280,7 @@ void GrassRenderer::upload_chunks(SDL_GPUCopyPass* copy_pass, const glm::vec3& c
         chunk_storage_buffer_ =
             gpu::GPUBuffer::create_dynamic(*device_, gpu::GPUBuffer::Type::Storage, chunk_storage_capacity_bytes_);
         if (!chunk_storage_buffer_) {
-            SDL_Log("GrassRenderer::upload_chunks: Failed to grow chunk storage buffer");
+            BRACKEN_LOG_ERROR(LOG_TAG, "GrassRenderer::upload_chunks: Failed to grow chunk storage buffer");
             last_chunk_set_hash_ = 0;
             return;
         }
@@ -342,7 +346,7 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
     auto* pipeline = pipeline_registry_->get_pipeline(depth_equal ? gpu::PipelineType::GrassDepthEqual
                                                                   : gpu::PipelineType::Grass);
     if (!pipeline) {
-        SDL_Log("GrassRenderer::render: Failed to get grass pipeline");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GrassRenderer::render: Failed to get grass pipeline");
         return;
     }
 
@@ -456,7 +460,7 @@ void GrassRenderer::render_prepass(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer
 
     auto* pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::DepthPrepassGrass);
     if (!pipeline) {
-        SDL_Log("GrassRenderer::render_prepass: Failed to get grass prepass pipeline");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GrassRenderer::render_prepass: Failed to get grass prepass pipeline");
         return;
     }
 

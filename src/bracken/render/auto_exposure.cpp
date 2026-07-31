@@ -1,13 +1,17 @@
 #include "auto_exposure.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_compute.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include <array>
 #include <cstring>
 #include <SDL3/SDL_gpu.h>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "exposure";
+} // namespace
 
 AutoExposure::AutoExposure() = default;
 
@@ -47,12 +51,12 @@ bool AutoExposure::init(gpu::GPUDevice& device) {
     snap_frames_left_ = SNAP_FRAMES;
 
     if (!is_ready()) {
-        SDL_Log("AutoExposure: Failed to initialize");
+        BRACKEN_LOG_ERROR(LOG_TAG, "AutoExposure: Failed to initialize");
         return false;
     }
 
-    SDL_Log("AutoExposure: Initialized (%d-bin log2 histogram, EV %.0f..%.0f)", EXPOSURE_HISTOGRAM_BINS,
-            EXPOSURE_MIN_LOG2_LUMA, EXPOSURE_MAX_LOG2_LUMA);
+    BRACKEN_LOG_INFO(LOG_TAG, "AutoExposure: Initialized ({}-bin log2 histogram, EV {:.0f}..{:.0f})",
+                     EXPOSURE_HISTOGRAM_BINS, EXPOSURE_MIN_LOG2_LUMA, EXPOSURE_MAX_LOG2_LUMA);
     return true;
 }
 

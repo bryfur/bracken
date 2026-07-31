@@ -3,6 +3,7 @@
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
@@ -24,11 +25,14 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <SDL3/SDL_log.h>
 #include <SDL3_image/SDL_image.h>
 #include <vector>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "terrain";
+} // namespace
 
 namespace gpu = bracken::gpu;
 
@@ -48,7 +52,7 @@ bool TerrainRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeli
     // Create material sampler with linear filtering and repeat addressing
     material_sampler_ = gpu::GPUSampler::create(device, gpu::SamplerConfig::anisotropic(8.0f));
     if (!material_sampler_) {
-        SDL_Log("TerrainRenderer::init: Failed to create material sampler");
+        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::init: Failed to create material sampler");
         return false;
     }
 
@@ -56,7 +60,7 @@ bool TerrainRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeli
     // splatmap wrap across the 500-unit margin ring outside the world bounds.
     splatmap_sampler_ = gpu::GPUSampler::create(device, gpu::SamplerConfig::linear_clamp());
     if (!splatmap_sampler_) {
-        SDL_Log("TerrainRenderer::init: Failed to create splatmap sampler");
+        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::init: Failed to create splatmap sampler");
         return false;
     }
 
@@ -92,7 +96,7 @@ void TerrainRenderer::update_splatmap(const uint8_t* data, uint32_t resolution) 
     );
 
     if (!splatmap_texture_) {
-        SDL_Log("TerrainRenderer::update_splatmap: Failed to update splatmap texture");
+        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::update_splatmap: Failed to update splatmap texture");
     }
 }
 
@@ -112,7 +116,7 @@ void TerrainRenderer::upload_heightmap_texture() {
     );
 
     if (!heightmap_texture_) {
-        SDL_Log("TerrainRenderer::upload_heightmap_texture: Failed to create heightmap texture");
+        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::upload_heightmap_texture: Failed to create heightmap texture");
     }
 }
 
@@ -161,8 +165,8 @@ void TerrainRenderer::load_terrain_textures() {
     for (int i = 0; i < 4; ++i) {
         loaded_surfaces[i] = IMG_Load(texture_paths[i].c_str());
         if (!loaded_surfaces[i]) {
-            SDL_Log("TerrainRenderer::load_terrain_textures: Failed to load %s: %s", texture_paths[i].c_str(),
-                    SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::load_terrain_textures: Failed to load {}: {}",
+                              texture_paths[i].c_str(), SDL_GetError());
             all_loaded = false;
             break;
         }
@@ -170,8 +174,8 @@ void TerrainRenderer::load_terrain_textures() {
         // Convert to RGBA8 format
         converted_surfaces[i] = SDL_ConvertSurface(loaded_surfaces[i], SDL_PIXELFORMAT_RGBA32);
         if (!converted_surfaces[i]) {
-            SDL_Log("TerrainRenderer::load_terrain_textures: Failed to convert %s to RGBA8: %s",
-                    texture_paths[i].c_str(), SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::load_terrain_textures: Failed to convert {} to RGBA8: {}",
+                              texture_paths[i].c_str(), SDL_GetError());
             all_loaded = false;
             break;
         }
@@ -181,7 +185,8 @@ void TerrainRenderer::load_terrain_textures() {
             tex_width = converted_surfaces[i]->w;
             tex_height = converted_surfaces[i]->h;
         } else if (converted_surfaces[i]->w != tex_width || converted_surfaces[i]->h != tex_height) {
-            SDL_Log("TerrainRenderer::load_terrain_textures: Texture size mismatch for %s", texture_paths[i].c_str());
+            BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::load_terrain_textures: Texture size mismatch for {}",
+                              texture_paths[i].c_str());
             all_loaded = false;
             break;
         }
@@ -198,7 +203,8 @@ void TerrainRenderer::load_terrain_textures() {
                                                                    gpu::TextureFormat::RGBA8_SRGB, layer_data, true);
 
         if (!material_array_texture_) {
-            SDL_Log("TerrainRenderer::load_terrain_textures: Failed to create material array texture");
+            BRACKEN_LOG_ERROR(LOG_TAG,
+                              "TerrainRenderer::load_terrain_textures: Failed to create material array texture");
         }
     }
 
@@ -268,7 +274,8 @@ void TerrainRenderer::create_fallback_material_array() {
     }
     material_array_texture_ = gpu::GPUTexture::create_2d_array(*device_, SIZE, SIZE, 4,
                                                                gpu::TextureFormat::RGBA8_SRGB, layer_data.data(), true);
-    SDL_Log("TerrainRenderer: no material textures under assets/textures/, using procedural fallback");
+    BRACKEN_LOG_WARN(LOG_TAG,
+                     "TerrainRenderer: no material textures under assets/textures/, using procedural fallback");
 }
 
 void TerrainRenderer::create_fallback_splatmap() {
@@ -279,7 +286,7 @@ void TerrainRenderer::create_fallback_splatmap() {
         data[i] = 255;
     }
     splatmap_texture_ = gpu::GPUTexture::create_2d(*device_, SIZE, SIZE, gpu::TextureFormat::RGBA8, data.data());
-    SDL_Log("TerrainRenderer: no splatmap under assets/textures/, using all-grass fallback");
+    BRACKEN_LOG_WARN(LOG_TAG, "TerrainRenderer: no splatmap under assets/textures/, using all-grass fallback");
 }
 
 float TerrainRenderer::get_height(float x, float z) const {
@@ -448,7 +455,7 @@ void TerrainRenderer::generate_terrain_mesh() {
                                                    vertex_count * sizeof(TerrainVertex));
 
     if (!vertex_buffer_) {
-        SDL_Log("TerrainRenderer::generate_terrain_mesh: Failed to create vertex buffer");
+        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::generate_terrain_mesh: Failed to create vertex buffer");
         return;
     }
 
@@ -456,7 +463,7 @@ void TerrainRenderer::generate_terrain_mesh() {
         gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Index, indices, index_count * sizeof(uint32_t));
 
     if (!index_buffer_) {
-        SDL_Log("TerrainRenderer::generate_terrain_mesh: Failed to create index buffer");
+        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::generate_terrain_mesh: Failed to create index buffer");
         vertex_buffer_.reset();
         return;
     }
@@ -475,7 +482,7 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
         return;
     }
     if (!material_array_texture_ || !splatmap_texture_ || !material_sampler_) {
-        SDL_Log("TerrainRenderer::render: Terrain textures/sampler not ready, skipping");
+        BRACKEN_LOG_WARN(LOG_TAG, "TerrainRenderer::render: Terrain textures/sampler not ready, skipping");
         return;
     }
 
@@ -483,7 +490,7 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
     auto* pipeline = pipeline_registry_->get_pipeline(depth_equal ? gpu::PipelineType::TerrainDepthEqual
                                                                   : gpu::PipelineType::Terrain);
     if (!pipeline) {
-        SDL_Log("TerrainRenderer::render: Failed to get terrain pipeline");
+        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::render: Failed to get terrain pipeline");
         return;
     }
 
@@ -747,7 +754,9 @@ void TerrainRenderer::set_anisotropic_filter(float level) {
     // Recreate the terrain material-array sampler with the new anisotropy level
     material_sampler_ = gpu::GPUSampler::create(*device_, gpu::SamplerConfig::anisotropic(level));
     if (!material_sampler_) {
-        SDL_Log("TerrainRenderer::set_anisotropic_filter: Failed to recreate material sampler with level %.1f", level);
+        BRACKEN_LOG_ERROR(
+            LOG_TAG, "TerrainRenderer::set_anisotropic_filter: Failed to recreate material sampler with level {:.1f}",
+            level);
     }
 }
 
@@ -959,8 +968,9 @@ void TerrainRenderer::generate_shadow_terrain_mesh() {
     shadow_index_buffer_ = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Index, indices.data(),
                                                          indices.size() * sizeof(uint32_t));
     shadow_index_count_ = static_cast<uint32_t>(indices.size());
-    SDL_Log("TerrainRenderer: Shadow mesh %d cells / %zu tiles -> %u triangles (main: %u tris, %zu tiles)",
-            cells_x * cells_z, shadow_tiles_.size(), shadow_index_count_ / 3, index_count_ / 3, tiles_.size());
+    BRACKEN_LOG_INFO(LOG_TAG,
+                     "TerrainRenderer: Shadow mesh {} cells / {} tiles -> {} triangles (main: {} tris, {} tiles)",
+                     cells_x * cells_z, shadow_tiles_.size(), shadow_index_count_ / 3, index_count_ / 3, tiles_.size());
 }
 
 } // namespace bracken::render

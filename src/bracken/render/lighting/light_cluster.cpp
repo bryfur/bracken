@@ -2,6 +2,7 @@
 
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 
 #include <algorithm>
@@ -11,11 +12,11 @@
 #include <cstring>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <limits>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render::lighting {
 
 namespace {
+constexpr const char* LOG_TAG = "lights";
 
 // Std140 layout sanity. PointLight: 3 float4-sized rows in 48B, SpotLight: 4
 // in 64B (the third/fourth row carries casts_shadows + the engine-assigned
@@ -119,7 +120,7 @@ bool ClusterGrid::init(gpu::GPUDevice& device, uint32_t max_lights) {
     light_indices_buf_ =
         gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Storage, light_indices_buffer_size());
     if (!light_data_buf_ || !cluster_offsets_buf_ || !light_indices_buf_) {
-        SDL_Log("ClusterGrid::init: failed to allocate storage buffers");
+        BRACKEN_LOG_ERROR(LOG_TAG, "ClusterGrid::init: failed to allocate storage buffers");
         shutdown();
         return false;
     }
@@ -476,8 +477,8 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
     }
 
     if (truncated && !warned_truncation_) {
-        SDL_Log("ClusterGrid: at least one cluster exceeded MAX_LIGHTS_PER_CLUSTER=%u, truncating",
-                MAX_LIGHTS_PER_CLUSTER);
+        BRACKEN_LOG_WARN(LOG_TAG, "ClusterGrid: at least one cluster exceeded MAX_LIGHTS_PER_CLUSTER={}, truncating",
+                         MAX_LIGHTS_PER_CLUSTER);
         warned_truncation_ = true;
     }
 

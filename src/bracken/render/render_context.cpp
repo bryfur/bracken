@@ -1,13 +1,17 @@
 #include "render_context.hpp"
+#include "bracken/core/logger.hpp"
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_gpu.h"
 #include "SDL3/SDL_video.h"
 #include <algorithm>
 #include <cstdint>
-#include <SDL3/SDL_log.h>
 #include <string>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "render";
+} // namespace
 
 
 RenderContext::~RenderContext() {
@@ -21,13 +25,13 @@ bool RenderContext::init(int width, int height, const std::string& title) {
     // Create window without OpenGL flag - SDL3 GPU handles its own context
     window_ = SDL_CreateWindow(title.c_str(), width, height, SDL_WINDOW_RESIZABLE);
     if (!window_) {
-        SDL_Log("RenderContext::init: Failed to create window: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "RenderContext::init: Failed to create window: {}", SDL_GetError());
         return false;
     }
 
     // Initialize the GPU device with the window
     if (!device_.init(window_)) {
-        SDL_Log("RenderContext::init: Failed to initialize GPU device");
+        BRACKEN_LOG_ERROR(LOG_TAG, "RenderContext::init: Failed to initialize GPU device");
         SDL_DestroyWindow(window_);
         window_ = nullptr;
         return false;
@@ -37,8 +41,8 @@ bool RenderContext::init(int width, int height, const std::string& title) {
     // offscreen targets are pixel-sized, not logical-unit-sized.
     update_viewport();
 
-    SDL_Log("RenderContext::init: Initialized with %s backend", device_.driver_name().c_str());
-    SDL_Log("RenderContext::init: Drawable size: %dx%d pixels", width_, height_);
+    BRACKEN_LOG_INFO(LOG_TAG, "RenderContext::init: Initialized with {} backend", device_.driver_name().c_str());
+    BRACKEN_LOG_INFO(LOG_TAG, "RenderContext::init: Drawable size: {}x{} pixels", width_, height_);
 
     return true;
 }
@@ -70,8 +74,8 @@ void RenderContext::update_viewport() {
 
 void RenderContext::begin_frame() {
     if (current_cmd_ != nullptr) {
-        SDL_Log("RenderContext::begin_frame: Warning - called while a frame is already in progress. "
-                "Submitting previous frame to avoid command buffer leak.");
+        BRACKEN_LOG_WARN(LOG_TAG, "RenderContext::begin_frame: Warning - called while a frame is already in progress. "
+                                  "Submitting previous frame to avoid command buffer leak.");
         end_frame(current_cmd_);
     }
     current_cmd_ = begin_frame_cmd();
@@ -136,7 +140,7 @@ void RenderContext::set_vsync_mode(int mode) {
             break;
     }
     if (!device_.set_swapchain_parameters(present_mode)) {
-        SDL_Log("RenderContext::set_vsync_mode: failed to set present mode %d", mode);
+        BRACKEN_LOG_WARN(LOG_TAG, "RenderContext::set_vsync_mode: failed to set present mode {}", mode);
     }
 }
 
@@ -221,9 +225,10 @@ void RenderContext::set_window_mode(int window_mode, int resolution_index) {
             // Clearing the fullscreen mode also discards any exclusive mode a
             // previous call applied — without this, SDL would keep the OLD
             // exclusive resolution.
-            SDL_Log("RenderContext::set_window_mode: resolution_index %d matches no display mode "
-                    "(%d available); falling back to borderless fullscreen",
-                    resolution_index, static_cast<int>(available_resolutions_.size()));
+            BRACKEN_LOG_WARN(LOG_TAG,
+                             "RenderContext::set_window_mode: resolution_index {} matches no display mode "
+                             "({} available); falling back to borderless fullscreen",
+                             resolution_index, static_cast<int>(available_resolutions_.size()));
             SDL_SetWindowFullscreenMode(window_, nullptr);
             window_mode = 1;
         }

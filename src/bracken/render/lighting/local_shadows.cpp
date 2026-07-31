@@ -1,5 +1,6 @@
 #include "bracken/render/lighting/local_shadows.hpp"
 
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 
 #include <algorithm>
@@ -7,11 +8,11 @@
 #include <cmath>
 #include <glm/gtc/matrix_transform.hpp>
 #include <limits>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render::lighting {
 
 namespace {
+constexpr const char* LOG_TAG = "shadows";
 
 // GPU mirror layout sanity (cluster_lighting.hlsli LocalShadowSlot).
 static_assert(sizeof(LocalShadowSlotGPU) == 96, "LocalShadowSlotGPU must be 96 bytes");
@@ -459,7 +460,8 @@ bool LocalShadowMap::init(gpu::GPUDevice& device, int atlas_resolution) {
 
     atlas_texture_ = gpu::GPUTexture::create_depth(device, atlas_resolution_, atlas_resolution_);
     if (!atlas_texture_) {
-        SDL_Log("LocalShadowMap::init: failed to create %dx%d shadow atlas", atlas_resolution_, atlas_resolution_);
+        BRACKEN_LOG_ERROR(LOG_TAG, "LocalShadowMap::init: failed to create {}x{} shadow atlas", atlas_resolution_,
+                          atlas_resolution_);
         shutdown();
         return false;
     }
@@ -477,7 +479,7 @@ bool LocalShadowMap::init(gpu::GPUDevice& device, int atlas_resolution) {
     compare_info.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
     compare_sampler_ = device.create_sampler(compare_info);
     if (!compare_sampler_) {
-        SDL_Log("LocalShadowMap::init: failed to create comparison sampler");
+        BRACKEN_LOG_ERROR(LOG_TAG, "LocalShadowMap::init: failed to create comparison sampler");
         shutdown();
         return false;
     }
@@ -485,13 +487,13 @@ bool LocalShadowMap::init(gpu::GPUDevice& device, int atlas_resolution) {
     slot_buffer_ = gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Storage,
                                                   sizeof(LocalShadowSlotGPU) * LOCAL_SHADOW_MAX_SLOTS);
     if (!slot_buffer_) {
-        SDL_Log("LocalShadowMap::init: failed to create slot-data storage buffer");
+        BRACKEN_LOG_ERROR(LOG_TAG, "LocalShadowMap::init: failed to create slot-data storage buffer");
         shutdown();
         return false;
     }
 
-    SDL_Log("LocalShadowMap: initialized %dx%d atlas (%d per tile, %dx%d tiles)", atlas_resolution_,
-            atlas_resolution_, tile_resolution(), LOCAL_SHADOW_TILES_PER_ROW, LOCAL_SHADOW_TILES_PER_ROW);
+    BRACKEN_LOG_INFO(LOG_TAG, "LocalShadowMap: initialized {}x{} atlas ({} per tile, {}x{} tiles)", atlas_resolution_,
+                     atlas_resolution_, tile_resolution(), LOCAL_SHADOW_TILES_PER_ROW, LOCAL_SHADOW_TILES_PER_ROW);
     return true;
 }
 
@@ -518,13 +520,14 @@ bool LocalShadowMap::reinit(int atlas_resolution) {
     atlas_initialized_ = false;
     atlas_texture_ = gpu::GPUTexture::create_depth(*device_, atlas_resolution_, atlas_resolution_);
     if (!atlas_texture_) {
-        SDL_Log("LocalShadowMap::reinit: failed to create %dx%d shadow atlas", atlas_resolution_, atlas_resolution_);
+        BRACKEN_LOG_ERROR(LOG_TAG, "LocalShadowMap::reinit: failed to create {}x{} shadow atlas", atlas_resolution_,
+                          atlas_resolution_);
         return false;
     }
     // Every cached tile just died with the old texture.
     selector_.invalidate_all_tiles();
-    SDL_Log("LocalShadowMap: reinitialized %dx%d atlas (%d per tile)", atlas_resolution_, atlas_resolution_,
-            tile_resolution());
+    BRACKEN_LOG_INFO(LOG_TAG, "LocalShadowMap: reinitialized {}x{} atlas ({} per tile)", atlas_resolution_,
+                     atlas_resolution_, tile_resolution());
     return true;
 }
 
@@ -566,7 +569,7 @@ SDL_GPURenderPass* LocalShadowMap::begin_pass(SDL_GPUCommandBuffer* cmd) {
 
     current_pass_ = SDL_BeginGPURenderPass(cmd, nullptr, 0, &depth_target);
     if (!current_pass_) {
-        SDL_Log("LocalShadowMap::begin_pass: failed to begin atlas render pass");
+        BRACKEN_LOG_ERROR(LOG_TAG, "LocalShadowMap::begin_pass: failed to begin atlas render pass");
         return nullptr;
     }
     atlas_initialized_ = true;

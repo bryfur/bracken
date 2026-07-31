@@ -11,7 +11,6 @@
 #include "glm/ext/matrix_float4x4.hpp"
 #include "glm/ext/vector_float4.hpp"
 #include "SDL3/SDL_gpu.h"
-#include "SDL3/SDL_log.h"
 #include "SDL3/SDL_rect.h"
 #include "bracken/render/text_renderer.hpp"
 #include <algorithm>
@@ -23,6 +22,10 @@
 #include <vector>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "ui";
+} // namespace
 
 namespace gpu = bracken::gpu;
 
@@ -44,7 +47,7 @@ bool UIRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_re
         gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Vertex, INITIAL_VERTEX_CAPACITY * sizeof(UIVertex));
 
     if (!vertex_buffer_) {
-        BRACKEN_LOG_ERROR("ui", "Failed to create UI vertex buffer");
+        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create UI vertex buffer");
         return false;
     }
 
@@ -65,7 +68,7 @@ bool UIRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_re
 
         dummy_texture_ = SDL_CreateGPUTexture(device.handle(), &tex_info);
         if (!dummy_texture_) {
-            BRACKEN_LOG_ERROR("ui", "Failed to create UI dummy texture");
+            BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create UI dummy texture");
             return false;
         }
 
@@ -118,7 +121,7 @@ bool UIRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_re
 
         sampler_ = SDL_CreateGPUSampler(device.handle(), &samp_info);
         if (!sampler_) {
-            BRACKEN_LOG_ERROR("ui", "Failed to create UI sampler");
+            BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create UI sampler");
             return false;
         }
     }
@@ -126,9 +129,9 @@ bool UIRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_re
     // Initialize text renderer
     text_renderer_ = std::make_unique<TextRenderer>();
     if (text_renderer_->init(device, pipeline_registry)) {
-        BRACKEN_LOG_INFO("ui", "Text renderer initialized");
+        BRACKEN_LOG_INFO(LOG_TAG, "Text renderer initialized");
     } else {
-        BRACKEN_LOG_ERROR("ui", "Failed to initialize text renderer");
+        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to initialize text renderer");
     }
 
     // Set up projection
@@ -229,13 +232,13 @@ void UIRenderer::reserve_gpu_capacity() {
         // The old buffer may still be referenced by in-flight GPU work; SDL3
         // GPU defers the actual release until the GPU is done with it.
         vertex_buffer_ = std::move(grown);
-        BRACKEN_LOG_INFO("ui", "Grew UI vertex buffer to {} vertices ({} bytes)", new_bytes / sizeof(UIVertex),
+        BRACKEN_LOG_INFO(LOG_TAG, "Grew UI vertex buffer to {} vertices ({} bytes)", new_bytes / sizeof(UIVertex),
                          new_bytes);
         return;
     }
 
     const size_t capacity_vertices = vertex_buffer_->size() / sizeof(UIVertex);
-    BRACKEN_LOG_WARN("ui", "Failed to grow UI vertex buffer to {} bytes - truncating batch from {} to {} vertices",
+    BRACKEN_LOG_WARN(LOG_TAG, "Failed to grow UI vertex buffer to {} bytes - truncating batch from {} to {} vertices",
                      new_bytes, vertex_batch_.size(), capacity_vertices);
     truncate_batch(capacity_vertices);
 }
@@ -283,7 +286,7 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
 
     SDL_GPURenderPass* render_pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, nullptr);
     if (!render_pass) {
-        BRACKEN_LOG_ERROR("ui", "execute: Failed to begin render pass");
+        BRACKEN_LOG_ERROR(LOG_TAG, "execute: Failed to begin render pass");
         return;
     }
 
@@ -301,7 +304,7 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
     }
 
     if (!ui_pipeline) {
-        SDL_Log("UIRenderer::execute: UI pipeline not available, skipping UI draw");
+        BRACKEN_LOG_WARN(LOG_TAG, "UIRenderer::execute: UI pipeline not available, skipping UI draw");
         SDL_EndGPURenderPass(render_pass);
         vertex_batch_.clear();
         draw_ranges_.clear();

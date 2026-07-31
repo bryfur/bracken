@@ -1,12 +1,13 @@
 #include "gtao.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_pipeline.hpp"
 #include <SDL3/SDL_gpu.h>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render {
 
 namespace {
+constexpr const char* LOG_TAG = "gtao";
 
 // Golden-ratio low-discrepancy sequence for the per-frame temporal jitter:
 // slice rotation and step offset never repeat and cover [0,1) uniformly,
@@ -49,13 +50,13 @@ bool GTAO::init(gpu::GPUDevice& device, int width, int height, bool half_res) {
     linear_clamp_sampler_ = device_->create_sampler(linear_info);
 
     if (!is_ready()) {
-        SDL_Log("GTAO: Failed to initialize");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GTAO: Failed to initialize");
         return false;
     }
 
     clear_full_res_texture();
 
-    SDL_Log("GTAO: Initialized %dx%d (working res %dx%d)", width, height, ao_width_, ao_height_);
+    BRACKEN_LOG_INFO(LOG_TAG, "GTAO: Initialized {}x{} (working res {}x{})", width, height, ao_width_, ao_height_);
     return true;
 }
 
@@ -90,7 +91,8 @@ void GTAO::resize(int width, int height) {
     height_ = height;
     create_textures();
     clear_full_res_texture();
-    SDL_Log("GTAO: Resized to %dx%d (working res %dx%d, history invalidated)", width, height, ao_width_, ao_height_);
+    BRACKEN_LOG_INFO(LOG_TAG, "GTAO: Resized to {}x{} (working res {}x{}, history invalidated)", width, height,
+                     ao_width_, ao_height_);
 }
 
 void GTAO::set_half_res(bool half_res) {
@@ -101,7 +103,7 @@ void GTAO::set_half_res(bool half_res) {
     half_res_ = half_res;
     create_textures();
     clear_full_res_texture();
-    SDL_Log("GTAO: Working res now %dx%d (history invalidated)", ao_width_, ao_height_);
+    BRACKEN_LOG_INFO(LOG_TAG, "GTAO: Working res now {}x{} (history invalidated)", ao_width_, ao_height_);
 }
 
 void GTAO::create_textures() {
@@ -131,7 +133,7 @@ void GTAO::clear_full_res_texture() {
     // bind the texture before the first render() (e.g. AO mode Off).
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device_->handle());
     if (!cmd) {
-        SDL_Log("GTAO: Failed to acquire command buffer for AO clear: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GTAO: Failed to acquire command buffer for AO clear: {}", SDL_GetError());
         return;
     }
 

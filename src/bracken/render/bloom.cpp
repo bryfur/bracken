@@ -1,12 +1,16 @@
 #include "bloom.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_pipeline.hpp"
 #include <algorithm>
 #include <cmath>
 #include <SDL3/SDL_gpu.h>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "bloom";
+} // namespace
 
 Bloom::Bloom() = default;
 
@@ -23,11 +27,11 @@ bool Bloom::init(gpu::GPUDevice& device, int width, int height) {
     create_sampler();
 
     if (!is_ready()) {
-        SDL_Log("Bloom: Failed to initialize");
+        BRACKEN_LOG_ERROR(LOG_TAG, "Bloom: Failed to initialize");
         return false;
     }
 
-    SDL_Log("Bloom: Initialized %dx%d (%d mip levels)", width, height, mip_count_);
+    BRACKEN_LOG_INFO(LOG_TAG, "Bloom: Initialized {}x{} ({} mip levels)", width, height, mip_count_);
     return true;
 }
 
@@ -56,7 +60,7 @@ void Bloom::resize(int width, int height) {
     height_ = height;
 
     create_textures(width, height);
-    SDL_Log("Bloom: Resized to %dx%d (%d mip levels)", width, height, mip_count_);
+    BRACKEN_LOG_INFO(LOG_TAG, "Bloom: Resized to {}x{} ({} mip levels)", width, height, mip_count_);
 }
 
 int Bloom::compute_mip_count(int width, int height) {

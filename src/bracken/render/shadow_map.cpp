@@ -1,14 +1,15 @@
 #include "shadow_map.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "SDL3/SDL_gpu.h"
 #include <algorithm>
 #include <cmath>
 #include <glm/gtc/matrix_transform.hpp>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render {
 
 namespace {
+constexpr const char* LOG_TAG = "shadows";
 // Tallest caster height (world units) above its receivers that the cascades
 // account for. A caster up-sun of a cascade's view slice still shadows it;
 // the ortho volume must reach h / sin(elevation) toward the light to include
@@ -35,7 +36,7 @@ bool ShadowMap::init(gpu::GPUDevice& device, int resolution) {
 
     atlas_texture_ = gpu::GPUTexture::create_depth(device, resolution_ * 2, resolution_ * 2);
     if (!atlas_texture_) {
-        SDL_Log("ShadowMap::init: Failed to create shadow atlas texture");
+        BRACKEN_LOG_ERROR(LOG_TAG, "ShadowMap::init: Failed to create shadow atlas texture");
         return false;
     }
 
@@ -52,7 +53,7 @@ bool ShadowMap::init(gpu::GPUDevice& device, int resolution) {
 
     shadow_sampler_ = device.create_sampler(sampler_info);
     if (!shadow_sampler_) {
-        SDL_Log("ShadowMap::init: Failed to create shadow sampler");
+        BRACKEN_LOG_ERROR(LOG_TAG, "ShadowMap::init: Failed to create shadow sampler");
         return false;
     }
 
@@ -66,12 +67,12 @@ bool ShadowMap::init(gpu::GPUDevice& device, int resolution) {
 
     shadow_compare_sampler_ = device.create_sampler(compare_info);
     if (!shadow_compare_sampler_) {
-        SDL_Log("ShadowMap::init: Failed to create shadow comparison sampler");
+        BRACKEN_LOG_ERROR(LOG_TAG, "ShadowMap::init: Failed to create shadow comparison sampler");
         return false;
     }
 
-    SDL_Log("ShadowMap: Initialized %dx%d atlas (%d per cascade, %d cascades)", resolution_ * 2, resolution_ * 2,
-            resolution_, active_cascades_);
+    BRACKEN_LOG_INFO(LOG_TAG, "ShadowMap: Initialized {}x{} atlas ({} per cascade, {} cascades)", resolution_ * 2,
+                     resolution_ * 2, resolution_, active_cascades_);
     return true;
 }
 
@@ -101,11 +102,12 @@ bool ShadowMap::reinit(int resolution) {
 
     atlas_texture_ = gpu::GPUTexture::create_depth(*device_, resolution_ * 2, resolution_ * 2);
     if (!atlas_texture_) {
-        SDL_Log("ShadowMap::reinit: Failed to create shadow atlas texture");
+        BRACKEN_LOG_ERROR(LOG_TAG, "ShadowMap::reinit: Failed to create shadow atlas texture");
         return false;
     }
 
-    SDL_Log("ShadowMap: Reinitialized %dx%d atlas (%d per cascade)", resolution_ * 2, resolution_ * 2, resolution_);
+    BRACKEN_LOG_INFO(LOG_TAG, "ShadowMap: Reinitialized {}x{} atlas ({} per cascade)", resolution_ * 2, resolution_ * 2,
+                     resolution_);
     return true;
 }
 
@@ -225,7 +227,7 @@ SDL_GPURenderPass* ShadowMap::begin_shadow_pass(SDL_GPUCommandBuffer* cmd) {
 
     current_shadow_pass_ = SDL_BeginGPURenderPass(cmd, nullptr, 0, &depth_target);
     if (!current_shadow_pass_) {
-        SDL_Log("ShadowMap::begin_shadow_pass: Failed to begin atlas render pass");
+        BRACKEN_LOG_ERROR(LOG_TAG, "ShadowMap::begin_shadow_pass: Failed to begin atlas render pass");
         return nullptr;
     }
 

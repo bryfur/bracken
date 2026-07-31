@@ -1,11 +1,15 @@
 #include "post_process_stack.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_pipeline.hpp"
 #include <algorithm>
 #include <SDL3/SDL_gpu.h>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "post";
+} // namespace
 
 PostProcessStack::PostProcessStack() = default;
 
@@ -27,11 +31,11 @@ bool PostProcessStack::init(gpu::GPUDevice& device, int width, int height) {
     dummy_exposure_buffer_ = gpu::GPUBuffer::create_static(device, gpu::GPUBuffer::Type::Storage, zeros, sizeof(zeros));
 
     if (!is_ready()) {
-        SDL_Log("PostProcessStack: Failed to initialize");
+        BRACKEN_LOG_ERROR(LOG_TAG, "PostProcessStack: Failed to initialize");
         return false;
     }
 
-    SDL_Log("PostProcessStack: Initialized %dx%d", width, height);
+    BRACKEN_LOG_INFO(LOG_TAG, "PostProcessStack: Initialized {}x{}", width, height);
     return true;
 }
 
@@ -69,7 +73,7 @@ void PostProcessStack::resize(int width, int height) {
     height_ = height;
 
     create_textures(width, height);
-    SDL_Log("PostProcessStack: Resized to %dx%d", width, height);
+    BRACKEN_LOG_INFO(LOG_TAG, "PostProcessStack: Resized to {}x{}", width, height);
 }
 
 void PostProcessStack::create_textures(int width, int height) {

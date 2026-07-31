@@ -5,9 +5,12 @@
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include <algorithm>
 #include <SDL3/SDL_gpu.h>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "render";
+} // namespace
 
 IBL::IBL() = default;
 
@@ -62,7 +65,7 @@ bool IBL::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
     lut_sampler_ = device.create_sampler(lut_info);
 
     if (!is_ready()) {
-        SDL_Log("IBL: Failed to initialize");
+        BRACKEN_LOG_ERROR(LOG_TAG, "IBL: Failed to initialize");
         return false;
     }
 
@@ -72,7 +75,7 @@ bool IBL::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
     // differs, the first update() detects it and refreshes amortized.
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device.handle());
     if (!cmd) {
-        SDL_Log("IBL: Failed to acquire init command buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "IBL: Failed to acquire init command buffer: {}", SDL_GetError());
         return false;
     }
     render_brdf_lut(cmd, pipelines);
@@ -85,7 +88,7 @@ bool IBL::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
     refresh_count_ = 1;
     SDL_SubmitGPUCommandBuffer(cmd);
 
-    BRACKEN_LOG_INFO("render",
+    BRACKEN_LOG_INFO(LOG_TAG,
                      "IBL initialized: {}px specular cube x{} mips, {}px irradiance cube, {}px BRDF LUT "
                      "(full chain built; refreshes amortize {} passes at {}/frame)",
                      SPECULAR_SIZE, SPECULAR_MIPS, IRRADIANCE_SIZE, BRDF_LUT_SIZE, TOTAL_UNITS, UNITS_PER_FRAME);
@@ -135,7 +138,7 @@ void IBL::update(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, co
             snapshot_ = current;
             snapshot_time_ = sky_time;
             next_unit_ = 0;
-            BRACKEN_LOG_DEBUG("render", "IBL: sky changed - refreshing prefilter chain ({} passes, {}/frame)",
+            BRACKEN_LOG_DEBUG(LOG_TAG, "IBL: sky changed - refreshing prefilter chain ({} passes, {}/frame)",
                               TOTAL_UNITS, UNITS_PER_FRAME);
         }
     }

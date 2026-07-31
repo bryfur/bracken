@@ -1,12 +1,16 @@
 #include "volumetric_fog.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_pipeline.hpp"
 #include <algorithm>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <SDL3/SDL_gpu.h>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "fog";
+} // namespace
 
 VolumetricFog::VolumetricFog() = default;
 
@@ -25,11 +29,11 @@ bool VolumetricFog::init(gpu::GPUDevice& device, int width, int height) {
     create_sampler();
 
     if (!is_ready()) {
-        SDL_Log("VolumetricFog: Failed to initialize");
+        BRACKEN_LOG_ERROR(LOG_TAG, "VolumetricFog: Failed to initialize");
         return false;
     }
 
-    SDL_Log("VolumetricFog: Initialized %dx%d (fog: %dx%d)", width, height, fog_width_, fog_height_);
+    BRACKEN_LOG_INFO(LOG_TAG, "VolumetricFog: Initialized {}x{} (fog: {}x{})", width, height, fog_width_, fog_height_);
     return true;
 }
 
@@ -58,7 +62,7 @@ void VolumetricFog::resize(int width, int height) {
     fog_height_ = std::max(1, height / 2);
 
     create_textures(width, height);
-    SDL_Log("VolumetricFog: Resized to %dx%d (fog: %dx%d)", width, height, fog_width_, fog_height_);
+    BRACKEN_LOG_INFO(LOG_TAG, "VolumetricFog: Resized to {}x{} (fog: {}x{})", width, height, fog_width_, fog_height_);
 }
 
 void VolumetricFog::create_textures(int width, int height) {

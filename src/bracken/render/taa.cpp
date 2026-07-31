@@ -1,10 +1,14 @@
 #include "taa.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_pipeline.hpp"
 #include <SDL3/SDL_gpu.h>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::render {
+
+namespace {
+constexpr const char* LOG_TAG = "taa";
+} // namespace
 
 TAA::TAA() = default;
 
@@ -34,11 +38,11 @@ bool TAA::init(gpu::GPUDevice& device, int width, int height) {
     linear_clamp_sampler_ = device_->create_sampler(linear_info);
 
     if (!is_ready()) {
-        SDL_Log("TAA: Failed to initialize");
+        BRACKEN_LOG_ERROR(LOG_TAG, "TAA: Failed to initialize");
         return false;
     }
 
-    SDL_Log("TAA: Initialized %dx%d (RGBA16F double-buffered history)", width, height);
+    BRACKEN_LOG_INFO(LOG_TAG, "TAA: Initialized {}x{} (RGBA16F double-buffered history)", width, height);
     return true;
 }
 
@@ -69,7 +73,7 @@ void TAA::resize(int width, int height) {
     height_ = height;
     create_textures(width, height);
     history_valid_ = false;
-    SDL_Log("TAA: Resized to %dx%d (history invalidated)", width, height);
+    BRACKEN_LOG_INFO(LOG_TAG, "TAA: Resized to {}x{} (history invalidated)", width, height);
 }
 
 void TAA::create_textures(int width, int height) {
