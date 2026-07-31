@@ -346,6 +346,34 @@ public:
     /** Matrices of one palette, by a SEALED command's palette id. */
     [[nodiscard]] std::span<const glm::mat4> palette_matrices(BonePaletteId id) const;
 
+    /**
+     * What the FILL threw away before it ever became a command.
+     *
+     * These are host-side mistakes caught at emit time — an invalid handle, a
+     * palette id from a failed allocation, an allocation over the frame's
+     * MAX_BONE_PALETTES budget — and they are counted rather than logged per
+     * occurrence, because a host that gets one of these wrong gets it wrong
+     * for every instance, every frame. FrameBuilder::seal() emits ONE summary
+     * line per frame from these counts; the renderer folds them into
+     * FrameDiagnostics. Readable while Filling too (seal() reads them itself).
+     */
+    struct BuildDiagnostics {
+        uint32_t draws_dropped_invalid_handle = 0;
+        uint32_t skinned_dropped_invalid_palette = 0;
+        uint32_t palettes_over_budget = 0;
+
+        [[nodiscard]] bool any() const {
+            return draws_dropped_invalid_handle != 0 || skinned_dropped_invalid_palette != 0 ||
+                   palettes_over_budget != 0;
+        }
+    };
+
+    [[nodiscard]] BuildDiagnostics build_diagnostics() const noexcept {
+        return {drops_invalid_handle_.load(std::memory_order_relaxed),
+                drops_invalid_palette_.load(std::memory_order_relaxed),
+                drops_palette_budget_.load(std::memory_order_relaxed)};
+    }
+
     /** Total matrix count across palettes() — the size of the packed palette
      *  stream a renderer uploads (sum of joint_count, == last palette's
      *  matrix_offset + joint_count). */
@@ -494,6 +522,19 @@ public:
         return palette_slots_.fetch_add(1, std::memory_order_relaxed) < MAX_BONE_PALETTES;
     }
 
+    /** Palette slots claimed this fill (may exceed MAX_BONE_PALETTES on an
+     *  over-budget frame — that overshoot IS the diagnostic). */
+    [[nodiscard]] uint32_t palette_slots_taken() const noexcept {
+        return palette_slots_.load(std::memory_order_relaxed);
+    }
+
+    /** Emit-time drop counters, bumped from any fill-stage lane thread.
+     *  Relaxed: each is a self-contained count on an already-failing path,
+     *  published to readers by the Filling → Sealed release edge. */
+    void count_drop_invalid_handle() noexcept { drops_invalid_handle_.fetch_add(1, std::memory_order_relaxed); }
+    void count_drop_invalid_palette() noexcept { drops_invalid_palette_.fetch_add(1, std::memory_order_relaxed); }
+    void count_drop_palette_budget() noexcept { drops_palette_budget_.fetch_add(1, std::memory_order_relaxed); }
+
 private:
     friend class FrameBuilder; // writes the sealed views + performs the Filling→Sealed publish
 
@@ -534,6 +575,12 @@ private:
     // past the cap on over-budget frames; reset() zeroes it. No pairing
     // partner.
     std::atomic<uint32_t> palette_slots_{0};
+    // Emit-time drop counts (see count_drop_*): relaxed fetch_add on failing
+    // paths only, zeroed by reset(). No pairing partner — their values ride
+    // the seal edge like the rest of the payload.
+    std::atomic<uint32_t> drops_invalid_handle_{0};
+    std::atomic<uint32_t> drops_invalid_palette_{0};
+    std::atomic<uint32_t> drops_palette_budget_{0};
 
     // state_ — the packet lifecycle word (Retired → Filling → Sealed →
     // Consuming → Retired). Every transition is a release store by the stage

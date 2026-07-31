@@ -82,6 +82,11 @@ public:
      */
     void ensure_models_uploaded(std::span<const bracken::scene::EffectEmitterSnapshot> emitters);
 
+    /** Emitters in the last ensure_models_uploaded() whose EmitterDefinition
+     *  named a model the ModelManager does not have — those particles draw
+     *  nothing. Folded into FrameDiagnostics::effect_models_unresolved. */
+    [[nodiscard]] uint32_t models_unresolved() const { return models_unresolved_; }
+
     /**
      * Pack per-particle instance data ({model matrix, tint+opacity}) from
      * the sealed packet's effect-instance snapshot into the per-frame
@@ -144,6 +149,9 @@ private:
     // Definitions already warned about for an unresolved model name, so the
     // uncached retry doesn't log every frame.
     std::unordered_set<const bracken::EmitterDefinition*> warned_missing_models_;
+    // Emitters whose model name resolved to nothing during the last
+    // ensure_models_uploaded() — folded into FrameDiagnostics by the renderer.
+    uint32_t models_unresolved_ = 0;
 
     // Per-frame instancing state, rebuilt by upload_particle_instances().
     // Model pointers stay valid frame-locally (same contract as the bone

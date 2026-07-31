@@ -1,6 +1,7 @@
 #include "bracken/render/effect_renderer.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
+#include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_device.hpp"
@@ -160,6 +161,7 @@ ModelHandle EffectRenderer::resolve_emitter_model(const bracken::EmitterDefiniti
 
 void EffectRenderer::ensure_models_uploaded(std::span<const bracken::scene::EffectEmitterSnapshot> emitters) {
     BRACKEN_PROFILE_ZONE_COLOR("EffectRenderer::ensure_models_uploaded", 0x3D6E9E);
+    models_unresolved_ = 0;
     if (!device_ || !model_manager_) {
         return;
     }
@@ -170,6 +172,7 @@ void EffectRenderer::ensure_models_uploaded(std::span<const bracken::scene::Effe
         }
         ModelHandle handle = resolve_emitter_model(*emitter.definition);
         if (handle == INVALID_MODEL_HANDLE) {
+            ++models_unresolved_; // emitter names a model nothing registered
             continue;
         }
         Model* model = model_manager_->get_model(handle);
@@ -207,16 +210,20 @@ void EffectRenderer::upload_particle_instances(SDL_GPUCopyPass* copy_pass,
         // The pre-pass upload (ensure_models_uploaded) should have handled
         // this; never upload from the frame copy pass — skip and log instead.
         if (!model->meshes.empty() && !model->meshes[0].uploaded) {
-            BRACKEN_LOG_WARN("effect", "Effect model '{}' not GPU-uploaded; skipping particles this frame",
-                             emitter.definition->model);
+            // Per-frame path: throttled, because a model that failed to upload
+            // fails again next frame and every frame after that.
+            BRACKEN_LOG_WARN_THROTTLED(5.0, "effect",
+                                       "Effect model '{}' not GPU-uploaded; skipping particles this frame",
+                                       emitter.definition->model);
             continue;
         }
 
         // Snapshot ranges are engine-built; stay defensive in release anyway.
         if (emitter.first_particle + emitter.particle_count > particles.size()) {
-            BRACKEN_LOG_ERROR("effect", "Effect snapshot range [{}, {}) exceeds particle span ({}); skipping batch",
-                              emitter.first_particle, emitter.first_particle + emitter.particle_count,
-                              particles.size());
+            BRACKEN_LOG_ERROR_THROTTLED(5.0, "effect",
+                                        "Effect snapshot range [{}, {}) exceeds particle span ({}); skipping batch",
+                                        emitter.first_particle, emitter.first_particle + emitter.particle_count,
+                                        particles.size());
             continue;
         }
 

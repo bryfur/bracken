@@ -124,7 +124,26 @@ public:
     // ========== Debug Stats ==========
 
     void set_collect_stats(bool enabled) { collect_stats_ = enabled; }
+    bool collect_stats() const { return collect_stats_; }
     const bracken::RenderStats& render_stats() const { return render_stats_; }
+
+    /**
+     * Everything the last rendered frame threw away (unknown model handles,
+     * skinned draws with no skeleton, over-budget palettes, dropped lights,
+     * a missing camera). Unlike render_stats() these are accumulated
+     * unconditionally — a drop is never something a host opted out of
+     * knowing about.
+     */
+    const bracken::FrameDiagnostics& frame_diagnostics() const { return frame_diagnostics_; }
+
+    /**
+     * Diagnostic predicate: a frame carrying 3D content that is rendered
+     * before any camera was ever set draws nothing at all. Device-free static
+     * so the check is testable headless.
+     */
+    static bool frame_needs_camera(const FramePacket& frame, bool have_camera) {
+        return frame.has_3d_content() && !have_camera;
+    }
 
     // ========== Screenshot ==========
 
@@ -717,6 +736,9 @@ private:
     // ========== Debug Stats ==========
     bool collect_stats_ = false;
     bracken::RenderStats render_stats_;
+    // Reset every render_frame regardless of collect_stats_ (see
+    // frame_diagnostics()).
+    bracken::FrameDiagnostics frame_diagnostics_;
     gpu::GPUTimestampPool gpu_timer_pool_;
 
     // ========== Post-UI Callback ==========

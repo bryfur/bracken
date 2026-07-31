@@ -281,6 +281,19 @@ protected:
 
     void set_collect_render_stats(bool enabled);
     const RenderStats& render_stats() const;
+
+    /**
+     * What the last rendered frame threw away: unknown model handles, skinned
+     * draws with no skeleton, over-budget bone palettes, effect emitters
+     * naming missing models, lights past MAX_LIGHTS, cluster bins that
+     * truncated, and whether the frame had 3D content but no camera.
+     *
+     * Always accumulated — unlike render_stats() this does not require
+     * set_collect_render_stats(true), because a silently dropped draw is
+     * never something a host opted out of being told about. Main-thread /
+     * fence read (the renderer writes it during render_frame).
+     */
+    const FrameDiagnostics& frame_diagnostics() const;
     std::string gpu_driver_name() const;
 
     /** Pin the simulation timestep, decoupling simulated time from wall clock.

@@ -5,6 +5,7 @@
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
 #include "bracken/core/jobs/task_group.hpp"
+#include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
@@ -565,10 +566,22 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     BRACKEN_PROFILE_ZONE("SceneRenderer::render_frame");
     // Swapchain acquire + every sub-renderer assume the SDL main thread.
     BRACKEN_ASSERT_MAIN_THREAD();
+    // Diagnostics reset unconditionally: they are drop counters, not opt-in
+    // instrumentation (see SceneRenderer::frame_diagnostics()).
+    frame_diagnostics_ = {};
     if (collect_stats_) {
         render_stats_ = {};
         render_stats_.jobs_pending = core::jobs::JobSystem::instance().pending_count();
+        render_stats_.packet_bytes_used = frame.bytes_used();
+        render_stats_.packet_bytes_capacity = frame.bytes_capacity();
+        render_stats_.bone_palettes_used = static_cast<uint32_t>(frame.palettes().size());
+        render_stats_.bone_palettes_budget = FramePacket::MAX_BONE_PALETTES;
     }
+    // Emit-time drops the FrameBuilder already counted on the packet.
+    const FramePacket::BuildDiagnostics build_diag = frame.build_diagnostics();
+    frame_diagnostics_.draws_dropped_unknown_model += build_diag.draws_dropped_invalid_handle;
+    frame_diagnostics_.skinned_dropped_no_skeleton += build_diag.skinned_dropped_invalid_palette;
+    frame_diagnostics_.palettes_over_budget += build_diag.palettes_over_budget;
     const GraphicsSettings& gfx = graphics_ ? *graphics_ : default_graphics_;
     const float dt = frame.dt();
 
@@ -626,6 +639,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     // particle system: spawns were applied and the live EffectSystem updated
     // on the sim side before this packet sealed.
     effects_->ensure_models_uploaded(frame.effect_emitters());
+    frame_diagnostics_.effect_models_unresolved += effects_->models_unresolved();
 
     begin_frame();
 
@@ -639,7 +653,16 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     gpu_timer_pool_.begin_frame();
 
     // 3D needs both content and a camera (no camera ever set = skip 3D,
-    // conservative fallback for the packet's optional camera).
+    // conservative fallback for the packet's optional camera). A frame that
+    // describes geometry and never set a camera renders NOTHING — that is the
+    // single most common "I built a frame and see nothing" report, so name it
+    // and name the fix. Once: it is a standing property of the host's code.
+    if (frame_needs_camera(frame, have_frame_camera_)) {
+        frame_diagnostics_.camera_missing = true;
+        BRACKEN_LOG_WARN_ONCE("render",
+                              "frame has 3D content but no camera was ever set - call frame().set_camera(); "
+                              "the entire 3D pass is being skipped");
+    }
     bool has_content = frame.has_3d_content() && have_frame_camera_;
     frame_prepass_active_ = false; // set by the HDR path when the prepass records
     // Reset the frame's AO texture to the white dummy: forward pipelines
@@ -796,10 +819,21 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             uint32_t cw = static_cast<uint32_t>(std::max(context_->width(), 1));
             uint32_t ch = static_cast<uint32_t>(std::max(context_->height(), 1));
             cluster_grid_.begin_frame(camera, cw, ch, 0.1f, gfx.get_draw_distance());
-            for (const auto& l : frame_point_lights_) cluster_grid_.add_point_light(l);
-            for (const auto& l : frame_spot_lights_) cluster_grid_.add_spot_light(l);
+            for (const auto& l : frame_point_lights_) {
+                (void)cluster_grid_.add_point_light(l); // refusals are counted below
+            }
+            for (const auto& l : frame_spot_lights_) {
+                (void)cluster_grid_.add_spot_light(l);
+            }
             cluster_grid_.build();
             frame_cluster_params_ = cluster_grid_.params();
+            frame_diagnostics_.lights_dropped += cluster_grid_.lights_dropped();
+            frame_diagnostics_.cluster_lights_dropped += cluster_grid_.cluster_lights_dropped();
+            if (collect_stats_) {
+                render_stats_.lights_submitted +=
+                    static_cast<uint32_t>(frame_point_lights_.size() + frame_spot_lights_.size());
+                render_stats_.lights_binned += cluster_grid_.total_lights();
+            }
         } else if (cluster_grid_ready_) {
             // No dynamic lights: publish zeroed params so the shaders see
             // gridDim.w == 0 instead of last frame's stale light count.
@@ -1712,7 +1746,7 @@ void SceneRenderer::render_model_command_inner(const ModelDrawCommand& cmd, cons
         }
         SDL_DrawGPUIndexedPrimitives(main_render_pass_, mesh.index_count(), 1, 0, 0, 0);
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
 // ============================================================================
@@ -1751,16 +1785,26 @@ static void bin_main_chunk(std::span<const ModelDrawCommand> cmds, size_t begin,
 
         const ModelHandle handle = cmd.model_handle;
 
+        // ONE lookup, serving both the bounds test and the diagnostic. This
+        // is the single point at which every model command of the frame is
+        // visited exactly once, so it is where an unresolvable handle gets
+        // counted: the command survives culling here and then silently draws
+        // nothing at record time, which from outside is indistinguishable
+        // from the model being invisible. Diagnostics are NOT gated on
+        // p.collect_stats — a drop is not opt-in instrumentation.
+        const Model* model = p.models->get_model(handle);
+        if (model == nullptr) {
+            stats.diagnostics.draws_dropped_unknown_model++;
+        }
+
         // Main visibility only needs bounds when frustum culling is on; a
         // command whose model is missing has no bounds and stays visible
         // (matches the serial walk, where the frustum test required bounds).
         bool main_visible = true;
-        if (p.do_frustum_cull) {
-            if (const Model* model = p.models->get_model(handle)) {
-                const glm::vec3 world_center = glm::vec3(t * glm::vec4(model->bounding_center, 1.0f));
-                const float world_radius = model->bounding_half_diag * max_scale_factor(t);
-                main_visible = p.main_frustum->intersects_sphere(world_center, world_radius);
-            }
+        if (p.do_frustum_cull && model != nullptr) {
+            const glm::vec3 world_center = glm::vec3(t * glm::vec4(model->bounding_center, 1.0f));
+            const float world_radius = model->bounding_half_diag * max_scale_factor(t);
+            main_visible = p.main_frustum->intersects_sphere(world_center, world_radius);
         }
 
         if (!main_visible) {
@@ -2049,7 +2093,7 @@ void SceneRenderer::build_instance_batches(const FramePacket& frame, const Camer
     const InstanceBinOutputs out{instance_batches_,   instance_batches_touched_, shadow_instance_batches_,
                                  shadow_batches_touched_, non_instanced_commands_, stats_partial};
     prep_instance_batches(core::jobs::JobSystem::instance(), frame.model_commands(), p, prep_scratch_, out);
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
 void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
@@ -2175,7 +2219,12 @@ static void resolve_skinned_chunk(std::span<const SkinnedDrawCommand> cmds, size
                                     static_cast<uint32_t>(bracken::animation::MAX_BONES)});
         }
         if (joint_count == 0) {
-            continue; // no model/skeleton/palette joints: not drawable as skinned
+            // No model, no skeleton, or a zero-joint palette: not drawable as
+            // skinned and not drawn at all. Counted here (the one place every
+            // skinned command is visited exactly once) rather than dropped in
+            // silence.
+            stats.diagnostics.skinned_dropped_no_skeleton++;
+            continue;
         }
 
         // Resolve world bounds once here; the main view and every shadow
@@ -2276,7 +2325,7 @@ void SceneRenderer::pack_bone_palettes(const FramePacket& frame, const CameraSta
     FrameStatsPartial stats_partial;
     prep_resolve_skinned(core::jobs::JobSystem::instance(), cmds, frame.palettes(), p, prep_scratch_.skinned,
                          skinned_resolved_, stats_partial);
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
 void SceneRenderer::upload_bone_palettes(SDL_GPUCopyPass* copy_pass, const FramePacket& frame) {
@@ -2486,7 +2535,7 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
 
         base_instance += instance_count;
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
 // ============================================================================
@@ -2642,7 +2691,7 @@ void SceneRenderer::prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUComma
 
         base_instance += instance_count;
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
 void SceneRenderer::prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
@@ -2726,7 +2775,7 @@ void SceneRenderer::prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUC
             SDL_DrawGPUIndexedPrimitives(pass, mesh.index_count(), 1, 0, 0, 0);
         }
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
 void SceneRenderer::prepass_draw_skinned_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
@@ -2805,7 +2854,7 @@ void SceneRenderer::prepass_draw_skinned_models(SDL_GPURenderPass* pass, SDL_GPU
             SDL_DrawGPUIndexedPrimitives(pass, mesh.index_count(), 1, 0, 0, 0);
         }
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
 void SceneRenderer::render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
@@ -2898,7 +2947,7 @@ void SceneRenderer::render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_
 
         base_instance += instance_count;
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
 void SceneRenderer::render_skinned_model_command_inner(const SkinnedDrawCommand& cmd, Model& model,
@@ -2982,7 +3031,7 @@ void SceneRenderer::render_skinned_model_command_inner(const SkinnedDrawCommand&
         }
         SDL_DrawGPUIndexedPrimitives(main_render_pass_, mesh.index_count(), 1, 0, 0, 0);
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
 // ============================================================================
@@ -3083,7 +3132,7 @@ void SceneRenderer::render_transparent_models(const CameraState& camera) {
         }
         SDL_DrawGPUIndexedPrimitives(main_render_pass_, mesh.index_count(), 1, 0, 0, 0);
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
     transparent_draws_.clear();
 }
 
@@ -3457,7 +3506,7 @@ void SceneRenderer::render_shadow_passes() {
         terrain_->render_shadow(shadow_pass, cmd, cascade_data.light_view_projection,
                                 &shadow_cascade_frustums_[cascade]);
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 
     shadow_map_->end_shadow_pass();
 }
@@ -3646,7 +3695,7 @@ void SceneRenderer::render_local_shadow_passes(const FramePacket& frame, const C
             }
         }
     }
-    stats_partial.merge_into(render_stats_);
+    stats_partial.merge_into(render_stats_, frame_diagnostics_);
 
     local_shadows_->end_pass();
 }

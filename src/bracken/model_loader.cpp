@@ -720,7 +720,13 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
         }
     }
 
-    // Load animations
+    // Load animations.
+    //
+    // Three kinds of glTF animation channel are silently unusable here, and
+    // "silently" was the defect: an artist whose walk cycle does nothing gets
+    // no signal at all. Count them per model and report once at the end —
+    // per-channel logging on a 200-channel rig is worse than useless.
+    ModelLoadReport report;
     for (const auto& gltf_anim : gltf.animations) {
         BRACKEN_PROFILE_ZONE("ModelLoader::parse_animation");
         animation::AnimationClip clip;
@@ -741,6 +747,7 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
             int node_idx = channel.target_node;
             auto joint_it = node_to_joint.find(node_idx);
             if (joint_it == node_to_joint.end()) {
+                report.channels_non_skin_node++; // targets a node outside the skin
                 continue;
             }
             int joint_idx = joint_it->second;
@@ -748,10 +755,12 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
             // Only TRS paths are supported ("weights" = morph targets).
             const bool is_rotation = channel.target_path == "rotation";
             if (channel.target_path != "translation" && !is_rotation && channel.target_path != "scale") {
+                report.channels_non_trs_path++;
                 continue;
             }
 
             if (channel.sampler < 0 || channel.sampler >= static_cast<int>(gltf_anim.samplers.size())) {
+                report.channels_bad_sampler++;
                 continue;
             }
             const auto& sampler = gltf_anim.samplers[channel.sampler];
@@ -848,6 +857,14 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
     model.compute_bounding_sphere();
     BRACKEN_LOG_INFO("model", "Loaded GLB model: {} ({} meshes) bounds: Y=[{}, {}]", path, model.meshes.size(),
                     model.min_y, model.max_y);
+    if (report.any()) {
+        BRACKEN_LOG_WARN("model",
+                        "{}: dropped {} animation channel(s) - {} targeting nodes outside the skin, {} on "
+                        "unsupported paths (only translation/rotation/scale are read; morph 'weights' are not), "
+                        "{} with an out-of-range sampler index",
+                        path, report.total(), report.channels_non_skin_node, report.channels_non_trs_path,
+                        report.channels_bad_sampler);
+    }
     return true;
 }
 

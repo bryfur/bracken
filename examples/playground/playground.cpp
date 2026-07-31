@@ -1567,6 +1567,19 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
         // The hard regression gate. Unlike everything on the line above, this
         // is computed entirely CPU-side, so it is exact and driver-independent.
         std::cout << std::format("[smoke] packet_digest=0x{:016x}\n", packet_digest());
+        // Digest sibling: also CPU-side and driver-independent. The digest
+        // proves the packet did not change; this proves the renderer did not
+        // start THROWING AWAY parts of it. A regression in any drop path
+        // (unknown handles, skeleton-less skinned draws, palette budget,
+        // unresolved effect models, light caps, a lost camera) moves a number
+        // here while the digest stays put.
+        const auto& diag = frame_diagnostics();
+        std::cout << std::format("[smoke] diagnostics unknown_model={} no_skeleton={} palettes_over_budget={} "
+                                 "effect_models_unresolved={} lights_dropped={} cluster_lights_dropped={} "
+                                 "camera_missing={}\n",
+                                 diag.draws_dropped_unknown_model, diag.skinned_dropped_no_skeleton,
+                                 diag.palettes_over_budget, diag.effect_models_unresolved, diag.lights_dropped,
+                                 diag.cluster_lights_dropped, diag.camera_missing ? 1 : 0);
         quit();
     }
 }

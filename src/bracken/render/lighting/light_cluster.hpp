@@ -57,8 +57,19 @@ public:
     void begin_frame(const scene::CameraState& camera, uint32_t screen_w, uint32_t screen_h, float near_plane,
                      float far_plane);
 
-    void add_point_light(const PointLight& l);
-    void add_spot_light(const SpotLight& l);
+    // Submit a dynamic light for this frame. FALSE means the light was
+    // DROPPED because the frame already holds max_lights (MAX_LIGHTS = 256)
+    // — a host submitting 300 lights used to lose 44 of them, chosen by
+    // lane-merge order, in total silence. Dropped lights are counted
+    // (lights_dropped()) and warned about once per grid.
+    [[nodiscard]] bool add_point_light(const PointLight& l);
+    [[nodiscard]] bool add_spot_light(const SpotLight& l);
+
+    // Lights refused since the last begin_frame() (see add_point_light).
+    [[nodiscard]] uint32_t lights_dropped() const { return lights_dropped_; }
+    // Light-to-cluster insertions the last build() refused because a bin was
+    // already at MAX_LIGHTS_PER_CLUSTER (see RenderStats/FrameDiagnostics).
+    [[nodiscard]] uint32_t cluster_lights_dropped() const { return cluster_lights_dropped_; }
 
     // CPU-side bin lights into clusters; populates the per-cluster offset/count
     // table and concatenated light index list. Per-light cluster-range
@@ -126,6 +137,8 @@ private:
     };
 
     void compute_cluster_bounds(core::jobs::JobSystem& js);
+    // Count + warn-once for a light past the frame cap; always returns false.
+    bool reject_over_cap();
     static bool sphere_intersects_aabb(const glm::vec3& center, float radius, const glm::vec3& aabb_min,
                                        const glm::vec3& aabb_max);
 
@@ -143,10 +156,10 @@ private:
     std::vector<ViewLight> view_lights_;        // scratch, reused across frames
     std::vector<LightRange> light_ranges_;      // scratch, per-light conservative cluster box
     // Per-chunk truncation partials for the binning fan-out: each chunk
-    // writes its own flag ONCE at chunk end (no shared cache-line writes in
-    // the per-item loop); merged single-threaded in chunk-index order after
-    // the join (§6.2).
-    std::vector<uint8_t> chunk_truncated_;
+    // accumulates a PRIVATE count and writes its own slot ONCE at chunk end
+    // (no shared cache-line writes in the per-item loop); merged
+    // single-threaded in chunk-index order after the join (§6.2).
+    std::vector<uint32_t> chunk_truncated_;
     std::vector<uint8_t> light_staging_;        // scratch for upload() packing
 
     ClusterParams params_{};
@@ -155,6 +168,9 @@ private:
     float last_far_ = 0.0f;
     bool bounds_valid_ = false;
     bool warned_truncation_ = false;
+    bool warned_dropped_ = false;
+    uint32_t lights_dropped_ = 0;         // reset each begin_frame()
+    uint32_t cluster_lights_dropped_ = 0; // set by build()
 
     // Dirty flag for cluster_offsets_, set while build() packs the table —
     // skips the ~27KB offsets transfer when bin layout is unchanged

@@ -176,6 +176,8 @@ void ClusterGrid::begin_frame(core::jobs::JobSystem& js, const scene::CameraStat
     // build() can diff against it (the upload dirty check) and rewrites it.
     for (auto& bin : bins_) bin.clear();
     warned_truncation_ = false;
+    lights_dropped_ = 0;
+    cluster_lights_dropped_ = 0;
 
     params_.view = camera.view;
     // The 4x4 inverse (~80 flops) only depends on the projection — recompute it
@@ -207,22 +209,40 @@ void ClusterGrid::begin_frame(core::jobs::JobSystem& js, const scene::CameraStat
     }
 }
 
-void ClusterGrid::add_point_light(const PointLight& l) {
+// Shared refusal path: a light past the frame cap is DROPPED, and dropping it
+// silently is how a host ends up debugging "why is that lamp black" against a
+// renderer that is working exactly as designed. Warn once per grid (the cap
+// is a standing property of the scene, not an event) and count every one.
+bool ClusterGrid::reject_over_cap() {
+    ++lights_dropped_;
+    if (!warned_dropped_) {
+        BRACKEN_LOG_WARN(LOG_TAG,
+                         "ClusterGrid: light budget MAX_LIGHTS={} reached; further lights this frame are dropped "
+                         "(submit fewer lights, or raise max_lights at init())",
+                         max_lights_);
+        warned_dropped_ = true;
+    }
+    return false;
+}
+
+bool ClusterGrid::add_point_light(const PointLight& l) {
     if (points_.size() + spots_.size() >= max_lights_) {
-        return;
+        return reject_over_cap();
     }
     uint32_t payload_idx = static_cast<uint32_t>(points_.size());
     points_.push_back(l);
     headers_.push_back({LIGHT_TYPE_POINT, payload_idx});
+    return true;
 }
 
-void ClusterGrid::add_spot_light(const SpotLight& l) {
+bool ClusterGrid::add_spot_light(const SpotLight& l) {
     if (points_.size() + spots_.size() >= max_lights_) {
-        return;
+        return reject_over_cap();
     }
     uint32_t payload_idx = static_cast<uint32_t>(spots_.size());
     spots_.push_back(l);
     headers_.push_back({LIGHT_TYPE_SPOT, payload_idx});
+    return true;
 }
 
 void ClusterGrid::compute_cluster_bounds(core::jobs::JobSystem& js) {
@@ -419,7 +439,7 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
     const std::size_t chunk_count = (CLUSTER_COUNT + BIN_GRAIN - 1) / BIN_GRAIN;
     chunk_truncated_.assign(chunk_count, 0);
     auto bin_chunk = [&](std::size_t chunk_begin, std::size_t chunk_end) {
-        bool truncated_local = false; // per-chunk partial; published once below
+        uint32_t truncated_local = 0; // per-chunk partial; published once below
         for (std::size_t i = 0; i < light_count; ++i) {
             const auto& lr = light_ranges_[i];
             if (!lr.active || lr.max_c < chunk_begin || lr.min_c >= chunk_end) {
@@ -448,7 +468,7 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
                         if (bin.size() < MAX_LIGHTS_PER_CLUSTER) {
                             bin.push_back(static_cast<uint32_t>(i));
                         } else {
-                            truncated_local = true;
+                            ++truncated_local;
                         }
                     }
                 }
@@ -456,8 +476,8 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
         }
         // One write per CHUNK to a chunk-indexed slot — never inside the
         // per-item loop (§7: no shared cache-line writes per item).
-        if (truncated_local) {
-            chunk_truncated_[chunk_begin / BIN_GRAIN] = 1;
+        if (truncated_local != 0) {
+            chunk_truncated_[chunk_begin / BIN_GRAIN] = truncated_local;
         }
     };
 
@@ -469,16 +489,18 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
         bin_chunk(0, CLUSTER_COUNT);
     }
 
-    // Merge partials single-threaded in chunk-index order (§6.2). OR is
-    // order-insensitive, but the pattern is the house contract.
-    bool truncated = false;
+    // Merge partials single-threaded in chunk-index order (§6.2). Integer
+    // addition commutes, but the pattern is the house contract.
+    cluster_lights_dropped_ = 0;
     for (std::size_t k = 0; k < chunk_count; ++k) {
-        truncated = truncated || chunk_truncated_[k] != 0;
+        cluster_lights_dropped_ += chunk_truncated_[k];
     }
 
-    if (truncated && !warned_truncation_) {
-        BRACKEN_LOG_WARN(LOG_TAG, "ClusterGrid: at least one cluster exceeded MAX_LIGHTS_PER_CLUSTER={}, truncating",
-                         MAX_LIGHTS_PER_CLUSTER);
+    if (cluster_lights_dropped_ != 0 && !warned_truncation_) {
+        BRACKEN_LOG_WARN(LOG_TAG,
+                         "ClusterGrid: {} light insertion(s) dropped by MAX_LIGHTS_PER_CLUSTER={}; those clusters "
+                         "are lit by only their first {} lights",
+                         cluster_lights_dropped_, MAX_LIGHTS_PER_CLUSTER, MAX_LIGHTS_PER_CLUSTER);
         warned_truncation_ = true;
     }
 

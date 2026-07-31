@@ -2,6 +2,7 @@
 
 #include <array>
 #include <gtest/gtest.h>
+#include <optional>
 
 namespace bracken {
 namespace {
@@ -13,6 +14,8 @@ FrameStatsPartial make_partial(uint32_t base) {
     p.entities_rendered = base + 3;
     p.entities_distance_culled = base + 4;
     p.entities_frustum_culled = base + 5;
+    p.diagnostics.draws_dropped_unknown_model = base + 6;
+    p.diagnostics.skinned_dropped_no_skeleton = base + 7;
     return p;
 }
 
@@ -33,9 +36,10 @@ TEST(FrameStatsPartial, MergeIntoAccumulates) {
     stats.entities_distance_culled = 40;
     stats.entities_frustum_culled = 50;
     stats.jobs_pending = 7;
-    stats.pass_times_ms.emplace_back("ShadowPass", 1.5f);
+    stats.pass_times_ms.push_back(PassTiming{"ShadowPass", 1.5f, std::nullopt});
+    FrameDiagnostics diag;
 
-    make_partial(100).merge_into(stats);
+    make_partial(100).merge_into(stats, diag);
 
     EXPECT_EQ(stats.draw_calls, 111u);
     EXPECT_EQ(stats.triangle_count, 122u);
@@ -45,7 +49,11 @@ TEST(FrameStatsPartial, MergeIntoAccumulates) {
     // Frame-level fields are not part of the partial and must be untouched.
     EXPECT_EQ(stats.jobs_pending, 7u);
     ASSERT_EQ(stats.pass_times_ms.size(), 1u);
-    EXPECT_EQ(stats.pass_times_ms[0].first, "ShadowPass");
+    EXPECT_EQ(stats.pass_times_ms[0].name, "ShadowPass");
+    // Diagnostics ride the same merge (and stay out of RenderStats).
+    EXPECT_EQ(diag.draws_dropped_unknown_model, 106u);
+    EXPECT_EQ(diag.skinned_dropped_no_skeleton, 107u);
+    EXPECT_TRUE(diag.any());
 }
 
 TEST(FrameStatsPartial, MergeOfZeroPartialIsNoOp) {
@@ -53,11 +61,13 @@ TEST(FrameStatsPartial, MergeOfZeroPartialIsNoOp) {
     stats.draw_calls = 3;
     stats.entities_frustum_culled = 9;
 
-    FrameStatsPartial{}.merge_into(stats);
+    FrameDiagnostics diag;
+    FrameStatsPartial{}.merge_into(stats, diag);
 
     EXPECT_EQ(stats.draw_calls, 3u);
     EXPECT_EQ(stats.triangle_count, 0u);
     EXPECT_EQ(stats.entities_frustum_culled, 9u);
+    EXPECT_FALSE(diag.any());
 }
 
 TEST(FrameStatsPartial, PlusEqualsFoldsChunks) {
@@ -70,6 +80,8 @@ TEST(FrameStatsPartial, PlusEqualsFoldsChunks) {
     EXPECT_EQ(total.entities_rendered, 1006u);       // (0+3) + (1000+3)
     EXPECT_EQ(total.entities_distance_culled, 1008u);// (0+4) + (1000+4)
     EXPECT_EQ(total.entities_frustum_culled, 1010u); // (0+5) + (1000+5)
+    EXPECT_EQ(total.diagnostics.draws_dropped_unknown_model, 1012u);
+    EXPECT_EQ(total.diagnostics.skinned_dropped_no_skeleton, 1014u);
 }
 
 // The Phase 3 discipline: per-chunk partials merged in chunk order at the
@@ -90,6 +102,9 @@ TEST(FrameStatsPartial, ChunkedMergeMatchesSerialAccumulation) {
         } else {
             serial.entities_frustum_culled++;
         }
+        if (i % 7 == 0) {
+            serial.diagnostics.draws_dropped_unknown_model++;
+        }
     }
 
     // Chunked: one partial per chunk, merged in chunk-index order.
@@ -105,13 +120,18 @@ TEST(FrameStatsPartial, ChunkedMergeMatchesSerialAccumulation) {
         } else {
             p.entities_frustum_culled++;
         }
+        if (i % 7 == 0) {
+            p.diagnostics.draws_dropped_unknown_model++;
+        }
     }
 
     RenderStats from_serial;
-    serial.merge_into(from_serial);
+    FrameDiagnostics diag_serial;
+    serial.merge_into(from_serial, diag_serial);
     RenderStats from_chunks;
+    FrameDiagnostics diag_chunks;
     for (const FrameStatsPartial& p : chunks) {
-        p.merge_into(from_chunks);
+        p.merge_into(from_chunks, diag_chunks);
     }
 
     EXPECT_EQ(from_chunks.draw_calls, from_serial.draw_calls);
@@ -119,6 +139,7 @@ TEST(FrameStatsPartial, ChunkedMergeMatchesSerialAccumulation) {
     EXPECT_EQ(from_chunks.entities_rendered, from_serial.entities_rendered);
     EXPECT_EQ(from_chunks.entities_distance_culled, from_serial.entities_distance_culled);
     EXPECT_EQ(from_chunks.entities_frustum_culled, from_serial.entities_frustum_culled);
+    EXPECT_EQ(diag_chunks.draws_dropped_unknown_model, diag_serial.draws_dropped_unknown_model);
 }
 
 } // namespace

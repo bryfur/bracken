@@ -103,7 +103,7 @@ static void BM_ClusterBuild(benchmark::State& state) {
     for (auto _ : state) {
         grid.begin_frame(js, cam, SCREEN_W, SCREEN_H, NEAR_PLANE, FAR_PLANE);
         for (const auto& p : lights) {
-            grid.add_point_light(p);
+            (void)grid.add_point_light(p);
         }
         grid.build(js);
         benchmark::DoNotOptimize(grid.cluster_offsets().data());
@@ -139,10 +139,10 @@ static void BM_ClusterBuildMixed(benchmark::State& state) {
     for (auto _ : state) {
         grid.begin_frame(js, cam, SCREEN_W, SCREEN_H, NEAR_PLANE, FAR_PLANE);
         for (const auto& p : points) {
-            grid.add_point_light(p);
+            (void)grid.add_point_light(p);
         }
         for (const auto& s : spots) {
-            grid.add_spot_light(s);
+            (void)grid.add_spot_light(s);
         }
         grid.build(js);
         benchmark::DoNotOptimize(grid.cluster_offsets().data());

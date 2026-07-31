@@ -39,27 +39,42 @@ int GPUTimestampPool::reserve_pair(const char* pass_name) {
     }
     const int idx = static_cast<int>(pass_names_.size());
     pass_names_.emplace_back(pass_name);
+    timeline_.reserve(static_cast<std::size_t>(idx), pass_name);
     return idx;
 }
 
-void GPUTimestampPool::write_begin(SDL_GPUCommandBuffer* /*cb*/, int /*pair_idx*/) {
-    // No-op until SDL3 exposes GPU timestamp queries.
+void GPUTimestampPool::write_begin(SDL_GPUCommandBuffer* /*cb*/, int pair_idx) {
+    // GPU-side: no-op until SDL3 exposes timestamp queries. CPU-side: this is
+    // the start of the pass's record window.
+    if (pair_idx >= 0) {
+        timeline_.begin_pass(static_cast<std::size_t>(pair_idx));
+    }
 }
 
-void GPUTimestampPool::write_end(SDL_GPUCommandBuffer* /*cb*/, int /*pair_idx*/) {
-    // No-op until SDL3 exposes GPU timestamp queries.
+void GPUTimestampPool::write_end(SDL_GPUCommandBuffer* /*cb*/, int pair_idx) {
+    if (pair_idx >= 0) {
+        timeline_.end_pass(static_cast<std::size_t>(pair_idx));
+    }
 }
 
-void GPUTimestampPool::read_results(std::vector<std::pair<std::string, float>>& ms_out) {
-    ms_out.clear();
-    ms_out.reserve(pass_names_.size());
-    for (const char* name : pass_names_) {
-        ms_out.emplace_back(name, 0.0f);
+void GPUTimestampPool::read_results(std::vector<PassTiming>& out) {
+    out.clear();
+    out.reserve(pass_names_.size());
+    for (std::size_t i = 0; i < pass_names_.size(); ++i) {
+        PassTiming t;
+        t.name = pass_names_[i]; // literal owned by the call site — view is safe
+        if (timeline_.has_sample(i)) {
+            t.cpu_ms = timeline_.pass_ms(i);
+        }
+        // t.gpu_ms stays nullopt while supported_ is false, which is always
+        // today. When SDL grows a timestamp API, fill it here.
+        out.push_back(t);
     }
 }
 
 void GPUTimestampPool::begin_frame() {
     pass_names_.clear();
+    timeline_.begin_frame();
 }
 
 void GPUTimestampPool::end_frame(SDL_GPUCommandBuffer* /*cb*/) {

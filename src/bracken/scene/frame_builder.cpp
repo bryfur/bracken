@@ -2,6 +2,7 @@
 
 #include "bracken/animation/animation_types.hpp" // MAX_BONES (the one authoritative definition)
 #include "bracken/core/assert.hpp"
+#include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 
 #include <algorithm>
@@ -224,6 +225,20 @@ void FrameBuilder::seal() {
     pkt.effect_spawns_ = merge_chain(&Lane::effect_spawns_);
     pkt.ui_commands_ = merge_chain(&Lane::ui_);
 
+    // One summary line per frame for everything the fill refused, throttled
+    // so a host with a standing bug does not drown its own log at 60 Hz. The
+    // counts are aggregated (FramePacket::BuildDiagnostics) precisely because
+    // the per-occurrence form was N identical lines per frame.
+    const FramePacket::BuildDiagnostics build_diag = pkt.build_diagnostics();
+    if (build_diag.any()) {
+        BRACKEN_LOG_WARN_THROTTLED(
+            5.0, "scene",
+            "frame {}: dropped {} draw(s) with an invalid ModelHandle, {} skinned draw(s) with an invalid bone "
+            "palette id, and refused {} palette allocation(s) over the {}-palette frame budget",
+            pkt.frame_index_, build_diag.draws_dropped_invalid_handle, build_diag.skinned_dropped_invalid_palette,
+            build_diag.palettes_over_budget, FramePacket::MAX_BONE_PALETTES);
+    }
+
     // Filling → Sealed: THE payload publish edge (see FramePacket::state_).
     pkt.state_.store(FramePacket::State::Sealed, std::memory_order_release);
     sealed_ = true;
@@ -267,14 +282,27 @@ std::string_view FrameBuilder::Lane::store_text(std::string_view text) {
 void FrameBuilder::Lane::draw_model(bracken::ModelHandle handle, const glm::mat4& transform, const glm::vec4& tint,
                                     bool force_non_instanced, bool no_fog, uint32_t motion_id) {
     assert_filling();
+    // Validate at EMIT time, the same treatment draw_skinned gives palettes:
+    // a command carrying INVALID_MODEL_HANDLE can never draw, and catching it
+    // here attributes the mistake to the frame that made it instead of to a
+    // render pass three stages downstream. Counted, not logged per call — see
+    // FramePacket::BuildDiagnostics; seal() prints the summary.
+    if (handle == bracken::INVALID_MODEL_HANDLE) {
+        packet_->count_drop_invalid_handle();
+        return;
+    }
     new (push_slot(models_)) ModelDrawCommand{handle, motion_id, transform, tint, force_non_instanced, no_fog};
 }
 
 void FrameBuilder::Lane::draw_skinned(bracken::ModelHandle handle, const glm::mat4& transform, BonePaletteId palette,
                                       const glm::vec4& tint, bool no_fog, uint32_t motion_id) {
     assert_filling();
+    if (handle == bracken::INVALID_MODEL_HANDLE) {
+        packet_->count_drop_invalid_handle();
+        return;
+    }
     if (!palette.valid()) {
-        BRACKEN_LOG_WARN("scene", "draw_skinned dropped: invalid bone palette id (allocation over budget?)");
+        packet_->count_drop_invalid_palette();
         return;
     }
     new (push_slot(skinned_)) SkinnedDrawCommand{handle, motion_id, transform, tint, palette, no_fog};
@@ -287,9 +315,11 @@ FrameBuilder::BonePaletteAllocation FrameBuilder::Lane::alloc_bone_palette(uint3
                    bracken::animation::MAX_BONES);
     if (!packet_->take_palette_slot()) {
         // Build-time budget failure — visible here instead of a silent
-        // render-time drop (docs/multithreading_plan.md §4.2).
-        BRACKEN_LOG_ERROR("scene", "alloc_bone_palette: frame palette budget ({}) exhausted; draw will be dropped",
-                          FramePacket::MAX_BONE_PALETTES);
+        // render-time drop (docs/multithreading_plan.md §4.2). Counted rather
+        // than logged per call: a host that overruns the budget overruns it
+        // for hundreds of draws per frame, and N identical lines at 60 Hz
+        // bury the one line that says what the budget is. seal() summarizes.
+        packet_->count_drop_palette_budget();
         return {};
     }
     auto* matrices =

@@ -495,6 +495,10 @@ const RenderStats& Application::render_stats() const {
     return scene_renderer_->render_stats();
 }
 
+const FrameDiagnostics& Application::frame_diagnostics() const {
+    return scene_renderer_->frame_diagnostics();
+}
+
 std::string Application::gpu_driver_name() const {
     return context_->device().driver_name();
 }

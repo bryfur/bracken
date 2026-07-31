@@ -3,6 +3,7 @@
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
+#include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
@@ -482,7 +483,8 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
         return;
     }
     if (!material_array_texture_ || !splatmap_texture_ || !material_sampler_) {
-        BRACKEN_LOG_WARN(LOG_TAG, "TerrainRenderer::render: Terrain textures/sampler not ready, skipping");
+        // Once: same standing condition, evaluated every frame at 60 Hz.
+        BRACKEN_LOG_WARN_ONCE(LOG_TAG, "TerrainRenderer::render: Terrain textures/sampler not ready, skipping");
         return;
     }
 

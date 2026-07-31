@@ -5,6 +5,7 @@
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/core/color.hpp"
+#include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "glm/ext/matrix_clip_space.hpp"
@@ -238,8 +239,9 @@ void UIRenderer::reserve_gpu_capacity() {
     }
 
     const size_t capacity_vertices = vertex_buffer_->size() / sizeof(UIVertex);
-    BRACKEN_LOG_WARN(LOG_TAG, "Failed to grow UI vertex buffer to {} bytes - truncating batch from {} to {} vertices",
-                     new_bytes, vertex_batch_.size(), capacity_vertices);
+    BRACKEN_LOG_WARN_THROTTLED(5.0, LOG_TAG,
+                               "Failed to grow UI vertex buffer to {} bytes - truncating batch from {} to {} vertices",
+                               new_bytes, vertex_batch_.size(), capacity_vertices);
     truncate_batch(capacity_vertices);
 }
 
@@ -304,7 +306,9 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
     }
 
     if (!ui_pipeline) {
-        BRACKEN_LOG_WARN(LOG_TAG, "UIRenderer::execute: UI pipeline not available, skipping UI draw");
+        // Once: a missing pipeline is a boot-time fact, not an event; it will
+        // be missing for every frame of the process's life.
+        BRACKEN_LOG_WARN_ONCE(LOG_TAG, "UIRenderer::execute: UI pipeline not available, skipping UI draw");
         SDL_EndGPURenderPass(render_pass);
         vertex_batch_.clear();
         draw_ranges_.clear();

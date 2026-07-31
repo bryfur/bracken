@@ -1,9 +1,10 @@
 #pragma once
 
+#include "bracken/core/pass_timeline.hpp"
+#include "bracken/render_stats.hpp" // PassTiming
+
 #include <cstddef>
 #include <SDL3/SDL_gpu.h>
-#include <string>
-#include <utility>
 #include <vector>
 
 namespace bracken::gpu {
@@ -29,9 +30,16 @@ inline void insert_debug_label(SDL_GPUCommandBuffer* cb, const char* name) noexc
     }
 }
 
-// SDL3 GPU does not yet expose per-pass timestamp queries (as of SDL 3.2).
-// This pool preserves the intended API so callers stay identical once SDL adds support;
-// read_results currently returns zeroed durations but correct pass names.
+// Per-pass timing for BRACKEN_GPU_TIMER scopes.
+//
+// TWO clocks, one API. The CPU clock is real: every scope is wall-clock timed
+// through core::PassTimeline, so all BRACKEN_GPU_TIMER sites report the cost
+// of RECORDING their pass with no call-site change. The GPU clock does not
+// exist — SDL3 exposes no timestamp query API (as of SDL 3.2), so
+// is_supported() is false, write_begin/write_end are no-ops, and read_results
+// reports PassTiming::gpu_ms as nullopt. That nullopt is the point: the old
+// API returned 0.0 ms, which reads as "this pass is free" rather than "this
+// number does not exist". For real GPU-side cost use RenderDoc/Nsight.
 class GPUTimestampPool {
 public:
     [[nodiscard]] bool init(GPUDevice& device, size_t pair_count);
@@ -45,7 +53,9 @@ public:
     void write_begin(SDL_GPUCommandBuffer* cb, int pair_idx);
     void write_end(SDL_GPUCommandBuffer* cb, int pair_idx);
 
-    void read_results(std::vector<std::pair<std::string, float>>& ms_out);
+    // Fill `out` with one entry per pass reserved this frame, in reservation
+    // order: cpu_ms always present, gpu_ms present only if is_supported().
+    void read_results(std::vector<PassTiming>& out);
 
     void begin_frame();
     void end_frame(SDL_GPUCommandBuffer* cb);
@@ -56,6 +66,7 @@ private:
     bool supported_ = false;
     size_t capacity_ = 0;
     std::vector<const char*> pass_names_; // interned literals, cleared per frame
+    core::PassTimeline timeline_;         // CPU record-time clock (always live)
 };
 
 class GPUTimerScope {

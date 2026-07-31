@@ -51,8 +51,8 @@ struct CpuOnlyClusterGrid {
              const std::vector<SpotLight>& spots) {
         // begin_frame() doesn't touch GPU buffers - safe even without init().
         g.begin_frame(cam, w, h, n, f);
-        for (const auto& p : points) g.add_point_light(p);
-        for (const auto& s : spots) g.add_spot_light(s);
+        for (const auto& p : points) (void)g.add_point_light(p);
+        for (const auto& s : spots) (void)g.add_spot_light(s);
         g.build();
     }
 };
@@ -187,7 +187,7 @@ TEST(ClusterGrid, LightLimitTruncatesPastMaxLights) {
         p.radius = 0.5f;
         p.color = glm::vec3(1.0f);
         p.intensity = 1.0f;
-        cg.g.add_point_light(p);
+        (void)cg.g.add_point_light(p);
     }
     cg.g.build();
     EXPECT_EQ(cg.g.total_lights(), MAX_LIGHTS);
@@ -420,8 +420,8 @@ void run_frames(bracken::core::jobs::JobSystem& js, ClusterGrid& g, const Camera
                 const std::vector<PointLight>& points, const std::vector<SpotLight>& spots) {
     for (int frame = 0; frame < 2; ++frame) {
         g.begin_frame(js, cam, 1920, 1080, 0.1f, 100.0f);
-        for (const auto& p : points) g.add_point_light(p);
-        for (const auto& s : spots) g.add_spot_light(s);
+        for (const auto& p : points) (void)g.add_point_light(p);
+        for (const auto& s : spots) (void)g.add_spot_light(s);
         g.build(js);
     }
 }

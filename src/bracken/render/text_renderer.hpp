@@ -262,7 +262,6 @@ private:
     int dirty_y1_ = 0;
 
     uint64_t current_frame_ = 0;
-    bool batch_full_warned_ = false; // throttles the quad-budget warning per frame
 
     // Batched text rendering data
     std::vector<TextRun> queued_runs_;

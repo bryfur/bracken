@@ -122,7 +122,9 @@ public:
      */
     class alignas(bracken::core::jobs::k_cache_line) Lane {
     public:
-        /** Mirror of RenderScene::add_model — static model draw. */
+        /** Mirror of RenderScene::add_model — static model draw. An
+         *  INVALID_MODEL_HANDLE drops the draw at emit time and is counted in
+         *  FramePacket::build_diagnostics() (summarized once at seal). */
         void draw_model(bracken::ModelHandle handle, const glm::mat4& transform,
                         const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, bool force_non_instanced = false,
                         bool no_fog = false, uint32_t motion_id = 0);
@@ -130,8 +132,9 @@ public:
         /**
          * Skinned model draw referencing a packet palette (see
          * alloc_bone_palette). The id may come from any lane, provided its
-         * allocation happened-before this call. Invalid ids (over-budget
-         * allocations) drop the draw with a warning.
+         * allocation happened-before this call. An invalid handle or an
+         * invalid id (over-budget allocation) drops the draw at emit time and
+         * is counted in FramePacket::build_diagnostics().
          */
         void draw_skinned(bracken::ModelHandle handle, const glm::mat4& transform, BonePaletteId palette,
                           const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, bool no_fog = false,
@@ -141,9 +144,11 @@ public:
          * Allocate a bone palette in packet memory: joint_count matrices
          * (1..=animation::MAX_BONES), 16-byte aligned, uninitialized — write
          * every matrix before seal. Budget: FramePacket::MAX_BONE_PALETTES
-         * per frame; over-budget allocations log an error and return an
-         * invalid allocation (empty span) — this is the visible build-time
-         * failure that replaces the old render-time drop. Share one palette
+         * per frame; over-budget allocations return an invalid allocation
+         * (empty span) and are counted in FramePacket::build_diagnostics(),
+         * which seal() summarizes in one throttled line — this is the visible
+         * build-time failure that replaces the old render-time drop and the
+         * old per-call log spam. Share one palette
          * across many draws by reusing the id (replaces the renderer's
          * pointer-dedupe of identity palettes).
          */

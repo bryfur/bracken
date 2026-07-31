@@ -163,6 +163,27 @@ struct Model {
     }
 };
 
+/**
+ * What a .glb load quietly could not use.
+ *
+ * glTF animation channels that target a node outside the skin, use a path
+ * other than translation/rotation/scale (i.e. morph-target `weights`), or
+ * name an out-of-range sampler are dropped by the loader. Each drop is
+ * legitimate; dropping them ALL in silence is not, because the visible
+ * symptom is "my animation does nothing" with no explanation anywhere. The
+ * loader counts them and logs one summary per model.
+ */
+struct ModelLoadReport {
+    uint32_t channels_non_skin_node = 0;
+    uint32_t channels_non_trs_path = 0;
+    uint32_t channels_bad_sampler = 0;
+
+    [[nodiscard]] uint32_t total() const {
+        return channels_non_skin_node + channels_non_trs_path + channels_bad_sampler;
+    }
+    [[nodiscard]] bool any() const { return total() != 0; }
+};
+
 class ModelLoader {
 public:
     /// Parse a .glb into `model`. Pure CPU work on caller-owned data — no

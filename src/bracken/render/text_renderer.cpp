@@ -4,6 +4,7 @@
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_pipeline.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
+#include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "glm/ext/matrix_float4x4.hpp"
@@ -171,7 +172,6 @@ void TextRenderer::release_pending_resources() {
         return;
     }
     current_frame_++;
-    batch_full_warned_ = false;
 }
 
 void TextRenderer::mark_dirty_rows(int y0, int y1) {
@@ -200,8 +200,12 @@ void TextRenderer::blit_glyph_to_atlas(const SDL_Surface* rgba, int x, int y) {
 }
 
 void TextRenderer::evict_all_glyphs() {
-    BRACKEN_LOG_WARN("text", "Glyph atlas overflow ({} glyphs) - evicting all; text may glitch for one frame",
-                    glyphs_.size());
+    // Throttled, not once: an atlas that keeps overflowing is a live problem
+    // (the text glitches every time), so silence after the first line would
+    // read as "fixed" — but at 60 Hz it is a log flood.
+    BRACKEN_LOG_WARN_THROTTLED(5.0, "text",
+                               "Glyph atlas overflow ({} glyphs) - evicting all; text may glitch for one frame",
+                               glyphs_.size());
     glyphs_.clear();
     packer_.reset();
     std::fill(atlas_pixels_.begin(), atlas_pixels_.end(), uint8_t{0});
@@ -345,11 +349,9 @@ size_t TextRenderer::build_string_quads(std::string_view text, float x, float y,
 
         if (glyph->has_bitmap) {
             if (out.size() + VERTICES_PER_QUAD * FLOATS_PER_VERTEX > max_floats) {
-                if (!batch_full_warned_) {
-                    BRACKEN_LOG_WARN("text", "Text quad budget ({}) exhausted - dropping glyphs this frame",
-                                    MAX_TEXT_QUADS);
-                    batch_full_warned_ = true;
-                }
+                BRACKEN_LOG_WARN_THROTTLED(5.0, "text",
+                                           "Text quad budget ({}) exhausted - dropping glyphs this frame",
+                                           MAX_TEXT_QUADS);
                 break;
             }
 
