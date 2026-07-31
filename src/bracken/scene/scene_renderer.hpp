@@ -390,6 +390,46 @@ public:
      */
     static void prep_copy_palettes(core::jobs::JobSystem& js, std::span<const BonePalette> palettes, glm::mat4* dst);
 
+    // ========== The instance-batch walk: ONE definition of the order ==========
+    /**
+     * Walk the frame's non-empty instance bins in PACKING order — ascending
+     * ModelHandle, with a running `base_instance` — and return the offset one
+     * past the last bin (what the shadow packer carries into the next
+     * cascade).
+     *
+     * upload_instance_buffers() packs the bins into the instance storage
+     * buffer in exactly this order, and three draw walks — forward
+     * (render_instanced_models), depth prepass (prepass_draw_instanced) and
+     * shadow (render_instanced_shadow_models) — index into that packed buffer
+     * with the same running offset. All four must agree exactly, and they now
+     * live in four different translation units, so the order has exactly one
+     * definition: this function.
+     *
+     * The subtle half is a bin whose handle no longer resolves to a Model. It
+     * was still PACKED — the pack loop never looks a model up — so a draw
+     * walk must skip the draw yet still ADVANCE past its range
+     * (for_each_drawable_instance_batch does exactly that). Getting it wrong
+     * makes every later bin render with another model's transforms, which is
+     * visible only in a scene carrying both an unresolvable handle and >= 2
+     * model types. Device-free and static so that contract is testable
+     * headless (scene/instance_batch_walk.test.cpp).
+     *
+     * fn(ModelHandle, const std::vector<Instance>&, uint32_t base_instance)
+     */
+    template <typename Instance, typename Fn>
+    static uint32_t for_each_instance_batch(const std::vector<std::vector<Instance>>& bins, uint32_t base_instance,
+                                            Fn&& fn) {
+        for (ModelHandle handle = 0; handle < bins.size(); ++handle) {
+            const std::vector<Instance>& instances = bins[handle];
+            if (instances.empty()) {
+                continue;
+            }
+            fn(handle, instances, base_instance);
+            base_instance += static_cast<uint32_t>(instances.size());
+        }
+        return base_instance;
+    }
+
 private:
     // Frame lifecycle
     void begin_frame();
@@ -415,6 +455,23 @@ private:
     void render_instanced_models(const CameraState& camera);
     void render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
                                         const glm::mat4& light_view_projection, int cascade);
+
+    // Drawing form of for_each_instance_batch (below): bins whose handle does
+    // not resolve to a Model are skipped but still consume their
+    // base_instance range — see the base walk's contract.
+    // fn(Model&, const std::vector<Instance>&, uint32_t base_instance)
+    template <typename Instance, typename Fn>
+    uint32_t for_each_drawable_instance_batch(const std::vector<std::vector<Instance>>& bins, uint32_t base_instance,
+                                              Fn&& fn) {
+        return for_each_instance_batch(
+            bins, base_instance, [&](ModelHandle handle, const std::vector<Instance>& instances, uint32_t base) {
+                Model* model = (handle != INVALID_MODEL_HANDLE) ? model_manager_->get_model(handle) : nullptr;
+                if (!model) {
+                    return; // dropped draw, but the range is still packed
+                }
+                fn(*model, instances, base);
+            });
+    }
 
     // Depth prepass: velocity (RG16F) + scene depth for every opaque
     // (alphaMode OPAQUE) draw, before the forward pass. Returns true when the
@@ -587,10 +644,28 @@ private:
     static constexpr uint32_t INVALID_PALETTE_OFFSET = 0xFFFFFFFFu;
     // Cull + depth variant currently bound for the model / skinned pipeline
     // families (only meaningful while that family is the active pipeline).
+    //
+    // ENTRY-ORDER DEPENDENCY (survey S16). These four are written ONLY by
+    // bind_model_pipeline / bind_skinned_pipeline and are never reset at a
+    // pass or frame boundary, so on their own they describe the last bind of
+    // any earlier pass. What makes them correct is that the first model /
+    // skinned draw of every frame enters through render_3d_scene, which binds
+    // unconditionally before the walk — after that the flags track the live
+    // pipeline. The readers (render_model_command_inner,
+    // render_skinned_model_command_inner) live in a different translation
+    // unit from the writers, where that coupling stops being visible, so the
+    // *_bound_ flags below turn it into a debug assertion instead of a
+    // comment. Resetting the variant flags themselves would change behaviour
+    // (an extra pipeline bind per frame) and is deliberately not done here.
     bool model_pipeline_double_sided_ = false;
     bool skinned_pipeline_double_sided_ = false;
     bool model_pipeline_depth_equal_ = false;
     bool skinned_pipeline_depth_equal_ = false;
+    // Diagnostic only (asserted, never branched on): a model / skinned
+    // pipeline bind has happened since render_3d_scene cleared these at the
+    // top of the pass, i.e. the variant flags above describe THIS pass.
+    bool model_pipeline_bound_ = false;
+    bool skinned_pipeline_bound_ = false;
 
     // ========== Bone Palettes ==========
     // Bone palettes live in the FramePacket (allocated by the host through

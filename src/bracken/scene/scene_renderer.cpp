@@ -1407,6 +1407,13 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
     // the skybox; drop anything stale from an aborted previous pass.
     transparent_draws_.clear();
 
+    // The model/skinned pipeline-variant flags describe the last bind of THIS
+    // pass only (survey S16 — see their declaration). This is the pass entry
+    // point, so nothing is bound yet; the walks below bind unconditionally
+    // before their first draw, and the readers assert it.
+    model_pipeline_bound_ = false;
+    skinned_pipeline_bound_ = false;
+
     // Prepare shadow bindings for terrain/grass: the atlas bound twice —
     // comparison sampler (hardware PCF) then raw sampler (PCSS blocker search).
     SDL_GPUTextureSamplerBinding shadow_bindings[2] = {};
@@ -1563,6 +1570,7 @@ bool SceneRenderer::bind_model_pipeline(bool double_sided, bool depth_equal) {
     bind_local_shadow_atlas(10);
     model_pipeline_double_sided_ = double_sided;
     model_pipeline_depth_equal_ = depth_equal;
+    model_pipeline_bound_ = true;
     return true;
 }
 
@@ -1592,6 +1600,7 @@ bool SceneRenderer::bind_skinned_pipeline(bool double_sided, bool depth_equal) {
     SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);
     skinned_pipeline_double_sided_ = double_sided;
     skinned_pipeline_depth_equal_ = depth_equal;
+    skinned_pipeline_bound_ = true;
     return true;
 }
 
@@ -1718,6 +1727,14 @@ void SceneRenderer::render_model_command_inner(const ModelDrawCommand& cmd, cons
     lighting_uniforms.tintColor = cmd.tint;
 
     SDL_PushGPUVertexUniformData(gpu_cmd, 0, &transform_uniforms, sizeof(transform_uniforms));
+
+    // The variant comparison below is only meaningful if a model-family bind
+    // happened in this pass (survey S16, entry-order dependency documented at
+    // the flags' declaration). Every caller binds first; assert it rather
+    // than trust a comment in another translation unit.
+    BRACKEN_ASSERT(model_pipeline_bound_,
+                   "render_model_command_inner: no model pipeline bound in this pass — the cull/depth variant "
+                   "flags describe an earlier pass's bind");
 
     // Per-section stats partial, merged into render_stats_ once at the end
     // (per-chunk merge discipline — see FrameStatsPartial in render_stats.hpp).
@@ -2154,13 +2171,12 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
             // the data instead of bin -> pack scratch -> transfer buffer).
             if (gpu::GPUBuffer::Mapping mapping = instance_storage_buffer_->map()) {
                 auto* dst = static_cast<gpu::InstanceData*>(mapping.data());
-                for (const auto& instances : instance_batches_) {
-                    if (instances.empty()) {
-                        continue;
-                    }
-                    std::memcpy(dst, instances.data(), instances.size() * sizeof(gpu::InstanceData));
-                    dst += instances.size();
-                }
+                (void)for_each_instance_batch(
+                    instance_batches_, 0,
+                    [&](ModelHandle, const std::vector<gpu::InstanceData>& instances, uint32_t) {
+                        std::memcpy(dst, instances.data(), instances.size() * sizeof(gpu::InstanceData));
+                        dst += instances.size();
+                    });
                 mapping.upload(copy_pass, required_size);
             }
         }
@@ -2197,14 +2213,12 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
             uint32_t packed = 0;
             for (int c = 0; c < MAX_SHADOW_CASCADES; ++c) {
                 shadow_cascade_base_instance_[c] = packed;
-                for (const auto& instances : shadow_instance_batches_[c]) {
-                    if (instances.empty()) {
-                        continue;
-                    }
-                    std::memcpy(dst, instances.data(), instances.size() * sizeof(gpu::ShadowInstanceData));
-                    dst += instances.size();
-                    packed += static_cast<uint32_t>(instances.size());
-                }
+                packed = for_each_instance_batch(
+                    shadow_instance_batches_[c], packed,
+                    [&](ModelHandle, const std::vector<gpu::ShadowInstanceData>& instances, uint32_t) {
+                        std::memcpy(dst, instances.data(), instances.size() * sizeof(gpu::ShadowInstanceData));
+                        dst += instances.size();
+                    });
             }
             mapping.upload(copy_pass, required_size);
         }
@@ -2494,74 +2508,63 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
         return true;
     };
 
-    // Draw each model type as a single instanced draw call per mesh.
-    // Ascending handle order matches the packing order in upload_instance_buffers.
+    // Draw each model type as a single instanced draw call per mesh, walking
+    // the bins in the one packing order (for_each_drawable_instance_batch).
     // Draw stats accumulate into a section-local partial, merged once after
     // the walk (per-chunk merge discipline — see FrameStatsPartial).
     FrameStatsPartial stats_partial;
-    uint32_t base_instance = 0;
-    for (ModelHandle batch_handle = 0; batch_handle < instance_batches_.size(); ++batch_handle) {
-        const auto& instances = instance_batches_[batch_handle];
-        if (instances.empty()) {
-            continue;
-        }
+    (void)for_each_drawable_instance_batch(
+        instance_batches_, 0,
+        [&](Model& model, const std::vector<gpu::InstanceData>& instances, uint32_t base_instance) {
+            const uint32_t instance_count = static_cast<uint32_t>(instances.size());
 
-        Model* model = (batch_handle != INVALID_MODEL_HANDLE) ? model_manager_->get_model(batch_handle) : nullptr;
-        if (!model) {
-            base_instance += static_cast<uint32_t>(instances.size());
-            continue;
-        }
-
-        uint32_t instance_count = static_cast<uint32_t>(instances.size());
-
-        for (auto& mesh : model->meshes) {
-            if (mesh.shadow_only) {
-                continue;
-            }
-            BRACKEN_ASSERT(mesh.uploaded, "Mesh not uploaded before instanced render");
-            if (!mesh.uploaded) {
-                continue;
-            }
-            if (!mesh.vertex_buffer || !mesh.index_buffer || mesh.index_count() == 0) {
-                continue;
-            }
-
-            // glTF alphaMode BLEND: one instanced draw can't be depth-sorted
-            // per instance, so route each instance through the sorted
-            // per-draw transparent path instead.
-            if (mesh.material.alpha_mode == AlphaMode::Blend) {
-                for (const auto& inst : instances) {
-                    queue_transparent_mesh(mesh, inst.model, inst.normalMatrix, inst.tint, inst.noFog > 0.5f,
-                                           INVALID_PALETTE_OFFSET, *model, camera);
+            for (auto& mesh : model.meshes) {
+                if (mesh.shadow_only) {
+                    continue;
                 }
-                continue;
+                BRACKEN_ASSERT(mesh.uploaded, "Mesh not uploaded before instanced render");
+                if (!mesh.uploaded) {
+                    continue;
+                }
+                if (!mesh.vertex_buffer || !mesh.index_buffer || mesh.index_count() == 0) {
+                    continue;
+                }
+
+                // glTF alphaMode BLEND: one instanced draw can't be depth-sorted
+                // per instance, so route each instance through the sorted
+                // per-draw transparent path instead.
+                if (mesh.material.alpha_mode == AlphaMode::Blend) {
+                    for (const auto& inst : instances) {
+                        queue_transparent_mesh(mesh, inst.model, inst.normalMatrix, inst.tint, inst.noFog > 0.5f,
+                                               INVALID_PALETTE_OFFSET, model, camera);
+                    }
+                    continue;
+                }
+
+                const bool wants_equal = frame_prepass_active_ && mesh.material.alpha_mode == AlphaMode::Opaque;
+                if (!ensure_pipeline(select_type(mesh.material.double_sided, wants_equal))) {
+                    continue;
+                }
+
+                apply_mesh_material(lighting_uniforms, mesh);
+                if (!lighting_pushed ||
+                    std::memcmp(&last_pushed, &lighting_uniforms, sizeof(lighting_uniforms)) != 0) {
+                    SDL_PushGPUFragmentUniformData(gpu_cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));
+                    last_pushed = lighting_uniforms;
+                    lighting_pushed = true;
+                }
+
+                bind_mesh_material_textures(mesh);
+
+                mesh.bind_buffers(main_render_pass_);
+                if (collect_stats_) {
+                    stats_partial.draw_calls++;
+                    stats_partial.triangle_count += mesh.index_count() / 3 * instance_count;
+                }
+                SDL_DrawGPUIndexedPrimitives(main_render_pass_, mesh.index_count(), instance_count, 0, 0,
+                                             base_instance);
             }
-
-            const bool wants_equal = frame_prepass_active_ && mesh.material.alpha_mode == AlphaMode::Opaque;
-            if (!ensure_pipeline(select_type(mesh.material.double_sided, wants_equal))) {
-                continue;
-            }
-
-            apply_mesh_material(lighting_uniforms, mesh);
-            if (!lighting_pushed ||
-                std::memcmp(&last_pushed, &lighting_uniforms, sizeof(lighting_uniforms)) != 0) {
-                SDL_PushGPUFragmentUniformData(gpu_cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));
-                last_pushed = lighting_uniforms;
-                lighting_pushed = true;
-            }
-
-            bind_mesh_material_textures(mesh);
-
-            mesh.bind_buffers(main_render_pass_);
-            if (collect_stats_) {
-                stats_partial.draw_calls++;
-                stats_partial.triangle_count += mesh.index_count() / 3 * instance_count;
-            }
-            SDL_DrawGPUIndexedPrimitives(main_render_pass_, mesh.index_count(), instance_count, 0, 0, base_instance);
-        }
-
-        base_instance += instance_count;
-    }
+        });
     stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
@@ -2663,61 +2666,50 @@ void SceneRenderer::prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUComma
                                                  : gpu::PipelineType::DepthPrepassInstancedModel);
     };
 
-    // Ascending handle order matches the packing order in upload_instance_buffers.
-    // Draw stats accumulate into a section-local partial, merged once after
-    // the walk (per-chunk merge discipline — see FrameStatsPartial).
+    // Same packing order as upload_instance_buffers / the forward walk
+    // (for_each_drawable_instance_batch). Draw stats accumulate into a
+    // section-local partial, merged once after the walk (per-chunk merge
+    // discipline — see FrameStatsPartial).
     FrameStatsPartial stats_partial;
-    uint32_t base_instance = 0;
-    for (ModelHandle batch_handle = 0; batch_handle < instance_batches_.size(); ++batch_handle) {
-        const auto& instances = instance_batches_[batch_handle];
-        if (instances.empty()) {
-            continue;
-        }
+    (void)for_each_drawable_instance_batch(
+        instance_batches_, 0,
+        [&](Model& model, const std::vector<gpu::InstanceData>& instances, uint32_t base_instance) {
+            const uint32_t instance_count = static_cast<uint32_t>(instances.size());
 
-        Model* model = (batch_handle != INVALID_MODEL_HANDLE) ? model_manager_->get_model(batch_handle) : nullptr;
-        if (!model) {
-            base_instance += static_cast<uint32_t>(instances.size());
-            continue;
-        }
-
-        const uint32_t instance_count = static_cast<uint32_t>(instances.size());
-
-        for (auto& mesh : model->meshes) {
-            if (mesh.shadow_only || !mesh.uploaded || !mesh.vertex_buffer || !mesh.index_buffer ||
-                mesh.index_count() == 0) {
-                continue;
-            }
-            // BLEND writes no depth; MASK goes through the alpha-tested
-            // masked variant so foliage participates in GTAO + velocity.
-            if (mesh.material.alpha_mode == AlphaMode::Blend) {
-                continue;
-            }
-            if (mesh.material.alpha_mode == AlphaMode::Mask) {
-                if (!ensure_pipeline_type(gpu::PipelineType::DepthPrepassInstancedModelMasked)) {
+            for (auto& mesh : model.meshes) {
+                if (mesh.shadow_only || !mesh.uploaded || !mesh.vertex_buffer || !mesh.index_buffer ||
+                    mesh.index_count() == 0) {
                     continue;
                 }
-                SDL_GPUTextureSamplerBinding tex_binding = {
-                    (mesh.has_texture && mesh.texture) ? mesh.texture->handle()
-                                                       : dummy_white_texture_->handle(),
-                    default_sampler_};
-                SDL_BindGPUFragmentSamplers(pass, 0, &tex_binding, 1);
-                gpu::PrepassMaskedUniforms masked = {};
-                masked.alphaCutoff = mesh.material.alpha_cutoff;
-                SDL_PushGPUFragmentUniformData(cmd, 0, &masked, sizeof(masked));
-            } else if (!ensure_pipeline(mesh.material.double_sided)) {
-                continue;
-            }
+                // BLEND writes no depth; MASK goes through the alpha-tested
+                // masked variant so foliage participates in GTAO + velocity.
+                if (mesh.material.alpha_mode == AlphaMode::Blend) {
+                    continue;
+                }
+                if (mesh.material.alpha_mode == AlphaMode::Mask) {
+                    if (!ensure_pipeline_type(gpu::PipelineType::DepthPrepassInstancedModelMasked)) {
+                        continue;
+                    }
+                    SDL_GPUTextureSamplerBinding tex_binding = {
+                        (mesh.has_texture && mesh.texture) ? mesh.texture->handle()
+                                                           : dummy_white_texture_->handle(),
+                        default_sampler_};
+                    SDL_BindGPUFragmentSamplers(pass, 0, &tex_binding, 1);
+                    gpu::PrepassMaskedUniforms masked = {};
+                    masked.alphaCutoff = mesh.material.alpha_cutoff;
+                    SDL_PushGPUFragmentUniformData(cmd, 0, &masked, sizeof(masked));
+                } else if (!ensure_pipeline(mesh.material.double_sided)) {
+                    continue;
+                }
 
-            mesh.bind_buffers(pass);
-            if (collect_stats_) {
-                stats_partial.draw_calls++;
-                stats_partial.triangle_count += mesh.index_count() / 3 * instance_count;
+                mesh.bind_buffers(pass);
+                if (collect_stats_) {
+                    stats_partial.draw_calls++;
+                    stats_partial.triangle_count += mesh.index_count() / 3 * instance_count;
+                }
+                SDL_DrawGPUIndexedPrimitives(pass, mesh.index_count(), instance_count, 0, 0, base_instance);
             }
-            SDL_DrawGPUIndexedPrimitives(pass, mesh.index_count(), instance_count, 0, 0, base_instance);
-        }
-
-        base_instance += instance_count;
-    }
+        });
     stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
@@ -2912,68 +2904,57 @@ void SceneRenderer::render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_
     SDL_GPUTexture* last_tex = nullptr;
     int last_has_tex = -1;
 
-    // Ascending handle order matches the per-cascade packing order in upload_instance_buffers.
-    // Draw stats accumulate into a section-local partial, merged once after
-    // the walk (per-chunk merge discipline — see FrameStatsPartial).
+    // Same walk as the forward/prepass paths, seeded with this cascade's
+    // section offset (for_each_drawable_instance_batch). Draw stats
+    // accumulate into a section-local partial, merged once after the walk
+    // (per-chunk merge discipline — see FrameStatsPartial).
     FrameStatsPartial stats_partial;
-    uint32_t base_instance = shadow_cascade_base_instance_[cascade];
-    for (ModelHandle batch_handle = 0; batch_handle < cascade_batches.size(); ++batch_handle) {
-        const auto& instances = cascade_batches[batch_handle];
-        if (instances.empty()) {
-            continue;
-        }
+    (void)for_each_drawable_instance_batch(
+        cascade_batches, shadow_cascade_base_instance_[cascade],
+        [&](Model& model, const std::vector<gpu::ShadowInstanceData>& instances, uint32_t base_instance) {
+            const uint32_t instance_count = static_cast<uint32_t>(instances.size());
 
-        Model* model = (batch_handle != INVALID_MODEL_HANDLE) ? model_manager_->get_model(batch_handle) : nullptr;
-        if (!model) {
-            base_instance += static_cast<uint32_t>(instances.size());
-            continue;
-        }
-
-        uint32_t instance_count = static_cast<uint32_t>(instances.size());
-
-        for (auto& mesh : model->meshes) {
-            if (!mesh.cast_shadows) {
-                continue; // skip leaves / transparent fluff
-            }
-            BRACKEN_ASSERT(mesh.uploaded, "Mesh not uploaded before instanced shadow render");
-            if (!mesh.uploaded) {
-                continue;
-            }
-            if (!mesh.vertex_buffer || !mesh.index_buffer || mesh.index_count() == 0) {
-                continue;
-            }
-
-            int has_tex = (mesh.has_texture && mesh.texture) ? 1 : 0;
-            if (has_tex != last_has_tex) {
-                gpu::ShadowFragUniforms shadow_frag = {};
-                shadow_frag.hasTexture = has_tex;
-                SDL_PushGPUFragmentUniformData(cmd, 0, &shadow_frag, sizeof(shadow_frag));
-                last_has_tex = has_tex;
-            }
-
-            if (has_tex && default_sampler_) {
-                SDL_GPUTexture* th = mesh.texture->handle();
-                if (th != last_tex) {
-                    SDL_GPUTextureSamplerBinding tb = {th, default_sampler_};
-                    SDL_BindGPUFragmentSamplers(pass, 0, &tb, 1);
-                    last_tex = th;
+            for (auto& mesh : model.meshes) {
+                if (!mesh.cast_shadows) {
+                    continue; // skip leaves / transparent fluff
                 }
-            } else if (default_sampler_ && dummy_white_texture_ && last_tex != dummy_white_texture_->handle()) {
-                SDL_GPUTextureSamplerBinding dummy = {dummy_white_texture_->handle(), default_sampler_};
-                SDL_BindGPUFragmentSamplers(pass, 0, &dummy, 1);
-                last_tex = dummy_white_texture_->handle();
-            }
+                BRACKEN_ASSERT(mesh.uploaded, "Mesh not uploaded before instanced shadow render");
+                if (!mesh.uploaded) {
+                    continue;
+                }
+                if (!mesh.vertex_buffer || !mesh.index_buffer || mesh.index_count() == 0) {
+                    continue;
+                }
 
-            mesh.bind_buffers(pass);
-            if (collect_stats_) {
-                stats_partial.draw_calls++;
-                stats_partial.triangle_count += mesh.index_count() / 3 * instance_count;
-            }
-            SDL_DrawGPUIndexedPrimitives(pass, mesh.index_count(), instance_count, 0, 0, base_instance);
-        }
+                int has_tex = (mesh.has_texture && mesh.texture) ? 1 : 0;
+                if (has_tex != last_has_tex) {
+                    gpu::ShadowFragUniforms shadow_frag = {};
+                    shadow_frag.hasTexture = has_tex;
+                    SDL_PushGPUFragmentUniformData(cmd, 0, &shadow_frag, sizeof(shadow_frag));
+                    last_has_tex = has_tex;
+                }
 
-        base_instance += instance_count;
-    }
+                if (has_tex && default_sampler_) {
+                    SDL_GPUTexture* th = mesh.texture->handle();
+                    if (th != last_tex) {
+                        SDL_GPUTextureSamplerBinding tb = {th, default_sampler_};
+                        SDL_BindGPUFragmentSamplers(pass, 0, &tb, 1);
+                        last_tex = th;
+                    }
+                } else if (default_sampler_ && dummy_white_texture_ && last_tex != dummy_white_texture_->handle()) {
+                    SDL_GPUTextureSamplerBinding dummy = {dummy_white_texture_->handle(), default_sampler_};
+                    SDL_BindGPUFragmentSamplers(pass, 0, &dummy, 1);
+                    last_tex = dummy_white_texture_->handle();
+                }
+
+                mesh.bind_buffers(pass);
+                if (collect_stats_) {
+                    stats_partial.draw_calls++;
+                    stats_partial.triangle_count += mesh.index_count() / 3 * instance_count;
+                }
+                SDL_DrawGPUIndexedPrimitives(pass, mesh.index_count(), instance_count, 0, 0, base_instance);
+            }
+        });
     stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
@@ -3005,6 +2986,13 @@ void SceneRenderer::render_skinned_model_command_inner(const SkinnedDrawCommand&
     lighting_uniforms.tintColor = cmd.tint;
 
     SDL_PushGPUVertexUniformData(gpu_cmd, 0, &transform_uniforms, sizeof(transform_uniforms));
+
+    // Same entry-order dependency as the static path (survey S16): the
+    // skinned variant flags describe the last bind of THIS pass, and
+    // render_3d_scene binds before the first skinned draw.
+    BRACKEN_ASSERT(skinned_pipeline_bound_,
+                   "render_skinned_model_command_inner: no skinned pipeline bound in this pass — the cull/depth "
+                   "variant flags describe an earlier pass's bind");
 
     // Per-section stats partial, merged into render_stats_ once at the end
     // (per-chunk merge discipline — see FrameStatsPartial in render_stats.hpp).
