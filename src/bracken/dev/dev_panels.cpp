@@ -169,16 +169,16 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
     static const char* const SHADOW_MODES[] = {"Off", "PCF", "PCSS"};
     changed |= combo_enum("Shadows", settings.shadow_mode, SHADOW_MODES, 3);
     static const char* const CASCADE_COUNTS[] = {"1", "2", "3", "4"};
-    changed |= ImGui::Combo("Shadow cascades", &settings.shadow_cascades, CASCADE_COUNTS, 4);
+    changed |= combo_enum("Shadow cascades", settings.shadow_cascades, CASCADE_COUNTS, 4);
     static const char* const SHADOW_RESOLUTIONS[] = {"512", "1024", "2048", "4096"};
-    changed |= ImGui::Combo("Shadow resolution", &settings.shadow_resolution, SHADOW_RESOLUTIONS, 4);
+    changed |= combo_enum("Shadow resolution", settings.shadow_resolution, SHADOW_RESOLUTIONS, 4);
     changed |= ImGui::SliderFloat("Shadow distance", &settings.shadow_distance, 500.0f, 12000.0f, "%.0f",
                                   ImGuiSliderFlags_Logarithmic);
     changed |= ImGui::Checkbox("Local light shadows", &settings.local_shadows);
     changed |= ImGui::SliderInt("Shadowed point lights", &settings.local_shadow_point_budget, 0, 8);
     changed |= ImGui::SliderInt("Shadowed spot lights", &settings.local_shadow_spot_budget, 0, 16);
     static const char* const LOCAL_SHADOW_RESOLUTIONS[] = {"1024", "2048", "4096"};
-    changed |= ImGui::Combo("Local shadow atlas", &settings.local_shadow_resolution, LOCAL_SHADOW_RESOLUTIONS, 3);
+    changed |= combo_enum("Local shadow atlas", settings.local_shadow_resolution, LOCAL_SHADOW_RESOLUTIONS, 3);
     static const char* const AO_MODES[] = {"Off", "GTAO Half", "GTAO Full"};
     changed |= combo_enum("Ambient occlusion", settings.ao_mode, AO_MODES, 3);
     static const char* const AA_MODES[] = {"Off", "FXAA", "TAA"};
@@ -186,11 +186,11 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
     static const char* const TONEMAP_MODES[] = {"ACES (fitted)", "ACES (Narkowicz)", "Reinhard", "None"};
     changed |= combo_enum("Tonemap", settings.tonemap_mode, TONEMAP_MODES, 4);
     static const char* const ANISO_LEVELS[] = {"Off", "2x", "4x", "8x", "16x"};
-    changed |= ImGui::Combo("Anisotropic filter", &settings.anisotropic_filter, ANISO_LEVELS, 5);
+    changed |= combo_enum("Anisotropic filter", settings.anisotropic_filter, ANISO_LEVELS, 5);
     static const char* const VSYNC_MODES[] = {"Immediate", "VSync", "Mailbox"};
-    changed |= ImGui::Combo("VSync", &settings.vsync_mode, VSYNC_MODES, 3);
+    changed |= combo_enum("VSync", settings.vsync_mode, VSYNC_MODES, 3);
     static const char* const WINDOW_MODES[] = {"Windowed", "Borderless fullscreen", "Exclusive fullscreen"};
-    changed |= ImGui::Combo("Window mode", &settings.window_mode, WINDOW_MODES, 3);
+    changed |= combo_enum("Window mode", settings.window_mode, WINDOW_MODES, 3);
 
     ImGui::SeparatorText("Features");
     changed |= ImGui::Checkbox("Image-based lighting", &settings.ibl_enabled);
@@ -208,7 +208,7 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
 
     ImGui::SeparatorText("Culling");
     static const char* const DRAW_DISTANCES[] = {"500", "1000", "2000", "4000", "8000", "16000", "32000"};
-    changed |= ImGui::Combo("Draw distance", &settings.draw_distance, DRAW_DISTANCES, 7);
+    changed |= combo_enum("Draw distance", settings.draw_distance, DRAW_DISTANCES, 7);
 
     ImGui::SeparatorText("Tone & grading");
     changed |= ImGui::Checkbox("Auto exposure", &settings.auto_exposure);

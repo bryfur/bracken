@@ -194,15 +194,13 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
     }
 
     const GraphicsSettings& gfx = graphics_ ? *graphics_ : default_graphics_;
-    static constexpr int resolution_table[] = {512, 1024, 2048, 4096};
-    int shadow_res = resolution_table[std::clamp(gfx.shadow_resolution, 0, 3)];
-    shadow_map_->set_active_cascades(gfx.shadow_cascades + 1);
+    const int shadow_res = shadow_map_texels(gfx.shadow_resolution);
+    shadow_map_->set_active_cascades(cascade_count(gfx.shadow_cascades));
     if (!shadow_map_->init(context_->device(), shadow_res)) {
         std::cerr << "Warning: Failed to initialize shadow map (shadows disabled)" << '\n';
     }
 
-    static constexpr int local_shadow_resolution_table[] = {1024, 2048, 4096};
-    int local_shadow_res = local_shadow_resolution_table[std::clamp(gfx.local_shadow_resolution, 0, 2)];
+    const int local_shadow_res = local_shadow_atlas_texels(gfx.local_shadow_resolution);
     if (!local_shadows_->init(context_->device(), local_shadow_res)) {
         std::cerr << "Warning: Failed to initialize local shadow map (point/spot shadows disabled)" << '\n';
     }
@@ -369,9 +367,8 @@ void SceneRenderer::set_graphics_settings(const GraphicsSettings& settings) {
     // Apply shadow settings unconditionally, comparing against the shadow
     // map's current state, so saved settings take effect on the first call
     // at boot (reinit is a no-op before init since there's no device yet).
-    static constexpr int resolution_table[] = {512, 1024, 2048, 4096};
-    int new_res = resolution_table[std::clamp(settings.shadow_resolution, 0, 3)];
-    int new_cascades = settings.shadow_cascades + 1;
+    const int new_res = shadow_map_texels(settings.shadow_resolution);
+    const int new_cascades = cascade_count(settings.shadow_cascades);
 
     if (new_res != shadow_map_->resolution()) {
         shadow_map_->reinit(new_res);
@@ -382,8 +379,7 @@ void SceneRenderer::set_graphics_settings(const GraphicsSettings& settings) {
 
     // Local (point/spot) shadow atlas resolution — reinit drops every cached
     // tile, so lights re-render under the per-frame cap over the next frames.
-    static constexpr int local_shadow_resolution_table[] = {1024, 2048, 4096};
-    int new_local_res = local_shadow_resolution_table[std::clamp(settings.local_shadow_resolution, 0, 2)];
+    const int new_local_res = local_shadow_atlas_texels(settings.local_shadow_resolution);
     if (new_local_res != local_shadows_->atlas_resolution()) {
         local_shadows_->reinit(new_local_res);
     }

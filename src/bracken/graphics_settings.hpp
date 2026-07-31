@@ -40,6 +40,103 @@ enum class TonemapMode : int {
     None = 3,
 };
 
+// The enums below replace bare ints whose meaning lived in a trailing comment.
+// The failure mode that motivated them is invisible rather than loud: writing
+// `shadow_resolution = 2048` looks obviously right, silently clamps to 3, and
+// yields 4096; `shadow_cascades = 4` clamps to 3, which also happens to mean
+// four cascades. Naming the values makes both a compile error.
+
+/** Far-plane / culling distance in world units. */
+enum class DrawDistance : int {
+    D500 = 0,
+    D1000 = 1,
+    D2000 = 2,
+    D4000 = 3,
+    D8000 = 4,
+    D16000 = 5,
+    D32000 = 6,
+};
+
+/** Texture anisotropy. `X2` = 2x, and so on. */
+enum class AnisotropicFilter : int {
+    Off = 0,
+    X2 = 1,
+    X4 = 2,
+    X8 = 3,
+    X16 = 4,
+};
+
+/** Present mode. Clamped to the max the swapchain supports at apply time. */
+enum class VSyncMode : int {
+    Immediate = 0,
+    Vsync = 1,
+    Mailbox = 2,
+};
+
+/** Cascade count for the sun's CSM. Use cascade_count() for the actual number
+ *  — the enumerator values are indices, so `Four` is 3. */
+enum class ShadowCascades : int {
+    One = 0,
+    Two = 1,
+    Three = 2,
+    Four = 3,
+};
+
+/** Per-cascade shadow map edge length in texels. */
+enum class ShadowResolution : int {
+    R512 = 0,
+    R1024 = 1,
+    R2048 = 2,
+    R4096 = 3,
+};
+
+/** Edge length of the local (point/spot) shadow atlas in texels. */
+enum class LocalShadowResolution : int {
+    R1024 = 0,
+    R2048 = 1,
+    R4096 = 2,
+};
+
+enum class WindowMode : int {
+    Windowed = 0,
+    BorderlessFullscreen = 1,
+    ExclusiveFullscreen = 2,
+};
+
+/** Number of cascades, i.e. 1..4 — not the enumerator's index value. */
+[[nodiscard]] constexpr int cascade_count(ShadowCascades c) {
+    return std::clamp(static_cast<int>(c), 0, 3) + 1;
+}
+
+// The lookups below SATURATE rather than fall back to a default. The fields
+// are public and these enums are int-backed, so a corrupt settings file or a
+// static_cast can still present an out-of-range value; saturating keeps a
+// too-large value large and a too-small value small, which is the behavior
+// these accessors had when the fields were bare ints.
+/** Shadow map edge length in texels. */
+[[nodiscard]] constexpr int shadow_map_texels(ShadowResolution r) {
+    constexpr int table[] = {512, 1024, 2048, 4096};
+    return table[std::clamp(static_cast<int>(r), 0, 3)];
+}
+
+/** Local shadow atlas edge length in texels. */
+[[nodiscard]] constexpr int local_shadow_atlas_texels(LocalShadowResolution r) {
+    constexpr int table[] = {1024, 2048, 4096};
+    return table[std::clamp(static_cast<int>(r), 0, 2)];
+}
+
+/** Far distance in world units. */
+[[nodiscard]] constexpr float draw_distance_units(DrawDistance d) {
+    constexpr float table[] = {500.0f, 1000.0f, 2000.0f, 4000.0f, 8000.0f, 16000.0f, 32000.0f};
+    return table[std::clamp(static_cast<int>(d), 0, 6)];
+}
+
+/** Anisotropy as a sample-count multiplier (1, 2, 4, 8, 16). */
+[[nodiscard]] constexpr int anisotropy_samples(AnisotropicFilter f) {
+    constexpr int table[] = {1, 2, 4, 8, 16};
+    return table[std::clamp(static_cast<int>(f), 0, 4)];
+}
+
 struct GraphicsSettings {
     // Bumped when default semantics change (e.g. the wave-3 lighting model
     // retuned sun/ambient/exposure/bloom). Files saved without this key were
@@ -57,15 +154,15 @@ struct GraphicsSettings {
     bool show_debug_hud = false;
 
     // Culling settings
-    int draw_distance = 3; // 0=500, 1=1000, 2=2000, 3=4000, 4=8000, 5=16000, 6=32000
+    DrawDistance draw_distance = DrawDistance::D4000;
     bool frustum_culling = true;
 
     // Quality settings
-    int anisotropic_filter = 4;               // 0=off, 1=2x, 2=4x, 3=8x, 4=16x
-    int vsync_mode = 2;                       // 0=immediate, 1=vsync, 2=mailbox (clamped to max supported at apply)
+    AnisotropicFilter anisotropic_filter = AnisotropicFilter::X16;
+    VSyncMode vsync_mode = VSyncMode::Mailbox; // clamped to max supported at apply
     ShadowMode shadow_mode = ShadowMode::PCSS;
-    int shadow_cascades = 3;                  // 0=1, 1=2, 2=3, 3=4
-    int shadow_resolution = 2;                // 0=512, 1=1024, 2=2048, 3=4096
+    ShadowCascades shadow_cascades = ShadowCascades::Four;
+    ShadowResolution shadow_resolution = ShadowResolution::R2048;
     // Sun (CSM) shadow range in world units, additionally clamped by draw
     // distance at the use site; the shader fades shadows out over the last
     // 15% instead of popping. Texel density scales inversely — raising it
@@ -76,7 +173,7 @@ struct GraphicsSettings {
     bool local_shadows = true;                // master toggle for local-light shadows
     int local_shadow_point_budget = 4;        // shadowed point lights per frame (0-8)
     int local_shadow_spot_budget = 2;         // shadowed spot lights per frame (0-16)
-    int local_shadow_resolution = 1;          // atlas size: 0=1024, 1=2048, 2=4096
+    LocalShadowResolution local_shadow_resolution = LocalShadowResolution::R2048;
     AOMode ao_mode = AOMode::GTAO_Half;
     // TAA is the default for fresh settings; files that stored a mode keep it.
     AAMode aa_mode = AAMode::TAA;
@@ -86,7 +183,7 @@ struct GraphicsSettings {
     float bloom_strength = 0.25f;             // Bloom intensity (0.0 - 1.0)
     bool volumetric_fog = false;              // Atmospheric fog haze (expensive, off by default)
     bool god_rays = false;                    // Light shafts through shadows (requires volumetric_fog)
-    int window_mode = 0;                      // 0=windowed, 1=borderless fullscreen, 2=exclusive fullscreen
+    WindowMode window_mode = WindowMode::Windowed;
     int resolution_index = 0;                 // index into RenderContext::available_resolutions(); an index past
                                               // that list falls back to borderless at apply time (with a warning)
 
@@ -127,12 +224,7 @@ struct GraphicsSettings {
     // Volumetric fog
     float fog_density = 0.05f; // density multiplier
 
-    float get_draw_distance() const {
-        constexpr float distances[] = {500.0f, 1000.0f, 2000.0f, 4000.0f, 8000.0f, 16000.0f, 32000.0f};
-        // Clamped so a corrupt/hand-edited settings file can never index out
-        // of bounds (the field is also public, so hosts can set it directly).
-        return distances[std::clamp(draw_distance, 0, 6)];
-    }
+    float get_draw_distance() const { return draw_distance_units(draw_distance); }
 
     /**
      * Clamp every enum-like/index field to its valid range. Applied by load()

@@ -21,15 +21,15 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
     EXPECT_TRUE(s.grass_enabled);
     EXPECT_TRUE(s.skybox_enabled);
     EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);
-    EXPECT_EQ(s.shadow_cascades, 3);
+    EXPECT_EQ(s.shadow_cascades, ShadowCascades::Four);
     EXPECT_EQ(s.ao_mode, AOMode::GTAO_Half); // half-res GTAO on by default for fresh settings
     EXPECT_EQ(s.aa_mode, AAMode::TAA); // TAA on by default for fresh settings
-    EXPECT_EQ(s.vsync_mode, 2);
+    EXPECT_EQ(s.vsync_mode, VSyncMode::Mailbox);
     EXPECT_TRUE(s.ibl_enabled); // sky image-based lighting on by default
     EXPECT_TRUE(s.local_shadows); // point/spot light shadows on by default
     EXPECT_EQ(s.local_shadow_point_budget, 4);
     EXPECT_EQ(s.local_shadow_spot_budget, 2);
-    EXPECT_EQ(s.local_shadow_resolution, 1); // 2048 atlas
+    EXPECT_EQ(s.local_shadow_resolution, LocalShadowResolution::R2048); // 2048 atlas
     EXPECT_TRUE(s.bloom_enabled);
     EXPECT_FLOAT_EQ(s.bloom_strength, 0.25f);
     EXPECT_FLOAT_EQ(s.bloom_threshold, 1.1f);
@@ -49,13 +49,13 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
 
 TEST_F(GraphicsSettingsTest, GetDrawDistanceMapping) {
     GraphicsSettings s;
-    s.draw_distance = 0;
+    s.draw_distance = DrawDistance::D500;
     EXPECT_FLOAT_EQ(s.get_draw_distance(), 500.0f);
-    s.draw_distance = 1;
+    s.draw_distance = DrawDistance::D1000;
     EXPECT_FLOAT_EQ(s.get_draw_distance(), 1000.0f);
-    s.draw_distance = 3;
+    s.draw_distance = DrawDistance::D4000;
     EXPECT_FLOAT_EQ(s.get_draw_distance(), 4000.0f);
-    s.draw_distance = 6;
+    s.draw_distance = DrawDistance::D32000;
     EXPECT_FLOAT_EQ(s.get_draw_distance(), 32000.0f);
 }
 
@@ -82,25 +82,25 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     original.rocks_enabled = false;
     original.show_fps = true;
     original.show_debug_hud = true;
-    original.draw_distance = 5;
+    original.draw_distance = DrawDistance::D16000;
     original.frustum_culling = false;
     original.shadow_mode = ShadowMode::PCF;
-    original.shadow_cascades = 3;
-    original.shadow_resolution = 3;
+    original.shadow_cascades = ShadowCascades::Four;
+    original.shadow_resolution = ShadowResolution::R4096;
     original.shadow_distance = 6500.0f;
     original.ao_mode = AOMode::GTAO_Full;
     original.ibl_enabled = false;
     original.local_shadows = false;
     original.local_shadow_point_budget = 7;
     original.local_shadow_spot_budget = 5;
-    original.local_shadow_resolution = 2;
+    original.local_shadow_resolution = LocalShadowResolution::R4096;
     original.bloom_enabled = false;
     original.bloom_strength = 0.77f;
     original.volumetric_fog = true;
     original.god_rays = true;
-    original.vsync_mode = 1;
-    original.window_mode = 1;
-    original.anisotropic_filter = 3;
+    original.vsync_mode = VSyncMode::Vsync;
+    original.window_mode = WindowMode::BorderlessFullscreen;
+    original.anisotropic_filter = AnisotropicFilter::X8;
     original.aa_mode = AAMode::Off;
     original.auto_exposure = false;
     original.auto_exposure_min_ev = -2.0f;
@@ -120,25 +120,25 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     EXPECT_EQ(loaded.rocks_enabled, false);
     EXPECT_EQ(loaded.show_fps, true);
     EXPECT_EQ(loaded.show_debug_hud, true);
-    EXPECT_EQ(loaded.draw_distance, 5);
+    EXPECT_EQ(loaded.draw_distance, DrawDistance::D16000);
     EXPECT_EQ(loaded.frustum_culling, false);
     EXPECT_EQ(loaded.shadow_mode, ShadowMode::PCF);
-    EXPECT_EQ(loaded.shadow_cascades, 3);
-    EXPECT_EQ(loaded.shadow_resolution, 3);
+    EXPECT_EQ(loaded.shadow_cascades, ShadowCascades::Four);
+    EXPECT_EQ(loaded.shadow_resolution, ShadowResolution::R4096);
     EXPECT_NEAR(loaded.shadow_distance, 6500.0f, 0.5f);
     EXPECT_EQ(loaded.ao_mode, AOMode::GTAO_Full);
     EXPECT_EQ(loaded.ibl_enabled, false);
     EXPECT_EQ(loaded.local_shadows, false);
     EXPECT_EQ(loaded.local_shadow_point_budget, 7);
     EXPECT_EQ(loaded.local_shadow_spot_budget, 5);
-    EXPECT_EQ(loaded.local_shadow_resolution, 2);
+    EXPECT_EQ(loaded.local_shadow_resolution, LocalShadowResolution::R4096);
     EXPECT_EQ(loaded.bloom_enabled, false);
     EXPECT_NEAR(loaded.bloom_strength, 0.77f, 0.01f);
     EXPECT_EQ(loaded.volumetric_fog, true);
     EXPECT_EQ(loaded.god_rays, true);
-    EXPECT_EQ(loaded.vsync_mode, 1);
-    EXPECT_EQ(loaded.window_mode, 1);
-    EXPECT_EQ(loaded.anisotropic_filter, 3);
+    EXPECT_EQ(loaded.vsync_mode, VSyncMode::Vsync);
+    EXPECT_EQ(loaded.window_mode, WindowMode::BorderlessFullscreen);
+    EXPECT_EQ(loaded.anisotropic_filter, AnisotropicFilter::X8);
     EXPECT_EQ(loaded.aa_mode, AAMode::Off);
     EXPECT_EQ(loaded.auto_exposure, false);
     EXPECT_FLOAT_EQ(loaded.auto_exposure_min_ev, -2.0f);
@@ -192,7 +192,7 @@ TEST_F(GraphicsSettingsTest, LoadFileWithMalformedValues) {
     GraphicsSettings s;
     ASSERT_TRUE(s.load(TEST_FILE));
     EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);              // default, "abc" failed to parse
-    EXPECT_EQ(s.draw_distance, 3);            // default, "!@#" failed to parse
+    EXPECT_EQ(s.draw_distance, DrawDistance::D4000);            // default, "!@#" failed to parse
     EXPECT_FLOAT_EQ(s.bloom_strength, 0.25f); // default, "not_a_float" failed
     EXPECT_EQ(s.ao_mode, AOMode::GTAO_Full);  // successfully parsed
 }
@@ -228,20 +228,20 @@ TEST_F(GraphicsSettingsTest, LoadEmptyFileKeepsDefaults) {
     EXPECT_TRUE(s.rocks_enabled);
     EXPECT_FALSE(s.show_fps);
     EXPECT_FALSE(s.show_debug_hud);
-    EXPECT_EQ(s.draw_distance, 3);
+    EXPECT_EQ(s.draw_distance, DrawDistance::D4000);
     EXPECT_TRUE(s.frustum_culling);
-    EXPECT_EQ(s.anisotropic_filter, 4);
-    EXPECT_EQ(s.vsync_mode, 2);
+    EXPECT_EQ(s.anisotropic_filter, AnisotropicFilter::X16);
+    EXPECT_EQ(s.vsync_mode, VSyncMode::Mailbox);
     EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);
-    EXPECT_EQ(s.shadow_cascades, 3);
-    EXPECT_EQ(s.shadow_resolution, 2);
+    EXPECT_EQ(s.shadow_cascades, ShadowCascades::Four);
+    EXPECT_EQ(s.shadow_resolution, ShadowResolution::R2048);
     EXPECT_EQ(s.ao_mode, AOMode::GTAO_Half);
     EXPECT_EQ(s.aa_mode, AAMode::TAA);
     EXPECT_TRUE(s.bloom_enabled);
     EXPECT_FLOAT_EQ(s.bloom_strength, 0.25f);
     EXPECT_FALSE(s.volumetric_fog);
     EXPECT_FALSE(s.god_rays);
-    EXPECT_EQ(s.window_mode, 0);
+    EXPECT_EQ(s.window_mode, WindowMode::Windowed);
     EXPECT_EQ(s.resolution_index, 0);
 }
 
@@ -331,7 +331,7 @@ TEST_F(GraphicsSettingsTest, NegativeIntegerValuesClampedOnLoad) {
     // load() normalizes at the trust boundary: negative values clamp to the
     // bottom of each range instead of being stored as-is.
     EXPECT_EQ(s.shadow_mode, ShadowMode::Off);
-    EXPECT_EQ(s.draw_distance, 0);
+    EXPECT_EQ(s.draw_distance, DrawDistance::D500);
 }
 
 // --- Settings-version migration tests ---
@@ -381,8 +381,8 @@ TEST_F(GraphicsSettingsTest, MigrationPreservesNonLightingValues) {
     ASSERT_TRUE(s.load(TEST_FILE));
 
     EXPECT_FALSE(s.fog_enabled);
-    EXPECT_EQ(s.draw_distance, 5);
-    EXPECT_EQ(s.window_mode, 1);
+    EXPECT_EQ(s.draw_distance, DrawDistance::D16000);
+    EXPECT_EQ(s.window_mode, WindowMode::BorderlessFullscreen);
     EXPECT_FLOAT_EQ(s.ao_strength, 1.5f);
     EXPECT_FLOAT_EQ(s.sun_intensity, 3.0f);
 }
@@ -400,7 +400,7 @@ TEST_F(GraphicsSettingsTest, VersionedFileSkipsMigration) {
     ASSERT_TRUE(s.load(TEST_FILE));
 
     EXPECT_FLOAT_EQ(s.sun_intensity, 1.7f);
-    EXPECT_EQ(s.vsync_mode, 0);
+    EXPECT_EQ(s.vsync_mode, VSyncMode::Immediate);
     EXPECT_EQ(s.shadow_mode, ShadowMode::PCF);
     EXPECT_EQ(s.settings_version, GraphicsSettings::CURRENT_SETTINGS_VERSION);
 }
@@ -496,9 +496,9 @@ TEST_F(GraphicsSettingsTest, GetDrawDistanceClampsOutOfRangeIndex) {
     GraphicsSettings s;
     // A corrupt file (or a buggy host) can leave the public field out of
     // range; the accessor must never index out of bounds.
-    s.draw_distance = 9;
+    s.draw_distance = static_cast<DrawDistance>(9);
     EXPECT_FLOAT_EQ(s.get_draw_distance(), 32000.0f);
-    s.draw_distance = -3;
+    s.draw_distance = static_cast<DrawDistance>(-3);
     EXPECT_FLOAT_EQ(s.get_draw_distance(), 500.0f);
 }
 
@@ -510,7 +510,7 @@ TEST_F(GraphicsSettingsTest, LoadClampsOutOfRangeDrawDistance) {
     }
     GraphicsSettings s;
     ASSERT_TRUE(s.load(TEST_FILE));
-    EXPECT_EQ(s.draw_distance, 6);
+    EXPECT_EQ(s.draw_distance, DrawDistance::D32000);
     EXPECT_FLOAT_EQ(s.get_draw_distance(), 32000.0f);
 }
 
@@ -535,11 +535,11 @@ TEST_F(GraphicsSettingsTest, LoadClampsOutOfRangeModes) {
     EXPECT_EQ(s.ao_mode, AOMode::GTAO_Full); // clamps to the highest mode
     EXPECT_EQ(s.aa_mode, AAMode::TAA);
     EXPECT_EQ(s.tonemap_mode, TonemapMode::None);
-    EXPECT_EQ(s.vsync_mode, 2);
-    EXPECT_EQ(s.window_mode, 2);
-    EXPECT_EQ(s.anisotropic_filter, 4);
-    EXPECT_EQ(s.shadow_resolution, 3);
-    EXPECT_EQ(s.shadow_cascades, 0);
+    EXPECT_EQ(s.vsync_mode, VSyncMode::Mailbox);
+    EXPECT_EQ(s.window_mode, WindowMode::ExclusiveFullscreen);
+    EXPECT_EQ(s.anisotropic_filter, AnisotropicFilter::X16);
+    EXPECT_EQ(s.shadow_resolution, ShadowResolution::R4096);
+    EXPECT_EQ(s.shadow_cascades, ShadowCascades::One);
     EXPECT_EQ(s.resolution_index, 0);
 }
 
@@ -555,16 +555,16 @@ TEST_F(GraphicsSettingsTest, AoModeOnDiskValuesArePinned) {
 
 TEST_F(GraphicsSettingsTest, ClampToValidRangesNormalizesDirectMutation) {
     GraphicsSettings s;
-    s.draw_distance = 100;
+    s.draw_distance = static_cast<DrawDistance>(100);
     s.shadow_mode = static_cast<ShadowMode>(7);
     s.ao_mode = static_cast<AOMode>(-1);
     s.aa_mode = static_cast<AAMode>(5);
     s.tonemap_mode = static_cast<TonemapMode>(-2);
     s.local_shadow_point_budget = 99;
     s.local_shadow_spot_budget = -3;
-    s.local_shadow_resolution = 7;
+    s.local_shadow_resolution = static_cast<LocalShadowResolution>(7);
     s.clamp_to_valid_ranges();
-    EXPECT_EQ(s.draw_distance, 6);
+    EXPECT_EQ(s.draw_distance, DrawDistance::D32000);
     EXPECT_EQ(s.shadow_mode, ShadowMode::PCSS);
     EXPECT_EQ(s.ao_mode, AOMode::Off);
     EXPECT_EQ(s.aa_mode, AAMode::TAA);
@@ -572,7 +572,7 @@ TEST_F(GraphicsSettingsTest, ClampToValidRangesNormalizesDirectMutation) {
     // Budgets clamp to the 8x8 atlas capacity (8 point groups, 16 spot tiles).
     EXPECT_EQ(s.local_shadow_point_budget, 8);
     EXPECT_EQ(s.local_shadow_spot_budget, 0);
-    EXPECT_EQ(s.local_shadow_resolution, 2);
+    EXPECT_EQ(s.local_shadow_resolution, LocalShadowResolution::R4096);
 }
 
 TEST_F(GraphicsSettingsTest, LocalShadowsSerializeNumerically) {
@@ -583,7 +583,7 @@ TEST_F(GraphicsSettingsTest, LocalShadowsSerializeNumerically) {
     s.local_shadows = false;
     s.local_shadow_point_budget = 6;
     s.local_shadow_spot_budget = 3;
-    s.local_shadow_resolution = 0;
+    s.local_shadow_resolution = LocalShadowResolution::R1024;
     ASSERT_TRUE(s.save(TEST_FILE));
 
     std::ifstream in(TEST_FILE);
@@ -608,7 +608,7 @@ TEST_F(GraphicsSettingsTest, LocalShadowsSerializeNumerically) {
     EXPECT_FALSE(loaded.local_shadows);
     EXPECT_EQ(loaded.local_shadow_point_budget, 6);
     EXPECT_EQ(loaded.local_shadow_spot_budget, 3);
-    EXPECT_EQ(loaded.local_shadow_resolution, 0);
+    EXPECT_EQ(loaded.local_shadow_resolution, LocalShadowResolution::R1024);
 }
 
 TEST_F(GraphicsSettingsTest, AutoExposureClampedOnLoad) {

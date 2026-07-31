@@ -434,12 +434,12 @@ All the facade methods below dereference subsystems created by `init_renderer` �
 #### Window mode, resolution, vsync, filtering
 
 ```cpp
-set_window_mode(1);                 // 0=windowed, 1=borderless fullscreen, 2=exclusive fullscreen
+set_window_mode(WindowMode::BorderlessFullscreen);
 auto modes = available_resolutions(); // std::vector<Application::DisplayMode>{ int w, h; }
 set_window_mode(2, /*resolution_index=*/0); // exclusive fullscreen at modes[0]
-set_vsync_mode(2);                  // 0=immediate, 1=vsync, 2=mailbox (triple buffer)
+set_vsync_mode(VSyncMode::Mailbox); // triple buffer
 int best = max_vsync_mode();        // highest mode the swapchain supports
-set_anisotropic_filter(4);          // 0=off, 1=2x, 2=4x, 3=8x, 4=16x
+set_anisotropic_filter(AnisotropicFilter::X16);
 int w = screen_width();             // current drawable size
 int h = screen_height();
 ```
@@ -504,18 +504,18 @@ Enum modes are `enum class : int` with **stable underlying values** — they are
 | `fog_enabled` | `true` | distance fog |
 | `grass_enabled` / `skybox_enabled` / `trees_enabled` / `rocks_enabled` | `true` | feature toggles |
 | `show_fps` / `show_debug_hud` | `false` | HUD toggles (host-interpreted) |
-| `draw_distance` | `3` | index: 0=500, 1=1000, 2=2000, 3=4000, 4=8000, 5=16000, 6=32000 (`get_draw_distance()`) |
+| `draw_distance` | `DrawDistance::D4000` | `DrawDistance` enum; world units via `get_draw_distance()` / `draw_distance_units()` |
 | `frustum_culling` | `true` | CPU frustum culling toggle |
-| `anisotropic_filter` | `4` | 0=off, 1=2x, 2=4x, 3=8x, 4=16x |
-| `vsync_mode` | `2` | 0=immediate, 1=vsync, 2=mailbox; clamped to `max_vsync_mode()` at apply |
+| `anisotropic_filter` | `AnisotropicFilter::X16` | `AnisotropicFilter` enum; sample count via `anisotropy_samples()` |
+| `vsync_mode` | `VSyncMode::Mailbox` | `VSyncMode` enum; clamped to `max_vsync_mode()` at apply |
 | `shadow_mode` | `ShadowMode::PCSS` | `Off`/`PCF`/`PCSS` (0/1/2) |
-| `shadow_cascades` | `3` | index: 0=1 … 3=4 cascades |
-| `shadow_resolution` | `2` | index: 0=512, 1=1024, 2=2048, 3=4096 |
+| `shadow_cascades` | `ShadowCascades::Four` | `ShadowCascades` enum; actual count via `cascade_count()` (enumerator values are indices) |
+| `shadow_resolution` | `ShadowResolution::R2048` | `ShadowResolution` enum; texels via `shadow_map_texels()` |
 | `shadow_distance` | `4000.0f` | CSM range in world units (also clamped by draw distance); fades out over the last 15% |
 | `local_shadows` | `true` | point/spot light shadows for lights submitted with `casts_shadows = true` |
 | `local_shadow_point_budget` | `4` | shadowed point lights per frame (0–8; 6 atlas tiles each) |
 | `local_shadow_spot_budget` | `2` | shadowed spot lights per frame (0–16; 1 atlas tile each) |
-| `local_shadow_resolution` | `1` | local-shadow atlas size index: 0=1024, 1=2048, 2=4096 (8×8 tiles → 128/256/512 px per tile) |
+| `local_shadow_resolution` | `LocalShadowResolution::R2048` | `LocalShadowResolution` enum; texels via `local_shadow_atlas_texels()` (8×8 tiles → 128/256/512 px per tile) |
 | `ao_mode` | `AOMode::GTAO_Half` | `Off`/`GTAO_Half`/`GTAO_Full` (0/1/2) |
 | `aa_mode` | `AAMode::TAA` | `Off`/`FXAA`/`TAA` (0/1/2); TAA is the fresh-settings default, persisted files keep their stored mode |
 | `ibl_enabled` | `true` | image-based lighting: ambient diffuse + specular come from the prefiltered procedural sky; `false` falls back to the two-color hemisphere ambient |
@@ -4038,7 +4038,7 @@ Everything a game usually needs is in `GraphicsSettings`
 auto& gs = graphics_settings();
 gs.shadow_mode       = bracken::ShadowMode::PCSS; // Off / PCF / PCSS (default PCSS)
 gs.shadow_cascades   = 3;                         // 0=1, 1=2, 2=3, 3=4 cascades (default 3)
-gs.shadow_resolution = 2;                         // 0=512, 1=1024, 2=2048, 3=4096 (default 2)
+gs.shadow_resolution = ShadowResolution::R2048;   // default
 request_graphics_settings(gs);   // sim-safe; applied at the next frame fence
 ```
 

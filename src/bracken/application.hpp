@@ -204,10 +204,10 @@ protected:
      * on_main_frame only. From on_simulate, use request_graphics_settings().
      */
     void set_graphics_settings(const GraphicsSettings& settings);
-    void set_anisotropic_filter(int level);
-    void set_vsync_mode(int mode);
+    void set_anisotropic_filter(AnisotropicFilter level);
+    void set_vsync_mode(VSyncMode mode);
     int max_vsync_mode() const;
-    void set_window_mode(int window_mode, int resolution_index = 0);
+    void set_window_mode(WindowMode window_mode, int resolution_index = 0);
 
     /** Apply all graphics settings (scene renderer, vsync, anisotropic,
      *  window mode). Main-thread tier, no sim in flight (see above). */

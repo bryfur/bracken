@@ -16,21 +16,22 @@ template<typename E> E clamp_enum(E value, E lo, E hi) {
 } // namespace
 
 void GraphicsSettings::clamp_to_valid_ranges() {
-    draw_distance = std::clamp(draw_distance, 0, 6);
-    anisotropic_filter = std::clamp(anisotropic_filter, 0, 4);
-    vsync_mode = std::clamp(vsync_mode, 0, 2);
+    draw_distance = clamp_enum(draw_distance, DrawDistance::D500, DrawDistance::D32000);
+    anisotropic_filter = clamp_enum(anisotropic_filter, AnisotropicFilter::Off, AnisotropicFilter::X16);
+    vsync_mode = clamp_enum(vsync_mode, VSyncMode::Immediate, VSyncMode::Mailbox);
     shadow_mode = clamp_enum(shadow_mode, ShadowMode::Off, ShadowMode::PCSS);
-    shadow_cascades = std::clamp(shadow_cascades, 0, 3);
-    shadow_resolution = std::clamp(shadow_resolution, 0, 3);
+    shadow_cascades = clamp_enum(shadow_cascades, ShadowCascades::One, ShadowCascades::Four);
+    shadow_resolution = clamp_enum(shadow_resolution, ShadowResolution::R512, ShadowResolution::R4096);
     shadow_distance = std::clamp(shadow_distance, 200.0f, 20000.0f);
     // Budget bounds mirror render::lighting::LOCAL_SHADOW_MAX_{POINT,SPOT}_BUDGET
     // (the 8x8 atlas holds 8*6 point-face tiles + 16 spot tiles exactly).
     local_shadow_point_budget = std::clamp(local_shadow_point_budget, 0, 8);
     local_shadow_spot_budget = std::clamp(local_shadow_spot_budget, 0, 16);
-    local_shadow_resolution = std::clamp(local_shadow_resolution, 0, 2);
+    local_shadow_resolution =
+        clamp_enum(local_shadow_resolution, LocalShadowResolution::R1024, LocalShadowResolution::R4096);
     ao_mode = clamp_enum(ao_mode, AOMode::Off, AOMode::GTAO_Full);
     aa_mode = clamp_enum(aa_mode, AAMode::Off, AAMode::TAA);
-    window_mode = std::clamp(window_mode, 0, 2);
+    window_mode = clamp_enum(window_mode, WindowMode::Windowed, WindowMode::ExclusiveFullscreen);
     // Only the lower bound is enforced here — the upper bound depends on the
     // runtime display-mode list, which this struct never sees. An index past
     // that list is handled at apply time: RenderContext::set_window_mode
@@ -60,18 +61,18 @@ bool GraphicsSettings::save(const std::string& path) const {
     out << "rocks_enabled=" << rocks_enabled << "\n";
     out << "show_fps=" << show_fps << "\n";
     out << "show_debug_hud=" << show_debug_hud << "\n";
-    out << "draw_distance=" << draw_distance << "\n";
+    out << "draw_distance=" << static_cast<int>(draw_distance) << "\n";
     out << "frustum_culling=" << frustum_culling << "\n";
-    out << "anisotropic_filter=" << anisotropic_filter << "\n";
-    out << "vsync_mode=" << vsync_mode << "\n";
+    out << "anisotropic_filter=" << static_cast<int>(anisotropic_filter) << "\n";
+    out << "vsync_mode=" << static_cast<int>(vsync_mode) << "\n";
     out << "shadow_mode=" << static_cast<int>(shadow_mode) << "\n";
-    out << "shadow_cascades=" << shadow_cascades << "\n";
-    out << "shadow_resolution=" << shadow_resolution << "\n";
+    out << "shadow_cascades=" << static_cast<int>(shadow_cascades) << "\n";
+    out << "shadow_resolution=" << static_cast<int>(shadow_resolution) << "\n";
     out << "shadow_distance=" << shadow_distance << "\n";
     out << "local_shadows=" << local_shadows << "\n";
     out << "local_shadow_point_budget=" << local_shadow_point_budget << "\n";
     out << "local_shadow_spot_budget=" << local_shadow_spot_budget << "\n";
-    out << "local_shadow_resolution=" << local_shadow_resolution << "\n";
+    out << "local_shadow_resolution=" << static_cast<int>(local_shadow_resolution) << "\n";
     out << "ao_mode=" << static_cast<int>(ao_mode) << "\n";
     out << "aa_mode=" << static_cast<int>(aa_mode) << "\n";
     out << "ibl_enabled=" << ibl_enabled << "\n";
@@ -79,7 +80,7 @@ bool GraphicsSettings::save(const std::string& path) const {
     out << "bloom_strength=" << bloom_strength << "\n";
     out << "volumetric_fog=" << volumetric_fog << "\n";
     out << "god_rays=" << god_rays << "\n";
-    out << "window_mode=" << window_mode << "\n";
+    out << "window_mode=" << static_cast<int>(window_mode) << "\n";
     out << "resolution_index=" << resolution_index << "\n";
     out << "exposure=" << exposure << "\n";
     out << "tonemap_mode=" << static_cast<int>(tonemap_mode) << "\n";
@@ -157,18 +158,18 @@ bool GraphicsSettings::load(const std::string& path) {
     read_bool("rocks_enabled", rocks_enabled);
     read_bool("show_fps", show_fps);
     read_bool("show_debug_hud", show_debug_hud);
-    read_int("draw_distance", draw_distance);
+    read_enum("draw_distance", draw_distance);
     read_bool("frustum_culling", frustum_culling);
-    read_int("anisotropic_filter", anisotropic_filter);
-    read_int("vsync_mode", vsync_mode);
+    read_enum("anisotropic_filter", anisotropic_filter);
+    read_enum("vsync_mode", vsync_mode);
     read_enum("shadow_mode", shadow_mode);
-    read_int("shadow_cascades", shadow_cascades);
-    read_int("shadow_resolution", shadow_resolution);
+    read_enum("shadow_cascades", shadow_cascades);
+    read_enum("shadow_resolution", shadow_resolution);
     read_float("shadow_distance", shadow_distance);
     read_bool("local_shadows", local_shadows);
     read_int("local_shadow_point_budget", local_shadow_point_budget);
     read_int("local_shadow_spot_budget", local_shadow_spot_budget);
-    read_int("local_shadow_resolution", local_shadow_resolution);
+    read_enum("local_shadow_resolution", local_shadow_resolution);
     read_enum("ao_mode", ao_mode);
     read_enum("aa_mode", aa_mode);
     read_bool("ibl_enabled", ibl_enabled);
@@ -176,7 +177,7 @@ bool GraphicsSettings::load(const std::string& path) {
     read_float("bloom_strength", bloom_strength);
     read_bool("volumetric_fog", volumetric_fog);
     read_bool("god_rays", god_rays);
-    read_int("window_mode", window_mode);
+    read_enum("window_mode", window_mode);
     read_int("resolution_index", resolution_index);
     read_float("exposure", exposure);
     read_enum("tonemap_mode", tonemap_mode);

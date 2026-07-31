@@ -442,20 +442,20 @@ void Application::set_graphics_settings(const GraphicsSettings& settings) {
     scene_renderer_->set_graphics_settings(settings);
 }
 
-void Application::set_anisotropic_filter(int level) {
-    scene_renderer_->set_anisotropic_filter(level);
+void Application::set_anisotropic_filter(AnisotropicFilter level) {
+    scene_renderer_->set_anisotropic_filter(static_cast<int>(level));
 }
 
-void Application::set_vsync_mode(int mode) {
-    scene_renderer_->set_vsync_mode(mode);
+void Application::set_vsync_mode(VSyncMode mode) {
+    scene_renderer_->set_vsync_mode(static_cast<int>(mode));
 }
 
 int Application::max_vsync_mode() const {
     return scene_renderer_->max_vsync_mode();
 }
 
-void Application::set_window_mode(int window_mode, int resolution_index) {
-    context_->set_window_mode(window_mode, resolution_index);
+void Application::set_window_mode(WindowMode window_mode, int resolution_index) {
+    context_->set_window_mode(static_cast<int>(window_mode), resolution_index);
 }
 
 std::vector<Application::DisplayMode> Application::available_resolutions() const {
