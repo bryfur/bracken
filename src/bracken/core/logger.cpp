@@ -59,6 +59,11 @@ void StdoutSink::write(LogLevel level, const char* category, std::string_view ms
 }
 
 Logger::Logger() {
+    // SDL applies its own per-category priority filter (application category
+    // defaults to Info) on top of Logger::should_log, which would silently
+    // drop Trace/Debug from StdoutSink. Open SDL's filter fully once so
+    // set_min_level() is the single level knob.
+    SDL_SetLogPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_TRACE);
     sinks_.push_back(Entry{next_id_++, std::make_shared<StdoutSink>()});
 }
 

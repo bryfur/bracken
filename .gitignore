@@ -63,3 +63,11 @@ _deps/
 *.temp
 shader_cache/
 .claude/worktrees/
+build-tsan/
+
+# Python tooling caches
+__pycache__/
+*.pyc
+
+# Smoke-test output artifacts
+playground_smoke.png

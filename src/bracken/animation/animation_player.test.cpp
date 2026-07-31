@@ -343,3 +343,43 @@ TEST_F(AnimationPlayerTest, MultipleUpdatesAccumulateCorrectly) {
     glm::mat4 root_bone = player.bone_matrices()[0];
     EXPECT_TRUE(approx(root_bone[3][0], 0.5f));
 }
+
+// write_palette: the FramePacket-era copy of the pose into caller storage
+// (packet memory in real use) — animated prefix verbatim, identity fill for
+// any slots beyond used_joint_count(), and no writes past a short span.
+TEST_F(AnimationPlayerTest, WritePaletteCopiesUsedPrefixAndFillsIdentity) {
+    AnimationPlayer player;
+    player.update(skeleton, clips, 0.5f);
+    ASSERT_EQ(player.used_joint_count(), 2u);
+
+    std::array<glm::mat4, 4> dst;
+    for (auto& m : dst) m = glm::mat4(0.0f); // poison so identity fill is provable
+    player.write_palette(dst);
+
+    EXPECT_EQ(dst[0], player.bone_matrices()[0]);
+    EXPECT_EQ(dst[1], player.bone_matrices()[1]);
+    EXPECT_EQ(dst[2], glm::mat4(1.0f));
+    EXPECT_EQ(dst[3], glm::mat4(1.0f));
+}
+
+TEST_F(AnimationPlayerTest, WritePaletteRespectsShortDestination) {
+    AnimationPlayer player;
+    player.update(skeleton, clips, 0.5f);
+
+    std::array<glm::mat4, 2> storage;
+    storage[0] = glm::mat4(0.0f);
+    storage[1] = glm::mat4(123.0f); // sentinel past the span
+    player.write_palette(std::span<glm::mat4>(storage.data(), 1));
+
+    EXPECT_EQ(storage[0], player.bone_matrices()[0]);
+    EXPECT_EQ(storage[1], glm::mat4(123.0f));
+}
+
+TEST_F(AnimationPlayerTest, WritePaletteBeforeUpdateFillsIdentity) {
+    AnimationPlayer player; // used_joint_count() == 0 until the first update
+    std::array<glm::mat4, 2> dst;
+    for (auto& m : dst) m = glm::mat4(0.0f);
+    player.write_palette(dst);
+    EXPECT_EQ(dst[0], glm::mat4(1.0f));
+    EXPECT_EQ(dst[1], glm::mat4(1.0f));
+}

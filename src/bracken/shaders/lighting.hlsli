@@ -10,13 +10,7 @@ float luminance(float3 c) {
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
-// Exact sRGB <-> linear (piecewise), used sparingly where sampler gamma doesn't apply.
-float3 srgbToLinear(float3 c) {
-    float3 lo = c / 12.92;
-    float3 hi = pow((c + 0.055) / 1.055, 2.4);
-    return lerp(lo, hi, step(0.04045, c));
-}
-
+// Exact linear -> sRGB (piecewise), used sparingly where sampler gamma doesn't apply.
 float3 linearToSrgb(float3 c) {
     float3 lo = c * 12.92;
     float3 hi = 1.055 * pow(max(c, 1e-5), 1.0 / 2.4) - 0.055;

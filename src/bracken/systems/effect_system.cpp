@@ -1,11 +1,16 @@
 #include "effect_system.hpp"
+#include "bracken/core/assert.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
+#include "bracken/scene/frame_builder.hpp"
 #include <algorithm>
+#include <cmath>
 #include <glm/gtc/constants.hpp>
 #include <random>
 
 namespace bracken::systems {
 
+using bracken::SpawnMode;
 using bracken::VelocityType;
 
 namespace {
@@ -22,7 +27,7 @@ float random_float(float min, float max) {
 } // anonymous namespace
 
 int EffectSystem::spawn_effect(const EffectDefinition* definition, const glm::vec3& position,
-                               const glm::vec3& direction, float range) {
+                               const glm::vec3& direction) {
     BRACKEN_PROFILE_ZONE_COLOR("EffectSystem::spawn_effect", 0x3D6E9E);
     if (!definition) {
         return -1;
@@ -32,15 +37,27 @@ int EffectSystem::spawn_effect(const EffectDefinition* definition, const glm::ve
     effect.definition = definition;
     effect.age = 0.0f;
 
-    float actual_range = range < 0 ? definition->default_range : range;
-
     // Create emitter instances
     for (const auto& emitter_def : definition->emitters) {
+        // Definition intake is the engine's earliest validation boundary
+        // (parsing effect files is the host's job — see docs/effects_system.md):
+        // a CONTINUOUS spawn_rate that is zero, negative, or non-finite would
+        // otherwise hang update()'s catch-up loop. The emitter is kept but
+        // stays inert — spawn_phase skips continuous spawning for it.
+        if (emitter_def.spawn_mode == SpawnMode::CONTINUOUS &&
+            !(std::isfinite(emitter_def.spawn_rate) && emitter_def.spawn_rate > 0.0f)) {
+            if (warned_bad_spawn_rate_.insert(&emitter_def).second) {
+                BRACKEN_LOG_WARN("effect",
+                                 "Effect '{}' emitter '{}': CONTINUOUS spawn_rate {} is invalid "
+                                 "(must be > 0 and finite); emitter will not spawn",
+                                 definition->name, emitter_def.name, emitter_def.spawn_rate);
+            }
+        }
+
         EmitterInstance emitter;
         emitter.definition = &emitter_def;
         emitter.origin = position;
         emitter.direction = direction;
-        emitter.range = actual_range;
         emitter.age = 0.0f;
         emitter.next_spawn_time = emitter_def.delay;
         emitter.has_spawned_burst = false;
@@ -50,6 +67,42 @@ int EffectSystem::spawn_effect(const EffectDefinition* definition, const glm::ve
 
     effects_.push_back(std::move(effect));
     return static_cast<int>(effects_.size() - 1);
+}
+
+void EffectSystem::spawn_phase(EmitterInstance& emitter, float dt, bool allow_spawn) {
+    if (!emitter.definition) {
+        return;
+    }
+
+    const auto& def = *emitter.definition;
+    emitter.age += dt;
+
+    if (!allow_spawn || !emitter.is_active()) {
+        return;
+    }
+
+    if (def.spawn_mode == SpawnMode::BURST && !emitter.has_spawned_burst) {
+        if (emitter.age >= def.delay) {
+            spawn_particles(emitter, def.spawn_count);
+            emitter.has_spawned_burst = true;
+        }
+    } else if (def.spawn_mode == SpawnMode::CONTINUOUS) {
+        // Interval is hoisted and validated: the catch-up loop below only
+        // terminates for a positive, finite interval. rate <= 0 gives a
+        // negative interval (a negative rate used to hang this loop with
+        // unbounded particle growth), rate == 0 gives +inf (used to emit
+        // a single stray particle), rate == +inf gives 0 (would spin
+        // forever), NaN fails every comparison. spawn_effect() already
+        // warns about such definitions; this guard keeps update() robust
+        // regardless.
+        const float spawn_interval = 1.0f / def.spawn_rate;
+        if (spawn_interval > 0.0f && std::isfinite(spawn_interval)) {
+            while (emitter.age >= emitter.next_spawn_time) {
+                spawn_particles(emitter, 1);
+                emitter.next_spawn_time += spawn_interval;
+            }
+        }
+    }
 }
 
 void EffectSystem::compact_effects() {
@@ -73,11 +126,15 @@ void EffectSystem::spawn_particles(EmitterInstance& emitter, int count) {
     for (int i = 0; i < count; ++i) {
         Particle particle;
 
-        // Position
+        // Position: emitter origin, jittered within the spawn volume when one
+        // is set (the zero-volume guard keeps point emitters' RNG sequences —
+        // and therefore existing effects — bit-identical).
         particle.position = emitter.origin;
-
-        // Model
-        particle.model = &def.model;
+        if (def.spawn_volume.x > 0.0f || def.spawn_volume.y > 0.0f || def.spawn_volume.z > 0.0f) {
+            particle.position += glm::vec3(random_float(-def.spawn_volume.x, def.spawn_volume.x),
+                                           random_float(-def.spawn_volume.y, def.spawn_volume.y),
+                                           random_float(-def.spawn_volume.z, def.spawn_volume.z));
+        }
 
         // Lifetime
         particle.lifetime = def.particle_lifetime;
@@ -253,6 +310,44 @@ size_t EffectSystem::particle_count() const {
         }
     }
     return count;
+}
+
+void EffectSystem::snapshot_into(scene::FrameBuilder& fb) const {
+    BRACKEN_PROFILE_ZONE_COLOR("EffectSystem::snapshot_into", 0x3D6E9E);
+
+    // Count live emitters (definition + at least one particle — the same
+    // filter the retired render-side walk applied) and their particles.
+    uint32_t emitter_total = 0;
+    uint32_t particle_total = 0;
+    for (const auto& effect : effects_) {
+        for (const auto& emitter : effect.emitters) {
+            if (emitter.definition != nullptr && !emitter.particles.empty()) {
+                ++emitter_total;
+                particle_total += static_cast<uint32_t>(emitter.particles.size());
+            }
+        }
+    }
+
+    auto alloc = fb.alloc_effect_snapshot(emitter_total, particle_total);
+
+    // Fill in deterministic (effect, emitter, particle) submission order —
+    // the order the retired renderer walk used, so batches are stable.
+    uint32_t e = 0;
+    uint32_t p = 0;
+    for (const auto& effect : effects_) {
+        for (const auto& emitter : effect.emitters) {
+            if (emitter.definition == nullptr || emitter.particles.empty()) {
+                continue;
+            }
+            alloc.emitters[e++] = {emitter.definition, p, static_cast<uint32_t>(emitter.particles.size())};
+            for (const auto& particle : emitter.particles) {
+                alloc.particles[p++] = {particle.position, particle.scale, particle.rotation, particle.opacity,
+                                        particle.color};
+            }
+        }
+    }
+    BRACKEN_ASSERT(e == emitter_total && p == particle_total, "effect snapshot count drift ({}≠{} or {}≠{})", e,
+                   emitter_total, p, particle_total);
 }
 
 } // namespace bracken::systems

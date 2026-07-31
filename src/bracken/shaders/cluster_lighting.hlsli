@@ -1,14 +1,21 @@
 // cluster_lighting.hlsli - bindings + accumulator for clustered forward+ lights.
 // Including shader must NOT also declare ClusterParams cbuffer / SSBO bindings;
-// these slots (set 3, b2 + three set-2 bindings after the sampled textures)
+// these slots (set 3, b2 + four set-2 bindings after the sampled textures)
 // are reserved for clustered lighting.
 //
 // SDL GPU lays out fragment set 2 as sampled textures, then storage textures,
 // then storage buffers. The SSBO bindings therefore start right after the
 // including shader's sampled textures: define CLUSTER_SSBO_BINDING_BASE to
 // that shader's fragment sampler count BEFORE including this file.
-// SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 3) then maps slots 0..2
+// SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4) then maps slots 0..3
 // onto these bindings.
+//
+// This header also owns the LOCAL (point/spot) shadow bindings: the shadow
+// atlas + comparison sampler pair is expected at the including shader's LAST
+// sampler slot (CLUSTER_SSBO_BINDING_BASE - 1), and the per-tile slot data
+// rides the 4th storage buffer. Local shadow maps are standard-Z perspective
+// depth (near -> 0, far -> 1, LESS_OR_EQUAL compare) rendered by
+// render::lighting::LocalShadowMap — see local_shadows.hpp for the CPU side.
 
 #ifndef CLUSTER_LIGHTING_HLSLI
 #define CLUSTER_LIGHTING_HLSLI
@@ -31,14 +38,94 @@ StructuredBuffer<uint2> clusterOffsetsBuf;
 [[vk::binding(CLUSTER_SSBO_BINDING_BASE + 2, 2)]]
 StructuredBuffer<uint> lightIndicesBuf;
 
+// ---------------------------------------------------------------------------
+// Local (point/spot) shadows
+// ---------------------------------------------------------------------------
+
+// D32 local-shadow atlas (8x8 tiles) at the including shader's last sampler
+// slot, sampled through a LESS_OR_EQUAL comparison sampler (each
+// SampleCmpLevelZero tap is a free 2x2 hardware PCF).
+[[vk::combinedImageSampler]][[vk::binding(CLUSTER_SSBO_BINDING_BASE - 1, 2)]]
+Texture2D localShadowAtlas;
+[[vk::combinedImageSampler]][[vk::binding(CLUSTER_SSBO_BINDING_BASE - 1, 2)]]
+SamplerComparisonState localShadowCmpSampler;
+
+// Mirrors render::lighting::LocalShadowSlotGPU (local_shadows.hpp), 96 bytes.
+struct LocalShadowSlot {
+    float4x4 viewProj; // world -> light clip (standard-Z perspective)
+    float4 rect;       // atlas UV: xy = tile origin, zw = tile scale
+    float4 params;     // x = world texel per unit distance (2*tan(fov/2)/tileRes)
+                       // y = tile-UV clamp inset for PCF, z = near plane,
+                       // w = atlas texel size (1 / atlas resolution)
+};
+
+#define LOCAL_SHADOW_MAX_SLOTS 64u
+
+[[vk::binding(CLUSTER_SSBO_BINDING_BASE + 3, 2)]]
+StructuredBuffer<LocalShadowSlot> localShadowSlots;
+
+// Cube-face index from the light->fragment vector (dominant axis):
+// 0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z. CPU mirror: lighting::local_shadow_cube_face.
+uint localShadowCubeFace(float3 d) {
+    float3 ad = abs(d);
+    if (ad.x >= ad.y && ad.x >= ad.z) return d.x > 0.0 ? 0u : 1u;
+    if (ad.y >= ad.z) return d.y > 0.0 ? 2u : 3u;
+    return d.z > 0.0 ? 4u : 5u;
+}
+
+// Visibility [0,1] from one local-shadow tile. Receiver bias is applied in
+// WORLD space — a normal offset plus a slope-scaled push toward the light,
+// both proportional to the tile's world texel size at this distance — so no
+// perspective-depth-unit conversion is needed (the caster pipelines add a
+// small rasterizer depth bias on top). 4 comparison taps on a half-texel
+// square = an effective 3x3 PCF footprint (each tap is a hardware 2x2).
+float sampleLocalShadowSlot(uint slot, float3 P, float3 N, float3 L, float dist) {
+    LocalShadowSlot s = localShadowSlots[min(slot, LOCAL_SHADOW_MAX_SLOTS - 1u)];
+    float texelWorld = max(dist, s.params.z) * s.params.x;
+    float NdotL = saturate(dot(N, L));
+    float tanTheta = min(sqrt(1.0 - NdotL * NdotL) / max(NdotL, 1e-2), 4.0);
+    float3 samplePos = P + N * (texelWorld * 1.5) + L * (texelWorld * (1.0 + tanTheta));
+    float4 lp = mul(s.viewProj, float4(samplePos, 1.0));
+    if (lp.w <= 1e-4) return 1.0;
+    float3 sc = lp.xyz / lp.w;
+    float2 uv = float2(sc.x * 0.5 + 0.5, 1.0 - (sc.y * 0.5 + 0.5));
+    if (min(uv.x, uv.y) < 0.0 || max(uv.x, uv.y) > 1.0 || sc.z <= 0.0 || sc.z >= 1.0)
+        return 1.0;
+    // Clamp inside the tile so PCF taps never bleed into a neighbor.
+    uv = clamp(uv, s.params.y, 1.0 - s.params.y);
+    float2 atlasUV = s.rect.xy + uv * s.rect.zw;
+    float t = 0.5 * s.params.w;
+    float sum = localShadowAtlas.SampleCmpLevelZero(localShadowCmpSampler, atlasUV + float2(-t, -t), sc.z);
+    sum += localShadowAtlas.SampleCmpLevelZero(localShadowCmpSampler, atlasUV + float2(t, -t), sc.z);
+    sum += localShadowAtlas.SampleCmpLevelZero(localShadowCmpSampler, atlasUV + float2(-t, t), sc.z);
+    sum += localShadowAtlas.SampleCmpLevelZero(localShadowCmpSampler, atlasUV + float2(t, t), sc.z);
+    return sum * 0.25;
+}
+
+// Shadow visibility for a local light: face select (points) + tile sample +
+// smooth fade to unshadowed near the light radius so the shadow never pops
+// at the shadow map's far plane.
+float localLightShadow(int shadow_slot, bool is_point, float3 light_pos, float radius,
+                       float3 P, float3 N, float3 L, float dist) {
+    if (shadow_slot < 0) return 1.0;
+    uint slot = uint(shadow_slot);
+    if (is_point) slot += localShadowCubeFace(P - light_pos);
+    float shadow = sampleLocalShadowSlot(slot, P, N, L, dist);
+    return lerp(shadow, 1.0, smoothstep(0.75, 1.0, dist / max(radius, 1e-4)));
+}
+
+// ---------------------------------------------------------------------------
+// Light data loads
+// ---------------------------------------------------------------------------
+
 // Light-data buffer section offsets. ClusterGrid::upload() (light_cluster.cpp)
 // packs the buffer as:
 //   [LightDataHeader 16B][LightHeader * cap][PointLight * cap][SpotLight * cap]
 // where cap = clusterParams.maxPerCluster.y — the CPU-side buffer capacity
 // (ClusterGrid max_lights_) — so the offsets follow the CPU layout instead of
-// hardcoding a light count. Strides: LightHeader 8B, PointLight 32B, SpotLight 64B.
+// hardcoding a light count. Strides: LightHeader 8B, PointLight 48B, SpotLight 64B.
 uint pointLightsBase() { return 16u + clusterParams.maxPerCluster.y * 8u; }
-uint spotLightsBase()  { return 16u + clusterParams.maxPerCluster.y * (8u + 32u); }
+uint spotLightsBase()  { return 16u + clusterParams.maxPerCluster.y * (8u + 48u); }
 
 LightHeader loadLightHeader(uint i) {
     uint base = 16u + i * 8u; // headers start right after the 16B LightDataHeader
@@ -50,14 +137,18 @@ LightHeader loadLightHeader(uint i) {
 }
 
 PointLightGPU loadPointLight(uint i) {
-    uint base = pointLightsBase() + i * 32;
+    uint base = pointLightsBase() + i * 48;
     uint4 a = lightDataBuf.Load4(base);
     uint4 b = lightDataBuf.Load4(base + 16);
+    uint4 c = lightDataBuf.Load4(base + 32);
     PointLightGPU p;
-    p.position  = asfloat(a.xyz);
-    p.radius    = asfloat(a.w);
-    p.color     = asfloat(b.xyz);
-    p.intensity = asfloat(b.w);
+    p.position    = asfloat(a.xyz);
+    p.radius      = asfloat(a.w);
+    p.color       = asfloat(b.xyz);
+    p.intensity   = asfloat(b.w);
+    // c.x is the CPU-side casts_shadows byte + padding (never read here);
+    // shadow_slot is engine-assigned each frame (-1 = unshadowed).
+    p.shadow_slot = asint(c.y);
     return p;
 }
 
@@ -68,14 +159,15 @@ SpotLightGPU loadSpotLight(uint i) {
     uint4 c = lightDataBuf.Load4(base + 32);
     uint4 d = lightDataBuf.Load4(base + 48);
     SpotLightGPU s;
-    s.position  = asfloat(a.xyz);
-    s.radius    = asfloat(a.w);
-    s.direction = asfloat(b.xyz);
-    s.inner_cos = asfloat(b.w);
-    s.color     = asfloat(c.xyz);
-    s.outer_cos = asfloat(c.w);
-    s.intensity = asfloat(d.x);
-    s._pad      = float3(0, 0, 0);
+    s.position    = asfloat(a.xyz);
+    s.radius      = asfloat(a.w);
+    s.direction   = asfloat(b.xyz);
+    s.inner_cos   = asfloat(b.w);
+    s.color       = asfloat(c.xyz);
+    s.outer_cos   = asfloat(c.w);
+    s.intensity   = asfloat(d.x);
+    // d.y is the CPU-side casts_shadows byte + padding (never read here).
+    s.shadow_slot = asint(d.z);
     return s;
 }
 
@@ -101,8 +193,10 @@ float3 accumulateClusterLights(float3 P, float3 N, float3 V,
             if (dist > pl.radius) continue;
             float3 L = to_light / max(dist, 1e-4);
             float att = pointFalloff(dist, pl.radius);
+            float shadow = localLightShadow(pl.shadow_slot, true, pl.position, pl.radius, P, N, L, dist);
+            if (shadow <= 0.0) continue;
             acc += evaluatePBRPoint(N, V, L, pl.color * pl.intensity, att,
-                                    baseColor, metallic, roughness, ao);
+                                    baseColor, metallic, roughness, ao) * shadow;
         } else {
             SpotLightGPU sl = loadSpotLight(h.payload_index);
             float3 to_light = sl.position - P;
@@ -112,8 +206,10 @@ float3 accumulateClusterLights(float3 P, float3 N, float3 V,
             float att = pointFalloff(dist, sl.radius);
             float cone = spotConeFactor(L, sl.direction, sl.inner_cos, sl.outer_cos);
             if (cone <= 0.0) continue;
+            float shadow = localLightShadow(sl.shadow_slot, false, sl.position, sl.radius, P, N, L, dist);
+            if (shadow <= 0.0) continue;
             acc += evaluatePBRSpot(N, V, L, sl.color * sl.intensity, att, cone,
-                                   baseColor, metallic, roughness, ao);
+                                   baseColor, metallic, roughness, ao) * shadow;
         }
     }
     return acc;

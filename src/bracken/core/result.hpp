@@ -115,7 +115,8 @@ private:
 
 /**
  * Result<void, E>: fallible operations with no success payload — the shape
- * every `bool init()/load()/save()`-style API needs to migrate to Result.
+ * new no-payload fallible APIs should take (existing bool APIs migrate only
+ * when touched — see CLAUDE.md).
  */
 template<typename E> class [[nodiscard]] Result<void, E> {
 public:

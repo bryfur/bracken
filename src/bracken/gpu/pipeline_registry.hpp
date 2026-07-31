@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gpu_compute.hpp"
 #include "gpu_device.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_shader.hpp"
@@ -25,7 +26,7 @@ enum class PipelineType {
     Model,        ///< Static 3D models
     SkinnedModel, ///< Animated/skeletal models
     Terrain,      ///< Terrain rendering with splatmap
-    Skybox,       ///< Skybox cubemap rendering
+    Skybox,       ///< Procedural sky (fullscreen triangle, no textures/cubemap)
     Grid,         ///< Debug grid overlay
 
     // 2D/UI pipelines
@@ -33,7 +34,9 @@ enum class PipelineType {
     Text, ///< Text rendering with font atlas
 
     // Effect pipelines
-    Particle, ///< HDR particles (instanced; particle.vert + particle.frag, ONE/ONE additive)
+    Particle, ///< HDR particles (instanced; particle.vert + particle.frag; blend configured
+              ///< (SRC_ALPHA, ONE) — the fragment shader writes alpha 1.0, so the effective
+              ///< color blend is (ONE, ONE) additive)
     Grass,    ///< Instanced grass rendering
 
     // Instanced rendering pipelines
@@ -44,16 +47,28 @@ enum class PipelineType {
     ShadowModel,        ///< Shadow depth pass for static models
     ShadowSkinnedModel, ///< Shadow depth pass for skinned models
     ShadowTerrain,      ///< Shadow depth pass for terrain
+    LocalShadowClear,   ///< Fullscreen depth clear of one local-shadow atlas tile
+                        ///< (viewport depth range pinned to [1,1]; compare ALWAYS)
 
     // Post-processing pipelines (fullscreen triangle, no vertex input)
-    SSAO,            ///< SSAO ambient occlusion calculation
-    GTAO,            ///< GTAO ambient occlusion calculation
+    GTAO,            ///< GTAO (horizon-based) ambient occlusion from prepass depth
+    GTAOTemporal,    ///< GTAO temporal accumulation (velocity reprojection + depth reject)
+    GTAOUpsample,    ///< GTAO joint-bilateral upsample to the full-res R8 AO texture
     BlurAO,          ///< Bilateral blur for AO
-    Composite,       ///< Final composite (color * AO + bloom) to swapchain
+    Composite,       ///< Final composite (scene + bloom + fog, tonemap) to swapchain
     BloomDownsample, ///< Bloom brightness extract + downsample
     BloomUpsample,   ///< Bloom tent-filter upsample (additive accumulate)
     VolumetricFog,   ///< Volumetric fog with god rays
     Fxaa,            ///< FXAA 3.11 on the LDR composite output -> swapchain
+    TaaResolve,      ///< TAA resolve: HDR scene + history + velocity + depth -> new history
+    TaaSharpen,      ///< Post-TAA unsharp mask, resolved history -> HDR scene target
+
+    // IBL prefilter pipelines (fullscreen triangle into one cubemap face/mip;
+    // render::IBL drives them — see render/ibl.hpp).
+    SkyCapture,           ///< Procedural sky radiance -> capture cube face (RGBA16F)
+    IblSpecularPrefilter, ///< GGX importance-sampled prefilter of the capture cube, per mip
+    IblIrradiance,        ///< Cosine-hemisphere irradiance convolution of the capture cube
+    IblBrdfLut,           ///< Karis split-sum BRDF LUT (RG16F, rendered once at init)
 
     // Model-family material variants for glTF flags: DoubleSided disables
     // back-face culling; Blend enables alpha blending (depth test on, depth
@@ -65,6 +80,52 @@ enum class PipelineType {
     SkinnedModelBlend,            ///< Skinned models, alphaMode BLEND
     SkinnedModelBlendDoubleSided, ///< Skinned models, BLEND + doubleSided
     InstancedModelDoubleSided,    ///< Instanced static models, doubleSided
+
+    // Depth-prepass pipelines: position-only vertex work, velocity (RG16F)
+    // color target + scene depth, reversed-Z GREATER_OR_EQUAL with depth
+    // writes ON. OPAQUE geometry uses the position-only variants; MASK
+    // geometry uses the *Masked alpha-tested variants below (BLEND keeps
+    // its forward depth behavior).
+    DepthPrepassModel,                    ///< Prepass: static models
+    DepthPrepassModelDoubleSided,         ///< Prepass: static models, doubleSided
+    DepthPrepassSkinnedModel,             ///< Prepass: skinned models (curr + prev palettes)
+    DepthPrepassSkinnedModelDoubleSided,  ///< Prepass: skinned models, doubleSided
+    DepthPrepassInstancedModel,           ///< Prepass: instanced models
+    DepthPrepassInstancedModelDoubleSided,///< Prepass: instanced models, doubleSided
+    DepthPrepassTerrain,                  ///< Prepass: terrain
+    DepthPrepassGrass,                    ///< Prepass: grass blades
+
+    // "DepthEqual" forward variants for geometry whose depth was laid down by
+    // the prepass: depth test EQUAL, depth writes OFF, otherwise identical to
+    // their base pipeline. MASK/BLEND/skybox/particles keep GREATER_OR_EQUAL.
+    ModelDepthEqual,                   ///< Static models after prepass
+    ModelDoubleSidedDepthEqual,        ///< Static models, doubleSided, after prepass
+    SkinnedModelDepthEqual,            ///< Skinned models after prepass
+    SkinnedModelDoubleSidedDepthEqual, ///< Skinned models, doubleSided, after prepass
+    InstancedModelDepthEqual,          ///< Instanced models after prepass
+    InstancedModelDoubleSidedDepthEqual,///< Instanced models, doubleSided, after prepass
+    TerrainDepthEqual,                 ///< Terrain after prepass
+    GrassDepthEqual,                   ///< Grass after prepass
+
+    DepthPrepassModelMasked,           ///< Static MASK meshes (alpha-tested prepass, no cull)
+    DepthPrepassInstancedModelMasked,  ///< Instanced MASK meshes (alpha-tested prepass, no cull)
+
+    Water,                             ///< Water surface (own pass after opaques + skybox)
+
+    // Count for iteration
+    Count
+};
+
+/**
+ * @brief Compute pipeline enumeration (managed alongside the graphics
+ * pipelines: same cache, eager preload and hot-reload paths).
+ * Compute shaders are `{name}.comp.hlsl` (entry `CSMain`) compiled to
+ * `.comp.spv` — see gpu_compute.hpp for the binding conventions.
+ */
+enum class ComputePipelineType {
+    ExposureHistogram, ///< 256-bin log2-luminance histogram of the HDR scene (16x16 tiles, LDS-merged)
+    ExposureAdapt,     ///< Histogram reduce -> target EV -> temporal adaptation (single workgroup)
+    WaterSim,          ///< Wave-equation water simulation substep (ping-pong RG16F state)
 
     // Count for iteration
     Count
@@ -103,10 +164,14 @@ inline const char* pipeline_type_to_string(PipelineType type) {
             return "ShadowSkinnedModel";
         case PipelineType::ShadowTerrain:
             return "ShadowTerrain";
-        case PipelineType::SSAO:
-            return "SSAO";
+        case PipelineType::LocalShadowClear:
+            return "LocalShadowClear";
         case PipelineType::GTAO:
             return "GTAO";
+        case PipelineType::GTAOTemporal:
+            return "GTAOTemporal";
+        case PipelineType::GTAOUpsample:
+            return "GTAOUpsample";
         case PipelineType::BlurAO:
             return "BlurAO";
         case PipelineType::Composite:
@@ -119,6 +184,18 @@ inline const char* pipeline_type_to_string(PipelineType type) {
             return "VolumetricFog";
         case PipelineType::Fxaa:
             return "Fxaa";
+        case PipelineType::TaaResolve:
+            return "TaaResolve";
+        case PipelineType::TaaSharpen:
+            return "TaaSharpen";
+        case PipelineType::SkyCapture:
+            return "SkyCapture";
+        case PipelineType::IblSpecularPrefilter:
+            return "IblSpecularPrefilter";
+        case PipelineType::IblIrradiance:
+            return "IblIrradiance";
+        case PipelineType::IblBrdfLut:
+            return "IblBrdfLut";
         case PipelineType::ModelDoubleSided:
             return "ModelDoubleSided";
         case PipelineType::ModelBlend:
@@ -133,6 +210,60 @@ inline const char* pipeline_type_to_string(PipelineType type) {
             return "SkinnedModelBlendDoubleSided";
         case PipelineType::InstancedModelDoubleSided:
             return "InstancedModelDoubleSided";
+        case PipelineType::DepthPrepassModel:
+            return "DepthPrepassModel";
+        case PipelineType::DepthPrepassModelDoubleSided:
+            return "DepthPrepassModelDoubleSided";
+        case PipelineType::DepthPrepassSkinnedModel:
+            return "DepthPrepassSkinnedModel";
+        case PipelineType::DepthPrepassSkinnedModelDoubleSided:
+            return "DepthPrepassSkinnedModelDoubleSided";
+        case PipelineType::DepthPrepassInstancedModel:
+            return "DepthPrepassInstancedModel";
+        case PipelineType::DepthPrepassInstancedModelDoubleSided:
+            return "DepthPrepassInstancedModelDoubleSided";
+        case PipelineType::DepthPrepassTerrain:
+            return "DepthPrepassTerrain";
+        case PipelineType::DepthPrepassGrass:
+            return "DepthPrepassGrass";
+        case PipelineType::ModelDepthEqual:
+            return "ModelDepthEqual";
+        case PipelineType::ModelDoubleSidedDepthEqual:
+            return "ModelDoubleSidedDepthEqual";
+        case PipelineType::SkinnedModelDepthEqual:
+            return "SkinnedModelDepthEqual";
+        case PipelineType::SkinnedModelDoubleSidedDepthEqual:
+            return "SkinnedModelDoubleSidedDepthEqual";
+        case PipelineType::InstancedModelDepthEqual:
+            return "InstancedModelDepthEqual";
+        case PipelineType::InstancedModelDoubleSidedDepthEqual:
+            return "InstancedModelDoubleSidedDepthEqual";
+        case PipelineType::TerrainDepthEqual:
+            return "TerrainDepthEqual";
+        case PipelineType::GrassDepthEqual:
+            return "GrassDepthEqual";
+        case PipelineType::DepthPrepassModelMasked:
+            return "DepthPrepassModelMasked";
+        case PipelineType::DepthPrepassInstancedModelMasked:
+            return "DepthPrepassInstancedModelMasked";
+        case PipelineType::Water:
+            return "Water";
+        default:
+            return "Unknown";
+    }
+}
+
+/**
+ * @brief Convert compute pipeline type to string for debugging
+ */
+inline const char* compute_pipeline_type_to_string(ComputePipelineType type) {
+    switch (type) {
+        case ComputePipelineType::ExposureHistogram:
+            return "ExposureHistogram";
+        case ComputePipelineType::ExposureAdapt:
+            return "ExposureAdapt";
+        case ComputePipelineType::WaterSim:
+            return "WaterSim";
         default:
             return "Unknown";
     }
@@ -142,19 +273,30 @@ inline const char* pipeline_type_to_string(PipelineType type) {
  * @brief Registry for managing and caching GPU pipelines
  *
  * The PipelineRegistry provides a central location for creating and caching
- * all graphics pipelines used by the renderer. It handles:
- * - Lazy pipeline creation on first access
+ * all graphics + compute pipelines used by the renderer. It handles:
+ * - Eager pre-creation of the full static set (preload_all_pipelines)
  * - Pipeline caching to avoid recreation
  * - Shader compilation and management
  * - Proper resource cleanup on shutdown
  *
+ * Thread-safety tiers (see docs/multithreading_plan.md §6.1):
+ * - **main-thread (asserted)**: init, shutdown, preload_all_pipelines,
+ *   invalidate_all, set_swapchain_format, enable_hot_reload,
+ *   reload_all_pipelines, and any get_pipeline/get_compute_pipeline call
+ *   that has to CREATE a pipeline (cache miss).
+ * - **worker-safe after preload**: get_pipeline/get_compute_pipeline on
+ *   already-cached entries are read-only unordered_map lookups. The intended
+ *   protocol is: preload the full enumeration at init (SceneRenderer does),
+ *   after which the hot path never mutates the cache. A cache miss after
+ *   preload is logged — it means the static enumeration is incomplete.
+ *
  * Usage:
  *   PipelineRegistry registry;
  *   registry.init(device);
+ *   registry.preload_all_pipelines();   // pre-create the full static set
  *
- *   // Get pipelines (created on demand)
+ *   // Read-only lookup on the hot path:
  *   auto* model_pipeline = registry.get_pipeline(PipelineType::Model);
- *   auto* ui_pipeline = registry.get_pipeline(PipelineType::UI);
  *
  *   // In render loop:
  *   model_pipeline->bind(render_pass);
@@ -175,7 +317,9 @@ public:
     /**
      * @brief Initialize the pipeline registry
      *
-     * Must be called before any pipelines can be retrieved.
+     * Must be called before any pipelines can be retrieved. Main-thread
+     * (asserted). Call preload_all_pipelines() afterwards (after
+     * set_swapchain_format) so hot-path lookups stay read-only.
      *
      * @param device The GPU device to create pipelines on
      * @return true on success, false on failure
@@ -183,7 +327,7 @@ public:
     [[nodiscard]] bool init(GPUDevice& device);
 
     /**
-     * @brief Shutdown and release all cached pipelines
+     * @brief Shutdown and release all cached pipelines. Main-thread (asserted).
      */
     void shutdown();
 
@@ -195,8 +339,12 @@ public:
     /**
      * @brief Get a pipeline by type
      *
-     * Pipelines are created lazily on first access. Returns nullptr if
-     * the pipeline could not be created.
+     * After preload_all_pipelines() this is a read-only cache lookup
+     * (worker-safe). A cache miss falls back to a guarded creation path:
+     * main-thread asserted, and logged when it happens after a preload
+     * (a lazy creation on the hot path means the static enumeration missed
+     * a variant — a contract violation once recording is parallel).
+     * Returns nullptr if the pipeline could not be created.
      *
      * @param type The pipeline type to retrieve
      * @return Pointer to the pipeline, or nullptr on failure
@@ -218,45 +366,88 @@ public:
     GPUPipeline* get_shadow_model_pipeline() { return get_pipeline(PipelineType::ShadowModel); }
     GPUPipeline* get_shadow_skinned_model_pipeline() { return get_pipeline(PipelineType::ShadowSkinnedModel); }
     GPUPipeline* get_shadow_terrain_pipeline() { return get_pipeline(PipelineType::ShadowTerrain); }
-    GPUPipeline* get_ssao_pipeline() { return get_pipeline(PipelineType::SSAO); }
     GPUPipeline* get_gtao_pipeline() { return get_pipeline(PipelineType::GTAO); }
+    GPUPipeline* get_gtao_temporal_pipeline() { return get_pipeline(PipelineType::GTAOTemporal); }
+    GPUPipeline* get_gtao_upsample_pipeline() { return get_pipeline(PipelineType::GTAOUpsample); }
     GPUPipeline* get_blur_ao_pipeline() { return get_pipeline(PipelineType::BlurAO); }
     GPUPipeline* get_composite_pipeline() { return get_pipeline(PipelineType::Composite); }
     GPUPipeline* get_bloom_downsample_pipeline() { return get_pipeline(PipelineType::BloomDownsample); }
     GPUPipeline* get_bloom_upsample_pipeline() { return get_pipeline(PipelineType::BloomUpsample); }
     GPUPipeline* get_volumetric_fog_pipeline() { return get_pipeline(PipelineType::VolumetricFog); }
     GPUPipeline* get_fxaa_pipeline() { return get_pipeline(PipelineType::Fxaa); }
+    GPUPipeline* get_taa_resolve_pipeline() { return get_pipeline(PipelineType::TaaResolve); }
+    GPUPipeline* get_taa_sharpen_pipeline() { return get_pipeline(PipelineType::TaaSharpen); }
+    GPUPipeline* get_sky_capture_pipeline() { return get_pipeline(PipelineType::SkyCapture); }
+    GPUPipeline* get_ibl_specular_prefilter_pipeline() { return get_pipeline(PipelineType::IblSpecularPrefilter); }
+    GPUPipeline* get_ibl_irradiance_pipeline() { return get_pipeline(PipelineType::IblIrradiance); }
+    GPUPipeline* get_ibl_brdf_lut_pipeline() { return get_pipeline(PipelineType::IblBrdfLut); }
 
     /**
-     * @brief Pre-create all pipelines
+     * @brief Get a compute pipeline by type
      *
-     * Call this during loading to create all pipelines upfront and avoid
-     * hitching during gameplay. Returns false if any pipeline fails to create.
+     * Same contract as get_pipeline: read-only lookup after preload
+     * (worker-safe), guarded main-thread-asserted creation on a miss,
+     * rebuilt by the same hot-reload/invalidation paths as the graphics
+     * pipelines. Returns nullptr if the pipeline could not be created.
+     */
+    GPUComputePipeline* get_compute_pipeline(ComputePipelineType type);
+
+    /**
+     * @brief Pre-create the full static pipeline set (graphics + compute)
+     *
+     * Main-thread (asserted). Call during loading, after set_swapchain_format.
+     * Once this returns, every enumerated PipelineType/ComputePipelineType is
+     * cached and get_pipeline()/get_compute_pipeline() are read-only lookups —
+     * this is what deletes the lazy first-touch creation race.
+     * Returns false if any pipeline fails to create.
      *
      * @return true if all pipelines created successfully
      */
     [[nodiscard]] bool preload_all_pipelines();
 
     /**
-     * @brief Get the number of cached pipelines
+     * @brief Get the number of cached pipelines (graphics + compute)
      */
-    size_t cached_pipeline_count() const { return pipelines_.size(); }
+    size_t cached_pipeline_count() const { return pipelines_.size() + compute_pipelines_.size(); }
+
+    /**
+     * @brief Total pipelines created since init (graphics + compute)
+     *
+     * Monotonic creation counter — unlike cached_pipeline_count() it is not
+     * reduced by invalidation. Lets tests (and diagnostics) verify that no
+     * lazy creation happened during a get_pipeline sequence: if the count is
+     * unchanged, every get was a pure cache lookup.
+     */
+    size_t creation_count() const { return creation_count_; }
+
+    /**
+     * @brief True once preload_all_pipelines() has completed
+     *
+     * While true, any creation inside get_pipeline/get_compute_pipeline is
+     * logged as an enumeration gap.
+     */
+    bool is_preloaded() const { return preloaded_; }
 
     /**
      * @brief Invalidate all cached pipelines
      *
-     * Call this if the swapchain format changes (e.g., window resize that
-     * changes color format). Pipelines will be recreated on next access.
+     * Main-thread (asserted). Call this if the shader binaries changed
+     * (hot reload). Follow with preload_all_pipelines() — the registry drops
+     * back to not-preloaded until then, and lookups may hit the guarded
+     * creation path.
      */
     void invalidate_all();
 
     /**
      * @brief Set the swapchain color format
      *
-     * Must be called before pipelines are created. If called after pipelines
-     * exist, only the pipelines that actually target the swapchain format
-     * (UI, Text, Composite, Fxaa) are invalidated; scene/HDR/post
+     * Main-thread (asserted). Ideally called before pipelines are created. If
+     * called after, only the pipelines that actually target the swapchain
+     * format (UI, Text, Composite, Fxaa) are affected; scene/HDR/post
      * pipelines render to fixed-format offscreen targets and stay cached.
+     * When the registry is already preloaded the affected pipelines are
+     * re-created eagerly here (not lazily on next access), so hot-path
+     * lookups stay read-only.
      */
     void set_swapchain_format(SDL_GPUTextureFormat format);
 
@@ -273,16 +464,28 @@ public:
     SDL_GPUTextureFormat get_scene_color_format() const { return scene_color_format_; }
 
     /**
+     * @brief Get the velocity (motion-vector) target format written by the
+     * depth-prepass pipelines. The SceneRenderer's velocity texture must be
+     * created with this format.
+     */
+    SDL_GPUTextureFormat get_velocity_format() const { return velocity_format_; }
+
+    /**
      * @brief Enable shader hot-reload by watching the SPIRV directory.
      *
-     * On any .spv change, all cached pipelines are invalidated and pre-loaded
-     * again. Coarse but correct; live pipelines from the previous frame are
+     * Main-thread (asserted) — like all FileWatcher entry points. On any .spv
+     * change, all cached pipelines are invalidated and eagerly pre-loaded
+     * again (the watcher applies callbacks on the main thread at the frame
+     * fence). Coarse but correct; live pipelines from the previous frame are
      * released by SDL once the in-flight commands finish.
      */
     void enable_hot_reload(core::asset::FileWatcher& watcher);
 
     /**
      * @brief Force a hot-reload pass right now (mainly for tests/diagnostics).
+     *
+     * Main-thread (asserted). Invalidates and eagerly re-creates the full
+     * set — never leaves lazy creation for the hot path.
      */
     void reload_all_pipelines();
 
@@ -292,40 +495,96 @@ public:
     const std::string& shader_path() const { return shader_path_; }
 
 private:
+    // Guarded creation path (cache-miss side of get_pipeline /
+    // get_compute_pipeline, plus the eager recreation in
+    // set_swapchain_format). Main-thread asserted; bumps creation_count_.
+    GPUPipeline* create_and_cache_pipeline(PipelineType type);
+    GPUComputePipeline* create_and_cache_compute_pipeline(ComputePipelineType type);
+
+    // Dispatch to the per-type creator (the static enumeration).
+    std::unique_ptr<GPUPipeline> create_pipeline_uncached(PipelineType type);
+    std::unique_ptr<GPUComputePipeline> create_compute_pipeline_uncached(ComputePipelineType type);
+
     // Pipeline creation methods. The model-family creators take the glTF
     // material variant flags (alphaMode BLEND -> alpha_blend, doubleSided ->
-    // no back-face culling).
-    std::unique_ptr<GPUPipeline> create_model_pipeline(bool alpha_blend = false, bool double_sided = false);
-    std::unique_ptr<GPUPipeline> create_skinned_model_pipeline(bool alpha_blend = false, bool double_sided = false);
-    std::unique_ptr<GPUPipeline> create_terrain_pipeline();
+    // no back-face culling). depth_equal selects the post-prepass forward
+    // variant (depth test EQUAL, writes off); mutually exclusive with
+    // alpha_blend (BLEND draws are excluded from the prepass).
+    std::unique_ptr<GPUPipeline> create_model_pipeline(bool alpha_blend = false, bool double_sided = false,
+                                                       bool depth_equal = false);
+    std::unique_ptr<GPUPipeline> create_skinned_model_pipeline(bool alpha_blend = false, bool double_sided = false,
+                                                               bool depth_equal = false);
+    std::unique_ptr<GPUPipeline> create_terrain_pipeline(bool depth_equal = false);
     std::unique_ptr<GPUPipeline> create_skybox_pipeline();
     std::unique_ptr<GPUPipeline> create_grid_pipeline();
     std::unique_ptr<GPUPipeline> create_ui_pipeline();
     std::unique_ptr<GPUPipeline> create_text_pipeline();
     std::unique_ptr<GPUPipeline> create_particle_pipeline();
-    std::unique_ptr<GPUPipeline> create_grass_pipeline();
-    std::unique_ptr<GPUPipeline> create_instanced_model_pipeline(bool double_sided = false);
+    std::unique_ptr<GPUPipeline> create_grass_pipeline(bool depth_equal = false);
+    std::unique_ptr<GPUPipeline> create_instanced_model_pipeline(bool double_sided = false, bool depth_equal = false);
+
+    // Depth-prepass creators (position-only VS + shared velocity fragment).
+    std::unique_ptr<GPUPipeline> create_prepass_model_pipeline(bool double_sided = false);
+    std::unique_ptr<GPUPipeline> create_prepass_skinned_model_pipeline(bool double_sided = false);
+    std::unique_ptr<GPUPipeline> create_prepass_instanced_model_pipeline(bool double_sided = false);
+    std::unique_ptr<GPUPipeline> create_prepass_terrain_pipeline();
+    // Alpha-MASK prepass variants: texcoord passthrough + alpha-tested
+    // fragment so foliage writes depth (GTAO + velocity coverage). Always
+    // no-cull — MASK foliage is double-sided in practice.
+    std::unique_ptr<GPUPipeline> create_prepass_model_masked_pipeline();
+    std::unique_ptr<GPUPipeline> create_prepass_instanced_model_masked_pipeline();
+    std::unique_ptr<GPUPipeline> create_prepass_grass_pipeline();
     std::unique_ptr<GPUPipeline> create_instanced_shadow_model_pipeline();
     std::unique_ptr<GPUPipeline> create_shadow_model_pipeline();
     std::unique_ptr<GPUPipeline> create_shadow_skinned_model_pipeline();
     std::unique_ptr<GPUPipeline> create_shadow_terrain_pipeline();
-    std::unique_ptr<GPUPipeline> create_ssao_pipeline();
+    std::unique_ptr<GPUPipeline> create_local_shadow_clear_pipeline();
     std::unique_ptr<GPUPipeline> create_gtao_pipeline();
+    std::unique_ptr<GPUPipeline> create_gtao_temporal_pipeline();
+    std::unique_ptr<GPUPipeline> create_gtao_upsample_pipeline();
     std::unique_ptr<GPUPipeline> create_blur_ao_pipeline();
     std::unique_ptr<GPUPipeline> create_composite_pipeline();
     std::unique_ptr<GPUPipeline> create_bloom_downsample_pipeline();
     std::unique_ptr<GPUPipeline> create_bloom_upsample_pipeline();
     std::unique_ptr<GPUPipeline> create_volumetric_fog_pipeline();
     std::unique_ptr<GPUPipeline> create_fxaa_pipeline();
+    std::unique_ptr<GPUPipeline> create_taa_resolve_pipeline();
+    std::unique_ptr<GPUPipeline> create_taa_sharpen_pipeline();
+    std::unique_ptr<GPUPipeline> create_sky_capture_pipeline();
+    std::unique_ptr<GPUPipeline> create_ibl_specular_prefilter_pipeline();
+    std::unique_ptr<GPUPipeline> create_ibl_irradiance_pipeline();
+    std::unique_ptr<GPUPipeline> create_ibl_brdf_lut_pipeline();
+    std::unique_ptr<GPUPipeline> create_water_pipeline();
+
+    // Compute pipeline creators (declared ComputeResources are validated
+    // against SPIR-V reflection at creation — see gpu_compute.hpp).
+    std::unique_ptr<GPUComputePipeline> create_exposure_histogram_pipeline();
+    std::unique_ptr<GPUComputePipeline> create_exposure_adapt_pipeline();
+    std::unique_ptr<GPUComputePipeline> create_water_sim_pipeline();
 
     GPUDevice* device_ = nullptr;
     SDL_GPUTextureFormat swapchain_format_ = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
     // HDR scene target format: lighting/bloom/fog compute in linear HDR, composite tonemaps.
     SDL_GPUTextureFormat scene_color_format_ = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
     SDL_GPUTextureFormat depth_format_ = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    // Motion-vector target written by the depth-prepass pipelines (TAA input).
+    SDL_GPUTextureFormat velocity_format_ = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
 
-    // Pipeline cache
+    // Pipeline caches (compute shares the graphics invalidation/hot-reload
+    // lifecycle; cached_pipeline_count() counts both). Mutated only on the
+    // main thread (asserted on every insert/erase path); read-only lookups
+    // are worker-safe once preloaded_ is true and no mutation is in flight.
     std::unordered_map<PipelineType, std::unique_ptr<GPUPipeline>> pipelines_;
+    std::unordered_map<ComputePipelineType, std::unique_ptr<GPUComputePipeline>> compute_pipelines_;
+
+    // Monotonic count of pipelines created since init (see creation_count()).
+    // Plain size_t, not atomic: every writer is on the main-thread-asserted
+    // creation path.
+    size_t creation_count_ = 0;
+
+    // True after preload_all_pipelines(); reset by invalidate_all/shutdown.
+    // While true, a cache miss in get_*_pipeline logs an enumeration gap.
+    bool preloaded_ = false;
 
     // Shader manager for loading shaders from files
     std::unique_ptr<ShaderManager> shader_manager_;

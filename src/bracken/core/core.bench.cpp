@@ -28,8 +28,9 @@ std::string make_string(std::size_t len) {
 }
 
 // Init the shared JobSystem exactly once across all benchmark runs. The
-// singleton has no re-init path, so a static guard keeps repeated benchmark
-// invocations (and multiple grain Args) from touching it more than once.
+// singleton does support shutdown()+init() re-initialization (pinned by the
+// InitAfterShutdownReinitializes test); the static guard simply avoids
+// redundant init calls across benchmark repetitions and multiple grain Args.
 void ensure_job_system() {
     static bool initialized = [] {
         if (!JobSystem::instance().is_initialized()) {

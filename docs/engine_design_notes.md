@@ -48,11 +48,96 @@ Gameplay concepts were deliberately hoisted out of the engine:
 - Core utilities live in `core/`: `logger` (over `SDL_Log`, thread-safe sinks,
   `std::format`), `assert`, `result`, `handle`, `hash` (`StringId`, fnv1a).
 
-Keep it this way. No combat/inventory/skill/ECS/physics types in engine headers.
+Keep it this way. No combat/inventory/skill/ECS types in engine headers.
+(Physics is no longer on that list — it became engine infrastructure by the
+2026-07-21 decision record below; the boundary it must respect is the same
+one everything else respects: no *gameplay* concepts, and no backend types
+in public headers.)
+
+---
+
+## Decision record — 2026-07-21: rigid-body physics as engine infrastructure
+
+**Decision.** Bracken ships a physics module: `src/bracken/physics/` —
+`bracken::physics::PhysicsWorld`, a glm-only pimpl over vendored **Jolt
+Physics v5.2.0**. This revises the original extraction-era scope ("no
+physics"), by owner decision. The scope line moves, the principle doesn't:
+physics is *engine* infrastructure (bodies, shapes, impulses, queries — the
+same altitude as rendering and animation), while gameplay concepts (combat,
+inventory, ECS) stay out. Jolt is linked `PRIVATE`; no `JPH::` type appears
+in a public bracken header, so the backend remains a swappable
+implementation detail.
+
+**Why a job bridge instead of Jolt's thread pool.** Jolt ships
+`JobSystemThreadPool`, which would spawn its own N workers — exactly the
+oversubscription the multithreading plan forbids (§7: **one pool owns the
+cores**; the risk table lists "pool + FileWatcher + driver threads" as the
+trap). So `physics/jolt_job_system.{hpp,cpp}` implements
+`JPH::JobSystemWithBarrier` over `core::jobs::JobSystem`: Jolt's step jobs
+become bracken jobs (pooled `FixedSizeFreeList` records,
+`Execute()`/`Release()` thunks matching the thread pool's reference
+discipline). This composes with the pipelined frame for free — a
+`PhysicsWorld::update()` inside the sim stage fans its Jolt jobs onto the
+same workers the sim already runs on, bracken's helping waits keep nested
+fork-join deadlock-free, and Jolt's own barrier wait executes ready jobs on
+the calling thread, so even a 1-worker pool makes progress. No second pool,
+no new parking/wake protocol, no new lock-free structure to get subtly
+wrong.
+
+**Boundaries that hold.** `PhysicsWorld` is tier owned/sim-stage (single
+owner, no GPU/main-thread coupling); determinism is pinned by test
+(bit-identical twin worlds after 120 steps, any worker count); the
+fixed-step accumulator clamps overload debt instead of spiraling. The
+module follows the boot-time `bool init()` + log error-handling convention.
+
+---
+
+## Decision record — 2026-07-18: natively multithreaded engine
+
+**Decision.** Bracken is rebuilt as a natively multithreaded engine — the
+Frostbite model: an always-on worker pool, a frame pipelined through immutable
+per-frame snapshots, one code path at every worker count.
+[docs/multithreading_plan.md](multithreading_plan.md) is the plan of record;
+Phase 1 (always-on pool with lock-free internals, `TaskGroup`,
+owner-asserted arenas, pre-created pipeline/shader/model tables, the
+thread-safety tier table, the TSan lane) has landed.
+
+**What this supersedes.** The "default to serial / infrastructure without
+load" guidance below, *as it applies to threading only*. That guidance was
+written for an engine with no parallel workload and no mandate; the product
+direction now is a modern-engine architecture, and "optionally parallel"
+would mean maintaining two code paths forever — the one thing the plan
+forbids. `Application::init_engine` now initializes the pool
+unconditionally (`BRACKEN_WORKERS` env; `=1` is the single-worker debug
+mode, same code, one worker), and the old objections were fixed rather than
+argued with: idle workers no longer wake on a 50 ms poll to contend on a
+shared mutex — they park on `std::atomic::wait` and cost ~zero when quiet.
+
+**What still stands from the superseded lesson** (these sub-lessons govern
+every phase of the migration):
+
+- **Measure.** Each phase must win at scale and not regress the 1-character
+  smoke scene; grains are sized by measurement, not vibes.
+- **Grain guards.** `parallel_for` still runs tiny counts inline on the
+  caller — that is granularity control inside the one code path, not a
+  serial mode.
+- **The lambda-capture container bug.** The historical never-diagnosed
+  libstdc++ bounds assert (an entity container snapshotted by reference into
+  worker lambdas) is why the end-state API takes caller-stable ranges and
+  engine-owned builder lanes — the pattern that caused it becomes unwritable,
+  not merely discouraged.
+- The non-threading clauses — FileWatcher opt-in, FrameAllocator
+  by-measurement, keep the engine game-agnostic, diagnose-don't-patch — are
+  untouched. `render_graph/` stays unwired until Phase 5 wires it as the
+  frame scheduler with a measured recording workload.
 
 ---
 
 ## The "infrastructure without load" trap
+
+> **Superseded for threading (2026-07-18)** — see the decision record above.
+> The job-system bullet below is retained as history; the pool is now
+> always-on. The lesson still binds every *other* kind of infrastructure.
 
 The single most important lesson from building this engine. Several subsystems
 were added with the right *shape* for a production engine but no *workload* to
@@ -64,29 +149,34 @@ Subsystems in this tree that this lesson applies to — they exist and are corre
 but should stay **off / serial / unwired** until a measured workload justifies
 them:
 
-- **`core/jobs/` JobSystem + `parallel_for`**: idle workers still wake to look
-  for steals and contend on a shared mutex. With near-zero parallel work this is
-  pure overhead. Prefer lazy init (spawn workers only when a caller actually
-  submits work above the parallel threshold). Default to serial; parallelize
-  only skinning/culling/particles in the thousands.
+- **`core/jobs/` JobSystem + `parallel_for`** *(superseded 2026-07-18 — see
+  the decision record)*: the historical objection was that idle workers woke
+  every 50 ms to look for steals and contend on a shared mutex — pure
+  overhead with near-zero parallel work. The Phase-1 rewrite removed the
+  overhead instead of the pool: lock-free deques, `atomic::wait` parking
+  (~zero cost when quiet), always-on by product direction.
 - **`core/asset/` FileWatcher**: a background thread doing recursive directory
   iteration + `stat()` on a poll interval is real DX value *only while actively
   iterating on shaders/models*. Gate it behind an opt-in flag; default OFF.
-- **`render_graph/`**: a correct pass scheduler (topo-sort, transient pool,
-  debug-group integration), but **not wired into `scene_renderer.cpp`** — passes
+- **`render_graph/`**: a correct pass scheduler (topo-sort, transient texture
+  pool with lifetime-based reuse), but **not wired into `scene_renderer.cpp`** — passes
   are issued directly. The graph's value materializes only when the pass count
-  grows past hand-tractable size, or for TAA history / transient aliasing /
-  multi-camera. Keep it in tree (the tests are valuable); don't route the
-  renderer through it without a reason.
+  grows past hand-tractable size, or for transient aliasing / multi-camera.
+  (TAA and GTAO both landed with hand-managed double-buffered histories and
+  did not need it — history buffers are persistent, which is exactly what a
+  transient pool doesn't manage.) Keep it in tree (the tests are valuable);
+  don't route the renderer through it without a reason.
 - **`memory/` FrameAllocator**: replacing capacity-stable `std::vector`s with it
   yielded the same performance and more bookkeeping. Use it where allocation
   churn is actually measured, not preemptively.
 
 `parallel_for` is **not free** even with a serial fallback below threshold —
 dispatch + wait + snapshot patterns add fixed overhead. For a handful of
-entities, just iterate. (A historical bug: snapshotting an entity container by
+entities, just iterate — the grain guards exist so that this stays true with
+an always-on pool. (A historical bug: snapshotting an entity container by
 reference into worker lambdas tripped a libstdc++ vector bounds assertion that
-was never cleanly diagnosed. Default to serial.)
+was never cleanly diagnosed. The multithreading plan's builder-lane API is
+designed so this pattern cannot be written.)
 
 ---
 
@@ -96,7 +186,10 @@ Re-read before adding any cross-cutting infrastructure:
 
 1. **Infrastructure is added when there's a workload it absorbs.**
    "Future-proof" is a justification trap.
-2. **Default to serial.** Parallelize only when measured wall-clock improves.
+2. **Default to serial** *(superseded for threading, 2026-07-18 — see the
+   decision record; the engine is natively multithreaded with one code path)*.
+   The surviving kernel: parallelize a given loop only when measured
+   wall-clock improves — grain guards keep tiny counts inline.
 3. **Default to off.** Watchers, profilers, hot-reloaders — opt-in.
 4. **Diagnose, don't patch.** If a fix introduces a regression, revert and
    understand. Don't stack patches.
@@ -110,19 +203,24 @@ Re-read before adding any cross-cutting infrastructure:
 ## Forward-looking rendering work (when budget permits)
 
 Real engine features that push toward "envy of engine developers" once the
-foundation is stable:
+foundation is stable. Items 1–3 **landed in the 2026-07 graphics feature
+campaign** (see `docs/audits/RESOLUTIONS.md`, 2026-07-12 entry) and are kept
+here for the record:
 
-1. **IBL** — pre-filtered cubemap + split-sum BRDF LUT. The PBR path already has
-   the analytic stand-in to upgrade: `ambientPBR` in `shaders/pbr.hlsli`
-   (hemisphere irradiance for diffuse, Karis `EnvBRDFApprox` for specular).
-   Replace the hemisphere lerp with an irradiance-map sample and the Karis fit
-   with prefiltered-cubemap + BRDF-LUT lookups.
-2. **Per-light shadow atlas** for point/spot lights (only the directional sun
-   casts today). Clustered forward+ is already in place, so this slots in.
-3. **TAA + motion vectors** — the biggest remaining AA-quality gap. This is also
-   the first concrete reason to wire up `render_graph/` (history buffers).
-4. **Compute-shader-driven cluster light culling** — the CPU-side bin is fine for
-   v1, but for >>100 lights, GPU-driven is the way.
+1. **IBL** — ✅ landed: `render::IBL` prefilters the procedural sky into
+   irradiance + GGX-specular cubemaps and a split-sum BRDF LUT, amortized
+   over frames on sky changes; `ambientIBL` in `shaders/pbr.hlsli` replaces
+   the hemisphere ambient when `ibl_enabled` (which remains the fallback).
+2. **Per-light shadow atlas** for point/spot lights — ✅ landed:
+   `render::lighting::LocalShadowMap`/`LocalShadowSelector`, a budgeted
+   cached-tile 8×8 D32 atlas, host opt-in per light via `casts_shadows`.
+3. **TAA + motion vectors** — ✅ landed: depth prepass writes RG16F velocity;
+   `render::TAA` resolves in HDR pre-bloom. Notably it did NOT need
+   `render_graph/` — the history buffers are persistent and hand-managed.
+4. **Compute-shader-driven cluster light culling** — still future: the
+   CPU-side bin is fine for v1, but for >>100 lights, GPU-driven is the way
+   (the compute foundation — `gpu_compute.hpp`, used by the histogram auto
+   exposure — is now in place to build on).
 
 ### Tooling
 - **Tracy-by-default in dev builds** — make `BRACKEN_ENABLE_TRACY=ON` the default for

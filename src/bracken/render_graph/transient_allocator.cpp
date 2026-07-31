@@ -23,9 +23,8 @@ TransientAllocator::~TransientAllocator() {
     shutdown();
 }
 
-bool TransientAllocator::init(gpu::GPUDevice& device) {
+void TransientAllocator::init(gpu::GPUDevice& device) {
     device_ = &device;
-    return true;
 }
 
 void TransientAllocator::shutdown() {
@@ -43,6 +42,15 @@ SDL_GPUTexture* TransientAllocator::acquire_texture(const TextureDesc& desc, con
             ++reuses_;
             return e.tex;
         }
+    }
+    // Test seam: simulate SDL_CreateGPUTexture failure once the budget runs out.
+    if (create_budget_ == 0) {
+        BRACKEN_LOG_ERROR("rg", "TransientAllocator: texture create budget exhausted (test seam) for '{}'",
+                          debug_name ? debug_name : "(unnamed)");
+        return nullptr;
+    }
+    if (create_budget_ > 0) {
+        --create_budget_;
     }
     if (!device_) {
         // Test mode: hand out a sentinel pointer keyed by bucket size so reuse logic still works.

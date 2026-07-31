@@ -24,8 +24,15 @@ public:
     const Arena& last_frame() const noexcept { return arenas_[1 - current_]; }
 
     // Flip the active arena and reset the new "this frame" so old contents are recycled.
+    //
+    // Owner handoff (debug builds): the newly-active arena may still be bound
+    // to whichever thread filled it two frames ago, so swap() force-rebinds it
+    // to the calling thread before reset(); reset() then re-opens the binding,
+    // making the next allocating thread the new owner (see Arena's owner-thread
+    // enforcement). Both calls are no-ops in release builds.
     void swap() {
         current_ = 1 - current_;
+        arenas_[current_].rebind_owner();
         arenas_[current_].reset();
     }
 

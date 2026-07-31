@@ -1,5 +1,6 @@
 #include <benchmark/benchmark.h>
 
+#include "bracken/core/jobs/job_system.hpp"
 #include "bracken/render/lighting/light.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
 #include "bracken/scene/camera_state.hpp"
@@ -84,48 +85,97 @@ std::vector<SpotLight> make_spot_lights(std::size_t count, uint32_t seed) {
 // never touch the GPU buffers (see light_cluster.test.cpp), so setup stays
 // GPU-free. Reusing one grid across iterations matches steady-state frame
 // behavior: cluster AABBs are cached while the projection is unchanged.
+//
+// Second arg = worker count of a caller-owned JobSystem driving the binning
+// fan-out; 0 leaves the pool uninitialized (the inline single-chunk path), so
+// serial vs parallel build() is directly comparable.
 static void BM_ClusterBuild(benchmark::State& state) {
     const std::size_t light_count = static_cast<std::size_t>(state.range(0));
+    const unsigned workers = static_cast<unsigned>(state.range(1));
     const std::vector<PointLight> lights = make_point_lights(light_count, 12345);
     const CameraState cam = make_camera();
+    bracken::core::jobs::JobSystem js;
+    if (workers > 0) {
+        js.init(workers);
+    }
     ClusterGrid grid;
 
     for (auto _ : state) {
-        grid.begin_frame(cam, SCREEN_W, SCREEN_H, NEAR_PLANE, FAR_PLANE);
+        grid.begin_frame(js, cam, SCREEN_W, SCREEN_H, NEAR_PLANE, FAR_PLANE);
         for (const auto& p : lights) {
             grid.add_point_light(p);
         }
-        grid.build();
+        grid.build(js);
         benchmark::DoNotOptimize(grid.cluster_offsets().data());
         benchmark::DoNotOptimize(grid.light_indices().data());
         benchmark::ClobberMemory();
     }
     state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(light_count));
 }
-BENCHMARK(BM_ClusterBuild)->Arg(16)->Arg(64)->Arg(256);
+BENCHMARK(BM_ClusterBuild)
+    ->ArgNames({"lights", "workers"})
+    ->Args({16, 0})
+    ->Args({64, 0})
+    ->Args({256, 0})
+    ->Args({64, 4})
+    ->Args({256, 4})
+    ->Args({256, 8});
 
 // Mixed point + spot workload (half each) — exercises both header types and
-// the per-type payload lookup in build().
+// the per-type payload lookup in build(). Same (lights, workers) shape as
+// BM_ClusterBuild.
 static void BM_ClusterBuildMixed(benchmark::State& state) {
     const std::size_t light_count = static_cast<std::size_t>(state.range(0));
+    const unsigned workers = static_cast<unsigned>(state.range(1));
     const std::vector<PointLight> points = make_point_lights(light_count / 2, 12345);
     const std::vector<SpotLight> spots = make_spot_lights(light_count - light_count / 2, 67890);
     const CameraState cam = make_camera();
+    bracken::core::jobs::JobSystem js;
+    if (workers > 0) {
+        js.init(workers);
+    }
     ClusterGrid grid;
 
     for (auto _ : state) {
-        grid.begin_frame(cam, SCREEN_W, SCREEN_H, NEAR_PLANE, FAR_PLANE);
+        grid.begin_frame(js, cam, SCREEN_W, SCREEN_H, NEAR_PLANE, FAR_PLANE);
         for (const auto& p : points) {
             grid.add_point_light(p);
         }
         for (const auto& s : spots) {
             grid.add_spot_light(s);
         }
-        grid.build();
+        grid.build(js);
         benchmark::DoNotOptimize(grid.cluster_offsets().data());
         benchmark::DoNotOptimize(grid.light_indices().data());
         benchmark::ClobberMemory();
     }
     state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(light_count));
 }
-BENCHMARK(BM_ClusterBuildMixed)->Arg(16)->Arg(64)->Arg(256);
+BENCHMARK(BM_ClusterBuildMixed)
+    ->ArgNames({"lights", "workers"})
+    ->Args({16, 0})
+    ->Args({64, 0})
+    ->Args({256, 0})
+    ->Args({256, 4});
+
+// Memoized cluster-AABB rebuild (compute_cluster_bounds), forced every
+// iteration by alternating two projections. Arg = worker count (0 = inline).
+static void BM_ClusterBounds(benchmark::State& state) {
+    const unsigned workers = static_cast<unsigned>(state.range(0));
+    bracken::core::jobs::JobSystem js;
+    if (workers > 0) {
+        js.init(workers);
+    }
+    const CameraState cam_a = make_camera(60.0f);
+    const CameraState cam_b = make_camera(65.0f);
+    ClusterGrid grid;
+    bool flip = false;
+
+    for (auto _ : state) {
+        grid.begin_frame(js, flip ? cam_b : cam_a, SCREEN_W, SCREEN_H, NEAR_PLANE, FAR_PLANE);
+        flip = !flip;
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(CLUSTER_COUNT));
+}
+BENCHMARK(BM_ClusterBounds)->ArgName("workers")->Arg(0)->Arg(4);

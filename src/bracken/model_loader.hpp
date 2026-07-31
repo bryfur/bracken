@@ -56,7 +56,10 @@ struct PBRMaterial {
     float alpha_cutoff = 0.5f;
     bool double_sided = false;
     // True when occlusionTexture shares the metallic-roughness image (glTF ORM
-    // packing): AO lives in the R channel of metallic_roughness_texture.
+    // packing): AO lives in the R channel of metallic_roughness_texture. This
+    // is the ONLY supported occlusion layout — a standalone (non-ORM) AO map
+    // has no sampler binding in the model shaders, so the loader drops it with
+    // a warning. See docs/skinned_mesh_format.md.
     bool has_packed_occlusion = false;
     // CPU-side raw pixels for deferred GPU upload; freed after upload_to_gpu.
     std::vector<uint8_t> metallic_roughness_pixels;
@@ -65,15 +68,11 @@ struct PBRMaterial {
     std::vector<uint8_t> normal_pixels;
     int normal_width = 0;
     int normal_height = 0;
-    std::vector<uint8_t> occlusion_pixels;
-    int occlusion_width = 0;
-    int occlusion_height = 0;
     std::vector<uint8_t> emissive_pixels;
     int emissive_width = 0;
     int emissive_height = 0;
     std::unique_ptr<gpu::GPUTexture> metallic_roughness_texture;
     std::unique_ptr<gpu::GPUTexture> normal_texture;
-    std::unique_ptr<gpu::GPUTexture> occlusion_texture;
     std::unique_ptr<gpu::GPUTexture> emissive_texture;
 };
 
@@ -90,7 +89,6 @@ struct Mesh {
     bool uploaded = false;
 
     bool has_texture = false;
-    uint32_t base_color = 0xFFFFFFFF;
     bool is_skinned = false; // True if using skinned vertices
 
     // Perf flags.
@@ -167,11 +165,28 @@ struct Model {
 
 class ModelLoader {
 public:
+    /// Parse a .glb into `model`. Pure CPU work on caller-owned data — no
+    /// shared state, thread-agnostic (Phase 6 streaming will run it on jobs).
     [[nodiscard]] static bool load_glb(const std::string& path, Model& model);
+    /// Create GPU buffers/textures for every un-uploaded mesh and free the
+    /// CPU-side copies. Main-thread tier (asserted): GPU resource creation.
     static void upload_to_gpu(gpu::GPUDevice& device, Model& model);
+    /// Release the model's GPU resources. Main-thread tier (asserted).
     static void free_gpu_resources(Model& model);
 };
 
+/**
+ * @brief Owns all loaded models and their GPU resources.
+ *
+ * Thread-safety tiers (see docs/multithreading_plan.md §6.1):
+ * - **main-thread (asserted)**: every mutation path — load_model,
+ *   register_model, reload_model, enable_hot_reload, unload_all (set_device
+ *   belongs to init and is main-thread by convention).
+ * - **worker-safe after load**: get_model/get_handle lookups are const and
+ *   safe from any thread once loading is complete and no mutation (including
+ *   a hot-reload apply, which rewrites model contents in place) is in flight.
+ *   The hot-reload fence guarantees that quiescence in the pipelined frame.
+ */
 class ModelManager {
 public:
     ModelManager();
@@ -186,31 +201,40 @@ public:
 
     void set_device(gpu::GPUDevice* device) { device_ = device; }
 
-    /// Load a model and return its handle (INVALID_MODEL_HANDLE on failure)
+    /// Load a model and return its handle (INVALID_MODEL_HANDLE on failure).
+    /// Main-thread (asserted).
     ModelHandle load_model(const std::string& name, const std::string& path);
 
-    /// O(1) lookup by handle
+    /// O(1) lookup by handle. Const-safe after load (worker-safe when no
+    /// mutation is in flight).
     Model* get_model(ModelHandle handle) const;
 
-    /// Name-based lookup (backward compat, uses hash map)
+    /// Name-based lookup (backward compat, uses hash map). Const-safe after
+    /// load.
     Model* get_model(const std::string& name) const;
 
-    /// Resolve a name to a handle (INVALID_MODEL_HANDLE if not found)
+    /// Resolve a name to a handle (INVALID_MODEL_HANDLE if not found).
+    /// Const-safe after load.
     ModelHandle get_handle(const std::string& name) const;
 
     /// Register a pre-built model (e.g. procedurally generated). Takes ownership.
-    /// Uploads to GPU if device is set. Returns handle.
+    /// Uploads to GPU if device is set. Returns handle. Main-thread (asserted).
     ModelHandle register_model(const std::string& name, std::unique_ptr<Model> model);
 
-    /// Re-parse the source file and swap GPU buffers in place; the existing
-    /// ModelHandle keeps pointing at the same slot. Returns false if the file
-    /// failed to load (the existing model is left untouched).
+    /// Re-parse the source file and replace the model's contents in place:
+    /// the ModelHandle and any raw Model* previously returned by get_model
+    /// stay valid across the reload. Pointers/spans INTO the model (meshes,
+    /// animations, skeleton joints) are invalidated — re-derive them from the
+    /// Model each frame. Returns false if the file failed to load (the
+    /// existing model is left untouched). Main-thread (asserted).
     [[nodiscard]] bool reload_model(ModelHandle handle);
 
-    /// Enable hot-reload: re-load any model whose source file (.glb/.gltf) is
-    /// modified on disk.
+    /// Enable hot-reload: re-load any model whose source .glb file is
+    /// modified on disk (the loader is GLB-binary-only; there are no .gltf
+    /// models to watch). Main-thread (asserted).
     void enable_hot_reload(core::asset::FileWatcher& watcher);
 
+    /// Release every model and its GPU resources. Main-thread (asserted).
     void unload_all();
 
 private:

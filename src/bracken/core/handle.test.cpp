@@ -17,6 +17,16 @@ TEST(Handle, InvalidIsNotValid) {
     EXPECT_FALSE(h.is_valid());
 }
 
+TEST(Handle, DefaultConstructedIsInvalid) {
+    Handle<MeshTag> h{};
+    EXPECT_FALSE(h.is_valid());
+    EXPECT_EQ(h, Handle<MeshTag>::invalid());
+
+    Handle<MeshTag> plain; // default-init, not value-init
+    EXPECT_FALSE(plain.is_valid());
+    EXPECT_EQ(plain, Handle<MeshTag>::invalid());
+}
+
 TEST(Handle, EqualityCompares) {
     Handle<MeshTag> a{1, 2};
     Handle<MeshTag> b{1, 2};
@@ -31,6 +41,16 @@ TEST(Handle, HashSpecializationCompiles) {
     set.insert(Handle<MeshTag>{2, 1});
     set.insert(Handle<MeshTag>{1, 1});
     EXPECT_EQ(set.size(), 2u);
+}
+
+TEST(Handle, HashDistinguishesIndexAndGeneration) {
+    std::hash<Handle<MeshTag>> hasher;
+    // Computed via uint64_t: (generation << 32) | index — no size_t-width shift.
+    EXPECT_NE(hasher(Handle<MeshTag>{1, 1}), hasher(Handle<MeshTag>{1, 2}));
+    EXPECT_NE(hasher(Handle<MeshTag>{1, 1}), hasher(Handle<MeshTag>{2, 1}));
+    if constexpr (sizeof(size_t) >= 8) {
+        EXPECT_EQ(hasher(Handle<MeshTag>{3, 5}), (uint64_t{5} << 32) | 3u);
+    }
 }
 
 TEST(HandlePool, AcquireReturnsLiveHandle) {
@@ -84,6 +104,46 @@ TEST(HandlePool, DoubleReleaseFails) {
     auto h = pool.acquire(7);
     EXPECT_TRUE(pool.release(h));
     EXPECT_FALSE(pool.release(h));
+}
+
+TEST(HandlePool, ClearInvalidatesRetainedHandles) {
+    HandlePool<MeshTag, int> pool;
+    auto h1 = pool.acquire(10);
+    auto h2 = pool.acquire(20);
+    pool.clear();
+
+    EXPECT_EQ(pool.size(), 0u);
+    EXPECT_EQ(pool.get(h1), nullptr);
+    EXPECT_EQ(pool.get(h2), nullptr);
+    EXPECT_FALSE(pool.release(h1));
+
+    // Post-clear acquisitions reuse slots, but stale pre-clear handles must
+    // not alias them (generations survive the clear).
+    auto h3 = pool.acquire(30);
+    auto h4 = pool.acquire(40);
+    EXPECT_EQ(pool.get(h1), nullptr);
+    EXPECT_EQ(pool.get(h2), nullptr);
+    ASSERT_NE(pool.get(h3), nullptr);
+    ASSERT_NE(pool.get(h4), nullptr);
+    EXPECT_EQ(*pool.get(h3), 30);
+    EXPECT_EQ(*pool.get(h4), 40);
+    EXPECT_EQ(pool.size(), 2u);
+}
+
+TEST(HandlePool, ClearIsIdempotentAndSkipsFreeSlots) {
+    HandlePool<MeshTag, int> pool;
+    auto a = pool.acquire(1);
+    auto b = pool.acquire(2);
+    EXPECT_TRUE(pool.release(a)); // one slot already free before clear
+    pool.clear();
+    pool.clear(); // second clear must not bump generations of free slots again
+
+    EXPECT_EQ(pool.size(), 0u);
+    auto c = pool.acquire(3);
+    EXPECT_EQ(pool.get(a), nullptr);
+    EXPECT_EQ(pool.get(b), nullptr);
+    ASSERT_NE(pool.get(c), nullptr);
+    EXPECT_EQ(*pool.get(c), 3);
 }
 
 TEST(HandlePool, TagsAreTypeSafe) {

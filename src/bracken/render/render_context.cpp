@@ -154,7 +154,10 @@ void RenderContext::query_display_modes() {
     }
 
     for (int i = 0; i < count; i++) {
-        // Deduplicate by w×h — SDL may list the same resolution at different refresh rates
+        // Deduplicate by (w, h, pixel_density) — SDL may list the same
+        // resolution at different refresh rates; the first listed mode wins.
+        // All pixel densities are kept (exclusive-mode matching in
+        // set_window_mode keys on this density-inclusive triple).
         bool duplicate = false;
         for (const auto& existing : available_resolutions_) {
             if (existing.w == modes[i]->w && existing.h == modes[i]->h &&
@@ -175,12 +178,11 @@ void RenderContext::set_window_mode(int window_mode, int resolution_index) {
         return;
     }
 
-    // Fullscreen/window transitions are expensive; skip when nothing changed.
+    // Fullscreen/window transitions are expensive; skip when the request
+    // matches the last applied state.
     if (window_mode == current_window_mode_ && resolution_index == current_resolution_index_) {
         return;
     }
-    current_window_mode_ = window_mode;
-    current_resolution_index_ = resolution_index;
 
     if (window_mode == 0) {
         // Windowed
@@ -213,9 +215,26 @@ void RenderContext::set_window_mode(int window_mode, int resolution_index) {
 
         if (selected) {
             SDL_SetWindowFullscreenMode(window_, selected);
+        } else {
+            // Stale resolution_index (settings file from another monitor, or
+            // the mode list changed): fall back to borderless deterministically.
+            // Clearing the fullscreen mode also discards any exclusive mode a
+            // previous call applied — without this, SDL would keep the OLD
+            // exclusive resolution.
+            SDL_Log("RenderContext::set_window_mode: resolution_index %d matches no display mode "
+                    "(%d available); falling back to borderless fullscreen",
+                    resolution_index, static_cast<int>(available_resolutions_.size()));
+            SDL_SetWindowFullscreenMode(window_, nullptr);
+            window_mode = 1;
         }
         SDL_SetWindowFullscreen(window_, true);
     }
+
+    // Record what was actually applied — the exclusive no-match path demotes
+    // window_mode to borderless above, so a later retry of the same exclusive
+    // request is not swallowed by the change-detection early-out.
+    current_window_mode_ = window_mode;
+    current_resolution_index_ = resolution_index;
     update_viewport();
 }
 

@@ -77,7 +77,10 @@ void add_sphere(Mesh& mesh, float radius, int stacks, int sectors, const glm::ve
         for (uint32_t j = 0; j < static_cast<uint32_t>(sectors); ++j) {
             uint32_t a = i * ring + j;
             uint32_t b = a + ring;
-            mesh.indices.insert(mesh.indices.end(), {a, b, a + 1, a + 1, b, b + 1});
+            // CCW from outside (engine front face); the flat-shaded look of
+            // the emissive orbs hid an inverted winding here for a long time —
+            // the chrome sphere's mirror made it visible (N pointed inward).
+            mesh.indices.insert(mesh.indices.end(), {a, a + 1, b, a + 1, b + 1, b});
         }
     }
 }
@@ -262,11 +265,12 @@ std::unique_ptr<Model> build_character_model() {
     model->has_skeleton = true;
     model->foot_ik.init(model->skeleton);
 
-    // Body — one box per joint, bind-pose positions in model space, feet at y=0.
+    // Body — one box per joint, bind-pose positions in model space, feet at
+    // y=0. Villager palette: russet wool tunic, undyed hose, weathered boots.
     Mesh mesh;
     mesh.is_skinned = true;
-    const glm::vec4 body{0.72f, 0.54f, 0.36f, 1.0f};
-    const glm::vec4 dark{0.40f, 0.36f, 0.34f, 1.0f};
+    const glm::vec4 body{0.16f, 0.30f, 0.15f, 1.0f}; // dyed-wool green, can't read as skin
+    const glm::vec4 dark{0.28f, 0.24f, 0.19f, 1.0f};
     const glm::vec4 head{0.86f, 0.72f, 0.52f, 1.0f};
     add_skinned_box(mesh, {0, 97, 0}, {14, 10, 8}, J_HIPS, dark);
     add_skinned_box(mesh, {0, 134, 0}, {15, 20, 9}, J_SPINE, body);
@@ -299,8 +303,26 @@ std::unique_ptr<Model> build_orb_model() {
     mesh.material.roughness_factor = 0.35f;
     // HDR emissive so the orbs feed the bloom pass (bloom_threshold defaults to 1.1).
     mesh.material.emissive_factor = {2.4f, 1.7f, 0.55f};
+    // The orb is a light BULB: its point light sits at the mesh center, so if
+    // this shell cast shadows it would occlude its own light entirely
+    // (local-light shadow maps render from inside it). Emissive bulb geometry
+    // must opt out of shadow casting.
+    mesh.cast_shadows = false;
     model->meshes.push_back(std::move(mesh));
     finalize_bounds(*model, glm::vec3(-8.0f), glm::vec3(8.0f));
+    return model;
+}
+
+std::unique_ptr<Model> build_chrome_sphere_model() {
+    auto model = std::make_unique<Model>();
+    Mesh mesh;
+    add_sphere(mesh, 45.0f, 24, 32, {1.0f, 1.0f, 1.0f, 1.0f});
+    // Polished metal: with IBL on, the ambient specular term mirrors the
+    // prefiltered sky (mip 0 at this roughness), sun highlight included.
+    mesh.material.metallic_factor = 1.0f;
+    mesh.material.roughness_factor = 0.06f;
+    model->meshes.push_back(std::move(mesh));
+    finalize_bounds(*model, glm::vec3(-45.0f), glm::vec3(45.0f));
     return model;
 }
 
@@ -311,6 +333,65 @@ std::unique_ptr<Model> build_shard_model() {
     mesh.material.emissive_factor = {2.0f, 1.2f, 0.4f};
     model->meshes.push_back(std::move(mesh));
     finalize_bounds(*model, glm::vec3(-2.5f), glm::vec3(2.5f));
+    return model;
+}
+
+std::unique_ptr<Model> build_rain_streak_model() {
+    auto model = std::make_unique<Model>();
+    Mesh mesh;
+    // Two crossed vertical quads, each emitted with both windings so the
+    // streak is visible from every yaw without a double-sided pipeline.
+    // Centered on the origin; the fall direction is baked by the effect.
+    constexpr float HALF_W = 0.9f;
+    constexpr float HALF_H = 26.0f;
+    const glm::vec4 color{0.42f, 0.52f, 0.72f, 1.0f}; // dim: particles blend additively
+    const glm::vec3 axes[2] = {{1, 0, 0}, {0, 0, 1}};
+    for (const glm::vec3& axis : axes) {
+        const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
+        const glm::vec3 corners[4] = {
+            -axis * HALF_W + glm::vec3(0, -HALF_H, 0),
+            axis * HALF_W + glm::vec3(0, -HALF_H, 0),
+            axis * HALF_W + glm::vec3(0, HALF_H, 0),
+            -axis * HALF_W + glm::vec3(0, HALF_H, 0),
+        };
+        const glm::vec3 normal = glm::cross(axis, glm::vec3(0, 1, 0));
+        for (const glm::vec3& c : corners) {
+            Vertex3D v;
+            v.position = c;
+            v.normal = normal;
+            v.color = color;
+            mesh.vertices.push_back(v);
+        }
+        mesh.indices.insert(mesh.indices.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
+        mesh.indices.insert(mesh.indices.end(), {base, base + 2, base + 1, base, base + 3, base + 2});
+    }
+    mesh.cast_shadows = false;
+    model->meshes.push_back(std::move(mesh));
+    finalize_bounds(*model, {-HALF_W, -HALF_H, -HALF_W}, {HALF_W, HALF_H, HALF_W});
+    return model;
+}
+
+std::unique_ptr<Model> build_splash_drop_model() {
+    auto model = std::make_unique<Model>();
+    Mesh mesh;
+    add_sphere(mesh, 1.6f, 3, 5, {0.55f, 0.65f, 0.85f, 1.0f});
+    mesh.cast_shadows = false;
+    model->meshes.push_back(std::move(mesh));
+    finalize_bounds(*model, glm::vec3(-1.6f), glm::vec3(1.6f));
+    return model;
+}
+
+std::unique_ptr<Model> build_smoke_puff_model() {
+    auto model = std::make_unique<Model>();
+    Mesh mesh;
+    // Low-poly so the faceting reads as billowing; the effect scales it up
+    // over each particle's lifetime.
+    add_sphere(mesh, 9.0f, 5, 7, {0.74f, 0.72f, 0.70f, 1.0f});
+    mesh.material.roughness_factor = 1.0f;
+    // Smoke should never write into the shadow atlas or the sun cascades.
+    mesh.cast_shadows = false;
+    model->meshes.push_back(std::move(mesh));
+    finalize_bounds(*model, glm::vec3(-9.0f), glm::vec3(9.0f));
     return model;
 }
 

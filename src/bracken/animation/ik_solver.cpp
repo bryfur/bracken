@@ -143,8 +143,7 @@ void solve_two_bone_ik(std::span<glm::mat4> bone_matrices, std::span<glm::mat4> 
 }
 
 void apply_foot_ik(std::span<glm::mat4> bone_matrices, std::span<glm::mat4> world_transforms, const Skeleton& skeleton,
-                   const FootIKData& ik, const glm::mat4& /*model_to_world*/, float scale, float left_terrain_offset,
-                   float right_terrain_offset) {
+                   const FootIKData& ik, float scale, float left_terrain_offset, float right_terrain_offset) {
     BRACKEN_PROFILE_ZONE_COLOR("apply_foot_ik", 0x8E44AD);
     // Unresolved bone names leave indices at -1; indexing the spans with them
     // is UB, so an invalid FootIKData must be a hard no-op.
@@ -169,12 +168,13 @@ void apply_foot_ik(std::span<glm::mat4> bone_matrices, std::span<glm::mat4> worl
         float drop_model = pelvis_drop / scale;
         size_t count = std::min({skeleton.joints.size(), bone_matrices.size(), world_transforms.size()});
         for (size_t i = 0; i < count; i++) {
+            // Lowering a joint is world' = translate(0,drop,0) * world, which
+            // only touches the translation column; the same holds for
+            // bone = world * inverse_bind, so the exact delta for ANY affine
+            // inverse-bind matrix (rotated/scaled included) is a bump of the
+            // bone matrix's translation Y.
             world_transforms[i][3].y += drop_model;
-            const glm::mat4& inv_bind = skeleton.joints[i].inverse_bind_matrix;
-            bone_matrices[i][3][0] += drop_model * inv_bind[1][0];
-            bone_matrices[i][3][1] += drop_model * inv_bind[1][1];
-            bone_matrices[i][3][2] += drop_model * inv_bind[1][2];
-            bone_matrices[i][3][3] += drop_model * inv_bind[1][3];
+            bone_matrices[i][3].y += drop_model;
         }
         left_offset -= pelvis_drop;
         right_offset -= pelvis_drop;

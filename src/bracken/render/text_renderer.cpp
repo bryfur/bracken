@@ -1,4 +1,5 @@
 #include "bracken/render/text_renderer.hpp"
+#include "bracken/core/color.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_pipeline.hpp"
@@ -373,82 +374,12 @@ size_t TextRenderer::build_string_quads(std::string_view text, float x, float y,
     return quads;
 }
 
-void TextRenderer::prepare_text_textures(SDL_GPUCommandBuffer* cmd, const std::vector<std::string>& texts) {
-    if (!font_) {
-        return;
-    }
-    for (const auto& text : texts) {
-        std::string_view sv = text;
-        for (size_t i = 0; i < sv.size();) {
-            ensure_glyph(decode_utf8(sv, i));
-        }
-    }
-    flush_atlas(cmd);
-}
-
 void TextRenderer::create_pending_textures(SDL_GPUCommandBuffer* cmd) {
     BRACKEN_PROFILE_ZONE_COLOR("TextRenderer::create_pending_textures", 0xC0392B);
     flush_atlas(cmd);
 }
 
-void TextRenderer::draw_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::string_view text, float x,
-                             float y, uint32_t color, float scale) {
-    if (!font_ || text.empty() || !device_ || !pipeline_registry_ || !cmd || !render_pass) {
-        return;
-    }
-
-    // Build quads; this rasterizes any missing glyphs into the CPU atlas.
-    std::vector<float> vertices;
-    const size_t quads =
-        build_string_quads(text, x, y, scale, vertices, MAX_TEXT_QUADS * VERTICES_PER_QUAD * FLOATS_PER_VERTEX);
-    if (quads == 0) {
-        return;
-    }
-    if (dirty_y0_ < dirty_y1_) {
-        // New glyphs are not on the GPU yet (we are inside a render pass and
-        // cannot upload). They flush at the next copy pass; draw next frame.
-        return;
-    }
-
-    // Upload vertex data
-    vertex_buffer_->update(cmd, vertices.data(), vertices.size() * sizeof(float));
-
-    // Bind text pipeline
-    auto* text_pipeline = pipeline_registry_->get_text_pipeline();
-    if (text_pipeline) {
-        text_pipeline->bind(render_pass);
-    }
-
-    // Push uniforms - projection matrix to vertex shader
-    SDL_PushGPUVertexUniformData(cmd, 0, &projection_, sizeof(glm::mat4));
-
-    // Push text color to fragment shader (ABGR format - same as rest of renderer)
-    glm::vec4 text_color((color & 0xFF) / 255.0f, ((color >> 8) & 0xFF) / 255.0f, ((color >> 16) & 0xFF) / 255.0f,
-                         ((color >> 24) & 0xFF) / 255.0f);
-    SDL_PushGPUFragmentUniformData(cmd, 0, &text_color, sizeof(glm::vec4));
-
-    // Bind atlas texture and sampler
-    SDL_GPUTextureSamplerBinding tex_binding = {};
-    tex_binding.texture = atlas_texture_;
-    tex_binding.sampler = sampler_;
-    SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_binding, 1);
-
-    // Bind vertex buffer
-    SDL_GPUBufferBinding vb_binding = {};
-    vb_binding.buffer = vertex_buffer_->handle();
-    vb_binding.offset = 0;
-    SDL_BindGPUVertexBuffers(render_pass, 0, &vb_binding, 1);
-
-    SDL_DrawGPUPrimitives(render_pass, static_cast<Uint32>(quads * VERTICES_PER_QUAD), 1, 0, 0);
-}
-
-void TextRenderer::draw_text_centered(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::string_view text,
-                                      float x, float y, uint32_t color, float scale) {
-    int width = get_text_width(text, scale);
-    draw_text(cmd, render_pass, text, x - width / 2.0f, y, color, scale);
-}
-
-int TextRenderer::get_text_width(std::string_view text, float scale) {
+int TextRenderer::get_text_width(std::string_view text, float scale) const {
     if (!font_ || text.empty()) {
         return 0;
     }
@@ -459,7 +390,7 @@ int TextRenderer::get_text_width(std::string_view text, float scale) {
     return static_cast<int>(w * scale);
 }
 
-int TextRenderer::get_text_height(float scale) {
+int TextRenderer::get_text_height(float scale) const {
     if (!font_) {
         return 0;
     }
@@ -534,8 +465,7 @@ void TextRenderer::draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass
     // Merge contiguous same-color runs into a single draw; push the color
     // uniform only when it changes (common case: same color for many labels).
     const auto push_color = [&](uint32_t color) {
-        glm::vec4 text_color((color & 0xFF) / 255.0f, ((color >> 8) & 0xFF) / 255.0f, ((color >> 16) & 0xFF) / 255.0f,
-                             ((color >> 24) & 0xFF) / 255.0f);
+        const glm::vec4 text_color = core::unpack_color(color); // engine-wide ARGB
         SDL_PushGPUFragmentUniformData(cmd, 0, &text_color, sizeof(glm::vec4));
     };
 
@@ -567,48 +497,6 @@ void TextRenderer::draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass
     // Clear queued data for next frame
     queued_runs_.clear();
     batch_vertices_.clear();
-}
-
-void TextRenderer::draw_text_immediate(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::string_view text,
-                                       float x, float y, uint32_t color, float scale) {
-    // Legacy path: appends into the staging batch and draws at that offset.
-    // Only renders correctly if the vertex data was already uploaded; prefer
-    // queue_text_draw + upload_queued_text + draw_queued_text.
-    if (!font_ || text.empty() || !device_ || !pipeline_registry_ || !cmd || !render_pass) {
-        return;
-    }
-
-    const size_t immediate_offset = batch_vertices_.size();
-    const size_t quads =
-        build_string_quads(text, x, y, scale, batch_vertices_, MAX_TEXT_QUADS * VERTICES_PER_QUAD * FLOATS_PER_VERTEX);
-    if (quads == 0) {
-        return;
-    }
-
-    // Bind text pipeline
-    auto* text_pipeline = pipeline_registry_->get_text_pipeline();
-    if (text_pipeline) {
-        text_pipeline->bind(render_pass);
-    }
-
-    // Push uniforms
-    SDL_PushGPUVertexUniformData(cmd, 0, &projection_, sizeof(glm::mat4));
-    glm::vec4 text_color((color & 0xFF) / 255.0f, ((color >> 8) & 0xFF) / 255.0f, ((color >> 16) & 0xFF) / 255.0f,
-                         ((color >> 24) & 0xFF) / 255.0f);
-    SDL_PushGPUFragmentUniformData(cmd, 0, &text_color, sizeof(glm::vec4));
-
-    // Bind atlas texture and sampler
-    SDL_GPUTextureSamplerBinding tex_binding = {};
-    tex_binding.texture = atlas_texture_;
-    tex_binding.sampler = sampler_;
-    SDL_BindGPUFragmentSamplers(render_pass, 0, &tex_binding, 1);
-
-    SDL_GPUBufferBinding vb_binding = {};
-    vb_binding.buffer = vertex_buffer_->handle();
-    vb_binding.offset = static_cast<Uint32>(immediate_offset * sizeof(float));
-    SDL_BindGPUVertexBuffers(render_pass, 0, &vb_binding, 1);
-
-    SDL_DrawGPUPrimitives(render_pass, static_cast<Uint32>(quads * VERTICES_PER_QUAD), 1, 0, 0);
 }
 
 } // namespace bracken::render

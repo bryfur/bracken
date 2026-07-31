@@ -118,6 +118,46 @@ float3 ambientPBR(float3 N, float3 V, float3 baseColor, float metallic, float ro
     return (diffuse + specular) * ao;
 }
 
+// Image-based ambient from the sky prefilter chain (render/ibl.hpp):
+// diffuse = irradiance-cubemap sample x albedo; specular = GGX-prefiltered
+// cubemap sample (roughness -> mip) x split-sum BRDF LUT, with a Frostbite
+// horizon-occlusion guard (normal mapping can push R below the geometric
+// surface). `ao` (combined material + screen AO) and `lift` (shadow-driven
+// ambient lift) multiply the WHOLE ambient — exactly like ambientPBR, whose
+// hemisphere terms this replaces when the ibl uniform flag is on. All colors
+// linear.
+static const float IBL_SPECULAR_MIPS = 7.0; // render::IBL::SPECULAR_MIPS — keep in sync
+
+float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metallic,
+                  float roughness, float ao, float lift,
+                  TextureCube<float4> irradianceMap, SamplerState irradianceSampler,
+                  TextureCube<float4> specularMap, SamplerState specularSampler,
+                  Texture2D<float4> brdfLut, SamplerState brdfLutSampler) {
+    float NdotV = max(dot(N, V), 1e-4);
+    float3 F0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metallic);
+
+    // Diffuse: cosine-convolved sky irradiance along the normal, energy split
+    // via roughness-aware Fresnel (irradiance is already cosine-integrated).
+    float3 F = fresnelSchlickRoughness(NdotV, F0, roughness);
+    float3 kd = (1.0 - F) * (1.0 - metallic);
+    float3 irradiance = irradianceMap.SampleLevel(irradianceSampler, N, 0).rgb;
+    float3 diffuse = kd * baseColor * irradiance;
+
+    // Specular: prefiltered radiance along R at the roughness-matched mip,
+    // scaled/biased by the split-sum LUT.
+    float3 R = reflect(-V, N);
+    float mip = roughness * (IBL_SPECULAR_MIPS - 1.0);
+    float3 prefiltered = specularMap.SampleLevel(specularSampler, R, mip).rgb;
+    float2 envBRDF = brdfLut.SampleLevel(brdfLutSampler, float2(NdotV, roughness), 0).rg;
+    // Horizon occlusion: fade lobes that dip below the geometric surface.
+    // No-op when N == Ngeo (dot(R, N) == NdotV >= 0).
+    float horizon = saturate(1.0 + dot(R, Ngeo));
+    horizon *= horizon;
+    float3 specular = prefiltered * (F0 * envBRDF.x + envBRDF.y) * horizon;
+
+    return (diffuse + specular) * (ao * lift);
+}
+
 // Kaplanyan-style specular anti-aliasing: widen perceptual roughness by the
 // screen-space normal variance so curved/thin geometry doesn't shimmer.
 // Fragment-shader only (uses derivatives).

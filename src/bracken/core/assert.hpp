@@ -2,6 +2,7 @@
 
 #include "bracken/core/logger.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <format>
 #include <string>
@@ -14,7 +15,11 @@ namespace bracken::core::detail {
 [[noreturn]] inline void abort_with(LogLevel level, const char* file, int line, const char* expr,
                                     std::string_view msg) {
     std::string full = std::format("{}:{}: assertion `{}` failed: {}", file, line, expr ? expr : "<unreachable>", msg);
-    log_plain(level, "assert", full);
+    // Bypass the min-level filter: an aborting contract violation must never be
+    // silenced by set_min_level(Off). Sinks may still be cleared, so also print
+    // to stderr as a last-resort channel before aborting.
+    Logger::instance().dispatch(level, "assert", full);
+    std::fprintf(stderr, "%s\n", full.c_str());
     std::abort();
 }
 
@@ -57,8 +62,11 @@ bool is_main_thread() noexcept;
         }                                                                                                              \
     } while (0)
 
+// Release builds keep the condition type-checked (never evaluated) via
+// sizeof, so asserted expressions can't bit-rot against renamed symbols.
+// Corollary: conditions must be side-effect-free.
 #ifdef NDEBUG
-#define BRACKEN_ASSERT(cond, ...) ((void)0)
+#define BRACKEN_ASSERT(cond, ...) ((void)sizeof(!(cond)))
 #else
 #define BRACKEN_ASSERT(cond, ...) BRACKEN_VERIFY(cond __VA_OPT__(, ) __VA_ARGS__)
 #endif

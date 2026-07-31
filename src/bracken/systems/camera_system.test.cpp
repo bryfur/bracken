@@ -142,17 +142,42 @@ TEST_F(CameraSystemTest, DirectionalShakeDecaysToZeroAfterDuration) {
 // ===== Zoom =====
 
 TEST_F(CameraSystemTest, AdjustZoomClampsToMinDistance) {
-    // Zoom limits are the CameraSystem defaults (min 80, max 600), not part of
-    // CameraModeConfig.
+    // Zoom limits come from CameraModeConfig (defaults zoom_min 80, zoom_max 600).
     camera.adjust_zoom(-100000.0f);
     step(kConvergeSteps);
-    EXPECT_NEAR(camera.get_current_distance(), 80.0f, 0.1f);
+    EXPECT_NEAR(camera.get_current_distance(), camera.get_config().zoom_min, 0.1f);
 }
 
 TEST_F(CameraSystemTest, AdjustZoomClampsToMaxDistance) {
     camera.adjust_zoom(100000.0f);
     step(kConvergeSteps);
-    EXPECT_NEAR(camera.get_current_distance(), 600.0f, 0.1f);
+    EXPECT_NEAR(camera.get_current_distance(), camera.get_config().zoom_max, 0.1f);
+}
+
+TEST_F(CameraSystemTest, ConfigZoomLimitsClampZoom) {
+    CameraModeConfig config;
+    config.zoom_min = 50.0f;
+    config.zoom_max = 900.0f;
+    config.distance = 400.0f;
+    camera.set_config(config);
+
+    camera.adjust_zoom(-100000.0f);
+    step(kConvergeSteps);
+    EXPECT_NEAR(camera.get_current_distance(), 50.0f, 0.1f);
+
+    camera.adjust_zoom(100000.0f);
+    step(kConvergeSteps);
+    EXPECT_NEAR(camera.get_current_distance(), 900.0f, 0.1f);
+}
+
+TEST_F(CameraSystemTest, SetConfigClampsDistanceToZoomLimits) {
+    CameraModeConfig config;
+    config.zoom_min = 100.0f;
+    config.zoom_max = 200.0f;
+    config.distance = 5000.0f; // outside the zoom range
+    camera.set_config(config);
+    step(kConvergeSteps);
+    EXPECT_NEAR(camera.get_current_distance(), 200.0f, 0.1f);
 }
 
 // ===== Pitch clamping =====
@@ -197,6 +222,117 @@ TEST_F(CameraSystemTest, TerrainHeightCallbackKeepsCameraAboveGround) {
         uncollided.update(kDt);
     }
     EXPECT_LT(uncollided.get_position().y, kGroundHeight);
+}
+
+// ===== Configurable planes / FOV / clearance =====
+
+TEST_F(CameraSystemTest, ConfigNearFarPlanesDriveProjection) {
+    CameraModeConfig config;
+    config.near_plane = 1.0f;
+    config.far_plane = 2000.0f;
+    camera.set_config(config);
+    camera.update(kDt);
+
+    // Reversed-Z: near/far are swapped in the RH_ZO perspective call.
+    const float aspect = 1280.0f / 720.0f; // default screen size
+    glm::mat4 expected =
+        glm::perspective(glm::radians(camera.get_current_fov()), aspect, config.far_plane, config.near_plane);
+    glm::mat4 proj = camera.get_projection_matrix();
+    EXPECT_NEAR(proj[2][2], expected[2][2], 1e-6f);
+    EXPECT_NEAR(proj[3][2], expected[3][2], 1e-4f);
+}
+
+TEST_F(CameraSystemTest, ConfigSprintFovBonusAppliesAtSpeed) {
+    CameraModeConfig config;
+    config.sprint_fov_bonus = 20.0f;
+    config.sprint_speed_ref = 100.0f;
+    config.auto_center_enabled = false;
+    camera.set_config(config);
+    camera.set_target_velocity(glm::vec3(200.0f, 0.0f, 0.0f)); // saturates the speed factor
+    step(kConvergeSteps);
+    EXPECT_NEAR(camera.get_current_fov(), config.fov + config.sprint_fov_bonus, 0.1f);
+}
+
+TEST_F(CameraSystemTest, ConfigGroundClearanceRaisesCamera) {
+    CameraModeConfig config;
+    config.ground_clearance = 150.0f;
+    camera.set_config(config);
+    camera.set_terrain_height_func([](float, float) { return 0.0f; });
+    camera.set_target(glm::vec3(0.0f));
+    camera.set_pitch(-60.0f); // aim the camera arm well below the terrain plane
+    step(kConvergeSteps);
+    EXPECT_GE(camera.get_position().y, config.ground_clearance - 0.001f);
+}
+
+// ===== Shake vs collision order =====
+
+TEST_F(CameraSystemTest, ShakeCannotPushCameraBelowGroundClearance) {
+    // Shake is computed before collision avoidance, so the terrain clamp
+    // contains even huge shake displacements on every frame.
+    constexpr float kGround = 100.0f;
+    camera.set_terrain_height_func([](float, float) { return kGround; });
+    camera.set_target(glm::vec3(0.0f));
+    step(kConvergeSteps);
+
+    const float clearance = camera.get_config().ground_clearance;
+    camera.add_directional_shake(glm::vec3(0.0f, -1.0f, 0.0f), 500.0f, 0.5f);
+    for (int i = 0; i < 60; ++i) {
+        camera.update(kDt);
+        EXPECT_GE(camera.get_position().y, kGround + clearance - 0.001f);
+    }
+}
+
+// ===== Focus strength clamping =====
+
+TEST_F(CameraSystemTest, FocusStrengthClampsToOne) {
+    glm::vec3 focus(1000.0f, 0.0f, 0.0f);
+
+    CameraSystem clamped;
+    clamped.set_focus_target(&focus);
+    clamped.set_focus_strength(50.0f); // documented range is 0-1; must clamp
+
+    CameraSystem reference;
+    reference.set_focus_target(&focus);
+    reference.set_focus_strength(1.0f);
+
+    for (int i = 0; i < 120; ++i) {
+        clamped.update(kDt);
+        reference.update(kDt);
+    }
+    // Sanity: the soft-lock actually rotated the camera...
+    EXPECT_NE(reference.get_input_yaw(), 0.0f);
+    // ...and the over-unity strength behaves exactly like 1.0.
+    EXPECT_FLOAT_EQ(clamped.get_input_yaw(), reference.get_input_yaw());
+}
+
+// ===== Absolute-angle input vs auto-centering =====
+
+TEST_F(CameraSystemTest, SetYawChangeCountsAsInputForAutoCentering) {
+    camera.set_target(glm::vec3(0.0f));
+    camera.set_target_velocity(glm::vec3(0.0f, 0.0f, -300.0f)); // movement yaw = 0
+
+    // Drive the camera with a changing absolute yaw for well past the
+    // auto-center delay; each change must count as input.
+    const float delay = camera.get_config().auto_center_delay;
+    const int drive_frames = static_cast<int>((delay + 1.0f) / kDt);
+    float yaw = 90.0f;
+    for (int i = 0; i < drive_frames; ++i) {
+        yaw = (yaw == 90.0f) ? 91.0f : 90.0f;
+        camera.set_yaw(yaw);
+        camera.update(kDt);
+    }
+    const float held_yaw = camera.get_input_yaw();
+
+    // The host stops driving: for the first half of the delay, auto-centering
+    // must not have started (the input timer was reset by the last change).
+    step(static_cast<int>(0.5f * delay / kDt));
+    EXPECT_NEAR(camera.get_input_yaw(), held_yaw, 0.5f);
+
+    // After the full delay elapses, auto-centering drifts yaw toward the
+    // movement direction (0 degrees).
+    step(kConvergeSteps);
+    const float final_yaw = camera.get_input_yaw();
+    EXPECT_TRUE(final_yaw < 2.0f || final_yaw > 358.0f) << "final yaw: " << final_yaw;
 }
 
 // ===== Screen size / projection =====

@@ -1,8 +1,11 @@
 #include "bracken/procedural/tree_generator.hpp"
 #include "bracken/model_loader.hpp"
 #include <cmath>
+#include <cstdint>
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>
+#include <SDL3/SDL.h>
+#include <string>
 
 using namespace bracken::procedural;
 using namespace bracken;
@@ -174,4 +177,171 @@ TEST(TreeGenerator, TrunkOnlyWithZeroLevels) {
     ASSERT_NE(model, nullptr);
     // Should still have geometry (trunk + leaves at level 0)
     EXPECT_GT(model->meshes[0].vertices.size(), 0u);
+}
+
+// ============================================================================
+// Parameter validation (M20)
+// ============================================================================
+
+TEST(TreeGenerator, LevelsAboveMaxAreClampedWithoutOutOfBoundsReads) {
+    TreeParams p;
+    p.seed = 3;
+    p.levels = TreeParams::MAX_LEVELS + 2;      // out of range
+    p.children[TreeParams::MAX_LEVELS - 1] = 2; // would read past the arrays without clamping
+    auto clamped = TreeGenerator::generate(p);
+    ASSERT_NE(clamped, nullptr);
+
+    // Clamped generation must match a run at the maximum valid level exactly.
+    p.levels = TreeParams::MAX_LEVELS - 1;
+    auto max_valid = TreeGenerator::generate(p);
+    ASSERT_NE(max_valid, nullptr);
+    ASSERT_EQ(clamped->meshes.size(), max_valid->meshes.size());
+    for (size_t m = 0; m < clamped->meshes.size(); m++) {
+        EXPECT_EQ(clamped->meshes[m].vertices.size(), max_valid->meshes[m].vertices.size());
+        EXPECT_EQ(clamped->meshes[m].indices.size(), max_valid->meshes[m].indices.size());
+    }
+}
+
+TEST(TreeGenerator, NegativeLevelsClampToTrunkOnly) {
+    TreeParams p;
+    p.seed = 3;
+    p.levels = -5;
+    auto negative = TreeGenerator::generate(p);
+    ASSERT_NE(negative, nullptr);
+    p.levels = 0;
+    auto zero = TreeGenerator::generate(p);
+    ASSERT_NE(zero, nullptr);
+    EXPECT_EQ(negative->meshes[0].vertices.size(), zero->meshes[0].vertices.size());
+}
+
+TEST(TreeGenerator, ZeroSectionsAndSegmentsAreClampedToFiniteGeometry) {
+    TreeParams p;
+    p.seed = 3;
+    p.levels = 1;
+    for (int i = 0; i < TreeParams::MAX_LEVELS; i++) {
+        p.sections[i] = 0;
+        p.segments[i] = 0;
+        p.children[i] = -3;
+    }
+    auto model = TreeGenerator::generate(p);
+    ASSERT_NE(model, nullptr);
+    for (const auto& mesh : model->meshes) {
+        for (const auto& v : mesh.vertices) {
+            ASSERT_TRUE(std::isfinite(v.position.x));
+            ASSERT_TRUE(std::isfinite(v.position.y));
+            ASSERT_TRUE(std::isfinite(v.position.z));
+        }
+    }
+}
+
+// ============================================================================
+// Leaf material flags + texture fallback (M18/M19)
+// ============================================================================
+
+namespace {
+
+// Writes a small solid-color BMP that IMG_Load can read back. Returns ""
+// on failure.
+std::string write_test_texture() {
+    std::string path = ::testing::TempDir();
+    if (!path.empty() && path.back() != '/') {
+        path += '/';
+    }
+    path += "bracken_tree_generator_test_leaf.bmp";
+    SDL_Surface* surface = SDL_CreateSurface(4, 4, SDL_PIXELFORMAT_RGBA32);
+    if (!surface) {
+        return "";
+    }
+    SDL_FillSurfaceRect(surface, nullptr, SDL_MapSurfaceRGBA(surface, 60, 160, 40, 255));
+    const bool ok = SDL_SaveBMP(surface, path.c_str());
+    SDL_DestroySurface(surface);
+    return ok ? path : "";
+}
+
+} // namespace
+
+TEST(TreeGenerator, UntexturedLeafMeshIsDoubleSidedAndOpaque) {
+    TreeParams p;
+    p.seed = 1;
+    p.levels = 1;
+    p.leaf_count = 2;
+    auto model = TreeGenerator::generate(p);
+    ASSERT_GE(model->meshes.size(), 2u);
+    const auto& leaf = model->meshes[1];
+    EXPECT_FALSE(leaf.has_texture);
+    // Leaf cards must render from both sides even without a texture...
+    EXPECT_TRUE(leaf.material.double_sided);
+    // ...but alpha-testing only makes sense with a texture.
+    EXPECT_EQ(leaf.material.alpha_mode, AlphaMode::Opaque);
+}
+
+TEST(TreeGenerator, TexturedLeafMeshUsesAlphaMaskAndDoubleSided) {
+    const std::string texture = write_test_texture();
+    if (texture.empty()) {
+        GTEST_SKIP() << "could not write test texture";
+    }
+    TreeParams p;
+    p.seed = 1;
+    p.levels = 1;
+    p.leaf_count = 2;
+    p.leaf_texture_path = texture;
+    auto model = TreeGenerator::generate(p);
+    ASSERT_GE(model->meshes.size(), 2u);
+    const auto& leaf = model->meshes[1];
+    ASSERT_TRUE(leaf.has_texture);
+    EXPECT_EQ(leaf.material.alpha_mode, AlphaMode::Mask);
+    EXPECT_FLOAT_EQ(leaf.material.alpha_cutoff, 0.5f);
+    EXPECT_TRUE(leaf.material.double_sided);
+    // Vertex colors are whitened so the texture isn't tinted.
+    for (const auto& v : leaf.vertices) {
+        ASSERT_EQ(v.color, glm::vec4(1.0f));
+    }
+}
+
+TEST(TreeGenerator, MissingTexturePreservesVertexColorFallback) {
+    TreeParams p;
+    p.seed = 1;
+    p.levels = 1;
+    p.leaf_count = 2;
+    p.bark_texture_path = "/nonexistent/bracken_test/bark.png";
+    p.leaf_texture_path = "/nonexistent/bracken_test/leaf.png";
+    auto model = TreeGenerator::generate(p);
+    ASSERT_GE(model->meshes.size(), 2u);
+    const auto& branch = model->meshes[0];
+    const auto& leaf = model->meshes[1];
+    EXPECT_FALSE(branch.has_texture);
+    EXPECT_FALSE(leaf.has_texture);
+    // Failed loads must not whiten the vertex colors (all-white tree bug).
+    for (const auto& v : branch.vertices) {
+        ASSERT_EQ(v.color, p.bark_color);
+    }
+    for (const auto& v : leaf.vertices) {
+        ASSERT_EQ(v.color, p.leaf_color);
+    }
+    // No texture -> no alpha test.
+    EXPECT_EQ(leaf.material.alpha_mode, AlphaMode::Opaque);
+}
+
+// ============================================================================
+// Canopy shadow proxy geometry (L72)
+// ============================================================================
+
+TEST(TreeGenerator, CanopyProxyEmitsBothWindingsPerQuad) {
+    TreeParams p;
+    p.seed = 1;
+    p.levels = 1;
+    p.leaf_count = 2;
+    auto model = TreeGenerator::generate(p);
+    ASSERT_GE(model->meshes.size(), 3u);
+    const auto& proxy = model->meshes[2];
+    EXPECT_TRUE(proxy.shadow_only);
+    EXPECT_TRUE(proxy.cast_shadows);
+    // Per clump: 12 vertices (3 quads) and 36 indices (12 triangles — each
+    // quad is emitted with both winding orders for double-sided shadows).
+    ASSERT_GT(proxy.vertices.size(), 0u);
+    EXPECT_EQ(proxy.vertices.size() % 12, 0u);
+    EXPECT_EQ(proxy.indices.size(), proxy.vertices.size() * 3);
+    for (uint32_t index : proxy.indices) {
+        ASSERT_LT(index, proxy.vertices.size());
+    }
 }

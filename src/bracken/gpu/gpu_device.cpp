@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <SDL3/SDL_log.h>
+#include <SDL3/SDL_properties.h>
 #include <string>
 
 namespace bracken::gpu {
@@ -16,6 +17,9 @@ GPUDevice::~GPUDevice() {
 }
 
 bool GPUDevice::init(SDL_Window* window, bool prefer_low_power) {
+    // GPU device lifecycle is main-thread tier (asserted). Single-threaded
+    // test binaries bind "main" on first use — see core::bind_main_thread.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (device_) {
         SDL_Log("GPUDevice::init: Already initialized");
         return false;
@@ -41,12 +45,21 @@ bool GPUDevice::init(SDL_Window* window, bool prefer_low_power) {
             debug_env ? "from BRACKEN_GPU_DEBUG" : "build default");
 
     // Create the GPU device with automatic backend selection
-    // SDL3 will choose the best available backend (Metal on macOS, Vulkan/D3D12 on others)
-    device_ =
-        SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_METALLIB | SDL_GPU_SHADERFORMAT_DXIL,
-                            debug_mode,
-                            nullptr // prefer no specific driver
-        );
+    // SDL3 will choose the best available backend (Metal on macOS, Vulkan/D3D12 on others).
+    // Properties-based creation so prefer_low_power actually reaches SDL
+    // (SDL_CreateGPUDevice has no low-power knob).
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, debug_mode);
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_PREFERLOWPOWER_BOOLEAN, prefer_low_power);
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_METALLIB_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_DXIL_BOOLEAN, true);
+    device_ = SDL_CreateGPUDeviceWithProperties(props);
+    SDL_DestroyProperties(props);
+
+    if (prefer_low_power) {
+        SDL_Log("GPUDevice::init: prefer_low_power requested (energy-efficient adapter preferred)");
+    }
 
     if (!device_) {
         SDL_Log("GPUDevice::init: Failed to create GPU device: %s", SDL_GetError());
@@ -67,6 +80,8 @@ bool GPUDevice::init(SDL_Window* window, bool prefer_low_power) {
 
 void GPUDevice::shutdown() {
     if (device_) {
+        // GPU device destruction is main-thread tier.
+        BRACKEN_ASSERT_MAIN_THREAD();
         // Wait for all GPU operations to complete
         SDL_WaitForGPUIdle(device_);
 
@@ -158,8 +173,15 @@ SDL_GPUTexture* GPUDevice::acquire_swapchain_texture(SDL_GPUCommandBuffer* cmd, 
 // =============================================================================
 // Resource Creation
 // =============================================================================
+// All SDL_CreateGPU*/SDL_ReleaseGPU* calls funnel through the methods below,
+// so the main-thread contract for GPU resource create/destroy (thread-safety
+// tier "main-thread" — see docs/multithreading_plan.md §6.1) is asserted at
+// this single chokepoint. Until native streaming (Phase 6) introduces a
+// main-thread publish queue, creating or destroying a GPU resource off the
+// main thread is a contract violation.
 
 SDL_GPUBuffer* GPUDevice::create_buffer(const SDL_GPUBufferCreateInfo& info) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
         return nullptr;
     }
@@ -167,6 +189,7 @@ SDL_GPUBuffer* GPUDevice::create_buffer(const SDL_GPUBufferCreateInfo& info) {
 }
 
 SDL_GPUTransferBuffer* GPUDevice::create_transfer_buffer(const SDL_GPUTransferBufferCreateInfo& info) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
         return nullptr;
     }
@@ -174,6 +197,7 @@ SDL_GPUTransferBuffer* GPUDevice::create_transfer_buffer(const SDL_GPUTransferBu
 }
 
 SDL_GPUTexture* GPUDevice::create_texture(const SDL_GPUTextureCreateInfo& info) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
         return nullptr;
     }
@@ -181,6 +205,7 @@ SDL_GPUTexture* GPUDevice::create_texture(const SDL_GPUTextureCreateInfo& info) 
 }
 
 SDL_GPUSampler* GPUDevice::create_sampler(const SDL_GPUSamplerCreateInfo& info) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
         return nullptr;
     }
@@ -188,6 +213,7 @@ SDL_GPUSampler* GPUDevice::create_sampler(const SDL_GPUSamplerCreateInfo& info) 
 }
 
 SDL_GPUGraphicsPipeline* GPUDevice::create_graphics_pipeline(const SDL_GPUGraphicsPipelineCreateInfo& info) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
         return nullptr;
     }
@@ -195,6 +221,7 @@ SDL_GPUGraphicsPipeline* GPUDevice::create_graphics_pipeline(const SDL_GPUGraphi
 }
 
 SDL_GPUShader* GPUDevice::create_shader(const SDL_GPUShaderCreateInfo& info) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
         return nullptr;
     }
@@ -204,40 +231,54 @@ SDL_GPUShader* GPUDevice::create_shader(const SDL_GPUShaderCreateInfo& info) {
 // =============================================================================
 // Resource Destruction
 // =============================================================================
+// Main-thread asserted — see the Resource Creation note above.
 
 void GPUDevice::release_buffer(SDL_GPUBuffer* buffer) {
     if (device_ && buffer) {
+        BRACKEN_ASSERT_MAIN_THREAD();
         SDL_ReleaseGPUBuffer(device_, buffer);
     }
 }
 
 void GPUDevice::release_transfer_buffer(SDL_GPUTransferBuffer* buffer) {
     if (device_ && buffer) {
+        BRACKEN_ASSERT_MAIN_THREAD();
         SDL_ReleaseGPUTransferBuffer(device_, buffer);
     }
 }
 
 void GPUDevice::release_texture(SDL_GPUTexture* texture) {
     if (device_ && texture) {
+        BRACKEN_ASSERT_MAIN_THREAD();
         SDL_ReleaseGPUTexture(device_, texture);
     }
 }
 
 void GPUDevice::release_sampler(SDL_GPUSampler* sampler) {
     if (device_ && sampler) {
+        BRACKEN_ASSERT_MAIN_THREAD();
         SDL_ReleaseGPUSampler(device_, sampler);
     }
 }
 
 void GPUDevice::release_graphics_pipeline(SDL_GPUGraphicsPipeline* pipeline) {
     if (device_ && pipeline) {
+        BRACKEN_ASSERT_MAIN_THREAD();
         SDL_ReleaseGPUGraphicsPipeline(device_, pipeline);
     }
 }
 
 void GPUDevice::release_shader(SDL_GPUShader* shader) {
     if (device_ && shader) {
+        BRACKEN_ASSERT_MAIN_THREAD();
         SDL_ReleaseGPUShader(device_, shader);
+    }
+}
+
+void GPUDevice::release_compute_pipeline(SDL_GPUComputePipeline* pipeline) {
+    if (device_ && pipeline) {
+        BRACKEN_ASSERT_MAIN_THREAD();
+        SDL_ReleaseGPUComputePipeline(device_, pipeline);
     }
 }
 

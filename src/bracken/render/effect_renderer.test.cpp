@@ -2,9 +2,26 @@
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>
+#include <memory>
 
 using bracken::render::build_particle_transform;
 using bracken::systems::Particle;
+
+namespace bracken::render {
+
+// Friend of EffectRenderer (declared in effect_renderer.hpp): lets CPU-only
+// tests drive the emitter->model cache without a GPU device (init() needs
+// one, but resolve_emitter_model only touches the ModelManager + cache).
+struct EffectRendererTestAccess {
+    static void set_model_manager(EffectRenderer& renderer, bracken::ModelManager* manager) {
+        renderer.model_manager_ = manager;
+    }
+    static bracken::ModelHandle resolve(EffectRenderer& renderer, const bracken::EmitterDefinition& def) {
+        return renderer.resolve_emitter_model(def);
+    }
+};
+
+} // namespace bracken::render
 
 namespace {
 
@@ -83,4 +100,45 @@ TEST(BuildParticleTransform, CenterOffsetMapsModelCenterToParticlePosition) {
     EXPECT_NEAR(mapped.x, p.position.x, 1e-3f);
     EXPECT_NEAR(mapped.y, p.position.y, 1e-3f);
     EXPECT_NEAR(mapped.z, p.position.z, 1e-3f);
+}
+
+// ===== emitter->model cache (M26) =====
+
+using bracken::render::EffectRendererTestAccess;
+
+// A failed lookup must not be cached: a host that spawns an effect one frame
+// before registering the model would otherwise get an invisible effect for
+// the whole session.
+TEST(EffectRendererModelCache, FailedLookupIsNotCachedAndResolvesAfterRegistration) {
+    bracken::ModelManager manager; // no GPU device: register_model stays CPU-side
+    bracken::render::EffectRenderer renderer;
+    EffectRendererTestAccess::set_model_manager(renderer, &manager);
+
+    bracken::EmitterDefinition def;
+    def.name = "late";
+    def.model = "late_model";
+
+    // Model not registered yet: the lookup fails...
+    EXPECT_EQ(EffectRendererTestAccess::resolve(renderer, def), bracken::INVALID_MODEL_HANDLE);
+    EXPECT_EQ(EffectRendererTestAccess::resolve(renderer, def), bracken::INVALID_MODEL_HANDLE);
+
+    // ...but the failure is not cached, so registering the model afterwards
+    // makes the same definition resolve.
+    bracken::ModelHandle handle = manager.register_model("late_model", std::make_unique<bracken::Model>());
+    ASSERT_NE(handle, bracken::INVALID_MODEL_HANDLE);
+    EXPECT_EQ(EffectRendererTestAccess::resolve(renderer, def), handle);
+
+    // Successful lookups are cached and stay stable.
+    EXPECT_EQ(EffectRendererTestAccess::resolve(renderer, def), handle);
+}
+
+TEST(EffectRendererModelCache, EmptyModelNameAndNullManagerResolveInvalid) {
+    bracken::render::EffectRenderer renderer;
+
+    bracken::EmitterDefinition def; // model name empty
+    EXPECT_EQ(EffectRendererTestAccess::resolve(renderer, def), bracken::INVALID_MODEL_HANDLE);
+
+    bracken::ModelManager manager;
+    EffectRendererTestAccess::set_model_manager(renderer, &manager);
+    EXPECT_EQ(EffectRendererTestAccess::resolve(renderer, def), bracken::INVALID_MODEL_HANDLE);
 }

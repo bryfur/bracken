@@ -32,6 +32,7 @@
 #include "tiny_gltf.h"
 #include <SDL3_image/SDL_image.h>
 
+#include "bracken/core/assert.hpp"
 #include "bracken/core/asset/file_watcher.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
@@ -152,18 +153,13 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
     model.min_x = model.min_y = model.min_z = 1e10f;
     model.max_x = model.max_y = model.max_z = -1e10f;
 
-    // Load textures from images
-    std::vector<std::pair<std::vector<uint8_t>, std::pair<int, int>>> loaded_textures;
+    // Texture budget guard (see CLAUDE.md): assets shipping >2048² embedded
+    // images should be resized in the optimization pass, not at runtime.
     for (size_t i = 0; i < gltf.images.size(); i++) {
         const auto& image = gltf.images[i];
-        // Texture budget guard (see CLAUDE.md): assets shipping >2048² embedded
-        // images should be resized in the optimization pass, not at runtime.
         if (image.width > 2048 || image.height > 2048) {
             BRACKEN_LOG_WARN("model", "{}: embedded image {} is {}x{} (exceeds 2048x2048 budget)", path, i, image.width,
                             image.height);
-        }
-        if (!image.image.empty()) {
-            loaded_textures.push_back({image.image, {image.width, image.height}});
         }
     }
 
@@ -180,12 +176,6 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
 
                 // Base color factor
                 if (mat.pbrMetallicRoughness.baseColorFactor.size() == 4) {
-                    uint8_t r = static_cast<uint8_t>(mat.pbrMetallicRoughness.baseColorFactor[0] * 255);
-                    uint8_t g = static_cast<uint8_t>(mat.pbrMetallicRoughness.baseColorFactor[1] * 255);
-                    uint8_t b = static_cast<uint8_t>(mat.pbrMetallicRoughness.baseColorFactor[2] * 255);
-                    uint8_t a = static_cast<uint8_t>(mat.pbrMetallicRoughness.baseColorFactor[3] * 255);
-                    out_mesh.base_color = (a << 24) | (b << 16) | (g << 8) | r;
-
                     out_mesh.material.base_color_factor = {
                         static_cast<float>(mat.pbrMetallicRoughness.baseColorFactor[0]),
                         static_cast<float>(mat.pbrMetallicRoughness.baseColorFactor[1]),
@@ -232,8 +222,11 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
                     }
                 }
 
-                // Ambient occlusion (R channel). ORM-packed assets reuse the
-                // metallic-roughness image, so no separate upload is needed.
+                // Ambient occlusion (R channel). Only the glTF ORM packing —
+                // occlusionTexture sharing the metallic-roughness image — is
+                // supported; the model shaders have no separate AO sampler, so
+                // a standalone occlusion map cannot be consumed. Drop it loudly
+                // so asset authors know their baked AO is not applied.
                 int ao_idx = mat.occlusionTexture.index;
                 if (ao_idx >= 0 && ao_idx < static_cast<int>(gltf.textures.size())) {
                     int src = gltf.textures[ao_idx].source;
@@ -241,10 +234,11 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
                         if (src == mr_src) {
                             out_mesh.material.has_packed_occlusion = true;
                         } else {
-                            const auto& img = gltf.images[src];
-                            out_mesh.material.occlusion_pixels = img.image;
-                            out_mesh.material.occlusion_width = img.width;
-                            out_mesh.material.occlusion_height = img.height;
+                            BRACKEN_LOG_WARN("model",
+                                            "{}: standalone occlusion texture (image {}) is unsupported and was "
+                                            "dropped — pack AO into the R channel of the metallic-roughness image "
+                                            "(glTF ORM layout)",
+                                            path, src);
                         }
                     }
                 }
@@ -404,10 +398,10 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
                     v.color.b = colors_u8[i * 4 + 2] / 255.0f;
                     v.color.a = colors_u8[i * 4 + 3] / 255.0f;
                 } else {
-                    v.color.r = (out_mesh.base_color & 0xFF) / 255.0f;
-                    v.color.g = ((out_mesh.base_color >> 8) & 0xFF) / 255.0f;
-                    v.color.b = ((out_mesh.base_color >> 16) & 0xFF) / 255.0f;
-                    v.color.a = ((out_mesh.base_color >> 24) & 0xFF) / 255.0f;
+                    // No COLOR_0: bake white. baseColorFactor is applied in the
+                    // fragment shader (it multiplies vertexColor on the
+                    // untextured path), so baking it here would double-apply it.
+                    v.color = {1.0f, 1.0f, 1.0f, 1.0f};
                 }
 
                 if (tangents) {
@@ -453,14 +447,27 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
                 compute_tangents_from_uvs(out_mesh.vertices, out_mesh.indices);
             }
 
-            // Store texture data directly in mesh for deferred GPU upload
-            if (texture_image_idx >= 0 && texture_image_idx < static_cast<int>(loaded_textures.size())) {
-                const auto& [pixels, dims] = loaded_textures[texture_image_idx];
-                const auto width = dims.first;
-                const auto height = dims.second;
-                out_mesh.texture_pixels = pixels;
-                out_mesh.texture_width = width;
-                out_mesh.texture_height = height;
+            // Store texture data directly in mesh for deferred GPU upload.
+            // texture_image_idx is a raw glTF image index, so index gltf.images
+            // directly (like every other texture type); an image can be present
+            // but empty (e.g. an external-URI image that failed to resolve —
+            // tinygltf downgrades that to a warning), and using a compacted
+            // pixel vector here would shift every later mesh onto the wrong
+            // image.
+            if (out_mesh.has_texture) {
+                const tinygltf::Image* image =
+                    (texture_image_idx >= 0 && texture_image_idx < static_cast<int>(gltf.images.size()))
+                        ? &gltf.images[texture_image_idx]
+                        : nullptr;
+                if (image && !image->image.empty()) {
+                    out_mesh.texture_pixels = image->image;
+                    out_mesh.texture_width = image->width;
+                    out_mesh.texture_height = image->height;
+                } else {
+                    BRACKEN_LOG_WARN("model", "{}: base-color image {} has no pixel data; mesh renders untextured",
+                                    path, texture_image_idx);
+                    out_mesh.has_texture = false;
+                }
             }
 
             // Check for skinning data (JOINTS_0 and WEIGHTS_0)
@@ -516,21 +523,58 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
         }
     }
 
+    // Validated float-accessor fetch for skeleton and animation data,
+    // mirroring the JOINTS_0/WEIGHTS_0 pattern: require FLOAT componentType,
+    // the expected element type, and tight packing. Quantized exports
+    // (normalized u8/u16 animation outputs are valid core glTF) and
+    // interleaved views are unsupported — return null so callers drop the
+    // data with a warning instead of reinterpreting it as garbage floats.
+    auto get_float_accessor = [&](int accessor_idx, int expected_type, const char* what) -> const float* {
+        if (accessor_idx < 0 || accessor_idx >= static_cast<int>(gltf.accessors.size())) {
+            return nullptr;
+        }
+        const auto& accessor = gltf.accessors[accessor_idx];
+        if (accessor.bufferView < 0 || accessor.bufferView >= static_cast<int>(gltf.bufferViews.size())) {
+            BRACKEN_LOG_WARN("model", "{}: {} accessor has no bufferView (sparse accessors unsupported), data dropped",
+                            path, what);
+            return nullptr;
+        }
+        if (accessor.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT) {
+            BRACKEN_LOG_WARN("model",
+                            "{}: {} accessor componentType {} is not float (quantized data unsupported), data dropped",
+                            path, what, accessor.componentType);
+            return nullptr;
+        }
+        if (accessor.type != expected_type) {
+            BRACKEN_LOG_WARN("model", "{}: {} accessor has unexpected element type {}, data dropped", path, what,
+                            accessor.type);
+            return nullptr;
+        }
+        const auto& bufferView = gltf.bufferViews[accessor.bufferView];
+        int tight_stride =
+            static_cast<int>(sizeof(float)) * tinygltf::GetNumComponentsInType(static_cast<uint32_t>(accessor.type));
+        if (bufferView.byteStride != 0 && static_cast<int>(bufferView.byteStride) != tight_stride) {
+            BRACKEN_LOG_WARN("model",
+                            "{}: {} accessor has unsupported byteStride {} (expected packed {}), data dropped", path,
+                            what, bufferView.byteStride, tight_stride);
+            return nullptr;
+        }
+        const auto& buffer = gltf.buffers[bufferView.buffer];
+        return reinterpret_cast<const float*>(buffer.data.data() + bufferView.byteOffset + accessor.byteOffset);
+    };
+
     // Load skin data (skeleton)
     if (!gltf.skins.empty()) {
         BRACKEN_PROFILE_ZONE("ModelLoader::parse_skeleton");
         const auto& skin = gltf.skins[0];
         model.has_skeleton = true;
 
-        // Load inverse bind matrices
+        // Load inverse bind matrices (identity fallback per glTF when absent
+        // or when the accessor is unsupported — the latter warns above).
         std::vector<glm::mat4> inverse_bind_matrices;
-        if (skin.inverseBindMatrices >= 0) {
+        if (const float* data = get_float_accessor(skin.inverseBindMatrices, TINYGLTF_TYPE_MAT4, "inverseBindMatrices");
+            data != nullptr) {
             const auto& accessor = gltf.accessors[skin.inverseBindMatrices];
-            const auto& bufferView = gltf.bufferViews[accessor.bufferView];
-            const auto& buffer = gltf.buffers[bufferView.buffer];
-            const float* data =
-                reinterpret_cast<const float*>(buffer.data.data() + bufferView.byteOffset + accessor.byteOffset);
-
             for (size_t i = 0; i < accessor.count; i++) {
                 glm::mat4 mat;
                 std::memcpy(&mat, data + i * 16, sizeof(glm::mat4));
@@ -602,6 +646,71 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
             }
         }
 
+        // The animation/IK runtime propagates the joint hierarchy in a single
+        // index-order pass, which requires parents-before-children order
+        // (every parent_index < its joint's index). glTF does not guarantee
+        // any ordering of skin.joints, so normalize out-of-order skins with a
+        // stable topological reorder and remap the vertex joint indices that
+        // referenced the old order.
+        {
+            const size_t joint_count = model.skeleton.joints.size();
+            bool parents_first = true;
+            for (size_t i = 0; i < joint_count; i++) {
+                if (model.skeleton.joints[i].parent_index >= static_cast<int>(i)) {
+                    parents_first = false;
+                    break;
+                }
+            }
+            if (!parents_first) {
+                std::vector<int> new_of_old(joint_count, -1);
+                size_t assigned = 0;
+                bool progress = true;
+                while (assigned < joint_count && progress) {
+                    progress = false;
+                    for (size_t i = 0; i < joint_count; i++) {
+                        if (new_of_old[i] != -1) {
+                            continue;
+                        }
+                        int parent = model.skeleton.joints[i].parent_index;
+                        if (parent < 0 || (parent < static_cast<int>(joint_count) && new_of_old[parent] != -1)) {
+                            new_of_old[i] = static_cast<int>(assigned++);
+                            progress = true;
+                        }
+                    }
+                }
+                if (assigned < joint_count) {
+                    BRACKEN_LOG_ERROR("model", "{}: skin joint hierarchy contains a cycle, cannot load", path);
+                    return false;
+                }
+
+                std::vector<animation::Joint> reordered(joint_count);
+                std::vector<int> reordered_nodes(joint_count);
+                for (size_t old_idx = 0; old_idx < joint_count; old_idx++) {
+                    auto new_idx = static_cast<size_t>(new_of_old[old_idx]);
+                    reordered[new_idx] = std::move(model.skeleton.joints[old_idx]);
+                    int parent = reordered[new_idx].parent_index;
+                    reordered[new_idx].parent_index = parent < 0 ? -1 : new_of_old[parent];
+                    reordered_nodes[new_idx] = model.skeleton.joint_node_indices[old_idx];
+                }
+                model.skeleton.joints = std::move(reordered);
+                model.skeleton.joint_node_indices = std::move(reordered_nodes);
+
+                for (auto& mesh : model.meshes) {
+                    for (auto& sv : mesh.skinned_vertices) {
+                        for (auto& joint_idx : sv.joints) {
+                            if (joint_idx < joint_count) {
+                                joint_idx = static_cast<uint8_t>(new_of_old[joint_idx]);
+                            }
+                        }
+                    }
+                }
+                BRACKEN_LOG_WARN("model",
+                                "{}: skin joints were not ordered parents-before-children; reordered {} joints "
+                                "(vertex joint indices remapped)",
+                                path, joint_count);
+            }
+        }
+
         BRACKEN_LOG_DEBUG("model", "  Loaded skeleton with {} joints", model.skeleton.joints.size());
 
         // Cache foot IK bone indices
@@ -626,6 +735,7 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
 
         // Group samplers by target node
         std::unordered_map<int, animation::AnimationChannel> channels_by_joint;
+        bool warned_cubicspline = false;
 
         for (const auto& channel : gltf_anim.channels) {
             int node_idx = channel.target_node;
@@ -633,46 +743,85 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
             if (joint_it == node_to_joint.end()) {
                 continue;
             }
-
             int joint_idx = joint_it->second;
+
+            // Only TRS paths are supported ("weights" = morph targets).
+            const bool is_rotation = channel.target_path == "rotation";
+            if (channel.target_path != "translation" && !is_rotation && channel.target_path != "scale") {
+                continue;
+            }
+
+            if (channel.sampler < 0 || channel.sampler >= static_cast<int>(gltf_anim.samplers.size())) {
+                continue;
+            }
+            const auto& sampler = gltf_anim.samplers[channel.sampler];
+
+            // glTF sampler interpolation: LINEAR (default) and STEP are
+            // honored. CUBICSPLINE stores 3 output elements per key
+            // (in-tangent, value, out-tangent); cubic evaluation is not
+            // implemented, so extract the in-place values (middle element)
+            // and interpolate them linearly — poses at the keys are exact,
+            // in-between frames lose the authored easing.
+            animation::Interpolation interp = animation::Interpolation::Linear;
+            size_t elems_per_key = 1;
+            size_t value_elem = 0;
+            if (sampler.interpolation == "STEP") {
+                interp = animation::Interpolation::Step;
+            } else if (sampler.interpolation == "CUBICSPLINE") {
+                if (!warned_cubicspline) {
+                    BRACKEN_LOG_WARN("model",
+                                    "{}: animation '{}' uses CUBICSPLINE interpolation (unsupported); keyframe "
+                                    "values are kept, tangents ignored, tracks play back linearly",
+                                    path, gltf_anim.name);
+                    warned_cubicspline = true;
+                }
+                elems_per_key = 3;
+                value_elem = 1;
+            }
+
+            const float* times = get_float_accessor(sampler.input, TINYGLTF_TYPE_SCALAR, "animation sampler input");
+            const float* values = get_float_accessor(
+                sampler.output, is_rotation ? TINYGLTF_TYPE_VEC4 : TINYGLTF_TYPE_VEC3, "animation sampler output");
+            if (!times || !values) {
+                continue; // warning already logged by get_float_accessor
+            }
+
+            const auto& input_accessor = gltf.accessors[sampler.input];
+            const auto& output_accessor = gltf.accessors[sampler.output];
+            size_t count = input_accessor.count;
+            if (output_accessor.count < count * elems_per_key) {
+                BRACKEN_LOG_WARN("model",
+                                "{}: animation '{}' sampler output has {} elements but {} keys need {}, "
+                                "channel dropped",
+                                path, gltf_anim.name, output_accessor.count, count, count * elems_per_key);
+                continue;
+            }
+
             auto& anim_channel = channels_by_joint[joint_idx];
             anim_channel.bone_index = joint_idx;
 
-            const auto& sampler = gltf_anim.samplers[channel.sampler];
-
-            // Get input (time) data
-            const auto& input_accessor = gltf.accessors[sampler.input];
-            const auto& input_bufferView = gltf.bufferViews[input_accessor.bufferView];
-            const auto& input_buffer = gltf.buffers[input_bufferView.buffer];
-            const float* times = reinterpret_cast<const float*>(input_buffer.data.data() + input_bufferView.byteOffset +
-                                                                input_accessor.byteOffset);
-
-            // Get output (value) data
-            const auto& output_accessor = gltf.accessors[sampler.output];
-            const auto& output_bufferView = gltf.bufferViews[output_accessor.bufferView];
-            const auto& output_buffer = gltf.buffers[output_bufferView.buffer];
-            const float* values = reinterpret_cast<const float*>(
-                output_buffer.data.data() + output_bufferView.byteOffset + output_accessor.byteOffset);
-
-            size_t count = input_accessor.count;
-
             if (channel.target_path == "translation") {
+                anim_channel.position_interp = interp;
                 for (size_t i = 0; i < count; i++) {
+                    const float* v = values + (i * elems_per_key + value_elem) * 3;
                     anim_channel.position_times.push_back(times[i]);
-                    anim_channel.positions.emplace_back(values[i * 3], values[i * 3 + 1], values[i * 3 + 2]);
+                    anim_channel.positions.emplace_back(v[0], v[1], v[2]);
                     clip.duration = std::max(clip.duration, times[i]);
                 }
-            } else if (channel.target_path == "rotation") {
+            } else if (is_rotation) {
+                anim_channel.rotation_interp = interp;
                 for (size_t i = 0; i < count; i++) {
+                    const float* v = values + (i * elems_per_key + value_elem) * 4;
                     anim_channel.rotation_times.push_back(times[i]);
-                    anim_channel.rotations.emplace_back(values[i * 4 + 3], values[i * 4], values[i * 4 + 1],
-                                                        values[i * 4 + 2]);
+                    anim_channel.rotations.emplace_back(v[3], v[0], v[1], v[2]);
                     clip.duration = std::max(clip.duration, times[i]);
                 }
-            } else if (channel.target_path == "scale") {
+            } else { // scale
+                anim_channel.scale_interp = interp;
                 for (size_t i = 0; i < count; i++) {
+                    const float* v = values + (i * elems_per_key + value_elem) * 3;
                     anim_channel.scale_times.push_back(times[i]);
-                    anim_channel.scales.emplace_back(values[i * 3], values[i * 3 + 1], values[i * 3 + 2]);
+                    anim_channel.scales.emplace_back(v[0], v[1], v[2]);
                     clip.duration = std::max(clip.duration, times[i]);
                 }
             }
@@ -704,6 +853,8 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
 
 void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model) {
     BRACKEN_PROFILE_ZONE("ModelLoader::upload_to_gpu");
+    // GPU resource creation is main-thread tier (buffers + textures).
+    BRACKEN_ASSERT_MAIN_THREAD();
     for (auto& mesh : model.meshes) {
         if (mesh.uploaded) {
             continue;
@@ -789,11 +940,6 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model) {
             }
         }
 
-        // Separate (non-ORM-packed) occlusion images are not uploaded yet; drop
-        // the CPU copy so it doesn't pin RAM.
-        mesh.material.occlusion_pixels.clear();
-        mesh.material.occlusion_pixels.shrink_to_fit();
-
         mesh.uploaded = true;
 
         // Cache index count before freeing CPU-side geometry data
@@ -810,6 +956,8 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model) {
 }
 
 void ModelLoader::free_gpu_resources(Model& model) {
+    // GPU resource destruction is main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     for (auto& mesh : model.meshes) {
         // Free SDL3 GPU resources
         mesh.vertex_buffer.reset();
@@ -817,7 +965,6 @@ void ModelLoader::free_gpu_resources(Model& model) {
         mesh.texture.reset();
         mesh.material.normal_texture.reset();
         mesh.material.metallic_roughness_texture.reset();
-        mesh.material.occlusion_texture.reset();
         mesh.material.emissive_texture.reset();
         mesh.uploaded = false;
         mesh.has_texture = false;
@@ -835,6 +982,8 @@ ModelManager::~ModelManager() {
 }
 
 ModelHandle ModelManager::load_model(const std::string& name, const std::string& path) {
+    // Mutates the model table (and creates GPU resources): main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     auto model = std::make_unique<Model>();
     if (ModelLoader::load_glb(path, *model)) {
         // Upload to GPU if device is available
@@ -873,6 +1022,8 @@ Model* ModelManager::get_model(const std::string& name) const {
 }
 
 ModelHandle ModelManager::register_model(const std::string& name, std::unique_ptr<Model> model) {
+    // Mutates the model table (and creates GPU resources): main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (device_) {
         ModelLoader::upload_to_gpu(*device_, *model);
     }
@@ -884,6 +1035,8 @@ ModelHandle ModelManager::register_model(const std::string& name, std::unique_pt
 }
 
 bool ModelManager::reload_model(ModelHandle handle) {
+    // Hot-reload apply: replaces model contents in place — main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (handle == INVALID_MODEL_HANDLE || handle >= models_.size()) {
         return false;
     }
@@ -906,12 +1059,21 @@ bool ModelManager::reload_model(ModelHandle handle) {
             ModelLoader::free_gpu_resources(*models_[handle]);
         }
     }
-    models_[handle] = std::move(fresh);
+    if (models_[handle]) {
+        // Move-assign into the existing object so raw Model* handed to
+        // callers stay valid across reloads (the header promises pointer
+        // stability; only the model's *contents* are replaced).
+        *models_[handle] = std::move(*fresh);
+    } else {
+        models_[handle] = std::move(fresh);
+    }
     BRACKEN_LOG_INFO("hot_reload", "ModelManager: reloaded '{}'", path);
     return true;
 }
 
 void ModelManager::enable_hot_reload(core::asset::FileWatcher& watcher) {
+    // FileWatcher entry points are main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     watcher_ = &watcher;
     for (size_t i = 1; i < model_paths_.size(); ++i) {
         if (model_paths_[i].empty()) {
@@ -929,6 +1091,8 @@ ModelHandle ModelManager::get_handle(const std::string& name) const {
 }
 
 void ModelManager::unload_all() {
+    // Mutates the model table and releases GPU resources: main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     for (size_t i = 1; i < models_.size(); ++i) {
         if (models_[i]) {
             ModelLoader::free_gpu_resources(*models_[i]);

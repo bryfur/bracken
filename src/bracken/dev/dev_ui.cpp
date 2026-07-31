@@ -36,9 +36,13 @@ DevUI::~DevUI() {
 
 bool DevUI::init(render::RenderContext& context, Bindings bindings) {
     if (impl_) {
-        return true; // already initialized
+        // Re-init is an error, not a rebind: the ImGui context and backends
+        // are already tied to the original window/device, so applying new
+        // Bindings here would honor half the request and silently ignore the
+        // new RenderContext. Fail loudly; shutdown() first to re-point.
+        BRACKEN_LOG_WARN("devui", "init() called on an already-initialized DevUI; ignored — call shutdown() first");
+        return false;
     }
-    bindings_ = std::move(bindings);
 
     auto impl = std::make_unique<Impl>();
     IMGUI_CHECKVERSION();
@@ -67,6 +71,7 @@ bool DevUI::init(render::RenderContext& context, Bindings bindings) {
     }
 
     impl->backends_initialized = true;
+    bindings_ = std::move(bindings); // stored only on success — a failed init leaves no half-state
     impl_ = std::move(impl);
     BRACKEN_LOG_INFO("devui", "Dev UI initialized (Dear ImGui {})", IMGUI_VERSION);
     return true;
@@ -97,7 +102,11 @@ bool DevUI::process_event(const SDL_Event& event) {
     }
     // Always feed the backend: ImGui tracks mouse/keyboard/window state even
     // while the overlay is hidden, so it is coherent the moment it opens.
-    // (render() drains the resulting input queue every frame, visible or not.)
+    // (render() drains the resulting input queue on every frame it runs,
+    // visible or not — but the standard SceneRenderer wiring skips the
+    // post-UI callback on swapchain-acquire-failure/minimized frames, so
+    // events queued then accumulate — bounded — and are consumed by the first
+    // NewFrame after recovery.)
     ImGui_ImplSDL3_ProcessEvent(&event);
 
     // The toggle key is handled here, not by the host, so the overlay can
@@ -168,7 +177,7 @@ void DevUI::render(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain) {
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 
-    detail::draw_builtin_panels(bindings_);
+    detail::draw_builtin_panels(bindings_, panel_state_);
     for (auto& [name, draw] : panels_) {
         if (ImGui::Begin(name.c_str())) { // false while collapsed — skip the body
             draw();

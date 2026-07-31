@@ -27,7 +27,10 @@ public:
     RenderGraph(const RenderGraph&) = delete;
     RenderGraph& operator=(const RenderGraph&) = delete;
 
-    [[nodiscard]] bool init(gpu::GPUDevice& device);
+    // Bind the GPU device used to create transient textures. Cannot fail.
+    // Tests may skip this and run device-less: transient acquires then hand
+    // out non-null sentinel pointers so pooling/reuse logic stays testable.
+    void init(gpu::GPUDevice& device);
     void shutdown();
 
     // Begin a new frame. cb may be null for tests; execute() is then a no-op for managed render passes.
@@ -48,11 +51,12 @@ public:
     }
 
     // Untyped overload: setup builds, execute uses captured locals.
-    void add_pass(const std::string& name, PassType type, std::function<void(PassBuilder&)> setup,
-                  PassExecuteFn execute);
+    void add_pass(const std::string& name, std::function<void(PassBuilder&)> setup, PassExecuteFn execute);
 
     // Compile: topo-sort, resolve transient resources from the pool, compute lifetimes.
-    // Returns false on cycle (which is logged and skipped).
+    // Returns false (logged) on a dependency cycle or when a transient texture
+    // cannot be created; in both cases execute() is a no-op for this frame and
+    // any transients acquired before the failure are returned to the pool.
     [[nodiscard]] bool compile();
 
     // Execute compiled order. begin_frame() must have set the command buffer first.
@@ -69,7 +73,10 @@ public:
     size_t resource_count() const noexcept { return resources_.size(); }
     const std::vector<size_t>& compiled_order() const noexcept { return compiled_order_; }
 
-    // Emit Graphviz DOT description of the compiled graph for inspection.
+    // Emit a Graphviz DOT description of the *declared* dependency graph
+    // (passes, resources, read/write edges) — usable before compile(). After a
+    // successful compile(), each pass label is annotated with its execution
+    // step. Names are DOT-escaped.
     void dump_dot(std::ostream& os) const;
 
     // Access methods used by PassBuilder + RenderPassContext.
@@ -90,6 +97,7 @@ public:
     // For tests.
     PassNode& pass_at(size_t i) { return passes_[i]; }
     const PassNode& pass_at(size_t i) const { return passes_[i]; }
+    TransientAllocator& allocator_for_tests() noexcept { return allocator_; }
 
     // Force-evict pooled transient textures (call on resize).
     void evict_pool();
@@ -98,7 +106,7 @@ private:
     PassNode& create_pass_node(const std::string& name);
     bool topo_sort(std::vector<size_t>& out_order, bool& out_cycle) const;
     void compute_lifetimes();
-    void allocate_transients();
+    [[nodiscard]] bool allocate_transients();
 
     gpu::GPUDevice* device_ = nullptr;
     SDL_GPUCommandBuffer* cb_ = nullptr;

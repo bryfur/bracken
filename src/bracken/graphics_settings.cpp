@@ -22,13 +22,27 @@ void GraphicsSettings::clamp_to_valid_ranges() {
     shadow_mode = clamp_enum(shadow_mode, ShadowMode::Off, ShadowMode::PCSS);
     shadow_cascades = std::clamp(shadow_cascades, 0, 3);
     shadow_resolution = std::clamp(shadow_resolution, 0, 3);
-    ao_mode = clamp_enum(ao_mode, AOMode::Off, AOMode::GTAO);
-    aa_mode = clamp_enum(aa_mode, AAMode::Off, AAMode::FXAA);
+    shadow_distance = std::clamp(shadow_distance, 200.0f, 20000.0f);
+    // Budget bounds mirror render::lighting::LOCAL_SHADOW_MAX_{POINT,SPOT}_BUDGET
+    // (the 8x8 atlas holds 8*6 point-face tiles + 16 spot tiles exactly).
+    local_shadow_point_budget = std::clamp(local_shadow_point_budget, 0, 8);
+    local_shadow_spot_budget = std::clamp(local_shadow_spot_budget, 0, 16);
+    local_shadow_resolution = std::clamp(local_shadow_resolution, 0, 2);
+    ao_mode = clamp_enum(ao_mode, AOMode::Off, AOMode::GTAO_Full);
+    aa_mode = clamp_enum(aa_mode, AAMode::Off, AAMode::TAA);
     window_mode = std::clamp(window_mode, 0, 2);
-    // Upper bound depends on the runtime display-mode list; RenderContext
-    // re-clamps at apply time.
+    // Only the lower bound is enforced here — the upper bound depends on the
+    // runtime display-mode list, which this struct never sees. An index past
+    // that list is handled at apply time: RenderContext::set_window_mode
+    // warns and falls back to borderless fullscreen.
     resolution_index = std::max(resolution_index, 0);
     tonemap_mode = clamp_enum(tonemap_mode, TonemapMode::ACESFitted, TonemapMode::None);
+    // Auto exposure: EV clamp window kept ordered and within the histogram's
+    // meaningful correction range; adaptation speeds non-negative and sane.
+    auto_exposure_min_ev = std::clamp(auto_exposure_min_ev, -12.0f, 12.0f);
+    auto_exposure_max_ev = std::clamp(auto_exposure_max_ev, auto_exposure_min_ev, 12.0f);
+    auto_exposure_speed_up = std::clamp(auto_exposure_speed_up, 0.0f, 20.0f);
+    auto_exposure_speed_down = std::clamp(auto_exposure_speed_down, 0.0f, 20.0f);
 }
 
 bool GraphicsSettings::save(const std::string& path) const {
@@ -53,8 +67,14 @@ bool GraphicsSettings::save(const std::string& path) const {
     out << "shadow_mode=" << static_cast<int>(shadow_mode) << "\n";
     out << "shadow_cascades=" << shadow_cascades << "\n";
     out << "shadow_resolution=" << shadow_resolution << "\n";
+    out << "shadow_distance=" << shadow_distance << "\n";
+    out << "local_shadows=" << local_shadows << "\n";
+    out << "local_shadow_point_budget=" << local_shadow_point_budget << "\n";
+    out << "local_shadow_spot_budget=" << local_shadow_spot_budget << "\n";
+    out << "local_shadow_resolution=" << local_shadow_resolution << "\n";
     out << "ao_mode=" << static_cast<int>(ao_mode) << "\n";
     out << "aa_mode=" << static_cast<int>(aa_mode) << "\n";
+    out << "ibl_enabled=" << ibl_enabled << "\n";
     out << "bloom_enabled=" << bloom_enabled << "\n";
     out << "bloom_strength=" << bloom_strength << "\n";
     out << "volumetric_fog=" << volumetric_fog << "\n";
@@ -65,6 +85,11 @@ bool GraphicsSettings::save(const std::string& path) const {
     out << "tonemap_mode=" << static_cast<int>(tonemap_mode) << "\n";
     out << "contrast=" << contrast << "\n";
     out << "saturation=" << saturation << "\n";
+    out << "auto_exposure=" << auto_exposure << "\n";
+    out << "auto_exposure_min_ev=" << auto_exposure_min_ev << "\n";
+    out << "auto_exposure_max_ev=" << auto_exposure_max_ev << "\n";
+    out << "auto_exposure_speed_up=" << auto_exposure_speed_up << "\n";
+    out << "auto_exposure_speed_down=" << auto_exposure_speed_down << "\n";
     out << "ambient_strength=" << ambient_strength << "\n";
     out << "sun_intensity=" << sun_intensity << "\n";
     out << "bloom_threshold=" << bloom_threshold << "\n";
@@ -139,8 +164,14 @@ bool GraphicsSettings::load(const std::string& path) {
     read_enum("shadow_mode", shadow_mode);
     read_int("shadow_cascades", shadow_cascades);
     read_int("shadow_resolution", shadow_resolution);
+    read_float("shadow_distance", shadow_distance);
+    read_bool("local_shadows", local_shadows);
+    read_int("local_shadow_point_budget", local_shadow_point_budget);
+    read_int("local_shadow_spot_budget", local_shadow_spot_budget);
+    read_int("local_shadow_resolution", local_shadow_resolution);
     read_enum("ao_mode", ao_mode);
     read_enum("aa_mode", aa_mode);
+    read_bool("ibl_enabled", ibl_enabled);
     read_bool("bloom_enabled", bloom_enabled);
     read_float("bloom_strength", bloom_strength);
     read_bool("volumetric_fog", volumetric_fog);
@@ -151,6 +182,11 @@ bool GraphicsSettings::load(const std::string& path) {
     read_enum("tonemap_mode", tonemap_mode);
     read_float("contrast", contrast);
     read_float("saturation", saturation);
+    read_bool("auto_exposure", auto_exposure);
+    read_float("auto_exposure_min_ev", auto_exposure_min_ev);
+    read_float("auto_exposure_max_ev", auto_exposure_max_ev);
+    read_float("auto_exposure_speed_up", auto_exposure_speed_up);
+    read_float("auto_exposure_speed_down", auto_exposure_speed_down);
     read_float("ambient_strength", ambient_strength);
     read_float("sun_intensity", sun_intensity);
     read_float("bloom_threshold", bloom_threshold);

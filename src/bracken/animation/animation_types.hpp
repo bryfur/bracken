@@ -13,13 +13,13 @@
 namespace bracken::animation {
 
 constexpr int MAX_BONES = 128;
-constexpr int MAX_BONE_INFLUENCES = 4;
 
-struct AnimationKeyframe {
-    float time;
-    glm::vec3 translation;
-    glm::quat rotation;
-    glm::vec3 scale;
+// glTF sampler interpolation for a keyframe track. CUBICSPLINE has no runtime
+// representation: the loader extracts the per-key values and downgrades the
+// track to Linear (with a warning).
+enum class Interpolation : uint8_t {
+    Linear, // lerp / slerp between keys
+    Step,   // hold the previous key's value until the next key time
 };
 
 struct AnimationChannel {
@@ -30,6 +30,9 @@ struct AnimationChannel {
     std::vector<glm::quat> rotations;
     std::vector<float> scale_times;
     std::vector<glm::vec3> scales;
+    Interpolation position_interp = Interpolation::Linear;
+    Interpolation rotation_interp = Interpolation::Linear;
+    Interpolation scale_interp = Interpolation::Linear;
 };
 
 // Per-channel playback cursor. Lives on the player side so multiple instances
@@ -55,6 +58,10 @@ struct Joint {
     glm::vec3 local_scale{};
 };
 
+// Joints are stored parents-before-children: every joint's parent_index is
+// less than its own index (roots are -1). AnimationPlayer and the IK/lean
+// passes rely on this for their single-pass hierarchy propagation; the model
+// loader validates/normalizes glTF skins to this order at load.
 struct Skeleton {
     std::vector<Joint> joints;
     std::vector<int> joint_node_indices;
@@ -72,8 +79,13 @@ struct FootIKSmoother {
     }
 };
 
-// Configurable bone names for foot IK. Defaults match Mixamo conventions;
-// rigs from other DCCs can override.
+// Configurable bone names for foot IK. The defaults are the engine's generic
+// humanoid names (Hips, Spine, Left/RightUpperLeg, Left/RightLowerLeg,
+// Left/RightFoot). Matching is exact-string with no normalization — raw
+// Mixamo rigs do NOT match (they use `mixamorig:`-prefixed names, and even
+// prefix-stripped Mixamo bones are LeftUpLeg/LeftLeg); such rigs must supply
+// an explicit override. See docs/skinned_mesh_format.md, "Foot IK bone
+// naming".
 struct FootIKBoneNames {
     std::string hips = "Hips";
     std::string spine = "Spine";
@@ -173,7 +185,8 @@ struct ParamValue {
 };
 
 template<typename T>
-T interpolate_keyframes(const std::vector<float>& times, const std::vector<T>& values, float t, size_t& last_cursor) {
+T interpolate_keyframes(const std::vector<float>& times, const std::vector<T>& values, float t, size_t& last_cursor,
+                        Interpolation interp = Interpolation::Linear) {
     if (times.empty() || values.empty()) {
         {
             return T{};
@@ -197,6 +210,10 @@ T interpolate_keyframes(const std::vector<float>& times, const std::vector<T>& v
         last_cursor = i;
     }
 
+    if (interp == Interpolation::Step) {
+        return values[i];
+    }
+
     float t0 = times[i];
     float t1 = times[i + 1];
     float f = (t - t0) / (t1 - t0);
@@ -208,9 +225,11 @@ T interpolate_keyframes(const std::vector<float>& times, const std::vector<T>& v
     }
 }
 
-template<typename T> T interpolate_keyframes(const std::vector<float>& times, const std::vector<T>& values, float t) {
+template<typename T>
+T interpolate_keyframes(const std::vector<float>& times, const std::vector<T>& values, float t,
+                        Interpolation interp = Interpolation::Linear) {
     size_t cursor = 0;
-    return interpolate_keyframes(times, values, t, cursor);
+    return interpolate_keyframes(times, values, t, cursor, interp);
 }
 
 } // namespace bracken::animation

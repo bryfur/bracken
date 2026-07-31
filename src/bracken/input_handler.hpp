@@ -10,9 +10,81 @@
 
 namespace bracken {
 
+/**
+ * InputSnapshot — one frame's immutable, by-value copy of the InputHandler
+ * state, taken on the main thread after event pumping and carried into the
+ * sim stage (SimFrame::input()). Everything here is plain data: the sim job
+ * reads it freely from any pool worker while the main thread renders — no
+ * reference back into the live InputHandler (tier: `main-thread`) ever
+ * crosses the pipeline.
+ *
+ * Field names mirror the InputHandler getters they were copied from, so a
+ * port is mechanical (in.move_forward() -> in.move_forward,
+ * in.get_camera_yaw() -> in.camera_yaw); was_key_just_pressed keeps its
+ * function form for the scancode bounds check.
+ *
+ * Thread-safety tier: `worker-safe` (immutable value; copy freely).
+ */
+struct InputSnapshot {
+    /// Derived camera-relative movement/aim state (InputHandler::get_input).
+    InputState state{};
+
+    // Raw mouse position + button edges (mirror of the mouse getters).
+    float mouse_x = 0.0f;
+    float mouse_y = 0.0f;
+    bool mouse_left_held = false;
+    bool mouse_left_pressed = false;
+    bool mouse_left_released = false;
+    bool mouse_right_pressed = false;
+
+    // Camera orbit controls (sensitivity/inversion already applied).
+    float camera_yaw = 0.0f;
+    float camera_pitch = 20.0f;
+    float camera_zoom_delta = 0.0f;
+
+    // Raw movement keys (camera-relative axes live in `state`).
+    bool move_forward = false;
+    bool move_backward = false;
+    bool move_left = false;
+    bool move_right = false;
+
+    // Menu navigation edges.
+    bool menu_toggle_pressed = false;
+    bool menu_up_pressed = false;
+    bool menu_down_pressed = false;
+    bool menu_left_pressed = false;
+    bool menu_right_pressed = false;
+    bool menu_select_pressed = false;
+
+    // Text input: characters typed since the previous snapshot (the snapshot
+    // drains the handler's buffer — take_text_input semantics) + edge keys.
+    std::string text_input;
+    bool text_backspace_pressed = false;
+    bool text_enter_pressed = false;
+    bool text_escape_pressed = false;
+
+    // Controller.
+    bool has_controller = false;
+    bool controller_primary = false;
+    bool controller_secondary = false;
+
+    /// Per-frame key-press edges by physical scancode
+    /// (InputHandler::was_key_just_pressed).
+    std::array<bool, SDL_SCANCODE_COUNT> key_just_pressed{};
+
+    [[nodiscard]] bool was_key_just_pressed(SDL_Scancode scancode) const {
+        return scancode >= 0 && scancode < SDL_SCANCODE_COUNT && key_just_pressed[scancode];
+    }
+};
+
 // Engine-level raw input. Tracks mouse, keyboard, controller, and
 // camera-relative movement axes. Game-specific actions (attack, sprint,
 // skills, panel toggles) live in a client-side InputBindings layer.
+//
+// Thread-safety tier: `main-thread` — owned and pumped by Application::run's
+// event step (which runs at the frame fence, with no sim job in flight).
+// Sim-stage code never touches the handler; it reads the frame's
+// InputSnapshot through SimFrame::input().
 class InputHandler {
 public:
     InputHandler();
@@ -31,17 +103,17 @@ public:
     // Get current input state
     const bracken::InputState& get_input() const { return current_input_; }
 
+    // Build the frame's by-value InputSnapshot for the sim stage. Call on the
+    // main thread after post_process_events(); non-const because it DRAINS
+    // the pending text-input buffer into the snapshot (take_text_input
+    // semantics — the sim stage is the text consumer).
+    [[nodiscard]] InputSnapshot snapshot();
+
     // Check if input changed since last frame
     bool input_changed() const { return input_changed_; }
 
     // Reset input changed flag
     void reset_changed() { input_changed_ = false; }
-
-    // Set player position for mouse direction calculation
-    void set_player_screen_pos(float x, float y) {
-        player_screen_x_ = x;
-        player_screen_y_ = y;
-    }
 
     // Get raw mouse position
     float mouse_x() const { return mouse_x_; }
@@ -171,8 +243,6 @@ private:
     float mouse_y_ = 0.0f;
     float last_mouse_x_ = 0.0f;
     float last_mouse_y_ = 0.0f;
-    float player_screen_x_ = 640.0f;
-    float player_screen_y_ = 360.0f;
 
     // Raw movement keys
     bool move_forward_ = false;

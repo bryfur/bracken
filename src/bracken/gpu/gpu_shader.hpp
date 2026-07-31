@@ -10,25 +10,36 @@ namespace bracken::gpu {
 
 /**
  * @brief Shader stage types
+ *
+ * Compute exists for API completeness (build naming, cache keys) but does NOT
+ * go through GPUShader: SDL3 GPU has no SDL_GPUShader for compute — a compute
+ * SPIR-V module compiles directly into an SDL_GPUComputePipeline. Use
+ * gpu::GPUComputePipeline (gpu_compute.hpp) instead; GPUShader creation
+ * rejects ShaderStage::Compute.
  */
 enum class ShaderStage {
     Vertex,
     Fragment,
+    Compute,
 };
 
 /**
  * @brief Shader resource requirements for pipeline creation
  *
- * NOTE: These counts are not validated against hardware limits. The caller is
- * responsible for ensuring values don't exceed device capabilities. Exceeding
- * limits may cause silent failures or crashes on some hardware. Consider
- * querying SDL_GetGPUDeviceProperties() for device limits in production code.
+ * At shader creation these declared counts are cross-checked against SPIR-V
+ * reflection (SDL_ShaderCross_ReflectGraphicsSPIRV). On mismatch an error is
+ * logged and the reflected counts win, so a stale hand-maintained count can
+ * no longer silently misbind resources. Counts are still not validated
+ * against hardware limits; a shader exceeding device capabilities fails at
+ * shader/pipeline creation with an SDL error.
  */
 struct ShaderResources {
     uint32_t num_samplers = 0;
     uint32_t num_storage_textures = 0;
     uint32_t num_storage_buffers = 0;
     uint32_t num_uniform_buffers = 0;
+
+    friend bool operator==(const ShaderResources&, const ShaderResources&) = default;
 };
 
 /**
@@ -60,20 +71,37 @@ public:
      * @param device The GPU device
      * @param path Path to the compiled .spv file
      * @param stage Shader stage (Vertex or Fragment)
-     * @param entry_point Entry point function name (e.g., "VSMain", "PSMain")
-     * @param resources Shader resource requirements
+     * @param entry_point Entry point function name. Engine-built SPIR-V always
+     *                    uses "VSMain" (vertex) / "PSMain" (fragment); there is
+     *                    deliberately no default because a wrong entry point
+     *                    fails late and confusingly on Vulkan.
+     * @param resources Shader resource requirements (validated against SPIR-V
+     *                  reflection; see ShaderResources)
      * @return Unique pointer to the shader, or nullptr on failure
      */
     [[nodiscard]] static std::unique_ptr<GPUShader> load_spirv(GPUDevice& device, const std::string& path, ShaderStage stage,
-                                                 const std::string& entry_point = "main",
+                                                 const std::string& entry_point,
                                                  const ShaderResources& resources = {});
 
     /**
      * @brief Create a shader from SPIRV bytecode in memory
      */
     [[nodiscard]] static std::unique_ptr<GPUShader> create_from_spirv(GPUDevice& device, const std::vector<uint8_t>& spirv_bytecode,
-                                                        ShaderStage stage, const std::string& entry_point = "main",
+                                                        ShaderStage stage, const std::string& entry_point,
                                                         const ShaderResources& resources = {});
+
+    /**
+     * @brief Reflect the resource counts a SPIR-V module actually declares.
+     *
+     * Wraps SDL_ShaderCross_ReflectGraphicsSPIRV. Initializes the shader
+     * cross-compilation system on demand. Pure CPU work — no GPU device is
+     * required.
+     *
+     * @param spirv_bytecode The SPIR-V module
+     * @param out Filled with the reflected counts on success
+     * @return true on success, false if reflection failed (out untouched)
+     */
+    [[nodiscard]] static bool reflect_spirv_resources(const std::vector<uint8_t>& spirv_bytecode, ShaderResources& out);
 
     // =========================================================================
     // Accessors
@@ -81,6 +109,14 @@ public:
 
     SDL_GPUShader* handle() const { return shader_; }
     ShaderStage stage() const { return stage_; }
+
+    /**
+     * @brief Resource counts this shader was actually created with
+     *
+     * These are the counts baked into the SDL_GPUShader (reflected counts when
+     * reflection succeeded, caller-declared counts otherwise).
+     */
+    const ShaderResources& resources() const { return resources_; }
 
     // =========================================================================
     // Global Configuration
@@ -108,6 +144,7 @@ private:
     GPUDevice* device_ = nullptr;
     SDL_GPUShader* shader_ = nullptr;
     ShaderStage stage_ = ShaderStage::Vertex;
+    ShaderResources resources_{};
 
     static std::vector<uint8_t> read_file(const std::string& path);
 
@@ -120,6 +157,14 @@ private:
  * This is the recommended way to load shaders. It provides:
  * - Automatic SPIRV loading with backend conversion
  * - In-memory caching (avoid reloading within session)
+ *
+ * Thread-safety tiers (see docs/multithreading_plan.md §6.1):
+ * - **main-thread (asserted)**: every cache-mutating entry point — get()/
+ *   get_vertex()/get_fragment() on a cache MISS (first load of a shader),
+ *   clear_cache(), reload(), reload_all(), and destruction.
+ * - **worker-safe after init**: get() on an already-cached shader is a
+ *   read-only lookup, safe from any thread once all shaders are loaded
+ *   (pipeline preload does this) and no mutation is in flight.
  *
  * Usage:
  *   ShaderManager shaders(device);
@@ -144,35 +189,48 @@ public:
 
     /**
      * @brief Load or get a cached vertex shader
+     *
+     * Default entry point matches the engine's build-time convention (VSMain).
      */
-    GPUShader* get_vertex(const std::string& path, const std::string& entry_point = "main",
+    GPUShader* get_vertex(const std::string& path, const std::string& entry_point = "VSMain",
                           const ShaderResources& resources = {});
 
     /**
      * @brief Load or get a cached fragment shader
+     *
+     * Default entry point matches the engine's build-time convention (PSMain).
      */
-    GPUShader* get_fragment(const std::string& path, const std::string& entry_point = "main",
+    GPUShader* get_fragment(const std::string& path, const std::string& entry_point = "PSMain",
                             const ShaderResources& resources = {});
 
     /**
      * @brief Load or get a shader (generic)
+     *
+     * The cache key is (path, stage, entry_point). On a cache hit the
+     * requested resource counts are compared against the counts the cached
+     * shader was created with; a mismatch logs an error (the cached shader is
+     * returned unchanged — resource counts are baked in at first load).
+     *
+     * A cache hit is a read-only lookup (worker-safe after init); a cache
+     * miss loads and inserts, which is main-thread tier — asserted.
      */
     GPUShader* get(const std::string& path, ShaderStage stage, const std::string& entry_point,
                    const ShaderResources& resources = {});
 
     /**
-     * @brief Clear all cached shaders
+     * @brief Clear all cached shaders. Main-thread (asserted).
      */
     void clear_cache();
 
     /**
-     * @brief Reload a shader (clear from cache, reloads on next get)
+     * @brief Reload a shader (clear from cache, reloads on next get).
+     * Main-thread (asserted).
      * @return true if shader was in cache
      */
     [[nodiscard]] bool reload(const std::string& path);
 
     /**
-     * @brief Reload all shaders
+     * @brief Reload all shaders. Main-thread (asserted).
      * @return Number of shaders cleared
      */
     int reload_all();
@@ -180,42 +238,13 @@ public:
 private:
     GPUDevice& device_;
 
-    // NOTE: This cache is NOT thread-safe. If multi-threaded shader loading
-    // is needed, add mutex protection around cache operations, or ensure all
-    // shader loading happens on a single thread (e.g., the main/render thread).
+    // Thread-safety: mutation is main-thread tier and asserted at every
+    // mutating entry point (first-load insert, clear_cache, reload*);
+    // lookups of already-cached shaders are const-safe after init. No lock —
+    // the contract is enforced, not guarded.
     std::unordered_map<std::string, std::unique_ptr<GPUShader>> cache_;
 
     static std::string make_cache_key(const std::string& path, ShaderStage stage, const std::string& entry_point);
-};
-
-/**
- * @brief Shader program combining vertex and fragment shaders
- */
-class ShaderProgram {
-public:
-    ~ShaderProgram() = default;
-
-    ShaderProgram(const ShaderProgram&) = delete;
-    ShaderProgram& operator=(const ShaderProgram&) = delete;
-    ShaderProgram(ShaderProgram&&) = default;
-    ShaderProgram& operator=(ShaderProgram&&) = default;
-
-    /**
-     * @brief Load shader program from pre-compiled SPIRV files
-     */
-    [[nodiscard]] static std::unique_ptr<ShaderProgram> load(GPUDevice& device, const std::string& vertex_path,
-                                               const std::string& fragment_path,
-                                               const std::string& vertex_entry = "VSMain",
-                                               const std::string& fragment_entry = "PSMain");
-
-    SDL_GPUShader* vertex_shader() const { return vertex_ ? vertex_->handle() : nullptr; }
-    SDL_GPUShader* fragment_shader() const { return fragment_ ? fragment_->handle() : nullptr; }
-
-private:
-    ShaderProgram() = default;
-
-    std::unique_ptr<GPUShader> vertex_;
-    std::unique_ptr<GPUShader> fragment_;
 };
 
 } // namespace bracken::gpu

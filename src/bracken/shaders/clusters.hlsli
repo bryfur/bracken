@@ -24,13 +24,15 @@ struct ClusterParams {
 struct PointLightGPU {
     float3 position; float radius;
     float3 color;    float intensity;
+    int shadow_slot; // base tile of the light's 6 faces in the local-shadow atlas; -1 = unshadowed
 };
 
 struct SpotLightGPU {
     float3 position;  float radius;
     float3 direction; float inner_cos;
     float3 color;     float outer_cos;
-    float intensity;  float3 _pad;
+    float intensity;
+    int shadow_slot;  // the light's tile in the local-shadow atlas; -1 = unshadowed
 };
 
 struct LightHeader {

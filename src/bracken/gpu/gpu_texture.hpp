@@ -128,9 +128,33 @@ public:
                                                        bool generate_mipmaps = false);
 
     /**
-     * @brief Get the number of array layers (1 for non-array textures)
+     * @brief Create a cubemap texture (6 faces, optional full mip chain)
+     *
+     * With COLOR_TARGET in `usage`, every (face, mip) is individually
+     * renderable: set SDL_GPUColorTargetInfo::layer_or_depth_plane to the
+     * face (0..5, +X -X +Y -Y +Z -Z) and ::mip_level to the mip. Sampled as
+     * a TextureCube; SDL_GenerateMipmapsForGPUTexture fills the chain across
+     * all faces. Contents are undefined until first rendered/uploaded.
+     *
+     * @param device The GPU device
+     * @param size Face edge length in texels (cubemaps are square)
+     * @param format SDL GPU texture format
+     * @param usage SDL GPU texture usage flags (typically SAMPLER | COLOR_TARGET)
+     * @param mipmaps Allocate the full mip chain (log2(size)+1 levels)
+     * @return Unique pointer to the texture, or nullptr on failure
+     */
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_cube(GPUDevice& device, int size, SDL_GPUTextureFormat format,
+                                                   SDL_GPUTextureUsageFlags usage, bool mipmaps = false);
+
+    /**
+     * @brief Get the number of array layers (1 for non-array textures, 6 for cubemaps)
      */
     int layers() const { return layers_; }
+
+    /**
+     * @brief Get the number of mip levels
+     */
+    uint32_t mip_levels() const { return mip_levels_; }
 
     /**
      * @brief Create a depth-stencil buffer texture
@@ -156,8 +180,10 @@ public:
      * @brief Replace this texture's contents from a file on disk (hot-reload).
      *
      * On success the underlying SDL_GPUTexture is recreated and the old one
-     * released through the device. Returns false if the file cannot be loaded
-     * (existing GPU texture is left untouched).
+     * released through the device. The creation pixel format is preserved
+     * (an RGBA8_SRGB texture reloads as RGBA8_SRGB). Returns false if the
+     * file cannot be loaded or the texture's format has no TextureFormat
+     * mapping (existing GPU texture is left untouched).
      */
     [[nodiscard]] bool reload_from_file(const std::string& path, bool generate_mipmaps = true);
 

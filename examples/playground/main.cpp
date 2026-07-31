@@ -1,7 +1,7 @@
 #include "playground.hpp"
 
+#include <charconv>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <iostream>
@@ -52,15 +52,24 @@ bool verify_smoke_screenshot(const char* path) {
 // Usage: playground [--smoke [frames]]
 //   --smoke: self-drive for N frames (default 240) and exit — the integration-
 //            test mode. Prints "[smoke] OK ..." and "[smoke] screenshot OK ..."
-//            on success; exit code 1 if the run or the screenshot check fails.
+//            on success; exit code 1 if the run or the screenshot check fails,
+//            2 on bad arguments.
 int main(int argc, char** argv) {
     int smoke_frames = -1;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--smoke") == 0) {
             smoke_frames = 240;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
-                smoke_frames = std::atoi(argv[i + 1]);
-                ++i;
+                const char* arg = argv[++i];
+                const char* arg_end = arg + std::strlen(arg);
+                int frames = 0;
+                auto [parse_end, ec] = std::from_chars(arg, arg_end, frames);
+                if (ec != std::errc{} || parse_end != arg_end || frames <= 0) {
+                    std::cerr << "invalid --smoke frame count (expected a positive integer): "
+                              << arg << "\n";
+                    return 2;
+                }
+                smoke_frames = frames;
             }
         } else {
             std::cerr << "unknown argument: " << argv[i] << "\n";

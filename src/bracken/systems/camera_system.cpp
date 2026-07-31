@@ -18,7 +18,6 @@ CameraSystem::CameraSystem() {
 
     input_distance_ = current_config_.distance;
     current_distance_ = current_config_.distance;
-    base_fov_ = current_config_.fov;
     current_fov_ = current_config_.fov;
 }
 
@@ -28,18 +27,15 @@ void CameraSystem::update(float dt) {
     // Clamp dt to avoid instability
     dt = std::min(dt, 0.1f);
 
-    // Track total time for idle breathing effect
-    static float total_time = 0.0f;
-    total_time += dt;
-
-    // Update in proper order
+    // Update in proper order. Shake is computed before collision avoidance
+    // so terrain/obstacle clamps apply to the shaken position.
     update_input_smoothing(dt);
     update_look_ahead(dt);
     update_auto_centering(dt);
     update_soft_lock(dt);
     update_camera_position(dt);
-    update_collision_avoidance(dt);
     update_camera_shake(dt);
+    update_collision_avoidance(dt);
     update_dynamic_fov(dt);
 
     compute_matrices();
@@ -81,7 +77,7 @@ void CameraSystem::update_look_ahead(float dt) {
     glm::vec3 velocity_dir = speed > 1.0f ? glm::normalize(target_velocity_) : glm::vec3(0.0f);
 
     // Scale look-ahead by speed, capped at max
-    float look_ahead_factor = std::min(speed / 300.0f, 1.0f); // Normalize by typical run speed
+    float look_ahead_factor = std::min(speed / std::max(config.look_ahead_speed_ref, 0.001f), 1.0f);
     glm::vec3 desired_look_ahead = velocity_dir * config.look_ahead_dist * look_ahead_factor;
 
     // Smooth look-ahead to avoid jerky changes
@@ -96,7 +92,7 @@ void CameraSystem::update_auto_centering(float dt) {
     }
 
     // Start auto-centering after delay with no input
-    if (time_since_input_ > auto_center_delay_) {
+    if (time_since_input_ > config.auto_center_delay) {
         auto_centering_active_ = true;
     }
 
@@ -202,7 +198,11 @@ void CameraSystem::update_camera_position(float dt) {
 }
 
 void CameraSystem::update_collision_avoidance(float dt) {
-    final_camera_pos_ = current_camera_pos_;
+    const float ground_clearance = current_config_.ground_clearance;
+
+    // Start from the shaken camera position (update_camera_shake ran first)
+    // so the terrain/obstacle clamps below also contain shake displacement.
+    final_camera_pos_ = current_camera_pos_ + shake_offset_;
 
     // === Terrain collision ===
     if (get_terrain_height_) {
@@ -226,15 +226,15 @@ void CameraSystem::update_collision_avoidance(float dt) {
         }
 
         // Raise camera if clipping terrain
-        if (min_clearance < min_ground_clearance_) {
-            float adjustment = min_ground_clearance_ - min_clearance;
+        if (min_clearance < ground_clearance) {
+            float adjustment = ground_clearance - min_clearance;
             final_camera_pos_.y += adjustment;
         }
 
         // Final ground check at actual camera position
         float final_terrain_y = get_terrain_height_(final_camera_pos_.x, final_camera_pos_.z);
-        if (final_camera_pos_.y < final_terrain_y + min_ground_clearance_) {
-            final_camera_pos_.y = final_terrain_y + min_ground_clearance_;
+        if (final_camera_pos_.y < final_terrain_y + ground_clearance) {
+            final_camera_pos_.y = final_terrain_y + ground_clearance;
         }
     }
 
@@ -247,7 +247,7 @@ void CameraSystem::update_collision_avoidance(float dt) {
             float hit_distance = glm::length(hit_point - current_look_at_);
 
             // Place camera slightly in front of hit point
-            float safe_distance = std::max(hit_distance - 20.0f, min_distance_ * 0.3f);
+            float safe_distance = std::max(hit_distance - 20.0f, current_config_.zoom_min * 0.3f);
             final_camera_pos_ = current_look_at_ + to_camera * safe_distance;
 
             // Track collision offset for smooth pull-in
@@ -284,9 +284,10 @@ void CameraSystem::update_camera_shake(float dt) {
         float falloff = 1.0f - progress * progress; // Quadratic falloff
         float intensity = it->intensity * falloff;
 
-        // Generate shake based on type
+        // Generate shake based on type; per-type oscillation frequencies are
+        // the hard-coded sine multipliers below.
         glm::vec3 shake(0.0f);
-        float time = it->elapsed * it->frequency;
+        float time = it->elapsed;
 
         switch (it->type) {
             case ShakeType::Impact:
@@ -318,9 +319,8 @@ void CameraSystem::update_camera_shake(float dt) {
         shake_offset_ += shake;
         ++it;
     }
-
-    // Apply shake to final camera position
-    final_camera_pos_ += shake_offset_;
+    // shake_offset_ is applied by update_collision_avoidance (which runs
+    // next) so the collision clamps also contain shake displacement.
 }
 
 void CameraSystem::update_dynamic_fov(float dt) {
@@ -331,8 +331,8 @@ void CameraSystem::update_dynamic_fov(float dt) {
 
     // Speed-based FOV increase (sprint feeling)
     float speed = glm::length(target_velocity_);
-    float speed_factor = std::min(speed / 400.0f, 1.0f);
-    target_fov += sprint_fov_bonus_ * speed_factor * speed_factor;
+    float speed_factor = std::min(speed / std::max(config.sprint_speed_ref, 0.001f), 1.0f);
+    target_fov += config.sprint_fov_bonus * speed_factor * speed_factor;
 
     target_fov += fov_bias_;
 
@@ -341,9 +341,6 @@ void CameraSystem::update_dynamic_fov(float dt) {
 }
 
 void CameraSystem::compute_matrices() {
-    // Compute camera orientation vectors
-    float yaw_rad = glm::radians(current_yaw_);
-
     // Forward direction (where camera is looking)
     camera_forward_ = glm::normalize(current_look_at_ - final_camera_pos_);
 
@@ -357,13 +354,14 @@ void CameraSystem::compute_matrices() {
     view_matrix_ = glm::lookAt(final_camera_pos_, current_look_at_, glm::vec3(0.0f, 1.0f, 0.0f));
 
     // Projection matrix. Reversed-Z: near/far are deliberately swapped in the
-    // RH_ZO perspective call so the near plane (5) maps to depth 1 and the far
-    // plane (15000) to depth 0 — this spreads float32 depth precision evenly
-    // across the huge view range (scene pipelines test GREATER_OR_EQUAL and
-    // clear depth to 0.0; see docs/architecture.md "Coordinate, depth, and
-    // color conventions").
+    // RH_ZO perspective call so the near plane (default 5) maps to depth 1 and
+    // the far plane (default 15000) to depth 0 — this spreads float32 depth
+    // precision evenly across the huge view range (scene pipelines test
+    // GREATER_OR_EQUAL and clear depth to 0.0; see docs/architecture.md
+    // "Coordinate, depth, and color conventions").
     float aspect = static_cast<float>(screen_width_) / static_cast<float>(screen_height_);
-    projection_matrix_ = glm::perspective(glm::radians(current_fov_), aspect, 15000.0f, 5.0f);
+    projection_matrix_ = glm::perspective(glm::radians(current_fov_), aspect, current_config_.far_plane,
+                                          current_config_.near_plane);
 }
 
 // === Smooth damping functions (critically-damped spring) ===
@@ -436,26 +434,38 @@ void CameraSystem::rotate_pitch(float delta_degrees) {
 }
 
 void CameraSystem::set_yaw(float degrees) {
-    input_yaw_ = degrees;
-    while (input_yaw_ < 0.0f) input_yaw_ += 360.0f;
-    while (input_yaw_ >= 360.0f) input_yaw_ -= 360.0f;
+    float wrapped = degrees;
+    while (wrapped < 0.0f) wrapped += 360.0f;
+    while (wrapped >= 360.0f) wrapped -= 360.0f;
+    // A changed absolute angle counts as input so auto-centering stays
+    // suppressed for hosts that drive the camera via set_yaw/set_pitch.
+    // Hosts that hold a constant angle every frame should disable
+    // auto_center_enabled instead (their overwrite discards the nudge).
+    if (wrapped != input_yaw_) {
+        had_input_this_frame_ = true;
+    }
+    input_yaw_ = wrapped;
 }
 
 void CameraSystem::set_pitch(float degrees) {
     const auto& config = current_config_;
-    input_pitch_ = std::clamp(degrees, config.pitch_min, config.pitch_max);
+    float clamped = std::clamp(degrees, config.pitch_min, config.pitch_max);
+    if (clamped != input_pitch_) {
+        had_input_this_frame_ = true;
+    }
+    input_pitch_ = clamped;
 }
 
 void CameraSystem::adjust_zoom(float delta) {
-    input_distance_ = std::clamp(input_distance_ + delta, min_distance_, max_distance_);
+    input_distance_ = std::clamp(input_distance_ + delta, current_config_.zoom_min, current_config_.zoom_max);
     had_input_this_frame_ = true;
 }
 
 void CameraSystem::set_config(const CameraModeConfig& config) {
     current_config_ = config;
 
-    // Update distance to match new config
-    input_distance_ = config.distance;
+    // Update distance to match new config (kept within its zoom limits)
+    input_distance_ = std::clamp(config.distance, config.zoom_min, config.zoom_max);
 }
 
 void CameraSystem::add_shake(ShakeType type, float intensity, float duration) {
@@ -469,22 +479,6 @@ void CameraSystem::add_shake(ShakeType type, float intensity, float duration) {
     shake.duration = duration;
     shake.elapsed = 0.0f;
     shake.direction = glm::vec3(0.0f);
-
-    // Set frequency based on type
-    switch (type) {
-        case ShakeType::Impact:
-            shake.frequency = 1.0f;
-            break;
-        case ShakeType::Heavy:
-            shake.frequency = 1.0f;
-            break;
-        case ShakeType::Subtle:
-            shake.frequency = 1.0f;
-            break;
-        default:
-            shake.frequency = 1.0f;
-            break;
-    }
 
     active_shakes_.push_back(shake);
 }
@@ -500,7 +494,6 @@ void CameraSystem::add_directional_shake(const glm::vec3& direction, float inten
     shake.duration = duration;
     shake.elapsed = 0.0f;
     shake.direction = glm::length(direction) > 0.001f ? glm::normalize(direction) : glm::vec3(1, 0, 0);
-    shake.frequency = 1.0f;
 
     active_shakes_.push_back(shake);
 }

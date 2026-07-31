@@ -2,6 +2,8 @@
 
 #include "bracken/core/logger.hpp"
 
+#include <SDL3/SDL_log.h>
+
 #include <atomic>
 #include <memory>
 #include <string>
@@ -9,6 +11,14 @@
 #include <vector>
 
 using namespace bracken::core;
+
+TEST(LoggerSdlPriority, ConstructionOpensSdlLogFilterToTrace) {
+    // SDL's own per-category filter defaults to Info and would silently drop
+    // Trace/Debug forwarded by StdoutSink; the Logger constructor must open it
+    // so Logger::set_min_level is the single level knob.
+    Logger::instance();
+    EXPECT_EQ(SDL_GetLogPriority(SDL_LOG_CATEGORY_APPLICATION), SDL_LOG_PRIORITY_TRACE);
+}
 
 namespace {
 

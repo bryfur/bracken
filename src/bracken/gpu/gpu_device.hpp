@@ -43,7 +43,9 @@ public:
     /**
      * @brief Initialize the GPU device
      * @param window The SDL window to render to
-     * @param prefer_low_power If true, prefer integrated GPU over discrete
+     * @param prefer_low_power If true, prefer the energy-efficient adapter
+     *        (typically the integrated GPU) over maximum performance; wired to
+     *        SDL_PROP_GPU_DEVICE_CREATE_PREFERLOWPOWER_BOOLEAN
      * @return true on success, false on failure
      */
     [[nodiscard]] bool init(SDL_Window* window, bool prefer_low_power = false);
@@ -97,6 +99,12 @@ public:
 
     // =========================================================================
     // Resource Creation (Factory Methods)
+    //
+    // Thread-safety tier: main-thread (asserted). Every create_*/release_*
+    // below funnels an SDL_CreateGPU*/SDL_ReleaseGPU* call and must run on
+    // the engine main thread — see docs/multithreading_plan.md §6.1. Native
+    // streaming (Phase 6) will keep this contract via a main-thread publish
+    // queue rather than relaxing it.
     // =========================================================================
 
     /**
@@ -130,7 +138,7 @@ public:
     SDL_GPUShader* create_shader(const SDL_GPUShaderCreateInfo& info);
 
     // =========================================================================
-    // Resource Destruction
+    // Resource Destruction (main-thread, asserted — see Resource Creation)
     // =========================================================================
 
     void release_buffer(SDL_GPUBuffer* buffer);
@@ -139,6 +147,7 @@ public:
     void release_sampler(SDL_GPUSampler* sampler);
     void release_graphics_pipeline(SDL_GPUGraphicsPipeline* pipeline);
     void release_shader(SDL_GPUShader* shader);
+    void release_compute_pipeline(SDL_GPUComputePipeline* pipeline);
 
     // =========================================================================
     // Transfer Operations

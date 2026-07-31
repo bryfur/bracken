@@ -3,16 +3,14 @@
 #if defined(BRACKEN_DEV_UI) && BRACKEN_DEV_UI
 
 #include "bracken/graphics_settings.hpp"
+#include "bracken/render/auto_exposure.hpp"
 #include "bracken/render/environment.hpp"
 #include "bracken/render_stats.hpp"
 #include "bracken/scene/scene_renderer.hpp"
 #include "bracken/systems/camera_controller.hpp"
-#include "bracken/systems/effect_system.hpp"
 #include <algorithm>
-#include <array>
 #include <cfloat>
 #include <cmath>
-#include <cstddef>
 #include <cstdio>
 #include <glm/glm.hpp>
 #include <imgui.h>
@@ -38,20 +36,18 @@ bool combo_enum(const char* label, E& value, const char* const items[], int coun
 
 // ========== Stats ==========
 
-void draw_stats_tab(const DevUI::Bindings& bindings) {
+void draw_stats_tab(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
     if (bindings.fps != nullptr) {
         const float fps = *bindings.fps;
-        // 120-sample scrolling history. Static is fine: the overlay is
-        // main-thread only and drawn at most once per frame.
-        static std::array<float, 120> history{};
-        static size_t next_sample = 0;
-        history[next_sample] = fps;
-        next_sample = (next_sample + 1) % history.size();
+        // 120-sample scrolling history, kept on the owning DevUI instance so
+        // two overlays never interleave writes into a shared buffer.
+        state.fps_history[state.fps_next_sample] = fps;
+        state.fps_next_sample = (state.fps_next_sample + 1) % state.fps_history.size();
 
         char overlay[32];
         (void)std::snprintf(overlay, sizeof(overlay), "%.1f fps", static_cast<double>(fps));
-        ImGui::PlotLines("##fps_history", history.data(), static_cast<int>(history.size()),
-                         static_cast<int>(next_sample), overlay, 0.0f, FLT_MAX, ImVec2(-1.0f, 64.0f));
+        ImGui::PlotLines("##fps_history", state.fps_history.data(), static_cast<int>(state.fps_history.size()),
+                         static_cast<int>(state.fps_next_sample), overlay, 0.0f, FLT_MAX, ImVec2(-1.0f, 64.0f));
         ImGui::Text("Frame time: %.2f ms", fps > 0.0f ? static_cast<double>(1000.0f / fps) : 0.0);
     }
 
@@ -70,10 +66,11 @@ void draw_stats_tab(const DevUI::Bindings& bindings) {
         ImGui::Text("Entities rendered: %u", stats.entities_rendered);
         ImGui::Text("Entities culled: %u distance, %u frustum", stats.entities_distance_culled,
                     stats.entities_frustum_culled);
-        if (const auto* effects = bindings.scene_renderer->effect_system()) {
-            ImGui::Text("Particles: %u (in %u effects)", static_cast<unsigned>(effects->particle_count()),
-                        static_cast<unsigned>(effects->effect_count()));
-        }
+        // Render-side snapshot counts (the live EffectSystem is sim-stage-
+        // owned and may be mutating on a worker right now — never read it here).
+        ImGui::Text("Particles: %u (in %u effects)",
+                    static_cast<unsigned>(bindings.scene_renderer->frame_particle_count()),
+                    static_cast<unsigned>(bindings.scene_renderer->frame_effect_count()));
         ImGui::Spacing();
         ImGui::TextDisabled("Per-pass GPU times are stubbed (SDL3 limitation);");
         ImGui::TextDisabled("use Tracy (CPU) or RenderDoc/Nsight (GPU) for real numbers.");
@@ -85,7 +82,7 @@ void draw_stats_tab(const DevUI::Bindings& bindings) {
 void draw_environment_tab(scene::SceneRenderer& renderer) {
     // Mutating EnvironmentState in place is the intended live-edit path:
     // render_frame re-propagates env_ to every sub-renderer each frame.
-    EnvironmentState& env = renderer.environment();
+    render::EnvironmentState& env = renderer.environment();
 
     ImGui::SeparatorText("Sun");
     // sun_dir is the direction light TRAVELS; edit as azimuth/elevation of
@@ -118,6 +115,16 @@ void draw_environment_tab(scene::SceneRenderer& renderer) {
     ImGui::ColorEdit3("Ambient sky", &env.ambient_sky.x, HDR_COLOR_FLAGS);
     ImGui::ColorEdit3("Ambient ground", &env.ambient_ground.x, HDR_COLOR_FLAGS);
 
+    ImGui::SeparatorText("Clouds & haze");
+    // Coverage/density/scale/haze re-shape the sky, so each edit kicks off an
+    // amortized IBL refresh; speed only scales the scroll phase (never does).
+    ImGui::SliderFloat("Cloud coverage", &env.cloud_coverage, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat("Cloud density", &env.cloud_density, 0.0f, 2.0f, "%.2f");
+    ImGui::SliderFloat("Cloud scale", &env.cloud_scale, 0.25f, 4.0f, "%.2f");
+    ImGui::SliderFloat("Cloud speed", &env.cloud_speed, 0.0f, 8.0f, "%.2f");
+    ImGui::SliderFloat("Haze strength", &env.haze_strength, 0.0f, 1.5f, "%.2f");
+    ImGui::TextDisabled("Haze color follows the fog colors below.");
+
     ImGui::SeparatorText("Distance fog");
     ImGui::ColorEdit3("Fog horizon", &env.fog_color_horizon.x, HDR_COLOR_FLAGS);
     ImGui::ColorEdit3("Fog sun tint", &env.fog_color_sun.x, HDR_COLOR_FLAGS);
@@ -134,6 +141,22 @@ void draw_environment_tab(scene::SceneRenderer& renderer) {
     ImGui::DragFloat("March start", &env.fog_volumetric_start, 5.0f, 0.0f, 4000.0f, "%.0f");
     ImGui::DragFloat("March end", &env.fog_volumetric_end, 10.0f, 100.0f, 32000.0f, "%.0f");
     ImGui::TextDisabled("Volumetric pass runs only when 'Volumetric fog' is on (Graphics tab).");
+
+    ImGui::SeparatorText("Color grading");
+    // White balance shifts the scene illuminant pre-tonemap; the CDL triple
+    // grades the tonemapped image. All-neutral = pixel-identical output.
+    ImGui::SliderFloat("Temperature", &env.grade_temperature, -1.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat("Tint", &env.grade_tint, -1.0f, 1.0f, "%.2f");
+    ImGui::DragFloat3("CDL slope", &env.grade_slope.x, 0.01f, 0.0f, 4.0f, "%.2f");
+    ImGui::DragFloat3("CDL offset", &env.grade_offset.x, 0.005f, -1.0f, 1.0f, "%.3f");
+    ImGui::DragFloat3("CDL power", &env.grade_power.x, 0.01f, 0.1f, 4.0f, "%.2f");
+    if (ImGui::Button("Reset grading")) {
+        env.grade_temperature = 0.0f;
+        env.grade_tint = 0.0f;
+        env.grade_slope = glm::vec3(1.0f);
+        env.grade_offset = glm::vec3(0.0f);
+        env.grade_power = glm::vec3(1.0f);
+    }
 }
 
 // ========== Graphics ==========
@@ -149,10 +172,17 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
     changed |= ImGui::Combo("Shadow cascades", &settings.shadow_cascades, CASCADE_COUNTS, 4);
     static const char* const SHADOW_RESOLUTIONS[] = {"512", "1024", "2048", "4096"};
     changed |= ImGui::Combo("Shadow resolution", &settings.shadow_resolution, SHADOW_RESOLUTIONS, 4);
-    static const char* const AO_MODES[] = {"Off", "SSAO", "GTAO"};
+    changed |= ImGui::SliderFloat("Shadow distance", &settings.shadow_distance, 500.0f, 12000.0f, "%.0f",
+                                  ImGuiSliderFlags_Logarithmic);
+    changed |= ImGui::Checkbox("Local light shadows", &settings.local_shadows);
+    changed |= ImGui::SliderInt("Shadowed point lights", &settings.local_shadow_point_budget, 0, 8);
+    changed |= ImGui::SliderInt("Shadowed spot lights", &settings.local_shadow_spot_budget, 0, 16);
+    static const char* const LOCAL_SHADOW_RESOLUTIONS[] = {"1024", "2048", "4096"};
+    changed |= ImGui::Combo("Local shadow atlas", &settings.local_shadow_resolution, LOCAL_SHADOW_RESOLUTIONS, 3);
+    static const char* const AO_MODES[] = {"Off", "GTAO Half", "GTAO Full"};
     changed |= combo_enum("Ambient occlusion", settings.ao_mode, AO_MODES, 3);
-    static const char* const AA_MODES[] = {"Off", "FXAA"};
-    changed |= combo_enum("Anti-aliasing", settings.aa_mode, AA_MODES, 2);
+    static const char* const AA_MODES[] = {"Off", "FXAA", "TAA"};
+    changed |= combo_enum("Anti-aliasing", settings.aa_mode, AA_MODES, 3);
     static const char* const TONEMAP_MODES[] = {"ACES (fitted)", "ACES (Narkowicz)", "Reinhard", "None"};
     changed |= combo_enum("Tonemap", settings.tonemap_mode, TONEMAP_MODES, 4);
     static const char* const ANISO_LEVELS[] = {"Off", "2x", "4x", "8x", "16x"};
@@ -163,6 +193,7 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
     changed |= ImGui::Combo("Window mode", &settings.window_mode, WINDOW_MODES, 3);
 
     ImGui::SeparatorText("Features");
+    changed |= ImGui::Checkbox("Image-based lighting", &settings.ibl_enabled);
     changed |= ImGui::Checkbox("Bloom", &settings.bloom_enabled);
     changed |= ImGui::Checkbox("Volumetric fog", &settings.volumetric_fog);
     changed |= ImGui::Checkbox("God rays", &settings.god_rays);
@@ -180,7 +211,21 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
     changed |= ImGui::Combo("Draw distance", &settings.draw_distance, DRAW_DISTANCES, 7);
 
     ImGui::SeparatorText("Tone & grading");
-    changed |= ImGui::SliderFloat("Exposure", &settings.exposure, 0.1f, 4.0f, "%.2f");
+    changed |= ImGui::Checkbox("Auto exposure", &settings.auto_exposure);
+    // With auto exposure on, the exposure slider is the manual bias on top of
+    // the adapted EV; with it off, the whole exposure (pre-P6 behavior).
+    changed |= ImGui::SliderFloat("Exposure bias", &settings.exposure, 0.1f, 4.0f, "%.2f");
+    changed |= ImGui::SliderFloat("Adapt speed up", &settings.auto_exposure_speed_up, 0.0f, 10.0f, "%.1f EV/s");
+    changed |= ImGui::SliderFloat("Adapt speed down", &settings.auto_exposure_speed_down, 0.0f, 10.0f, "%.1f EV/s");
+    if (bindings.scene_renderer != nullptr) {
+        if (const auto* auto_exposure = bindings.scene_renderer->auto_exposure()) {
+            if (const auto& state = auto_exposure->latest_state()) {
+                // Once-per-second fenced readback; blank until the first lands.
+                ImGui::Text("Adapted EV: %+.2f (target %+.2f)", static_cast<double>(state->current_ev),
+                            static_cast<double>(state->target_ev));
+            }
+        }
+    }
     changed |= ImGui::SliderFloat("Contrast", &settings.contrast, 0.5f, 2.0f, "%.2f");
     changed |= ImGui::SliderFloat("Saturation", &settings.saturation, 0.0f, 2.0f, "%.2f");
     changed |= ImGui::SliderFloat("Ambient strength", &settings.ambient_strength, 0.0f, 1.0f, "%.2f");
@@ -195,15 +240,16 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
 
     // Push edits through the host's apply path only on frames where a widget
     // actually changed something (the host diffs internally, but there is no
-    // reason to spam it every frame).
-    if (changed && bindings.apply_settings) {
+    // reason to spam it every frame). Tab visibility guarantees
+    // apply_settings is non-empty — see draw_builtin_panels.
+    if (changed) {
         bindings.apply_settings(settings);
     }
 }
 
 // ========== Camera ==========
 
-void draw_camera_tab(systems::CameraController& camera) {
+void draw_camera_tab(systems::CameraController& camera, DevUI::PanelState& state) {
     const glm::vec3 position = camera.get_position();
     const glm::vec3 forward = camera.get_forward();
     // The abstract controller exposes no yaw/pitch getters; derive both from
@@ -224,37 +270,36 @@ void draw_camera_tab(systems::CameraController& camera) {
                 static_cast<double>(config.fov));
 
     ImGui::SeparatorText("Shake test");
-    static float shake_intensity = 1.0f;
-    static float shake_duration = 0.3f;
-    ImGui::SliderFloat("Intensity", &shake_intensity, 0.0f, 3.0f, "%.2f");
-    ImGui::SliderFloat("Duration", &shake_duration, 0.05f, 2.0f, "%.2f s");
+    ImGui::SliderFloat("Intensity", &state.shake_intensity, 0.0f, 3.0f, "%.2f");
+    ImGui::SliderFloat("Duration", &state.shake_duration, 0.05f, 2.0f, "%.2f s");
     if (ImGui::Button("Impact")) {
-        camera.add_shake(systems::ShakeType::Impact, shake_intensity, shake_duration);
+        camera.add_shake(systems::ShakeType::Impact, state.shake_intensity, state.shake_duration);
     }
     ImGui::SameLine();
     if (ImGui::Button("Heavy")) {
-        camera.add_shake(systems::ShakeType::Heavy, shake_intensity, shake_duration);
+        camera.add_shake(systems::ShakeType::Heavy, state.shake_intensity, state.shake_duration);
     }
     ImGui::SameLine();
     if (ImGui::Button("Subtle")) {
-        camera.add_shake(systems::ShakeType::Subtle, shake_intensity, shake_duration);
+        camera.add_shake(systems::ShakeType::Subtle, state.shake_intensity, state.shake_duration);
     }
     ImGui::SameLine();
     if (ImGui::Button("Directional (fwd)")) {
-        camera.add_directional_shake(forward, shake_intensity, shake_duration);
+        camera.add_directional_shake(forward, state.shake_intensity, state.shake_duration);
     }
 
+    // Re-derived from the controller every frame (like the Environment tab),
+    // so host calls to set_fov_bias()/set_focus_strength() are reflected.
     ImGui::SeparatorText("Framing");
-    static float fov_bias = 0.0f;
+    float fov_bias = camera.get_fov_bias();
     if (ImGui::SliderFloat("FOV bias", &fov_bias, -30.0f, 30.0f, "%.1f deg")) {
         camera.set_fov_bias(fov_bias);
     }
     ImGui::SameLine();
     if (ImGui::Button("Reset")) {
-        fov_bias = 0.0f;
         camera.set_fov_bias(0.0f);
     }
-    static float focus_strength = 0.0f;
+    float focus_strength = camera.get_focus_strength();
     if (ImGui::SliderFloat("Focus strength", &focus_strength, 0.0f, 1.0f, "%.2f")) {
         camera.set_focus_strength(focus_strength);
     }
@@ -262,7 +307,7 @@ void draw_camera_tab(systems::CameraController& camera) {
 
 } // namespace
 
-void draw_builtin_panels(const DevUI::Bindings& bindings) {
+void draw_builtin_panels(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
     ImGui::SetNextWindowSize(ImVec2(420.0f, 540.0f), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Bracken Dev")) {
         ImGui::End();
@@ -271,7 +316,7 @@ void draw_builtin_panels(const DevUI::Bindings& bindings) {
     if (ImGui::BeginTabBar("##bracken_dev_tabs")) {
         if ((bindings.fps != nullptr || bindings.scene_renderer != nullptr) && ImGui::BeginTabItem("Stats")) {
             ImGui::PushID("stats");
-            draw_stats_tab(bindings);
+            draw_stats_tab(bindings, state);
             ImGui::PopID();
             ImGui::EndTabItem();
         }
@@ -281,7 +326,11 @@ void draw_builtin_panels(const DevUI::Bindings& bindings) {
             ImGui::PopID();
             ImGui::EndTabItem();
         }
-        if (bindings.settings != nullptr && ImGui::BeginTabItem("Graphics")) {
+        // Graphics needs the struct AND the apply path: without the callback
+        // the widgets would mutate the host's GraphicsSettings in place while
+        // the renderer never hears about it, desyncing the two until the
+        // host's next unrelated apply flushes the stale dev-UI edits.
+        if (bindings.settings != nullptr && bindings.apply_settings && ImGui::BeginTabItem("Graphics")) {
             ImGui::PushID("graphics");
             draw_graphics_tab(bindings);
             ImGui::PopID();
@@ -289,7 +338,7 @@ void draw_builtin_panels(const DevUI::Bindings& bindings) {
         }
         if (bindings.camera != nullptr && ImGui::BeginTabItem("Camera")) {
             ImGui::PushID("camera");
-            draw_camera_tab(*bindings.camera);
+            draw_camera_tab(*bindings.camera, state);
             ImGui::PopID();
             ImGui::EndTabItem();
         }
@@ -304,7 +353,7 @@ void draw_builtin_panels(const DevUI::Bindings& bindings) {
 
 namespace bracken::dev::detail {
 
-void draw_builtin_panels(const DevUI::Bindings& /*bindings*/) {}
+void draw_builtin_panels(const DevUI::Bindings& /*bindings*/, DevUI::PanelState& /*state*/) {}
 
 } // namespace bracken::dev::detail
 

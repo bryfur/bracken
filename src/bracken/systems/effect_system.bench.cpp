@@ -2,6 +2,7 @@
 // evaluation it leans on per particle per frame.
 //
 // Run: ./build/src/bracken/bracken_benchmarks --benchmark_filter=BM_Effect
+#include "bracken/core/jobs/job_system.hpp"
 #include "bracken/effect_definition.hpp"
 #include "bracken/systems/effect_system.hpp"
 #include <benchmark/benchmark.h>
@@ -95,6 +96,43 @@ void BM_EffectUpdate(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(system.particle_count()));
 }
 BENCHMARK(BM_EffectUpdate)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
+
+// Same steady-state workload through the three-phase stage-helper form
+// (update(JobSystem&, dt)): SPAWN serial, INTEGRATE parallel_for over the
+// flattened particle space (grain 512), COMPACT per-emitter. Args are
+// {steady-state particles, workers}: workers==1 runs every chunk inline on
+// the caller — that delta vs BM_EffectUpdate is the fan-out bookkeeping tax;
+// workers==4 measures the actual speedup at each particle count.
+void BM_EffectUpdateParallel(benchmark::State& state) {
+    const auto target_particles = static_cast<float>(state.range(0));
+    const auto workers = static_cast<unsigned>(state.range(1));
+    const EffectDefinition def = make_continuous_effect(target_particles / kParticleLifetime);
+
+    // Caller-owned pool sized by the benchmark arg (the singleton would pin
+    // us to one ambient worker count).
+    bracken::core::jobs::JobSystem js;
+    js.init(workers);
+
+    EffectSystem system;
+    system.spawn_effect(&def, {0, 10, 0});
+    for (int i = 0; i < kWarmupSteps; ++i) {
+        system.update(js, kDt);
+    }
+
+    for (auto _ : state) {
+        system.update(js, kDt);
+        benchmark::ClobberMemory();
+    }
+
+    state.counters["particles"] = static_cast<double>(system.particle_count());
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(system.particle_count()));
+}
+BENCHMARK(BM_EffectUpdateParallel)
+    ->Args({1000, 4})
+    ->Args({10000, 1})
+    ->Args({10000, 4})
+    ->Args({50000, 4})
+    ->Unit(benchmark::kMicrosecond);
 
 // Same steady-state workload, but through the terrain-callback template
 // overload - isolates the per-particle heightmap sample + clamp overhead.

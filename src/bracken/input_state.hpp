@@ -5,8 +5,10 @@
 namespace bracken {
 
 /**
- * Engine-level input state. Contains movement and action state
- * without any network serialization or game-specific protocol knowledge.
+ * Engine-level input state: movement flags/axes and the current aim
+ * (attack) direction, without any network serialization or game-specific
+ * protocol knowledge. Game action state (attack, sprint, abilities) is
+ * host-owned — keep it in the consumer's own bindings layer.
  */
 struct InputState {
     // Legacy boolean movement flags
@@ -19,9 +21,7 @@ struct InputState {
     float move_dir_x = 0.0f;
     float move_dir_y = 0.0f;
 
-    // Action state
-    bool attacking = false;
-    bool sprinting = false;
+    // Aim direction (follows the camera-forward movement basis)
     float attack_dir_x = 0.0f;
     float attack_dir_y = 1.0f;
 };

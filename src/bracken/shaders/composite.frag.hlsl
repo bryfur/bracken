@@ -1,7 +1,18 @@
 // Composite Fragment Shader.
-// Input: linear HDR scene color + (optional) AO / bloom / volumetric fog.
-// AO and fog are half resolution and upsampled here with a depth-aware
-// (joint bilateral) 4-tap filter to avoid silhouette halos.
+// Input: linear HDR scene color + (optional) bloom / volumetric fog.
+// Fog is half resolution and upsampled here with a depth-aware (joint
+// bilateral) 4-tap filter to avoid silhouette halos.
+// Screen-space AO is NOT applied here: it is consumed by the forward pass
+// (ambient term only) — see gtao.frag.hlsl.
+// Exposure: manual bias (`exposure`) times, when autoExposureEnabled, the
+// exp2 of the adapted EV read from the exposure-state SSBO written by
+// exposure_adapt.comp.
+// Color grading: white balance (LMS gains) PRE-tonemap in linear light —
+// it models the illuminant, so it must see scene-referred values; the
+// ASC-CDL block (pow(c * slope + offset, power)) POST-tonemap on the
+// display-referred [0,1] image, before the contrast/saturation trims. Both
+// blocks are flag-gated so all-neutral parameters are pixel-identical to the
+// ungraded path (matrix/pow round-trips are not bit-exact even at neutral).
 // Output: gamma-encoded LDR to the swapchain (UNORM).
 // All math runs in linear light; tonemapping (ACES fitted) is applied once,
 // then gamma 2.2 is encoded explicitly because the swapchain is plain UNORM.
@@ -13,21 +24,29 @@ struct PSInput {
 
 [[vk::binding(0, 3)]]
 cbuffer CompositeUniforms : register(b0, space3) {
-    float aoStrength;
     float bloomStrength;
     float volumetricFogEnabled;
-    float _padding;
     float exposure;
     int tonemapMode;
     float contrast;
     float saturation;
-    // Joint bilateral upsample of the half-res AO/fog textures:
+    // Joint bilateral upsample of the half-res fog texture:
     // lowResTexelSize = 1 / half-res target size; depthA/depthB linearize the
     // depth buffer (viewZ = |depthB / (depth + depthA)|, glm RH_ZO — holds for
     // standard and reversed-Z projections alike).
     float2 lowResTexelSize;
     float depthA;
     float depthB;
+    float autoExposureEnabled;
+    float whiteBalanceEnabled;
+    float3 whiteBalance; // linear-RGB gains via LMS (render/color_grading.hpp)
+    float cdlEnabled;
+    float3 cdlSlope;
+    float _pad0;
+    float3 cdlOffset;
+    float _pad1;
+    float3 cdlPower;
+    float _pad2;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
@@ -36,24 +55,26 @@ Texture2D colorTexture : register(t0, space2);
 SamplerState colorSampler : register(s0, space2);
 
 [[vk::combinedImageSampler]][[vk::binding(1, 2)]]
-Texture2D<float> aoTexture : register(t1, space2);
+Texture2D bloomTexture : register(t1, space2);
 [[vk::combinedImageSampler]][[vk::binding(1, 2)]]
-SamplerState aoSampler : register(s1, space2);
+SamplerState bloomSampler : register(s1, space2);
 
 [[vk::combinedImageSampler]][[vk::binding(2, 2)]]
-Texture2D bloomTexture : register(t2, space2);
+Texture2D fogTexture : register(t2, space2);
 [[vk::combinedImageSampler]][[vk::binding(2, 2)]]
-SamplerState bloomSampler : register(s2, space2);
+SamplerState fogSampler : register(s2, space2);
 
 [[vk::combinedImageSampler]][[vk::binding(3, 2)]]
-Texture2D fogTexture : register(t3, space2);
+Texture2D<float> depthTexture : register(t3, space2);
 [[vk::combinedImageSampler]][[vk::binding(3, 2)]]
-SamplerState fogSampler : register(s3, space2);
+SamplerState depthSampler : register(s3, space2);
 
-[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
-Texture2D<float> depthTexture : register(t4, space2);
-[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
-SamplerState depthSampler : register(s4, space2);
+// Auto-exposure state written by exposure_adapt.comp:
+// x = adapted EV, y = target EV, z = avg log2 luminance, w = valid.
+// Only read when autoExposureEnabled — the slot binds a zeroed dummy buffer
+// when the auto-exposure system is off/unavailable.
+[[vk::binding(4, 2)]]
+StructuredBuffer<float4> exposureState : register(t4, space2);
 
 #include "lighting.hlsli"
 
@@ -61,18 +82,29 @@ float3 reinhard(float3 c) {
     return c / (c + 1.0);
 }
 
+// Linear sRGB <-> LMS (CIECAM02 transform pair), used by the white-balance
+// block. The gains themselves come from render::white_balance_coefficients.
+static const float3x3 LIN_TO_LMS = {
+    3.90405e-1, 5.49941e-1, 8.92632e-3,
+    7.08416e-2, 9.63172e-1, 1.35775e-3,
+    2.31082e-2, 1.28021e-1, 9.36245e-1
+};
+static const float3x3 LMS_TO_LIN = {
+    2.85847e+0, -1.62879e+0, -2.48910e-2,
+    -2.10182e-1, 1.15820e+0, 3.24281e-4,
+    -4.18120e-2, -1.18169e-1, 1.06867e+0
+};
+
 // Positive linear view depth from non-linear [0,1] depth (glm RH_ZO,
 // standard or reversed-Z — depthA/depthB come from the live projection).
 float linearizeDepth(float depth) {
     return abs(depthB / (depth + depthA));
 }
 
-// Joint bilateral upsample setup for the half-res AO/fog textures: the 4
-// nearest half-res texel centers, weighted by bilinear weight x depth
-// similarity to the full-res pixel. Plain bilinear mixes foreground and
-// background across depth discontinuities, producing dark AO fringes and
-// god-ray/fog bleeding around silhouettes. Weights are computed once and
-// shared by the AO and fog fetches (both are the same half-res grid).
+// Joint bilateral upsample setup for the half-res fog texture: the 4 nearest
+// half-res texel centers, weighted by bilinear weight x depth similarity to
+// the full-res pixel. Plain bilinear mixes foreground and background across
+// depth discontinuities, producing god-ray/fog bleeding around silhouettes.
 void bilateralTaps(float2 uv, out float2 tapUV[4], out float4 weights) {
     float2 pos = uv / lowResTexelSize - 0.5;
     float2 base = floor(pos);
@@ -108,29 +140,11 @@ void bilateralTaps(float2 uv, out float2 tapUV[4], out float4 weights) {
 float4 PSMain(PSInput input) : SV_Target {
     float3 color = colorTexture.Sample(colorSampler, input.texCoord).rgb;
 
-    // Depth-aware upsample weights, shared by the half-res AO and fog fetches.
-    float2 tapUV[4];
-    float4 tapW;
-    bilateralTaps(input.texCoord, tapUV, tapW);
-
-    // AO with sunlight protection. Physically, AO should only attenuate
-    // ambient/indirect light, but there is no depth prepass yet so the forward
-    // pass can't split ambient from direct — AO arrives here as a flat multiply
-    // on the FINAL lit color, which visibly darkens sun-lit + specular pixels
-    // (the classic SSAO-on-everything artifact). Approximate "ambient only" by
-    // protecting bright pixels: dim/ambient-lit regions receive full AO, while
-    // sun-lit pixels keep at least ~65% of their light.
-    float ao = 0.0;
-    [unroll]
-    for (int aoTap = 0; aoTap < 4; ++aoTap) {
-        ao += aoTexture.SampleLevel(aoSampler, tapUV[aoTap], 0) * tapW[aoTap];
-    }
-    float protect = saturate(luminance(color) * 0.6);
-    float aoFinal = lerp(ao, 1.0, protect * 0.65);
-    color *= lerp(1.0, aoFinal, aoStrength);
-
     // Premultiplied fog blend (scene * transmittance + inscattered) stays linear.
     if (volumetricFogEnabled > 0.5) {
+        float2 tapUV[4];
+        float4 tapW;
+        bilateralTaps(input.texCoord, tapUV, tapW);
         float4 vfog = float4(0.0, 0.0, 0.0, 0.0);
         [unroll]
         for (int fogTap = 0; fogTap < 4; ++fogTap) {
@@ -143,8 +157,19 @@ float4 PSMain(PSInput input) : SV_Target {
     float3 bloom = bloomTexture.Sample(bloomSampler, input.texCoord).rgb;
     color += bloom * bloomStrength;
 
-    // Exposure scales linear HDR before tonemap.
-    color *= exposure;
+    // Exposure scales linear HDR before tonemap: manual bias x adapted
+    // auto-exposure (exp2 of the EV the adapt compute pass converged on).
+    float exposureMul = exposure;
+    if (autoExposureEnabled > 0.5) {
+        exposureMul *= exp2(exposureState[0].x);
+    }
+    color *= exposureMul;
+
+    // White balance in linear light (scene-referred, pre-tonemap).
+    if (whiteBalanceEnabled > 0.5) {
+        float3 lms = mul(LIN_TO_LMS, color) * whiteBalance;
+        color = max(mul(LMS_TO_LIN, lms), 0.0);
+    }
 
     // Tonemap linear HDR -> [0,1] LDR.
     if (tonemapMode == 0) {
@@ -155,6 +180,12 @@ float4 PSMain(PSInput input) : SV_Target {
         color = reinhard(color);
     } else {
         color = saturate(color);
+    }
+
+    // ASC-CDL grade on the display-referred image (slope/offset/power;
+    // neutral = 1/0/1). Base clamped >= 0 for the pow.
+    if (cdlEnabled > 0.5) {
+        color = pow(max(color * cdlSlope + cdlOffset, 0.0), cdlPower);
     }
 
     // Post-tonemap contrast around mid-grey (0.5).

@@ -7,16 +7,21 @@
 #include "bracken/dev/dev_ui.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/render/render_context.hpp"
+#include "bracken/scene/frame_packet_ring.hpp"
 #include "bracken/scene/scene_renderer.hpp"
+#include "bracken/sim_frame.hpp"
 #include "bracken/systems/camera_system.hpp"
+#include "bracken/systems/effect_system.hpp"
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_filesystem.h"
 #include "SDL3/SDL_init.h"
 #include "SDL3/SDL_timer.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace bracken {
 
@@ -24,7 +29,7 @@ using namespace bracken::render;
 using namespace bracken::scene;
 using namespace bracken::systems;
 
-Application::Application() = default;
+Application::Application() : effect_system_(std::make_unique<systems::EffectSystem>()) {}
 
 Application::~Application() = default;
 
@@ -32,6 +37,33 @@ bool Application::init_engine() {
     // Record the engine main thread for BRACKEN_ASSERT_MAIN_THREAD() checks
     // (FileWatcher entry points, swapchain acquire, render_frame).
     core::bind_main_thread();
+
+    // The job-system worker pool is always-on engine infrastructure (see
+    // docs/multithreading_plan.md §4.1): it comes up before every other
+    // subsystem so any of them may submit jobs, and goes down first at
+    // shutdown (top of shutdown_renderer()) so no job outlives the
+    // subsystems it might touch. BRACKEN_WORKERS overrides the worker
+    // count: unset/0 = hardware_concurrency()-1 clamped >= 1;
+    // an explicit positive value is used as-is (BRACKEN_WORKERS=1 is the
+    // single-worker debug mode — same code path, one worker).
+    {
+        unsigned workers = 0; // 0 = JobSystem's default (hw-1, clamped >= 1)
+        // getenv is single-threaded at engine boot, before any worker thread is spawned.
+        // NOLINTNEXTLINE(concurrency-mt-unsafe)
+        if (const char* env = std::getenv("BRACKEN_WORKERS"); env && env[0] != '\0') {
+            char* end = nullptr;
+            const long parsed = std::strtol(env, &end, 10);
+            if (parsed > 0) {
+                workers = static_cast<unsigned>(parsed);
+            } else if (parsed < 0 || end == env) { // negative or non-numeric
+                BRACKEN_LOG_WARN("app", "Ignoring invalid BRACKEN_WORKERS='{}'; using default", env);
+            }
+        }
+        core::jobs::JobSystem::instance().init(workers);
+        BRACKEN_LOG_INFO("app", "Job system running with {} worker(s)",
+                         core::jobs::JobSystem::instance().worker_count());
+    }
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         BRACKEN_LOG_FATAL("app", "Failed to initialize SDL: {}", SDL_GetError());
         return false;
@@ -47,80 +79,263 @@ bool Application::init_engine() {
     return true;
 }
 
+void Application::pump_events() {
+    BRACKEN_PROFILE_ZONE("App::poll_events");
+    input_.reset_camera_deltas();
+    input_.clear_menu_inputs();
+    input_.clear_key_edges();
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        if (event.type == SDL_EVENT_QUIT) {
+            running_.store(false, std::memory_order_relaxed);
+            return;
+        }
+        // Dev overlay sees events first (ImGui tracks state even
+        // while hidden; consumes only when visible + wants input).
+        if (dev_ui_ && dev_ui_->process_event(event)) {
+            continue;
+        }
+        // Let subclass consume the event
+        if (!on_event(event)) {
+            input_.process_event(event);
+        }
+    }
+    // Polled movement keys bypass event consumption — mute them while
+    // the dev overlay owns the keyboard (e.g. typing in a panel).
+    input_.set_keyboard_captured(dev_ui_ && dev_ui_->wants_keyboard());
+    input_.post_process_events();
+}
+
+void Application::kick_sim() {
+    BRACKEN_ASSERT(!sim_in_flight_, "kick_sim with a sim job already in flight");
+
+    // Frame timing is computed AT KICK and carried in the packet.
+    // Nanosecond ticks: whole-millisecond timing quantizes dt to 0/1 ms steps
+    // at high frame rates, juddering animation and camera motion.
+    const uint64_t now = SDL_GetTicksNS();
+    float dt = static_cast<float>(static_cast<double>(now - last_frame_time_) /
+                                  static_cast<double>(SDL_NS_PER_SECOND));
+    last_frame_time_ = now;
+    dt = std::min(dt, 0.1f); // clamp huge jumps (debugger stalls, window drags)
+
+    sim_dt_ = dt;
+    sim_time_ += dt;
+    sim_frame_current_ = sim_frame_index_++;
+
+    // Take the input snapshot for this sim frame (main thread; the sim job
+    // reads it via the submit publish edge).
+    sim_input_ = input_.snapshot();
+    sim_feedback_.has_camera_forward = false;
+
+    // Acquire the fill slot + builder (Retired → Filling) and stamp timing.
+    FramePacket& packet = frame_packets().acquire_for_fill();
+    sim_builder_ = std::make_unique<FrameBuilder>(packet, k_sim_lanes);
+    sim_builder_->set_frame_timing(dt, sim_time_, sim_frame_current_);
+    sim_packet_ = &packet;
+
+    sim_task_ = core::jobs::JobSystem::instance().submit([this] { run_sim_job(); });
+    sim_in_flight_ = true;
+}
+
+void Application::run_sim_job() {
+    BRACKEN_PROFILE_ZONE("App::simulate");
+    FrameBuilder& fb = *sim_builder_;
+
+    {
+        BRACKEN_PROFILE_ZONE("App::on_simulate");
+        SimFrame sim(fb, sim_input_, sim_dt_, sim_time_, sim_frame_current_, &sim_feedback_);
+        on_simulate(sim);
+    }
+
+    // ---- Engine sim-stage tail (docs/multithreading_plan.md §4.2/§4.3) ----
+    // Apply the frame's queued effect spawns to the sim-owned EffectSystem in
+    // deterministic (lane, emission) order — the drain the renderer used to
+    // do, moved to the sim side.
+    fb.for_each_effect_spawn([this](const EffectSpawnCommand& spawn) {
+        if (spawn.definition != nullptr) {
+            effect_system_->spawn_effect(spawn.definition, spawn.position, spawn.direction);
+        }
+    });
+
+    // Particle update on the pool (nested fork-join from inside this job is
+    // supported by JobSystem::wait's helping). The terrain sampler is
+    // worker-safe: const bilinear reads of the immutable heightmap.
+    auto& js = core::jobs::JobSystem::instance();
+    if (scene_renderer_) {
+        effect_system_->update(js, sim_dt_,
+                               [this](float x, float z) { return scene_renderer_->get_terrain_height(x, z); });
+    } else {
+        effect_system_->update(js, sim_dt_);
+    }
+
+    // Effect-instance snapshot: the renderer draws THIS, never the live
+    // EffectSystem (which the next sim frame mutates concurrently).
+    effect_system_->snapshot_into(fb);
+
+    // Scene/sky clock advance (moved out of the renderer). The sky clock is
+    // a cloud scroll PHASE: dt scaled by the environment's cloud_speed — use
+    // the environment the host staged this frame (or the last one it ever
+    // staged; defaults otherwise).
+    if (fb.has_staged_environment()) {
+        sim_env_ = fb.staged_environment();
+    }
+    sim_scene_time_ += sim_dt_;
+    sim_sky_time_ += sim_dt_ * sim_env_.cloud_speed;
+    fb.set_engine_frame(sim_scene_time_, sim_sky_time_, static_cast<uint32_t>(effect_system_->effect_count()));
+
+    // Filling → Sealed. The TaskHandle join publishes the sealed packet to
+    // the main thread — no further handoff synchronization needed.
+    fb.seal();
+}
+
+scene::FramePacket* Application::join_sim() {
+    if (!sim_in_flight_) {
+        return nullptr;
+    }
+    sim_in_flight_ = false;
+    FramePacket* frame = sim_packet_;
+    sim_packet_ = nullptr;
+    try {
+        BRACKEN_PROFILE_ZONE("App::join_sim");
+        // Helping wait: the main thread executes pool jobs (including this
+        // frame's own sim fan-out) instead of idling.
+        core::jobs::JobSystem::instance().wait(sim_task_);
+    } catch (...) {
+        // Sim-job error policy: a host exception out of on_simulate must not
+        // vanish into the pool — fatal-log and rethrow on the main thread.
+        BRACKEN_LOG_FATAL("app", "on_simulate threw; abandoning frame {} and rethrowing on the main thread",
+                          sim_frame_current_);
+        sim_task_ = {};
+        sim_builder_.reset();
+        if (frame != nullptr) {
+            frame->reset(); // abandon the partial fill (any state → Retired)
+        }
+        throw;
+    }
+    sim_task_ = {};
+    sim_builder_.reset(); // spent after seal
+    return frame;         // Sealed
+}
+
+void Application::frame_fence(uint64_t joined_frame_index) {
+    BRACKEN_PROFILE_ZONE("App::frame_fence");
+    // No sim in flight here — the pipeline's quiescent point.
+    BRACKEN_ASSERT(!sim_in_flight_, "frame_fence with a sim job in flight");
+
+    // Hot-reload applies at the fence: no packet referencing the old
+    // resource is being built or rendered.
+    if (core::asset::FileWatcher::instance().is_initialized()) {
+        core::asset::FileWatcher::instance().poll_main_thread();
+    }
+
+    // Deferred graphics-settings application (request_graphics_settings; the
+    // main-thread slot — DevUI — wins over the sim slot when both are set).
+    if (has_pending_graphics_settings_ || has_pending_graphics_settings_main_) {
+        const GraphicsSettings& s =
+            has_pending_graphics_settings_main_ ? pending_graphics_settings_main_ : pending_graphics_settings_;
+        apply_all_graphics_settings(s);
+        has_pending_graphics_settings_ = false;
+        has_pending_graphics_settings_main_ = false;
+    }
+
+    // Camera-forward feedback from the joined sim frame: shapes the movement
+    // basis of the NEXT input snapshot (same one-frame latency as the old
+    // sequential loop).
+    if (sim_feedback_.has_camera_forward) {
+        input_.set_camera_forward(sim_feedback_.camera_forward_x, sim_feedback_.camera_forward_z);
+        sim_feedback_.has_camera_forward = false;
+    }
+
+    // FPS accounting lives at the fence so fps_ is never written while a sim
+    // job (which may read fps()) is in flight.
+    const uint64_t now = SDL_GetTicksNS();
+    frame_count_++;
+    if (now - fps_timer_ >= static_cast<uint64_t>(SDL_NS_PER_SECOND)) {
+        fps_ = static_cast<float>(frame_count_);
+        frame_count_ = 0;
+        fps_timer_ = now;
+    }
+
+    // Host main-thread hook — the only safe place to read live game state
+    // from the main thread (see application.hpp).
+    {
+        BRACKEN_PROFILE_ZONE("App::on_main_frame");
+        MainFrame mf(*this, joined_frame_index);
+        on_main_frame(mf);
+    }
+
+    // Forward the deferred screenshot request (from sim or on_main_frame)
+    // so the frame about to render is the one captured.
+    if (!pending_screenshot_path_.empty() && scene_renderer_) {
+        scene_renderer_->request_screenshot(std::move(pending_screenshot_path_));
+        pending_screenshot_path_.clear();
+    }
+}
+
 void Application::run() {
-    running_ = true;
+    BRACKEN_ASSERT_MAIN_THREAD();
+    running_.store(true, std::memory_order_relaxed);
     last_frame_time_ = SDL_GetTicksNS();
     fps_timer_ = last_frame_time_;
 
-    while (running_) {
-        // Nanosecond ticks: whole-millisecond timing quantizes dt to 0/1 ms steps
-        // at high frame rates, juddering animation and camera motion.
-        uint64_t current_time = SDL_GetTicksNS();
-        float dt = static_cast<float>(static_cast<double>(current_time - last_frame_time_) /
-                                      static_cast<double>(SDL_NS_PER_SECOND));
-        last_frame_time_ = current_time;
+    // Bootstrap: pump once so frame 0 sims real input, then kick sim job 0.
+    // No overlap for frame 0 — the loop joins it immediately.
+    pump_events();
+    if (running_.load(std::memory_order_relaxed)) {
+        kick_sim();
+    }
 
-        // Clamp delta time to avoid huge jumps
-        dt = std::min(dt, 0.1f);
+    // Steady state, iteration i (see application.hpp for the schedule):
+    // join sim i → fence → pump → kick sim i+1 → render i → retire i.
+    // Simulate(i+1) overlaps Render(i); pipeline depth 2.
+    while (running_.load(std::memory_order_relaxed)) {
+        FramePacket* frame = join_sim(); // (1) — rethrows sim exceptions
+        if (frame == nullptr) {
+            break; // defensive: nothing in flight
+        }
+        const uint64_t frame_index = frame->frame_index();
 
-        // FPS counter
-        frame_count_++;
-        if (current_time - fps_timer_ >= static_cast<uint64_t>(SDL_NS_PER_SECOND)) {
-            fps_ = static_cast<float>(frame_count_);
-            frame_count_ = 0;
-            fps_timer_ = current_time;
+        frame_fence(frame_index); // (2)
+
+        pump_events(); // (3)
+        if (!running_.load(std::memory_order_relaxed)) {
+            // Quit during the pump (or from sim i): frame i is sealed but
+            // will never render — retire it and leave with no sim in flight.
+            frame_packets().retire(*frame);
+            break;
         }
 
-        if (core::asset::FileWatcher::instance().is_initialized()) {
-            core::asset::FileWatcher::instance().poll_main_thread();
-        }
+        kick_sim(); // (4) — Simulate(i+1) now runs on the pool...
 
-        // Process input - poll events, let subclass see them first
-        {
-            BRACKEN_PROFILE_ZONE("App::poll_events");
-            input_.reset_camera_deltas();
-            input_.clear_menu_inputs();
-            input_.clear_key_edges();
-            SDL_Event event;
-            while (SDL_PollEvent(&event)) {
-                if (event.type == SDL_EVENT_QUIT) {
-                    running_ = false;
-                    break;
-                }
-                // Dev overlay sees events first (ImGui tracks state even
-                // while hidden; consumes only when visible + wants input).
-                if (dev_ui_ && dev_ui_->process_event(event)) {
-                    continue;
-                }
-                // Let subclass consume the event
-                if (!on_event(event)) {
-                    input_.process_event(event);
-                }
-            }
-            if (!running_) {
-                break;
-            }
-            // Polled movement keys bypass event consumption — mute them while
-            // the dev overlay owns the keyboard (e.g. typing in a panel).
-            input_.set_keyboard_captured(dev_ui_ && dev_ui_->wants_keyboard());
-            input_.post_process_events();
-        }
-
-        {
-            BRACKEN_PROFILE_ZONE("App::update");
-            on_update(dt);
-        }
-        {
+        // (5) ...while the main thread renders frame i (Prepare fan-out +
+        // Record + present, unchanged from Phase 3).
+        if (scene_renderer_) {
             BRACKEN_PROFILE_ZONE("App::render");
-            on_render();
+            render_frame(*frame);
         }
+
+        frame_packets().retire(*frame); // (6)
 
         BRACKEN_PROFILE_FRAME();
+    }
+
+    // Shutdown: join any in-flight sim before teardown — quit() may have
+    // been observed with a freshly kicked job still running, and nothing
+    // (renderer, effect system, packets) may be torn down under it. A sim
+    // exception here still rethrows out of run() (fatal-logged in join_sim).
+    if (sim_in_flight_) {
+        FramePacket* frame = join_sim();
+        if (frame != nullptr) {
+            frame_packets().retire(*frame);
+        }
     }
 }
 
 void Application::shutdown_engine() {
     core::asset::FileWatcher::instance().shutdown();
+    // Safety net for hosts that never brought up the renderer: normally the
+    // pool is already down (top of shutdown_renderer(), before GPU teardown);
+    // JobSystem::shutdown() is idempotent.
     core::jobs::JobSystem::instance().shutdown();
     SDL_Quit();
 }
@@ -159,6 +374,11 @@ bool Application::init_renderer(int width, int height, const std::string& title,
 }
 
 void Application::shutdown_renderer() {
+    // Stop the worker pool before any GPU teardown: joining the workers here
+    // guarantees no in-flight or queued job can touch a subsystem (renderer,
+    // device, model manager) that is about to be destroyed.
+    core::jobs::JobSystem::instance().shutdown();
+
     // Auto-save settings on shutdown
     auto path = settings_file_path();
     if (!path.empty()) {
@@ -184,8 +404,18 @@ void Application::shutdown_renderer() {
     context_.reset();
 }
 
-void Application::render_frame(RenderScene& scene, const UIScene& ui_scene, const CameraState& camera, float dt) {
-    scene_renderer_->render_frame(scene, ui_scene, camera, dt);
+void Application::render_frame(const FramePacket& frame) {
+    scene_renderer_->render_frame(frame);
+}
+
+scene::PacketRing& Application::frame_packets() {
+    // Lazily created so hosts that own their own ring (or never render)
+    // don't pay for idle packet arenas. Depth 2 (PacketRing's default): the
+    // pipelined loop renders one slot while the sim job fills the other.
+    if (!packet_ring_) {
+        packet_ring_ = std::make_unique<scene::PacketRing>();
+    }
+    return *packet_ring_;
 }
 
 void Application::set_heightmap(const Heightmap& heightmap) {
@@ -229,11 +459,11 @@ float Application::get_terrain_height(float x, float z) {
 }
 
 int Application::screen_width() const {
-    return context_->width();
+    return context_ ? context_->width() : 0;
 }
 
 int Application::screen_height() const {
-    return context_->height();
+    return context_ ? context_->height() : 0;
 }
 
 void Application::set_collect_render_stats(bool enabled) {
@@ -249,7 +479,29 @@ std::string Application::gpu_driver_name() const {
 }
 
 void Application::request_screenshot(const std::string& path) {
-    scene_renderer_->request_screenshot(path);
+    // Deferred: forwarded to the renderer at the frame fence, so a request
+    // from sim frame i captures frame i's rendering — and the sim job never
+    // touches the renderer's screenshot state while a frame is recording.
+    pending_screenshot_path_ = path;
+}
+
+void Application::request_graphics_settings(const GraphicsSettings& settings) {
+    // Deferred: applied by frame_fence() on the main thread with no sim in
+    // flight (the GPU/SDL work in apply_all_graphics_settings is main-thread
+    // tier). Two slots because the two legal callers can be CONCURRENT: the
+    // sim job (host frame code) and the main thread (the DevUI Graphics tab's
+    // apply callback fires during rendering, while a sim is in flight). Each
+    // slot is single-writer — sim-slot ordering rides the sim-job kick/join
+    // edges, the main slot never leaves the main thread — so no atomics.
+    // At the fence the main-thread slot wins (the DevUI edit is the more
+    // deliberate action).
+    if (core::is_main_thread()) {
+        pending_graphics_settings_main_ = settings;
+        has_pending_graphics_settings_main_ = true;
+    } else {
+        pending_graphics_settings_ = settings;
+        has_pending_graphics_settings_ = true;
+    }
 }
 
 void Application::apply_all_graphics_settings(const GraphicsSettings& settings) {
@@ -285,7 +537,10 @@ bool Application::init_dev_ui() {
         scene_renderer_.get(),
         &camera(),
         &graphics_settings_,
-        [this](const GraphicsSettings& s) { apply_all_graphics_settings(s); },
+        // The overlay draws DURING rendering, while the next sim runs —
+        // route its apply through the deferred request so the GPU/SDL work
+        // lands at the frame fence (see dev_ui.hpp's panel-data-safety note).
+        [this](const GraphicsSettings& s) { request_graphics_settings(s); },
         &fps_,
     };
     if (!dev_ui_->init(*context_, std::move(bindings))) {

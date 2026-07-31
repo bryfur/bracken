@@ -15,9 +15,13 @@ struct VSInput {
     [[vk::location(3)]] float3 normal : NORMAL;
 };
 
-// Vertex output / Fragment input
+// Vertex output / Fragment input.
+// position is `precise`: the depth prepass (prepass_terrain.vert.hlsl)
+// computes the same view->projection chain and the forward pipeline
+// depth-tests EQUAL against the prepass depth — both sides must be
+// bit-identical, so contraction on the position path is disabled in both.
 struct VSOutput {
-    float4 position : SV_Position;
+    precise float4 position : SV_Position;
     float4 vertexColor : TEXCOORD0;
     float3 fragPos : TEXCOORD1;
     float3 normal : TEXCOORD2;

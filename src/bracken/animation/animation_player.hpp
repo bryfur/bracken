@@ -18,6 +18,10 @@ public:
     AnimationPlayer(AnimationPlayer&&) noexcept = default;
     AnimationPlayer& operator=(AnimationPlayer&&) noexcept = default;
 
+    // Precondition: skeleton.joints must be ordered parents-before-children
+    // (every parent_index < its joint's index) — the hierarchy is propagated
+    // in a single index-order pass. Skeletons produced by ModelLoader::load_glb
+    // are normalized to this order at load.
     void update(const Skeleton& skeleton, const std::vector<AnimationClip>& clips, float dt);
 
     void crossfade_to(int clip_index, float duration = 0.2f);
@@ -49,6 +53,20 @@ public:
     // Joints written by the last update(); slots at/beyond this index hold
     // identity. Consumers packing palettes should read only this prefix.
     size_t used_joint_count() const { return used_joint_count_; }
+
+    /**
+     * Copy the current bone palette into caller-provided storage — e.g. the
+     * uninitialized packet memory returned by
+     * scene::FrameBuilder::alloc_bone_palette (docs/multithreading_plan.md
+     * §3.2): the used_joint_count() prefix of bone_matrices(), then identity
+     * for any remaining slots, so `dst` is fully written regardless of its
+     * size relative to the animated prefix. Call after update() (and any
+     * IK/lean patching) so the copy captures the final pose.
+     *
+     * Thread-safety tier: `sim-stage` — const read of per-instance state;
+     * safe from a sim job as long as it doesn't race this player's update().
+     */
+    void write_palette(std::span<glm::mat4> dst) const;
 
     // IK/lean integrators need to read (and occasionally patch) world transforms
     // together with the bone matrices. Exposed as spans so callers never own the

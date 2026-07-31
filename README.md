@@ -9,26 +9,50 @@ loading, skeletal animation, and a clustered-forward renderer.
 > *bracken (n.) — the coarse fern that carpets a forest floor.*
 
 This repository contains *only* the engine — no game, server, or networking
-code. It builds as a static library (`bracken`) plus its unit-test suite
-(`bracken_tests`, GoogleTest).
+code (rigid-body physics, however, ships in-engine: `bracken::physics`, a
+glm-typed API over vendored Jolt Physics). It builds as a static library
+(`bracken`) plus its unit-test suite (`bracken_tests`, GoogleTest).
 
 ## Features
 
 - **GPU abstraction** over the SDL3 GPU API (`src/bracken/gpu/`) — buffers,
-  textures, shaders, a lazy `PipelineRegistry`, uniform/SSBO management.
+  textures, shaders, compute pipelines, a lazy `PipelineRegistry`,
+  uniform/SSBO management.
 - **Clustered-forward renderer** (`src/bracken/render/`) — linear-space PBR
   with an HDR pipeline: clustered point/spot lighting (up to 256 lights),
-  cascaded shadow maps (PCF/PCSS), SSAO/GTAO, bloom, volumetric fog with god
-  rays, FXAA, procedural skybox, terrain, instanced grass, skinned meshes.
+  cascaded shadow maps (PCF/PCSS), budgeted point/spot light shadows
+  (cached-tile atlas, host opt-in per light), horizon-based GTAO (temporally
+  accumulated, ambient-only), image-based lighting prefiltered live from the
+  procedural sky (diffuse irradiance + GGX specular cubemaps + split-sum
+  BRDF LUT, amortized regeneration on sky changes), histogram auto exposure
+  (compute-based, percentile-clipped, temporally adapted), bloom, volumetric
+  fog with god rays, TAA (motion-vector based, the default) or FXAA, color
+  grading (white balance + ASC-CDL) at composite, a procedural sky
+  (domain-warped cloud deck with sun-aware scattering, live cloud/haze
+  controls, golden-hour/dusk/night response, fog-sky horizon agreement),
+  terrain, instanced grass, skinned meshes, and water — a surface renderer
+  (screen-space refraction with Beer-Lambert absorption, screen-space
+  reflections with a prefiltered-sky fallback, fresnel, sun glint, shoreline
+  foam) driven by a compute-shader
+  wave simulation (ping-pong wave equation with ripple impulses and
+  downstream advection).
 - **Skeletal animation** (`src/bracken/animation/`) — playback with crossfade,
   data-driven state machines, two-bone IK (foot placement, body lean).
-- **Scene layer** (`src/bracken/scene/`) — cameras, frustum culling, a
-  command-buffer `RenderScene` consumed by `SceneRenderer`, 2D `UIScene`.
+- **Scene layer** (`src/bracken/scene/`) — cameras, frustum culling, the
+  immutable per-frame `FramePacket` snapshot (built via `FrameBuilder`,
+  recycled through a `PacketRing`) consumed by `SceneRenderer`, incl. 2D UI
+  commands.
 - **Particle effects** (`src/bracken/systems/`, `effect_definition.hpp`) —
   data-driven mesh-particle emitters (burst/continuous, orbital/arc paths,
   lifetime curves).
 - **Procedural geometry** (`src/bracken/procedural/`) — tree and rock
   generators.
+- **Physics** (`src/bracken/physics/`) — rigid-body simulation backed by
+  **Jolt Physics** behind a glm-only `PhysicsWorld` API (Jolt never leaks
+  into public headers): fixed-timestep stepping, sphere/box/capsule bodies,
+  static heightfield terrain, kinematic movers, impulses, ray casts —
+  deterministic, with Jolt's internal parallelism running on the engine's
+  own job-system pool (no second thread pool).
 - **Core utilities** (`src/bracken/core/`) — logging, asserts, `Result`,
   handles, hashing/`StringId`, a job system, asset registry + file watcher,
   Tracy profiler hooks.
@@ -46,6 +70,7 @@ code. It builds as a static library (`bracken`) plus its unit-test suite
 | **SDL_shadercross** | Fetched + built (build-time shader compiler CLI + runtime cross-compile library; bundles DXC and SPIRV-Tools). |
 | **glm** | Fetched (header-only math). |
 | **tinygltf** | Fetched (header-only glTF loader — no Draco support). |
+| **Jolt Physics** | Fetched + built (v5.2.0, static; linked PRIVATE — Jolt types never appear in public bracken headers). |
 | **GoogleTest** | Fetched when `BRACKEN_BUILD_TESTS=ON` (default). |
 | **Dear ImGui** | Fetched when `BRACKEN_ENABLE_DEV_UI=ON` (default). |
 | **Tracy** | Fetched only when `BRACKEN_ENABLE_TRACY=ON` (default OFF). |
@@ -107,16 +132,35 @@ SDL3 GPU does not expose backend queues; use RenderDoc/Nsight for GPU timing.
 
 ## Example: playground
 
-[`examples/playground`](examples/playground) is a small orb-collector game
-that doubles as the engine's integration test. All assets are built in code
-(procedural terrain, trees, rocks, a skinned biped with authored Idle / Walk /
-Run / Attack clips) — the repo ships no binary assets. It deliberately touches
-every major subsystem: terrain + grass + skybox, skinned animation driven by a
+[`examples/playground`](examples/playground) is a small medieval-village
+orb-collector game that doubles as the engine's integration test. A simulated
+river runs along the west edge of the map (wade in to push ripples around). The village
+— a cobbled plaza ringed by six modular timber/stone buildings with glowing
+windows, chimney smoke, lanes, fences, and props — is assembled offline from a
+modular glTF asset pack by
+[`tools/build_medieval_assets.py`](examples/playground/tools/build_medieval_assets.py)
+into merged per-material `.glb`s (so the engine uploads each texture set
+exactly once). Only the character, orbs, and effect meshes are built in code —
+the buildings and props come from the building pack, and the forest ring,
+bushes, rocks, flowers, and grass tufts (which replace the engine's blade
+grass in this scene) come from a stylized nature pack, converted 1:1 with
+their own materials. The scene dressing is hand-placed, area by area, in
+[`scene_layout.cpp`](examples/playground/scene_layout.cpp) — market corner,
+farm wheat field, cottage garden, campsite, rock outcrops, flower drifts, and
+a forest ring composed from designed grove stamps; only the grass-tuft ground
+cover is a procedural fill. Without the generated assets the playground falls
+back to a procedural-only scene (generator trees/rocks + engine blade grass). It deliberately touches every major subsystem: terrain
+(splatmap-painted dirt lanes) + grass (exclusion zones under the paving) +
+skybox, `.glb` loading with full PBR materials, skinned animation driven by a
 state machine with foot IK and body lean, dynamic point/spot lights, particle
-effects, 3D billboards, debug lines, UI text, and runtime graphics-settings
-toggles (AO / bloom / fog / shadows / FXAA on F1–F6).
+effects (incl. continuous chimney smoke), 3D billboards, debug lines, UI text,
+and runtime graphics-settings toggles (AO / bloom / fog / shadows / AA mode /
+IBL / local shadows on F1–F8).
 
 ```bash
+# one-time: unpack the raw asset pack into examples/playground/assets/, then
+python3 examples/playground/tools/build_medieval_assets.py
+
 ./build/examples/playground/playground            # play it (WASD, mouse)
 ./build/examples/playground/playground --smoke    # self-drive 240 frames, print stats, exit
 ```
@@ -183,10 +227,12 @@ models (no Draco).
 
 | Doc | Contents |
 |---|---|
+| [docs/user_guide.md](docs/user_guide.md) | The definitive consumer guide: how to build, integrate, and use every engine feature, with code examples, defaults, and gotchas. |
+| [docs/technical_spec.md](docs/technical_spec.md) | Detailed specification of every engine feature: data structures, algorithms, contracts, constants, and known limitations. |
 | [docs/architecture.md](docs/architecture.md) | Runtime architecture: module map, `Application` lifecycle, frame/pass flow, GPU layer, threading & lifetime contracts, load-bearing constants, known stubs. |
 | [docs/engine_design_notes.md](docs/engine_design_notes.md) | Design rationale and lessons — read before adding cross-cutting infrastructure. |
 | [docs/skinned_mesh_format.md](docs/skinned_mesh_format.md) | The `.glb` authoring contract for skinned meshes (bones, channels, naming, checklist). |
 | [docs/effects_system.md](docs/effects_system.md) | Data-driven particle effects: definitions, runtime, rendering. |
-| [docs/audits/](docs/audits/) | Point-in-time engine audits (2026-07): performance, graphics features, C++23 modernization, shaders. Findings are adversarially verified; [RESOLUTIONS.md](docs/audits/RESOLUTIONS.md) records the outcome of each finding (fixed / partial / deferred). |
+| [docs/audits/](docs/audits/) | Point-in-time engine audits (2026-07): performance, graphics features, C++23 modernization, shaders, and a full-source documentation sweep ([documentation_sweep.md](docs/audits/documentation_sweep.md), all findings addressed 2026-07-12). Findings are adversarially verified; [RESOLUTIONS.md](docs/audits/RESOLUTIONS.md) records the outcome of each finding (fixed / partial / deferred). |
 | [src/bracken/shaders/README.md](src/bracken/shaders/README.md) | Shader naming, pipeline→shader map, SDL3 GPU binding order, CPU↔GPU uniform contract. |
 | [CLAUDE.md](CLAUDE.md) | Orientation + house rules for AI coding agents working in this repo. |

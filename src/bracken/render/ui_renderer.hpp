@@ -26,13 +26,14 @@ class TextRenderer;
  * - Rectangles (filled/outline)
  * - Circles
  * - Lines
+ * - Textured quads (image widgets)
  * - Text
  * - Buttons
- * - Health bars
  *
- * SDL3 GPU Migration: This renderer now uses GPUBuffer and GPUPipeline
- * instead of OpenGL VAO/VBO and shader programs. Pipeline state (blending,
- * depth test) is handled by the UI pipeline configuration.
+ * Drawing is two-phase: primitives are recorded CPU-side between begin() and
+ * end() (no GPU work), then execute() uploads the batch and renders it. The
+ * vertex batch is unbounded — the GPU vertex buffer grows on demand inside
+ * execute() when a frame outgrows it.
  */
 class UIRenderer {
 public:
@@ -66,7 +67,8 @@ public:
 
     /**
      * Begin UI recording phase.
-     * @param cmd Command buffer for the frame
+     * @param cmd Command buffer for the frame (unused during recording; kept
+     *            for signature stability)
      * Note: This only starts recording, not rendering. Call execute() to render.
      */
     void begin(SDL_GPUCommandBuffer* cmd);
@@ -86,7 +88,8 @@ public:
      */
     void execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, bool clear_background = false);
 
-    // Primitive drawing
+    // Primitive drawing. All `uint32_t color`/`tint` parameters are packed
+    // ARGB (0xAARRGGBB) — the engine-wide convention, see bracken/core/color.hpp.
     void draw_filled_rect(float x, float y, float w, float h, uint32_t color);
     void draw_rect_outline(float x, float y, float w, float h, uint32_t color, float line_width = 2.0f);
     void draw_circle(float x, float y, float radius, uint32_t color, int segments = 24);
@@ -94,22 +97,55 @@ public:
                              int segments = 24);
     void draw_line(float x1, float y1, float x2, float y2, uint32_t color, float line_width = 2.0f);
 
-    // Text drawing. The referenced characters are NOT copied: `text` must stay
-    // valid until execute() runs (UIScene command storage satisfies this).
+    /**
+     * Draw a textured quad (image widget). The texture is not copied or
+     * retained: it must stay valid until execute() runs. `tint` (packed ARGB,
+     * same as every other color parameter) multiplies the texture sample —
+     * 0xFFFFFFFF draws the texture unmodified. u0/v0..u1/v1 select the
+     * sampled sub-rectangle (defaults cover the whole texture). A null
+     * texture falls back to a solid `tint` quad.
+     */
+    void draw_textured_quad(SDL_GPUTexture* texture, float x, float y, float w, float h, uint32_t tint = 0xFFFFFFFF,
+                            float u0 = 0.0f, float v0 = 0.0f, float u1 = 1.0f, float v1 = 1.0f);
+
+    // Text drawing. `color` is packed ARGB, decoded identically to the shape
+    // primitives. The referenced characters are NOT copied: `text` must stay
+    // valid until execute() runs (FramePacket arena storage satisfies this —
+    // the packet is retired only after the frame is rendered).
     void draw_text(std::string_view text, float x, float y, uint32_t color, float scale = 1.0f);
 
     // Composite UI elements. `label` must stay valid until execute() (see draw_text).
     void draw_button(float x, float y, float w, float h, const std::string& label, uint32_t color, bool selected);
+
+    // Text measurement against the real font metrics (for centering,
+    // alignment and wrapping). Both return 0 before init() / when no font
+    // could be loaded.
+    int text_width(std::string_view text, float scale = 1.0f) const;
+    int text_height(float scale = 1.0f) const;
+
     // Access text renderer for advanced usage
     TextRenderer* text_renderer() { return text_renderer_.get(); }
+    const TextRenderer* text_renderer() const { return text_renderer_.get(); }
 
     int width() const { return width_; }
     int height() const { return height_; }
 
+    // Must match Vertex2D layout: position (2), texcoord (2), color (4)
+    struct UIVertex {
+        float x, y;       // Position
+        float u, v;       // Texcoord (unused for solid colors, set to 0)
+        float r, g, b, a; // Color
+    };
+
+    // Recording introspection (stats/tests): vertices, texture-switch draw
+    // ranges, and queued text draws recorded since begin().
+    size_t batch_vertex_count() const { return vertex_batch_.size(); }
+    size_t batch_draw_count() const { return draw_ranges_.size(); }
+    size_t queued_text_count() const { return queued_text_draws_.size(); }
+    const std::vector<UIVertex>& batch_vertices() const { return vertex_batch_; }
+
 private:
     void draw_quad(float x, float y, float w, float h, const glm::vec4& color);
-    void flush_batch();
-    static glm::vec4 color_from_uint32(uint32_t color);
 
     int width_ = 0;
     int height_ = 0;
@@ -123,22 +159,37 @@ private:
 
     // SDL3 GPU resources
     std::unique_ptr<gpu::GPUBuffer> vertex_buffer_;
-    SDL_GPUTexture* dummy_texture_ = nullptr; // 1x1 white texture for when no texture needed
-    SDL_GPUSampler* dummy_sampler_ = nullptr;
+    SDL_GPUTexture* dummy_texture_ = nullptr; // 1x1 white bound for solid-color draw ranges
+    SDL_GPUSampler* sampler_ = nullptr;       // linear/clamp; shared by solid + textured draws
 
-    // Current frame rendering state
-    SDL_GPUCommandBuffer* current_cmd_ = nullptr;
-    SDL_GPURenderPass* current_pass_ = nullptr;
-
-    // Vertex batching for efficient rendering
-    static constexpr size_t MAX_VERTICES = 16384;
-    // Must match Vertex2D layout: position (2), texcoord (2), color (4)
-    struct UIVertex {
-        float x, y;       // Position
-        float u, v;       // Texcoord (unused for solid colors, set to 0)
-        float r, g, b, a; // Color
-    };
+    // Vertex batching. The CPU batch is unbounded; the GPU buffer starts at
+    // INITIAL_VERTEX_CAPACITY vertices and is grown inside execute() when a
+    // frame records more (growth is logged; on allocation failure the batch
+    // is truncated to what fits rather than drawing stale buffer contents).
+    static constexpr size_t INITIAL_VERTEX_CAPACITY = 16384;
     std::vector<UIVertex> vertex_batch_;
+
+    // A contiguous run of vertices drawn with one texture binding, in
+    // submission order (painter's algorithm). texture == nullptr means solid
+    // color (dummy white texture, has_texture = 0).
+    struct DrawRange {
+        size_t first_vertex = 0;
+        uint32_t vertex_count = 0;
+        SDL_GPUTexture* texture = nullptr;
+    };
+    std::vector<DrawRange> draw_ranges_;
+
+    /// Range accepting vertices for `texture`; extends the last range when the
+    /// texture matches, otherwise opens a new one at the batch end.
+    DrawRange& range_for(SDL_GPUTexture* texture);
+
+    /// Drop recorded vertices/ranges beyond `max_vertices` (rounded down to
+    /// whole triangles). Fallback when growing the GPU buffer fails.
+    void truncate_batch(size_t max_vertices);
+
+    /// Ensure the GPU vertex buffer can hold the recorded batch, growing it if
+    /// needed; when growth fails the batch is truncated to what fits (logged).
+    void reserve_gpu_capacity();
 
     // Queued text draws (executed during execute() phase). Views into
     // caller-owned strings that must stay valid until execute() — no copies.

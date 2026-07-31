@@ -26,9 +26,11 @@ cbuffer GrassLightingUniforms {
     float3 sunColor;
     float sunIntensity;
     float3 ambientSky;
-    float _pad0;
+    float screenAOTexelX;  // 1 / render-target size: SV_Position.xy * texel = AO UV
     float3 ambientGround;
-    float _pad1;
+    float screenAOTexelY;
+    float iblEnabled;      // 1 = sky IBL ambient (samplers 3-5), 0 = hemisphere fallback
+    float3 _padIbl;
 };
 
 [[vk::binding(1, 3)]]
@@ -57,11 +59,37 @@ Texture2D shadowAtlasRaw;
 [[vk::combinedImageSampler]][[vk::binding(1, 2)]]
 SamplerState shadowRawSampler;
 
+// Full-res screen-space GTAO (R8, 1 = unoccluded), computed before this pass
+// from the prepass depth. Bound to a 1x1 white dummy when AO is off.
+[[vk::combinedImageSampler]][[vk::binding(2, 2)]]
+Texture2D<float> screenAOTexture;
+[[vk::combinedImageSampler]][[vk::binding(2, 2)]]
+SamplerState screenAOSampler;
+
+// Sky IBL chain (render/ibl.hpp): irradiance cube + GGX-prefiltered specular
+// cube + split-sum BRDF LUT. Bound to dummies when iblEnabled == 0.
+[[vk::combinedImageSampler]][[vk::binding(3, 2)]]
+TextureCube<float4> iblIrradianceMap;
+[[vk::combinedImageSampler]][[vk::binding(3, 2)]]
+SamplerState iblIrradianceSampler;
+
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
+TextureCube<float4> iblSpecularMap;
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
+SamplerState iblSpecularSampler;
+
+[[vk::combinedImageSampler]][[vk::binding(5, 2)]]
+Texture2D<float4> iblBrdfLut;
+[[vk::combinedImageSampler]][[vk::binding(5, 2)]]
+SamplerState iblBrdfLutSampler;
+
 #include "shadow_common.hlsli"
 #include "fog.hlsli"
 #include "lighting.hlsli"
-// Cluster SSBOs follow this shader's 2 fragment samplers in set 2.
-#define CLUSTER_SSBO_BINDING_BASE 2
+#include "pbr.hlsli"
+// Cluster SSBOs follow this shader's 7 fragment samplers in set 2 (slots
+// 0-5 above + the local-shadow atlas at 6, declared by the include).
+#define CLUSTER_SSBO_BINDING_BASE 7
 #include "cluster_lighting.hlsli"
 
 static const float GRASS_METALLIC  = 0.0;
@@ -93,9 +121,21 @@ float4 PSMain(PSInput input) : SV_Target {
     float3 halfVec = normalize(V + L);
     float spec = pow(max(dot(N, halfVec), 0.0), 32.0) * 0.3 * tipFactor;
 
+    // Screen-space GTAO, ambient only (grass has no material AO map).
+    // Direct light and the tip specular stay untouched.
+    float screenAO = screenAOTexture.Sample(
+        screenAOSampler, input.position.xy * float2(screenAOTexelX, screenAOTexelY));
+
     float ambientLift = lerp(ambientStrength, 1.0, shadow);
-    float3 ambient = ambientPBR(N, V, baseColor, GRASS_METALLIC, GRASS_ROUGHNESS, 1.0,
-                                ambientSky * ambientLift, ambientGround * ambientLift);
+    float3 ambient;
+    if (iblEnabled > 0.5) {
+        ambient = ambientIBL(N, N, V, baseColor, GRASS_METALLIC, GRASS_ROUGHNESS, screenAO,
+                             ambientLift, iblIrradianceMap, iblIrradianceSampler,
+                             iblSpecularMap, iblSpecularSampler, iblBrdfLut, iblBrdfLutSampler);
+    } else {
+        ambient = ambientPBR(N, V, baseColor, GRASS_METALLIC, GRASS_ROUGHNESS, screenAO,
+                             ambientSky * ambientLift, ambientGround * ambientLift);
+    }
 
     float3 color = direct + spec * lightColor + ambient;
 

@@ -4,6 +4,7 @@
 #include "bracken/gpu/gpu_pipeline.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
+#include "bracken/core/color.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "glm/ext/matrix_clip_space.hpp"
@@ -13,9 +14,9 @@
 #include "SDL3/SDL_log.h"
 #include "SDL3/SDL_rect.h"
 #include "bracken/render/text_renderer.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -40,7 +41,7 @@ bool UIRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_re
     // Create dynamic vertex buffer for UI quads
     // Each vertex matches Vertex2D layout: x, y, u, v, r, g, b, a (8 floats)
     vertex_buffer_ =
-        gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Vertex, MAX_VERTICES * sizeof(UIVertex));
+        gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Vertex, INITIAL_VERTEX_CAPACITY * sizeof(UIVertex));
 
     if (!vertex_buffer_) {
         BRACKEN_LOG_ERROR("ui", "Failed to create UI vertex buffer");
@@ -48,7 +49,7 @@ bool UIRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_re
     }
 
     // Reserve space for vertex batch
-    vertex_batch_.reserve(MAX_VERTICES);
+    vertex_batch_.reserve(INITIAL_VERTEX_CAPACITY);
 
     // Create dummy 1x1 white texture for when no texture is needed
     // (SDL3 GPU requires all sampler bindings to be valid)
@@ -105,18 +106,19 @@ bool UIRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_re
             SDL_ReleaseGPUTransferBuffer(device.handle(), tb);
         }
 
-        // Create sampler
+        // Create the shared UI sampler (linear so scaled textured quads
+        // filter smoothly; indistinguishable on the 1x1 dummy).
         SDL_GPUSamplerCreateInfo samp_info = {};
-        samp_info.min_filter = SDL_GPU_FILTER_NEAREST;
-        samp_info.mag_filter = SDL_GPU_FILTER_NEAREST;
+        samp_info.min_filter = SDL_GPU_FILTER_LINEAR;
+        samp_info.mag_filter = SDL_GPU_FILTER_LINEAR;
         samp_info.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
         samp_info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
         samp_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
         samp_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
 
-        dummy_sampler_ = SDL_CreateGPUSampler(device.handle(), &samp_info);
-        if (!dummy_sampler_) {
-            BRACKEN_LOG_ERROR("ui", "Failed to create UI dummy sampler");
+        sampler_ = SDL_CreateGPUSampler(device.handle(), &samp_info);
+        if (!sampler_) {
+            BRACKEN_LOG_ERROR("ui", "Failed to create UI sampler");
             return false;
         }
     }
@@ -139,9 +141,9 @@ void UIRenderer::shutdown() {
     vertex_buffer_.reset();
 
     if (device_) {
-        if (dummy_sampler_) {
-            SDL_ReleaseGPUSampler(device_->handle(), dummy_sampler_);
-            dummy_sampler_ = nullptr;
+        if (sampler_) {
+            SDL_ReleaseGPUSampler(device_->handle(), sampler_);
+            sampler_ = nullptr;
         }
         if (dummy_texture_) {
             SDL_ReleaseGPUTexture(device_->handle(), dummy_texture_);
@@ -169,10 +171,9 @@ void UIRenderer::set_screen_size(int width, int height) {
     projection_ = glm::ortho(0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, -1.0f, 1.0f);
 }
 
-void UIRenderer::begin(SDL_GPUCommandBuffer* cmd) {
-    current_cmd_ = cmd;
-    current_pass_ = nullptr; // No render pass during recording phase
+void UIRenderer::begin(SDL_GPUCommandBuffer* /*cmd*/) {
     vertex_batch_.clear();
+    draw_ranges_.clear();
     queued_text_draws_.clear();
 
     // Release pending GPU resources from previous frame
@@ -186,8 +187,57 @@ void UIRenderer::begin(SDL_GPUCommandBuffer* cmd) {
 }
 
 void UIRenderer::end() {
-    // Recording phase ends - don't flush yet, wait for execute()
-    // current_cmd_ is kept for execute() phase
+    // Recording phase ends - upload and drawing happen in execute()
+}
+
+UIRenderer::DrawRange& UIRenderer::range_for(SDL_GPUTexture* texture) {
+    // Ranges are recorded strictly in submission order, so the last range
+    // always ends at the current batch tail: extend it when the texture
+    // matches, otherwise open a new range.
+    if (draw_ranges_.empty() || draw_ranges_.back().texture != texture) {
+        draw_ranges_.push_back({vertex_batch_.size(), 0, texture});
+    }
+    return draw_ranges_.back();
+}
+
+void UIRenderer::truncate_batch(size_t max_vertices) {
+    max_vertices -= max_vertices % 3; // never draw a partial triangle
+    if (vertex_batch_.size() <= max_vertices) {
+        return;
+    }
+    vertex_batch_.resize(max_vertices);
+    while (!draw_ranges_.empty() && draw_ranges_.back().first_vertex >= max_vertices) {
+        draw_ranges_.pop_back();
+    }
+    if (!draw_ranges_.empty()) {
+        DrawRange& last = draw_ranges_.back();
+        last.vertex_count =
+            std::min(last.vertex_count, static_cast<uint32_t>(max_vertices - last.first_vertex));
+    }
+}
+
+void UIRenderer::reserve_gpu_capacity() {
+    const size_t needed_bytes = vertex_batch_.size() * sizeof(UIVertex);
+    if (needed_bytes <= vertex_buffer_->size()) {
+        return;
+    }
+
+    // Grow geometrically so repeated large frames don't reallocate every time.
+    const size_t new_bytes = std::max(vertex_buffer_->size() * 2, needed_bytes);
+    auto grown = gpu::GPUBuffer::create_dynamic(*device_, gpu::GPUBuffer::Type::Vertex, new_bytes);
+    if (grown) {
+        // The old buffer may still be referenced by in-flight GPU work; SDL3
+        // GPU defers the actual release until the GPU is done with it.
+        vertex_buffer_ = std::move(grown);
+        BRACKEN_LOG_INFO("ui", "Grew UI vertex buffer to {} vertices ({} bytes)", new_bytes / sizeof(UIVertex),
+                         new_bytes);
+        return;
+    }
+
+    const size_t capacity_vertices = vertex_buffer_->size() / sizeof(UIVertex);
+    BRACKEN_LOG_WARN("ui", "Failed to grow UI vertex buffer to {} bytes - truncating batch from {} to {} vertices",
+                     new_bytes, vertex_batch_.size(), capacity_vertices);
+    truncate_batch(capacity_vertices);
 }
 
 void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, bool clear_background) {
@@ -204,9 +254,12 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
     }
 
     // Phase 2: Upload all data (copy passes - BEFORE render pass)
-    // Upload UI vertex data
+    // Upload UI vertex data, growing the GPU buffer if this frame outgrew it
     if (!vertex_batch_.empty() && vertex_buffer_) {
-        vertex_buffer_->update(cmd, vertex_batch_.data(), vertex_batch_.size() * sizeof(UIVertex));
+        reserve_gpu_capacity();
+        if (!vertex_batch_.empty()) {
+            vertex_buffer_->update(cmd, vertex_batch_.data(), vertex_batch_.size() * sizeof(UIVertex));
+        }
     }
 
     // Create any pending text textures (copy pass)
@@ -251,9 +304,8 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
         SDL_Log("UIRenderer::execute: UI pipeline not available, skipping UI draw");
         SDL_EndGPURenderPass(render_pass);
         vertex_batch_.clear();
+        draw_ranges_.clear();
         queued_text_draws_.clear();
-        current_cmd_ = nullptr;
-        current_pass_ = nullptr;
         return;
     }
 
@@ -265,55 +317,47 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
     screen_uniforms.height = static_cast<float>(height_);
     SDL_PushGPUVertexUniformData(cmd, 0, &screen_uniforms, sizeof(screen_uniforms));
 
-    // Push fragment uniform (has_texture = 0 for solid colors)
-    gpu::UIFragmentUniforms frag_uniforms = {};
-    frag_uniforms.hasTexture = 0;
-    SDL_PushGPUFragmentUniformData(cmd, 0, &frag_uniforms, sizeof(frag_uniforms));
-
-    // Bind dummy texture/sampler for fragment shader (required even when not using textures)
-    if (dummy_texture_ && dummy_sampler_) {
-        SDL_GPUTextureSamplerBinding sampler_binding = {};
-        sampler_binding.texture = dummy_texture_;
-        sampler_binding.sampler = dummy_sampler_;
-        SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
-    }
-
-    // Phase 3a: Draw UI primitives (vertices already uploaded)
+    // Phase 3a: Draw UI primitives (vertices already uploaded), one draw per
+    // texture-switch range so textured quads interleave with solid primitives
+    // in submission order.
     if (!vertex_batch_.empty() && vertex_buffer_) {
         SDL_GPUBufferBinding vb_binding = {};
         vb_binding.buffer = vertex_buffer_->handle();
         vb_binding.offset = 0;
         SDL_BindGPUVertexBuffers(render_pass, 0, &vb_binding, 1);
-        SDL_DrawGPUPrimitives(render_pass, static_cast<uint32_t>(vertex_batch_.size()), 1, 0, 0);
+
+        // Force uniform push + texture bind on the first range
+        int bound_has_texture = -1;
+        SDL_GPUTexture* bound_texture = nullptr;
+
+        for (const DrawRange& range : draw_ranges_) {
+            if (range.vertex_count == 0) {
+                continue;
+            }
+            const int has_texture = range.texture ? 1 : 0;
+            if (has_texture != bound_has_texture) {
+                gpu::UIFragmentUniforms frag_uniforms = {};
+                frag_uniforms.hasTexture = has_texture;
+                SDL_PushGPUFragmentUniformData(cmd, 0, &frag_uniforms, sizeof(frag_uniforms));
+                bound_has_texture = has_texture;
+            }
+            // The sampler slot must always hold a valid texture; solid ranges
+            // use the 1x1 white dummy.
+            SDL_GPUTexture* texture = range.texture ? range.texture : dummy_texture_;
+            if (texture != bound_texture && texture && sampler_) {
+                SDL_GPUTextureSamplerBinding sampler_binding = {};
+                sampler_binding.texture = texture;
+                sampler_binding.sampler = sampler_;
+                SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
+                bound_texture = texture;
+            }
+            SDL_DrawGPUPrimitives(render_pass, range.vertex_count, 1, static_cast<uint32_t>(range.first_vertex), 0);
+        }
     }
 
     // Phase 3b: Draw queued text (vertices already uploaded)
     if (text_renderer_ && text_renderer_->is_ready()) {
         text_renderer_->draw_queued_text(cmd, render_pass);
-
-        // Re-bind UI pipeline after text (in case more UI drawing needed later)
-        if (pipeline_registry_) {
-            auto* ui_pipeline = pipeline_registry_->get_ui_pipeline();
-            if (ui_pipeline) {
-                ui_pipeline->bind(render_pass);
-            }
-        }
-        // Re-push uniforms after re-bind
-        gpu::UIScreenUniforms screen_uniforms2 = {};
-        screen_uniforms2.width = static_cast<float>(width_);
-        screen_uniforms2.height = static_cast<float>(height_);
-        SDL_PushGPUVertexUniformData(cmd, 0, &screen_uniforms2, sizeof(screen_uniforms2));
-
-        gpu::UIFragmentUniforms frag_uniforms2 = {};
-        frag_uniforms2.hasTexture = 0;
-        SDL_PushGPUFragmentUniformData(cmd, 0, &frag_uniforms2, sizeof(frag_uniforms2));
-        // Re-bind dummy sampler after text
-        if (dummy_texture_ && dummy_sampler_) {
-            SDL_GPUTextureSamplerBinding sampler_binding = {};
-            sampler_binding.texture = dummy_texture_;
-            sampler_binding.sampler = dummy_sampler_;
-            SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
-        }
     }
 
     // End render pass
@@ -321,45 +365,12 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
 
     // Clear for next frame
     vertex_batch_.clear();
+    draw_ranges_.clear();
     queued_text_draws_.clear();
-    current_cmd_ = nullptr;
-    current_pass_ = nullptr;
-}
-
-void UIRenderer::flush_batch() {
-    // No-op during recording phase (current_pass_ is null)
-    // All upload and drawing happens in execute()
-    //
-    // This method is kept for compatibility with code that checks batch capacity,
-    // but the actual flush is now done in execute().
-}
-
-glm::vec4 UIRenderer::color_from_uint32(uint32_t color) {
-    // Color format is ARGB: 0xAARRGGBB
-    float a = ((color >> 24) & 0xFF) / 255.0f;
-    float r = ((color >> 16) & 0xFF) / 255.0f;
-    float g = ((color >> 8) & 0xFF) / 255.0f;
-    float b = (color & 0xFF) / 255.0f;
-    return glm::vec4(r, g, b, a);
 }
 
 void UIRenderer::draw_quad(float x, float y, float w, float h, const glm::vec4& color) {
-    // Check if we need to flush before adding more vertices
-    if (vertex_batch_.size() + 6 > MAX_VERTICES) {
-        flush_batch();
-
-        // Re-bind UI pipeline after flush
-        if (pipeline_registry_) {
-            auto* ui_pipeline = pipeline_registry_->get_ui_pipeline();
-            if (ui_pipeline && current_pass_) {
-                ui_pipeline->bind(current_pass_);
-            }
-        }
-        // Re-push projection matrix
-        if (current_cmd_) {
-            SDL_PushGPUVertexUniformData(current_cmd_, 0, &projection_, sizeof(glm::mat4));
-        }
-    }
+    DrawRange& range = range_for(nullptr);
 
     // Add 6 vertices for two triangles (quad)
     UIVertex v0 = {x, y, 0, 0, color.r, color.g, color.b, color.a};
@@ -376,14 +387,43 @@ void UIRenderer::draw_quad(float x, float y, float w, float h, const glm::vec4& 
     vertex_batch_.push_back(v0);
     vertex_batch_.push_back(v2);
     vertex_batch_.push_back(v3);
+
+    range.vertex_count += 6;
+}
+
+void UIRenderer::draw_textured_quad(SDL_GPUTexture* texture, float x, float y, float w, float h, uint32_t tint,
+                                    float u0, float v0, float u1, float v1) {
+    if (!texture) {
+        // No texture: degrade to a solid quad in the tint color
+        draw_quad(x, y, w, h, core::unpack_color(tint));
+        return;
+    }
+
+    DrawRange& range = range_for(texture);
+    const glm::vec4 c = core::unpack_color(tint);
+
+    UIVertex tl = {x, y, u0, v0, c.r, c.g, c.b, c.a};
+    UIVertex tr = {x + w, y, u1, v0, c.r, c.g, c.b, c.a};
+    UIVertex br = {x + w, y + h, u1, v1, c.r, c.g, c.b, c.a};
+    UIVertex bl = {x, y + h, u0, v1, c.r, c.g, c.b, c.a};
+
+    vertex_batch_.push_back(tl);
+    vertex_batch_.push_back(tr);
+    vertex_batch_.push_back(br);
+
+    vertex_batch_.push_back(tl);
+    vertex_batch_.push_back(br);
+    vertex_batch_.push_back(bl);
+
+    range.vertex_count += 6;
 }
 
 void UIRenderer::draw_filled_rect(float x, float y, float w, float h, uint32_t color) {
-    draw_quad(x, y, w, h, color_from_uint32(color));
+    draw_quad(x, y, w, h, core::unpack_color(color));
 }
 
 void UIRenderer::draw_rect_outline(float x, float y, float w, float h, uint32_t color, float line_width) {
-    glm::vec4 c = color_from_uint32(color);
+    glm::vec4 c = core::unpack_color(color);
     draw_quad(x, y, w, line_width, c);                  // Top
     draw_quad(x, y + h - line_width, w, line_width, c); // Bottom
     draw_quad(x, y, line_width, h, c);                  // Left
@@ -391,24 +431,8 @@ void UIRenderer::draw_rect_outline(float x, float y, float w, float h, uint32_t 
 }
 
 void UIRenderer::draw_circle(float x, float y, float radius, uint32_t color, int segments) {
-    glm::vec4 c = color_from_uint32(color);
-
-    // Check if we have room for all circle vertices
-    size_t vertices_needed = static_cast<size_t>(segments) * 3;
-    if (vertex_batch_.size() + vertices_needed > MAX_VERTICES) {
-        flush_batch();
-
-        // Re-bind pipeline after flush
-        if (pipeline_registry_ && current_pass_) {
-            auto* ui_pipeline = pipeline_registry_->get_ui_pipeline();
-            if (ui_pipeline) {
-                ui_pipeline->bind(current_pass_);
-            }
-        }
-        if (current_cmd_) {
-            SDL_PushGPUVertexUniformData(current_cmd_, 0, &projection_, sizeof(glm::mat4));
-        }
-    }
+    glm::vec4 c = core::unpack_color(color);
+    DrawRange& range = range_for(nullptr);
 
     constexpr float PI = 3.14159265359f;
     for (int i = 0; i < segments; ++i) {
@@ -422,6 +446,7 @@ void UIRenderer::draw_circle(float x, float y, float radius, uint32_t color, int
         vertex_batch_.push_back(center);
         vertex_batch_.push_back(p1);
         vertex_batch_.push_back(p2);
+        range.vertex_count += 3;
     }
 }
 
@@ -438,24 +463,8 @@ void UIRenderer::draw_circle_outline(float x, float y, float radius, uint32_t co
         return;
     }
 
-    glm::vec4 c = color_from_uint32(color);
-
-    // Each segment of the ring is two triangles (6 vertices)
-    size_t vertices_needed = static_cast<size_t>(segments) * 6;
-    if (vertex_batch_.size() + vertices_needed > MAX_VERTICES) {
-        flush_batch();
-
-        // Re-bind pipeline after flush
-        if (pipeline_registry_ && current_pass_) {
-            auto* ui_pipeline = pipeline_registry_->get_ui_pipeline();
-            if (ui_pipeline) {
-                ui_pipeline->bind(current_pass_);
-            }
-        }
-        if (current_cmd_) {
-            SDL_PushGPUVertexUniformData(current_cmd_, 0, &projection_, sizeof(glm::mat4));
-        }
-    }
+    glm::vec4 c = core::unpack_color(color);
+    DrawRange& range = range_for(nullptr);
 
     constexpr float PI = 3.14159265359f;
     for (int i = 0; i < segments; ++i) {
@@ -486,11 +495,13 @@ void UIRenderer::draw_circle_outline(float x, float y, float radius, uint32_t co
         vertex_batch_.push_back(outer2);
         vertex_batch_.push_back(inner2);
         vertex_batch_.push_back(inner1);
+
+        range.vertex_count += 6;
     }
 }
 
 void UIRenderer::draw_line(float x1, float y1, float x2, float y2, uint32_t color, float line_width) {
-    glm::vec4 c = color_from_uint32(color);
+    glm::vec4 c = core::unpack_color(color);
 
     float dx = x2 - x1;
     float dy = y2 - y1;
@@ -503,20 +514,7 @@ void UIRenderer::draw_line(float x1, float y1, float x2, float y2, uint32_t colo
     float nx = -dy / len * line_width / 2;
     float ny = dx / len * line_width / 2;
 
-    // Check if we need to flush
-    if (vertex_batch_.size() + 6 > MAX_VERTICES) {
-        flush_batch();
-
-        if (pipeline_registry_ && current_pass_) {
-            auto* ui_pipeline = pipeline_registry_->get_ui_pipeline();
-            if (ui_pipeline) {
-                ui_pipeline->bind(current_pass_);
-            }
-        }
-        if (current_cmd_) {
-            SDL_PushGPUVertexUniformData(current_cmd_, 0, &projection_, sizeof(glm::mat4));
-        }
-    }
+    DrawRange& range = range_for(nullptr);
 
     // Create line quad vertices
     UIVertex v0 = {x1 + nx, y1 + ny, 0, 0, c.r, c.g, c.b, c.a};
@@ -533,6 +531,8 @@ void UIRenderer::draw_line(float x1, float y1, float x2, float y2, uint32_t colo
     vertex_batch_.push_back(v0);
     vertex_batch_.push_back(v2);
     vertex_batch_.push_back(v3);
+
+    range.vertex_count += 6;
 }
 
 void UIRenderer::draw_text(std::string_view text, float x, float y, uint32_t color, float scale) {
@@ -557,6 +557,14 @@ void UIRenderer::draw_button(float x, float y, float w, float h, const std::stri
         float text_y = y + (h - text_h) / 2.0f;
         draw_text(label, text_x, text_y, 0xFFFFFFFF, 1.0f);
     }
+}
+
+int UIRenderer::text_width(std::string_view text, float scale) const {
+    return text_renderer_ ? text_renderer_->get_text_width(text, scale) : 0;
+}
+
+int UIRenderer::text_height(float scale) const {
+    return text_renderer_ ? text_renderer_->get_text_height(scale) : 0;
 }
 
 } // namespace bracken::render

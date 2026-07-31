@@ -14,9 +14,13 @@ struct VSInput {
     [[vk::location(4)]] float4 tangent : TANGENT;
 };
 
-// Vertex output / Fragment input
+// Vertex output / Fragment input.
+// position is `precise`: the depth prepass (prepass_model.vert.hlsl) computes
+// the same model->view->projection chain and the forward pipeline depth-tests
+// EQUAL against the prepass depth — both sides must be bit-identical, so FMA
+// contraction/reassociation on the position path is disabled in both.
 struct VSOutput {
-    float4 position : SV_Position;
+    precise float4 position : SV_Position;
     float3 fragPos : TEXCOORD0;
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
@@ -34,9 +38,8 @@ cbuffer TransformUniforms {
     float3 cameraPos;
     float _padding0;
     float4x4 normalMatrix;  // Pre-computed inverse-transpose of model matrix (CPU-side)
-    int useSkinning;
     uint paletteOffset;     // unused here; layout shared with skinned_model.vert.hlsl
-    float2 _padding1;
+    float3 _padding1;
 };
 
 VSOutput VSMain(VSInput input) {

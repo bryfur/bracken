@@ -157,7 +157,6 @@ TEST(AppearanceDefinitionDefaults, Values) {
 TEST(EmitterDefinitionDefaults, Values) {
     EmitterDefinition e;
     EXPECT_TRUE(e.name.empty());
-    EXPECT_EQ(e.particle_type, "mesh");
     EXPECT_TRUE(e.model.empty());
     EXPECT_EQ(e.spawn_mode, SpawnMode::BURST);
     EXPECT_EQ(e.spawn_count, 1);
@@ -171,9 +170,8 @@ TEST(EffectDefinitionDefaults, Values) {
     EffectDefinition d;
     EXPECT_TRUE(d.name.empty());
     EXPECT_TRUE(d.emitters.empty());
-    EXPECT_FLOAT_EQ(d.duration, 1.0f);
-    EXPECT_FALSE(d.loop);
-    EXPECT_FLOAT_EQ(d.default_range, 100.0f);
+    // -1 = emitter-driven completion (no effect-level duration cap).
+    EXPECT_FLOAT_EQ(d.duration, -1.0f);
 }
 
 // ===== Struct size sanity checks =====

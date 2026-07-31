@@ -24,10 +24,13 @@ public:
     TransientAllocator(const TransientAllocator&) = delete;
     TransientAllocator& operator=(const TransientAllocator&) = delete;
 
-    [[nodiscard]] bool init(gpu::GPUDevice& device);
+    // Bind the GPU device used to create textures. Cannot fail. May be skipped
+    // for device-less tests: acquire_texture then returns non-null sentinels.
+    void init(gpu::GPUDevice& device);
     void shutdown();
 
-    // Acquire a texture matching desc. If pool has a free one, reuses it.
+    // Acquire a texture matching desc. If the pool has a free one, reuses it;
+    // otherwise creates one. Returns nullptr if creation fails (logged).
     SDL_GPUTexture* acquire_texture(const TextureDesc& desc, const char* debug_name);
 
     // Return a texture to the pool for reuse on next acquire.
@@ -49,6 +52,11 @@ public:
     // Destroy every pooled texture (called on resize / shutdown).
     void evict_all();
 
+    // Test seam: cap the number of texture *creations* (pool reuses are
+    // unaffected). Once the budget is exhausted, acquire_texture returns
+    // nullptr as if SDL_CreateGPUTexture had failed. -1 (default) = unlimited.
+    void set_texture_create_budget_for_testing(int64_t budget) noexcept { create_budget_ = budget; }
+
 private:
     struct DescKey {
         TextureDesc desc;
@@ -68,6 +76,7 @@ private:
 
     uint32_t acquires_ = 0;
     uint32_t reuses_ = 0;
+    int64_t create_budget_ = -1; // test seam; -1 = unlimited
 };
 
 } // namespace bracken::render_graph

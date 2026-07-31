@@ -21,7 +21,6 @@ public:
     SDL_GPURenderPass* render_pass() const noexcept { return render_pass_; }
 
     SDL_GPUTexture* get_texture(ResourceHandle h) const noexcept;
-    SDL_GPUBuffer* get_buffer(ResourceHandle h) const noexcept;
 
 private:
     RenderGraph* graph_;

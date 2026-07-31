@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_debug.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
@@ -7,18 +8,21 @@
 #include "bracken/graphics_settings.hpp"
 #include "bracken/render/environment.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
+#include "bracken/render/lighting/local_shadows.hpp"
 #include "bracken/render_stats.hpp"
-#include "bracken/scene/bone_palette_table.hpp"
 #include "bracken/scene/camera_state.hpp"
+#include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/frustum.hpp"
-#include "bracken/scene/render_scene.hpp"
-#include "bracken/scene/ui_scene.hpp"
+#include "bracken/scene/motion_history.hpp"
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <glm/glm.hpp>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -31,17 +35,22 @@ class UIRenderer;
 class EffectRenderer;
 class GrassRenderer;
 class ShadowMap;
-class AmbientOcclusion;
+class PostProcessStack;
+class GTAO;
 class Bloom;
 class VolumetricFog;
+class TAA;
+class AutoExposure;
+class IBL;
+class WaterRenderer;
 } // namespace bracken::render
 
 namespace bracken::gpu {
 class PipelineRegistry;
 }
 
-namespace bracken::systems {
-class EffectSystem;
+namespace bracken::core::jobs {
+class JobSystem;
 }
 
 namespace bracken {
@@ -58,9 +67,9 @@ namespace gpu = bracken::gpu;
 namespace render = bracken::render;
 
 /**
- * SceneRenderer consumes RenderScene + UIScene and produces a rendered frame.
+ * SceneRenderer consumes a sealed FramePacket and produces a rendered frame.
  * Owns all GPU resources, sub-renderers, and rendering state.
- * Game builds scenes; SceneRenderer draws them.
+ * The host describes a frame through a FrameBuilder; SceneRenderer draws it.
  */
 class SceneRenderer {
 public:
@@ -83,15 +92,25 @@ public:
     void shutdown();
 
     /**
-     * Render a complete frame from scene descriptions.
-     * @param scene 3D world scene commands
-     * @param ui_scene 2D UI commands
-     * @param camera Camera state for the frame
-     * @param dt Delta time for animations/effects
+     * Render a complete frame from a SEALED (or Consuming) FramePacket — the
+     * frame's immutable description: 3D commands, packet-owned bone palettes,
+     * lights, billboards, debug lines, UI commands, camera, environment,
+     * timing (dt = frame.dt()) and the engine section (sim-advanced
+     * scene/sky clocks + the effect-instance snapshot the particle pass
+     * consumes — the renderer never touches the live, sim-stage-owned
+     * EffectSystem; effect SPAWNS are applied on the sim side before seal).
+     * The packet is genuinely const: nothing in it is mutated or retained,
+     * and nothing in it references host storage (the old bone-matrix span
+     * lifetime contract is gone). The caller retires the packet wholesale
+     * after this returns.
+     *
+     * Camera/environment are per-frame optional: has_environment() adopts the
+     * packet snapshot into env_ (otherwise env_ — live-editable via
+     * environment(), e.g. the dev overlay — is used unchanged). Without a
+     * camera this frame the previous frame's camera is reused; if no camera
+     * was ever set the 3D passes are skipped (UI still renders).
      */
-    // RenderScene is taken by non-const reference because the renderer
-    // drains particle-effect spawn commands from it as part of consumption.
-    void render_frame(RenderScene& scene, const UIScene& ui_scene, const CameraState& camera, float dt);
+    void render_frame(const FramePacket& frame);
 
     // ========== Configuration ==========
 
@@ -122,22 +141,235 @@ public:
     render::TerrainRenderer& terrain();
     ModelManager& models();
     render::GrassRenderer* grass();
+
+    /** Water surface + wave simulation. Configure via water()->set_region()
+     *  (nothing renders until a region is set); inject ripples with
+     *  water()->add_ripple(). Null until init() succeeds. */
+    render::WaterRenderer* water();
     gpu::PipelineRegistry* pipeline_registry() { return pipeline_registry_.get(); }
     float get_terrain_height(float x, float z);
+
+    /** Measure text at `scale` in the UI font (pixels). 0 before init() —
+     *  hosts laying out UI (e.g. wrapped text emission) query these. */
+    int text_width(std::string_view text, float scale = 1.0f) const;
+    int text_height(float scale = 1.0f) const;
 
     /** Live-editable environment (sun/sky/fog — single source of truth).
      *  Mutations take effect next frame: render_frame re-propagates env_ to
      *  every sub-renderer at the top of each frame. */
-    EnvironmentState& environment() { return env_; }
+    render::EnvironmentState& environment() { return env_; }
 
-    /** Read-only view of the particle system (e.g. dev-overlay stats).
-     *  Null until init() succeeds. */
-    const bracken::systems::EffectSystem* effect_system() const { return effect_system_.get(); }
+    /** Effect/particle counts of the LAST CONSUMED packet's effect-instance
+     *  snapshot — render-side data, safe for the dev overlay to read while
+     *  the next frame's sim is in flight (the live EffectSystem is
+     *  sim-stage-owned and must never be read from the render side). */
+    uint32_t frame_effect_count() const { return frame_effect_count_; }
+    uint32_t frame_particle_count() const { return frame_particle_count_; }
+
+    /** Read-only view of the sky IBL prefilter chain (refresh stats for the
+     *  dev overlay / smoke logging). Null until init() succeeds. */
+    const render::IBL* ibl() const { return ibl_.get(); }
+
+    /** Histogram auto-exposure system — adapted-EV debug readback for the
+     *  dev overlay / smoke logging, plus metering tunables (percentiles,
+     *  target gray). Null until init() succeeds. */
+    render::AutoExposure* auto_exposure() { return auto_exposure_.get(); }
+    const render::AutoExposure* auto_exposure() const { return auto_exposure_.get(); }
+
+    /** Read-only view of the local (point/spot) shadow system — selection /
+     *  tile-cache stats for the dev overlay and smoke logging. Null until
+     *  init() succeeds. */
+    const render::lighting::LocalShadowMap* local_shadows() const { return local_shadows_.get(); }
+
+    // ========== Motion vectors / TAA foundation ==========
+
+    /** Whether the TAA sub-pixel camera jitter (Halton 2,3) was applied to
+     *  this frame's draw projection. Derived per frame from the graphics
+     *  settings: ON exactly when `aa_mode == AAMode::TAA` and the TAA resolve
+     *  can actually run (AO/offscreen path + TAA history initialized) — any
+     *  other AA mode renders unjittered. Velocity output is unaffected either
+     *  way (it always uses unjittered matrices). */
+    bool taa_jitter_enabled() const { return taa_jitter_enabled_; }
+
+    /** Screen-size RG16F motion-vector target written by the depth prepass
+     *  (UV-space delta, current minus previous — see
+     *  scene/velocity_math.hpp for the exact convention). Null until the
+     *  first prepass frame; contents are only valid for frames where
+     *  depth_prepass_active() was true. */
+    gpu::GPUTexture* velocity_texture() { return velocity_texture_.get(); }
+
+    /** True when this frame ran the depth prepass (velocity + depth laid
+     *  down before the forward pass; opaque forward draws used EQUAL). */
+    bool depth_prepass_active() const { return frame_prepass_active_; }
+
+    /** This frame's / previous frame's UNJITTERED view-projection. TAA and
+     *  any depth-reprojection consumer must use these, never the jittered
+     *  draw matrices. */
+    const glm::mat4& current_view_projection_unjittered() const { return frame_cam_.view_proj_unjittered; }
+    const glm::mat4& previous_view_projection_unjittered() const { return prev_view_proj_unjittered_; }
 
     // Post-UI callback: called after UI rendering, before end_frame.
     // Receives (command_buffer, swapchain_texture) for additional render passes (e.g. ImGui).
     using PostUICallback = std::function<void(SDL_GPUCommandBuffer*, SDL_GPUTexture*)>;
     void set_post_ui_callback(PostUICallback cb) { post_ui_callback_ = std::move(cb); }
+
+    // ========== CPU Prepare fan-out (docs/multithreading_plan.md §4.3) ==========
+    // The pure-CPU prep cores of render_frame — instance binning, skinned
+    // resolve, palette copy — factored as device-free statics so the
+    // js(1)/js(N) determinism parity test can drive them against caller-owned
+    // JobSystem pools (§6.2). The member wrappers (build_instance_batches /
+    // pack_bone_palettes / upload_bone_palettes) pass the renderer's own
+    // bins + scratch and JobSystem::instance().
+    //
+    // Determinism contract (§6.2): every core produces BIT-IDENTICAL outputs
+    // at any worker count. Chunks accumulate into their own per-chunk scratch
+    // (no atomics, no shared cache-line writes inside the per-item loops) and
+    // partials merge single-threaded in chunk-index order after the join —
+    // concatenating contiguous chunks in index order reproduces the serial
+    // command order exactly. Below one chunk the same binning code runs
+    // inline on the caller, writing the final outputs directly: granularity
+    // control, not a second code path.
+
+    // Mirror of render::CSM_MAX_CASCADES (render/shadow_map.hpp), duplicated
+    // because this header deliberately only forward-declares ShadowMap; a
+    // static_assert in scene_renderer.cpp keeps the two in lockstep.
+    static constexpr int MAX_SHADOW_CASCADES = 4;
+
+    // Chunk grains. Command-walk chunks target ~128 commands so per-chunk
+    // dispatch overhead stays well under the cull/bin work; totals <= grain
+    // run as one inline chunk, which keeps the 1-character playground
+    // effectively serial. Palette-copy items are much heavier per item (up to
+    // an 8 KB memcpy each), so they chunk at a smaller grain.
+    static constexpr std::size_t PREP_COMMAND_GRAIN = 128;
+    static constexpr std::size_t PREP_PALETTE_GRAIN = 32;
+
+    // Skinned commands resolved once per frame by pack_bone_palettes():
+    // Model*, world bounds, palette offset, main-view visibility, and the
+    // previous-frame motion state (model matrix + palette offset from
+    // MotionHistory), shared by the prepass, main view and every shadow
+    // cascade. Commands without a model/skeleton/palette joints are
+    // excluded. Cleared per frame, capacity preserved. `cmd` points into the
+    // consumed packet — valid only within render_frame (in tests: while the
+    // packet stays sealed).
+    struct ResolvedSkinnedEntry {
+        const SkinnedDrawCommand* cmd;
+        Model* model;
+        glm::vec3 world_center;
+        float world_radius;
+        uint32_t palette_offset;
+        bool main_visible;            // passed the main-view distance + frustum cull
+        glm::mat4 prev_model;         // last frame's transform (== current if no history)
+        uint32_t prev_palette_offset; // into the prev palette buffer; NO_PREV_PALETTE if none
+    };
+
+    /** Read-only inputs of the prep cores. Everything reachable through it is
+     *  worker-safe during the prep fan-out: const ModelManager lookups (no
+     *  mutation in flight — the hot-reload fence guarantees quiescence),
+     *  const MotionHistory lookups, and by-value/pointer frame state. */
+    struct PrepParams {
+        const ModelManager* models = nullptr;          // get_model — const, worker-safe after load
+        const MotionHistory* motion_history = nullptr; // find_prev — const lookups only
+        glm::vec3 camera_pos{0.0f};
+        const Frustum* main_frustum = nullptr;    // required when do_frustum_cull
+        const Frustum* cascade_frustums = nullptr; // [active_cascades] light frustums
+        int active_cascades = 0;                  // 0 = no shadow binning
+        float draw_dist_sq = 0.0f;
+        bool do_frustum_cull = false;
+        bool collect_stats = false;
+        bool prev_palette_valid = false; // prev palette buffer holds last frame's data
+    };
+
+    /** One chunk's private partial for the prep fan-outs. Each field group is
+     *  used by exactly one core (main-view binning / shadow-view binning /
+     *  skinned resolve); a chunk job clears ONLY the group it is about to
+     *  fill (O(touched), capacity preserved) at the top of the chunk, so
+     *  steady-state frames allocate nothing. Padded to the cache line:
+     *  adjacent chunk slots in the pool array are written by different
+     *  workers concurrently (render_stats.hpp merge discipline). */
+    struct alignas(core::jobs::k_cache_line) PrepChunkScratch {
+        // Main-view binning partial (dense by ModelHandle + first-touch list).
+        std::vector<std::vector<gpu::InstanceData>> bins;
+        std::vector<ModelHandle> touched;
+        std::vector<const ModelDrawCommand*> non_instanced;
+        // Shadow-view binning partial (each cascade view has its own pool).
+        std::vector<std::vector<gpu::ShadowInstanceData>> shadow_bins;
+        std::vector<ModelHandle> shadow_touched;
+        // Skinned-resolve partial.
+        std::vector<ResolvedSkinnedEntry> skinned;
+        // Cull/render counters of this chunk, merged in chunk-index order.
+        FrameStatsPartial stats;
+    };
+
+    /** One view's chunk-scratch pool: grown to the frame's chunk count on
+     *  demand and never shrunk — per-chunk capacity survives across frames
+     *  (the no-per-frame-allocs-at-steady-state discipline). Only chunk slots
+     *  [0, chunk_count) of a given frame are written and merged; higher slots
+     *  keep stale data and are never read. */
+    struct PrepViewScratch {
+        std::vector<PrepChunkScratch> chunks;
+    };
+
+    /** Per-view scratch pools for the Prepare fan-out. Views run as
+     *  concurrent sibling jobs, so each has its own pool: main view,
+     *  each CSM cascade, and the skinned resolve. Owned by the renderer
+     *  (member, not thread_local) so lifetime/reset stays testable. */
+    struct PrepScratch {
+        PrepViewScratch main;
+        std::array<PrepViewScratch, MAX_SHADOW_CASCADES> cascades;
+        PrepViewScratch skinned;
+    };
+
+    /** Output bindings of prep_instance_batches — references onto the
+     *  caller's containers (the renderer's members, or a test's locals).
+     *  All previous contents are cleared O(touched) by the call. */
+    struct InstanceBinOutputs {
+        std::vector<std::vector<gpu::InstanceData>>& instance_batches;
+        std::vector<ModelHandle>& instance_batches_touched;
+        std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, MAX_SHADOW_CASCADES>& shadow_instance_batches;
+        std::array<std::vector<ModelHandle>, MAX_SHADOW_CASCADES>& shadow_batches_touched;
+        std::vector<const ModelDrawCommand*>& non_instanced;
+        FrameStatsPartial& stats;
+    };
+
+    /**
+     * Cull + bin the packet's model commands for the main view and every
+     * active CSM cascade. Fan-out shape (§4.3): one TaskGroup job per view —
+     * the outputs are disjoint (instance_batches vs shadow_instance_batches[c])
+     * so views never share a write target; the main view runs on the caller,
+     * which then helps execute the cascade jobs inside the join. Within each
+     * view the command span is chunked at PREP_COMMAND_GRAIN with per-chunk
+     * partial bins merged in chunk order. Bin contents/order, touched lists,
+     * the non-instanced list and `out.stats` are bit-identical to the serial
+     * walk at any worker count.
+     */
+    static void prep_instance_batches(core::jobs::JobSystem& js, std::span<const ModelDrawCommand> cmds,
+                                      const PrepParams& p, PrepScratch& scratch, const InstanceBinOutputs& out);
+
+    /**
+     * Resolve the packet's skinned commands: per-command model lookup, joint
+     * clamp, world bounds, main-view cull and motion-history pairing — all
+     * pure reads that chunk at PREP_COMMAND_GRAIN with per-chunk partials
+     * appended into `out` in chunk-index order (byte-identical to the serial
+     * walk). Order-dependent palette work stays out of the fan-out entirely:
+     * palette offsets were prefix-summed serially at packet seal, and the
+     * old renderer-side dedupe table is gone (palette sharing happens at
+     * build time via shared BonePaletteIds).
+     */
+    static void prep_resolve_skinned(core::jobs::JobSystem& js, std::span<const SkinnedDrawCommand> cmds,
+                                     std::span<const BonePalette> palettes, const PrepParams& p,
+                                     PrepViewScratch& scratch, std::vector<ResolvedSkinnedEntry>& out,
+                                     FrameStatsPartial& stats);
+
+    /**
+     * Copy every packet palette into `dst` (the mapped GPU transfer buffer in
+     * render_frame; any caller-owned buffer of palette_matrix_total() matrices
+     * in tests). Each palette's destination range
+     * [matrix_offset, matrix_offset + joint_count) is disjoint by construction
+     * (the seal-time prefix sum — offset assignment itself stays serial), so
+     * chunks write disjoint ranges: no partials, no merge, bit-identical at
+     * any worker count.
+     */
+    static void prep_copy_palettes(core::jobs::JobSystem& js, std::span<const BonePalette> palettes, glm::mat4* dst);
 
 private:
     // Frame lifecycle
@@ -151,18 +383,37 @@ private:
     void end_ui();
 
     // Rendering
-    void render_3d_scene(const RenderScene& scene, const CameraState& camera);
-    void render_model_command(const ModelCommand& cmd, const CameraState& camera);
-    void render_model_command_inner(const ModelCommand& cmd, const CameraState& camera);
-    void render_skinned_model_command_inner(const SkinnedModelCommand& cmd, Model& model, const CameraState& camera,
+    void render_3d_scene(const FramePacket& frame, const CameraState& camera);
+    void render_model_command(const ModelDrawCommand& cmd, const CameraState& camera);
+    void render_model_command_inner(const ModelDrawCommand& cmd, const CameraState& camera);
+    void render_skinned_model_command_inner(const SkinnedDrawCommand& cmd, Model& model, const CameraState& camera,
                                             uint32_t palette_offset);
-    void build_instance_batches(const RenderScene& scene, const CameraState& camera, const Frustum& frustum);
+    void build_instance_batches(const FramePacket& frame, const CameraState& camera, const Frustum& frustum);
     void upload_instance_buffers(SDL_GPUCopyPass* copy_pass);
-    void pack_bone_palettes(const RenderScene& scene);
-    void upload_bone_palettes(SDL_GPUCopyPass* copy_pass);
+    void pack_bone_palettes(const FramePacket& frame, const CameraState& camera);
+    void upload_bone_palettes(SDL_GPUCopyPass* copy_pass, const FramePacket& frame);
     void render_instanced_models(const CameraState& camera);
     void render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
                                         const glm::mat4& light_view_projection, int cascade);
+
+    // Depth prepass: velocity (RG16F) + scene depth for every opaque
+    // (alphaMode OPAQUE) draw, before the forward pass. Returns true when the
+    // pass was recorded (forward opaques then depth-test EQUAL, writes off).
+    // `draw_camera` carries the jittered projection; velocity uses the
+    // frame's unjittered matrices.
+    [[nodiscard]] bool render_depth_prepass(const FramePacket& frame, const CameraState& draw_camera);
+    void prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
+                                const gpu::PrepassCameraUniforms& camera_uniforms);
+    void prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
+                                    const CameraState& draw_camera);
+    void prepass_draw_skinned_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
+                                     const CameraState& draw_camera);
+
+    // Bone-palette double buffer: [bone_palette_current_] is written/bound
+    // this frame; the other slot still holds last frame's palettes for the
+    // skinned prepass' previous-position path.
+    gpu::GPUBuffer* current_bone_palette_buffer() { return bone_palette_buffers_[bone_palette_current_].get(); }
+    gpu::GPUBuffer* prev_bone_palette_buffer() { return bone_palette_buffers_[bone_palette_current_ ^ 1].get(); }
 
     // Transparent (glTF alphaMode BLEND) path: meshes queued during the opaque
     // walks, then drawn back-to-front after the skybox with depth writes off.
@@ -171,18 +422,31 @@ private:
                                 const CameraState& camera);
     void render_transparent_models(const CameraState& camera);
 
-    // Bind the (double-sided or default-cull) model/skinned pipeline variant
-    // and re-establish the pass-level fragment state that follows a bind.
-    bool bind_model_pipeline(bool double_sided);
-    bool bind_skinned_pipeline(bool double_sided);
-    void render_ui_commands(const UIScene& ui_scene, const CameraState& camera);
-    void draw_billboard_3d(const Billboard3DCommand& cmd, const CameraState& camera);
-    void upload_debug_lines(const RenderScene& scene, SDL_GPUCopyPass* copy_pass);
+    // Bind the model/skinned pipeline variant (double-sided cull + post-
+    // prepass EQUAL depth) and re-establish the pass-level fragment state
+    // that follows a bind.
+    bool bind_model_pipeline(bool double_sided, bool depth_equal = false);
+    bool bind_skinned_pipeline(bool double_sided, bool depth_equal = false);
+    void render_ui_commands(const FramePacket& frame);
+    void draw_billboard_3d(const BillboardDrawCommand& cmd, const CameraState& camera);
+    void upload_debug_lines(const FramePacket& frame, SDL_GPUCopyPass* copy_pass);
     void render_debug_lines(const CameraState& camera);
 
-    // Shadow rendering
-    void render_shadow_passes(const RenderScene& scene, const CameraState& camera);
+    // Shadow rendering (casters come from the per-frame resolved scratch:
+    // instance batches + non_instanced_commands_ + skinned_resolved_).
+    void render_shadow_passes();
     void bind_shadow_data(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, int sampler_slot);
+
+    // Local (point/spot) light shadows: draws the tiles the selector marked
+    // for re-render this frame into the local atlas (casters = model +
+    // skinned commands within each light's radius; terrain and grass do not
+    // cast local shadows). Runs after the CSM shadow passes.
+    void render_local_shadow_passes(const FramePacket& frame, const CameraState& camera);
+    // Bind the local-shadow atlas + comparison sampler at the given fragment
+    // sampler slot of the current main pass (falls back to the CSM atlas as a
+    // typed filler when the local atlas is unavailable — the slot is always
+    // declared but only sampled for lights with shadow_slot >= 0).
+    void bind_local_shadow_atlas(uint32_t slot);
 
     // Model-pipeline material state. Lighting uniforms and per-slot texture
     // bindings persist across draws within a pass, so both are pushed lazily;
@@ -197,7 +461,23 @@ private:
     // fragment shaders (model/instanced/terrain/grass).
     void bind_cluster_lights(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, int uniform_slot);
 
-    // Depth pre-pass (renders depth-only before main pass to eliminate overdraw)
+    // Bind the frame's screen-space AO texture (or the 1x1 white dummy when
+    // `enabled` is false / AO didn't run) at the given fragment sampler slot
+    // of the current main pass. Every model-family pipeline bind must include
+    // this — the shaders always declare the slot.
+    void bind_screen_ao(uint32_t slot, bool enabled = true);
+
+    // Fill the 3-entry sky IBL binding array (irradiance cube, prefiltered
+    // specular cube, BRDF LUT — real chain when the IBL renderer is ready,
+    // cube-typed dummies otherwise). Returns false if no valid binding can be
+    // built (no dummies either — only possible before init completes).
+    bool fill_ibl_bindings(SDL_GPUTextureSamplerBinding out[3]);
+
+    // Bind the sky IBL chain at [base_slot, base_slot + 3) of the current
+    // main pass. Every model-family pipeline bind must include this — the
+    // shaders always declare the slots (terrain/grass receive the same
+    // bindings through their render() parameters instead).
+    void bind_ibl(uint32_t base_slot);
 
     // Setup
     void init_pipelines();
@@ -209,15 +489,26 @@ private:
     std::unique_ptr<render::WorldRenderer> world_;
     std::unique_ptr<render::UIRenderer> ui_;
     std::unique_ptr<render::EffectRenderer> effects_;
-    std::unique_ptr<bracken::systems::EffectSystem> effect_system_;
     std::unique_ptr<ModelManager> model_manager_;
     std::unique_ptr<render::GrassRenderer> grass_renderer_;
     std::unique_ptr<render::ShadowMap> shadow_map_;
-    std::unique_ptr<render::AmbientOcclusion> ao_;
+    std::unique_ptr<render::PostProcessStack> post_;
+    std::unique_ptr<render::GTAO> gtao_;
     std::unique_ptr<render::Bloom> bloom_;
     std::unique_ptr<render::VolumetricFog> volumetric_fog_;
+    std::unique_ptr<render::TAA> taa_;
+    std::unique_ptr<render::AutoExposure> auto_exposure_;
+    std::unique_ptr<render::IBL> ibl_;
+    std::unique_ptr<render::WaterRenderer> water_;
+    // Snapshots of the HDR color + depth taken between the opaque pass and
+    // the water pass (what water refraction / shoreline softness sample —
+    // the live targets stay bound for the actual draw). Screen-sized; lazily
+    // (re)created, only while a water region is active.
+    std::unique_ptr<gpu::GPUTexture> water_scene_copy_;
+    std::unique_ptr<gpu::GPUTexture> water_depth_copy_;
     render::lighting::ClusterGrid cluster_grid_;
     bool cluster_grid_ready_ = false;
+    std::unique_ptr<render::lighting::LocalShadowMap> local_shadows_;
 
     // ========== GPU Resources ==========
     std::unique_ptr<gpu::GPUBuffer> debug_line_vertex_buffer_;
@@ -229,6 +520,9 @@ private:
     std::unique_ptr<gpu::GPUTexture> dummy_white_texture_;    // 1x1 white for binding slots that need a texture
     std::unique_ptr<gpu::GPUTexture> default_normal_texture_; // 1x1 (128,128,255) flat tangent-space normal
     std::unique_ptr<gpu::GPUTexture> dummy_black_texture_;    // 1x1 black emissive fallback
+    std::unique_ptr<gpu::GPUTexture> dummy_black_cube_;       // 1x1x6 black cube for the IBL slots when
+                                                              // the IBL renderer is unavailable (a cube-
+                                                              // declared slot must get a cube texture)
 
     // ========== Instanced Rendering ==========
     // Per-model instance bins indexed directly by ModelHandle (a dense index
@@ -237,17 +531,12 @@ private:
     // ascending handle order (stable, texture-coherent), skipping empty bins.
     std::vector<std::vector<gpu::InstanceData>> instance_batches_;
     std::vector<ModelHandle> instance_batches_touched_;
-    // Mirror of render::CSM_MAX_CASCADES (render/shadow_map.hpp), duplicated
-    // because this header deliberately only forward-declares ShadowMap; a
-    // static_assert in scene_renderer.cpp keeps the two in lockstep.
-    static constexpr int MAX_SHADOW_CASCADES = 4;
     // Per-cascade shadow batches: each cascade has its own light-frustum-culled set of casters.
     // Only casters inside that cascade's light frustum are added, which dramatically
     // reduces shadow draw work for tight near cascades.
     std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, MAX_SHADOW_CASCADES> shadow_instance_batches_;
     std::array<std::vector<ModelHandle>, MAX_SHADOW_CASCADES> shadow_batches_touched_;
-    std::vector<const ModelCommand*> non_instanced_commands_;         // individual draw fallback
-    std::vector<const SkinnedModelCommand*> shadow_skinned_commands_; // pre-collected for shadow passes
+    std::vector<const ModelDrawCommand*> non_instanced_commands_; // individual draw fallback
     std::unique_ptr<gpu::GPUBuffer> instance_storage_buffer_;
     size_t instance_storage_capacity_ = 0;
     std::unique_ptr<gpu::GPUBuffer> shadow_instance_storage_buffer_;
@@ -276,66 +565,71 @@ private:
     };
     std::vector<TransparentDraw> transparent_draws_;
     static constexpr uint32_t INVALID_PALETTE_OFFSET = 0xFFFFFFFFu;
-    // Cull variant currently bound for the model / skinned pipeline families
-    // (only meaningful while that family is the active pipeline).
+    // Cull + depth variant currently bound for the model / skinned pipeline
+    // families (only meaningful while that family is the active pipeline).
     bool model_pipeline_double_sided_ = false;
     bool skinned_pipeline_double_sided_ = false;
+    bool model_pipeline_depth_equal_ = false;
+    bool skinned_pipeline_depth_equal_ = false;
 
     // ========== Bone Palettes ==========
-    // All skinned commands' bone matrices packed tightly (joint_count matrices
-    // each, not MAX_BONES) into one storage buffer, uploaded once per frame and
-    // shared by the main pass and every shadow cascade. Draws carry only a
-    // uint palette offset instead of an 8 KB uniform push per pass.
-    static constexpr uint32_t MAX_BONE_PALETTES = 1024;       // per-frame cap; draws beyond are dropped + logged
-    std::unique_ptr<gpu::GPUBuffer> bone_palette_buffer_;
-    size_t bone_palette_capacity_ = 0;                        // bytes; grown geometrically
-    // Palette copy plan built by pack_bone_palettes(): each range is memcpy'd
-    // straight from host bone storage into the mapped transfer buffer at
-    // upload time (no intermediate CPU pack scratch). Destination offsets are
-    // the running matrix total in range order.
-    struct PaletteCopyRange {
-        const glm::mat4* src;
-        uint32_t count;
-    };
-    std::vector<PaletteCopyRange> palette_copy_ranges_;
-    size_t bone_palette_matrix_count_ = 0;                    // total matrices to upload this frame
-    // Dedupe shared bone arrays (e.g. the static identity palette submitted
-    // for unbound skeletons): open-addressing hash keyed on the palette data
-    // pointer, O(1)-cleared per frame and allocation-free on the frame path.
-    BonePaletteTable palette_dedupe_{MAX_BONE_PALETTES};
+    // Bone palettes live in the FramePacket (allocated by the host through
+    // FrameBuilder::alloc_bone_palette, budgeted at build time by
+    // FramePacket::MAX_BONE_PALETTES): the frame's packed palette stream is
+    // uploaded palettes()-in-order into one storage buffer, shared by the
+    // main pass and every shadow cascade. Draws carry only a uint palette
+    // offset (BonePalette::matrix_offset, prefix-summed at seal) instead of
+    // an 8 KB uniform push per pass.
+    // DOUBLE-BUFFERED: uploads alternate between the two slots each rendered
+    // frame so the previous frame's palettes stay bindable — the skinned
+    // depth prepass reads them (via MotionHistory palette offsets) to compute
+    // per-bone motion vectors.
+    std::array<std::unique_ptr<gpu::GPUBuffer>, 2> bone_palette_buffers_;
+    std::array<size_t, 2> bone_palette_capacities_{};         // bytes; grown geometrically
+    int bone_palette_current_ = 0;                            // slot written/bound this frame
+    bool prev_palette_buffer_valid_ = false;                  // prev slot holds last frame's palettes
+    size_t bone_palette_matrix_count_ = 0;                    // total matrices uploaded this frame
 
-    // Skinned commands resolved once per frame by pack_bone_palettes():
-    // Model*, world bounds and palette offset, shared by the main view and
-    // every shadow cascade. Commands without a model/skeleton/bone data (or
-    // dropped over the palette cap) are excluded. Cleared per frame,
-    // capacity preserved.
-    struct ResolvedSkinnedEntry {
-        const SkinnedModelCommand* cmd;
-        Model* model;
-        glm::vec3 world_center;
-        float world_radius;
-        uint32_t palette_offset;
-    };
+    // Skinned commands resolved once per frame by pack_bone_palettes() (see
+    // ResolvedSkinnedEntry in the public prep section above).
     std::vector<ResolvedSkinnedEntry> skinned_resolved_;
+
+    // Per-view / per-chunk scratch pools for the CPU Prepare fan-out (see
+    // PrepScratch above). Capacity-stable across frames.
+    PrepScratch prep_scratch_;
 
     // Per-frame scratch for shadow-pass static entity resolution. Cleared per
     // render_shadow_passes call but capacity is preserved across frames.
     // Held as a member rather than a thread_local local so it participates
     // in normal object lifetime / can be reset by tests.
     struct ResolvedStaticEntry {
-        const ModelCommand* cmd;
+        const ModelDrawCommand* cmd;
         Model* model;
     };
     std::vector<ResolvedStaticEntry> shadow_static_scratch_;
 
     // ========== Render State ==========
+    // Frame camera adopted from the packet when the host set one
+    // (frame.has_camera()); a camera-less frame reuses the previous camera,
+    // and until any camera was ever set the 3D passes are skipped entirely
+    // (have_frame_camera_ false).
+    CameraState frame_camera_state_{glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f), glm::vec3(0.0f)};
+    bool have_frame_camera_ = false;
     Frustum frame_frustum_{}; // Extracted once per frame, reused across passes
     SDL_GPURenderPass* main_render_pass_ = nullptr;
     SDL_GPUTexture* current_swapchain_ = nullptr;
     bool had_main_pass_this_frame_ = false;
-    EnvironmentState env_;                 // single source of truth for sun/sky/fog
+    render::EnvironmentState env_;         // single source of truth for sun/sky/fog
     glm::vec3 light_dir_ = env_.sun_dir;   // refreshed from env_ every frame
-    float scene_time_ = 0.0f;              // accumulated dt, drives grass animation
+    // Scene clock (grass wind / water shading). Advanced by the SIM stage and
+    // adopted from the packet's engine section each frame (has_engine_frame);
+    // the renderer never integrates dt itself. Hand-built test packets
+    // without an engine section leave it unchanged.
+    float scene_time_ = 0.0f;
+    // Effect-instance snapshot counts of the last consumed packet (dev
+    // overlay stats — render-side data only).
+    uint32_t frame_effect_count_ = 0;
+    uint32_t frame_particle_count_ = 0;
     GraphicsSettings* graphics_ = nullptr;
     GraphicsSettings default_graphics_;
 
@@ -349,6 +643,29 @@ private:
     // when the scene has no dynamic lights so stale light counts never leak.
     render::lighting::ClusterParams frame_cluster_params_{};
 
+    // ========== Local (point/spot) light shadows ==========
+    // Per-frame copies of the scene's lights: the local-shadow selector
+    // writes each selected light's shadow_slot into these before they feed
+    // the cluster grid (scene commands are immutable to the renderer).
+    // Capacity persists across frames.
+    std::vector<render::lighting::PointLight> frame_point_lights_;
+    std::vector<render::lighting::SpotLight> frame_spot_lights_;
+    // Moving casters this frame (motion_id != 0 / skinned): cached local
+    // shadow tiles they intersect must re-render.
+    std::vector<render::lighting::LocalShadowDynamicCaster> local_dynamic_casters_;
+    // Per-light caster scratch for render_local_shadow_passes.
+    struct LocalShadowCaster {
+        const ModelDrawCommand* cmd;
+        Model* model;
+        glm::vec3 center;
+        float radius;
+    };
+    std::vector<LocalShadowCaster> local_static_casters_;
+    std::vector<const ResolvedSkinnedEntry*> local_skinned_casters_;
+    // Set per frame: local shadows setting on, LocalShadowMap alive, and the
+    // scene has dynamic lights (so the selector ran and slots are current).
+    bool frame_local_shadows_active_ = false;
+
     // Cached frame state (computed once in render_frame, reused everywhere)
     gpu::ShadowDataUniforms frame_shadow_uniforms_{};
     bool frame_fog_active_ = false;
@@ -359,6 +676,43 @@ private:
     // glm::inverse on a 4x4 is ~80 flops; running it every frame for AO/fog is waste.
     glm::mat4 cached_projection_{0.0f};
     glm::mat4 cached_inv_projection_{1.0f};
+
+    // ========== Motion Vectors / TAA Foundation ==========
+    // Per-frame camera matrices: the unjittered copies are captured BEFORE the
+    // optional TAA sub-pixel jitter is applied to the draw projection.
+    // Velocity math and frustum culling use the unjittered set exclusively.
+    struct FrameCameraMatrices {
+        glm::mat4 view{1.0f};
+        glm::mat4 proj_unjittered{1.0f};
+        glm::mat4 proj_jittered{1.0f};       // == unjittered when jitter is off
+        glm::mat4 view_proj_unjittered{1.0f};
+        glm::mat4 view_proj_jittered{1.0f};
+        glm::vec2 jitter_pixels{0.0f};
+    };
+    FrameCameraMatrices frame_cam_{};
+    glm::mat4 prev_view_proj_unjittered_{1.0f}; // last rendered frame's unjittered VP
+    bool have_prev_view_proj_ = false;          // first frame: prev == current (zero camera velocity)
+    uint64_t frame_index_ = 0;                  // rendered-frame counter (drives the jitter sequence)
+    bool taa_jitter_enabled_ = false;           // derived per frame: aa_mode == TAA && resolve can run
+
+    // Velocity (motion-vector) render target: RG16F, screen-sized, written by
+    // the depth prepass, cleared to zero (sky/unmoving pixels).
+    std::unique_ptr<gpu::GPUTexture> velocity_texture_;
+    // Set per frame: the depth prepass ran, so opaque forward draws bind the
+    // *DepthEqual pipeline variants (EQUAL compare, depth writes off).
+    bool frame_prepass_active_ = false;
+
+    // The AO texture forward draws sample this frame: gtao_'s full-res R8
+    // output when AO ran, otherwise the 1x1 white dummy. Reset at the top of
+    // every render_frame (never dangles across resizes/mode switches).
+    SDL_GPUTexture* frame_ao_texture_ = nullptr;
+
+    // Sky IBL is active this frame: settings flag on AND the prefilter chain
+    // is alive. Drives the iblEnabled uniform flag of every scene shader.
+    bool frame_ibl_active_ = false;
+
+    // motion_id -> previous-frame state (model matrix, palette offset).
+    MotionHistory motion_history_;
 
     // ========== Debug Stats ==========
     bool collect_stats_ = false;

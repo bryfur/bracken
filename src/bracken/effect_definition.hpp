@@ -82,14 +82,21 @@ struct AppearanceDefinition {
 struct EmitterDefinition {
     std::string name;
 
-    // Particle type and model
-    std::string particle_type = "mesh"; // "mesh" or "sprite"
+    // Particle model, looked up by name in the ModelManager
     std::string model;
 
     // Spawn behavior
     SpawnMode spawn_mode = SpawnMode::BURST;
     int spawn_count = 1;
-    float spawn_rate = 10.0f; // Particles per second (for CONTINUOUS)
+    float spawn_rate = 10.0f; // Particles per second (for CONTINUOUS; must be
+                              // > 0 — non-positive rates are rejected with a
+                              // warning at spawn and the emitter stays inert)
+    glm::vec3 spawn_volume{0.0f}; // Box half-extents around the emitter origin;
+                                  // each particle spawns at origin + a uniform
+                                  // random offset within the box. {0,0,0}
+                                  // (default) = point emitter. Area effects
+                                  // (rain, snow, fog banks) set this instead of
+                                  // spawning many point effects.
 
     // Particle lifetime
     float particle_lifetime = 1.0f; // How long each particle lives
@@ -109,12 +116,12 @@ struct EffectDefinition {
     std::string name;
     std::vector<EmitterDefinition> emitters;
 
-    // Effect-level properties
-    float duration = 1.0f; // Total effect duration
-    bool loop = false;
-
-    // Default values for spawning
-    float default_range = 100.0f; // Default effect range/scale
+    // Effect-level duration override. When >= 0, emitters stop spawning once
+    // the effect has been alive this long, and the effect completes (and is
+    // compacted away) as soon as its remaining particles die. -1 (default) =
+    // emitter-driven: each emitter runs its own duration and the effect
+    // completes when every emitter is done and every particle is dead.
+    float duration = -1.0f;
 };
 
 // Helper functions for curve evaluation

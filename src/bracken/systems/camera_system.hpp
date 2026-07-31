@@ -17,7 +17,6 @@ struct CameraShake {
     float duration;
     float elapsed;
     glm::vec3 direction; // For directional shakes
-    float frequency;     // Oscillation frequency
 };
 
 class CameraSystem : public CameraController {
@@ -45,13 +44,18 @@ public:
     const CameraModeConfig& get_config() const override { return current_config_; }
 
     // Soft-focus target (e.g. for action-cam soft-lock). Engine biases yaw
-    // toward focus_target_ when focus_strength_ > 0.
+    // toward focus_target_ when focus_strength_ > 0. Strength is clamped
+    // to [0, 1]; values above 1 would over-rotate and oscillate.
     void set_focus_target(const glm::vec3* target) override { focus_target_ = target; }
-    void set_focus_strength(float strength_0_1) override { focus_strength_ = strength_0_1; }
+    void set_focus_strength(float strength_0_1) override {
+        focus_strength_ = glm::clamp(strength_0_1, 0.0f, 1.0f);
+    }
+    float get_focus_strength() const override { return focus_strength_; }
 
     // Additive FOV bias (degrees). Caller manages over-time variation;
     // camera smooths the result toward target_fov + fov_bias_.
     void set_fov_bias(float fov_delta) override { fov_bias_ = fov_delta; }
+    float get_fov_bias() const override { return fov_bias_; }
 
     // Camera shake
     void add_shake(ShakeType type, float intensity, float duration = 0.3f) override;
@@ -79,18 +83,17 @@ public:
     // Set screen dimensions for projection matrix
     void set_screen_size(int width, int height) override;
 
-    // Debug visualization
-    void set_debug_draw_enabled(bool enabled) { debug_draw_ = enabled; }
-
 private:
-    // Internal update stages
+    // Internal update stages (in call order). Shake is computed before
+    // collision avoidance so the clamps apply to the shaken position and
+    // large shakes cannot push the camera through terrain/obstacles.
     void update_input_smoothing(float dt);
     void update_look_ahead(float dt);
     void update_auto_centering(float dt);
     void update_soft_lock(float dt);
     void update_camera_position(float dt);
-    void update_collision_avoidance(float dt);
     void update_camera_shake(float dt);
+    void update_collision_avoidance(float dt);
     void update_dynamic_fov(float dt);
     void compute_matrices();
 
@@ -121,23 +124,19 @@ private:
     float yaw_velocity_ = 0.0f;
     float pitch_velocity_ = 0.0f;
 
-    // Auto-centering
+    // Auto-centering (delay comes from current_config_.auto_center_delay)
     float time_since_input_ = 0.0f;
-    float auto_center_delay_ = 2.0f; // Seconds before auto-centering starts
     bool auto_centering_active_ = false;
 
-    // Distance/zoom
+    // Distance/zoom (limits come from current_config_.zoom_min/zoom_max)
     float input_distance_ = 250.0f;
     float current_distance_ = 250.0f;
     float distance_velocity_ = 0.0f;
-    float min_distance_ = 80.0f;
-    float max_distance_ = 600.0f;
 
-    // Collision avoidance
+    // Collision avoidance (ground clearance comes from current_config_)
     float collision_pull_in_speed_ = 15.0f;
     float collision_push_out_speed_ = 5.0f;
     float collision_distance_offset_ = 0.0f;
-    float min_ground_clearance_ = 25.0f;
 
     // Camera positions
     glm::vec3 ideal_camera_pos_ = glm::vec3(0.0f);
@@ -155,19 +154,14 @@ private:
     glm::vec3 camera_right_ = glm::vec3(1.0f, 0.0f, 0.0f);
     glm::vec3 camera_up_ = glm::vec3(0.0f, 1.0f, 0.0f);
 
-    // Combat targeting
-    bool in_combat_ = false;
-    const glm::vec3* combat_target_ = nullptr;
+    // Soft-lock smoothing
     float soft_lock_strength_ = 0.0f;
     float soft_lock_blend_speed_ = 3.0f;
     float soft_lock_velocity_ = 0.0f;
 
-    // Dynamic FOV
-    float base_fov_ = 55.0f;
+    // Dynamic FOV (sprint bonus comes from current_config_)
     float current_fov_ = 55.0f;
     float fov_velocity_ = 0.0f;
-    float sprint_fov_bonus_ = 8.0f;
-    float combat_fov_reduction_ = -3.0f;
     float fov_bias_ = 0.0f;
 
     // Soft-focus bias (action-cam soft-lock)
@@ -190,9 +184,6 @@ private:
     // Callbacks
     TerrainHeightFunc get_terrain_height_ = nullptr;
     CollisionCheckFunc check_collision_ = nullptr;
-
-    // Debug
-    bool debug_draw_ = false;
 
     // Input tracking
     bool had_input_this_frame_ = false;

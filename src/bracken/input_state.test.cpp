@@ -20,12 +20,6 @@ TEST(InputState, DefaultMoveDirIsZero) {
     EXPECT_FLOAT_EQ(s.move_dir_y, 0.0f);
 }
 
-TEST(InputState, DefaultActionState) {
-    InputState s;
-    EXPECT_FALSE(s.attacking);
-    EXPECT_FALSE(s.sprinting);
-}
-
 TEST(InputState, DefaultAttackDirPointsForward) {
     InputState s;
     EXPECT_FLOAT_EQ(s.attack_dir_x, 0.0f);

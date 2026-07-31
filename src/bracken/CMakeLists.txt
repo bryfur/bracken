@@ -71,6 +71,31 @@ FetchContent_Declare(
 set(GLM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glm)
 
+# Jolt Physics (rigid-body backend for bracken::physics). The CMake project
+# lives in the repo's Build/ subdirectory. Linked PRIVATE below and never
+# included from a public bracken header (physics_world.hpp is pimpl +
+# glm-only), so Jolt types and its JPH_* compile definitions stay inside the
+# engine's own translation units.
+FetchContent_Declare(
+    JoltPhysics
+    GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
+    GIT_TAG v5.2.0
+    SOURCE_SUBDIR "Build"
+)
+set(TARGET_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+set(TARGET_HELLO_WORLD OFF CACHE BOOL "" FORCE)
+set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
+set(TARGET_SAMPLES OFF CACHE BOOL "" FORCE)
+set(TARGET_VIEWER OFF CACHE BOOL "" FORCE)
+set(ENABLE_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "" FORCE)
+set(ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+# Jolt defaults to -fno-rtti; bracken builds with RTTI and derives from
+# JPH::JobSystemWithBarrier (physics/jolt_job_system.hpp), which needs the
+# base's typeinfo emitted — keep Jolt's RTTI ABI matched to ours.
+set(CPP_RTTI_ENABLED ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(JoltPhysics)
+
 # Compile shaders (HLSL -> SPIRV) at build time
 # Also fetches SDL_shadercross for both CLI (build-time) and library (runtime)
 add_subdirectory(shaders)
@@ -80,8 +105,11 @@ file(GLOB_RECURSE BRACKEN_SOURCES CONFIGURE_DEPENDS "*.cpp")
 list(FILTER BRACKEN_SOURCES EXCLUDE REGEX ".*\\.(test|bench)\\.cpp$")
 add_library(bracken STATIC ${BRACKEN_SOURCES})
 
+# PROJECT_SOURCE_DIR (the engine root, where project(bracken) is declared) —
+# not CMAKE_SOURCE_DIR, which resolves to the super-project's root when the
+# engine is consumed via add_subdirectory.
 target_include_directories(bracken PUBLIC
-    ${CMAKE_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src
     ${tinygltf_SOURCE_DIR}
     ${SDL_shadercross_SOURCE_DIR}/include
 )
@@ -95,6 +123,13 @@ target_link_libraries(bracken PUBLIC
     SDL3_shadercross::SDL3_shadercross-static
     glm::glm
 )
+
+# PRIVATE by design: Jolt headers (and their JPH_* definitions) are an
+# implementation detail of src/bracken/physics/ — consumers see only the
+# glm-typed bracken::physics API. Static archives still propagate the link
+# requirement ($<LINK_ONLY>), so executables linking `bracken` get Jolt's
+# symbols without its include paths.
+target_link_libraries(bracken PRIVATE Jolt)
 
 if(BRACKEN_ENABLE_TRACY)
     target_link_libraries(bracken PUBLIC TracyClient)
@@ -131,14 +166,18 @@ add_dependencies(bracken compile_shaders)
 # Store shader output dir in cache so it's globally accessible
 set(BRACKEN_SHADER_OUTPUT_DIR "${SHADER_OUTPUT_DIR}" CACHE INTERNAL "Path to compiled shaders")
 
-# Function for executables that link bracken to copy shaders next to their binary.
-# The copy_shaders target always runs after compile_shaders and copies the directory.
+# Function for executables that link bracken to stage shaders next to their
+# binary. The copy_shaders target always runs after compile_shaders; the
+# staging directory is removed and recreated each build so deleted/renamed
+# shaders don't keep shipping as stale .spv files.
 function(bracken_copy_shaders target)
     add_custom_target(${target}_copy_shaders ALL
+        COMMAND ${CMAKE_COMMAND} -E rm -rf
+            "$<TARGET_FILE_DIR:${target}>/shaders"
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${BRACKEN_SHADER_OUTPUT_DIR}"
             "$<TARGET_FILE_DIR:${target}>/shaders"
-        COMMENT "Copying shaders to ${target} output directory"
+        COMMENT "Staging shaders to ${target} output directory"
     )
     add_dependencies(${target}_copy_shaders compile_shaders)
     add_dependencies(${target} ${target}_copy_shaders)
@@ -151,7 +190,7 @@ if(BRACKEN_BUILD_BENCHMARKS)
     if(BRACKEN_BENCH_SOURCES)
         add_executable(bracken_benchmarks ${BRACKEN_BENCH_SOURCES})
         target_link_libraries(bracken_benchmarks PRIVATE bracken benchmark::benchmark_main)
-        target_include_directories(bracken_benchmarks PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        target_include_directories(bracken_benchmarks PRIVATE ${PROJECT_SOURCE_DIR}/src)
     endif()
 endif()
 
@@ -161,7 +200,7 @@ if(BRACKEN_BUILD_TESTS)
     if(BRACKEN_TEST_SOURCES)
         add_executable(bracken_tests ${BRACKEN_TEST_SOURCES})
         target_link_libraries(bracken_tests PRIVATE bracken GTest::gtest_main)
-        target_include_directories(bracken_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        target_include_directories(bracken_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
         include(GoogleTest)
         gtest_discover_tests(bracken_tests)

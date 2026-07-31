@@ -9,9 +9,18 @@
 namespace bracken::render {
 
 namespace {
-// Extra light-space depth behind/in front of each cascade's sphere so tall
-// casters outside the slice (mountains, towers) still write into the map.
-constexpr float Z_CASTER_PAD = 300.0f;
+// Tallest caster height (world units) above its receivers that the cascades
+// account for. A caster up-sun of a cascade's view slice still shadows it;
+// the ortho volume must reach h / sin(elevation) toward the light to include
+// it, or its shadow silently pops in only when the caster itself enters the
+// slice. 1500 covers ~12 m buildings/trees plus terrain relief with margin.
+constexpr float CASTER_HEIGHT_BUDGET = 1500.0f;
+// Floor on |light_dir.y| so the toward-light reach stays bounded (~10x
+// budget) as the sun grazes the horizon.
+constexpr float MIN_SUN_ELEVATION_SIN = 0.15f;
+// Small pad on the away-from-light side: receivers only need depth ordering,
+// not reach, so this side stays tight to preserve depth precision.
+constexpr float Z_RECEIVER_PAD = 100.0f;
 } // namespace
 
 ShadowMap::ShadowMap() = default;
@@ -170,13 +179,18 @@ void ShadowMap::fit_cascade(int cascade_index, const glm::mat4& camera_view, con
     center_ls.y = std::floor(center_ls.y / texel) * texel;
     center_ls.z = std::floor(center_ls.z / texel) * texel;
 
-    const float z_extent = radius + Z_CASTER_PAD;
-    glm::mat4 light_proj = glm::orthoRH_ZO(center_ls.x - radius, center_ls.x + radius, center_ls.y - radius,
-                                           center_ls.y + radius, -(center_ls.z + z_extent), -(center_ls.z - z_extent));
+    // Asymmetric depth window: reach far toward the light for out-of-slice
+    // casters (elevation-dependent), stay tight on the receiver side.
+    const float caster_reach =
+        radius + CASTER_HEIGHT_BUDGET / std::max(std::abs(light_direction.y), MIN_SUN_ELEVATION_SIN);
+    const float receiver_reach = radius + Z_RECEIVER_PAD;
+    glm::mat4 light_proj =
+        glm::orthoRH_ZO(center_ls.x - radius, center_ls.x + radius, center_ls.y - radius, center_ls.y + radius,
+                        -(center_ls.z + caster_reach), -(center_ls.z - receiver_reach));
 
     cascades_[cascade_index].light_view_projection = light_proj * light_view;
     cascades_[cascade_index].texel_world = texel;
-    cascades_[cascade_index].depth_range = 2.0f * z_extent;
+    cascades_[cascade_index].depth_range = caster_reach + receiver_reach;
 }
 
 void ShadowMap::update(const glm::mat4& camera_view, const glm::mat4& camera_proj, const glm::vec3& light_dir,

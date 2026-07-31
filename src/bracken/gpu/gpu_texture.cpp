@@ -1,4 +1,5 @@
 #include "gpu_texture.hpp"
+#include "bracken/core/assert.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_types.hpp"
 #include "SDL3/SDL_error.h"
@@ -20,6 +21,10 @@ namespace bracken::gpu {
 // =============================================================================
 // GPUTexture Implementation
 // =============================================================================
+// Thread-safety: texture creation/destruction is main-thread tier. Every
+// factory funnels through GPUDevice::create_texture and every destructor
+// through GPUDevice::release_texture, both of which assert the contract;
+// the asserts repeated below exist to fail at the caller-visible entry point.
 
 GPUTexture::~GPUTexture() {
     if (device_ && texture_) {
@@ -68,6 +73,10 @@ uint32_t GPUTexture::calculate_mip_levels(int width, int height) {
 }
 
 size_t GPUTexture::get_bytes_per_pixel(SDL_GPUTextureFormat format) {
+    // Covers every format the engine can actually meet here: the TextureFormat
+    // enum (gpu_types.hpp), swapchain candidates, and the HDR scene format.
+    // Unknown formats return 0 so callers fail loudly instead of mis-sizing
+    // the transfer buffer and silently truncating the upload.
     switch (format) {
         case SDL_GPU_TEXTUREFORMAT_R8_UNORM:
             return 1;
@@ -76,19 +85,35 @@ size_t GPUTexture::get_bytes_per_pixel(SDL_GPUTextureFormat format) {
         case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM:
         case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB:
         case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM:
+        case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB:
+        case SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT:
         case SDL_GPU_TEXTUREFORMAT_D32_FLOAT:
         case SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT:
             return 4;
+        case SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT:
+            return 8;
         default:
-            return 4;
+            SDL_Log("GPUTexture::get_bytes_per_pixel: unsupported format %d", static_cast<int>(format));
+            return 0;
     }
 }
 
 bool GPUTexture::reload_from_file(const std::string& path, bool generate_mipmaps) {
+    // Hot-reload swap: creates the fresh texture and releases the old one.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
         return false;
     }
-    auto fresh = load_from_file(*device_, path, generate_mipmaps);
+    // Preserve the creation format (notably RGBA8_SRGB for albedo art) —
+    // reloading with the load_from_file default would silently drop sRGB and
+    // wash out color textures.
+    TextureFormat creation_format = from_sdl_format(format_);
+    if (to_sdl_format(creation_format) != format_) {
+        SDL_Log("GPUTexture::reload_from_file: cannot reload '%s': texture format %d has no TextureFormat mapping",
+                path.c_str(), static_cast<int>(format_));
+        return false;
+    }
+    auto fresh = load_from_file(*device_, path, generate_mipmaps, creation_format);
     if (!fresh) {
         return false;
     }
@@ -135,6 +160,7 @@ std::unique_ptr<GPUTexture> GPUTexture::load_from_file(GPUDevice& device, const 
 
 std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, int height, TextureFormat format,
                                                   const void* pixels, bool generate_mipmaps) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     auto texture = std::unique_ptr<GPUTexture>(new GPUTexture());
     texture->device_ = &device;
     texture->width_ = width;
@@ -164,8 +190,12 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
     // Upload pixel data if provided
     if (pixels) {
         // Create transfer buffer
-        size_t data_size = static_cast<size_t>(width) * static_cast<size_t>(height) *
-                           get_bytes_per_pixel(texture->format_);
+        size_t bytes_per_pixel = get_bytes_per_pixel(texture->format_);
+        if (bytes_per_pixel == 0) {
+            SDL_Log("GPUTexture::create_2d: Cannot upload pixels for unsupported format");
+            return nullptr;
+        }
+        size_t data_size = static_cast<size_t>(width) * static_cast<size_t>(height) * bytes_per_pixel;
         SDL_GPUTransferBufferCreateInfo transfer_info = {};
         transfer_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
         transfer_info.size = static_cast<Uint32>(data_size);
@@ -173,7 +203,6 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
         SDL_GPUTransferBuffer* transfer = device.create_transfer_buffer(transfer_info);
         if (!transfer) {
             SDL_Log("GPUTexture::create_2d: Failed to create transfer buffer: %s", SDL_GetError());
-            device.release_texture(texture->texture_);
             return nullptr;
         }
 
@@ -182,7 +211,6 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
         if (!mapped) {
             SDL_Log("GPUTexture::create_2d: Failed to map transfer buffer: %s", SDL_GetError());
             device.release_transfer_buffer(transfer);
-            device.release_texture(texture->texture_);
             return nullptr;
         }
         std::memcpy(mapped, pixels, data_size);
@@ -193,7 +221,6 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
         if (!cmd) {
             SDL_Log("GPUTexture::create_2d: Failed to acquire command buffer: %s", SDL_GetError());
             device.release_transfer_buffer(transfer);
-            device.release_texture(texture->texture_);
             return nullptr;
         }
 
@@ -202,7 +229,6 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
             SDL_Log("GPUTexture::create_2d: Failed to begin copy pass: %s", SDL_GetError());
             SDL_CancelGPUCommandBuffer(cmd);
             device.release_transfer_buffer(transfer);
-            device.release_texture(texture->texture_);
             return nullptr;
         }
 
@@ -233,6 +259,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
 
 std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, int height, SDL_GPUTextureFormat format,
                                                   SDL_GPUTextureUsageFlags usage) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     auto texture = std::unique_ptr<GPUTexture>(new GPUTexture());
     texture->device_ = &device;
     texture->width_ = width;
@@ -384,9 +411,16 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d_array(GPUDevice& device, int w
     }
 
     // Upload all layers through one transfer buffer / command buffer, then a
-    // single mipmap-generation call covering every layer.
+    // single mipmap-generation call covering every layer. Any upload failure
+    // releases the texture and returns nullptr (header contract; a
+    // valid-looking texture with no pixel data would render garbage with no
+    // way for the caller to detect it).
     if (layer_data) {
         size_t bytes_per_pixel = get_bytes_per_pixel(texture->format_);
+        if (bytes_per_pixel == 0) {
+            SDL_Log("GPUTexture::create_2d_array: Cannot upload layers for unsupported format");
+            return nullptr;
+        }
         size_t layer_size = static_cast<size_t>(width) * height * bytes_per_pixel;
 
         SDL_GPUTransferBufferCreateInfo transfer_info = {};
@@ -396,14 +430,14 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d_array(GPUDevice& device, int w
         SDL_GPUTransferBuffer* transfer = device.create_transfer_buffer(transfer_info);
         if (!transfer) {
             SDL_Log("GPUTexture::create_2d_array: Failed to create transfer buffer: %s", SDL_GetError());
-            return texture;
+            return nullptr;
         }
 
         void* mapped = device.map_transfer_buffer(transfer, false);
         if (!mapped) {
             SDL_Log("GPUTexture::create_2d_array: Failed to map transfer buffer: %s", SDL_GetError());
             device.release_transfer_buffer(transfer);
-            return texture;
+            return nullptr;
         }
         for (int layer = 0; layer < layers; ++layer) {
             if (layer_data[layer]) {
@@ -417,7 +451,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d_array(GPUDevice& device, int w
         if (!cmd) {
             SDL_Log("GPUTexture::create_2d_array: Failed to acquire command buffer: %s", SDL_GetError());
             device.release_transfer_buffer(transfer);
-            return texture;
+            return nullptr;
         }
 
         SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(cmd);
@@ -425,7 +459,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d_array(GPUDevice& device, int w
             SDL_Log("GPUTexture::create_2d_array: Failed to begin copy pass: %s", SDL_GetError());
             SDL_CancelGPUCommandBuffer(cmd);
             device.release_transfer_buffer(transfer);
-            return texture;
+            return nullptr;
         }
 
         for (int layer = 0; layer < layers; ++layer) {
@@ -455,6 +489,35 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d_array(GPUDevice& device, int w
 
         SDL_SubmitGPUCommandBuffer(cmd);
         device.release_transfer_buffer(transfer);
+    }
+
+    return texture;
+}
+
+std::unique_ptr<GPUTexture> GPUTexture::create_cube(GPUDevice& device, int size, SDL_GPUTextureFormat format,
+                                                    SDL_GPUTextureUsageFlags usage, bool mipmaps) {
+    auto texture = std::unique_ptr<GPUTexture>(new GPUTexture());
+    texture->device_ = &device;
+    texture->width_ = size;
+    texture->height_ = size;
+    texture->layers_ = 6;
+    texture->format_ = format;
+    texture->is_render_target_ = (usage & (SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET)) != 0;
+    texture->mip_levels_ = mipmaps ? calculate_mip_levels(size, size) : 1;
+
+    SDL_GPUTextureCreateInfo tex_info = {};
+    tex_info.type = SDL_GPU_TEXTURETYPE_CUBE;
+    tex_info.format = format;
+    tex_info.usage = usage;
+    tex_info.width = static_cast<Uint32>(size);
+    tex_info.height = static_cast<Uint32>(size);
+    tex_info.layer_count_or_depth = 6;
+    tex_info.num_levels = texture->mip_levels_;
+
+    texture->texture_ = device.create_texture(tex_info);
+    if (!texture->texture_) {
+        SDL_Log("GPUTexture::create_cube: Failed to create texture: %s", SDL_GetError());
+        return nullptr;
     }
 
     return texture;
@@ -498,7 +561,12 @@ void GPUTexture::upload(SDL_GPUCommandBuffer* cmd, const void* pixels, int width
         return;
     }
 
-    size_t data_size = static_cast<size_t>(width) * static_cast<size_t>(height) * get_bytes_per_pixel(format_);
+    size_t bytes_per_pixel = get_bytes_per_pixel(format_);
+    if (bytes_per_pixel == 0) {
+        SDL_Log("GPUTexture::upload: Unsupported texture format, upload rejected");
+        return;
+    }
+    size_t data_size = static_cast<size_t>(width) * static_cast<size_t>(height) * bytes_per_pixel;
 
     SDL_GPUTransferBufferCreateInfo transfer_info = {};
     transfer_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
@@ -539,13 +607,14 @@ void GPUTexture::upload(SDL_GPUCommandBuffer* cmd, const void* pixels, int width
     SDL_UploadToGPUTexture(copy_pass, &src, &dst, false);
     SDL_EndGPUCopyPass(copy_pass);
 
-    // IMPORTANT: Transfer buffer lifetime management
-    // The transfer buffer must remain valid until the GPU finishes reading from it.
-    // Currently, we release it immediately which only works when:
-    //   1. The command buffer is submitted synchronously, OR
-    //   2. SDL internally waits for the copy to complete before returning
-    // For asynchronous submissions, consider deferring release until after
-    // SDL_SubmitGPUCommandBuffer() or using a per-frame staging buffer pool.
+    // Releasing before the caller submits `cmd` is safe by SDL3 GPU contract:
+    // resources are reference-tracked as they are recorded into command
+    // buffers, and SDL_ReleaseGPUTransferBuffer only marks the buffer for
+    // deletion — actual destruction is deferred until every command buffer
+    // referencing it has finished executing on the GPU.
+    // Note this method allocates a fresh transfer buffer per call; callers
+    // uploading every frame should keep a persistent staging buffer instead
+    // (as the text renderer does).
     device_->release_transfer_buffer(transfer);
 }
 

@@ -1,4 +1,5 @@
 #include "bracken/gpu/gpu_uniforms.hpp"
+#include "bracken/render/environment.hpp"
 #include <cstddef>
 #include <gtest/gtest.h>
 
@@ -24,6 +25,8 @@ TEST(UniformAlignment, AllStructsAre16ByteAligned) {
     EXPECT_EQ(alignof(ShadowFragUniforms), 16u);
     EXPECT_EQ(alignof(ShadowDataUniforms), 16u);
     EXPECT_EQ(alignof(GTAOUniforms), 16u);
+    EXPECT_EQ(alignof(GtaoTemporalUniforms), 16u);
+    EXPECT_EQ(alignof(GtaoUpsampleUniforms), 16u);
     EXPECT_EQ(alignof(BlurUniforms), 16u);
     EXPECT_EQ(alignof(CompositeUniforms), 16u);
     EXPECT_EQ(alignof(FxaaUniforms), 16u);
@@ -32,6 +35,14 @@ TEST(UniformAlignment, AllStructsAre16ByteAligned) {
     EXPECT_EQ(alignof(BloomDownsampleUniforms), 16u);
     EXPECT_EQ(alignof(BloomUpsampleUniforms), 16u);
     EXPECT_EQ(alignof(VolumetricFogUniforms), 16u);
+    EXPECT_EQ(alignof(PrepassModelUniforms), 16u);
+    EXPECT_EQ(alignof(PrepassCameraUniforms), 16u);
+    EXPECT_EQ(alignof(TaaResolveUniforms), 16u);
+    EXPECT_EQ(alignof(TaaSharpenUniforms), 16u);
+    EXPECT_EQ(alignof(SkyCaptureUniforms), 16u);
+    EXPECT_EQ(alignof(IblFilterUniforms), 16u);
+    EXPECT_EQ(alignof(ExposureHistogramUniforms), 16u);
+    EXPECT_EQ(alignof(ExposureAdaptUniforms), 16u);
 }
 
 // =============================================================================
@@ -55,6 +66,8 @@ TEST(UniformSizes, SizesAreMultiplesOf16) {
     EXPECT_EQ(sizeof(ShadowFragUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(ShadowDataUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(GTAOUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(GtaoTemporalUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(GtaoUpsampleUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(BlurUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(CompositeUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(FxaaUniforms) % 16, 0u);
@@ -63,6 +76,14 @@ TEST(UniformSizes, SizesAreMultiplesOf16) {
     EXPECT_EQ(sizeof(BloomDownsampleUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(BloomUpsampleUniforms) % 16, 0u);
     EXPECT_EQ(sizeof(VolumetricFogUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(PrepassModelUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(PrepassCameraUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(TaaResolveUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(TaaSharpenUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(SkyCaptureUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(IblFilterUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(ExposureHistogramUniforms) % 16, 0u);
+    EXPECT_EQ(sizeof(ExposureAdaptUniforms) % 16, 0u);
 }
 
 // =============================================================================
@@ -70,7 +91,7 @@ TEST(UniformSizes, SizesAreMultiplesOf16) {
 // =============================================================================
 
 TEST(ModelTransformUniformsLayout, SizeIs288Bytes) {
-    // 3 mat4 (192) + vec3+pad (16) + mat4 (64) + int+uint+pad[2] (16) = 288
+    // 3 mat4 (192) + vec3+pad (16) + mat4 (64) + uint+pad[3] (16) = 288
     EXPECT_EQ(sizeof(ModelTransformUniforms), 288u);
 }
 
@@ -80,8 +101,7 @@ TEST(ModelTransformUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(ModelTransformUniforms, projection), 128u);
     EXPECT_EQ(offsetof(ModelTransformUniforms, cameraPos), 192u);
     EXPECT_EQ(offsetof(ModelTransformUniforms, normalMatrix), 208u);
-    EXPECT_EQ(offsetof(ModelTransformUniforms, useSkinning), 272u);
-    EXPECT_EQ(offsetof(ModelTransformUniforms, paletteOffset), 276u);
+    EXPECT_EQ(offsetof(ModelTransformUniforms, paletteOffset), 272u);
 }
 
 // =============================================================================
@@ -133,9 +153,9 @@ TEST(UIFragmentUniformsLayout, FieldOffsets) {
 // ModelLightingUniforms - matches model.frag.hlsl LightingUniforms
 // =============================================================================
 
-TEST(ModelLightingUniformsLayout, SizeIs208Bytes) {
-    // 4 vec3+pad (64) + 2 vec4 (32) + 4 vec3+float (64) + 12 scalars (48) = 208
-    EXPECT_EQ(sizeof(ModelLightingUniforms), 208u);
+TEST(ModelLightingUniformsLayout, SizeIs224Bytes) {
+    // 4 vec3+pad (64) + 2 vec4 (32) + 4 vec3+float (64) + 16 scalars (64) = 224
+    EXPECT_EQ(sizeof(ModelLightingUniforms), 224u);
 }
 
 TEST(ModelLightingUniformsLayout, FieldOffsets) {
@@ -165,15 +185,18 @@ TEST(ModelLightingUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(ModelLightingUniforms, hasEmissiveMap), 196u);
     EXPECT_EQ(offsetof(ModelLightingUniforms, hasPackedOcclusion), 200u);
     EXPECT_EQ(offsetof(ModelLightingUniforms, alphaCutoff), 204u);
+    EXPECT_EQ(offsetof(ModelLightingUniforms, screenAOTexelX), 208u);
+    EXPECT_EQ(offsetof(ModelLightingUniforms, screenAOTexelY), 212u);
+    EXPECT_EQ(offsetof(ModelLightingUniforms, iblEnabled), 216u);
 }
 
 // =============================================================================
 // InstancedLightingUniforms - matches model_instanced.frag.hlsl LightingUniforms
 // =============================================================================
 
-TEST(InstancedLightingUniformsLayout, SizeIs192Bytes) {
+TEST(InstancedLightingUniformsLayout, SizeIs208Bytes) {
     // ModelLightingUniforms layout minus the vec4 tintColor (tint is per-instance)
-    EXPECT_EQ(sizeof(InstancedLightingUniforms), 192u);
+    EXPECT_EQ(sizeof(InstancedLightingUniforms), 208u);
 }
 
 TEST(InstancedLightingUniformsLayout, FieldOffsets) {
@@ -202,15 +225,18 @@ TEST(InstancedLightingUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(InstancedLightingUniforms, hasEmissiveMap), 180u);
     EXPECT_EQ(offsetof(InstancedLightingUniforms, hasPackedOcclusion), 184u);
     EXPECT_EQ(offsetof(InstancedLightingUniforms, alphaCutoff), 188u);
+    EXPECT_EQ(offsetof(InstancedLightingUniforms, screenAOTexelX), 192u);
+    EXPECT_EQ(offsetof(InstancedLightingUniforms, screenAOTexelY), 196u);
+    EXPECT_EQ(offsetof(InstancedLightingUniforms, iblEnabled), 200u);
 }
 
 // =============================================================================
 // SkyboxFragmentUniforms - matches skybox.frag.hlsl SkyUniforms
 // =============================================================================
 
-TEST(SkyboxFragmentUniformsLayout, SizeIs176Bytes) {
-    // mat4 (64) + 7 * (vec3 + float) rows (112) = 176
-    EXPECT_EQ(sizeof(SkyboxFragmentUniforms), 176u);
+TEST(SkyboxFragmentUniformsLayout, SizeIs192Bytes) {
+    // mat4 (64) + 7 * (vec3 + float) rows (112) + cloud/haze row (16) = 192
+    EXPECT_EQ(sizeof(SkyboxFragmentUniforms), 192u);
 }
 
 TEST(SkyboxFragmentUniformsLayout, FieldOffsets) {
@@ -223,35 +249,103 @@ TEST(SkyboxFragmentUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(SkyboxFragmentUniforms, groundColor), 128u);
     EXPECT_EQ(offsetof(SkyboxFragmentUniforms, fogHorizonColor), 144u);
     EXPECT_EQ(offsetof(SkyboxFragmentUniforms, fogSunColor), 160u);
+    EXPECT_EQ(offsetof(SkyboxFragmentUniforms, cloudCoverage), 176u);
+    EXPECT_EQ(offsetof(SkyboxFragmentUniforms, cloudDensity), 180u);
+    EXPECT_EQ(offsetof(SkyboxFragmentUniforms, cloudScale), 184u);
+    EXPECT_EQ(offsetof(SkyboxFragmentUniforms, hazeStrength), 188u);
+}
+
+TEST(SkyboxFragmentUniformsLayout, CloudDefaultsMatchEnvironmentState) {
+    // The uniform defaults exist only as a safety net; the real source of
+    // truth is EnvironmentState — keep them in lockstep.
+    const SkyboxFragmentUniforms u{};
+    const bracken::render::EnvironmentState env{};
+    EXPECT_EQ(u.cloudCoverage, env.cloud_coverage);
+    EXPECT_EQ(u.cloudDensity, env.cloud_density);
+    EXPECT_EQ(u.cloudScale, env.cloud_scale);
+    EXPECT_EQ(u.hazeStrength, env.haze_strength);
+}
+
+// =============================================================================
+// SkyCaptureUniforms - matches sky_capture.frag.hlsl SkyCaptureUniforms
+// =============================================================================
+
+TEST(SkyCaptureUniformsLayout, SizeIs176Bytes) {
+    // 10 * (vec3 + float) rows (3 face-basis + 7 atmosphere) + cloud/haze
+    // row = 176
+    EXPECT_EQ(sizeof(SkyCaptureUniforms), 176u);
+}
+
+TEST(SkyCaptureUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, faceForward), 0u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, faceRight), 16u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, faceUp), 32u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, sunDirection), 48u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, time), 60u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, sunColor), 64u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, zenithColor), 80u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, horizonColor), 96u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, groundColor), 112u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, fogHorizonColor), 128u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, fogSunColor), 144u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, cloudCoverage), 160u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, cloudDensity), 164u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, cloudScale), 168u);
+    EXPECT_EQ(offsetof(SkyCaptureUniforms, hazeStrength), 172u);
+}
+
+// =============================================================================
+// IblFilterUniforms - matches ibl_prefilter.frag.hlsl / ibl_irradiance.frag.hlsl
+// =============================================================================
+
+TEST(IblFilterUniformsLayout, SizeIs48Bytes) {
+    // 3 * (vec3 + float) rows = 48
+    EXPECT_EQ(sizeof(IblFilterUniforms), 48u);
+}
+
+TEST(IblFilterUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(IblFilterUniforms, faceForward), 0u);
+    EXPECT_EQ(offsetof(IblFilterUniforms, roughness), 12u);
+    EXPECT_EQ(offsetof(IblFilterUniforms, faceRight), 16u);
+    EXPECT_EQ(offsetof(IblFilterUniforms, sourceSize), 28u);
+    EXPECT_EQ(offsetof(IblFilterUniforms, faceUp), 32u);
 }
 
 // =============================================================================
 // CompositeUniforms - matches composite.frag.hlsl
 // =============================================================================
 
-TEST(CompositeUniformsLayout, SizeIs48Bytes) {
-    // 8 floats (ao/bloom/fog + exposure/tonemap/contrast/saturation) +
-    // vec2 lowResTexelSize + depthA + depthB = 48 bytes (3 16-byte blocks)
-    EXPECT_EQ(sizeof(CompositeUniforms), 48u);
+TEST(CompositeUniformsLayout, SizeIs112Bytes) {
+    // 3 pre-P6 16-byte blocks (bloom/fog/exposure/tonemap, contrast/
+    // saturation/lowResTexelSize, depthA/depthB/autoExposure/wbEnabled) +
+    // 4 grading rows (whiteBalance+cdlEnabled, slope, offset, power) = 112
+    EXPECT_EQ(sizeof(CompositeUniforms), 112u);
 }
 
 TEST(CompositeUniformsLayout, FieldOffsets) {
-    EXPECT_EQ(offsetof(CompositeUniforms, aoStrength), 0u);
-    EXPECT_EQ(offsetof(CompositeUniforms, bloomStrength), 4u);
-    EXPECT_EQ(offsetof(CompositeUniforms, volumetricFogEnabled), 8u);
-    EXPECT_EQ(offsetof(CompositeUniforms, exposure), 16u);
-    EXPECT_EQ(offsetof(CompositeUniforms, tonemapMode), 20u);
-    EXPECT_EQ(offsetof(CompositeUniforms, contrast), 24u);
-    EXPECT_EQ(offsetof(CompositeUniforms, saturation), 28u);
-    EXPECT_EQ(offsetof(CompositeUniforms, lowResTexelSize), 32u);
-    EXPECT_EQ(offsetof(CompositeUniforms, depthA), 40u);
-    EXPECT_EQ(offsetof(CompositeUniforms, depthB), 44u);
+    EXPECT_EQ(offsetof(CompositeUniforms, bloomStrength), 0u);
+    EXPECT_EQ(offsetof(CompositeUniforms, volumetricFogEnabled), 4u);
+    EXPECT_EQ(offsetof(CompositeUniforms, exposure), 8u);
+    EXPECT_EQ(offsetof(CompositeUniforms, tonemapMode), 12u);
+    EXPECT_EQ(offsetof(CompositeUniforms, contrast), 16u);
+    EXPECT_EQ(offsetof(CompositeUniforms, saturation), 20u);
+    EXPECT_EQ(offsetof(CompositeUniforms, lowResTexelSize), 24u);
+    EXPECT_EQ(offsetof(CompositeUniforms, depthA), 32u);
+    EXPECT_EQ(offsetof(CompositeUniforms, depthB), 36u);
+    EXPECT_EQ(offsetof(CompositeUniforms, autoExposureEnabled), 40u);
+    EXPECT_EQ(offsetof(CompositeUniforms, whiteBalanceEnabled), 44u);
+    EXPECT_EQ(offsetof(CompositeUniforms, whiteBalance), 48u);
+    EXPECT_EQ(offsetof(CompositeUniforms, cdlEnabled), 60u);
+    EXPECT_EQ(offsetof(CompositeUniforms, cdlSlope), 64u);
+    EXPECT_EQ(offsetof(CompositeUniforms, cdlOffset), 80u);
+    EXPECT_EQ(offsetof(CompositeUniforms, cdlPower), 96u);
 }
 
 TEST(CompositeUniformsLayout, DefaultValues) {
     CompositeUniforms u;
-    EXPECT_FLOAT_EQ(u.aoStrength, 1.0f);
-    EXPECT_FLOAT_EQ(u.bloomStrength, 0.35f);
+    // Must track GraphicsSettings::bloom_strength (agreement is pinned in
+    // post_process_stack.test.cpp).
+    EXPECT_FLOAT_EQ(u.bloomStrength, 0.25f);
     EXPECT_FLOAT_EQ(u.volumetricFogEnabled, 0.0f);
     EXPECT_FLOAT_EQ(u.exposure, 1.0f);
     EXPECT_EQ(u.tonemapMode, 0);
@@ -260,6 +354,60 @@ TEST(CompositeUniformsLayout, DefaultValues) {
     // depthA/depthB of 0 degrade to plain bilinear weights in the shader.
     EXPECT_FLOAT_EQ(u.depthA, 0.0f);
     EXPECT_FLOAT_EQ(u.depthB, 0.0f);
+    // Exposure/grading defaults must be NEUTRAL (flags off, identity grade):
+    // the ungraded path is pixel-identical to pre-P6 output.
+    EXPECT_FLOAT_EQ(u.autoExposureEnabled, 0.0f);
+    EXPECT_FLOAT_EQ(u.whiteBalanceEnabled, 0.0f);
+    EXPECT_EQ(u.whiteBalance, glm::vec3(1.0f));
+    EXPECT_FLOAT_EQ(u.cdlEnabled, 0.0f);
+    EXPECT_EQ(u.cdlSlope, glm::vec3(1.0f));
+    EXPECT_EQ(u.cdlOffset, glm::vec3(0.0f));
+    EXPECT_EQ(u.cdlPower, glm::vec3(1.0f));
+}
+
+// =============================================================================
+// Exposure compute uniforms - match exposure_histogram.comp.hlsl /
+// exposure_adapt.comp.hlsl (compute set 2, b0)
+// =============================================================================
+
+TEST(ExposureHistogramUniformsLayout, SizeAndOffsets) {
+    // uint2 extent + minLog2Luma + invLog2Range = one 16-byte row
+    EXPECT_EQ(sizeof(ExposureHistogramUniforms), 16u);
+    EXPECT_EQ(offsetof(ExposureHistogramUniforms, width), 0u);
+    EXPECT_EQ(offsetof(ExposureHistogramUniforms, height), 4u);
+    EXPECT_EQ(offsetof(ExposureHistogramUniforms, minLog2Luma), 8u);
+    EXPECT_EQ(offsetof(ExposureHistogramUniforms, invLog2Range), 12u);
+}
+
+TEST(ExposureAdaptUniformsLayout, SizeAndOffsets) {
+    // 12 floats = 3 16-byte rows
+    EXPECT_EQ(sizeof(ExposureAdaptUniforms), 48u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, minLog2Luma), 0u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, log2Range), 4u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, deltaTime), 8u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, firstFrame), 12u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, speedUp), 16u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, speedDown), 20u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, minEv), 24u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, maxEv), 28u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, lowPercentile), 32u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, highPercentile), 36u);
+    EXPECT_EQ(offsetof(ExposureAdaptUniforms, log2TargetGray), 40u);
+}
+
+TEST(ExposureAdaptUniformsLayout, DefaultsTrackSettingsAndConstants) {
+    const ExposureAdaptUniforms u;
+    // Speeds/clamps mirror the GraphicsSettings defaults (the frame path
+    // overwrites them from settings each frame); percentile/range defaults
+    // mirror render/auto_exposure.hpp.
+    EXPECT_FLOAT_EQ(u.minLog2Luma, -10.0f);
+    EXPECT_FLOAT_EQ(u.log2Range, 26.0f);
+    EXPECT_FLOAT_EQ(u.speedUp, 1.5f);
+    EXPECT_FLOAT_EQ(u.speedDown, 2.5f);
+    EXPECT_FLOAT_EQ(u.minEv, -4.0f);
+    EXPECT_FLOAT_EQ(u.maxEv, 4.0f);
+    EXPECT_FLOAT_EQ(u.lowPercentile, 0.60f);
+    EXPECT_FLOAT_EQ(u.highPercentile, 0.05f);
 }
 
 // =============================================================================
@@ -337,28 +485,73 @@ TEST(GTAOUniformsLayout, FieldOffsets) {
     EXPECT_EQ(offsetof(GTAOUniforms, screenSize), 128u);
     EXPECT_EQ(offsetof(GTAOUniforms, invScreenSize), 136u);
     EXPECT_EQ(offsetof(GTAOUniforms, radius), 144u);
-    EXPECT_EQ(offsetof(GTAOUniforms, bias), 148u);
-    EXPECT_EQ(offsetof(GTAOUniforms, numDirections), 152u);
-    EXPECT_EQ(offsetof(GTAOUniforms, numSteps), 156u);
-    EXPECT_EQ(offsetof(GTAOUniforms, radiusScale), 160u);
-    EXPECT_EQ(offsetof(GTAOUniforms, maxDistance), 164u);
-    EXPECT_EQ(offsetof(GTAOUniforms, sampleKernel), 176u);
+    EXPECT_EQ(offsetof(GTAOUniforms, radiusScale), 148u);
+    EXPECT_EQ(offsetof(GTAOUniforms, falloffRange), 152u);
+    EXPECT_EQ(offsetof(GTAOUniforms, thinOccluderCompensation), 156u);
+    EXPECT_EQ(offsetof(GTAOUniforms, temporalRotation), 160u);
+    EXPECT_EQ(offsetof(GTAOUniforms, temporalOffset), 164u);
+    EXPECT_EQ(offsetof(GTAOUniforms, maxDistance), 168u);
 }
 
-TEST(GTAOUniformsLayout, SizeIs560Bytes) {
-    // 2 mat4 (128) + 2 vec2 (16) + 8 scalars (32) + 24 vec4 kernel (384) = 560
-    EXPECT_EQ(sizeof(GTAOUniforms), 560u);
+TEST(GTAOUniformsLayout, SizeIs176Bytes) {
+    // 2 mat4 (128) + 2 vec2 (16) + 8 scalars (32) = 176
+    EXPECT_EQ(sizeof(GTAOUniforms), 176u);
 }
 
 TEST(GTAOUniformsLayout, DefaultValues) {
     GTAOUniforms u;
     EXPECT_FLOAT_EQ(u.radius, 4.0f);
     EXPECT_FLOAT_EQ(u.radiusScale, 1.0f);
-    EXPECT_EQ(u.numDirections, 6);
-    EXPECT_EQ(u.numSteps, 3);
+    // Falloff spans a sane fraction of the radius; thin-occluder decay is a
+    // blend factor in [0, 1].
+    EXPECT_GT(u.falloffRange, 0.0f);
+    EXPECT_LE(u.falloffRange, 1.0f);
+    EXPECT_GE(u.thinOccluderCompensation, 0.0f);
+    EXPECT_LE(u.thinOccluderCompensation, 1.0f);
     EXPECT_FLOAT_EQ(u.maxDistance, 12000.0f);
-    // The blur pass must agree with the AO passes on the far cutoff.
+    // The blur pass must agree with the AO pass on the far cutoff.
     EXPECT_FLOAT_EQ(u.maxDistance, BlurUniforms{}.maxDistance);
+}
+
+// =============================================================================
+// GtaoTemporalUniforms - matches gtao_temporal.frag.hlsl
+// =============================================================================
+
+TEST(GtaoTemporalUniformsLayout, SizeIs32Bytes) {
+    EXPECT_EQ(sizeof(GtaoTemporalUniforms), 32u);
+}
+
+TEST(GtaoTemporalUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(GtaoTemporalUniforms, invScreenSize), 0u);
+    EXPECT_EQ(offsetof(GtaoTemporalUniforms, depthA), 8u);
+    EXPECT_EQ(offsetof(GtaoTemporalUniforms, depthB), 12u);
+    EXPECT_EQ(offsetof(GtaoTemporalUniforms, historyValid), 16u);
+    EXPECT_EQ(offsetof(GtaoTemporalUniforms, feedbackMax), 20u);
+    EXPECT_EQ(offsetof(GtaoTemporalUniforms, depthRejectScale), 24u);
+}
+
+TEST(GtaoTemporalUniformsLayout, DefaultValues) {
+    GtaoTemporalUniforms u;
+    // History invalid until the CPU says otherwise (first frame outputs the
+    // current AO unblended). Tuning constants are NSDMI live values.
+    EXPECT_FLOAT_EQ(u.historyValid, 0.0f);
+    EXPECT_FLOAT_EQ(u.feedbackMax, 0.9f);
+    EXPECT_GT(u.depthRejectScale, 0.0f);
+}
+
+// =============================================================================
+// GtaoUpsampleUniforms - matches gtao_upsample.frag.hlsl
+// =============================================================================
+
+TEST(GtaoUpsampleUniformsLayout, SizeIs32Bytes) {
+    EXPECT_EQ(sizeof(GtaoUpsampleUniforms), 32u);
+}
+
+TEST(GtaoUpsampleUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(GtaoUpsampleUniforms, lowResTexelSize), 0u);
+    EXPECT_EQ(offsetof(GtaoUpsampleUniforms, depthA), 8u);
+    EXPECT_EQ(offsetof(GtaoUpsampleUniforms, depthB), 12u);
+    EXPECT_EQ(offsetof(GtaoUpsampleUniforms, strength), 16u);
 }
 
 // =============================================================================
@@ -457,4 +650,106 @@ TEST(BloomDownsampleUniformsLayout, DefaultValues) {
     // byte-identical to the old pre-exposure behavior.
     EXPECT_FLOAT_EQ(u.exposure, 1.0f);
     EXPECT_FLOAT_EQ(u.isFirstPass, 1.0f);
+}
+
+// =============================================================================
+// PrepassModelUniforms - matches prepass_model.vert.hlsl /
+// prepass_skinned.vert.hlsl PrepassTransformUniforms
+// =============================================================================
+
+TEST(PrepassModelUniformsLayout, SizeIs400Bytes) {
+    // 6 mat4 (384) + 2 uint + pad[2] (16) = 400
+    EXPECT_EQ(sizeof(PrepassModelUniforms), 400u);
+}
+
+TEST(PrepassModelUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(PrepassModelUniforms, model), 0u);
+    EXPECT_EQ(offsetof(PrepassModelUniforms, view), 64u);
+    EXPECT_EQ(offsetof(PrepassModelUniforms, projection), 128u);
+    EXPECT_EQ(offsetof(PrepassModelUniforms, prevModel), 192u);
+    EXPECT_EQ(offsetof(PrepassModelUniforms, currViewProjectionNoJitter), 256u);
+    EXPECT_EQ(offsetof(PrepassModelUniforms, prevViewProjectionNoJitter), 320u);
+    EXPECT_EQ(offsetof(PrepassModelUniforms, paletteOffset), 384u);
+    EXPECT_EQ(offsetof(PrepassModelUniforms, prevPaletteOffset), 388u);
+}
+
+TEST(PrepassModelUniformsLayout, DefaultPrevPaletteIsSentinel) {
+    PrepassModelUniforms u;
+    EXPECT_EQ(u.prevPaletteOffset, PrepassModelUniforms::NO_PREV_PALETTE);
+}
+
+// =============================================================================
+// PrepassCameraUniforms - matches prepass_instanced.vert.hlsl /
+// prepass_terrain.vert.hlsl PrepassCameraUniforms
+// =============================================================================
+
+TEST(PrepassCameraUniformsLayout, SizeIs256Bytes) {
+    EXPECT_EQ(sizeof(PrepassCameraUniforms), 256u);
+}
+
+TEST(PrepassCameraUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(PrepassCameraUniforms, view), 0u);
+    EXPECT_EQ(offsetof(PrepassCameraUniforms, projection), 64u);
+    EXPECT_EQ(offsetof(PrepassCameraUniforms, currViewProjectionNoJitter), 128u);
+    EXPECT_EQ(offsetof(PrepassCameraUniforms, prevViewProjectionNoJitter), 192u);
+}
+
+// =============================================================================
+// InstanceData - matches model_instanced.vert.hlsl + prepass_instanced.vert.hlsl
+// =============================================================================
+
+TEST(InstanceDataLayout, SizeIs224Bytes) {
+    // 2 mat4 (128) + vec4 (16) + noFog+pad[3] (16) + prevModel mat4 (64) = 224
+    EXPECT_EQ(sizeof(InstanceData), 224u);
+}
+
+TEST(InstanceDataLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(InstanceData, model), 0u);
+    EXPECT_EQ(offsetof(InstanceData, normalMatrix), 64u);
+    EXPECT_EQ(offsetof(InstanceData, tint), 128u);
+    EXPECT_EQ(offsetof(InstanceData, noFog), 144u);
+    EXPECT_EQ(offsetof(InstanceData, prevModel), 160u);
+}
+
+// =============================================================================
+// TaaResolveUniforms - matches taa_resolve.frag.hlsl
+// =============================================================================
+
+TEST(TaaResolveUniformsLayout, SizeIs176Bytes) {
+    // 2 mat4 (128) + vec2+vec2 (16) + vec3+float (16) + 4 floats (16) = 176
+    EXPECT_EQ(sizeof(TaaResolveUniforms), 176u);
+}
+
+TEST(TaaResolveUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(TaaResolveUniforms, currInvViewProjUnjittered), 0u);
+    EXPECT_EQ(offsetof(TaaResolveUniforms, prevViewProjUnjittered), 64u);
+    EXPECT_EQ(offsetof(TaaResolveUniforms, screenSize), 128u);
+    EXPECT_EQ(offsetof(TaaResolveUniforms, invScreenSize), 136u);
+    EXPECT_EQ(offsetof(TaaResolveUniforms, cameraPos), 144u);
+    EXPECT_EQ(offsetof(TaaResolveUniforms, historyValid), 156u);
+    EXPECT_EQ(offsetof(TaaResolveUniforms, feedbackMax), 160u);
+    EXPECT_EQ(offsetof(TaaResolveUniforms, varianceGamma), 164u);
+}
+
+TEST(TaaResolveUniformsLayout, DefaultValues) {
+    TaaResolveUniforms u;
+    // History invalid until the CPU says otherwise (first frame outputs
+    // the current color unblended).
+    EXPECT_FLOAT_EQ(u.historyValid, 0.0f);
+    // Engine tuning constants — the NSDMI defaults are the live values.
+    EXPECT_FLOAT_EQ(u.feedbackMax, 0.9f);
+    EXPECT_FLOAT_EQ(u.varianceGamma, 1.0f);
+}
+
+// =============================================================================
+// TaaSharpenUniforms - matches taa_sharpen.frag.hlsl
+// =============================================================================
+
+TEST(TaaSharpenUniformsLayout, SizeIs16Bytes) {
+    EXPECT_EQ(sizeof(TaaSharpenUniforms), 16u);
+}
+
+TEST(TaaSharpenUniformsLayout, FieldOffsets) {
+    EXPECT_EQ(offsetof(TaaSharpenUniforms, invScreenSize), 0u);
+    EXPECT_EQ(offsetof(TaaSharpenUniforms, sharpenStrength), 8u);
 }

@@ -1,4 +1,5 @@
 #include "gpu_shader.hpp"
+#include "bracken/core/assert.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "SDL3/SDL_error.h"
 #include <cstddef>
@@ -7,6 +8,7 @@
 #include <ios>
 #include <memory>
 #include <SDL3/SDL_log.h>
+#include <SDL3/SDL_stdinc.h>
 #include <SDL3_shadercross/SDL_shadercross.h>
 #include <sstream>
 #include <string>
@@ -31,7 +33,8 @@ GPUShader::~GPUShader() {
 GPUShader::GPUShader(GPUShader&& other) noexcept
     : device_(other.device_),
       shader_(other.shader_),
-      stage_(other.stage_) {
+      stage_(other.stage_),
+      resources_(other.resources_) {
     other.device_ = nullptr;
     other.shader_ = nullptr;
 }
@@ -45,6 +48,7 @@ GPUShader& GPUShader::operator=(GPUShader&& other) noexcept {
         device_ = other.device_;
         shader_ = other.shader_;
         stage_ = other.stage_;
+        resources_ = other.resources_;
 
         other.device_ = nullptr;
         other.shader_ = nullptr;
@@ -118,6 +122,28 @@ std::unique_ptr<GPUShader> GPUShader::load_spirv(GPUDevice& device, const std::s
     return shader;
 }
 
+bool GPUShader::reflect_spirv_resources(const std::vector<uint8_t>& spirv_bytecode, ShaderResources& out) {
+    if (!s_compiler_initialized && !init_compiler()) {
+        return false;
+    }
+    if (spirv_bytecode.empty()) {
+        return false;
+    }
+
+    SDL_ShaderCross_GraphicsShaderMetadata* meta =
+        SDL_ShaderCross_ReflectGraphicsSPIRV(spirv_bytecode.data(), spirv_bytecode.size(), 0);
+    if (!meta) {
+        return false;
+    }
+
+    out.num_samplers = meta->resource_info.num_samplers;
+    out.num_storage_textures = meta->resource_info.num_storage_textures;
+    out.num_storage_buffers = meta->resource_info.num_storage_buffers;
+    out.num_uniform_buffers = meta->resource_info.num_uniform_buffers;
+    SDL_free(meta);
+    return true;
+}
+
 std::unique_ptr<GPUShader> GPUShader::create_from_spirv(GPUDevice& device, const std::vector<uint8_t>& spirv_bytecode,
                                                         ShaderStage stage, const std::string& entry_point,
                                                         const ShaderResources& resources) {
@@ -128,8 +154,19 @@ std::unique_ptr<GPUShader> GPUShader::create_from_spirv(GPUDevice& device, const
         }
     }
 
+    // GPU resource creation is main-thread tier (SDL_CreateGPUShader under
+    // the hood). Single-threaded test binaries bind "main" on first use.
+    BRACKEN_ASSERT_MAIN_THREAD();
+
     if (spirv_bytecode.empty()) {
         SDL_Log("GPUShader::create_from_spirv: Empty bytecode");
+        return nullptr;
+    }
+
+    if (stage == ShaderStage::Compute) {
+        // SDL3 GPU compute shaders are whole pipelines, not SDL_GPUShaders.
+        SDL_Log("GPUShader::create_from_spirv: compute shaders do not produce SDL_GPUShaders; "
+                "use GPUComputePipeline (gpu_compute.hpp)");
         return nullptr;
     }
 
@@ -137,12 +174,34 @@ std::unique_ptr<GPUShader> GPUShader::create_from_spirv(GPUDevice& device, const
     shader->device_ = &device;
     shader->stage_ = stage;
 
+    // Cross-check the caller-declared counts against what the SPIR-V actually
+    // declares. Stale hand-maintained counts are the documented most-common way
+    // to silently break rendering, so a mismatch is loud — and the reflected
+    // counts win, since they are by definition what SDL needs to bind.
+    ShaderResources effective = resources;
+    ShaderResources reflected;
+    if (reflect_spirv_resources(spirv_bytecode, reflected)) {
+        if (reflected != resources) {
+            SDL_Log("GPUShader::create_from_spirv: ERROR: declared resource counts do not match SPIR-V "
+                    "(entry '%s'): samplers %u/%u, storage_textures %u/%u, storage_buffers %u/%u, "
+                    "uniform_buffers %u/%u (declared/reflected). Using reflected counts; fix the caller.",
+                    entry_point.c_str(), resources.num_samplers, reflected.num_samplers,
+                    resources.num_storage_textures, reflected.num_storage_textures, resources.num_storage_buffers,
+                    reflected.num_storage_buffers, resources.num_uniform_buffers, reflected.num_uniform_buffers);
+            effective = reflected;
+        }
+    } else {
+        SDL_Log("GPUShader::create_from_spirv: SPIR-V reflection failed (%s); using declared resource counts",
+                SDL_GetError());
+    }
+    shader->resources_ = effective;
+
     // Set up resource info
     SDL_ShaderCross_GraphicsShaderResourceInfo resource_info = {};
-    resource_info.num_samplers = resources.num_samplers;
-    resource_info.num_storage_textures = resources.num_storage_textures;
-    resource_info.num_storage_buffers = resources.num_storage_buffers;
-    resource_info.num_uniform_buffers = resources.num_uniform_buffers;
+    resource_info.num_samplers = effective.num_samplers;
+    resource_info.num_storage_textures = effective.num_storage_textures;
+    resource_info.num_storage_buffers = effective.num_storage_buffers;
+    resource_info.num_uniform_buffers = effective.num_uniform_buffers;
 
     // Set up SPIRV info
     SDL_ShaderCross_SPIRV_Info spirv_info = {};
@@ -151,11 +210,17 @@ std::unique_ptr<GPUShader> GPUShader::create_from_spirv(GPUDevice& device, const
     spirv_info.entrypoint = entry_point.c_str();
     spirv_info.shader_stage =
         (stage == ShaderStage::Vertex) ? SDL_SHADERCROSS_SHADERSTAGE_VERTEX : SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT;
-    spirv_info.props = 0;
+    // SPIRV-Cross emits MSL 1.2 by default, but CalculateLevelOfDetail*
+    // (OpImageQueryLod) in the model/masked-prepass shaders needs MSL 2.2
+    // (macOS 10.15+). Ignored by the non-Metal backends.
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetStringProperty(props, SDL_SHADERCROSS_PROP_SPIRV_MSL_VERSION_STRING, "2.2.0");
+    spirv_info.props = props;
 
     // Compile SPIRV to backend shader (Vulkan uses SPIRV directly,
     // Metal/D3D12 get transpiled via SPIRV-Cross)
     shader->shader_ = SDL_ShaderCross_CompileGraphicsShaderFromSPIRV(device.handle(), &spirv_info, &resource_info, 0);
+    SDL_DestroyProperties(props);
 
     if (!shader->shader_) {
         SDL_Log("GPUShader::create_from_spirv: SPIRV->GPU failed: %s", SDL_GetError());
@@ -204,10 +269,23 @@ GPUShader* ShaderManager::get(const std::string& path, ShaderStage stage, const 
     // Check cache
     auto it = cache_.find(key);
     if (it != cache_.end()) {
+        // Resource counts are baked into the SDL_GPUShader at first load; a
+        // second caller requesting different counts would otherwise silently
+        // get the first-baked shader (load-order dependent misbinding).
+        const ShaderResources& cached = it->second->resources();
+        if (!(cached == resources)) {
+            SDL_Log("ShaderManager::get: ERROR: '%s' requested with resource counts differing from the cached "
+                    "shader: samplers %u/%u, storage_textures %u/%u, storage_buffers %u/%u, uniform_buffers %u/%u "
+                    "(requested/cached). Returning the cached shader; reconcile the call sites.",
+                    path.c_str(), resources.num_samplers, cached.num_samplers, resources.num_storage_textures,
+                    cached.num_storage_textures, resources.num_storage_buffers, cached.num_storage_buffers,
+                    resources.num_uniform_buffers, cached.num_uniform_buffers);
+        }
         return it->second.get();
     }
 
-    // Load shader
+    // Cache miss: load + insert mutate the cache — main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     auto shader = GPUShader::load_spirv(device_, path, stage, entry_point, resources);
     if (!shader) {
         SDL_Log("ShaderManager: Failed to load '%s'", path.c_str());
@@ -221,10 +299,13 @@ GPUShader* ShaderManager::get(const std::string& path, ShaderStage stage, const 
 }
 
 void ShaderManager::clear_cache() {
+    // Cache mutation + GPU shader release: main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     cache_.clear();
 }
 
 bool ShaderManager::reload(const std::string& path) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     // Find and remove all cache entries for this path
     auto matches_path = [&path](const std::string& key) {
         size_t colon_pos = key.find(':');
@@ -256,31 +337,6 @@ int ShaderManager::reload_all() {
     clear_cache();
     SDL_Log("ShaderManager: Cleared %d shaders for reload", count);
     return count;
-}
-
-// =============================================================================
-// ShaderProgram Implementation
-// =============================================================================
-
-std::unique_ptr<ShaderProgram> ShaderProgram::load(GPUDevice& device, const std::string& vertex_path,
-                                                   const std::string& fragment_path, const std::string& vertex_entry,
-                                                   const std::string& fragment_entry) {
-
-    auto program = std::unique_ptr<ShaderProgram>(new ShaderProgram());
-
-    program->vertex_ = GPUShader::load_spirv(device, vertex_path, ShaderStage::Vertex, vertex_entry);
-    if (!program->vertex_) {
-        SDL_Log("ShaderProgram::load: Failed to load vertex shader '%s'", vertex_path.c_str());
-        return nullptr;
-    }
-
-    program->fragment_ = GPUShader::load_spirv(device, fragment_path, ShaderStage::Fragment, fragment_entry);
-    if (!program->fragment_) {
-        SDL_Log("ShaderProgram::load: Failed to load fragment shader '%s'", fragment_path.c_str());
-        return nullptr;
-    }
-
-    return program;
 }
 
 } // namespace bracken::gpu

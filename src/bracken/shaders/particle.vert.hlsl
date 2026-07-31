@@ -64,8 +64,10 @@ VSOutput VSMain(VSInput input, uint instanceID : SV_InstanceID) {
     output.position = mul(projection, mul(view, worldPos));
     output.texCoord = input.texCoord;
 
-    // Additive (ONE, ONE) blending ignores alpha, so opacity fades by
-    // scaling rgb; alpha is fixed at 1.0 (see particle.frag).
+    // The pipeline's color blend is configured (SRC_ALPHA, ONE); the fragment
+    // shader writes alpha 1.0 so the effective color blend is (ONE, ONE).
+    // That effective additive blend never sees opacity, so it fades by
+    // scaling rgb here (see particle.frag).
     output.color = float4(input.color.rgb * inst.color.rgb * inst.color.a, 1.0);
 
     return output;

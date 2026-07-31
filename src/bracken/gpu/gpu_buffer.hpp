@@ -28,7 +28,11 @@ public:
         Vertex,  ///< Vertex buffer for geometry data
         Index,   ///< Index buffer for indexed drawing
         Uniform, ///< Uniform buffer for shader constants
-        Storage, ///< Storage buffer for compute or large data
+        Storage, ///< Read-only storage buffer for graphics stages
+        ComputeStorage, ///< Compute read-write storage (histogram/reduction
+                        ///< targets); also readable as a graphics-stage
+                        ///< read-only SSBO (COMPUTE_STORAGE_READ | WRITE |
+                        ///< GRAPHICS_STORAGE_READ)
     };
 
     ~GPUBuffer();

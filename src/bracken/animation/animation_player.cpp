@@ -2,6 +2,7 @@
 
 #include "bracken/core/profiler.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -18,6 +19,12 @@ void AnimationPlayer::reset() {
     for (auto& m : bone_matrices_) m = glm::mat4(1.0f);
     for (auto& m : world_transforms_) m = glm::mat4(1.0f);
     used_joint_count_ = 0;
+}
+
+void AnimationPlayer::write_palette(std::span<glm::mat4> dst) const {
+    const size_t used = std::min(dst.size(), used_joint_count_);
+    std::copy_n(bone_matrices_.data(), used, dst.data());
+    std::fill(dst.begin() + static_cast<std::ptrdiff_t>(used), dst.end(), glm::mat4(1.0f));
 }
 
 void AnimationPlayer::crossfade_to(int clip_index, float duration) {
@@ -108,13 +115,13 @@ static void sample_clip_joint(const AnimationClip* clip, const std::vector<const
     auto& cur = cursors[joint_idx];
 
     if (!ch->position_times.empty()) {
-        out_translation = interpolate_keyframes(ch->position_times, ch->positions, time, cur.pos);
+        out_translation = interpolate_keyframes(ch->position_times, ch->positions, time, cur.pos, ch->position_interp);
     }
     if (!ch->rotation_times.empty()) {
-        out_rotation = interpolate_keyframes(ch->rotation_times, ch->rotations, time, cur.rot);
+        out_rotation = interpolate_keyframes(ch->rotation_times, ch->rotations, time, cur.rot, ch->rotation_interp);
     }
     if (!ch->scale_times.empty()) {
-        out_scale = interpolate_keyframes(ch->scale_times, ch->scales, time, cur.scale);
+        out_scale = interpolate_keyframes(ch->scale_times, ch->scales, time, cur.scale, ch->scale_interp);
     }
 }
 

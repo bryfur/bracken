@@ -23,13 +23,20 @@ namespace gpu = bracken::gpu;
 namespace {
 
 /// Unlit additive HDR particles: emitted RGB is pushed above the bloom
-/// threshold so spell effects glow. Opacity fades by scaling RGB (additive
-/// blend ignores alpha), so particles dissolve into the scene smoothly.
+/// threshold so spell effects glow. Opacity fades by scaling RGB — the blend
+/// is configured (SRC_ALPHA, ONE) and particle.frag writes alpha 1.0, so the
+/// effective (ONE, ONE) color blend never sees opacity — and particles
+/// dissolve into the scene smoothly.
 constexpr float PARTICLE_EMISSIVE_BOOST = 2.0f;
 
 } // anonymous namespace
 
-glm::mat4 build_particle_transform(const bracken::systems::Particle& particle, const glm::vec3& center_offset) {
+namespace {
+
+// Shared core of both build_particle_transform overloads: any particle type
+// exposing .position / .rotation (euler radians) / .scale.
+template<typename ParticleT>
+glm::mat4 build_particle_transform_impl(const ParticleT& particle, const glm::vec3& center_offset) {
     // Equivalent to translate(position) * rotate(Y) * rotate(X) * rotate(Z) *
     // scale(s) * translate(-center_offset), composed directly: one sin/cos
     // pair per axis instead of three chained 4x4 rotate multiplies
@@ -55,6 +62,17 @@ glm::mat4 build_particle_transform(const bracken::systems::Particle& particle, c
     // T * R * S * T(-center): translation = position - R * (center * s).
     model_mat[3] = glm::vec4(particle.position - rotation * (center_offset * s), 1.0f);
     return model_mat;
+}
+
+} // anonymous namespace
+
+glm::mat4 build_particle_transform(const bracken::systems::Particle& particle, const glm::vec3& center_offset) {
+    return build_particle_transform_impl(particle, center_offset);
+}
+
+glm::mat4 build_particle_transform(const bracken::scene::EffectParticleSnapshot& particle,
+                                   const glm::vec3& center_offset) {
+    return build_particle_transform_impl(particle, center_offset);
 }
 
 EffectRenderer::EffectRenderer() = default;
@@ -106,6 +124,7 @@ void EffectRenderer::shutdown() {
     }
     dummy_white_texture_.reset();
     emitter_model_cache_.clear();
+    warned_missing_models_.clear();
     batches_.clear();
     instance_scratch_.clear();
     instance_buffer_.reset();
@@ -124,39 +143,45 @@ ModelHandle EffectRenderer::resolve_emitter_model(const bracken::EmitterDefiniti
     ModelHandle handle = INVALID_MODEL_HANDLE;
     if (model_manager_ && !def.model.empty()) {
         handle = model_manager_->get_handle(def.model);
-        if (handle == INVALID_MODEL_HANDLE) {
-            BRACKEN_LOG_WARN("effect", "Effect emitter '{}' references unknown model '{}'", def.name, def.model);
+    }
+    if (handle == INVALID_MODEL_HANDLE) {
+        // Never cache failed lookups: a model registered after the emitter's
+        // first use must resolve on the next call. Warn once per definition
+        // so the per-frame retry doesn't spam the log.
+        if (model_manager_ && !def.model.empty() && warned_missing_models_.insert(&def).second) {
+            BRACKEN_LOG_WARN("effect", "Effect emitter '{}' references unknown model '{}' (will retry)", def.name,
+                             def.model);
         }
+        return INVALID_MODEL_HANDLE;
     }
     emitter_model_cache_.emplace(&def, handle);
     return handle;
 }
 
-void EffectRenderer::ensure_models_uploaded(const bracken::systems::EffectSystem& effect_system) {
+void EffectRenderer::ensure_models_uploaded(std::span<const bracken::scene::EffectEmitterSnapshot> emitters) {
     BRACKEN_PROFILE_ZONE_COLOR("EffectRenderer::ensure_models_uploaded", 0x3D6E9E);
     if (!device_ || !model_manager_) {
         return;
     }
 
-    for (const auto& effect : effect_system.get_effects()) {
-        for (const auto& emitter : effect.emitters) {
-            if (!emitter.definition) {
-                continue;
-            }
-            ModelHandle handle = resolve_emitter_model(*emitter.definition);
-            if (handle == INVALID_MODEL_HANDLE) {
-                continue;
-            }
-            Model* model = model_manager_->get_model(handle);
-            if (model && !model->meshes.empty() && !model->meshes[0].uploaded) {
-                ModelLoader::upload_to_gpu(*device_, *model);
-            }
+    for (const auto& emitter : emitters) {
+        if (!emitter.definition) {
+            continue;
+        }
+        ModelHandle handle = resolve_emitter_model(*emitter.definition);
+        if (handle == INVALID_MODEL_HANDLE) {
+            continue;
+        }
+        Model* model = model_manager_->get_model(handle);
+        if (model && !model->meshes.empty() && !model->meshes[0].uploaded) {
+            ModelLoader::upload_to_gpu(*device_, *model);
         }
     }
 }
 
 void EffectRenderer::upload_particle_instances(SDL_GPUCopyPass* copy_pass,
-                                               const bracken::systems::EffectSystem& effect_system) {
+                                               std::span<const bracken::scene::EffectEmitterSnapshot> emitters,
+                                               std::span<const bracken::scene::EffectParticleSnapshot> particles) {
     BRACKEN_PROFILE_ZONE_COLOR("EffectRenderer::upload_particle_instances", 0x27AE60);
     batches_.clear();
     instance_scratch_.clear();
@@ -165,41 +190,48 @@ void EffectRenderer::upload_particle_instances(SDL_GPUCopyPass* copy_pass,
     }
 
     // Particles within one emitter all share the emitter's model, so each
-    // emitter packs into one contiguous instance range = one draw batch.
-    for (const auto& effect : effect_system.get_effects()) {
-        for (const auto& emitter : effect.emitters) {
-            if (!emitter.definition || emitter.particles.empty()) {
-                continue;
-            }
-
-            ModelHandle handle = resolve_emitter_model(*emitter.definition);
-            Model* model = (handle != INVALID_MODEL_HANDLE) ? model_manager_->get_model(handle) : nullptr;
-            if (!model) {
-                continue;
-            }
-
-            // The pre-pass upload (ensure_models_uploaded) should have handled
-            // this; never upload from the frame copy pass — skip and log instead.
-            if (!model->meshes.empty() && !model->meshes[0].uploaded) {
-                BRACKEN_LOG_WARN("effect", "Effect model '{}' not GPU-uploaded; skipping particles this frame",
-                                emitter.definition->model);
-                continue;
-            }
-
-            // Model-center recentering offset is constant per model; hoisted
-            // out of the per-particle loop.
-            const glm::vec3 center((model->min_x + model->max_x) * 0.5f, (model->min_y + model->max_y) * 0.5f,
-                                   (model->min_z + model->max_z) * 0.5f);
-
-            const uint32_t first_instance = static_cast<uint32_t>(instance_scratch_.size());
-            for (const auto& particle : emitter.particles) {
-                instance_scratch_.push_back(
-                    {build_particle_transform(particle, center),
-                     glm::vec4(particle.color.r, particle.color.g, particle.color.b, particle.opacity)});
-            }
-            batches_.push_back(
-                {model, first_instance, static_cast<uint32_t>(instance_scratch_.size()) - first_instance});
+    // emitter snapshot packs into one contiguous instance range = one draw
+    // batch. The snapshot ranges come from the sealed packet — the live
+    // EffectSystem is sim-stage-owned and never read here.
+    for (const auto& emitter : emitters) {
+        if (!emitter.definition || emitter.particle_count == 0) {
+            continue;
         }
+
+        ModelHandle handle = resolve_emitter_model(*emitter.definition);
+        Model* model = (handle != INVALID_MODEL_HANDLE) ? model_manager_->get_model(handle) : nullptr;
+        if (!model) {
+            continue;
+        }
+
+        // The pre-pass upload (ensure_models_uploaded) should have handled
+        // this; never upload from the frame copy pass — skip and log instead.
+        if (!model->meshes.empty() && !model->meshes[0].uploaded) {
+            BRACKEN_LOG_WARN("effect", "Effect model '{}' not GPU-uploaded; skipping particles this frame",
+                             emitter.definition->model);
+            continue;
+        }
+
+        // Snapshot ranges are engine-built; stay defensive in release anyway.
+        if (emitter.first_particle + emitter.particle_count > particles.size()) {
+            BRACKEN_LOG_ERROR("effect", "Effect snapshot range [{}, {}) exceeds particle span ({}); skipping batch",
+                              emitter.first_particle, emitter.first_particle + emitter.particle_count,
+                              particles.size());
+            continue;
+        }
+
+        // Model-center recentering offset is constant per model; hoisted
+        // out of the per-particle loop.
+        const glm::vec3 center((model->min_x + model->max_x) * 0.5f, (model->min_y + model->max_y) * 0.5f,
+                               (model->min_z + model->max_z) * 0.5f);
+
+        const uint32_t first_instance = static_cast<uint32_t>(instance_scratch_.size());
+        for (const auto& particle : particles.subspan(emitter.first_particle, emitter.particle_count)) {
+            instance_scratch_.push_back(
+                {build_particle_transform(particle, center),
+                 glm::vec4(particle.color.r, particle.color.g, particle.color.b, particle.opacity)});
+        }
+        batches_.push_back({model, first_instance, static_cast<uint32_t>(instance_scratch_.size()) - first_instance});
     }
 
     if (instance_scratch_.empty()) {

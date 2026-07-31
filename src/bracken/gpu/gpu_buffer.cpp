@@ -1,4 +1,5 @@
 #include "gpu_buffer.hpp"
+#include "bracken/core/assert.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_gpu.h"
@@ -73,11 +74,20 @@ SDL_GPUBufferUsageFlags GPUBuffer::get_usage_flags(Type type) {
             return SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ;
         case Type::Storage:
             return SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ;
+        case Type::ComputeStorage:
+            // Read-write in compute passes (SDL_BeginGPUComputePass bindings +
+            // read-only set-0 bindings) AND readable as a graphics-stage SSBO,
+            // so compute results feed fragment shaders without a copy.
+            return SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ | SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE |
+                   SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ;
     }
     return SDL_GPU_BUFFERUSAGE_VERTEX;
 }
 
 std::unique_ptr<GPUBuffer> GPUBuffer::create_static(GPUDevice& device, Type type, const void* data, size_t size) {
+    // GPU resource creation is main-thread tier (also submits its own upload
+    // command buffer). Destruction asserts inside GPUDevice::release_*.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!data || size == 0) {
         SDL_Log("GPUBuffer::create_static: Invalid parameters");
         return nullptr;
@@ -160,6 +170,8 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_static(GPUDevice& device, Type type
 }
 
 std::unique_ptr<GPUBuffer> GPUBuffer::create_dynamic(GPUDevice& device, Type type, size_t size) {
+    // GPU resource creation is main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (size == 0) {
         SDL_Log("GPUBuffer::create_dynamic: Invalid size");
         return nullptr;

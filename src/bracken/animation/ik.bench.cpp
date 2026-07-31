@@ -25,8 +25,8 @@ struct Lcg {
     float next_range(float lo, float hi) { return lo + (hi - lo) * next01(); }
 };
 
-// Joint indices in the benchmark rig. Leg/hip/spine names follow the Mixamo
-// conventions in FootIKBoneNames so FootIKData::init resolves them.
+// Joint indices in the benchmark rig. Leg/hip/spine names match the engine's
+// default FootIKBoneNames so FootIKData::init resolves them.
 constexpr int HIPS = 0;
 constexpr int SPINE = 1;
 constexpr int L_UPPER = 2;
@@ -160,7 +160,6 @@ static void BM_ApplyFootIK(benchmark::State& state) {
 
     std::array<glm::mat4, MAX_BONES> world = rig.bind_world;
     std::array<glm::mat4, MAX_BONES> bones = rig.bind_bones;
-    const glm::mat4 model_to_world(1.0f);
     const bool pelvis_drop = state.range(0) != 0;
 
     Lcg rng;
@@ -177,7 +176,7 @@ static void BM_ApplyFootIK(benchmark::State& state) {
             left = -left;
         }
 
-        apply_foot_ik(bones, world, rig.skeleton, ik, model_to_world, 1.0f, left, right);
+        apply_foot_ik(bones, world, rig.skeleton, ik, 1.0f, left, right);
         benchmark::DoNotOptimize(bones.data());
         benchmark::DoNotOptimize(world.data());
         benchmark::ClobberMemory();

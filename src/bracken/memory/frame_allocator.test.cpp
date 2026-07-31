@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <thread>
 
 using namespace bracken::memory;
 
@@ -25,9 +26,9 @@ TEST(FrameAllocator, SwapFlipsThisAndLast) {
 
 TEST(FrameAllocator, SwapResetsNewFrame) {
     FrameAllocator fa(1024);
-    fa.this_frame().allocate(100, 8);
+    ASSERT_NE(fa.this_frame().allocate(100, 8), nullptr);
     fa.swap();
-    fa.this_frame().allocate(50, 8);
+    ASSERT_NE(fa.this_frame().allocate(50, 8), nullptr);
     fa.swap();
     EXPECT_EQ(fa.this_frame().bytes_used(), 0u);
 }
@@ -128,8 +129,8 @@ TEST(FrameAllocator, AllocationLargerThanChunkGrowsArena) {
 
 TEST(FrameAllocator, SwapCycleReleasesGrowthChunks) {
     FrameAllocator fa(64);
-    fa.this_frame().allocate(16, 8);
-    fa.this_frame().allocate(4096, 8);
+    ASSERT_NE(fa.this_frame().allocate(16, 8), nullptr);
+    ASSERT_NE(fa.this_frame().allocate(4096, 8), nullptr);
     const std::size_t grown_capacity = fa.this_frame().bytes_capacity();
     EXPECT_GT(grown_capacity, 64u);
 
@@ -138,6 +139,42 @@ TEST(FrameAllocator, SwapCycleReleasesGrowthChunks) {
     EXPECT_EQ(fa.this_frame().bytes_used(), 0u);
     // reset() keeps only the initial chunk; the growth chunks are freed.
     EXPECT_EQ(fa.this_frame().bytes_capacity(), 64u);
+}
+
+// --- Owner-thread enforcement (debug builds; no-op in release) ---
+
+TEST(FrameAllocatorOwnerDeathTest, ForeignThreadAllocateAsserts) {
+    FrameAllocator fa(1024);
+    ASSERT_NE(fa.this_frame().allocate(8, 8), nullptr); // binds to this thread
+    EXPECT_DEBUG_DEATH(
+        {
+            std::thread t([&] { (void)fa.this_frame().allocate(8, 8); });
+            t.join();
+        },
+        "non-owner thread");
+}
+
+TEST(FrameAllocator, SwapReclaimsArenaFilledByAnotherThread) {
+    FrameAllocator fa(1024);
+    // A worker fills this frame's arena (becomes its owner).
+    std::thread t([&] { (void)fa.this_frame().allocate(64, 8); });
+    t.join();
+    // swap() force-rebinds the newly-active arena before resetting it, so the
+    // frame fence never trips the owner assert even when workers filled frames.
+    fa.swap();
+    fa.swap(); // resets the worker-owned arena — must not assert
+    EXPECT_NE(fa.this_frame().allocate(16, 8), nullptr);
+}
+
+TEST(FrameAllocator, SwapReopensBindingForNextFillerThread) {
+    FrameAllocator fa(1024);
+    ASSERT_NE(fa.this_frame().allocate(8, 8), nullptr);
+    fa.swap();
+    // The freshly reset arena's binding is open: a worker may claim it.
+    bool worker_alloc_ok = false;
+    std::thread t([&] { worker_alloc_ok = fa.this_frame().allocate(16, 8) != nullptr; });
+    t.join();
+    EXPECT_TRUE(worker_alloc_ok);
 }
 
 TEST(FrameAllocator, AllocateAfterSwapReturnsFreshMemory) {

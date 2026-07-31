@@ -340,28 +340,39 @@ static float rock_sdf(glm::vec3 p, int steps, float seed, float smoothness) {
     return d;
 }
 
+// Reduce the integer seed to a float-exact value before it enters the
+// sin()-based SDF hash. Casting the raw uint32_t loses precision above 2^24
+// (distinct large seeds collide on the same rock), and sin() of very large
+// arguments degrades the hash. An integer avalanche hash masked to [0, 2^20)
+// keeps every value exactly representable and spreads wide seed ranges
+// (e.g. world-position hashes) across ~1M distinct shapes.
+static float hash_seed(uint32_t seed) {
+    uint32_t h = seed;
+    h ^= h >> 16;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13;
+    h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return static_cast<float>(h & 0xFFFFFu);
+}
+
 static float scalar_field(glm::vec3 p, const RockParams& params) {
     // Clip bottom for flat base (just below center)
     if (p.y < -0.05f) {
         return 0.0f;
     }
 
-    float d = rock_sdf(p * 2.0f, params.steps, static_cast<float>(params.seed), params.smoothness);
+    const float seed = hash_seed(params.seed);
+    float d = rock_sdf(p * 2.0f, params.steps, seed, params.smoothness);
     if (params.displacement_scale > 0.0f) {
         glm::vec2 eps(0.0001f, 0.0f);
         glm::vec3 n;
-        n.x = rock_sdf((p + glm::vec3(eps.x, eps.y, eps.y)) * 2.0f, params.steps, static_cast<float>(params.seed),
-                       params.smoothness) -
-              rock_sdf((p - glm::vec3(eps.x, eps.y, eps.y)) * 2.0f, params.steps, static_cast<float>(params.seed),
-                       params.smoothness);
-        n.y = rock_sdf((p + glm::vec3(eps.y, eps.x, eps.y)) * 2.0f, params.steps, static_cast<float>(params.seed),
-                       params.smoothness) -
-              rock_sdf((p - glm::vec3(eps.y, eps.x, eps.y)) * 2.0f, params.steps, static_cast<float>(params.seed),
-                       params.smoothness);
-        n.z = rock_sdf((p + glm::vec3(eps.y, eps.y, eps.x)) * 2.0f, params.steps, static_cast<float>(params.seed),
-                       params.smoothness) -
-              rock_sdf((p - glm::vec3(eps.y, eps.y, eps.x)) * 2.0f, params.steps, static_cast<float>(params.seed),
-                       params.smoothness);
+        n.x = rock_sdf((p + glm::vec3(eps.x, eps.y, eps.y)) * 2.0f, params.steps, seed, params.smoothness) -
+              rock_sdf((p - glm::vec3(eps.x, eps.y, eps.y)) * 2.0f, params.steps, seed, params.smoothness);
+        n.y = rock_sdf((p + glm::vec3(eps.y, eps.x, eps.y)) * 2.0f, params.steps, seed, params.smoothness) -
+              rock_sdf((p - glm::vec3(eps.y, eps.x, eps.y)) * 2.0f, params.steps, seed, params.smoothness);
+        n.z = rock_sdf((p + glm::vec3(eps.y, eps.y, eps.x)) * 2.0f, params.steps, seed, params.smoothness) -
+              rock_sdf((p - glm::vec3(eps.y, eps.y, eps.x)) * 2.0f, params.steps, seed, params.smoothness);
         n = glm::normalize(n);
         n = glm::max(n * n, glm::vec3(0.001f));
         n /= (n.x + n.y + n.z);
@@ -601,9 +612,6 @@ std::unique_ptr<Model> RockGenerator::generate(const RockParams& params) {
     mesh.vertices = std::move(vertices);
     mesh.indices = std::move(indices);
     mesh.has_texture = false;
-    mesh.base_color = 0xFF000000 | (static_cast<uint32_t>(params.color.r * 255) << 16) |
-                      (static_cast<uint32_t>(params.color.g * 255) << 8) |
-                      (static_cast<uint32_t>(params.color.b * 255));
     model->meshes.push_back(std::move(mesh));
 
     model->min_x = model->min_y = model->min_z = 1e9f;
@@ -637,7 +645,7 @@ std::unique_ptr<Model> RockGenerator::generate(const RockParams& params) {
 // Presets
 // ============================================================================
 
-std::unique_ptr<Model> RockGenerator::generate_boulder(uint32_t seed, const std::string&) {
+std::unique_ptr<Model> RockGenerator::generate_boulder(uint32_t seed) {
     BRACKEN_PROFILE_ZONE("RockGenerator::generate_boulder");
     RockParams p;
     p.seed = seed == 0 ? 880 : seed;
@@ -651,7 +659,7 @@ std::unique_ptr<Model> RockGenerator::generate_boulder(uint32_t seed, const std:
     return generate(p);
 }
 
-std::unique_ptr<Model> RockGenerator::generate_slate(uint32_t seed, const std::string&) {
+std::unique_ptr<Model> RockGenerator::generate_slate(uint32_t seed) {
     BRACKEN_PROFILE_ZONE("RockGenerator::generate_slate");
     RockParams p;
     p.seed = seed == 0 ? 123 : seed;
@@ -665,7 +673,7 @@ std::unique_ptr<Model> RockGenerator::generate_slate(uint32_t seed, const std::s
     return generate(p);
 }
 
-std::unique_ptr<Model> RockGenerator::generate_spire(uint32_t seed, const std::string&) {
+std::unique_ptr<Model> RockGenerator::generate_spire(uint32_t seed) {
     BRACKEN_PROFILE_ZONE("RockGenerator::generate_spire");
     RockParams p;
     p.seed = seed == 0 ? 456 : seed;
@@ -679,7 +687,7 @@ std::unique_ptr<Model> RockGenerator::generate_spire(uint32_t seed, const std::s
     return generate(p);
 }
 
-std::unique_ptr<Model> RockGenerator::generate_cluster(uint32_t seed, const std::string&) {
+std::unique_ptr<Model> RockGenerator::generate_cluster(uint32_t seed) {
     BRACKEN_PROFILE_ZONE("RockGenerator::generate_cluster");
     RockParams p;
     p.seed = seed == 0 ? 789 : seed;
@@ -693,7 +701,7 @@ std::unique_ptr<Model> RockGenerator::generate_cluster(uint32_t seed, const std:
     return generate(p);
 }
 
-std::unique_ptr<Model> RockGenerator::generate_mossy(uint32_t seed, const std::string&) {
+std::unique_ptr<Model> RockGenerator::generate_mossy(uint32_t seed) {
     BRACKEN_PROFILE_ZONE("RockGenerator::generate_mossy");
     RockParams p;
     p.seed = seed == 0 ? 321 : seed;

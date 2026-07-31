@@ -409,3 +409,64 @@ TEST(ProceduralConfig, DefaultValuesAreSensible) {
     EXPECT_TRUE(config.foot_ik);
     EXPECT_TRUE(config.lean);
 }
+
+// ============================================================================
+// interpolate_keyframes — STEP interpolation
+// ============================================================================
+
+TEST(InterpolateKeyframesStep, HoldsPreviousKeyValueMidSegment) {
+    std::vector<float> times = {0.0f, 1.0f, 2.0f};
+    std::vector<glm::vec3> values = {{0.0f, 0.0f, 0.0f}, {10.0f, 0.0f, 0.0f}, {20.0f, 0.0f, 0.0f}};
+
+    // Anywhere inside a segment, STEP returns that segment's left key exactly.
+    auto mid0 = interpolate_keyframes(times, values, 0.5f, Interpolation::Step);
+    EXPECT_FLOAT_EQ(mid0.x, 0.0f);
+    auto late0 = interpolate_keyframes(times, values, 0.999f, Interpolation::Step);
+    EXPECT_FLOAT_EQ(late0.x, 0.0f);
+    auto mid1 = interpolate_keyframes(times, values, 1.5f, Interpolation::Step);
+    EXPECT_FLOAT_EQ(mid1.x, 10.0f);
+}
+
+TEST(InterpolateKeyframesStep, ExactKeyTimesReturnKeyValues) {
+    std::vector<float> times = {0.0f, 1.0f, 2.0f};
+    std::vector<glm::vec3> values = {{0.0f, 0.0f, 0.0f}, {10.0f, 0.0f, 0.0f}, {20.0f, 0.0f, 0.0f}};
+
+    EXPECT_FLOAT_EQ(interpolate_keyframes(times, values, 0.0f, Interpolation::Step).x, 0.0f);
+    EXPECT_FLOAT_EQ(interpolate_keyframes(times, values, 1.0f, Interpolation::Step).x, 10.0f);
+    EXPECT_FLOAT_EQ(interpolate_keyframes(times, values, 2.0f, Interpolation::Step).x, 20.0f);
+    // Out of range clamps to the boundary keys, same as Linear.
+    EXPECT_FLOAT_EQ(interpolate_keyframes(times, values, -1.0f, Interpolation::Step).x, 0.0f);
+    EXPECT_FLOAT_EQ(interpolate_keyframes(times, values, 5.0f, Interpolation::Step).x, 20.0f);
+}
+
+TEST(InterpolateKeyframesStep, QuaternionsAreNotSlerped) {
+    std::vector<float> times = {0.0f, 1.0f};
+    glm::quat identity(1.0f, 0.0f, 0.0f, 0.0f);
+    glm::quat quarter = glm::angleAxis(glm::half_pi<float>(), glm::vec3(0.0f, 1.0f, 0.0f));
+    std::vector<glm::quat> values = {identity, quarter};
+
+    auto result = interpolate_keyframes(times, values, 0.5f, Interpolation::Step);
+    EXPECT_FLOAT_EQ(result.w, identity.w);
+    EXPECT_FLOAT_EQ(result.y, identity.y);
+}
+
+TEST(InterpolateKeyframesStep, CursorVariantMatchesAndAdvances) {
+    std::vector<float> times = {0.0f, 1.0f, 2.0f, 3.0f};
+    std::vector<glm::vec3> values = {
+        {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {2.0f, 0.0f, 0.0f}, {3.0f, 0.0f, 0.0f}};
+
+    size_t cursor = 0;
+    EXPECT_FLOAT_EQ(interpolate_keyframes(times, values, 0.5f, cursor, Interpolation::Step).x, 0.0f);
+    EXPECT_EQ(cursor, 0u);
+    EXPECT_FLOAT_EQ(interpolate_keyframes(times, values, 2.5f, cursor, Interpolation::Step).x, 2.0f);
+    EXPECT_EQ(cursor, 2u);
+    // Warm cursor hit: same segment, still the held value.
+    EXPECT_FLOAT_EQ(interpolate_keyframes(times, values, 2.9f, cursor, Interpolation::Step).x, 2.0f);
+}
+
+TEST(AnimationChannel, InterpolationDefaultsToLinear) {
+    AnimationChannel ch;
+    EXPECT_EQ(ch.position_interp, Interpolation::Linear);
+    EXPECT_EQ(ch.rotation_interp, Interpolation::Linear);
+    EXPECT_EQ(ch.scale_interp, Interpolation::Linear);
+}

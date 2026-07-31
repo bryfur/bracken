@@ -51,8 +51,6 @@ public:
     // If true, the graph will SDL_BeginGPURenderPass / SDL_EndGPURenderPass for you.
     void set_managed_render_pass(bool managed) noexcept;
 
-    void set_pass_type(PassType t) noexcept;
-
 private:
     RenderGraph* graph_;
     PassNode* node_;

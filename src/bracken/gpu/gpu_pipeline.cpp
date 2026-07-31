@@ -1,4 +1,5 @@
 #include "gpu_pipeline.hpp"
+#include "bracken/core/assert.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_types.hpp"
 #include "SDL3/SDL_error.h"
@@ -108,6 +109,9 @@ GPUPipeline& GPUPipeline::operator=(GPUPipeline&& other) noexcept {
 }
 
 std::unique_ptr<GPUPipeline> GPUPipeline::create(GPUDevice& device, const PipelineConfig& config) {
+    // GPU pipeline creation is main-thread tier. Destruction asserts inside
+    // GPUDevice::release_graphics_pipeline.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!config.vertex_shader || !config.fragment_shader) {
         SDL_Log("GPUPipeline::create: Missing shaders");
         return nullptr;

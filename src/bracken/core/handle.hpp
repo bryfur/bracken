@@ -8,12 +8,13 @@
 namespace bracken::core {
 
 template<typename Tag> struct Handle {
-    uint32_t index = 0;
-    uint32_t generation = 0;
-
     static constexpr uint32_t k_invalid_index = static_cast<uint32_t>(-1);
 
-    static constexpr Handle invalid() { return Handle{k_invalid_index, 0}; }
+    // Default-constructed handles are invalid: Handle{} == Handle::invalid().
+    uint32_t index = k_invalid_index;
+    uint32_t generation = 0;
+
+    static constexpr Handle invalid() { return Handle{}; }
 
     [[nodiscard]] bool is_valid() const noexcept { return index != k_invalid_index; }
 
@@ -104,9 +105,21 @@ public:
 
     size_t capacity() const noexcept { return slots_.size(); }
 
+    // Releases every live slot. Generations are preserved (and bumped for the
+    // released slots), so handles retained across a clear() fail validation
+    // instead of aliasing post-clear acquisitions. Slot storage is kept, so
+    // capacity() is unchanged.
     void clear() {
-        slots_.clear();
-        free_head_ = HandleT::k_invalid_index;
+        for (uint32_t i = 0; i < static_cast<uint32_t>(slots_.size()); ++i) {
+            Slot& slot = slots_[i];
+            if (slot.next_free != k_occupied) {
+                continue; // already on the free list
+            }
+            slot.value = T{};
+            slot.generation += 1;
+            slot.next_free = free_head_;
+            free_head_ = i;
+        }
     }
 
 private:
@@ -128,7 +141,8 @@ private:
 namespace std {
 template<typename Tag> struct hash<::bracken::core::Handle<Tag>> {
     size_t operator()(const ::bracken::core::Handle<Tag>& h) const noexcept {
-        return (static_cast<size_t>(h.generation) << 32) ^ static_cast<size_t>(h.index);
+        // Combine in a fixed 64-bit type: shifting size_t by 32 is UB on 32-bit targets.
+        return static_cast<size_t>((static_cast<uint64_t>(h.generation) << 32) | h.index);
     }
 };
 } // namespace std

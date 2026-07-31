@@ -158,38 +158,41 @@ void InputHandler::process_event(const SDL_Event& event) {
         }
     }
 
-    // Handle key events for menu
+    // Handle key events for menu. Matched by physical scancode — the same
+    // convention as movement polling and the key-edge array — so the physical
+    // WASD keys that move the character also navigate menus on non-QWERTY
+    // layouts (AZERTY etc.).
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
-        switch (event.key.key) {
-            case SDLK_ESCAPE:
+        switch (event.key.scancode) {
+            case SDL_SCANCODE_ESCAPE:
                 menu_toggle_pressed_ = true;
                 break;
-            case SDLK_UP:
-            case SDLK_W:
+            case SDL_SCANCODE_UP:
+            case SDL_SCANCODE_W:
                 if (!game_input_enabled_) {
                     menu_up_pressed_ = true;
                 }
                 break;
-            case SDLK_DOWN:
-            case SDLK_S:
+            case SDL_SCANCODE_DOWN:
+            case SDL_SCANCODE_S:
                 if (!game_input_enabled_) {
                     menu_down_pressed_ = true;
                 }
                 break;
-            case SDLK_LEFT:
-            case SDLK_A:
+            case SDL_SCANCODE_LEFT:
+            case SDL_SCANCODE_A:
                 if (!game_input_enabled_) {
                     menu_left_pressed_ = true;
                 }
                 break;
-            case SDLK_RIGHT:
-            case SDLK_D:
+            case SDL_SCANCODE_RIGHT:
+            case SDL_SCANCODE_D:
                 if (!game_input_enabled_) {
                     menu_right_pressed_ = true;
                 }
                 break;
-            case SDLK_RETURN:
-            case SDLK_SPACE:
+            case SDL_SCANCODE_RETURN:
+            case SDL_SCANCODE_SPACE:
                 if (!game_input_enabled_) {
                     menu_select_pressed_ = true;
                 }
@@ -528,6 +531,49 @@ void InputHandler::handle_controller_removed(SDL_JoystickID id) {
             SDL_free(joysticks);
         }
     }
+}
+
+InputSnapshot InputHandler::snapshot() {
+    InputSnapshot s;
+    s.state = current_input_;
+
+    s.mouse_x = mouse_x_;
+    s.mouse_y = mouse_y_;
+    s.mouse_left_held = left_mouse_down_;
+    s.mouse_left_pressed = left_mouse_pressed_edge_;
+    s.mouse_left_released = left_mouse_released_edge_;
+    s.mouse_right_pressed = right_mouse_pressed_edge_;
+
+    s.camera_yaw = camera_yaw_;
+    s.camera_pitch = camera_pitch_;
+    s.camera_zoom_delta = camera_zoom_delta_;
+
+    s.move_forward = move_forward_;
+    s.move_backward = move_backward_;
+    s.move_left = move_left_;
+    s.move_right = move_right_;
+
+    s.menu_toggle_pressed = menu_toggle_pressed_;
+    s.menu_up_pressed = menu_up_pressed_;
+    s.menu_down_pressed = menu_down_pressed_;
+    s.menu_left_pressed = menu_left_pressed_;
+    s.menu_right_pressed = menu_right_pressed_;
+    s.menu_select_pressed = menu_select_pressed_;
+
+    // Drain the text buffer (take_text_input semantics): the sim stage is
+    // the text consumer, and each snapshot carries only the delta.
+    s.text_input = std::move(text_input_buffer_);
+    text_input_buffer_.clear();
+    s.text_backspace_pressed = text_backspace_pressed_;
+    s.text_enter_pressed = text_enter_pressed_;
+    s.text_escape_pressed = text_escape_pressed_;
+
+    s.has_controller = gamepad_ != nullptr;
+    s.controller_primary = controller_primary_;
+    s.controller_secondary = controller_secondary_;
+
+    s.key_just_pressed = key_just_pressed_;
+    return s;
 }
 
 } // namespace bracken

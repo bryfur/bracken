@@ -17,7 +17,10 @@ namespace bracken::procedural {
  */
 struct TreeParams {
     uint32_t seed = 0;
-    int levels = 3; // Branch recursion depth (0 = trunk only)
+    // Branch recursion depth (0 = trunk only). Valid range is
+    // [0, MAX_LEVELS - 1]; generate() clamps out-of-range values with a
+    // warning (the per-level arrays below are indexed up to `levels`).
+    int levels = 3;
 
     // Per-level branch parameters (index 0 = trunk, 1+ = child branches)
     static constexpr int MAX_LEVELS = 4;

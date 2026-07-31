@@ -240,8 +240,8 @@ TEST_F(TwoBoneIKTest, BoneMatricesMatchWorldTransforms) {
 // apply_foot_ik
 // ============================================================================
 
-// Minimal biped: hips + spine + two legs, joint names following the Mixamo
-// conventions in FootIKBoneNames so FootIKData::init resolves them. Knees are
+// Minimal biped: hips + spine + two legs, joint names matching the engine's
+// default FootIKBoneNames so FootIKData::init resolves them. Knees are
 // pre-bent toward +z so the leg solve's pole derivation is never degenerate.
 class FootIKTest : public ::testing::Test {
 protected:
@@ -263,7 +263,7 @@ protected:
     Pose pose;
 };
 
-TEST_F(FootIKTest, InitResolvesMixamoBoneNames) {
+TEST_F(FootIKTest, InitResolvesDefaultBoneNames) {
     EXPECT_TRUE(ik.valid);
     EXPECT_EQ(ik.hips, 0);
     EXPECT_EQ(ik.spine, 1);
@@ -277,7 +277,7 @@ TEST_F(FootIKTest, SubThresholdOffsetsAreNoOp) {
     Pose before = pose;
 
     // Both offsets inside the 0.1 deadzone: the whole pass is skipped.
-    apply_foot_ik(pose.bones, pose.world, skeleton, ik, glm::mat4(1.0f), 1.0f, 0.05f, -0.05f);
+    apply_foot_ik(pose.bones, pose.world, skeleton, ik, 1.0f, 0.05f, -0.05f);
 
     expect_pose_unchanged(pose, before, skeleton.joints.size());
 }
@@ -290,15 +290,15 @@ TEST_F(FootIKTest, InvalidDataIsNoOp) {
     ASSERT_FALSE(invalid.valid);
     Pose before = pose;
 
-    apply_foot_ik(pose.bones, pose.world, skeleton, invalid, glm::mat4(1.0f), 1.0f, 0.0f, 0.0f);
+    apply_foot_ik(pose.bones, pose.world, skeleton, invalid, 1.0f, 0.0f, 0.0f);
     expect_pose_unchanged(pose, before, skeleton.joints.size());
 
-    apply_foot_ik(pose.bones, pose.world, skeleton, invalid, glm::mat4(1.0f), 1.0f, -5.0f, 3.0f);
+    apply_foot_ik(pose.bones, pose.world, skeleton, invalid, 1.0f, -5.0f, 3.0f);
     expect_pose_unchanged(pose, before, skeleton.joints.size());
 }
 
 TEST_F(FootIKTest, EqualNegativeOffsetsDropWholeSkeleton) {
-    apply_foot_ik(pose.bones, pose.world, skeleton, ik, glm::mat4(1.0f), 1.0f, -0.5f, -0.5f);
+    apply_foot_ik(pose.bones, pose.world, skeleton, ik, 1.0f, -0.5f, -0.5f);
 
     // Pelvis drop absorbs the entire correction: every joint moves down by 0.5
     // and no per-leg solve is needed.
@@ -311,7 +311,7 @@ TEST_F(FootIKTest, EqualNegativeOffsetsDropWholeSkeleton) {
 }
 
 TEST_F(FootIKTest, UnevenOffsetsSolveHigherLeg) {
-    apply_foot_ik(pose.bones, pose.world, skeleton, ik, glm::mat4(1.0f), 1.0f, -0.5f, 0.0f);
+    apply_foot_ik(pose.bones, pose.world, skeleton, ik, 1.0f, -0.5f, 0.0f);
 
     // The pelvis drops to the lower (left) foot; the right leg is then IK'd
     // back up to its original ground height.
@@ -325,7 +325,7 @@ TEST_F(FootIKTest, UnevenOffsetsSolveHigherLeg) {
 TEST_F(FootIKTest, PositiveOffsetsRaiseFeetWithoutPelvisShift) {
     Pose before = pose;
 
-    apply_foot_ik(pose.bones, pose.world, skeleton, ik, glm::mat4(1.0f), 1.0f, 0.3f, 0.3f);
+    apply_foot_ik(pose.bones, pose.world, skeleton, ik, 1.0f, 0.3f, 0.3f);
 
     // Feet stepping up onto higher terrain: no pelvis drop, both legs solve.
     EXPECT_EQ(pose.world[ik.hips], before.world[ik.hips]);
@@ -336,7 +336,7 @@ TEST_F(FootIKTest, PositiveOffsetsRaiseFeetWithoutPelvisShift) {
 }
 
 TEST_F(FootIKTest, ScaleConvertsWorldOffsetsToModelSpace) {
-    apply_foot_ik(pose.bones, pose.world, skeleton, ik, glm::mat4(1.0f), 2.0f, -0.5f, -0.5f);
+    apply_foot_ik(pose.bones, pose.world, skeleton, ik, 2.0f, -0.5f, -0.5f);
 
     // A -0.5 world-space offset on a 2x-scaled model is a -0.25 model-space drop.
     expect_vec_near(joint_pos(pose, ik.hips), glm::vec3(0.0f, 0.75f, 0.0f));
@@ -345,12 +345,41 @@ TEST_F(FootIKTest, ScaleConvertsWorldOffsetsToModelSpace) {
 }
 
 TEST_F(FootIKTest, OffsetsClampToMaxCorrection) {
-    apply_foot_ik(pose.bones, pose.world, skeleton, ik, glm::mat4(1.0f), 1.0f, -20.0f, -20.0f);
+    apply_foot_ik(pose.bones, pose.world, skeleton, ik, 1.0f, -20.0f, -20.0f);
 
     // Corrections are clamped to +/-8 before the pelvis drop is computed.
     expect_vec_near(joint_pos(pose, ik.hips), glm::vec3(0.0f, -7.0f, 0.0f));
     expect_vec_near(joint_pos(pose, ik.left_foot), glm::vec3(0.2f, -8.0f, 0.0f));
     expect_vec_near(joint_pos(pose, ik.right_foot), glm::vec3(-0.2f, -8.0f, 0.0f));
+    expect_pose_finite(pose, skeleton.joints.size());
+}
+
+// Real DCC exports routinely carry rotation (and scale) in their inverse-bind
+// matrices; the pelvis drop must preserve bone = world * inverse_bind for
+// those too, not just for translation-only bind poses.
+TEST_F(FootIKTest, PelvisDropPreservesInvariantWithRotatedInverseBind) {
+    // Re-rig every joint with a rotated + scaled inverse-bind matrix and
+    // recompute the matching bind pose (world = inverse(inverse_bind), so
+    // bone = world * inverse_bind starts as identity).
+    for (size_t i = 0; i < skeleton.joints.size(); i++) {
+        glm::mat4 bind = glm::translate(glm::mat4(1.0f), -glm::vec3(skeleton.joints[i].inverse_bind_matrix[3]));
+        glm::mat4 rot = glm::rotate(glm::mat4(1.0f), 0.7f + 0.3f * static_cast<float>(i),
+                                    glm::normalize(glm::vec3(1.0f, 2.0f, 3.0f)));
+        glm::mat4 scale_m = glm::scale(glm::mat4(1.0f), glm::vec3(1.25f));
+        skeleton.joints[i].inverse_bind_matrix = rot * scale_m * bind;
+        pose.world[i] = glm::inverse(skeleton.joints[i].inverse_bind_matrix);
+        pose.bones[i] = glm::mat4(1.0f);
+    }
+
+    // Equal negative offsets: the correction is absorbed entirely by the
+    // pelvis drop (no per-leg solve), isolating the incremental update.
+    apply_foot_ik(pose.bones, pose.world, skeleton, ik, 1.0f, -0.5f, -0.5f);
+
+    for (size_t i = 0; i < skeleton.joints.size(); i++) {
+        EXPECT_NEAR(pose.world[i][3].y, glm::inverse(skeleton.joints[i].inverse_bind_matrix)[3].y - 0.5f, 1e-4f)
+            << "joint " << i << " world Y";
+        expect_mat_near(pose.bones[i], pose.world[i] * skeleton.joints[i].inverse_bind_matrix);
+    }
     expect_pose_finite(pose, skeleton.joints.size());
 }
 

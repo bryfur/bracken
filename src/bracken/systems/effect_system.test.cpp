@@ -2,6 +2,7 @@
 #include <cmath>
 #include <glm/gtc/constants.hpp>
 #include <gtest/gtest.h>
+#include <limits>
 
 using namespace bracken::systems;
 using namespace bracken;
@@ -35,11 +36,6 @@ TEST(Particle, DefaultTiming) {
     Particle p;
     EXPECT_FLOAT_EQ(p.age, 0.0f);
     EXPECT_FLOAT_EQ(p.lifetime, 1.0f);
-}
-
-TEST(Particle, DefaultModelIsNull) {
-    Particle p;
-    EXPECT_EQ(p.model, nullptr);
 }
 
 // ===== EmitterInstance tests =====
@@ -145,6 +141,32 @@ TEST(EffectInstance, IsNotCompleteWhenAnyEmitterStillActive) {
     EXPECT_FALSE(effect.is_complete());
 }
 
+TEST(EffectInstance, EffectDurationOverridesStillActiveEmitters) {
+    // Effect-level duration (>= 0): once elapsed, the effect is complete as
+    // soon as all particles are dead — even if emitters are still "active"
+    // on their own schedule.
+    EffectDefinition effect_def;
+    effect_def.duration = 1.0f;
+    EmitterDefinition def;
+    def.duration = 10.0f;
+
+    EffectInstance effect;
+    effect.definition = &effect_def;
+    EmitterInstance e1;
+    e1.definition = &def;
+    e1.age = 2.0f; // emitter still active (2 < 10)
+    effect.emitters.push_back(e1);
+
+    effect.age = 0.5f; // duration not elapsed yet
+    EXPECT_FALSE(effect.is_complete());
+
+    effect.age = 1.5f; // duration elapsed, no particles left
+    EXPECT_TRUE(effect.is_complete());
+
+    effect.emitters[0].particles.push_back(Particle{}); // live particle remains
+    EXPECT_FALSE(effect.is_complete());
+}
+
 TEST(EffectInstance, IsNotCompleteWhenEmitterHasLiveParticles) {
     EmitterDefinition def;
     def.duration = 1.0f;
@@ -234,6 +256,45 @@ TEST_F(EffectSystemTest, BurstSpawnsParticlesOnFirstUpdate) {
     EXPECT_EQ(system.particle_count(), 5u);
 }
 
+TEST_F(EffectSystemTest, SpawnVolumeJittersWithinBox) {
+    auto def = make_effect(32, 2.0f);
+    def.emitters[0].spawn_volume = {50.0f, 10.0f, 25.0f};
+    const glm::vec3 origin{100.0f, 200.0f, 300.0f};
+    system.spawn_effect(&def, origin);
+    system.update(0.016f, flat_terrain); // CUSTOM velocity 0 — positions stay at spawn
+
+    bool any_offset = false;
+    for (const auto& eff : system.get_effects()) {
+        for (const auto& em : eff.emitters) {
+            for (const auto& p : em.particles) {
+                EXPECT_GE(p.position.x, origin.x - 50.0f);
+                EXPECT_LE(p.position.x, origin.x + 50.0f);
+                EXPECT_GE(p.position.y, origin.y - 10.0f);
+                EXPECT_LE(p.position.y, origin.y + 10.0f);
+                EXPECT_GE(p.position.z, origin.z - 25.0f);
+                EXPECT_LE(p.position.z, origin.z + 25.0f);
+                any_offset |= glm::distance(p.position, origin) > 0.01f;
+            }
+        }
+    }
+    EXPECT_TRUE(any_offset); // 32 uniform draws in a 100x20x50 box can't all land on the origin
+}
+
+TEST_F(EffectSystemTest, ZeroSpawnVolumeStaysAPointEmitter) {
+    auto def = make_effect(8, 2.0f);
+    const glm::vec3 origin{7.0f, 100.0f, -3.0f};
+    system.spawn_effect(&def, origin);
+    system.update(0.016f, flat_terrain);
+
+    for (const auto& eff : system.get_effects()) {
+        for (const auto& em : eff.emitters) {
+            for (const auto& p : em.particles) {
+                EXPECT_EQ(p.position, origin); // exact — the volume path (and its RNG draws) must be skipped
+            }
+        }
+    }
+}
+
 TEST_F(EffectSystemTest, ParticlesAgeOverTime) {
     auto def = make_effect(1, 10.0f);
     system.spawn_effect(&def, {0, 0, 0});
@@ -289,32 +350,6 @@ TEST_F(EffectSystemTest, ClearRemovesAllEffects) {
     EXPECT_EQ(system.particle_count(), 0u);
 }
 
-TEST_F(EffectSystemTest, EffectUsesDefinitionDefaultRange) {
-    EffectDefinition def;
-    def.name = "ranged";
-    def.default_range = 42.0f;
-    EmitterDefinition emitter_def = make_burst_emitter(1, 5.0f);
-    def.emitters.push_back(emitter_def);
-
-    system.spawn_effect(&def, {0, 0, 0}, {1, 0, 0}, -1.0f);
-    system.update(0.016f, flat_terrain);
-
-    const auto& effects = system.get_effects();
-    ASSERT_EQ(effects.size(), 1u);
-    EXPECT_FLOAT_EQ(effects[0].emitters[0].range, 42.0f);
-}
-
-TEST_F(EffectSystemTest, EffectUsesOverriddenRange) {
-    auto def = make_effect(1, 5.0f);
-    def.default_range = 42.0f;
-
-    system.spawn_effect(&def, {0, 0, 0}, {1, 0, 0}, 99.0f);
-
-    const auto& effects = system.get_effects();
-    ASSERT_EQ(effects.size(), 1u);
-    EXPECT_FLOAT_EQ(effects[0].emitters[0].range, 99.0f);
-}
-
 TEST_F(EffectSystemTest, ContinuousEmitterSpawnsOverTime) {
     EffectDefinition def;
     def.name = "continuous";
@@ -340,6 +375,105 @@ TEST_F(EffectSystemTest, ContinuousEmitterSpawnsOverTime) {
     size_t count = system.particle_count();
     EXPECT_GE(count, 8u);
     EXPECT_LE(count, 12u);
+}
+
+// ===== CONTINUOUS spawn_rate validation (H3) =====
+//
+// A non-positive spawn_rate must never enter the catch-up loop: 0 used to
+// silently emit a single particle, and a negative rate made the loop
+// condition permanently true — a hang with unbounded particle growth. The
+// negative/NaN/inf tests below would not terminate without the guard.
+
+namespace {
+
+EffectDefinition make_continuous_effect_with_rate(float spawn_rate) {
+    EffectDefinition def;
+    def.name = "bad_rate";
+    EmitterDefinition emitter_def;
+    emitter_def.name = "continuous";
+    emitter_def.spawn_mode = SpawnMode::CONTINUOUS;
+    emitter_def.spawn_rate = spawn_rate;
+    emitter_def.particle_lifetime = 0.2f;
+    emitter_def.duration = 0.5f;
+    emitter_def.model = "test";
+    emitter_def.velocity.type = VelocityType::CUSTOM;
+    emitter_def.velocity.speed = 0.0f;
+    def.emitters.push_back(emitter_def);
+    return def;
+}
+
+} // namespace
+
+TEST_F(EffectSystemTest, ContinuousEmitterWithZeroSpawnRateSpawnsNothing) {
+    auto def = make_continuous_effect_with_rate(0.0f);
+    EXPECT_EQ(system.spawn_effect(&def, {0, 0, 0}), 0);
+
+    for (int i = 0; i < 20; ++i) {
+        system.update(0.05f, flat_terrain);
+        EXPECT_EQ(system.particle_count(), 0u);
+    }
+    // The inert emitter still ages out, so the effect compacts away normally.
+    EXPECT_EQ(system.effect_count(), 0u);
+}
+
+TEST_F(EffectSystemTest, ContinuousEmitterWithNegativeSpawnRateTerminatesAndSpawnsNothing) {
+    auto def = make_continuous_effect_with_rate(-5.0f);
+    EXPECT_EQ(system.spawn_effect(&def, {0, 0, 0}), 0);
+
+    // Without the guard this loop never returns (unbounded particle growth).
+    for (int i = 0; i < 20; ++i) {
+        system.update(0.05f, flat_terrain);
+        EXPECT_EQ(system.particle_count(), 0u);
+    }
+    EXPECT_EQ(system.effect_count(), 0u);
+}
+
+TEST_F(EffectSystemTest, ContinuousEmitterWithNonFiniteSpawnRateTerminatesAndSpawnsNothing) {
+    for (float rate : {std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        auto def = make_continuous_effect_with_rate(rate);
+        system.spawn_effect(&def, {0, 0, 0});
+        for (int i = 0; i < 20; ++i) {
+            system.update(0.05f, flat_terrain);
+            EXPECT_EQ(system.particle_count(), 0u);
+        }
+        EXPECT_EQ(system.effect_count(), 0u);
+    }
+}
+
+// ===== Effect-level duration =====
+
+TEST_F(EffectSystemTest, EffectDurationStopsSpawningAndCompletesEffect) {
+    auto def = make_continuous_effect_with_rate(100.0f);
+    def.name = "capped";
+    def.emitters[0].duration = 10.0f; // emitter alone would run 10 s...
+    def.duration = 0.3f;              // ...but the effect caps it at 0.3 s
+
+    system.spawn_effect(&def, {0, 0, 0});
+
+    for (int i = 0; i < 40; ++i) { // 0.8 s total
+        system.update(0.02f, flat_terrain);
+    }
+    // Well past the effect duration + particle lifetime (0.3 + 0.2), spawning
+    // has stopped and every particle has died, so the effect is compacted
+    // long before the emitter's own 10 s duration.
+    EXPECT_EQ(system.particle_count(), 0u);
+    EXPECT_EQ(system.effect_count(), 0u);
+}
+
+TEST_F(EffectSystemTest, DefaultEffectDurationIsEmitterDriven) {
+    auto def = make_continuous_effect_with_rate(100.0f);
+    def.name = "uncapped";
+    def.emitters[0].duration = 10.0f;
+    ASSERT_FLOAT_EQ(def.duration, -1.0f); // default: no effect-level cap
+
+    system.spawn_effect(&def, {0, 0, 0});
+
+    for (int i = 0; i < 50; ++i) { // 1 s total — far past any 0.3 s-style cap
+        system.update(0.02f, flat_terrain);
+    }
+    // The emitter is still spawning on its own 10 s schedule.
+    EXPECT_GT(system.particle_count(), 0u);
+    EXPECT_EQ(system.effect_count(), 1u);
 }
 
 TEST_F(EffectSystemTest, TerrainHeightPreventsParticlesBelowGround) {

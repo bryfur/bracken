@@ -7,7 +7,6 @@
 #include <SDL3/SDL_gpu.h>
 #include <SDL3/SDL_surface.h>
 #include <SDL3_ttf/SDL_ttf.h>
-#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -152,29 +151,12 @@ public:
     void set_projection(const glm::mat4& projection);
 
     /**
-     * Draw text at the specified position (legacy immediate path).
-     * Only draws if every glyph is already resident in the atlas; otherwise
-     * the glyphs are rasterized CPU-side and drawn from the next frame on.
-     * @param cmd Command buffer for the frame
-     * @param render_pass Active render pass to draw into
-     * @param text The text string to render
-     * @param x X position (screen coordinates)
-     * @param y Y position (screen coordinates)
-     * @param color Text color in ABGR format
-     * @param scale Text scale factor
-     */
-    void draw_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::string_view text, float x, float y,
-                   uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
-
-    void draw_text_centered(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::string_view text, float x,
-                            float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
-
-    /**
-     * Queue a text draw for batched rendering.
-     * Call this instead of draw_text during recording phase.
-     * Missing glyphs are rasterized into the CPU-side atlas immediately and
-     * uploaded by the next copy-pass flush (create_pending_textures /
-     * upload_queued_text), so new strings render the same frame.
+     * Queue a text draw for batched rendering (call during recording phase).
+     * `color` is packed ARGB (0xAARRGGBB) — the engine-wide convention, see
+     * bracken/core/color.hpp. Missing glyphs are rasterized into the
+     * CPU-side atlas immediately and uploaded by the next copy-pass flush
+     * (create_pending_textures / upload_queued_text), so new strings render
+     * the same frame.
      */
     void queue_text_draw(std::string_view text, float x, float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
 
@@ -190,17 +172,10 @@ public:
      */
     void draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass);
 
-    /**
-     * Draw text immediately without uploading vertex data.
-     * Used during execute phase when vertex buffer is already uploaded.
-     * Note: only renders correctly if the vertex data happens to be resident;
-     * prefer queue_text_draw + upload_queued_text + draw_queued_text.
-     */
-    void draw_text_immediate(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::string_view text, float x,
-                             float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
-
-    int get_text_width(std::string_view text, float scale = 1.0f);
-    int get_text_height(float scale = 1.0f);
+    /// Rendered width in pixels of `text` at `scale` (0 when no font is loaded).
+    int get_text_width(std::string_view text, float scale = 1.0f) const;
+    /// Font line height in pixels at `scale` (0 when no font is loaded).
+    int get_text_height(float scale = 1.0f) const;
 
     bool is_ready() const { return initialized_ && font_ != nullptr; }
 
@@ -208,13 +183,6 @@ public:
      * Frame-boundary housekeeping. Call at the beginning of each frame.
      */
     void release_pending_resources();
-
-    /**
-     * Pre-rasterize the glyphs of the given strings and upload the atlas.
-     * Call BEFORE starting a render pass (performs a copy pass when new
-     * glyphs were added).
-     */
-    void prepare_text_textures(SDL_GPUCommandBuffer* cmd, const std::vector<std::string>& texts);
 
     /**
      * Upload any newly rasterized glyphs to the atlas texture.

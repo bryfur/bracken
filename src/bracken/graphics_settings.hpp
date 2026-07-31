@@ -16,15 +16,21 @@ enum class ShadowMode : int {
     PCSS = 2,
 };
 
+// Screen-space ambient occlusion: horizon-based GTAO computed from the depth
+// prepass and applied to the forward pass's AMBIENT term only. Half/Full is
+// the AO compute resolution. Numeric values were redefined in the AO
+// rearchitecture (1 was "SSAO", 2 was a fake "GTAO"); old settings files map
+// 1 -> GTAO_Half and 2 -> GTAO_Full, which preserves their relative cost.
 enum class AOMode : int {
     Off = 0,
-    SSAO = 1,
-    GTAO = 2,
+    GTAO_Half = 1,
+    GTAO_Full = 2,
 };
 
 enum class AAMode : int {
     Off = 0,
     FXAA = 1,
+    TAA = 2,
 };
 
 enum class TonemapMode : int {
@@ -60,20 +66,48 @@ struct GraphicsSettings {
     ShadowMode shadow_mode = ShadowMode::PCSS;
     int shadow_cascades = 3;                  // 0=1, 1=2, 2=3, 3=4
     int shadow_resolution = 2;                // 0=512, 1=1024, 2=2048, 3=4096
-    AOMode ao_mode = AOMode::SSAO;
-    AAMode aa_mode = AAMode::FXAA;
+    // Sun (CSM) shadow range in world units, additionally clamped by draw
+    // distance at the use site; the shader fades shadows out over the last
+    // 15% instead of popping. Texel density scales inversely — raising it
+    // softens distant shadows at a given shadow_resolution.
+    float shadow_distance = 4000.0f;
+    // Local (point/spot) light shadows: budgeted shadow maps for lights the
+    // host opted in via PointLight/SpotLight::casts_shadows.
+    bool local_shadows = true;                // master toggle for local-light shadows
+    int local_shadow_point_budget = 4;        // shadowed point lights per frame (0-8)
+    int local_shadow_spot_budget = 2;         // shadowed spot lights per frame (0-16)
+    int local_shadow_resolution = 1;          // atlas size: 0=1024, 1=2048, 2=4096
+    AOMode ao_mode = AOMode::GTAO_Half;
+    // TAA is the default for fresh settings; files that stored a mode keep it.
+    AAMode aa_mode = AAMode::TAA;
+    bool ibl_enabled = true;                  // Image-based lighting: ambient from the prefiltered
+                                              // procedural sky; OFF falls back to hemisphere ambient
     bool bloom_enabled = true;                // Bloom post-processing
     float bloom_strength = 0.25f;             // Bloom intensity (0.0 - 1.0)
     bool volumetric_fog = false;              // Atmospheric fog haze (expensive, off by default)
     bool god_rays = false;                    // Light shafts through shadows (requires volumetric_fog)
     int window_mode = 0;                      // 0=windowed, 1=borderless fullscreen, 2=exclusive fullscreen
-    int resolution_index = 0;                 // index into available native display modes
+    int resolution_index = 0;                 // index into RenderContext::available_resolutions(); an index past
+                                              // that list falls back to borderless at apply time (with a warning)
 
     // Tone, exposure, color grading
+    // With auto_exposure on, `exposure` is the manual BIAS multiplied on top
+    // of the adapted exp2(EV); with it off, the whole exposure (pre-P6
+    // behavior). Look-style grading (white balance, CDL) lives in
+    // render::EnvironmentState, not here.
     float exposure = 1.0f; // linear scene multiplier before tonemap; 1.0 = neutral
     TonemapMode tonemap_mode = TonemapMode::ACESFitted;
     float contrast = 1.0f;   // post-tonemap contrast; 1.0 = neutral, 1.2 = punchy
     float saturation = 1.0f; // post-tonemap saturation; 1.0 = neutral, 0.0 = grayscale
+
+    // Histogram auto exposure (render::AutoExposure; needs the HDR path).
+    // The adapted EV is clamped to [min_ev, max_ev]; the default scene is
+    // calibrated to converge near EV 0, so 0/0 would pin it off entirely.
+    bool auto_exposure = true;
+    float auto_exposure_min_ev = -4.0f;    // clamp on the adapted EV (clamped to [-12, 12] on load)
+    float auto_exposure_max_ev = 4.0f;
+    float auto_exposure_speed_up = 1.5f;   // EV/s toward brighter (scene got darker)
+    float auto_exposure_speed_down = 2.5f; // EV/s toward darker (scene got brighter)
 
     // Lighting feel
     float ambient_strength = 0.45f; // shadow-region lift; 0.0 = full black in shadow, 1.0 = fully lit

@@ -142,6 +142,44 @@ TEST(VertexAttributes, Vertex2DAttributesMatchLayout) {
     EXPECT_EQ(attrs[2].format, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4);
 }
 
+// =============================================================================
+// TextureFormat <-> SDL format mapping
+// =============================================================================
+
+// reload_from_file relies on from_sdl_format to recover the creation format
+// (notably RGBA8_SRGB); every enum value must round-trip.
+TEST(TextureFormatMapping, RoundTripsAllEnumValues) {
+    constexpr TextureFormat formats[] = {
+        TextureFormat::RGBA8, TextureFormat::RGBA8_SRGB, TextureFormat::BGRA8, TextureFormat::R8,
+        TextureFormat::R16,   TextureFormat::RG16F,      TextureFormat::D32F,  TextureFormat::D24S8,
+    };
+    for (TextureFormat f : formats) {
+        EXPECT_EQ(from_sdl_format(to_sdl_format(f)), f) << "format " << static_cast<int>(f);
+    }
+}
+
+TEST(TextureFormatMapping, UnmappedSdlFormatDoesNotRoundTrip) {
+    // Detectable-by-callers contract for formats outside the enum.
+    SDL_GPUTextureFormat wide = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+    EXPECT_NE(to_sdl_format(from_sdl_format(wide)), wide);
+}
+
+// =============================================================================
+// Blend state presets
+// =============================================================================
+
+// Pins the configured factors for BlendMode::Additive: color (SRC_ALPHA, ONE).
+// The particle fragment shader writes alpha 1.0, so the effective color blend
+// for particles is (ONE, ONE) — this test documents that the (ONE, ONE) is
+// effective, not configured.
+TEST(BlendState, AdditiveConfiguredFactorsAreSrcAlphaOne) {
+    SDL_GPUColorTargetBlendState state = get_blend_state(BlendMode::Additive);
+    EXPECT_TRUE(state.enable_blend);
+    EXPECT_EQ(state.src_color_blendfactor, SDL_GPU_BLENDFACTOR_SRC_ALPHA);
+    EXPECT_EQ(state.dst_color_blendfactor, SDL_GPU_BLENDFACTOR_ONE);
+    EXPECT_EQ(state.color_blend_op, SDL_GPU_BLENDOP_ADD);
+}
+
 TEST(VertexAttributes, AllAttributesBoundToSlot0) {
     for (const auto& attr : get_vertex3d_attributes()) {
         EXPECT_EQ(attr.buffer_slot, 0u);

@@ -6,6 +6,20 @@
 
 using namespace bracken::render;
 
+// --- Measurement --------------------------------------------------------------
+
+TEST(TextRendererMeasurement, ZeroAndConstCallableBeforeInit) {
+    // Measurement is part of the host-facing metrics path (UIRenderer::
+    // text_width/text_height): it must be const and safe before init() /
+    // without a font, returning 0.
+    const TextRenderer tr;
+    EXPECT_FALSE(tr.is_ready());
+    EXPECT_EQ(tr.get_text_width("hello"), 0);
+    EXPECT_EQ(tr.get_text_width("hello", 2.0f), 0);
+    EXPECT_EQ(tr.get_text_height(), 0);
+    EXPECT_EQ(tr.get_text_height(3.0f), 0);
+}
+
 // --- ShelfPacker (glyph atlas packing) ---------------------------------------
 
 TEST(ShelfPacker, PacksLeftToRightOnOneShelf) {

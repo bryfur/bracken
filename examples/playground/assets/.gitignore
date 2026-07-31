@@ -1,0 +1,27 @@
+# The raw medieval asset pack is unpacked here but not tracked (hundreds of
+# MB, multiple engine formats). Only the pipeline outputs in generated/ are
+# candidates for version control.
+/FBX/
+/FBX (Unity)/
+/FBX (Unreal Engine)/
+/OBJ/
+/glTF/
+/glTF (Godot)/
+/Textures/
+# Pipeline outputs: ~50 MB of .glb + textures regenerated from the raw packs by
+# tools/build_medieval_assets.py. The playground falls back to a procedural-only
+# scene when they are absent, so they stay out of history.
+/generated/
+
+# Stray files shipped in the raw pack root.
+/Preview.jpg
+/License_Pro.txt
+/Format Differences.txt
+/nature/FBX/
+/nature/FBX (Unity)/
+/nature/OBJ/
+/nature/glTF/
+/nature/Textures/
+/nature/*.jpg
+/nature/*.txt
+/nature/desktop.ini

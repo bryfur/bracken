@@ -1,7 +1,6 @@
 #pragma once
 
 #include "bracken/gpu/gpu_device.hpp"
-#include <glm/glm.hpp>
 #include <SDL3/SDL_gpu.h>
 #include <SDL3/SDL_video.h>
 #include <string>
@@ -112,6 +111,11 @@ public:
 
     /**
      * Set window mode: 0=windowed, 1=borderless fullscreen, 2=exclusive fullscreen.
+     * For exclusive fullscreen, resolution_index selects into
+     * available_resolutions(); if it matches no current display mode (stale
+     * settings file, monitor change) the call logs a warning and falls back to
+     * borderless fullscreen — and records the fallback, not the failed
+     * request, so re-applying the same settings retries the lookup.
      */
     void set_window_mode(int window_mode, int resolution_index = 0);
 
@@ -122,24 +126,17 @@ public:
     };
 
     /**
-     * Get available native display modes (pixel_density == 1.0).
+     * Get the available fullscreen display modes, deduplicated by
+     * (w, h, pixel_density) — refresh-rate variants collapse to the first
+     * mode SDL lists. All pixel densities are kept, so on HiDPI displays the
+     * same w×h can appear more than once (at different densities).
      */
     const std::vector<DisplayMode>& available_resolutions() const { return available_resolutions_; }
 
     /**
-     * Refresh the list of available native display modes.
+     * Refresh the list of available fullscreen display modes.
      */
     void query_display_modes();
-
-    /**
-     * Get clear color for render passes
-     */
-    const glm::vec4& clear_color() const { return clear_color_; }
-
-    /**
-     * Set clear color for render passes
-     */
-    void set_clear_color(const glm::vec4& color) { clear_color_ = color; }
 
 private:
     SDL_Window* window_ = nullptr;
@@ -154,9 +151,6 @@ private:
 
     // Current frame's command buffer (valid between begin_frame and end_frame)
     SDL_GPUCommandBuffer* current_cmd_ = nullptr;
-
-    // Clear color for render passes
-    glm::vec4 clear_color_ = glm::vec4(0.05f, 0.07f, 0.1f, 1.0f);
 };
 
 } // namespace bracken::render

@@ -1,4 +1,8 @@
 #include "terrain_renderer.hpp"
+#include "bracken/core/assert.hpp"
+#include "bracken/core/jobs/cache_line.hpp"
+#include "bracken/core/jobs/job_system.hpp"
+#include "bracken/core/jobs/parallel_for.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
@@ -136,9 +140,15 @@ void TerrainRenderer::load_terrain_textures() {
         return;
     }
 
-    // Load individual material textures using SDL_image
-    const char* texture_paths[4] = {"assets/textures/grass_seamless.png", "assets/textures/dirt_seamless.png",
-                                    "assets/textures/rock_seamless.png", "assets/textures/sand_seamless.png"};
+    // Material art lives next to the executable (same anchoring as the
+    // compiled shaders — SDL_GetBasePath), NOT the process CWD, so the app
+    // finds its terrain regardless of where it is launched from.
+    const char* base_path = SDL_GetBasePath();
+    const std::string prefix = base_path ? base_path : "";
+    const std::string texture_paths[4] = {prefix + "assets/textures/grass_seamless.png",
+                                          prefix + "assets/textures/dirt_seamless.png",
+                                          prefix + "assets/textures/rock_seamless.png",
+                                          prefix + "assets/textures/sand_seamless.png"};
 
     SDL_Surface* loaded_surfaces[4] = {nullptr, nullptr, nullptr, nullptr};
     SDL_Surface* converted_surfaces[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -149,9 +159,10 @@ void TerrainRenderer::load_terrain_textures() {
     // Load all textures and convert to RGBA8
     bool all_loaded = true;
     for (int i = 0; i < 4; ++i) {
-        loaded_surfaces[i] = IMG_Load(texture_paths[i]);
+        loaded_surfaces[i] = IMG_Load(texture_paths[i].c_str());
         if (!loaded_surfaces[i]) {
-            SDL_Log("TerrainRenderer::load_terrain_textures: Failed to load %s: %s", texture_paths[i], SDL_GetError());
+            SDL_Log("TerrainRenderer::load_terrain_textures: Failed to load %s: %s", texture_paths[i].c_str(),
+                    SDL_GetError());
             all_loaded = false;
             break;
         }
@@ -159,8 +170,8 @@ void TerrainRenderer::load_terrain_textures() {
         // Convert to RGBA8 format
         converted_surfaces[i] = SDL_ConvertSurface(loaded_surfaces[i], SDL_PIXELFORMAT_RGBA32);
         if (!converted_surfaces[i]) {
-            SDL_Log("TerrainRenderer::load_terrain_textures: Failed to convert %s to RGBA8: %s", texture_paths[i],
-                    SDL_GetError());
+            SDL_Log("TerrainRenderer::load_terrain_textures: Failed to convert %s to RGBA8: %s",
+                    texture_paths[i].c_str(), SDL_GetError());
             all_loaded = false;
             break;
         }
@@ -170,7 +181,7 @@ void TerrainRenderer::load_terrain_textures() {
             tex_width = converted_surfaces[i]->w;
             tex_height = converted_surfaces[i]->h;
         } else if (converted_surfaces[i]->w != tex_width || converted_surfaces[i]->h != tex_height) {
-            SDL_Log("TerrainRenderer::load_terrain_textures: Texture size mismatch for %s", texture_paths[i]);
+            SDL_Log("TerrainRenderer::load_terrain_textures: Texture size mismatch for %s", texture_paths[i].c_str());
             all_loaded = false;
             break;
         }
@@ -207,8 +218,9 @@ void TerrainRenderer::load_terrain_textures() {
         create_fallback_material_array();
     }
 
-    // Load splatmap texture
-    splatmap_texture_ = gpu::GPUTexture::load_from_file(*device_, "assets/textures/terrain_splatmap.png", false);
+    // Load splatmap texture (same executable-relative anchoring)
+    splatmap_texture_ =
+        gpu::GPUTexture::load_from_file(*device_, prefix + "assets/textures/terrain_splatmap.png", false);
 
     if (!splatmap_texture_) {
         create_fallback_splatmap();
@@ -428,7 +440,7 @@ void TerrainRenderer::generate_terrain_mesh() {
             }
         }
     }
-    build_tile_rows(tiles_, tile_rows_);
+    build_tile_rows(core::jobs::JobSystem::instance(), tiles_, tile_rows_);
 
     index_count_ = static_cast<uint32_t>(index_count);
 
@@ -453,7 +465,10 @@ void TerrainRenderer::generate_terrain_mesh() {
 void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view,
                              const glm::mat4& projection, const glm::vec3& camera_pos, const glm::vec3& light_dir,
                              const SDL_GPUTextureSamplerBinding* shadow_bindings, int shadow_binding_count,
-                             const scene::Frustum* frustum) {
+                             const SDL_GPUTextureSamplerBinding* ao_binding, glm::vec2 ao_texel,
+                             const scene::Frustum* frustum, bool depth_equal,
+                             const SDL_GPUTextureSamplerBinding* ibl_bindings, bool ibl_enabled,
+                             const SDL_GPUTextureSamplerBinding* local_shadow_binding) {
     BRACKEN_PROFILE_ZONE_COLOR("TerrainRenderer::render", 0xC0392B);
     // Skip rendering if required resources aren't available
     if (!pipeline_registry_ || !vertex_buffer_ || !index_buffer_ || !pass || !cmd) {
@@ -464,8 +479,9 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
         return;
     }
 
-    // Get terrain pipeline
-    auto* pipeline = pipeline_registry_->get_terrain_pipeline();
+    // Get terrain pipeline (EQUAL/write-off variant after a depth prepass)
+    auto* pipeline = pipeline_registry_->get_pipeline(depth_equal ? gpu::PipelineType::TerrainDepthEqual
+                                                                  : gpu::PipelineType::Terrain);
     if (!pipeline) {
         SDL_Log("TerrainRenderer::render: Failed to get terrain pipeline");
         return;
@@ -492,12 +508,19 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
     lighting_uniforms.lightDir = light_dir;
     lighting_uniforms.fogHeightFalloff = env_.fog_height_falloff;
     lighting_uniforms.cameraPos = camera_pos;
-    lighting_uniforms.world_size = world_width_; // Assumes square terrain
     lighting_uniforms.ambientSky = env_.ambient_sky;
     lighting_uniforms.ambientStrength = ambient_strength_;
     lighting_uniforms.ambientGround = env_.ambient_ground;
     lighting_uniforms.sunIntensity = sun_intensity_;
     lighting_uniforms.sunColor = env_.sun_color;
+    lighting_uniforms.screenAOTexelX = ao_texel.x;
+    lighting_uniforms.screenAOTexelY = ao_texel.y;
+    // Splat region: the splatmap spans the world rect, anchored at the origin
+    // (the terrain mesh itself is generated over [0, world] on both axes).
+    // Separate X/Z sizes support non-square worlds.
+    lighting_uniforms.splat_params =
+        glm::vec4(0.0f, 0.0f, std::max(world_width_, 1.0f), std::max(world_height_, 1.0f));
+    lighting_uniforms.iblEnabled = (ibl_enabled && ibl_bindings) ? 1.0f : 0.0f;
 
     SDL_PushGPUFragmentUniformData(cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));
 
@@ -514,9 +537,29 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
         SDL_BindGPUFragmentSamplers(pass, 2, shadow_bindings, shadow_binding_count);
     }
 
+    // Bind screen-space AO at slot 4 (white dummy when AO is off).
+    if (ao_binding) {
+        SDL_BindGPUFragmentSamplers(pass, 4, ao_binding, 1);
+    }
+
+    // Bind the sky IBL chain at slots 5-7 (irradiance cube, prefiltered
+    // specular cube, BRDF LUT — cube-typed dummies when IBL is off).
+    if (ibl_bindings) {
+        SDL_BindGPUFragmentSamplers(pass, 5, ibl_bindings, 3);
+    }
+
+    // Local (point/spot) shadow atlas + comparison sampler at slot 8.
+    if (local_shadow_binding) {
+        SDL_BindGPUFragmentSamplers(pass, 8, local_shadow_binding, 1);
+    }
+
     if (cluster_light_data_ && cluster_offsets_ && cluster_indices_ && cluster_params_) {
-        SDL_GPUBuffer* bufs[3] = {cluster_light_data_, cluster_offsets_, cluster_indices_};
-        SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 3);
+        // 4th SSBO = local-shadow slot data; substitute the light-data buffer
+        // when local shadows are unavailable (declared but never read while
+        // every light's shadow_slot is -1).
+        SDL_GPUBuffer* slots = cluster_local_shadow_slots_ ? cluster_local_shadow_slots_ : cluster_light_data_;
+        SDL_GPUBuffer* bufs[4] = {cluster_light_data_, cluster_offsets_, cluster_indices_, slots};
+        SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4);
         SDL_PushGPUFragmentUniformData(cmd, 2, cluster_params_, static_cast<Uint32>(cluster_params_size_));
     }
 
@@ -535,67 +578,161 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
     // into ~10-30 row runs.
     // Fallback: if no frustum provided or no tiles, draw the whole mesh.
     if (frustum && !tiles_.empty()) {
-        draw_culled_tiles(pass, *frustum, tiles_, tile_rows_);
+        draw_culled_tiles(core::jobs::JobSystem::instance(), pass, *frustum, tiles_, tile_rows_);
     } else {
         SDL_DrawGPUIndexedPrimitives(pass, index_count_, 1, 0, 0, 0);
     }
 }
 
-void TerrainRenderer::build_tile_rows(const std::vector<TerrainTile>& tiles, std::vector<TileRow>& rows) {
+void TerrainRenderer::build_tile_rows(core::jobs::JobSystem& js, const std::vector<TerrainTile>& tiles,
+                                      std::vector<TileRow>& rows) {
     rows.clear();
-    float row_z = 0.0f;
-    for (size_t i = 0; i < tiles.size(); ++i) {
-        const TerrainTile& tile = tiles[i];
-        // Tiles are generated row-major, so tiles sharing a min-z band are
-        // contiguous; a z change starts a new row.
-        if (rows.empty() || tile.aabb_min.z != row_z) {
-            rows.push_back({i, 0, tile.aabb_min, tile.aabb_max});
-            row_z = tile.aabb_min.z;
+    if (tiles.empty()) {
+        return;
+    }
+
+    // Deterministic chunked fan-out (multithreading_plan §4.3/§6.2): tiles
+    // are grouped into rows per chunk (each chunk writes only its OWN
+    // cache-line-aligned partial), then partials merge single-threaded in
+    // chunk-index order, coalescing a z-band row that spans a chunk seam.
+    // Chunk boundaries depend only on the grain, so the result is identical
+    // to the serial scan at any worker count (the 1-worker / uninitialized
+    // pool runs the same lambda as one chunk into partials[0]).
+    const std::size_t grain = ROW_BUILD_TILE_GRAIN;
+    const std::size_t fanout_chunks = (tiles.size() + grain - 1) / grain;
+
+    struct alignas(core::jobs::k_cache_line) RowPartial {
+        std::vector<TileRow> rows;
+    };
+    std::vector<RowPartial> partials(fanout_chunks);
+
+    core::jobs::parallel_for(
+        js, 0, tiles.size(),
+        [&](std::size_t begin, std::size_t end) {
+            const std::size_t chunk_index = begin / grain;
+            BRACKEN_ASSERT(chunk_index < partials.size());
+            std::vector<TileRow>& out = partials[chunk_index].rows;
+            float row_z = 0.0f;
+            for (std::size_t i = begin; i < end; ++i) {
+                const TerrainTile& tile = tiles[i];
+                // Tiles are generated row-major, so tiles sharing a min-z band
+                // are contiguous; a z change starts a new row.
+                if (out.empty() || tile.aabb_min.z != row_z) {
+                    out.push_back({i, 0, tile.aabb_min, tile.aabb_max});
+                    row_z = tile.aabb_min.z;
+                }
+                TileRow& row = out.back();
+                ++row.tile_count;
+                row.aabb_min = glm::min(row.aabb_min, tile.aabb_min);
+                row.aabb_max = glm::max(row.aabb_max, tile.aabb_max);
+            }
+        },
+        grain);
+
+    // Single-threaded merge in chunk-index order. Every tile in a row shares
+    // the row's aabb_min.z (that's the grouping key), so a partial's first
+    // row continues the previous chunk's last row iff their z bands match.
+    for (const RowPartial& partial : partials) {
+        for (const TileRow& row : partial.rows) {
+            if (!rows.empty() && row.aabb_min.z == rows.back().aabb_min.z) {
+                TileRow& prev = rows.back();
+                prev.tile_count += row.tile_count;
+                prev.aabb_min = glm::min(prev.aabb_min, row.aabb_min);
+                prev.aabb_max = glm::max(prev.aabb_max, row.aabb_max);
+            } else {
+                rows.push_back(row);
+            }
         }
-        TileRow& row = rows.back();
-        ++row.tile_count;
-        row.aabb_min = glm::min(row.aabb_min, tile.aabb_min);
-        row.aabb_max = glm::max(row.aabb_max, tile.aabb_max);
     }
 }
 
-void TerrainRenderer::draw_culled_tiles(SDL_GPURenderPass* pass, const scene::Frustum& frustum,
-                                        const std::vector<TerrainTile>& tiles, const std::vector<TileRow>& rows) {
-    uint32_t run_first = 0;
-    uint32_t run_count = 0;
-    auto cull_and_merge_tile = [&](const TerrainTile& tile) {
-        if (!frustum.intersects_aabb(tile.aabb_min, tile.aabb_max)) {
-            return;
-        }
-        if (run_count > 0 && tile.first_index == run_first + run_count) {
-            run_count += tile.index_count;
+void TerrainRenderer::cull_tile_runs(core::jobs::JobSystem& js, const scene::Frustum& frustum,
+                                     const std::vector<TerrainTile>& tiles, const std::vector<TileRow>& rows,
+                                     std::vector<TileRun>& out_runs) {
+    out_runs.clear();
+
+    // Appends a visible tile to a run list, extending the tail run when the
+    // tile's index range is contiguous with it (tiles are stored row-major,
+    // back-to-back in the index buffer).
+    auto merge_tile = [](std::vector<TileRun>& runs, const TerrainTile& tile) {
+        if (!runs.empty() && tile.first_index == runs.back().first_index + runs.back().index_count) {
+            runs.back().index_count += tile.index_count;
         } else {
-            if (run_count > 0) {
-                SDL_DrawGPUIndexedPrimitives(pass, run_count, 1, run_first, 0, 0);
-            }
-            run_first = tile.first_index;
-            run_count = tile.index_count;
+            runs.push_back({tile.first_index, tile.index_count});
         }
     };
-    if (!rows.empty()) {
-        for (const auto& row : rows) {
-            // One AABB test skips the row's whole tile span when it lies
-            // outside the frustum (the common case: 80-95% of the world).
-            if (!frustum.intersects_aabb(row.aabb_min, row.aabb_max)) {
-                continue;
-            }
-            const size_t row_end = row.first_tile + row.tile_count;
-            for (size_t i = row.first_tile; i < row_end; ++i) {
-                cull_and_merge_tile(tiles[i]);
+
+    if (rows.empty()) {
+        // No row acceleration (unbuilt rows): plain serial tile walk.
+        for (const TerrainTile& tile : tiles) {
+            if (frustum.intersects_aabb(tile.aabb_min, tile.aabb_max)) {
+                merge_tile(out_runs, tile);
             }
         }
-    } else {
-        for (const auto& tile : tiles) {
-            cull_and_merge_tile(tile);
+        return;
+    }
+
+    // Deterministic chunked fan-out over tile rows (multithreading_plan
+    // §4.3/§6.2): each chunk culls its rows into its OWN cache-line-aligned
+    // partial run list; the contiguous-run merge below consumes partials
+    // single-threaded in chunk-index order, coalescing runs across chunk
+    // seams. Chunk boundaries depend only on the grain, so the run list is
+    // bit-identical to the serial walk at any worker count (1-worker /
+    // uninitialized pools run the same lambda as one chunk — granularity
+    // control, not a second code path).
+    const std::size_t grain = CULL_ROW_GRAIN;
+    const std::size_t fanout_chunks = (rows.size() + grain - 1) / grain;
+
+    struct alignas(core::jobs::k_cache_line) RunPartial {
+        std::vector<TileRun> runs;
+    };
+    std::vector<RunPartial> partials(fanout_chunks);
+
+    core::jobs::parallel_for(
+        js, 0, rows.size(),
+        [&](std::size_t begin, std::size_t end) {
+            const std::size_t chunk_index = begin / grain;
+            BRACKEN_ASSERT(chunk_index < partials.size());
+            std::vector<TileRun>& runs = partials[chunk_index].runs;
+            for (std::size_t r = begin; r < end; ++r) {
+                const TileRow& row = rows[r];
+                // One AABB test skips the row's whole tile span when it lies
+                // outside the frustum (the common case: 80-95% of the world).
+                if (!frustum.intersects_aabb(row.aabb_min, row.aabb_max)) {
+                    continue;
+                }
+                const std::size_t row_end = row.first_tile + row.tile_count;
+                for (std::size_t i = row.first_tile; i < row_end; ++i) {
+                    const TerrainTile& tile = tiles[i];
+                    if (frustum.intersects_aabb(tile.aabb_min, tile.aabb_max)) {
+                        merge_tile(runs, tile);
+                    }
+                }
+            }
+        },
+        grain);
+
+    // Single-threaded merge in chunk-index order; merge_tile-style coalescing
+    // across the seam reproduces the serial run structure exactly (runs
+    // within a partial are non-contiguous by construction, so only seam runs
+    // can fuse).
+    for (const RunPartial& partial : partials) {
+        for (const TileRun& run : partial.runs) {
+            if (!out_runs.empty() && run.first_index == out_runs.back().first_index + out_runs.back().index_count) {
+                out_runs.back().index_count += run.index_count;
+            } else {
+                out_runs.push_back(run);
+            }
         }
     }
-    if (run_count > 0) {
-        SDL_DrawGPUIndexedPrimitives(pass, run_count, 1, run_first, 0, 0);
+}
+
+void TerrainRenderer::draw_culled_tiles(core::jobs::JobSystem& js, SDL_GPURenderPass* pass,
+                                        const scene::Frustum& frustum, const std::vector<TerrainTile>& tiles,
+                                        const std::vector<TileRow>& rows) {
+    cull_tile_runs(js, frustum, tiles, rows, tile_runs_scratch_);
+    for (const TileRun& run : tile_runs_scratch_) {
+        SDL_DrawGPUIndexedPrimitives(pass, run.index_count, 1, run.first_index, 0, 0);
     }
 }
 
@@ -607,20 +744,52 @@ void TerrainRenderer::set_anisotropic_filter(float level) {
     // Clamp level to reasonable range (1.0 = no anisotropy, 16.0 = max typical)
     level = std::max(1.0f, std::min(16.0f, level));
 
-    // Recreate grass sampler with new anisotropy level
+    // Recreate the terrain material-array sampler with the new anisotropy level
     material_sampler_ = gpu::GPUSampler::create(*device_, gpu::SamplerConfig::anisotropic(level));
     if (!material_sampler_) {
-        SDL_Log("TerrainRenderer::set_anisotropic_filter: Failed to recreate grass sampler with level %.1f", level);
+        SDL_Log("TerrainRenderer::set_anisotropic_filter: Failed to recreate material sampler with level %.1f", level);
     }
 }
 
 void TerrainRenderer::set_cluster_lighting(SDL_GPUBuffer* light_data, SDL_GPUBuffer* cluster_offsets,
-                                           SDL_GPUBuffer* light_indices, const void* params, size_t params_size) {
+                                           SDL_GPUBuffer* light_indices, const void* params, size_t params_size,
+                                           SDL_GPUBuffer* local_shadow_slots) {
     cluster_light_data_ = light_data;
     cluster_offsets_ = cluster_offsets;
     cluster_indices_ = light_indices;
     cluster_params_ = params;
     cluster_params_size_ = params_size;
+    cluster_local_shadow_slots_ = local_shadow_slots;
+}
+
+void TerrainRenderer::render_prepass(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
+                                     const gpu::PrepassCameraUniforms& uniforms, const scene::Frustum* frustum) {
+    BRACKEN_PROFILE_ZONE_COLOR("TerrainRenderer::render_prepass", 0xC0392B);
+    if (!pipeline_registry_ || !vertex_buffer_ || !index_buffer_ || index_count_ == 0 || !pass || !cmd) {
+        return;
+    }
+
+    auto* pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::DepthPrepassTerrain);
+    if (!pipeline) {
+        return;
+    }
+
+    pipeline->bind(pass);
+    SDL_PushGPUVertexUniformData(cmd, 0, &uniforms, sizeof(uniforms));
+
+    // Full-LOD mesh + the same tile culling as render(): the forward pass
+    // depth-tests EQUAL, so the prepass must cover exactly the same geometry.
+    SDL_GPUBufferBinding vb_binding = {vertex_buffer_->handle(), 0};
+    SDL_BindGPUVertexBuffers(pass, 0, &vb_binding, 1);
+
+    SDL_GPUBufferBinding ib_binding = {index_buffer_->handle(), 0};
+    SDL_BindGPUIndexBuffer(pass, &ib_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+
+    if (frustum && !tiles_.empty()) {
+        draw_culled_tiles(core::jobs::JobSystem::instance(), pass, *frustum, tiles_, tile_rows_);
+    } else {
+        SDL_DrawGPUIndexedPrimitives(pass, index_count_, 1, 0, 0, 0);
+    }
 }
 
 void TerrainRenderer::render_shadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
@@ -663,7 +832,7 @@ void TerrainRenderer::render_shadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffe
     // single draws (same as the main pass).
     if (frustum && !tile_list->empty()) {
         const std::vector<TileRow>& rows = using_shadow_mesh ? shadow_tile_rows_ : tile_rows_;
-        draw_culled_tiles(pass, *frustum, *tile_list, rows);
+        draw_culled_tiles(core::jobs::JobSystem::instance(), pass, *frustum, *tile_list, rows);
     } else {
         SDL_DrawGPUIndexedPrimitives(pass, idx_count, 1, 0, 0, 0);
     }
@@ -783,7 +952,7 @@ void TerrainRenderer::generate_shadow_terrain_mesh() {
             }
         }
     }
-    build_tile_rows(shadow_tiles_, shadow_tile_rows_);
+    build_tile_rows(core::jobs::JobSystem::instance(), shadow_tiles_, shadow_tile_rows_);
 
     shadow_vertex_buffer_ = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Vertex, vertices.data(),
                                                           vertices.size() * sizeof(TerrainVertex));

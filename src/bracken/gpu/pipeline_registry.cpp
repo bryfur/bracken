@@ -1,4 +1,5 @@
 #include "pipeline_registry.hpp"
+#include "bracken/core/assert.hpp"
 #include "bracken/core/asset/file_watcher.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_device.hpp"
@@ -22,6 +23,8 @@ PipelineRegistry::~PipelineRegistry() {
 }
 
 bool PipelineRegistry::init(GPUDevice& device) {
+    // GPU resource creation/destruction is main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (device_) {
         SDL_Log("PipelineRegistry: Already initialized");
         return false;
@@ -50,12 +53,16 @@ bool PipelineRegistry::init(GPUDevice& device) {
 }
 
 void PipelineRegistry::shutdown() {
-    if (!device_ && pipelines_.empty() && !shader_manager_) {
+    if (!device_ && pipelines_.empty() && compute_pipelines_.empty() && !shader_manager_) {
         return; // Already shut down
     }
+    // GPU resource destruction is main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     pipelines_.clear();
+    compute_pipelines_.clear();
     shader_manager_.reset();
     device_ = nullptr;
+    preloaded_ = false;
     SDL_Log("PipelineRegistry: Shutdown complete");
 }
 
@@ -65,13 +72,43 @@ GPUPipeline* PipelineRegistry::get_pipeline(PipelineType type) {
         return nullptr;
     }
 
-    // Check cache first
+    // Hot path: read-only cache lookup — worker-safe once the full set was
+    // preloaded (no mutation happens on a hit).
     auto it = pipelines_.find(type);
     if (it != pipelines_.end()) {
         return it->second.get();
     }
 
-    // Create pipeline on demand
+    return create_and_cache_pipeline(type);
+}
+
+GPUPipeline* PipelineRegistry::create_and_cache_pipeline(PipelineType type) {
+    // Guarded creation path: cache mutation + SDL pipeline creation are
+    // main-thread tier. From Phase 5 onward (parallel recording) reaching
+    // this off the main thread is a contract violation, not just a race.
+    BRACKEN_ASSERT_MAIN_THREAD();
+    if (preloaded_) {
+        BRACKEN_LOG_WARN("gpu", "PipelineRegistry: lazy creation of {} pipeline after preload — "
+                                "the static pipeline enumeration is missing this variant",
+                         pipeline_type_to_string(type));
+    }
+
+    std::unique_ptr<GPUPipeline> pipeline = create_pipeline_uncached(type);
+
+    if (!pipeline) {
+        SDL_Log("PipelineRegistry: Failed to create %s pipeline", pipeline_type_to_string(type));
+        return nullptr;
+    }
+
+    SDL_Log("PipelineRegistry: Created %s pipeline", pipeline_type_to_string(type));
+
+    ++creation_count_;
+    auto* result = pipeline.get();
+    pipelines_[type] = std::move(pipeline);
+    return result;
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_pipeline_uncached(PipelineType type) {
     std::unique_ptr<GPUPipeline> pipeline;
 
     switch (type) {
@@ -117,11 +154,17 @@ GPUPipeline* PipelineRegistry::get_pipeline(PipelineType type) {
         case PipelineType::ShadowTerrain:
             pipeline = create_shadow_terrain_pipeline();
             break;
-        case PipelineType::SSAO:
-            pipeline = create_ssao_pipeline();
+        case PipelineType::LocalShadowClear:
+            pipeline = create_local_shadow_clear_pipeline();
             break;
         case PipelineType::GTAO:
             pipeline = create_gtao_pipeline();
+            break;
+        case PipelineType::GTAOTemporal:
+            pipeline = create_gtao_temporal_pipeline();
+            break;
+        case PipelineType::GTAOUpsample:
+            pipeline = create_gtao_upsample_pipeline();
             break;
         case PipelineType::BlurAO:
             pipeline = create_blur_ao_pipeline();
@@ -140,6 +183,24 @@ GPUPipeline* PipelineRegistry::get_pipeline(PipelineType type) {
             break;
         case PipelineType::Fxaa:
             pipeline = create_fxaa_pipeline();
+            break;
+        case PipelineType::TaaResolve:
+            pipeline = create_taa_resolve_pipeline();
+            break;
+        case PipelineType::TaaSharpen:
+            pipeline = create_taa_sharpen_pipeline();
+            break;
+        case PipelineType::SkyCapture:
+            pipeline = create_sky_capture_pipeline();
+            break;
+        case PipelineType::IblSpecularPrefilter:
+            pipeline = create_ibl_specular_prefilter_pipeline();
+            break;
+        case PipelineType::IblIrradiance:
+            pipeline = create_ibl_irradiance_pipeline();
+            break;
+        case PipelineType::IblBrdfLut:
+            pipeline = create_ibl_brdf_lut_pipeline();
             break;
         case PipelineType::ModelDoubleSided:
             pipeline = create_model_pipeline(false, true);
@@ -162,24 +223,130 @@ GPUPipeline* PipelineRegistry::get_pipeline(PipelineType type) {
         case PipelineType::InstancedModelDoubleSided:
             pipeline = create_instanced_model_pipeline(true);
             break;
+        case PipelineType::DepthPrepassModel:
+            pipeline = create_prepass_model_pipeline(false);
+            break;
+        case PipelineType::DepthPrepassModelDoubleSided:
+            pipeline = create_prepass_model_pipeline(true);
+            break;
+        case PipelineType::DepthPrepassSkinnedModel:
+            pipeline = create_prepass_skinned_model_pipeline(false);
+            break;
+        case PipelineType::DepthPrepassSkinnedModelDoubleSided:
+            pipeline = create_prepass_skinned_model_pipeline(true);
+            break;
+        case PipelineType::DepthPrepassInstancedModel:
+            pipeline = create_prepass_instanced_model_pipeline(false);
+            break;
+        case PipelineType::DepthPrepassInstancedModelDoubleSided:
+            pipeline = create_prepass_instanced_model_pipeline(true);
+            break;
+        case PipelineType::DepthPrepassTerrain:
+            pipeline = create_prepass_terrain_pipeline();
+            break;
+        case PipelineType::DepthPrepassGrass:
+            pipeline = create_prepass_grass_pipeline();
+            break;
+        case PipelineType::ModelDepthEqual:
+            pipeline = create_model_pipeline(false, false, true);
+            break;
+        case PipelineType::ModelDoubleSidedDepthEqual:
+            pipeline = create_model_pipeline(false, true, true);
+            break;
+        case PipelineType::SkinnedModelDepthEqual:
+            pipeline = create_skinned_model_pipeline(false, false, true);
+            break;
+        case PipelineType::SkinnedModelDoubleSidedDepthEqual:
+            pipeline = create_skinned_model_pipeline(false, true, true);
+            break;
+        case PipelineType::InstancedModelDepthEqual:
+            pipeline = create_instanced_model_pipeline(false, true);
+            break;
+        case PipelineType::InstancedModelDoubleSidedDepthEqual:
+            pipeline = create_instanced_model_pipeline(true, true);
+            break;
+        case PipelineType::TerrainDepthEqual:
+            pipeline = create_terrain_pipeline(true);
+            break;
+        case PipelineType::GrassDepthEqual:
+            pipeline = create_grass_pipeline(true);
+            break;
+        case PipelineType::DepthPrepassModelMasked:
+            pipeline = create_prepass_model_masked_pipeline();
+            break;
+        case PipelineType::DepthPrepassInstancedModelMasked:
+            pipeline = create_prepass_instanced_model_masked_pipeline();
+            break;
+        case PipelineType::Water:
+            pipeline = create_water_pipeline();
+            break;
         default:
             SDL_Log("PipelineRegistry: Unknown pipeline type %d", static_cast<int>(type));
             return nullptr;
     }
 
-    if (!pipeline) {
-        SDL_Log("PipelineRegistry: Failed to create %s pipeline", pipeline_type_to_string(type));
+    return pipeline;
+}
+
+GPUComputePipeline* PipelineRegistry::get_compute_pipeline(ComputePipelineType type) {
+    if (!device_) {
+        SDL_Log("PipelineRegistry: Not initialized");
         return nullptr;
     }
 
-    SDL_Log("PipelineRegistry: Created %s pipeline", pipeline_type_to_string(type));
+    // Hot path: read-only cache lookup — worker-safe once preloaded.
+    auto it = compute_pipelines_.find(type);
+    if (it != compute_pipelines_.end()) {
+        return it->second.get();
+    }
 
+    return create_and_cache_compute_pipeline(type);
+}
+
+GPUComputePipeline* PipelineRegistry::create_and_cache_compute_pipeline(ComputePipelineType type) {
+    // Same guarded creation contract as create_and_cache_pipeline.
+    BRACKEN_ASSERT_MAIN_THREAD();
+    if (preloaded_) {
+        BRACKEN_LOG_WARN("gpu", "PipelineRegistry: lazy creation of {} compute pipeline after preload — "
+                                "the static pipeline enumeration is missing this variant",
+                         compute_pipeline_type_to_string(type));
+    }
+
+    std::unique_ptr<GPUComputePipeline> pipeline = create_compute_pipeline_uncached(type);
+
+    if (!pipeline) {
+        SDL_Log("PipelineRegistry: Failed to create %s compute pipeline", compute_pipeline_type_to_string(type));
+        return nullptr;
+    }
+
+    SDL_Log("PipelineRegistry: Created %s compute pipeline", compute_pipeline_type_to_string(type));
+
+    ++creation_count_;
     auto* result = pipeline.get();
-    pipelines_[type] = std::move(pipeline);
+    compute_pipelines_[type] = std::move(pipeline);
     return result;
 }
 
+std::unique_ptr<GPUComputePipeline> PipelineRegistry::create_compute_pipeline_uncached(ComputePipelineType type) {
+    switch (type) {
+        case ComputePipelineType::ExposureHistogram:
+            return create_exposure_histogram_pipeline();
+        case ComputePipelineType::ExposureAdapt:
+            return create_exposure_adapt_pipeline();
+        case ComputePipelineType::WaterSim:
+            return create_water_sim_pipeline();
+        default:
+            SDL_Log("PipelineRegistry: Unknown compute pipeline type %d", static_cast<int>(type));
+            return nullptr;
+    }
+}
+
 bool PipelineRegistry::preload_all_pipelines() {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    if (!device_) {
+        SDL_Log("PipelineRegistry: preload_all_pipelines called before init");
+        return false;
+    }
     SDL_Log("PipelineRegistry: Preloading all pipelines...");
 
     bool success = true;
@@ -190,20 +357,38 @@ bool PipelineRegistry::preload_all_pipelines() {
             success = false;
         }
     }
+    for (int i = 0; i < static_cast<int>(ComputePipelineType::Count); ++i) {
+        auto type = static_cast<ComputePipelineType>(i);
+        if (!get_compute_pipeline(type)) {
+            SDL_Log("PipelineRegistry: Failed to preload %s compute pipeline", compute_pipeline_type_to_string(type));
+            success = false;
+        }
+    }
 
-    SDL_Log("PipelineRegistry: Preloaded %zu pipelines", pipelines_.size());
+    // The full enumeration has been walked; from here on, get_pipeline /
+    // get_compute_pipeline are read-only lookups and any creation is logged
+    // as an enumeration gap. Set even on partial failure — a variant that
+    // failed to create here will fail identically on a lazy retry.
+    preloaded_ = true;
+
+    SDL_Log("PipelineRegistry: Preloaded %zu pipelines", pipelines_.size() + compute_pipelines_.size());
     return success;
 }
 
 void PipelineRegistry::invalidate_all() {
+    // Cache mutation + (deferred) GPU pipeline release: main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     pipelines_.clear();
+    compute_pipelines_.clear();
     if (shader_manager_) {
         shader_manager_->clear_cache();
     }
+    preloaded_ = false; // caller must preload_all_pipelines() again
     SDL_Log("PipelineRegistry: All pipelines invalidated");
 }
 
 void PipelineRegistry::set_swapchain_format(SDL_GPUTextureFormat format) {
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (format == swapchain_format_) {
         return;
     }
@@ -220,9 +405,26 @@ void PipelineRegistry::set_swapchain_format(SDL_GPUTextureFormat format) {
         invalidated += pipelines_.erase(type);
     }
     SDL_Log("PipelineRegistry: Swapchain format changed, invalidated %zu swapchain-dependent pipelines", invalidated);
+
+    // Keep the pre-creation contract: if the registry was already preloaded,
+    // re-create the affected pipelines now instead of leaving lazy creation
+    // for the next hot-path lookup. Drop preloaded_ for the duration so this
+    // intentional eager re-creation is not logged as an enumeration gap.
+    if (preloaded_ && invalidated > 0) {
+        preloaded_ = false;
+        for (PipelineType type : swapchain_dependent) {
+            if (!create_and_cache_pipeline(type)) {
+                SDL_Log("PipelineRegistry: Failed to re-create %s pipeline after swapchain format change",
+                        pipeline_type_to_string(type));
+            }
+        }
+        preloaded_ = true;
+    }
 }
 
 void PipelineRegistry::enable_hot_reload(core::asset::FileWatcher& watcher) {
+    // FileWatcher entry points are main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
         BRACKEN_LOG_WARN("hot_reload", "PipelineRegistry::enable_hot_reload called before init");
         return;
@@ -230,15 +432,28 @@ void PipelineRegistry::enable_hot_reload(core::asset::FileWatcher& watcher) {
     if (watcher_ != nullptr) {
         return;
     }
-    watcher_ = &watcher;
-    shader_watch_handle_ = watcher_->watch_directory(shader_path_, ".spv", [this](const std::filesystem::path& p) {
+    uint32_t handle = watcher.watch_directory(shader_path_, ".spv", [this](const std::filesystem::path& p) {
         BRACKEN_LOG_INFO("hot_reload", "Shader changed: {} -- rebuilding pipelines", p.filename().string());
         reload_all_pipelines();
     });
+    if (handle == core::asset::FileWatcher::k_invalid_handle) {
+        // Leave watcher_ null so a later call (e.g. after the host initializes
+        // the FileWatcher) can retry instead of being blocked by the latch.
+        BRACKEN_LOG_WARN("hot_reload",
+                         "PipelineRegistry: watch_directory failed for {} (FileWatcher not initialized?); "
+                         "shader hot-reload NOT enabled",
+                         shader_path_);
+        return;
+    }
+    watcher_ = &watcher;
+    shader_watch_handle_ = handle;
     BRACKEN_LOG_INFO("hot_reload", "PipelineRegistry hot-reload enabled at {}", shader_path_);
 }
 
 void PipelineRegistry::reload_all_pipelines() {
+    // Hot-reload apply is main-thread tier (the FileWatcher hands callbacks
+    // to the main thread); re-creation is eager, never left to lazy lookup.
+    BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
         return;
     }
@@ -252,14 +467,15 @@ void PipelineRegistry::reload_all_pipelines() {
 // Pipeline Creation Methods
 // =============================================================================
 
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_model_pipeline(bool alpha_blend, bool double_sided) {
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_model_pipeline(bool alpha_blend, bool double_sided,
+                                                                     bool depth_equal) {
     ShaderResources vs_resources;
     vs_resources.num_uniform_buffers = 1;
 
     ShaderResources fs_resources;
     fs_resources.num_uniform_buffers = 3; // lighting + shadow data + cluster params
-    fs_resources.num_samplers = 6;        // baseColor + shadow atlas (cmp + raw) + normal + metallic-roughness + emissive
-    fs_resources.num_storage_buffers = 3; // light data + cluster offsets + light indices
+    fs_resources.num_samplers = 11;       // baseColor + shadow atlas (cmp + raw) + normal + metallic-roughness + emissive + screen AO + IBL (irradiance/prefiltered/BRDF LUT) + local-shadow atlas
+    fs_resources.num_storage_buffers = 4; // light data + cluster offsets + light indices + local-shadow slots
 
     auto* vs = shader_manager_->get(shader_path_ + "model.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
     auto* fs = shader_manager_->get(shader_path_ + "model.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
@@ -282,21 +498,27 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_model_pipeline(bool alpha_
     if (double_sided) {
         config.no_cull(); // glTF doubleSided
     }
+    if (depth_equal) {
+        // Post-prepass forward variant: depth was laid down by the depth
+        // prepass, so test EQUAL and skip the redundant depth write.
+        config.depth_compare_op = SDL_GPU_COMPAREOP_EQUAL;
+        config.depth_write_enable = false;
+    }
     config.color_format = scene_color_format_;
     config.depth_format = depth_format_;
 
     return GPUPipeline::create(*device_, config);
 }
 
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_instanced_model_pipeline(bool double_sided) {
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_instanced_model_pipeline(bool double_sided, bool depth_equal) {
     ShaderResources vs_resources;
     vs_resources.num_uniform_buffers = 1; // camera uniforms
     vs_resources.num_storage_buffers = 1; // instance data
 
     ShaderResources fs_resources;
     fs_resources.num_uniform_buffers = 3; // lighting + shadow data + cluster params
-    fs_resources.num_samplers = 6;        // baseColor + shadow atlas (cmp + raw) + normal + metallic-roughness + emissive
-    fs_resources.num_storage_buffers = 3; // light data + cluster offsets + light indices
+    fs_resources.num_samplers = 11;       // baseColor + shadow atlas (cmp + raw) + normal + metallic-roughness + emissive + screen AO + IBL (irradiance/prefiltered/BRDF LUT) + local-shadow atlas
+    fs_resources.num_storage_buffers = 4; // light data + cluster offsets + light indices + local-shadow slots
 
     auto* vs =
         shader_manager_->get(shader_path_ + "model_instanced.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
@@ -313,6 +535,10 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_instanced_model_pipeline(b
     config.with_vertex3d().opaque();
     if (double_sided) {
         config.no_cull(); // glTF doubleSided
+    }
+    if (depth_equal) {
+        config.depth_compare_op = SDL_GPU_COMPAREOP_EQUAL;
+        config.depth_write_enable = false;
     }
     config.color_format = scene_color_format_;
     config.depth_format = depth_format_;
@@ -356,15 +582,16 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_instanced_shadow_model_pip
     return GPUPipeline::create(*device_, config);
 }
 
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_skinned_model_pipeline(bool alpha_blend, bool double_sided) {
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_skinned_model_pipeline(bool alpha_blend, bool double_sided,
+                                                                             bool depth_equal) {
     ShaderResources vs_resources;
     vs_resources.num_uniform_buffers = 1; // transform (incl. palette offset)
     vs_resources.num_storage_buffers = 1; // tightly packed bone palettes
 
     ShaderResources fs_resources;
     fs_resources.num_uniform_buffers = 3; // lighting + shadow data + cluster params
-    fs_resources.num_samplers = 6;        // baseColor + shadow atlas (cmp + raw) + normal + metallic-roughness + emissive
-    fs_resources.num_storage_buffers = 3; // light data + cluster offsets + light indices
+    fs_resources.num_samplers = 11;       // baseColor + shadow atlas (cmp + raw) + normal + metallic-roughness + emissive + screen AO + IBL (irradiance/prefiltered/BRDF LUT) + local-shadow atlas
+    fs_resources.num_storage_buffers = 4; // light data + cluster offsets + light indices + local-shadow slots
 
     auto* vs =
         shader_manager_->get(shader_path_ + "skinned_model.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
@@ -388,20 +615,24 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_skinned_model_pipeline(boo
     if (double_sided) {
         config.no_cull(); // glTF doubleSided
     }
+    if (depth_equal) {
+        config.depth_compare_op = SDL_GPU_COMPAREOP_EQUAL;
+        config.depth_write_enable = false;
+    }
     config.color_format = scene_color_format_;
     config.depth_format = depth_format_;
 
     return GPUPipeline::create(*device_, config);
 }
 
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_terrain_pipeline() {
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_terrain_pipeline(bool depth_equal) {
     ShaderResources vs_resources;
     vs_resources.num_uniform_buffers = 1;
 
     ShaderResources fs_resources;
     fs_resources.num_uniform_buffers = 3; // lighting + shadow data + cluster params
-    fs_resources.num_samplers = 4;        // material array + splatmap + shadow atlas (cmp + raw)
-    fs_resources.num_storage_buffers = 3; // light data + cluster offsets + light indices
+    fs_resources.num_samplers = 9;        // material array + splatmap + shadow atlas (cmp + raw) + screen AO + IBL (irradiance/prefiltered/BRDF LUT) + local-shadow atlas
+    fs_resources.num_storage_buffers = 4; // light data + cluster offsets + light indices + local-shadow slots
 
     auto* vs = shader_manager_->get(shader_path_ + "terrain.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
     auto* fs = shader_manager_->get(shader_path_ + "terrain.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
@@ -428,6 +659,10 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_terrain_pipeline() {
     };
 
     config.opaque();
+    if (depth_equal) {
+        config.depth_compare_op = SDL_GPU_COMPAREOP_EQUAL;
+        config.depth_write_enable = false;
+    }
     config.color_format = scene_color_format_;
     config.depth_format = depth_format_;
 
@@ -604,7 +839,7 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_particle_pipeline() {
     return GPUPipeline::create(*device_, config);
 }
 
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_grass_pipeline() {
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_grass_pipeline(bool depth_equal) {
     ShaderResources vs_resources;
     vs_resources.num_uniform_buffers = 1;
     vs_resources.num_samplers = 2;        // heightmap + splatmap textures
@@ -612,8 +847,8 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_grass_pipeline() {
 
     ShaderResources fs_resources;
     fs_resources.num_uniform_buffers = 3; // lighting + shadow data + cluster params
-    fs_resources.num_samplers = 2;        // shadow atlas (cmp + raw)
-    fs_resources.num_storage_buffers = 3; // light data + cluster offsets + light indices
+    fs_resources.num_samplers = 7;        // shadow atlas (cmp + raw) + screen AO + IBL (irradiance/prefiltered/BRDF LUT) + local-shadow atlas
+    fs_resources.num_storage_buffers = 4; // light data + cluster offsets + light indices + local-shadow slots
 
     auto* vs = shader_manager_->get(shader_path_ + "grass.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
     auto* fs = shader_manager_->get(shader_path_ + "grass.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
@@ -626,7 +861,255 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_grass_pipeline() {
     config.vertex_shader = vs->handle();
     config.fragment_shader = fs->handle();
     config.with_vertex3d().opaque().no_cull();
+    if (depth_equal) {
+        config.depth_compare_op = SDL_GPU_COMPAREOP_EQUAL;
+        config.depth_write_enable = false;
+    }
     config.color_format = scene_color_format_;
+    config.depth_format = depth_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+// =============================================================================
+// Depth-prepass pipelines
+// =============================================================================
+// All prepass pipelines share prepass_velocity.frag (zero fragment resources),
+// render into the RG16F velocity target + the scene depth target, and keep the
+// scene's reversed-Z GREATER_OR_EQUAL compare with depth writes ON. Vertex
+// buffers are the same as the forward pass; only the position(-and-skinning)
+// attributes are declared.
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_prepass_model_pipeline(bool double_sided) {
+    ShaderResources vs_resources;
+    vs_resources.num_uniform_buffers = 1; // PrepassModelUniforms
+
+    ShaderResources fs_resources; // velocity output only, no resources
+
+    auto* vs =
+        shader_manager_->get(shader_path_ + "prepass_model.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs = shader_manager_->get(shader_path_ + "prepass_velocity.frag.spv", ShaderStage::Fragment, "PSMain",
+                                    fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    // Forward Vertex3D stride, position attribute only.
+    config.vertex_buffers = {get_vertex3d_buffer_desc()};
+    config.vertex_attributes = {
+        {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, position)},
+    };
+    config.opaque();
+    if (double_sided) {
+        config.no_cull();
+    }
+    config.color_format = velocity_format_;
+    config.depth_format = depth_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_prepass_skinned_model_pipeline(bool double_sided) {
+    ShaderResources vs_resources;
+    vs_resources.num_uniform_buffers = 1; // PrepassModelUniforms
+    vs_resources.num_storage_buffers = 2; // current + previous bone palettes
+
+    ShaderResources fs_resources;
+
+    auto* vs =
+        shader_manager_->get(shader_path_ + "prepass_skinned.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs = shader_manager_->get(shader_path_ + "prepass_velocity.frag.spv", ShaderStage::Fragment, "PSMain",
+                                    fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    // Forward SkinnedVertex stride; position + joints + weights only.
+    config.vertex_buffers = {get_skinned_vertex_buffer_desc()};
+    config.vertex_attributes = {
+        {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(SkinnedVertex, position)},
+        {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4, offsetof(SkinnedVertex, joints)},
+        {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, offsetof(SkinnedVertex, weights)},
+    };
+    config.opaque();
+    if (double_sided) {
+        config.no_cull();
+    }
+    config.color_format = velocity_format_;
+    config.depth_format = depth_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_prepass_instanced_model_pipeline(bool double_sided) {
+    ShaderResources vs_resources;
+    vs_resources.num_uniform_buffers = 1; // PrepassCameraUniforms
+    vs_resources.num_storage_buffers = 1; // shared InstanceData buffer
+
+    ShaderResources fs_resources;
+
+    auto* vs =
+        shader_manager_->get(shader_path_ + "prepass_instanced.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs = shader_manager_->get(shader_path_ + "prepass_velocity.frag.spv", ShaderStage::Fragment, "PSMain",
+                                    fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.vertex_buffers = {get_vertex3d_buffer_desc()};
+    config.vertex_attributes = {
+        {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, position)},
+    };
+    config.opaque();
+    if (double_sided) {
+        config.no_cull();
+    }
+    config.color_format = velocity_format_;
+    config.depth_format = depth_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_prepass_model_masked_pipeline() {
+    ShaderResources vs_resources;
+    vs_resources.num_uniform_buffers = 1; // PrepassModelUniforms
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // PrepassMaskedUniforms (alpha cutoff)
+    fs_resources.num_samplers = 1;        // base color (alpha test)
+
+    auto* vs = shader_manager_->get(shader_path_ + "prepass_model_masked.vert.spv", ShaderStage::Vertex, "VSMain",
+                                    vs_resources);
+    auto* fs = shader_manager_->get(shader_path_ + "prepass_velocity_masked.frag.spv", ShaderStage::Fragment,
+                                    "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.vertex_buffers = {get_vertex3d_buffer_desc()};
+    config.vertex_attributes = {
+        {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, position)},
+        {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(Vertex3D, texcoord)},
+    };
+    config.opaque().no_cull(); // MASK foliage is double-sided in practice
+    config.color_format = velocity_format_;
+    config.depth_format = depth_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_prepass_instanced_model_masked_pipeline() {
+    ShaderResources vs_resources;
+    vs_resources.num_uniform_buffers = 1; // PrepassCameraUniforms
+    vs_resources.num_storage_buffers = 1; // shared InstanceData buffer
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // PrepassMaskedUniforms (alpha cutoff)
+    fs_resources.num_samplers = 1;        // base color (alpha test)
+
+    auto* vs = shader_manager_->get(shader_path_ + "prepass_instanced_masked.vert.spv", ShaderStage::Vertex,
+                                    "VSMain", vs_resources);
+    auto* fs = shader_manager_->get(shader_path_ + "prepass_velocity_masked.frag.spv", ShaderStage::Fragment,
+                                    "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.vertex_buffers = {get_vertex3d_buffer_desc()};
+    config.vertex_attributes = {
+        {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, position)},
+        {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(Vertex3D, texcoord)},
+    };
+    config.opaque().no_cull();
+    config.color_format = velocity_format_;
+    config.depth_format = depth_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_prepass_terrain_pipeline() {
+    ShaderResources vs_resources;
+    vs_resources.num_uniform_buffers = 1; // PrepassCameraUniforms
+
+    ShaderResources fs_resources;
+
+    auto* vs =
+        shader_manager_->get(shader_path_ + "prepass_terrain.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs = shader_manager_->get(shader_path_ + "prepass_velocity.frag.spv", ShaderStage::Fragment, "PSMain",
+                                    fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    // Forward terrain stride (12 floats), position attribute only.
+    config.vertex_buffers = {{.slot = 0,
+                              .pitch = sizeof(float) * 12,
+                              .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX,
+                              .instance_step_rate = 0}};
+    config.vertex_attributes = {
+        {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0},
+    };
+    config.opaque();
+    config.color_format = velocity_format_;
+    config.depth_format = depth_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_prepass_grass_pipeline() {
+    // Same vertex-stage resources as the forward grass pipeline: the prepass
+    // shader runs the identical blade placement math (grass_blade.hlsli).
+    ShaderResources vs_resources;
+    vs_resources.num_uniform_buffers = 1; // GrassUniforms (identical layout)
+    vs_resources.num_samplers = 2;        // heightmap + splatmap
+    vs_resources.num_storage_buffers = 1; // visible-chunk origins
+
+    ShaderResources fs_resources;
+
+    auto* vs =
+        shader_manager_->get(shader_path_ + "prepass_grass.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs = shader_manager_->get(shader_path_ + "prepass_velocity.frag.spv", ShaderStage::Fragment, "PSMain",
+                                    fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    // Forward Vertex3D stride, position attribute only; no_cull matches the
+    // forward grass pipeline so the EQUAL depth coverage is identical.
+    config.vertex_buffers = {get_vertex3d_buffer_desc()};
+    config.vertex_attributes = {
+        {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, position)},
+    };
+    config.opaque().no_cull();
+    config.color_format = velocity_format_;
     config.depth_format = depth_format_;
 
     return GPUPipeline::create(*device_, config);
@@ -732,15 +1215,18 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_shadow_terrain_pipeline() 
     return GPUPipeline::create(*device_, config);
 }
 
-std::unique_ptr<GPUPipeline> PipelineRegistry::create_ssao_pipeline() {
-    ShaderResources vs_resources;
-
-    ShaderResources fs_resources;
-    fs_resources.num_uniform_buffers = 1;
-    fs_resources.num_samplers = 1;
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_local_shadow_clear_pipeline() {
+    // Per-tile depth clear for the local-shadow atlas: cached tiles persist
+    // across frames (the atlas pass LOADs), so a dirty tile is "cleared" by
+    // drawing the fullscreen triangle over its viewport with the depth range
+    // pinned to [1,1] (far plane) and an ALWAYS depth test. No new shaders:
+    // fullscreen.vert + the empty opaque shadow fragment.
+    ShaderResources vs_resources; // fullscreen triangle from SV_VertexID
+    ShaderResources fs_resources; // empty fragment, no outputs
 
     auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
-    auto* fs = shader_manager_->get(shader_path_ + "ssao.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+    auto* fs = shader_manager_->get(shader_path_ + "shadow_depth_opaque.frag.spv", ShaderStage::Fragment, "PSMain",
+                                    fs_resources);
 
     if (!vs || !fs) {
         return nullptr;
@@ -749,8 +1235,10 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_ssao_pipeline() {
     PipelineConfig config;
     config.vertex_shader = vs->handle();
     config.fragment_shader = fs->handle();
-    config.opaque().no_depth().no_cull();
-    config.color_format = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
+    config.opaque().no_cull();
+    config.depth_compare_op = SDL_GPU_COMPAREOP_ALWAYS;
+    config.color_format = SDL_GPU_TEXTUREFORMAT_INVALID; // depth-only
+    config.depth_format = depth_format_;
 
     return GPUPipeline::create(*device_, config);
 }
@@ -774,6 +1262,55 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_gtao_pipeline() {
     config.vertex_shader = vs->handle();
     config.fragment_shader = fs->handle();
     // No vertex input (fullscreen triangle from SV_VertexID)
+    config.opaque().no_depth().no_cull();
+    config.color_format = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_gtao_temporal_pipeline() {
+    ShaderResources vs_resources;
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // GtaoTemporalUniforms
+    fs_resources.num_samplers = 4;        // raw AO + history + velocity + depth
+
+    auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs =
+        shader_manager_->get(shader_path_ + "gtao_temporal.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.opaque().no_depth().no_cull();
+    // RG16F history: R = accumulated AO, G = linear view depth (disocclusion reject).
+    config.color_format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_gtao_upsample_pipeline() {
+    ShaderResources vs_resources;
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // GtaoUpsampleUniforms
+    fs_resources.num_samplers = 2;        // blurred AO + depth texture
+
+    auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs =
+        shader_manager_->get(shader_path_ + "gtao_upsample.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
     config.opaque().no_depth().no_cull();
     config.color_format = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
 
@@ -808,7 +1345,8 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_composite_pipeline() {
 
     ShaderResources fs_resources;
     fs_resources.num_uniform_buffers = 1; // CompositeUniforms
-    fs_resources.num_samplers = 5;        // color + AO + bloom + volumetric fog + depth
+    fs_resources.num_samplers = 4;        // color + bloom + volumetric fog + depth
+    fs_resources.num_storage_buffers = 1; // auto-exposure state (AutoExposure or dummy)
 
     auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
     auto* fs = shader_manager_->get(shader_path_ + "composite.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
@@ -922,6 +1460,227 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_fxaa_pipeline() {
     config.color_format = swapchain_format_;
 
     return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_taa_resolve_pipeline() {
+    ShaderResources vs_resources;
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // TaaResolveUniforms
+    fs_resources.num_samplers = 4;        // scene color + history + velocity + depth
+
+    auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs =
+        shader_manager_->get(shader_path_ + "taa_resolve.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.opaque().no_depth().no_cull();
+    // Writes the RGBA16F history buffer (same format as the HDR scene target).
+    config.color_format = scene_color_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_taa_sharpen_pipeline() {
+    ShaderResources vs_resources;
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // TaaSharpenUniforms
+    fs_resources.num_samplers = 1;        // resolved history
+
+    auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs =
+        shader_manager_->get(shader_path_ + "taa_sharpen.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.opaque().no_depth().no_cull();
+    // Writes back over the HDR offscreen scene target for bloom/composite.
+    config.color_format = scene_color_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_sky_capture_pipeline() {
+    ShaderResources vs_resources;
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // SkyCaptureUniforms
+
+    auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs =
+        shader_manager_->get(shader_path_ + "sky_capture.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.opaque().no_depth().no_cull();
+    // Targets one face of the RGBA16F sky-capture cube (linear HDR radiance).
+    config.color_format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_ibl_specular_prefilter_pipeline() {
+    ShaderResources vs_resources;
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // IblFilterUniforms
+    fs_resources.num_samplers = 1;        // sky-capture cube
+
+    auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs =
+        shader_manager_->get(shader_path_ + "ibl_prefilter.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.opaque().no_depth().no_cull();
+    // Targets one (face, mip) of the RGBA16F prefiltered specular cube.
+    config.color_format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_ibl_irradiance_pipeline() {
+    ShaderResources vs_resources;
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // IblFilterUniforms
+    fs_resources.num_samplers = 1;        // sky-capture cube
+
+    auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs =
+        shader_manager_->get(shader_path_ + "ibl_irradiance.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.opaque().no_depth().no_cull();
+    // Targets one face of the RGBA16F irradiance cube.
+    config.color_format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_ibl_brdf_lut_pipeline() {
+    ShaderResources vs_resources;
+
+    ShaderResources fs_resources; // fully procedural: no uniforms, no samplers
+
+    auto* vs = shader_manager_->get(shader_path_ + "fullscreen.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs =
+        shader_manager_->get(shader_path_ + "ibl_brdf_lut.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+    config.opaque().no_depth().no_cull();
+    // Split-sum (A, B) pair per texel.
+    config.color_format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+std::unique_ptr<GPUPipeline> PipelineRegistry::create_water_pipeline() {
+    ShaderResources vs_resources;
+    vs_resources.num_uniform_buffers = 1; // WaterRenderer::VertexUniforms
+    vs_resources.num_samplers = 1;        // sim height state (vertex displacement)
+
+    ShaderResources fs_resources;
+    fs_resources.num_uniform_buffers = 1; // WaterRenderer::FragmentUniforms
+    fs_resources.num_samplers = 4;        // scene color copy, scene depth copy, sim state, IBL specular
+
+    auto* vs = shader_manager_->get(shader_path_ + "water.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
+    auto* fs = shader_manager_->get(shader_path_ + "water.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);
+    if (!vs || !fs) {
+        return nullptr;
+    }
+
+    PipelineConfig config;
+    config.vertex_shader = vs->handle();
+    config.fragment_shader = fs->handle();
+
+    // Minimal grid vertex: float2 world-space XZ (the VS lifts it to the
+    // water level and displaces by the simulation height field).
+    SDL_GPUVertexBufferDescription vb = {};
+    vb.slot = 0;
+    vb.pitch = sizeof(float) * 2;
+    vb.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+    config.vertex_buffers = {vb};
+    SDL_GPUVertexAttribute attr = {};
+    attr.location = 0;
+    attr.buffer_slot = 0;
+    attr.format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2;
+    attr.offset = 0;
+    config.vertex_attributes = {attr};
+
+    // Refraction/reflection blending is composited in-shader from the scene
+    // copies, so the pipeline itself is opaque; depth test + write stay on
+    // (reversed-Z default) so fog, TAA reprojection and later transparents
+    // see the water surface in the depth buffer.
+    config.opaque().no_cull();
+    config.color_format = scene_color_format_;
+    config.depth_format = depth_format_;
+
+    return GPUPipeline::create(*device_, config);
+}
+
+// =============================================================================
+// Compute pipelines
+// =============================================================================
+
+std::unique_ptr<GPUComputePipeline> PipelineRegistry::create_exposure_histogram_pipeline() {
+    ComputeResources resources;
+    resources.num_samplers = 1;                  // HDR scene color
+    resources.num_readwrite_storage_buffers = 1; // histogram bins
+    resources.num_uniform_buffers = 1;           // ExposureHistogramUniforms
+
+    return GPUComputePipeline::load_spirv(*device_, shader_path_ + "exposure_histogram.comp.spv", "CSMain", resources);
+}
+
+std::unique_ptr<GPUComputePipeline> PipelineRegistry::create_exposure_adapt_pipeline() {
+    ComputeResources resources;
+    resources.num_readwrite_storage_buffers = 2; // histogram bins (read + reset) + exposure state
+    resources.num_uniform_buffers = 1;           // ExposureAdaptUniforms
+
+    return GPUComputePipeline::load_spirv(*device_, shader_path_ + "exposure_adapt.comp.spv", "CSMain", resources);
+}
+
+std::unique_ptr<GPUComputePipeline> PipelineRegistry::create_water_sim_pipeline() {
+    ComputeResources resources;
+    resources.num_readonly_storage_textures = 1;  // previous wave state
+    resources.num_readwrite_storage_textures = 1; // next wave state
+    resources.num_uniform_buffers = 1;            // WaterRenderer::SimUniforms
+
+    return GPUComputePipeline::load_spirv(*device_, shader_path_ + "water_sim.comp.spv", "CSMain", resources);
 }
 
 } // namespace bracken::gpu

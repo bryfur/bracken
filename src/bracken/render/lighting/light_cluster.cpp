@@ -1,22 +1,30 @@
 #include "bracken/render/lighting/light_cluster.hpp"
 
+#include "bracken/core/jobs/job_system.hpp"
+#include "bracken/core/jobs/parallel_for.hpp"
 #include "bracken/core/profiler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <limits>
-#include <SDL3/SDL_error.h>
 #include <SDL3/SDL_log.h>
 
 namespace bracken::render::lighting {
 
 namespace {
 
-// Std140 layout sanity. PointLight: 2 vec3+float in 32B. SpotLight: 4 vec4 in 64B.
-static_assert(sizeof(PointLight) == 32, "PointLight must be 32 bytes (std140)");
+// Std140 layout sanity. PointLight: 3 float4-sized rows in 48B, SpotLight: 4
+// in 64B (the third/fourth row carries casts_shadows + the engine-assigned
+// shadow_slot the shader reads — cluster_lighting.hlsli loadPointLight/
+// loadSpotLight hardcode these strides and the shadow_slot byte offsets).
+static_assert(sizeof(PointLight) == 48, "PointLight must be 48 bytes (std140)");
+static_assert(offsetof(PointLight, shadow_slot) == 36, "PointLight::shadow_slot read at byte 36 by the shader");
 static_assert(sizeof(SpotLight) == 64, "SpotLight must be 64 bytes (std140)");
+static_assert(offsetof(SpotLight, shadow_slot) == 56, "SpotLight::shadow_slot read at byte 56 by the shader");
 static_assert(sizeof(LightHeader) == 8, "LightHeader must be 8 bytes");
 
 // Single GPU layout combining headers + point payloads + spot payloads.
@@ -70,6 +78,19 @@ float exp_z_slice(uint32_t z, float near_z, float far_z) {
     return near_z * std::pow(far_z / near_z, static_cast<float>(z) / CLUSTER_DIM_Z);
 }
 
+// Fan-out grains (docs/multithreading_plan.md §4.3, cluster light binning).
+// Bounds rebuild: ~256 clusters per chunk -> 13-14 chunks over the
+// 3,456-cluster grid.
+constexpr std::size_t BOUNDS_GRAIN = 256;
+// Binning: chunk the cluster range in whole Z-slices (CLUSTER_DIM_X *
+// CLUSTER_DIM_Y = 144 clusters per slice); 3 slices per chunk -> 8 chunks.
+// Slice alignment keeps a light's row clipping mostly chunk-local.
+constexpr std::size_t BIN_GRAIN = static_cast<std::size_t>(CLUSTER_DIM_X) * CLUSTER_DIM_Y * 3;
+// Below this many dynamic lights the binning runs as ONE inline chunk (same
+// code path — granularity control, §6.2): the playground's handful of lights
+// must not pay chunk-dispatch overhead.
+constexpr std::size_t BIN_MIN_PARALLEL_LIGHTS = 9;
+
 } // namespace
 
 ClusterGrid::~ClusterGrid() {
@@ -117,6 +138,8 @@ void ClusterGrid::shutdown() {
     light_indices_.clear();
     bins_.clear();
     view_lights_.clear();
+    light_ranges_.clear();
+    chunk_truncated_.clear();
     light_staging_.clear();
     offsets_dirty_ = true;
     offsets_all_zero_ = false;
@@ -125,6 +148,11 @@ void ClusterGrid::shutdown() {
 
 void ClusterGrid::begin_frame(const scene::CameraState& camera, uint32_t screen_w, uint32_t screen_h, float near_plane,
                               float far_plane) {
+    begin_frame(core::jobs::JobSystem::instance(), camera, screen_w, screen_h, near_plane, far_plane);
+}
+
+void ClusterGrid::begin_frame(core::jobs::JobSystem& js, const scene::CameraState& camera, uint32_t screen_w,
+                              uint32_t screen_h, float near_plane, float far_plane) {
     BRACKEN_PROFILE_ZONE_COLOR("ClusterGrid::begin_frame", 0x27AE60);
     // Allow CPU-only callers (tests) to skip init() — lazily size scratch arrays.
     if (cluster_bounds_.size() != CLUSTER_COUNT) {
@@ -171,7 +199,7 @@ void ClusterGrid::begin_frame(const scene::CameraState& camera, uint32_t screen_
     // Cluster AABBs only depend on the projection + near/far. Recompute when
     // they change; otherwise the previous frame's bounds are still valid.
     if (!bounds_valid_ || projection_changed || near_safe != last_near_ || far_safe != last_far_) {
-        compute_cluster_bounds();
+        compute_cluster_bounds(js);
         last_near_ = near_safe;
         last_far_ = far_safe;
         bounds_valid_ = true;
@@ -196,12 +224,16 @@ void ClusterGrid::add_spot_light(const SpotLight& l) {
     headers_.push_back({LIGHT_TYPE_SPOT, payload_idx});
 }
 
-void ClusterGrid::compute_cluster_bounds() {
+void ClusterGrid::compute_cluster_bounds(core::jobs::JobSystem& js) {
     BRACKEN_PROFILE_ZONE_COLOR("ClusterGrid::compute_cluster_bounds", 0x27AE60);
     const float near_z = -params_.zPlanes.x;
     const float far_z = -params_.zPlanes.y;
     const glm::mat4& invProj = params_.invProjection;
 
+    // Per-slice view-space depth range, precomputed serially so every chunk
+    // reads the exact floats the old per-slice loop produced (no redundant
+    // pow() per cluster, and trivially bit-identical, §6.2).
+    std::array<glm::vec2, CLUSTER_DIM_Z> slice_z; // .x = zn, .y = zf
     for (uint32_t z = 0; z < CLUSTER_DIM_Z; ++z) {
         // View-space depths are negative (camera looks down -Z).
         float zn = -exp_z_slice(z, -near_z, -far_z);
@@ -210,9 +242,25 @@ void ClusterGrid::compute_cluster_bounds() {
         if (zn < zf) {
             std::swap(zn, zf);
         }
+        slice_z[z] = {zn, zf};
+    }
 
-        for (uint32_t y = 0; y < CLUSTER_DIM_Y; ++y) {
-            for (uint32_t x = 0; x < CLUSTER_DIM_X; ++x) {
+    // Chunked fan-out over the 3,456-cluster range (§4.3): each cluster's
+    // bounds are a pure function of its index — disjoint per-element writes,
+    // no partials, no merge. The guards inside parallel_for (uninitialized
+    // pool, one worker) collapse this to one inline chunk on the caller.
+    core::jobs::parallel_for(
+        js, 0, CLUSTER_COUNT,
+        [&](std::size_t chunk_begin, std::size_t chunk_end) {
+            for (std::size_t ci = chunk_begin; ci < chunk_end; ++ci) {
+                const uint32_t idx = static_cast<uint32_t>(ci);
+                const uint32_t z = idx / (CLUSTER_DIM_X * CLUSTER_DIM_Y);
+                const uint32_t rem = idx % (CLUSTER_DIM_X * CLUSTER_DIM_Y);
+                const uint32_t y = rem / CLUSTER_DIM_X;
+                const uint32_t x = rem % CLUSTER_DIM_X;
+                const float zn = slice_z[z].x;
+                const float zf = slice_z[z].y;
+
                 glm::vec3 corners[8];
                 corners[0] = unproject_corner(x, y, zn, invProj);
                 corners[1] = unproject_corner(x + 1, y, zn, invProj);
@@ -229,11 +277,10 @@ void ClusterGrid::compute_cluster_bounds() {
                     mn = glm::min(mn, corners[i]);
                     mx = glm::max(mx, corners[i]);
                 }
-                uint32_t idx = (z * CLUSTER_DIM_Y + y) * CLUSTER_DIM_X + x;
-                cluster_bounds_[idx] = {mn, mx};
+                cluster_bounds_[ci] = {mn, mx};
             }
-        }
-    }
+        },
+        BOUNDS_GRAIN);
 }
 
 bool ClusterGrid::sphere_intersects_aabb(const glm::vec3& center, float radius, const glm::vec3& aabb_min,
@@ -244,6 +291,10 @@ bool ClusterGrid::sphere_intersects_aabb(const glm::vec3& center, float radius, 
 }
 
 void ClusterGrid::build() {
+    build(core::jobs::JobSystem::instance());
+}
+
+void ClusterGrid::build(core::jobs::JobSystem& js) {
     BRACKEN_PROFILE_ZONE_COLOR("ClusterGrid::build", 0x27AE60);
     const glm::mat4& view = params_.view;
 
@@ -277,16 +328,14 @@ void ClusterGrid::build() {
         view_lights_[i].radius = radius;
     }
 
-    bool truncated = false;
-
     // Per-light cluster-range insertion: instead of testing every one of the
     // CLUSTER_COUNT clusters against every light (O(clusters x lights)),
     // compute each light's conservative cluster-index box — Z slices from the
     // inverse of exp_z_slice, X/Y tiles from the projected NDC extent of the
     // sphere's view-space AABB — then run the exact sphere/AABB refine only
-    // inside it: O(lights x touched clusters). Lights insert in ascending index
-    // order, so per-cluster lists keep the same ordering the previous
-    // per-cluster scan produced.
+    // inside it: O(lights x touched clusters). The range precompute below
+    // runs ONCE, serially, before the fan-out (no redundant per-chunk sphere
+    // math); insertion then chunks the CLUSTER range — see bin_chunk.
     const float near_z = params_.zPlanes.x;
     const float far_z = params_.zPlanes.y;
     const float dim_z = static_cast<float>(CLUSTER_DIM_Z);
@@ -301,8 +350,11 @@ void ClusterGrid::build() {
         return static_cast<uint32_t>(std::clamp(t, 0.0f, static_cast<float>(dim - 1)));
     };
 
+    light_ranges_.resize(light_count);
     for (std::size_t i = 0; i < light_count; ++i) {
         const auto& vl = view_lights_[i];
+        auto& lr = light_ranges_[i];
+        lr.active = false;
         if (vl.radius <= 0.0f) {
             continue;
         }
@@ -350,24 +402,77 @@ void ClusterGrid::build() {
                 y1 = tile_of(ndc_max.y, CLUSTER_DIM_Y);
             }
         }
+        lr = {x0, x1, y0, y1, z0, z1,
+              /*min_c=*/(z0 * CLUSTER_DIM_Y + y0) * CLUSTER_DIM_X + x0,
+              /*max_c=*/(z1 * CLUSTER_DIM_Y + y1) * CLUSTER_DIM_X + x1,
+              /*active=*/true};
+    }
 
-        for (uint32_t z = z0; z <= z1; ++z) {
-            for (uint32_t y = y0; y <= y1; ++y) {
-                for (uint32_t x = x0; x <= x1; ++x) {
-                    const uint32_t c = (z * CLUSTER_DIM_Y + y) * CLUSTER_DIM_X + x;
-                    const auto& cb = cluster_bounds_[c];
-                    if (!sphere_intersects_aabb(vl.view_pos, vl.radius, cb.view_min, cb.view_max)) {
-                        continue;
+    // Per-cluster insertion chunked by cluster index (§4.3): a chunk owns the
+    // disjoint cluster subrange [chunk_begin, chunk_end) and is the ONLY
+    // writer of those clusters' bins — no merge, no contention. Within a
+    // chunk lights are walked in ascending index order, so each bin receives
+    // exactly the sequence the serial light-major loop produced (including
+    // the MAX_LIGHTS_PER_CLUSTER cutoff keeping the lowest indices):
+    // bit-identical at any worker count / any grain (§6.2).
+    const std::size_t chunk_count = (CLUSTER_COUNT + BIN_GRAIN - 1) / BIN_GRAIN;
+    chunk_truncated_.assign(chunk_count, 0);
+    auto bin_chunk = [&](std::size_t chunk_begin, std::size_t chunk_end) {
+        bool truncated_local = false; // per-chunk partial; published once below
+        for (std::size_t i = 0; i < light_count; ++i) {
+            const auto& lr = light_ranges_[i];
+            if (!lr.active || lr.max_c < chunk_begin || lr.min_c >= chunk_end) {
+                continue;
+            }
+            const auto& vl = view_lights_[i];
+            bool past_chunk = false;
+            for (uint32_t z = lr.z0; z <= lr.z1 && !past_chunk; ++z) {
+                for (uint32_t y = lr.y0; y <= lr.y1; ++y) {
+                    const std::size_t row = (static_cast<std::size_t>(z) * CLUSTER_DIM_Y + y) * CLUSTER_DIM_X;
+                    if (row + lr.x0 >= chunk_end) {
+                        past_chunk = true; // rows only grow with (z, y) — done with this light
+                        break;
                     }
-                    auto& bin = bins_[c];
-                    if (bin.size() < MAX_LIGHTS_PER_CLUSTER) {
-                        bin.push_back(static_cast<uint32_t>(i));
-                    } else {
-                        truncated = true;
+                    if (row + lr.x1 < chunk_begin) {
+                        continue; // row entirely before this chunk
+                    }
+                    const std::size_t c_lo = std::max<std::size_t>(row + lr.x0, chunk_begin);
+                    const std::size_t c_hi = std::min<std::size_t>(row + lr.x1, chunk_end - 1);
+                    for (std::size_t c = c_lo; c <= c_hi; ++c) {
+                        const auto& cb = cluster_bounds_[c];
+                        if (!sphere_intersects_aabb(vl.view_pos, vl.radius, cb.view_min, cb.view_max)) {
+                            continue;
+                        }
+                        auto& bin = bins_[c];
+                        if (bin.size() < MAX_LIGHTS_PER_CLUSTER) {
+                            bin.push_back(static_cast<uint32_t>(i));
+                        } else {
+                            truncated_local = true;
+                        }
                     }
                 }
             }
         }
+        // One write per CHUNK to a chunk-indexed slot — never inside the
+        // per-item loop (§7: no shared cache-line writes per item).
+        if (truncated_local) {
+            chunk_truncated_[chunk_begin / BIN_GRAIN] = 1;
+        }
+    };
+
+    // Grain guard: tiny light lists (the 1-character playground) and
+    // uninitialized pools run the SAME body as one inline chunk.
+    if (js.is_initialized() && light_count >= BIN_MIN_PARALLEL_LIGHTS) {
+        core::jobs::parallel_for(js, 0, CLUSTER_COUNT, bin_chunk, BIN_GRAIN);
+    } else {
+        bin_chunk(0, CLUSTER_COUNT);
+    }
+
+    // Merge partials single-threaded in chunk-index order (§6.2). OR is
+    // order-insensitive, but the pattern is the house contract.
+    bool truncated = false;
+    for (std::size_t k = 0; k < chunk_count; ++k) {
+        truncated = truncated || chunk_truncated_[k] != 0;
     }
 
     if (truncated && !warned_truncation_) {
@@ -398,21 +503,6 @@ void ClusterGrid::build() {
     offsets_all_zero_ = light_indices_.empty();
 
     params_.gridDim.w = static_cast<uint32_t>(headers_.size());
-}
-
-void ClusterGrid::upload(SDL_GPUCommandBuffer* cb, memory::Arena* /*frame_arena*/) {
-    if (!cb || !light_data_buf_) {
-        return;
-    }
-
-    // One copy pass shared by all cluster buffers.
-    SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(cb);
-    if (!copy_pass) {
-        SDL_Log("ClusterGrid::upload: failed to begin copy pass: %s", SDL_GetError());
-        return;
-    }
-    upload(copy_pass);
-    SDL_EndGPUCopyPass(copy_pass);
 }
 
 void ClusterGrid::upload(SDL_GPUCopyPass* copy_pass) {

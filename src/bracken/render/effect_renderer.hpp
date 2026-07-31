@@ -6,12 +6,15 @@
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/model_loader.hpp"
+#include "bracken/scene/frame_packet.hpp" // Effect{Emitter,Particle}Snapshot
 #include "bracken/systems/effect_system.hpp"
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <memory>
 #include <SDL3/SDL_gpu.h>
+#include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace bracken::render {
@@ -25,6 +28,12 @@ namespace gpu = bracken::gpu;
 /// equivalence with the naive glm chain.
 glm::mat4 build_particle_transform(const bracken::systems::Particle& particle, const glm::vec3& center_offset);
 
+/// Sealed-packet form: identical math over a frame's EffectParticleSnapshot
+/// (the render path — particles reach the renderer only through the packet's
+/// effect-instance snapshot).
+glm::mat4 build_particle_transform(const bracken::scene::EffectParticleSnapshot& particle,
+                                   const glm::vec3& center_offset);
+
 /**
  * EffectRenderer draws particle-based spell/attack effects.
  *
@@ -32,8 +41,10 @@ glm::mat4 build_particle_transform(const bracken::systems::Particle& particle, c
  * pipeline: per-particle {transform, tint+opacity} records are packed into a
  * per-frame storage buffer (uploaded in SceneRenderer's consolidated
  * FrameUploads copy pass), then each (emitter, mesh) batch is ONE instanced
- * draw with a small instance-offset uniform. Shading is unlit additive HDR
- * (ONE, ONE), depth test LESS_OR_EQUAL against opaques, depth write off.
+ * draw with a small instance-offset uniform. Shading is unlit additive HDR —
+ * the blend is configured (SRC_ALPHA, ONE) and the fragment shader writes
+ * alpha 1.0, so the effective color blend is (ONE, ONE) — with depth test
+ * GREATER_OR_EQUAL (reversed-Z) against opaques, depth write off.
  * Opacity fades by scaling the emitted RGB, and the emissive boost pushes
  * bright particles over the bloom threshold so spell glow feeds the bloom
  * chain.
@@ -63,26 +74,30 @@ public:
     void shutdown();
 
     /**
-     * Ensure every model referenced by the effect system's active emitters is
-     * resolved + GPU-uploaded. Must be called OUTSIDE any render pass (uploads
-     * submit their own copy work); SceneRenderer calls it in the pre-pass
-     * section of render_frame so first spell use never hitches mid-pass.
+     * Ensure every model referenced by the frame's effect-instance snapshot
+     * (the sealed packet's effect_emitters()) is resolved + GPU-uploaded.
+     * Must be called OUTSIDE any render pass (uploads submit their own copy
+     * work); SceneRenderer calls it in the pre-pass section of render_frame
+     * so first spell use never hitches mid-pass. Main thread (GPU create).
      */
-    void ensure_models_uploaded(const bracken::systems::EffectSystem& effect_system);
+    void ensure_models_uploaded(std::span<const bracken::scene::EffectEmitterSnapshot> emitters);
 
     /**
-     * Pack per-particle instance data ({model matrix, tint+opacity}) for
-     * every active emitter into the per-frame instance storage buffer and
-     * record its upload. Particles of one emitter share the emitter's model,
-     * so each emitter becomes one contiguous batch. Models that missed the
-     * ensure_models_uploaded window are skipped (never uploaded from here).
-     * Must be called from the frame's consolidated copy pass before
-     * draw_particle_effects — the draw consumes the batches built here.
+     * Pack per-particle instance data ({model matrix, tint+opacity}) from
+     * the sealed packet's effect-instance snapshot into the per-frame
+     * instance storage buffer and record its upload. Particles of one
+     * emitter share the emitter's model, so each emitter becomes one
+     * contiguous batch. Models that missed the ensure_models_uploaded window
+     * are skipped (never uploaded from here). Must be called from the
+     * frame's consolidated copy pass before draw_particle_effects — the draw
+     * consumes the batches built here.
      * @param copy_pass Open copy pass to record the upload into
-     * @param effect_system Effect system containing all active effects and particles
+     * @param emitters  Sealed packet's effect_emitters()
+     * @param particles Sealed packet's effect_particles()
      */
     void upload_particle_instances(SDL_GPUCopyPass* copy_pass,
-                                   const bracken::systems::EffectSystem& effect_system);
+                                   std::span<const bracken::scene::EffectEmitterSnapshot> emitters,
+                                   std::span<const bracken::scene::EffectParticleSnapshot> particles);
 
     /**
      * Draw the particle batches packed by upload_particle_instances() through
@@ -98,10 +113,14 @@ public:
                                const glm::mat4& projection, const glm::vec3& camera_pos);
 
 private:
+    friend struct EffectRendererTestAccess; // effect_renderer.test.cpp
+
     /// Resolve (and cache) the ModelHandle for an emitter definition.
     /// Definitions are loaded once and have stable addresses, so a
     /// pointer-keyed cache turns per-particle string hashing into a single
-    /// pointer-hash lookup per emitter.
+    /// pointer-hash lookup per emitter. Failed lookups are NOT cached — a
+    /// model registered after an emitter's first use resolves on the next
+    /// call (the miss is warned once per definition to avoid per-frame spam).
     ModelHandle resolve_emitter_model(const bracken::EmitterDefinition& def);
 
     /// One instanced draw group: all particles of one emitter (they share the
@@ -119,7 +138,12 @@ private:
     std::unique_ptr<gpu::GPUTexture> dummy_white_texture_; // bound when a mesh has no base color texture
 
     // EmitterDefinition* -> ModelHandle, resolved once per definition.
+    // Only successful lookups are stored (see resolve_emitter_model).
     std::unordered_map<const bracken::EmitterDefinition*, ModelHandle> emitter_model_cache_;
+
+    // Definitions already warned about for an unresolved model name, so the
+    // uncached retry doesn't log every frame.
+    std::unordered_set<const bracken::EmitterDefinition*> warned_missing_models_;
 
     // Per-frame instancing state, rebuilt by upload_particle_instances().
     // Model pointers stay valid frame-locally (same contract as the bone

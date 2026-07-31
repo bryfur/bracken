@@ -1,8 +1,10 @@
 #define GLM_ENABLE_EXPERIMENTAL
 #include "tree_generator.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_types.hpp"
 #include "bracken/model_loader.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <glm/glm.hpp>
@@ -106,13 +108,9 @@ struct TreeBuilder {
 
         glm::quat section_orient = branch.orientation;
         glm::vec3 section_origin = branch.origin;
+        // Note: ez-tree divides deciduous section length by (levels-1); we
+        // deliberately keep a uniform section length for all tree types.
         float section_length = branch.length / static_cast<float>(branch.section_count);
-        if (!params.evergreen) {
-            section_length /= static_cast<float>(std::max(1, params.levels - 1));
-            section_length *= static_cast<float>(std::max(1, params.levels - 1));
-            // Actually ez-tree divides by (levels-1) for deciduous. Let's keep it simple:
-            section_length = branch.length / static_cast<float>(branch.section_count);
-        }
 
         std::vector<SectionInfo> sections;
         sections.reserve(branch.section_count + 1);
@@ -371,14 +369,17 @@ static bool load_texture_from_file(const std::string& path, Mesh& mesh) {
 
     SDL_Surface* surface = IMG_Load(path.c_str());
     if (!surface) {
-        SDL_Log("TreeGenerator: Failed to load texture %s: %s", path.c_str(), SDL_GetError());
+        BRACKEN_LOG_WARN("procedural", "TreeGenerator: failed to load texture '{}': {} (falling back to vertex colors)",
+                         path, SDL_GetError());
         return false;
     }
 
     SDL_Surface* rgba = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
     SDL_DestroySurface(surface);
     if (!rgba) {
-        SDL_Log("TreeGenerator: Failed to convert texture to RGBA: %s", SDL_GetError());
+        BRACKEN_LOG_WARN("procedural",
+                         "TreeGenerator: failed to convert texture '{}' to RGBA: {} (falling back to vertex colors)",
+                         path, SDL_GetError());
         return false;
     }
 
@@ -394,11 +395,47 @@ static bool load_texture_from_file(const std::string& path, Mesh& mesh) {
 }
 
 // ============================================================================
+// Parameter validation
+// ============================================================================
+
+// Clamp out-of-range TreeParams to safe values. Branch level reaches
+// params.levels inclusive, and every per-level array has MAX_LEVELS entries,
+// so levels must stay in [0, MAX_LEVELS-1] or generation reads past the
+// arrays (UB). Non-positive sections/segments would divide by zero (NaN
+// geometry) or produce degenerate rings; negative children/leaf counts are
+// meaningless.
+static TreeParams sanitize_params(const TreeParams& in) {
+    TreeParams p = in;
+    if (p.levels < 0 || p.levels > TreeParams::MAX_LEVELS - 1) {
+        BRACKEN_LOG_WARN("procedural", "TreeParams::levels {} out of range [0, {}]; clamping", p.levels,
+                         TreeParams::MAX_LEVELS - 1);
+        p.levels = std::clamp(p.levels, 0, TreeParams::MAX_LEVELS - 1);
+    }
+    bool clamped = false;
+    for (int i = 0; i < TreeParams::MAX_LEVELS; i++) {
+        clamped |= (p.sections[i] < 1 || p.segments[i] < 3 || p.children[i] < 0);
+        p.sections[i] = std::max(1, p.sections[i]);
+        p.segments[i] = std::max(3, p.segments[i]);
+        p.children[i] = std::max(0, p.children[i]);
+    }
+    if (p.leaf_count < 0) {
+        clamped = true;
+        p.leaf_count = 0;
+    }
+    if (clamped) {
+        BRACKEN_LOG_WARN("procedural",
+                         "TreeParams sections/segments/children/leaf_count out of range; clamped to minimums");
+    }
+    return p;
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
-std::unique_ptr<Model> TreeGenerator::generate(const TreeParams& params) {
+std::unique_ptr<Model> TreeGenerator::generate(const TreeParams& raw_params) {
     BRACKEN_PROFILE_ZONE("TreeGenerator::generate");
+    const TreeParams params = sanitize_params(raw_params);
     TreeBuilder builder(params);
     builder.build();
 
@@ -409,15 +446,11 @@ std::unique_ptr<Model> TreeGenerator::generate(const TreeParams& params) {
         Mesh branch_mesh;
         branch_mesh.vertices = std::move(builder.branch_verts);
         branch_mesh.indices = std::move(builder.branch_indices);
-        // Set white vertex color so texture isn't tinted when textured
-        if (!params.bark_texture_path.empty()) {
+        // Whiten vertex colors only after a successful load so the texture
+        // isn't tinted; on failure the bark vertex colors remain as a visible
+        // fallback (load_texture_from_file logs the error).
+        if (!params.bark_texture_path.empty() && load_texture_from_file(params.bark_texture_path, branch_mesh)) {
             for (auto& v : branch_mesh.vertices) v.color = glm::vec4(1.0f);
-            load_texture_from_file(params.bark_texture_path, branch_mesh);
-        }
-        if (!branch_mesh.has_texture) {
-            branch_mesh.base_color = 0xFF000000 | (static_cast<uint32_t>(params.bark_color.r * 255) << 16) |
-                                     (static_cast<uint32_t>(params.bark_color.g * 255) << 8) |
-                                     (static_cast<uint32_t>(params.bark_color.b * 255));
         }
         model->meshes.push_back(std::move(branch_mesh));
     }
@@ -431,14 +464,17 @@ std::unique_ptr<Model> TreeGenerator::generate(const TreeParams& params) {
         leaf_mesh.vertices = std::move(builder.leaf_verts);
         leaf_mesh.indices = std::move(builder.leaf_indices);
         leaf_mesh.cast_shadows = false;
-        if (!params.leaf_texture_path.empty()) {
+        // Leaf quads are flat cards viewed from either side — without the
+        // double-sided pipeline variant they vanish when seen from behind.
+        leaf_mesh.material.double_sided = true;
+        if (!params.leaf_texture_path.empty() && load_texture_from_file(params.leaf_texture_path, leaf_mesh)) {
+            // Whiten vertex colors so the texture isn't tinted (on failure the
+            // leaf vertex colors remain as a visible fallback), and alpha-test
+            // the leaf texture so transparent texels discard instead of
+            // rendering as opaque rectangles.
             for (auto& v : leaf_mesh.vertices) v.color = glm::vec4(1.0f);
-            load_texture_from_file(params.leaf_texture_path, leaf_mesh);
-        }
-        if (!leaf_mesh.has_texture) {
-            leaf_mesh.base_color = 0xFF000000 | (static_cast<uint32_t>(params.leaf_color.r * 255) << 16) |
-                                   (static_cast<uint32_t>(params.leaf_color.g * 255) << 8) |
-                                   (static_cast<uint32_t>(params.leaf_color.b * 255));
+            leaf_mesh.material.alpha_mode = AlphaMode::Mask;
+            leaf_mesh.material.alpha_cutoff = 0.5f;
         }
         model->meshes.push_back(std::move(leaf_mesh));
     }
@@ -451,8 +487,9 @@ std::unique_ptr<Model> TreeGenerator::generate(const TreeParams& params) {
     // leaf texture punches a leaf-shaped silhouette into the shadow — we get
     // actual dappled leaf shadows rather than smooth blobs.
     //
-    // Per cluster: 12 vertices + 6 triangles (3 quads).
-    // Typical tree with ~60 clusters: ~360 tris per tree (vs ~2000+ for raw
+    // Per cluster: 12 vertices + 12 triangles (3 quads, each emitted with
+    // both winding orders since shadow pipelines cull front faces).
+    // Typical tree with ~60 clusters: ~720 tris per tree (vs ~2000+ for raw
     // leaves, 1200 for icosphere blobs). Fewer but bigger quads means ~10x
     // less alpha-test overdraw than rasterizing the real leaf mesh.
     if (!builder.leaf_clumps.empty()) {
@@ -479,12 +516,8 @@ std::unique_ptr<Model> TreeGenerator::generate(const TreeParams& params) {
         if (!params.leaf_texture_path.empty()) {
             load_texture_from_file(params.leaf_texture_path, proxy_mesh);
         }
-        proxy_mesh.base_color = 0xFF000000 | (static_cast<uint32_t>(params.leaf_color.r * 255) << 16) |
-                                (static_cast<uint32_t>(params.leaf_color.g * 255) << 8) |
-                                (static_cast<uint32_t>(params.leaf_color.b * 255));
-
         proxy_mesh.vertices.reserve(builder.leaf_clumps.size() * 12);
-        proxy_mesh.indices.reserve(builder.leaf_clumps.size() * 18);
+        proxy_mesh.indices.reserve(builder.leaf_clumps.size() * 36);
 
         // Deterministic per-clump hash for size + rotation variation.
         uint32_t hash_state = params.seed * 0x9E3779B9u + 0x85EBCA6Bu;

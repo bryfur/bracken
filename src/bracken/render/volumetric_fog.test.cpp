@@ -10,7 +10,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <gtest/gtest.h>
 
-using bracken::EnvironmentState;
+using bracken::render::EnvironmentState;
 using bracken::render::CSM_MAX_CASCADES;
 using bracken::render::ShadowMap;
 using bracken::render::VolumetricFog;

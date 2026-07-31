@@ -18,9 +18,13 @@ struct VSInput {
     [[vk::location(6)]] float4 weights : BLENDWEIGHT;
 };
 
-// Vertex output / Fragment input
+// Vertex output / Fragment input.
+// position is `precise`: the depth prepass (prepass_skinned.vert.hlsl)
+// computes the same skinning + transform chain and the forward pipeline
+// depth-tests EQUAL against the prepass depth — both sides must be
+// bit-identical, so contraction on the position path is disabled in both.
 struct VSOutput {
-    float4 position : SV_Position;
+    precise float4 position : SV_Position;
     float3 fragPos : TEXCOORD0;
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
@@ -38,9 +42,8 @@ cbuffer TransformUniforms {
     float3 cameraPos;
     float _padding0;
     float4x4 normalMatrix;  // Pre-computed inverse-transpose of model matrix (CPU-side)
-    int useSkinning;
     uint paletteOffset;     // start of this draw's palette in bonePalettes, in matrices
-    float2 _padding1;
+    float3 _padding1;
 };
 
 // All skinned draws' bone palettes this frame, tightly packed

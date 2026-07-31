@@ -23,13 +23,16 @@ cbuffer LightingUniforms {
     float3 lightDir;
     float fogHeightFalloff;
     float3 cameraPos;
-    float worldSize;
+    float screenAOTexelX;  // 1 / render-target size: SV_Position.xy * texel = AO UV
     float3 ambientSky;
     float ambientStrength;
     float3 ambientGround;
     float sunIntensity;
     float3 sunColor;
-    float _padding0;
+    float screenAOTexelY;
+    float4 splatParams;    // xy = splat origin (world XZ), zw = splat X/Z size
+    float iblEnabled;      // 1 = sky IBL ambient (samplers 5-7), 0 = hemisphere fallback
+    float3 _padIbl;
 };
 
 [[vk::binding(1, 3)]]
@@ -68,11 +71,37 @@ Texture2D shadowAtlasRaw;
 [[vk::combinedImageSampler]][[vk::binding(3, 2)]]
 SamplerState shadowRawSampler;
 
+// Full-res screen-space GTAO (R8, 1 = unoccluded), computed before this pass
+// from the prepass depth. Bound to a 1x1 white dummy when AO is off.
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
+Texture2D<float> screenAOTexture;
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
+SamplerState screenAOSampler;
+
+// Sky IBL chain (render/ibl.hpp): irradiance cube + GGX-prefiltered specular
+// cube + split-sum BRDF LUT. Bound to dummies when iblEnabled == 0.
+[[vk::combinedImageSampler]][[vk::binding(5, 2)]]
+TextureCube<float4> iblIrradianceMap;
+[[vk::combinedImageSampler]][[vk::binding(5, 2)]]
+SamplerState iblIrradianceSampler;
+
+[[vk::combinedImageSampler]][[vk::binding(6, 2)]]
+TextureCube<float4> iblSpecularMap;
+[[vk::combinedImageSampler]][[vk::binding(6, 2)]]
+SamplerState iblSpecularSampler;
+
+[[vk::combinedImageSampler]][[vk::binding(7, 2)]]
+Texture2D<float4> iblBrdfLut;
+[[vk::combinedImageSampler]][[vk::binding(7, 2)]]
+SamplerState iblBrdfLutSampler;
+
 #include "shadow_common.hlsli"
 #include "fog.hlsli"
 #include "lighting.hlsli"
-// Cluster SSBOs follow this shader's 4 fragment samplers in set 2.
-#define CLUSTER_SSBO_BINDING_BASE 4
+#include "pbr.hlsli"
+// Cluster SSBOs follow this shader's 9 fragment samplers in set 2 (slots
+// 0-7 above + the local-shadow atlas at 8, declared by the include).
+#define CLUSTER_SSBO_BINDING_BASE 9
 #include "cluster_lighting.hlsli"
 
 static const float TERRAIN_METALLIC = 0.0;
@@ -136,7 +165,9 @@ float4 PSMain(PSInput input) : SV_Target {
     float3 worldPos = input.fragPos;
     float3 N = normalize(input.normal);
 
-    float2 splatmapUV = worldPos.xz / worldSize;
+    // Splat UV from the world-rect splat region (CLAMP sampler handles the
+    // margin ring outside the world bounds).
+    float2 splatmapUV = (worldPos.xz - splatParams.xy) / splatParams.zw;
     float4 splatWeights = splatmapTexture.Sample(splatmapSampler, splatmapUV);
 
     float noise = valueNoise(worldPos.xz * 0.004);
@@ -185,9 +216,21 @@ float4 PSMain(PSInput input) : SV_Target {
     float3 direct = evaluatePBR(N, V, L, lightColor,
                                  baseColor, TERRAIN_METALLIC, roughness, TERRAIN_AO);
 
+    // Screen-space GTAO, ambient only (terrain has no material AO map, so
+    // min(TERRAIN_AO, screenAO) == screenAO). Direct light stays untouched.
+    float screenAO = screenAOTexture.Sample(
+        screenAOSampler, input.position.xy * float2(screenAOTexelX, screenAOTexelY));
+
     float ambientLift = lerp(ambientStrength, 1.0, shadow);
-    float3 ambient = ambientPBR(N, V, baseColor, TERRAIN_METALLIC, roughness, TERRAIN_AO,
-                                ambientSky * ambientLift, ambientGround * ambientLift);
+    float3 ambient;
+    if (iblEnabled > 0.5) {
+        ambient = ambientIBL(N, N, V, baseColor, TERRAIN_METALLIC, roughness, min(TERRAIN_AO, screenAO),
+                             ambientLift, iblIrradianceMap, iblIrradianceSampler,
+                             iblSpecularMap, iblSpecularSampler, iblBrdfLut, iblBrdfLutSampler);
+    } else {
+        ambient = ambientPBR(N, V, baseColor, TERRAIN_METALLIC, roughness, min(TERRAIN_AO, screenAO),
+                             ambientSky * ambientLift, ambientGround * ambientLift);
+    }
 
     float3 color = direct + ambient;
 

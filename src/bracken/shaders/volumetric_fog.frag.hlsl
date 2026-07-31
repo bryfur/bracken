@@ -56,12 +56,8 @@ Texture2D shadowMap : register(t1, space2);
 [[vk::combinedImageSampler]][[vk::binding(1, 2)]]
 SamplerState shadowSampler : register(s1, space2);
 
-float3 reconstructWorldPos(float2 uv, float depth) {
-    float4 clipPos = float4(uv * 2.0 - 1.0, depth, 1.0);
-    clipPos.y = -clipPos.y;  // Flip Y for Vulkan
-    float4 worldPos = mul(invViewProjection, clipPos);
-    return worldPos.xyz / worldPos.w;
-}
+// worldPosFromDepth + interleavedGradientNoise
+#include "lighting.hlsli"
 
 // dist = camera distance of the march sample. It stands in for view depth
 // when selecting a cascade: distance >= view depth, so at worst a farther
@@ -111,7 +107,7 @@ float4 PSMain(PSInput input) : SV_Target {
     // early-outing so god rays and haze cross the horizon silhouette.
     // Reversed-Z: the cleared/skybox far-plane depth is exactly 0.0.
     bool isSky = depth <= 0.0;
-    float3 worldPos = reconstructWorldPos(input.texCoord, depth);
+    float3 worldPos = worldPosFromDepth(input.texCoord, depth, invViewProjection);
     float3 rayDir = worldPos - cameraPos;
     float rayLength = length(rayDir);
     rayDir /= rayLength;
@@ -131,8 +127,7 @@ float4 PSMain(PSInput input) : SV_Target {
     float transmittance = 1.0;
 
     // Interleaved gradient noise (less visible pattern than white noise hash)
-    float2 screenPos = input.position.xy;
-    float dither = frac(52.9829189 * frac(dot(screenPos, float2(0.06711056, 0.00583715))));
+    float dither = interleavedGradientNoise(input.position.xy);
     float dist = startDist + stepSize * dither;
     float3 pos = cameraPos + rayDir * dist;
 

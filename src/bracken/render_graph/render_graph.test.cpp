@@ -36,11 +36,11 @@ TEST(RenderGraph, LinearTopoOrder_ABC) {
     std::vector<std::string> order;
 
     g.add_pass(
-        "A", PassType::Generic, [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
+        "A", [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
         [&](RenderPassContext&) { order.emplace_back("A"); });
 
     g.add_pass(
-        "B", PassType::Generic,
+        "B",
         [](PassBuilder& b) {
             b.read("X");
             b.create_color_target("Y", make_color_desc());
@@ -48,7 +48,7 @@ TEST(RenderGraph, LinearTopoOrder_ABC) {
         [&](RenderPassContext&) { order.emplace_back("B"); });
 
     g.add_pass(
-        "C", PassType::Generic,
+        "C",
         [](PassBuilder& b) {
             b.read("Y");
             b.create_color_target("Z", make_color_desc());
@@ -71,11 +71,11 @@ TEST(RenderGraph, DiamondTopoOrder) {
     std::vector<std::string> order;
 
     g.add_pass(
-        "A", PassType::Generic, [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
+        "A", [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
         [&](RenderPassContext&) { order.emplace_back("A"); });
 
     g.add_pass(
-        "B", PassType::Generic,
+        "B",
         [](PassBuilder& b) {
             b.read("X");
             b.create_color_target("Y", make_color_desc());
@@ -83,7 +83,7 @@ TEST(RenderGraph, DiamondTopoOrder) {
         [&](RenderPassContext&) { order.emplace_back("B"); });
 
     g.add_pass(
-        "C", PassType::Generic,
+        "C",
         [](PassBuilder& b) {
             b.read("X");
             b.create_color_target("Z", make_color_desc());
@@ -91,7 +91,7 @@ TEST(RenderGraph, DiamondTopoOrder) {
         [&](RenderPassContext&) { order.emplace_back("C"); });
 
     g.add_pass(
-        "D", PassType::Generic,
+        "D",
         [](PassBuilder& b) {
             b.read("Y");
             b.read("Z");
@@ -133,14 +133,14 @@ TEST(RenderGraph, TransientReuseSharesUnderlyingTexture) {
     // C writes Z with same desc as X -- since X is no longer needed after B, Z should
     // reuse X's underlying texture.
     g.add_pass(
-        "A", PassType::Generic, [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
+        "A", [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
         [&](RenderPassContext& ctx) {
             tex_x = ctx.get_texture(ctx.command_buffer() == nullptr ? ResourceHandle{} : ResourceHandle{});
             (void)ctx;
         });
 
     g.add_pass(
-        "B", PassType::Generic,
+        "B",
         [](PassBuilder& b) {
             b.read("X");
             // unique desc so Y doesn't conflict with X reuse logic
@@ -150,7 +150,7 @@ TEST(RenderGraph, TransientReuseSharesUnderlyingTexture) {
         [&](RenderPassContext&) {});
 
     g.add_pass(
-        "C", PassType::Generic,
+        "C",
         [](PassBuilder& b) {
             b.read("Y");
             b.create_color_target("Z", make_color_desc());
@@ -182,7 +182,7 @@ TEST(RenderGraph, ImportedTextureSurfacesUnchanged) {
 
     SDL_GPUTexture* observed = nullptr;
     g.add_pass(
-        "UseImported", PassType::Generic,
+        "UseImported",
         [&](PassBuilder& b) {
             b.import_texture("shadow_atlas", sentinel, 4096, 4096, SDL_GPU_TEXTUREFORMAT_D32_FLOAT);
             b.read("shadow_atlas");
@@ -206,7 +206,7 @@ TEST(RenderGraph, CycleDetectedAndSkipped) {
 
     // A writes X reads Y. B writes Y reads X. Cycle.
     g.add_pass(
-        "A", PassType::Generic, [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
+        "A", [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
         [&](RenderPassContext&) { a_ran = true; });
     // post-hoc: declare A reads Y and B writes Y reads X by manual access.
     {
@@ -214,7 +214,7 @@ TEST(RenderGraph, CycleDetectedAndSkipped) {
         // Reach into pass A's reads to force cycle.
         g.pass_at(0).reads.push_back(g.declare_transient_texture("Y", make_color_desc(64, 64)));
         g.add_pass(
-            "B", PassType::Generic,
+            "B",
             [](PassBuilder& b) {
                 b.write("Y");
                 b.read("X");
@@ -231,13 +231,74 @@ TEST(RenderGraph, CycleDetectedAndSkipped) {
     g.end_frame();
 }
 
+TEST(RenderGraph, CompileFailsWhenTransientAllocationFails) {
+    RenderGraph g;
+    g.begin_frame(nullptr);
+    g.allocator_for_tests().set_texture_create_budget_for_testing(0);
+
+    bool ran = false;
+    g.add_pass(
+        "A", [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
+        [&](RenderPassContext&) { ran = true; });
+
+    EXPECT_FALSE(g.compile());
+    EXPECT_TRUE(g.compiled_order().empty());
+    g.execute();
+    EXPECT_FALSE(ran) << "execute() must be a no-op after a failed compile()";
+
+    auto h = g.find_resource("X");
+    ASSERT_TRUE(h.valid());
+    EXPECT_EQ(g.resource(h).resolved_texture, nullptr);
+    g.end_frame();
+}
+
+TEST(RenderGraph, PartialTransientAllocationFailureReleasesAcquired) {
+    RenderGraph g;
+    g.begin_frame(nullptr);
+    // First creation succeeds, second fails.
+    g.allocator_for_tests().set_texture_create_budget_for_testing(1);
+
+    bool a_ran = false;
+    bool b_ran = false;
+    g.add_pass(
+        "A", [](PassBuilder& b) { b.create_color_target("X", make_color_desc()); },
+        [&](RenderPassContext&) { a_ran = true; });
+    g.add_pass(
+        "B",
+        [](PassBuilder& b) {
+            b.read("X");
+            // Different desc so Y cannot reuse X's pooled texture.
+            b.create_color_target("Y", make_color_desc(128, 128));
+        },
+        [&](RenderPassContext&) { b_ran = true; });
+
+    EXPECT_FALSE(g.compile());
+    g.execute();
+    EXPECT_FALSE(a_ran);
+    EXPECT_FALSE(b_ran);
+
+    // No resource keeps a dangling pointer to a released texture.
+    EXPECT_EQ(g.resource(g.find_resource("X")).resolved_texture, nullptr);
+    EXPECT_EQ(g.resource(g.find_resource("Y")).resolved_texture, nullptr);
+
+    // X's texture was returned to the pool: a fresh frame needing the same
+    // desc reuses it without creating anything (budget is still exhausted).
+    g.end_frame();
+    g.begin_frame(nullptr);
+    g.add_pass(
+        "A2", [](PassBuilder& b) { b.create_color_target("X2", make_color_desc()); }, [](RenderPassContext&) {});
+    EXPECT_TRUE(g.compile());
+    EXPECT_GE(g.last_reuse_count(), 1u);
+    g.end_frame();
+}
+
 TEST(RenderGraph, DumpDotProducesDigraph) {
     RenderGraph g;
     g.begin_frame(nullptr);
     g.add_pass(
-        "Producer", PassType::Generic, [](PassBuilder& b) { b.create_color_target("Tex", make_color_desc()); },
+        "Producer", [](PassBuilder& b) { b.create_color_target("Tex", make_color_desc()); },
         [](RenderPassContext&) {});
-    g.add_pass("Consumer", PassType::Generic, [](PassBuilder& b) { b.read("Tex"); }, [](RenderPassContext&) {});
+    g.add_pass("Consumer", [](PassBuilder& b) { b.read("Tex"); }, [](RenderPassContext&) {});
     ASSERT_TRUE(g.compile());
 
     std::ostringstream os;
@@ -247,6 +308,50 @@ TEST(RenderGraph, DumpDotProducesDigraph) {
     EXPECT_NE(out.find("Producer"), std::string::npos);
     EXPECT_NE(out.find("Consumer"), std::string::npos);
     EXPECT_NE(out.find("Tex"), std::string::npos);
+    g.end_frame();
+}
+
+TEST(RenderGraph, DumpDotEscapesLabels) {
+    RenderGraph g;
+    g.begin_frame(nullptr);
+    g.add_pass(
+        "quote\"back\\slash",
+        [](PassBuilder& b) { b.create_color_target("res\"name", make_color_desc()); },
+        [](RenderPassContext&) {});
+
+    std::ostringstream os;
+    g.dump_dot(os);
+    const std::string out = os.str();
+    EXPECT_NE(out.find("label=\"quote\\\"back\\\\slash\""), std::string::npos)
+        << "pass name must be DOT-escaped, got:\n"
+        << out;
+    EXPECT_NE(out.find("label=\"res\\\"name (T)\""), std::string::npos)
+        << "resource name must be DOT-escaped, got:\n"
+        << out;
+    g.end_frame();
+}
+
+TEST(RenderGraph, DumpDotAnnotatesCompiledSteps) {
+    RenderGraph g;
+    g.begin_frame(nullptr);
+    g.add_pass(
+        "Producer", [](PassBuilder& b) { b.create_color_target("Tex", make_color_desc()); },
+        [](RenderPassContext&) {});
+    g.add_pass("Consumer", [](PassBuilder& b) { b.read("Tex"); }, [](RenderPassContext&) {});
+
+    // Before compile(): declared graph only, no step annotations.
+    {
+        std::ostringstream os;
+        g.dump_dot(os);
+        EXPECT_EQ(os.str().find("[step "), std::string::npos);
+    }
+
+    ASSERT_TRUE(g.compile());
+    std::ostringstream os;
+    g.dump_dot(os);
+    const std::string out = os.str();
+    EXPECT_NE(out.find("Producer\\n[step 0]"), std::string::npos) << out;
+    EXPECT_NE(out.find("Consumer\\n[step 1]"), std::string::npos) << out;
     g.end_frame();
 }
 

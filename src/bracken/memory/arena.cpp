@@ -1,10 +1,16 @@
 #include "bracken/memory/arena.hpp"
 
+#include "bracken/core/assert.hpp"
 #include "bracken/core/profiler.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstdlib>
 #include <new>
+
+#ifndef NDEBUG
+#include <functional>
+#endif
 
 namespace bracken::memory {
 
@@ -44,6 +50,11 @@ Arena::Arena(Arena&& other) noexcept
     other.destructors_.clear();
     other.owns_memory_ = true;
     other.fixed_buffer_ = false;
+#ifndef NDEBUG
+    // Carry the owner binding with the storage; the moved-from arena re-opens.
+    owner_.store(other.owner_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    other.owner_.store(std::thread::id{}, std::memory_order_relaxed);
+#endif
 }
 
 Arena& Arena::operator=(Arena&& other) noexcept {
@@ -59,13 +70,63 @@ Arena& Arena::operator=(Arena&& other) noexcept {
         other.destructors_.clear();
         other.owns_memory_ = true;
         other.fixed_buffer_ = false;
+#ifndef NDEBUG
+        // Carry the owner binding with the storage; the moved-from arena re-opens.
+        owner_.store(other.owner_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        other.owner_.store(std::thread::id{}, std::memory_order_relaxed);
+#endif
     }
     return *this;
 }
 
+#ifndef NDEBUG
+
+void Arena::assert_owner(const char* op) noexcept {
+    const std::thread::id self = std::this_thread::get_id();
+    std::thread::id expected{};
+    // Binding open → first toucher becomes the owner (relaxed CAS; see the
+    // owner_ protocol note in arena.hpp — this is a detector, not a publish).
+    if (owner_.compare_exchange_strong(expected, self, std::memory_order_relaxed)) {
+        return;
+    }
+    BRACKEN_ASSERT(expected == self,
+                   "Arena::{}: called from a non-owner thread (owner {:#x}, caller {:#x}). The "
+                   "arena is single-owner; hand off via reset() on the owner (re-opens the "
+                   "binding) or an explicit rebind_owner() on the new thread",
+                   op, std::hash<std::thread::id>{}(expected), std::hash<std::thread::id>{}(self));
+}
+
+void Arena::bind_owner() noexcept {
+    const std::thread::id self = std::this_thread::get_id();
+    std::thread::id expected{};
+    if (!owner_.compare_exchange_strong(expected, self, std::memory_order_relaxed)) {
+        BRACKEN_ASSERT(expected == self,
+                       "Arena::bind_owner: already bound to another thread (owner {:#x}, caller "
+                       "{:#x}); use rebind_owner() for an explicit handoff",
+                       std::hash<std::thread::id>{}(expected), std::hash<std::thread::id>{}(self));
+    }
+}
+
+void Arena::rebind_owner() noexcept {
+    owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+}
+
+#endif // !NDEBUG
+
 void* Arena::allocate(std::size_t size, std::size_t align) {
+#ifndef NDEBUG
+    assert_owner("allocate");
+#endif
+    // align_up below only works for power-of-two alignments; anything else
+    // (e.g. a stride-derived 12) would silently return a misaligned pointer.
+    BRACKEN_ASSERT(align == 0 || std::has_single_bit(align),
+                   "Arena::allocate: alignment must be a power of two (got {})", align);
     if (size == 0) {
-        return nullptr;
+        // Zero-size requests succeed: return a valid non-null pointer (never
+        // dereferenceable, no alignment guarantee) so that nullptr uniquely
+        // signals allocation failure. No arena bytes are consumed.
+        static std::max_align_t s_zero_size_object;
+        return &s_zero_size_object;
     }
     if (align == 0) {
         align = alignof(std::max_align_t);
@@ -116,6 +177,12 @@ bool Arena::grow(std::size_t min_bytes) {
 }
 
 void Arena::reset() {
+#ifndef NDEBUG
+    assert_owner("reset");
+    // Re-open the binding: the next thread to allocate (or bind_owner()) after
+    // a reset becomes the new owner — the per-frame stage-handoff point.
+    owner_.store(std::thread::id{}, std::memory_order_relaxed);
+#endif
     destroy_all();
     if (fixed_buffer_) {
         if (!chunks_.empty()) {

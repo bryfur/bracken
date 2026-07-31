@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <limits>
 #include <ostream>
 #include <queue>
 #include <unordered_set>
@@ -20,17 +21,6 @@ SDL_GPUTexture* RenderPassContext::get_texture(ResourceHandle h) const noexcept 
     }
     const auto& r = graph_->resource(h);
     return r.transient ? r.resolved_texture : r.imported_texture;
-}
-
-SDL_GPUBuffer* RenderPassContext::get_buffer(ResourceHandle h) const noexcept {
-    if (!graph_) {
-        return nullptr;
-    }
-    if (!h.valid()) {
-        return nullptr;
-    }
-    const auto& r = graph_->resource(h);
-    return r.transient ? r.resolved_buffer : r.imported_buffer;
 }
 
 // ---------- PassBuilder ----------
@@ -117,7 +107,6 @@ void PassBuilder::write(ResourceHandle h) {
     }
     if (std::find(node_->writes.begin(), node_->writes.end(), h) == node_->writes.end()) {
         node_->writes.push_back(h);
-        graph_->resource(h).version += 1;
     }
 }
 
@@ -151,9 +140,6 @@ void PassBuilder::attach_depth(ResourceHandle h, SDL_GPULoadOp loadop, float cle
 void PassBuilder::set_managed_render_pass(bool managed) noexcept {
     node_->managed_render_pass = managed;
 }
-void PassBuilder::set_pass_type(PassType t) noexcept {
-    node_->type = t;
-}
 
 // ---------- RenderGraph ----------
 
@@ -161,9 +147,9 @@ RenderGraph::~RenderGraph() {
     shutdown();
 }
 
-bool RenderGraph::init(gpu::GPUDevice& device) {
+void RenderGraph::init(gpu::GPUDevice& device) {
     device_ = &device;
-    return allocator_.init(device);
+    allocator_.init(device);
 }
 
 void RenderGraph::shutdown() {
@@ -196,10 +182,8 @@ PassNode& RenderGraph::create_pass_node(const std::string& name) {
     return n;
 }
 
-void RenderGraph::add_pass(const std::string& name, PassType type, std::function<void(PassBuilder&)> setup,
-                           PassExecuteFn execute) {
+void RenderGraph::add_pass(const std::string& name, std::function<void(PassBuilder&)> setup, PassExecuteFn execute) {
     PassNode& node = create_pass_node(name);
-    node.type = type;
     {
         PassBuilder b(*this, node);
         if (setup) {
@@ -233,7 +217,6 @@ ResourceHandle RenderGraph::declare_transient_texture(const std::string& name, c
     }
     uint32_t idx = static_cast<uint32_t>(resources_.size());
     ResourceNode r;
-    r.type = ResourceType::Texture;
     r.name = name;
     r.transient = true;
     r.texture_desc = desc;
@@ -256,7 +239,6 @@ ResourceHandle RenderGraph::declare_imported_texture(const std::string& name, SD
     }
     uint32_t idx = static_cast<uint32_t>(resources_.size());
     ResourceNode r;
-    r.type = ResourceType::Texture;
     r.name = name;
     r.transient = false;
     r.imported_texture = tex;
@@ -354,9 +336,11 @@ void RenderGraph::compute_lifetimes() {
     }
 }
 
-void RenderGraph::allocate_transients() {
+bool RenderGraph::allocate_transients() {
     // For each compiled step, acquire transients whose first_write_pass == step,
     // and release ones whose last_read_pass == step. This implements interval-based reuse.
+    // Returns false if any transient texture cannot be created; the caller
+    // (compile) releases whatever was acquired and fails the compile.
     last_transient_count_ = 0;
     last_reuse_count_ = 0;
     uint32_t reuses_before = allocator_.reuses_this_frame();
@@ -369,6 +353,11 @@ void RenderGraph::allocate_transients() {
             }
             if (r.first_write_pass == static_cast<uint32_t>(step) && r.resolved_texture == nullptr) {
                 r.resolved_texture = allocator_.acquire_texture(r.texture_desc, r.name.c_str());
+                if (r.resolved_texture == nullptr) {
+                    BRACKEN_LOG_ERROR("rg", "allocate_transients: failed to create transient '{}' ({}x{})", r.name,
+                                      r.texture_desc.width, r.texture_desc.height);
+                    return false;
+                }
                 ++last_transient_count_;
             }
         }
@@ -387,6 +376,7 @@ void RenderGraph::allocate_transients() {
     }
 
     last_reuse_count_ = allocator_.reuses_this_frame() - reuses_before;
+    return true;
 }
 
 bool RenderGraph::compile() {
@@ -399,7 +389,20 @@ bool RenderGraph::compile() {
         return false;
     }
     compute_lifetimes();
-    allocate_transients();
+    if (!allocate_transients()) {
+        BRACKEN_LOG_ERROR("rg", "compile: transient allocation failed (passes={}); skipping execute", passes_.size());
+        // Return anything acquired before the failure to the pool so nothing
+        // leaks, and null the resolved pointers so no pass can see a stale one.
+        for (auto& r : resources_) {
+            if (r.transient && r.resolved_texture != nullptr) {
+                allocator_.release_texture(r.texture_desc, r.resolved_texture);
+                r.resolved_texture = nullptr;
+            }
+        }
+        compiled_order_.clear();
+        compiled_ = false;
+        return false;
+    }
     last_compiled_passes_ = static_cast<uint32_t>(compiled_order_.size());
     compiled_ = true;
     return true;
@@ -455,7 +458,6 @@ void RenderGraph::end_frame() {
     for (auto& r : resources_) {
         if (r.transient) {
             r.resolved_texture = nullptr;
-            r.resolved_buffer = nullptr;
         }
     }
     cb_ = nullptr;
@@ -465,15 +467,54 @@ void RenderGraph::evict_pool() {
     allocator_.evict_all();
 }
 
+namespace {
+// Escape a name for use inside a double-quoted DOT label.
+std::string dot_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            default:
+                out += c;
+                break;
+        }
+    }
+    return out;
+}
+} // namespace
+
 void RenderGraph::dump_dot(std::ostream& os) const {
+    // Map pass index -> compiled execution step (only available after a
+    // successful compile(); before that, only the declared graph is dumped).
+    constexpr size_t NO_STEP = std::numeric_limits<size_t>::max();
+    std::vector<size_t> step_of(passes_.size(), NO_STEP);
+    if (compiled_) {
+        for (size_t step = 0; step < compiled_order_.size(); ++step) {
+            step_of[compiled_order_[step]] = step;
+        }
+    }
+
     os << "digraph RenderGraph {\n";
     os << "  rankdir=LR;\n";
     for (size_t i = 0; i < passes_.size(); ++i) {
-        os << "  pass" << i << " [label=\"" << passes_[i].name << "\", shape=box];\n";
+        os << "  pass" << i << " [label=\"" << dot_escape(passes_[i].name);
+        if (step_of[i] != NO_STEP) {
+            os << "\\n[step " << step_of[i] << "]";
+        }
+        os << "\", shape=box];\n";
     }
     for (size_t i = 0; i < resources_.size(); ++i) {
-        os << "  res" << i << " [label=\"" << resources_[i].name << (resources_[i].transient ? " (T)" : " (I)")
-           << "\", shape=ellipse];\n";
+        os << "  res" << i << " [label=\"" << dot_escape(resources_[i].name)
+           << (resources_[i].transient ? " (T)" : " (I)") << "\", shape=ellipse];\n";
     }
     for (size_t i = 0; i < passes_.size(); ++i) {
         for (auto h : passes_[i].writes) {

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "bracken/core/jobs/job_system.hpp"
 #include "bracken/render/lighting/light.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
 #include "bracken/scene/camera_state.hpp"
@@ -219,9 +220,20 @@ TEST(ClusterGrid, BuildIsDeterministic) {
 }
 
 TEST(LightStruct, SizesMatchSpec) {
-    EXPECT_EQ(sizeof(PointLight), 32u);
+    // Strides hardcoded in cluster_lighting.hlsli (loadPointLight/loadSpotLight).
+    EXPECT_EQ(sizeof(PointLight), 48u);
     EXPECT_EQ(sizeof(SpotLight), 64u);
     EXPECT_EQ(sizeof(LightHeader), 8u);
+    // shadow_slot byte offsets the shader reads (Load4 lanes c.y / d.z).
+    EXPECT_EQ(offsetof(PointLight, shadow_slot), 36u);
+    EXPECT_EQ(offsetof(SpotLight, shadow_slot), 56u);
+    // Host-facing defaults: opt-out of shadows, engine slot unassigned.
+    PointLight p{};
+    SpotLight s{};
+    EXPECT_FALSE(p.casts_shadows);
+    EXPECT_FALSE(s.casts_shadows);
+    EXPECT_EQ(p.shadow_slot, -1);
+    EXPECT_EQ(s.shadow_slot, -1);
 }
 
 TEST(ClusterGrid, ParamsCarryShaderContract) {
@@ -356,6 +368,126 @@ TEST(ClusterGrid, BinnedClustersCoverAllLitFragmentsReversedZ) {
     cam.view_projection = cam.projection * cam.view;
     cam.position = glm::vec3(0.0f);
     check_binned_clusters_cover_lit_fragments(cam, near_plane, far_plane);
+}
+
+namespace {
+
+// Seeded light sets for the parallel parity tests — fixed seed constants, no
+// runtime RNG (docs/multithreading_plan.md §6.2).
+constexpr uint32_t k_parity_point_seed = 424242;
+constexpr uint32_t k_parity_spot_seed = 971131;
+
+std::vector<PointLight> make_seeded_point_lights(std::size_t count, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> px(-30.0f, 30.0f);
+    std::uniform_real_distribution<float> py(-10.0f, 10.0f);
+    std::uniform_real_distribution<float> pz(-80.0f, -1.0f);
+    std::uniform_real_distribution<float> pr(0.5f, 6.0f);
+    std::vector<PointLight> lights(count);
+    for (auto& p : lights) {
+        p.position = glm::vec3(px(rng), py(rng), pz(rng));
+        p.radius = pr(rng);
+        p.color = glm::vec3(1.0f);
+        p.intensity = 1.0f;
+    }
+    return lights;
+}
+
+std::vector<SpotLight> make_seeded_spot_lights(std::size_t count, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> px(-30.0f, 30.0f);
+    std::uniform_real_distribution<float> py(-10.0f, 10.0f);
+    std::uniform_real_distribution<float> pz(-80.0f, -1.0f);
+    std::uniform_real_distribution<float> pr(0.5f, 6.0f);
+    std::uniform_real_distribution<float> pd(-1.0f, 1.0f);
+    std::vector<SpotLight> lights(count);
+    for (auto& s : lights) {
+        s.position = glm::vec3(px(rng), py(rng), pz(rng));
+        s.radius = pr(rng);
+        glm::vec3 dir(pd(rng), pd(rng), pd(rng));
+        s.direction = glm::dot(dir, dir) > 1e-6f ? glm::normalize(dir) : glm::vec3(0.0f, -1.0f, 0.0f);
+        s.inner_cos = glm::cos(glm::radians(15.0f));
+        s.outer_cos = glm::cos(glm::radians(25.0f));
+        s.color = glm::vec3(1.0f);
+        s.intensity = 1.0f;
+    }
+    return lights;
+}
+
+// Drives begin_frame/add/build against a caller-owned pool. Two frames so the
+// second build also exercises the packing dirty-diff over populated bins.
+void run_frames(bracken::core::jobs::JobSystem& js, ClusterGrid& g, const CameraState& cam,
+                const std::vector<PointLight>& points, const std::vector<SpotLight>& spots) {
+    for (int frame = 0; frame < 2; ++frame) {
+        g.begin_frame(js, cam, 1920, 1080, 0.1f, 100.0f);
+        for (const auto& p : points) g.add_point_light(p);
+        for (const auto& s : spots) g.add_spot_light(s);
+        g.build(js);
+    }
+}
+
+} // namespace
+
+TEST(ClusterGrid, ParallelBuildBitIdenticalAcrossWorkerCounts) {
+    // Determinism contract (§6.2): the cluster-chunked binning fan-out must
+    // produce bins (observable through the packed offset/count table) and
+    // packed index arrays BIT-identical at every worker count. Caller-owned
+    // pools: 1 worker (parallel_for collapses to one inline chunk) vs 4.
+    const auto points = make_seeded_point_lights(96, k_parity_point_seed);
+    const auto spots = make_seeded_spot_lights(32, k_parity_spot_seed);
+    const CameraState cam = make_camera(1920, 1080);
+
+    bracken::core::jobs::JobSystem js1;
+    js1.init(1);
+    bracken::core::jobs::JobSystem js4;
+    js4.init(4);
+    bracken::core::jobs::JobSystem js_uninit; // never init(): guaranteed inline path
+
+    ClusterGrid g1;
+    ClusterGrid g4;
+    ClusterGrid g0;
+    run_frames(js1, g1, cam, points, spots);
+    run_frames(js4, g4, cam, points, spots);
+    run_frames(js_uninit, g0, cam, points, spots);
+
+    ASSERT_FALSE(g1.light_indices().empty());
+    // Bins are fully captured by (offset, count) + the packed index stream.
+    EXPECT_EQ(g1.cluster_offsets(), g4.cluster_offsets());
+    EXPECT_EQ(g1.light_indices(), g4.light_indices());
+    EXPECT_EQ(g0.cluster_offsets(), g4.cluster_offsets());
+    EXPECT_EQ(g0.light_indices(), g4.light_indices());
+}
+
+TEST(ClusterGrid, ParallelBuildTruncationBitIdentical) {
+    // 150 identical overlapping lights force the MAX_LIGHTS_PER_CLUSTER
+    // cutoff: the parallel per-cluster form must keep exactly the same lowest
+    // light indices as the inline path.
+    std::vector<PointLight> lights(150);
+    for (auto& p : lights) {
+        p.position = glm::vec3(0.0f, 0.0f, -10.0f);
+        p.radius = 3.0f;
+        p.color = glm::vec3(1.0f);
+        p.intensity = 1.0f;
+    }
+    const CameraState cam = make_camera(1920, 1080);
+
+    bracken::core::jobs::JobSystem js4;
+    js4.init(4);
+    bracken::core::jobs::JobSystem js_uninit;
+
+    ClusterGrid g4;
+    ClusterGrid g0;
+    run_frames(js4, g4, cam, lights, {});
+    run_frames(js_uninit, g0, cam, lights, {});
+
+    EXPECT_EQ(g0.cluster_offsets(), g4.cluster_offsets());
+    EXPECT_EQ(g0.light_indices(), g4.light_indices());
+
+    uint32_t max_count = 0;
+    for (uint32_t c = 0; c < CLUSTER_COUNT; ++c) {
+        max_count = std::max(max_count, g4.cluster_offsets()[c * 2 + 1]);
+    }
+    EXPECT_EQ(max_count, MAX_LIGHTS_PER_CLUSTER);
 }
 
 TEST(ClusterGrid, PerClusterCountNeverExceedsCap) {

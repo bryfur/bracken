@@ -11,7 +11,9 @@ namespace bracken::dev::detail {
 
 /** Draw the built-in "Bracken Dev" window (tabs: Stats, Environment,
  *  Graphics, Camera). Runs inside an active ImGui frame. Sections whose
- *  binding is null are hidden. */
-void draw_builtin_panels(const DevUI::Bindings& bindings);
+ *  binding is null are hidden; Graphics additionally requires a non-empty
+ *  `apply_settings`. `state` is the owning DevUI's per-instance widget
+ *  state (slider values, FPS history). */
+void draw_builtin_panels(const DevUI::Bindings& bindings, DevUI::PanelState& state);
 
 } // namespace bracken::dev::detail

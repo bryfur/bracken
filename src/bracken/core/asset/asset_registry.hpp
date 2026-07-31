@@ -41,6 +41,15 @@ public:
             BRACKEN_LOG_ERROR("hot_reload", "AssetRegistry: failed to load '{}'", entry->path.string());
             return Handle::invalid();
         }
+        // A second load under an existing name would otherwise orphan the old
+        // entry (alive, watched, unreachable by name) — unload it first. Done
+        // only after the new load succeeded so a failed load keeps the old
+        // asset intact.
+        if (auto it = name_to_handle_.find(entry->name); it != name_to_handle_.end()) {
+            BRACKEN_LOG_WARN("hot_reload", "AssetRegistry: '{}' already loaded; replacing previous entry",
+                             entry->name);
+            unload(it->second);
+        }
         Handle h = next_handle();
         entry->handle = h;
         if (watcher_) {
@@ -92,7 +101,11 @@ public:
         if (slot->watch != FileWatcher::k_invalid_handle && watcher_) {
             watcher_->unwatch(slot->watch);
         }
-        name_to_handle_.erase(slot->name);
+        // Only drop the name mapping if it still points at this entry — a
+        // newer entry may have claimed the name since.
+        if (auto it = name_to_handle_.find(slot->name); it != name_to_handle_.end() && it->second == h) {
+            name_to_handle_.erase(it);
+        }
         // Bump generation for the slot so old handles fail validation.
         free_generations_.push_back(slot->handle.generation + 1);
         free_indices_.push_back(h.index);

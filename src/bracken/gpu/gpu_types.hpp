@@ -48,48 +48,6 @@ struct Vertex2D {
     glm::vec4 color;
 };
 
-/// Grass instance data for instanced rendering
-struct GrassInstance {
-    glm::vec3 position;
-    float rotation;
-    float scale;
-    float color_variation;
-};
-
-// =============================================================================
-// Uniform Buffer Structures - Must match shader layouts (std140 compatible)
-// =============================================================================
-
-/// Camera/view uniform block
-struct alignas(16) CameraUniforms {
-    glm::mat4 view;
-    glm::mat4 projection;
-    glm::vec3 camera_pos;
-    float padding;
-};
-
-/// Per-model transform uniform block
-struct alignas(16) ModelUniforms {
-    glm::mat4 model;
-    glm::vec4 tint;
-};
-
-/// Lighting uniform block
-struct alignas(16) LightUniforms {
-    glm::vec3 light_dir;
-    float ambient;
-    glm::vec3 light_color;
-    float padding;
-    glm::mat4 light_space_matrix;
-};
-
-/// Time and animation uniform block
-struct alignas(16) TimeUniforms {
-    float time;
-    float delta_time;
-    float padding[2];
-};
-
 // =============================================================================
 // Texture Formats - Common format mappings
 // =============================================================================
@@ -100,6 +58,7 @@ enum class TextureFormat {
     BGRA8,
     R8,
     R16,   // 16-bit unsigned normalized (for heightmaps)
+    RG16F, // 2x 16-bit float (screen-space velocity / motion vectors)
     D32F,  // Depth 32-bit float
     D24S8, // Depth 24 + Stencil 8
 };
@@ -116,12 +75,40 @@ inline SDL_GPUTextureFormat to_sdl_format(TextureFormat format) {
             return SDL_GPU_TEXTUREFORMAT_R8_UNORM;
         case TextureFormat::R16:
             return SDL_GPU_TEXTUREFORMAT_R16_UNORM;
+        case TextureFormat::RG16F:
+            return SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
         case TextureFormat::D32F:
             return SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
         case TextureFormat::D24S8:
             return SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
         default:
             return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+/// Inverse of to_sdl_format for the formats it can produce. Returns RGBA8 for
+/// any SDL format outside that set; callers that need to detect an unmappable
+/// format should verify `to_sdl_format(from_sdl_format(f)) == f` round-trips.
+inline TextureFormat from_sdl_format(SDL_GPUTextureFormat format) {
+    switch (format) {
+        case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM:
+            return TextureFormat::RGBA8;
+        case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB:
+            return TextureFormat::RGBA8_SRGB;
+        case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM:
+            return TextureFormat::BGRA8;
+        case SDL_GPU_TEXTUREFORMAT_R8_UNORM:
+            return TextureFormat::R8;
+        case SDL_GPU_TEXTUREFORMAT_R16_UNORM:
+            return TextureFormat::R16;
+        case SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT:
+            return TextureFormat::RG16F;
+        case SDL_GPU_TEXTUREFORMAT_D32_FLOAT:
+            return TextureFormat::D32F;
+        case SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT:
+            return TextureFormat::D24S8;
+        default:
+            return TextureFormat::RGBA8;
     }
 }
 
@@ -155,6 +142,10 @@ inline SDL_GPUColorTargetBlendState get_blend_state(BlendMode mode) {
             break;
 
         case BlendMode::Additive:
+            // Configured as color (SRC_ALPHA, ONE). The particle fragment
+            // shader writes alpha 1.0, so the effective color blend for
+            // particles is (ONE, ONE); a shader that outputs alpha < 1 gets
+            // alpha-weighted additive blending instead.
             state.enable_blend = true;
             state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
             state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
