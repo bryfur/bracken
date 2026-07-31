@@ -5,6 +5,7 @@
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
 #include "bracken/core/jobs/task_group.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_debug.hpp"
@@ -37,7 +38,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <limits>
 #include <memory>
 #include <type_traits>
@@ -54,6 +54,10 @@
 #include "glm/matrix.hpp"
 
 namespace bracken::scene {
+
+namespace {
+constexpr const char* LOG_TAG = "scene";
+} // namespace
 
 namespace gpu = bracken::gpu;
 namespace render = bracken::render;
@@ -146,7 +150,7 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
     context_ = &context;
 
     if (!pipeline_registry_->init(context_->device())) {
-        std::cerr << "Failed to initialize pipeline registry" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to initialize pipeline registry");
         return false;
     }
     pipeline_registry_->set_swapchain_format(context_->swapchain_format());
@@ -154,12 +158,12 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
     model_manager_->set_device(&context_->device());
 
     if (!terrain_->init(context_->device(), *pipeline_registry_, world_width, world_height)) {
-        std::cerr << "Failed to initialize terrain renderer" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to initialize terrain renderer");
         return false;
     }
 
     if (!world_->init(context_->device(), *pipeline_registry_)) {
-        std::cerr << "Failed to initialize world renderer" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to initialize world renderer");
         return false;
     }
 
@@ -167,18 +171,18 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
     int h = context_->height();
 
     if (!ui_->init(context_->device(), *pipeline_registry_, w, h)) {
-        std::cerr << "Failed to initialize UI renderer" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to initialize UI renderer");
         return false;
     }
 
     if (!effects_->init(context_->device(), *pipeline_registry_, model_manager_.get())) {
-        std::cerr << "Failed to initialize effect renderer" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to initialize effect renderer");
         return false;
     }
 
     depth_texture_ = gpu::GPUTexture::create_depth(context_->device(), w, h);
     if (!depth_texture_) {
-        std::cerr << "Failed to create depth texture" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create depth texture");
         return false;
     }
 
@@ -186,55 +190,55 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
 
     // Preload all pipelines upfront to avoid hitching during gameplay
     if (!pipeline_registry_->preload_all_pipelines()) {
-        std::cerr << "Warning: Some pipelines failed to preload" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Some pipelines failed to preload");
     }
 
     if (grass_renderer_ && !grass_renderer_->init(context_->device(), *pipeline_registry_, world_width, world_height)) {
-        std::cerr << "Warning: Failed to initialize grass renderer (grass disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize grass renderer (grass disabled)");
     }
 
     const GraphicsSettings& gfx = graphics_ ? *graphics_ : default_graphics_;
     const int shadow_res = shadow_map_texels(gfx.shadow_resolution);
     shadow_map_->set_active_cascades(cascade_count(gfx.shadow_cascades));
     if (!shadow_map_->init(context_->device(), shadow_res)) {
-        std::cerr << "Warning: Failed to initialize shadow map (shadows disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize shadow map (shadows disabled)");
     }
 
     const int local_shadow_res = local_shadow_atlas_texels(gfx.local_shadow_resolution);
     if (!local_shadows_->init(context_->device(), local_shadow_res)) {
-        std::cerr << "Warning: Failed to initialize local shadow map (point/spot shadows disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize local shadow map (point/spot shadows disabled)");
     }
 
     if (!post_->init(context_->device(), w, h)) {
-        std::cerr << "Warning: Failed to initialize post-process stack (HDR path disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize post-process stack (HDR path disabled)");
     }
 
     if (!gtao_->init(context_->device(), w, h, gfx.ao_mode != AOMode::GTAO_Full)) {
-        std::cerr << "Warning: Failed to initialize GTAO (AO disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize GTAO (AO disabled)");
     }
 
     if (!bloom_->init(context_->device(), w, h)) {
-        std::cerr << "Warning: Failed to initialize Bloom (bloom disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize Bloom (bloom disabled)");
     }
 
     if (!volumetric_fog_->init(context_->device(), w, h)) {
-        std::cerr << "Warning: Failed to initialize Volumetric Fog (fog disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize Volumetric Fog (fog disabled)");
     }
 
     if (!taa_->init(context_->device(), w, h)) {
-        std::cerr << "Warning: Failed to initialize TAA (temporal AA disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize TAA (temporal AA disabled)");
     }
 
     if (!auto_exposure_->init(context_->device())) {
-        std::cerr << "Warning: Failed to initialize AutoExposure (histogram exposure disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize AutoExposure (histogram exposure disabled)");
     }
 
     if (!ibl_->init(context_->device(), *pipeline_registry_)) {
-        std::cerr << "Warning: Failed to initialize IBL (sky image-based lighting disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize IBL (sky image-based lighting disabled)");
     }
 
     if (!water_->init(context_->device(), *pipeline_registry_)) {
-        std::cerr << "Warning: Failed to initialize WaterRenderer (water disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize WaterRenderer (water disabled)");
     }
 
     // Timestamp pool is a documented stub (returns zeros); failure is harmless.
@@ -242,7 +246,7 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
 
     cluster_grid_ready_ = cluster_grid_.init(context_->device(), render::lighting::MAX_LIGHTS);
     if (!cluster_grid_ready_) {
-        std::cerr << "Warning: Failed to initialize ClusterGrid (dynamic lighting disabled)" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize ClusterGrid (dynamic lighting disabled)");
     }
 
     return true;
@@ -290,7 +294,7 @@ void SceneRenderer::init_pipelines() {
     auto* skinned_pipeline = pipeline_registry_->get_skinned_model_pipeline();
 
     if (!model_pipeline || !skinned_pipeline) {
-        std::cerr << "Warning: Some pipelines failed to preload" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Some pipelines failed to preload");
     }
 
     SDL_GPUSamplerCreateInfo sampler_info = {};
@@ -308,7 +312,7 @@ void SceneRenderer::init_pipelines() {
     default_sampler_ = context_->device().create_sampler(sampler_info);
 
     if (!default_sampler_) {
-        std::cerr << "Warning: Failed to create default GPU sampler" << '\n';
+        BRACKEN_LOG_WARN(LOG_TAG, "Failed to create default GPU sampler");
     }
 
     // Create 1x1 white dummy texture for binding slots that require a texture
@@ -433,7 +437,7 @@ void SceneRenderer::set_anisotropic_filter(int level) {
         default_sampler_ = context_->device().create_sampler(sampler_info);
 
         if (!default_sampler_) {
-            std::cerr << "Warning: Failed to recreate default GPU sampler (anisotropic level: " << level << ")" << '\n';
+            BRACKEN_LOG_WARN(LOG_TAG, "Failed to recreate default GPU sampler (anisotropic level: {})", level);
         }
     }
 }
@@ -451,7 +455,7 @@ void SceneRenderer::set_heightmap(const Heightmap& heightmap) {
         grass_renderer_->set_heightmap(terrain_->heightmap_texture(), hm_params);
     }
 
-    std::cout << "[Renderer] Heightmap set for terrain rendering" << '\n';
+    BRACKEN_LOG_DEBUG(LOG_TAG, "Heightmap set for terrain rendering");
 }
 
 // ============================================================================
@@ -472,7 +476,7 @@ void SceneRenderer::end_frame() {
 void SceneRenderer::begin_main_pass() {
     SDL_GPUCommandBuffer* cmd = context_->current_command_buffer();
     if (!cmd) {
-        std::cerr << "begin_main_pass: No active command buffer" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "begin_main_pass: No active command buffer");
         return;
     }
 
@@ -480,7 +484,7 @@ void SceneRenderer::begin_main_pass() {
     uint32_t sw_height = 0;
     current_swapchain_ = context_->acquire_swapchain_texture(cmd, &sw_width, &sw_height);
     if (!current_swapchain_) {
-        std::cerr << "begin_main_pass: Failed to acquire swapchain texture" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "begin_main_pass: Failed to acquire swapchain texture");
         return;
     }
 
@@ -488,7 +492,7 @@ void SceneRenderer::begin_main_pass() {
                            depth_texture_->height() != static_cast<int>(sw_height))) {
         depth_texture_ = gpu::GPUTexture::create_depth(context_->device(), sw_width, sw_height);
         if (!depth_texture_) {
-            std::cerr << "begin_main_pass: Failed to resize depth texture" << '\n';
+            BRACKEN_LOG_ERROR(LOG_TAG, "begin_main_pass: Failed to resize depth texture");
             return;
         }
     }
@@ -510,7 +514,7 @@ void SceneRenderer::begin_main_pass() {
 
     main_render_pass_ = SDL_BeginGPURenderPass(cmd, &color_target, 1, depth_texture_ ? &depth_target : nullptr);
     if (!main_render_pass_) {
-        std::cerr << "begin_main_pass: Failed to begin render pass" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "begin_main_pass: Failed to begin render pass");
         return;
     }
 
@@ -527,7 +531,7 @@ void SceneRenderer::end_main_pass() {
 void SceneRenderer::begin_ui() {
     SDL_GPUCommandBuffer* cmd = context_->current_command_buffer();
     if (!cmd) {
-        std::cerr << "begin_ui: No active command buffer" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "begin_ui: No active command buffer");
         return;
     }
 
@@ -827,7 +831,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 }
                 SDL_EndGPUCopyPass(copy_pass);
             } else {
-                std::cerr << "render_frame: Failed to begin frame upload copy pass" << '\n';
+                BRACKEN_LOG_ERROR(LOG_TAG, "render_frame: Failed to begin frame upload copy pass");
             }
         }
 
@@ -910,7 +914,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                         context_->device(), vw, vh, pipeline_registry_->get_velocity_format(),
                         SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
                     if (!velocity_texture_) {
-                        std::cerr << "render_frame: failed to create velocity texture (prepass disabled)" << '\n';
+                        BRACKEN_LOG_WARN(LOG_TAG, "render_frame: failed to create velocity texture (prepass disabled)");
                     }
                 }
             }
@@ -1261,7 +1265,7 @@ void SceneRenderer::capture_screenshot_and_end_frame() {
     tb_info.size = w * h * 4;
     SDL_GPUTransferBuffer* transfer = device.create_transfer_buffer(tb_info);
     if (!transfer) {
-        std::cerr << "Screenshot: failed to create download buffer: " << SDL_GetError() << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "Screenshot: failed to create download buffer: {}", SDL_GetError());
         end_frame();
         return;
     }
@@ -1298,8 +1302,8 @@ void SceneRenderer::capture_screenshot_and_end_frame() {
         pixel_format = SDL_PIXELFORMAT_RGBA32;
         break;
     default:
-        std::cerr << "Screenshot: unexpected swapchain format " << static_cast<int>(gpu_format)
-                  << ", assuming RGBA8\n";
+        BRACKEN_LOG_WARN(LOG_TAG, "Screenshot: unexpected swapchain format {}, assuming RGBA8",
+                         static_cast<int>(gpu_format));
         pixel_format = SDL_PIXELFORMAT_RGBA32;
         break;
     }
@@ -1322,9 +1326,9 @@ void SceneRenderer::capture_screenshot_and_end_frame() {
     device.release_transfer_buffer(transfer);
 
     if (saved) {
-        SDL_Log("SceneRenderer: screenshot saved to '%s' (%ux%u)", path.c_str(), w, h);
+        BRACKEN_LOG_INFO(LOG_TAG, "SceneRenderer: screenshot saved to '{}' ({}x{})", path.c_str(), w, h);
     } else {
-        std::cerr << "Screenshot: failed to save '" << path << "': " << SDL_GetError() << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "Screenshot: failed to save '{}': {}", path, SDL_GetError());
     }
 }
 
@@ -2067,7 +2071,7 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
             instance_storage_buffer_ = gpu::GPUBuffer::create_dynamic(context_->device(), gpu::GPUBuffer::Type::Storage,
                                                                       instance_storage_capacity_);
             if (!instance_storage_buffer_) {
-                std::cerr << "[SceneRenderer] Failed to create instance storage buffer" << '\n';
+                BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create instance storage buffer");
                 instance_storage_capacity_ = 0;
             }
         }
@@ -2108,7 +2112,7 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
             shadow_instance_storage_buffer_ = gpu::GPUBuffer::create_dynamic(
                 context_->device(), gpu::GPUBuffer::Type::Storage, shadow_instance_storage_capacity_);
             if (!shadow_instance_storage_buffer_) {
-                std::cerr << "[SceneRenderer] Failed to create shadow instance storage buffer" << '\n';
+                BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create shadow instance storage buffer");
                 shadow_instance_storage_capacity_ = 0;
                 shadow_cascade_base_instance_ = {0, 0, 0, 0};
                 return;
@@ -2291,7 +2295,7 @@ void SceneRenderer::upload_bone_palettes(SDL_GPUCopyPass* copy_pass, const Frame
         capacity = std::max(required_size * 2, static_cast<size_t>(64 * 1024));
         buffer = gpu::GPUBuffer::create_dynamic(context_->device(), gpu::GPUBuffer::Type::Storage, capacity);
         if (!buffer) {
-            std::cerr << "[SceneRenderer] Failed to create bone palette storage buffer" << '\n';
+            BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create bone palette storage buffer");
             capacity = 0;
             return;
         }
@@ -2304,7 +2308,7 @@ void SceneRenderer::upload_bone_palettes(SDL_GPUCopyPass* copy_pass, const Frame
     // parallelize over disjoint ranges — see prep_copy_palettes).
     gpu::GPUBuffer::Mapping mapping = buffer->map();
     if (!mapping) {
-        std::cerr << "[SceneRenderer] Failed to map bone palette transfer buffer" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to map bone palette transfer buffer");
         return;
     }
     prep_copy_palettes(core::jobs::JobSystem::instance(), frame.palettes(),
@@ -2525,7 +2529,7 @@ bool SceneRenderer::render_depth_prepass(const FramePacket& frame, const CameraS
 
     SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target);
     if (!pass) {
-        std::cerr << "render_depth_prepass: failed to begin render pass" << '\n';
+        BRACKEN_LOG_ERROR(LOG_TAG, "render_depth_prepass: failed to begin render pass");
         return false;
     }
 
