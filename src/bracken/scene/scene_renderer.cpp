@@ -551,6 +551,12 @@ void SceneRenderer::begin_ui() {
 void SceneRenderer::end_ui() {
     ui_->end();
 
+    // Sampled before execute(), which clears the batch.
+    if (collect_stats_) {
+        render_stats_.ui_vertices = static_cast<uint32_t>(ui_->batch_vertex_count());
+        render_stats_.ui_draws = static_cast<uint32_t>(ui_->batch_draw_count());
+    }
+
     SDL_GPUCommandBuffer* cmd = context_->current_command_buffer();
     if (cmd && current_swapchain_) {
         bool clear_background = !had_main_pass_this_frame_;
@@ -1274,6 +1280,10 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
         gpu_timer_pool_.end_frame(end_cmd);
     }
     if (collect_stats_) {
+        if (local_shadows_) {
+            render_stats_.local_shadow_tiles_rendered =
+                static_cast<uint32_t>(local_shadows_->selector().tiles_rendered_last_frame());
+        }
         gpu_timer_pool_.read_results(render_stats_.pass_times_ms);
         BRACKEN_PROFILE_PLOT("render.draw_calls", static_cast<int64_t>(render_stats_.draw_calls));
         BRACKEN_PROFILE_PLOT("render.triangles", static_cast<int64_t>(render_stats_.triangle_count));
@@ -2105,6 +2115,9 @@ void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
     size_t total_instances = 0;
     for (ModelHandle h : instance_batches_touched_) {
         total_instances += instance_batches_[h].size();
+    }
+    if (collect_stats_) {
+        render_stats_.instances_drawn = static_cast<uint32_t>(total_instances);
     }
 
     if (total_instances > 0) {

@@ -1,5 +1,7 @@
 #include "gpu_device.hpp"
 #include "bracken/core/assert.hpp"
+
+#include <chrono>
 #include "bracken/core/jobs/job_stage.hpp"
 #include "bracken/core/logger.hpp"
 #include "SDL3/SDL_error.h"
@@ -123,7 +125,12 @@ void GPUDevice::end_frame(SDL_GPUCommandBuffer* cmd) {
         return;
     }
 
+    // Submit can block behind a full queue; it belongs in the same bucket as
+    // the swapchain wait (time the CPU spent waiting on the GPU, not working).
+    const auto begin = std::chrono::steady_clock::now();
     SDL_SubmitGPUCommandBuffer(cmd);
+    present_wait_ns_ +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count();
 }
 
 bool GPUDevice::end_frame_and_wait(SDL_GPUCommandBuffer* cmd) {
@@ -131,6 +138,7 @@ bool GPUDevice::end_frame_and_wait(SDL_GPUCommandBuffer* cmd) {
         return false;
     }
 
+    const auto begin = std::chrono::steady_clock::now();
     SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!fence) {
         BRACKEN_LOG_ERROR(LOG_TAG, "GPUDevice::end_frame_and_wait: submit failed: {}", SDL_GetError());
@@ -138,6 +146,8 @@ bool GPUDevice::end_frame_and_wait(SDL_GPUCommandBuffer* cmd) {
     }
     SDL_WaitForGPUFences(device_, true, &fence, 1);
     SDL_ReleaseGPUFence(device_, fence);
+    present_wait_ns_ +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count();
     return true;
 }
 
@@ -146,6 +156,20 @@ SDL_GPUTexture* GPUDevice::acquire_swapchain_texture(SDL_GPUCommandBuffer* cmd, 
     // SDL contract: must run on the thread that created the window.
     BRACKEN_ASSERT_MAIN_THREAD();
     BRACKEN_ASSERT_NOT_SIM_STAGE();
+    // SDL_WaitAndAcquireGPUSwapchainTexture BLOCKS until the presentation
+    // engine hands back an image, i.e. until the GPU has caught up. With no
+    // timestamp query API in SDL3, this stall is the only in-engine signal
+    // separating "GPU-bound" from "CPU-bound", so it is measured rather than
+    // guessed at. See present_wait_ms().
+    const auto wait_begin = std::chrono::steady_clock::now();
+    const struct WaitTimer {
+        GPUDevice* self;
+        std::chrono::steady_clock::time_point begin;
+        ~WaitTimer() {
+            self->present_wait_ns_ +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count();
+        }
+    } wait_timer{this, wait_begin};
     if (!cmd || !window_) {
         BRACKEN_LOG_ERROR(LOG_TAG, "GPUDevice::acquire_swapchain_texture: cmd={} window={}",
                           reinterpret_cast<void*>(cmd), reinterpret_cast<void*>(window_));

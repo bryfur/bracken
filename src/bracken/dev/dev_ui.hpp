@@ -78,6 +78,15 @@ public:
         GraphicsSettings* settings = nullptr;           ///< edited in place...
         std::function<void(const GraphicsSettings&)> apply_settings; ///< ...then pushed through this
         const float* fps = nullptr;                     ///< Application's fps counter
+        /// Application's EMA-smoothed phase timings (nullable; the Stats tab
+        /// omits the breakdown when any is null). `present_wait_ms` is a
+        /// SUBSET of `render_ms` — the part the CPU spent blocked on the GPU,
+        /// which with no SDL3 timestamp API is the only in-engine
+        /// GPU-bound-vs-CPU-bound signal.
+        const float* sim_ms = nullptr;
+        const float* render_ms = nullptr;
+        const float* fence_ms = nullptr;
+        const float* present_wait_ms = nullptr;
     };
 
     /** Widget state for the built-in panels. Lives on the instance rather

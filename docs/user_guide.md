@@ -158,7 +158,7 @@ Micro-benchmarks live next to their unit as `*.bench.cpp` (auto-globbed, linked 
 
 ### Profiling (Tracy)
 
-Configure with `-DBRACKEN_ENABLE_TRACY=ON`, run any engine app, and connect the Tracy profiler GUI. The engine is instrumented end to end: frame marks, per-pass CPU zones, draw-call/triangle/particle plots, allocator memory tracking, named threads. **GPU zones are not available** — SDL3 GPU does not expose backend queues (and the engine's `GPUTimestampPool` per-pass timings are stubs returning zeros). Use RenderDoc or Nsight for real GPU timing.
+Configure with `-DBRACKEN_ENABLE_TRACY=ON`, run any engine app, and connect the Tracy profiler GUI. The engine is instrumented end to end: frame marks, per-pass CPU zones, draw-call/triangle/particle plots, allocator memory tracking, named threads. **GPU zones are not available** — SDL3 GPU does not expose backend queues, and its per-pass timings are CPU-record times, not GPU execution times. Use RenderDoc or Nsight for real GPU timing.
 
 ### Consuming the engine from a game project
 
@@ -671,9 +671,19 @@ std::cout << std::format("draw_calls={} triangles={} entities={}\n",
                          stats.draw_calls, stats.triangle_count, stats.entities_rendered);
 ```
 
-Fields: `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending` (all `uint32_t`), and `pass_times_ms` (`std::vector<std::pair<std::string, float>>`).
+Counters: `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`, `ui_draws`, `local_shadow_tiles_rendered` (all `uint32_t`). Budgets, so the caps that actually get hit stop failing silently: `packet_bytes_used`/`packet_bytes_capacity`, `bone_palettes_used`/`bone_palettes_budget`, `lights_submitted`/`lights_binned`. Per-pass timing: `pass_times_ms` is `std::vector<PassTiming>` where `PassTiming` is `{ std::string_view name; std::optional<float> cpu_ms; std::optional<float> gpu_ms; }`.
 
-**Gotcha:** `pass_times_ms` entries are **always zero** — GPU per-pass timing is a stub (`GPUTimestampPool` cannot get timestamps through SDL3 GPU). Use Tracy for CPU timings or RenderDoc/Nsight for real GPU numbers. The counter fields are real.
+`render_stats()` returns `std::optional<RenderStats>` — `nullopt` when collection is off, so zeros can no longer be mistaken for "the renderer drew nothing".
+
+**Gotcha:** `cpu_ms` is the cost of **recording** the pass on the CPU, not of executing it on the GPU; a pass can record in 40 us and cost 4 ms on the device. `gpu_ms` is `nullopt` always — SDL3 exposes no timestamp query API. Use RenderDoc/Nsight for GPU numbers, and read `Application::present_wait_ms()` first to find out whether the frame is GPU-bound at all.
+
+### What the frame threw away: frame_diagnostics
+
+`Application::frame_diagnostics()` returns a `FrameDiagnostics` covering every silent drop path: `draws_dropped_unknown_model`, `skinned_dropped_no_skeleton`, `palettes_over_budget`, `effect_models_unresolved`, `lights_dropped`, `cluster_lights_dropped`, and `camera_missing`. Unlike `render_stats()` these are accumulated **unconditionally** — a dropped draw is not opt-in instrumentation. `diag.any()` is the one-line "is anything wrong" predicate. If you built a frame and see nothing, read this before reading anything else.
+
+### Where the frame's time went
+
+`Application::sim_ms()`, `render_ms()`, `fence_ms()` and `present_wait_ms()` are EMA-smoothed CPU milliseconds for the pipelined loop's phases. `sim_ms` overlaps the previous frame's `render_ms` (pipeline depth 2), so they deliberately do not sum to frame time. `present_wait_ms` is a subset of `render_ms`: the time the CPU spent blocked in swapchain acquire + submit, i.e. waiting for the GPU — the only in-engine signal separating a GPU-bound frame from a CPU-bound one.
 
 ### Screenshots: request_screenshot
 
@@ -711,7 +721,7 @@ dev_ui().set_toggle_key(SDL_SCANCODE_F10); // safe even when dev_ui_ok == false
 - Mutating `graphics_settings()` fields without calling `request_graphics_settings()` (or `apply_all_graphics_settings()` from a main-thread hook) — the renderer never sees the change (until something else applies).
 - Touching GPU/SDL/main-thread-tier APIs from `on_simulate` — it runs on a pool thread; debug builds assert.
 - Setting `god_rays = true` without `volumetric_fog = true` — god rays require volumetric fog.
-- Expecting `pass_times_ms` to contain real GPU timings (they are zeros by design).
+- Reading `PassTiming::cpu_ms` as GPU cost — it is the CPU's cost of recording the pass. `gpu_ms` is `nullopt`; SDL3 has no timestamp queries.
 - Calling `request_screenshot` every frame — each capture stalls the GPU pipeline.
 
 ---
@@ -744,6 +754,8 @@ BRACKEN_LOG_ERROR("settings", "Failed to save settings to {}", path);
 ```
 
 There is one macro per severity: `BRACKEN_LOG_TRACE`, `BRACKEN_LOG_DEBUG`, `BRACKEN_LOG_INFO`, `BRACKEN_LOG_WARN`, `BRACKEN_LOG_ERROR`, `BRACKEN_LOG_FATAL`. The first argument is a free-form **category** string (engine subsystems use one short tag per file, held in a file-local `constexpr const char* LOG_TAG`: `"app"`, `"gpu"`, `"render"`, `"scene"`, `"terrain"`, `"shadows"`, `"grass"`, `"taa"`, `"gtao"`, `"bloom"`, `"post"`, `"fog"`, `"exposure"`, `"lights"`, `"water"`, `"ui"`, `"text"`, `"effect"`, `"model"`, `"jobs"`, `"hot_reload"`, `"assert"`, ...); the rest is a `std::format` format string plus arguments — formatting errors are compile-time errors because the macros take `std::format_string`. Passing `nullptr` as the category is tolerated; sinks then receive `"general"`.
+
+**Logging from a per-frame path.** A plain `BRACKEN_LOG_WARN` inside `render()` or an emit method is a 60 Hz denial-of-service on the log: the first line — the one that says what broke — scrolls away before anyone reads it. `bracken/core/log_throttle.hpp` provides `BRACKEN_LOG_WARN_ONCE(category, ...)`, `BRACKEN_LOG_ERROR_ONCE`, and `BRACKEN_LOG_WARN_THROTTLED(seconds, category, ...)` / `BRACKEN_LOG_ERROR_THROTTLED`. Each expands to a function-local `static core::LogThrottle` (constexpr-constructible, so it is constant-initialized — no thread-safe-static guard on a hot path) and gates the whole call, formatting included. Choose ONCE for a standing fact ("UI pipeline not available", "no camera was ever set") and THROTTLED for a condition that can come and go and whose recurrence is the information (budget exhaustion, atlas eviction) — silence after one line would read as "fixed".
 
 `BRACKEN_LOG_FATAL` only logs — it does **not** abort. If you want "log and die", use `BRACKEN_VERIFY` (below).
 
@@ -1727,7 +1739,7 @@ Bracken's GPU layer (`src/bracken/gpu/`, namespace `bracken::gpu`) is a thin, ow
 - `PipelineRegistry` — the engine's cache of all built-in pipelines (pre-created at init as of the Phase-1 threading work; `get_*` are read-only lookups), with shader hot-reload (`src/bracken/gpu/pipeline_registry.hpp`).
 - `gpu_uniforms.hpp` — the byte-for-byte CPU mirrors of every HLSL cbuffer (`src/bracken/gpu/gpu_uniforms.hpp`).
 - `gpu_types.hpp` — shared vertex formats, texture-format and blend-mode enums (`src/bracken/gpu/gpu_types.hpp`).
-- `gpu_debug.hpp` — GPU debug groups/labels and the (stubbed) `GPUTimestampPool` (`src/bracken/gpu/gpu_debug.hpp`).
+- `gpu_debug.hpp` — GPU debug groups/labels and `GPUTimestampPool` (real CPU record timings; GPU timings unavailable) (`src/bracken/gpu/gpu_debug.hpp`).
 
 Most games never create a `GPUDevice` themselves: subclass `bracken::Application`, and the engine's `render::RenderContext` (`src/bracken/render/render_context.hpp`) owns the window + device. You reach the GPU layer through `context.device()` and `scene_renderer.pipeline_registry()`. The sections below still show standalone usage, because every renderer and custom pass ultimately talks to these classes.
 
@@ -2155,7 +2167,7 @@ Label your passes so RenderDoc/Nsight captures are navigable:
 }
 ```
 
-`GPUTimestampPool` + `BRACKEN_GPU_TIMER(pool, cmd, "PassName")` exist and are wired through `SceneRenderer` (initialized with 64 pairs), **but they are stubs**: SDL3 GPU (as of SDL 3.2) exposes no per-pass timestamp queries, so `is_supported()` is always `false` and `read_results()` returns the correct pass names with **0.0 ms durations**. Any per-pass GPU times you see in `RenderStats` are placeholders. For real numbers use Tracy (CPU-side, `BRACKEN_ENABLE_TRACY=ON`) or RenderDoc/Nsight (GPU-side). The API is kept so call sites stay identical when SDL adds support.
+`GPUTimestampPool` + `BRACKEN_GPU_TIMER(pool, cmd, "PassName")` are wired through `SceneRenderer` (64 pairs) and report a **real CPU record time** per scope through `core::PassTimeline` (`PassTiming::cpu_ms`, exponentially smoothed). The GPU half remains unavailable: SDL3 GPU (as of SDL 3.2) exposes no per-pass timestamp queries, so `is_supported()` is always `false` and `PassTiming::gpu_ms` is `std::nullopt` — deliberately not `0.0f`, which would read as a free pass. For GPU-side numbers use RenderDoc/Nsight. The API is kept so call sites stay identical when SDL adds support.
 
 One contract if you use the pool directly: the `pass_name` passed to `reserve_pair`/`BRACKEN_GPU_TIMER` is stored as a raw `const char*` — it must be a string literal (or otherwise outlive the frame).
 
@@ -2170,7 +2182,7 @@ One contract if you use the pool directly: the `pass_name` passed to `reserve_pa
 - Expecting `GPUBuffer::Type::Uniform` to be a bindable uniform buffer — it's a storage buffer; per-draw uniforms use `SDL_PushGPU*UniformData`.
 - Acquiring the swapchain off the main thread.
 - Destroying the `GPUDevice` before the resources created from it.
-- Trusting `GPUTimestampPool` numbers — they are zeros by design.
+- Reading `GPUTimestampPool`'s `cpu_ms` as GPU time — it measures command recording. `gpu_ms` is `nullopt` by design.
 
 ---
 
@@ -2806,7 +2818,7 @@ const bracken::RenderStats& stats = scene_renderer().render_stats();
 // stats.entities_distance_culled, stats.entities_frustum_culled, stats.pass_times_ms
 ```
 
-Stats are only accumulated while `set_collect_stats(true)`. Gotcha: `pass_times_ms` (per-pass GPU times) is **always zeroed** — `GPUTimestampPool` is a documented stub (SDL3 has no per-pass timestamp queries). Use Tracy for CPU timing and RenderDoc/Nsight for GPU timing.
+Stats are only accumulated while `set_collect_stats(true)` (`Application::render_stats()` returns `nullopt` otherwise). Gotcha: `pass_times_ms` carries CPU **record** times; `PassTiming::gpu_ms` is `nullopt` because SDL3 has no per-pass timestamp queries. Use RenderDoc/Nsight for GPU timing.
 
 #### Screenshots
 
@@ -6620,9 +6632,14 @@ the playground's smoke driver, which enables collection itself) would
 otherwise have their setting stomped when the overlay closes. The cost is a
 handful of CPU-side increments per frame.
 
-**Gotcha:** per-pass GPU times are stubs (`GPUTimestampPool` returns zeros —
-an SDL3 limitation), and the tab says so in disabled text. Use Tracy (CPU) or
-RenderDoc/Nsight (GPU) for real numbers.
+The tab also shows value/budget bars (bone palettes, packet arena, lights
+binned vs submitted), a "Dropped this frame" section that appears only when
+`FrameDiagnostics::any()` is true, and the frame-phase breakdown
+(simulate/render/fence/blocked-on-GPU).
+
+**Gotcha:** the per-pass table's "CPU (record)" column is real; the "GPU"
+column reads `n/a` because SDL3 exposes no timestamp queries, and the tab says
+so in disabled text. Use RenderDoc/Nsight for GPU numbers.
 
 #### Environment
 

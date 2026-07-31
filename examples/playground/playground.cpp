@@ -1536,7 +1536,14 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
     }
 
     if (frame_ >= smoke_frames_) {
-        const auto& stats = render_stats();
+        // render_stats() is nullopt when collection is off; the smoke driver
+        // turns it on at init, so a miss here is a real regression, not a
+        // reason to print zeros.
+        const std::optional<bracken::RenderStats> stats_opt = render_stats();
+        const bracken::RenderStats stats = stats_opt.value_or(bracken::RenderStats{});
+        if (!stats_opt) {
+            std::cout << "[smoke] WARNING: render stats collection was off\n";
+        }
         // Application::fps() is a once-per-second windowed counter and reads 0
         // when the whole run finishes in under a second; compute the average
         // over the run instead so the smoke line is meaningful at any speed.
@@ -1567,6 +1574,10 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
         // The hard regression gate. Unlike everything on the line above, this
         // is computed entirely CPU-side, so it is exact and driver-independent.
         std::cout << std::format("[smoke] packet_digest=0x{:016x}\n", packet_digest());
+        // Phase timings: CPU-record only (SDL3 has no GPU timestamp API).
+        // present_wait is the CPU/GPU-bound signal and is a subset of render.
+        std::cout << std::format("[smoke] timing sim={:.2f}ms render={:.2f}ms fence={:.2f}ms present_wait={:.2f}ms\n",
+                                 sim_ms(), render_ms(), fence_ms(), present_wait_ms());
         // Digest sibling: also CPU-side and driver-independent. The digest
         // proves the packet did not change; this proves the renderer did not
         // start THROWING AWAY parts of it. A regression in any drop path

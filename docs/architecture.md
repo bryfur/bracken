@@ -572,10 +572,14 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
   vectors; `scene::MotionHistory` maps a command's `motion_id` to last
   frame's palette offset.
 - **Debug tooling**: `BRACKEN_GPU_SCOPE` (SDL debug groups) labels every pass.
-  `GPUTimestampPool` / `BRACKEN_GPU_TIMER` exist but are **stubs** — SDL3 has
-  no per-pass timestamp queries, so `read_results` returns zeroed durations
-  and any per-pass GPU times in `RenderStats` are placeholders
-  (`gpu/gpu_debug.hpp`). Use RenderDoc/Nsight for real GPU timing.
+  `BRACKEN_GPU_TIMER` scopes report a REAL **CPU record** time (the cost of
+  building the pass's command stream), measured by `core::PassTimeline` inside
+  `GPUTimestampPool` — all 19 existing call sites, unchanged. The GPU half is
+  still unavailable: SDL3 has no per-pass timestamp queries, so
+  `is_supported()` is false and `PassTiming::gpu_ms` is `nullopt` rather than
+  a zero that reads as "free" (`gpu/gpu_debug.hpp`). Use RenderDoc/Nsight for
+  real GPU timing, and `Application::present_wait_ms()` to decide whether it
+  is worth looking.
 
 ---
 
@@ -638,7 +642,8 @@ Per-instance, host-driven. Types and constants in
   `Hips`, `Spine`, `Left/RightUpperLeg`, `Left/RightLowerLeg`,
   `Left/RightFoot` — override per rig.
 - glTF channels that target nodes outside the skin's joint list are
-  **silently dropped** at load; a clip that "doesn't play" usually means its
+  dropped at load — counted per model and reported in one `ModelLoadReport`
+  warning line; a clip that "doesn't play" usually means its
   channels don't drive skinned joints.
 
 ---
@@ -971,14 +976,20 @@ is a review defect, as is a mutex anywhere in the frame hot path (plan §7).
 Things that look functional but aren't, or fail quietly — check here before
 debugging "why is this value zero / where did my draw go":
 
-- **GPU per-pass timings are zeroed** — `GPUTimestampPool` is a stub (SDL3
-  limitation). Wall-clock CPU timings and Tracy zones are real; GPU pass times
-  in `RenderStats` are not.
+- **GPU-side per-pass timings do not exist** — SDL3 has no timestamp query
+  API, so `PassTiming::gpu_ms` is `nullopt` (not zero). `PassTiming::cpu_ms`
+  IS real: the CPU cost of recording that pass. Do not read it as GPU cost.
+- **`Application::render_stats()` returns `nullopt` while collection is off**
+  (`set_collect_render_stats`, default off) rather than an all-zero struct
+  that is indistinguishable from an empty frame.
 - **Bone-palette allocations beyond `MAX_BONE_PALETTES` (1024) fail at build
-  time** — `FrameBuilder::alloc_bone_palette` logs an error and returns an
-  invalid allocation (empty span); `draw_skinned` with an invalid id drops
-  the draw with a warning. Not asserted.
-- **Animation channels targeting non-skin nodes are silently dropped** at glb
+  time** — `FrameBuilder::alloc_bone_palette` counts the refusal in
+  `FramePacket::build_diagnostics()` (summarized once per frame at `seal()`,
+  surfaced as `FrameDiagnostics::palettes_over_budget`) and returns an
+  invalid allocation (empty span); `draw_skinned` with an invalid handle or
+  id drops the draw and counts it. Not asserted.
+- **Animation channels targeting non-skin nodes are dropped** (counted and
+  logged once per model as a `ModelLoadReport` summary) at glb
   load.
 - **`Mesh::near_only` is not enforced** — the flag exists, the renderer
   ignores it.

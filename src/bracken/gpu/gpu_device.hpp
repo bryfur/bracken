@@ -3,6 +3,7 @@
 #include <memory>
 #include <SDL3/SDL_gpu.h>
 #include <SDL3/SDL_video.h>
+#include <cstdint>
 #include <string>
 
 namespace bracken::gpu {
@@ -74,7 +75,9 @@ public:
      * @brief End the frame and submit the command buffer
      * @param cmd The command buffer to submit
      */
-    static void end_frame(SDL_GPUCommandBuffer* cmd);
+    // Non-static (was static): the submit stall is accumulated into
+    // present_wait_ms(). Every caller already goes through an instance.
+    void end_frame(SDL_GPUCommandBuffer* cmd);
 
     /**
      * @brief Submit the command buffer and block until the GPU has executed it.
@@ -200,9 +203,29 @@ public:
      */
     bool supports_format(SDL_GPUTextureFormat format, SDL_GPUTextureType type, SDL_GPUTextureUsageFlags usage) const;
 
+    /**
+     * Milliseconds the CPU spent BLOCKED on the GPU since the last
+     * reset_present_wait(): swapchain acquire (which waits for the
+     * presentation engine to return an image) plus command-buffer submit.
+     *
+     * SDL3 exposes no GPU timestamp query, so no engine-side number can say
+     * how long a pass took on the device. This is the one thing that CAN be
+     * measured honestly, and it answers the first question anyone asks about a
+     * depth-2 pipelined frame: a large value means the frame is GPU-bound and
+     * the CPU is idling on it; a near-zero value means the CPU is the limit
+     * and optimizing shaders will change nothing. Main-thread tier.
+     */
+    [[nodiscard]] float present_wait_ms() const noexcept {
+        return static_cast<float>(static_cast<double>(present_wait_ns_) * 1e-6);
+    }
+    void reset_present_wait() noexcept { present_wait_ns_ = 0; }
+
 private:
     SDL_GPUDevice* device_ = nullptr;
     SDL_Window* window_ = nullptr;
+    // Accumulated CPU-blocked-on-GPU nanoseconds; plain integer, main-thread
+    // only (every accumulating call site is main-thread asserted).
+    int64_t present_wait_ns_ = 0;
 };
 
 } // namespace bracken::gpu

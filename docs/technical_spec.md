@@ -260,7 +260,9 @@ Always constructs the `DevUI` object first (so `dev_ui()` and event/render calls
 - Unit tests: `*.test.cpp` next to their unit, auto-globbed into `bracken_tests`, registered individually via `gtest_discover_tests`. Run: `ctest --test-dir build --output-on-failure`, or the binary directly with `--gtest_filter`. Binary path: `build/src/bracken/bracken_tests`.
 - Benchmarks: `*.bench.cpp` next to their unit, auto-globbed into `bracken_benchmarks` (linked to `benchmark::benchmark_main`, so no `main` needed in bench files). Binary path: `build/src/bracken/bracken_benchmarks`; `--benchmark_filter=<regex>` selects a subset.
 - Integration test: the playground smoke run (below); optionally a ctest named `playground_smoke` (label `integration`, timeout 180 s, working directory = the playground binary dir) when `BRACKEN_PLAYGROUND_SMOKE_TEST=ON`.
-- `RenderStats` (`src/bracken/render_stats.hpp`), consumed by the smoke summary and dev-UI Stats panel: `uint32_t draw_calls, triangle_count, entities_rendered, entities_distance_culled, entities_frustum_culled, jobs_pending; std::vector<std::pair<std::string, float>> pass_times_ms`. Stats collection is opt-in via `set_collect_render_stats(bool)`. Note: GPU per-pass timings are stubs — `GPUTimestampPool` returns zeros (SDL3 limitation).
+- `RenderStats` (`src/bracken/render_stats.hpp`), consumed by the smoke summary and dev-UI Stats panel: counters (`draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`, `ui_draws`, `local_shadow_tiles_rendered`), budgets (`packet_bytes_used/capacity`, `bone_palettes_used/budget`, `lights_submitted/binned`) and `std::vector<PassTiming> pass_times_ms`. Collection is opt-in via `set_collect_render_stats(bool)`; `Application::render_stats()` returns `std::optional<RenderStats>`, `nullopt` while off.
+- `FrameDiagnostics` (same header), via `Application::frame_diagnostics()`: every drop path the frame took (`draws_dropped_unknown_model`, `skinned_dropped_no_skeleton`, `palettes_over_budget`, `effect_models_unresolved`, `lights_dropped`, `cluster_lights_dropped`, `camera_missing`). Accumulated unconditionally — not gated on `set_collect_render_stats`.
+- `PassTiming { std::string_view name; std::optional<float> cpu_ms, gpu_ms; }`: `cpu_ms` is the real CPU cost of RECORDING the pass (`core::PassTimeline`); `gpu_ms` is `nullopt` — SDL3 exposes no timestamp query API.
 
 ### Playground example — the canonical integration (`examples/playground/`)
 
@@ -718,12 +720,19 @@ struct RenderStats {
     uint32_t entities_distance_culled = 0;
     uint32_t entities_frustum_culled = 0;
     uint32_t jobs_pending = 0;            // JobSystem::pending_count()
-    std::vector<std::pair<std::string, float>> pass_times_ms; // ALWAYS ZEROS — see below
+    uint32_t instances_drawn = 0;
+    std::size_t packet_bytes_used = 0, packet_bytes_capacity = 0;
+    uint32_t bone_palettes_used = 0, bone_palettes_budget = 0;
+    uint32_t lights_submitted = 0, lights_binned = 0;
+    uint32_t local_shadow_tiles_rendered = 0;
+    uint32_t ui_vertices = 0, ui_draws = 0;
+    std::vector<PassTiming> pass_times_ms;    // cpu_ms real, gpu_ms nullopt — see below
 };
 ```
 
-- Owned by `SceneRenderer` (`scene/scene_renderer.hpp`: `bracken::RenderStats render_stats_`); exposed via `Application::render_stats()` (const ref) and gated by `Application::set_collect_render_stats(bool)` → `SceneRenderer::set_collect_stats`. **Default off**; when off, none of the counters are incremented (every increment site in `scene/scene_renderer.cpp` checks `collect_stats_`).
-- `pass_times_ms` is filled from `gpu_timer_pool_.read_results(...)` — but `GPUTimestampPool` is a **stub** (SDL3 GPU exposes no timestamp queries), so the per-pass GPU times are placeholder zeros (`docs/architecture.md` "Known stubs"). Pass labels are real; values are not. Use Tracy (CPU) or RenderDoc/Nsight (GPU) for real timings.
+- Owned by `SceneRenderer` (`scene/scene_renderer.hpp`: `bracken::RenderStats render_stats_`); exposed via `Application::render_stats()` (`std::optional<RenderStats>`, `nullopt` while collection is off) and gated by `Application::set_collect_render_stats(bool)` → `SceneRenderer::set_collect_stats`. **Default off**; when off, none of the counters are incremented (every increment site in `scene/scene_renderer.cpp` checks `collect_stats_`).
+- `FrameDiagnostics` is the exception to that gate: `SceneRenderer::frame_diagnostics()` is reset and accumulated every frame regardless, because a dropped draw is not opt-in instrumentation. It rides the same chunk-index-ordered `FrameStatsPartial` merge, so it needs no atomics and is bit-identical at any worker count.
+- `pass_times_ms` is filled from `gpu_timer_pool_.read_results(...)`. `cpu_ms` is a real wall-clock measurement of the pass's command recording (`core::PassTimeline`, EMA alpha 0.2, 64 slots, slot averages discarded when a slot's pass name changes). `gpu_ms` stays `nullopt`: SDL3 GPU exposes no timestamp queries. Use RenderDoc/Nsight for GPU-side cost.
 - When collecting, draw calls/triangles/entities are also emitted as Tracy plots (`render.draw_calls`, `render.triangles`, `render.entities`).
 
 ### Error handling summary
@@ -742,8 +751,8 @@ This layer predates the `core::Result` convention and uses `bool` + `BRACKEN_LOG
 - **No fixed timestep**: variable `dt` clamped at 0.1 s; long stalls silently compress simulated time.
 - `fps()` is a once-per-second integer frame count, `0.0f` for the first second.
 - `on_init`/`on_shutdown` are never invoked by `Application` — a host that forgets to drive them gets a null-deref in the first facade call, not a diagnostic.
-- Facade methods have no null checks (except `dev_ui()`'s assert); calling before `init_renderer()` is UB.
-- `pass_times_ms` values are zeros (GPU timestamp stub).
+- Facade methods are guarded by `BRACKEN_CONTRACT` (live in release unless `-DBRACKEN_ENABLE_CONTRACTS=OFF`): calling one before `init_renderer()` aborts with the member's name instead of segfaulting.
+- `PassTiming::gpu_ms` is always `nullopt` (SDL3 has no timestamp queries); `cpu_ms` measures command recording, not GPU execution.
 - Exclusive fullscreen with an unmatched `resolution_index` warns and falls back to borderless fullscreen (stale exclusive modes are cleared).
 - `set_vsync_mode` silently clamps to the supported maximum.
 - Mouse-button edges are never auto-cleared — a host that skips `clear_mouse_edges()` sees latched edges.
@@ -804,6 +813,8 @@ void log_plain(LogLevel, const char* category, std::string_view msg);
 ```
 
 Macros (variadic, category first, then a `std::format` string + args): `BRACKEN_LOG_TRACE/DEBUG/INFO/WARN/ERROR/FATAL(category, ...)`. Each expands to `::bracken::core::detail::log_formatted(LogLevel::X, (category), __VA_ARGS__)`. Format strings are compile-time checked (`std::format_string<Args...>`). `BRACKEN_LOG_FATAL` does not abort.
+
+Rate-limited variants (`bracken/core/log_throttle.hpp`, for call sites on a per-frame path): `BRACKEN_LOG_WARN_ONCE` / `BRACKEN_LOG_ERROR_ONCE` (first occurrence only) and `BRACKEN_LOG_WARN_THROTTLED(interval_s, ...)` / `BRACKEN_LOG_ERROR_THROTTLED` (at most one per interval). Each declares a function-local `static core::LogThrottle`; the type has a `constexpr` constructor so the static is constant-initialized (no guard variable), and every atomic inside is `relaxed` — the state is a self-contained bool/timestamp with no payload riding on it. `LogThrottle::suppressed()` reports how many occurrences the gate swallowed.
 
 #### Data structures and state
 
@@ -1058,7 +1069,7 @@ Suggested zone-color palette (header comment; used consistently at engine call s
 
 #### Known limitations (documented in the header and `docs/architecture.md`)
 
-- **No GPU zones**: SDL3 GPU does not expose backend queues/devices, so Tracy's GPU instrumentation (`TracyVkZone` etc.) cannot be wired up. GPU timing must come from RenderDoc/Nsight. Correspondingly, `GPUTimestampPool` per-pass GPU timings in `RenderStats` are stubs returning zeros — Tracy CPU zones are the real numbers.
+- **No GPU zones**: SDL3 GPU does not expose backend queues/devices, so Tracy's GPU instrumentation (`TracyVkZone` etc.) cannot be wired up. GPU timing must come from RenderDoc/Nsight. `GPUTimestampPool` reports real CPU record times per pass (`PassTiming::cpu_ms`) but no GPU times (`gpu_ms` is `nullopt`).
 - Zone names must be string literals (Tracy `ZoneScopedN` requirement); dynamic names go through `BRACKEN_PROFILE_ZONE_TAG`'s `ZoneText` instead.
 - There is no zero-overhead runtime toggle: enablement is a compile-time CMake decision (though `TRACY_ON_DEMAND` keeps the enabled build cheap while disconnected).
 
@@ -1802,7 +1813,7 @@ File map:
 | `src/bracken/gpu/pipeline_registry.hpp/.cpp` | `PipelineType` (53 values), `ComputePipelineType` (2), `PipelineRegistry` |
 | `src/bracken/gpu/gpu_uniforms.hpp` | CPU mirrors of every HLSL cbuffer + storage-buffer records |
 | `src/bracken/gpu/gpu_types.hpp` | Vertex formats, `TextureFormat`, `BlendMode`, vertex-attribute helpers |
-| `src/bracken/gpu/gpu_debug.hpp/.cpp` | `GPUDebugGroup`, `GPUTimestampPool` (stub), `GPUTimerScope`, macros |
+| `src/bracken/gpu/gpu_debug.hpp/.cpp` | `GPUDebugGroup`, `GPUTimestampPool` (CPU record timings; GPU timings unavailable), `GPUTimerScope`, macros |
 | Tests | `gpu_types.test.cpp`, `gpu_uniforms.test.cpp`, `gpu_pipeline.test.cpp`, `gpu_compute.test.cpp` (layout/config/reflection assertions; no GPU required) |
 
 ### GPUDevice (`src/bracken/gpu/gpu_device.hpp`)
@@ -2198,7 +2209,7 @@ Legacy: the `CameraUniforms`, `ModelUniforms`, `LightUniforms`, `TimeUniforms` s
 
 `GPUDebugGroup(cb, name)` — RAII `SDL_PushGPUDebugGroup`/`SDL_PopGPUDebugGroup`; null `cb`/`name` degrades to a no-op. Non-copyable/non-movable. Macro `BRACKEN_GPU_SCOPE(cb, name)` instantiates one with a line-unique identifier. `insert_debug_label(cb, name)` / `BRACKEN_GPU_LABEL` wraps `SDL_InsertGPUDebugLabel`.
 
-`GPUTimestampPool` — **stub by design**: SDL3 GPU (as of SDL 3.2) exposes no per-pass timestamp queries; the API shape is preserved so call sites remain identical when support lands.
+`GPUTimestampPool` — CPU-record timings are real (`core::PassTimeline` behind `write_begin`/`write_end`); the GPU half is **absent by necessity**: SDL3 GPU (as of SDL 3.2) exposes no per-pass timestamp queries, so `is_supported()` is false and `PassTiming::gpu_ms` is `nullopt`. The API shape is preserved so call sites remain identical when support lands.
 
 ```cpp
 [[nodiscard]] bool init(GPUDevice&, size_t pair_count);   // stores capacity, supported_ = false, returns true
@@ -2499,7 +2510,7 @@ Uniform pattern: `nullptr` return + `SDL_Log`/`BRACKEN_LOG_*` (no `core::Result`
 - **`ShaderManager::get` verifies `ShaderResources` on cache hits** — resource counts are baked at first load per (path, stage, entry); a later caller requesting different counts gets the cached shader plus an error log naming both sets of counts.
 - **Misnamed shader files are skipped with a warning**, not an error.
 - **Hot reload watches `.spv`, not `.hlsl`** — an HLSL edit needs `cmake --build build` before the watcher fires; a shader that fails to reload leaves its pipeline missing (draws that check for `nullptr` skip; `GPUPipeline::bind` no-ops on null).
-- **GPU per-pass timings are stubs** (`gpu/gpu_debug.hpp` `GPUTimestampPool` returns zeros; SDL3 has no timestamp queries) — irrelevant to shader authoring but affects shader perf measurement; use RenderDoc/Nsight.
+- **GPU-side per-pass timings do not exist** (`gpu/gpu_debug.hpp`: `PassTiming::gpu_ms` is `nullopt`; SDL3 has no timestamp queries; `cpu_ms` measures command recording, not shader cost) — irrelevant to shader authoring but affects shader perf measurement; use RenderDoc/Nsight.
 
 ---
 
@@ -2794,7 +2805,7 @@ Main-pass skinned draws (`render_skinned_model_command_inner`): `ModelTransformU
 
 #### RenderStats
 
-`bracken::RenderStats` (`src/bracken/render_stats.hpp`): `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending`, `pass_times_ms` (vector of name/ms pairs — **always zeros**; `GPUTimestampPool` is a stub, SDL3 has no per-pass timestamps). Collected only when `set_collect_stats(true)`; reset at the top of each `render_frame`.
+`bracken::RenderStats` (`src/bracken/render_stats.hpp`): `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`/`ui_draws`, `local_shadow_tiles_rendered`, the `*_used`/`*_budget` pairs, and `pass_times_ms` (`std::vector<PassTiming>` — `cpu_ms` real, `gpu_ms` `nullopt`; SDL3 has no per-pass timestamps). Collected only when `set_collect_stats(true)`; reset at the top of each `render_frame`. `SceneRenderer::frame_diagnostics()` (`FrameDiagnostics`) is reset and accumulated every frame regardless of that flag.
 
 #### Threading & lifetime
 
@@ -4832,7 +4843,7 @@ brightness far more than ground light (intended for day/night; use
   alpha test exactly, coverage boost included). BLEND transparents — and
   skinned MASK meshes, which have no masked prepass variant — neither
   occlude nor receive their own AO.
-- GPU per-pass timings around these passes (`BRACKEN_GPU_TIMER`) are stubs —
+- GPU-side per-pass timings around these passes (`BRACKEN_GPU_TIMER` reports CPU record time only) are unavailable —
   SDL3 has no timestamp queries; use RenderDoc/Nsight.
 
 ---
@@ -7925,7 +7936,7 @@ hides instead (pinned by `DevUIPanels.GraphicsTabHiddenWithoutApplyCallback`).
   rendered packet's snapshot counts (the live `EffectSystem` is sim-stage
   owned and is never read from the overlay).
   Ends with disabled-text disclosure that per-pass GPU times are stubbed
-  (SDL3 limitation; `GPUTimestampPool` returns zeros).
+  (SDL3 limitation; `PassTiming::gpu_ms` is `nullopt` — `cpu_ms` is command-record time, not GPU cost).
 
 #### Environment tab (`draw_environment_tab`)
 

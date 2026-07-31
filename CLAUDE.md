@@ -195,9 +195,14 @@ draws it.
   `RGBA16F`, depth `D32_FLOAT`.
 
 ### Gotchas (full list in [docs/architecture.md](docs/architecture.md))
-- **GPU per-pass timings are stubs** — `GPUTimestampPool` returns zeros (SDL3
-  limitation). Use Tracy (CPU) or RenderDoc/Nsight (GPU) for real numbers.
-- glTF animation channels targeting non-skin nodes are **silently dropped**
+- **Per-pass timings are CPU-record only** — `RenderStats::pass_times_ms` is
+  `PassTiming{name, cpu_ms, gpu_ms}`: `cpu_ms` is real (wall time spent
+  BUILDING the pass's command stream, via `core::PassTimeline`), `gpu_ms` is
+  `nullopt` because SDL3 exposes no timestamp query API. A pass can record in
+  40 us and cost 4 ms on the device — for GPU-side cost use RenderDoc/Nsight.
+  `Application::present_wait_ms()` is the CPU-bound-vs-GPU-bound signal.
+- glTF animation channels targeting non-skin nodes are dropped (counted and
+  summarized in one `ModelLoadReport` line per model since phase 4)
   at load; `Mesh::near_only` exists but is **not enforced**.
 - `render_graph/` is not in the frame path — don't route the renderer through
   it without a measured reason (design notes explain why).

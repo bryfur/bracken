@@ -128,6 +128,33 @@ public:
      *  read from the sim job: it is never written while a sim is in flight. */
     float fps() const { return fps_; }
 
+    /**
+     * Where the frame's wall time actually went, in milliseconds, smoothed
+     * with the same exponential average the per-pass timings use (a raw
+     * per-frame number at 100+ fps is unreadable and not actionable).
+     *
+     * The four cover the pipelined loop's four phases:
+     *   sim_ms()     — the whole sim job, including its own fan-out.
+     *   render_ms()  — Prepare + Record on the main thread, overlapping the
+     *                  NEXT sim (depth 2), so sim_ms + render_ms routinely
+     *                  exceeds the frame time. That is the pipeline working.
+     *   fence_ms()   — the quiescent point: hot-reload poll, deferred
+     *                  settings/screenshot, on_main_frame.
+     *   present_wait_ms() — CPU time blocked in swapchain acquire + submit,
+     *                  i.e. waiting for the GPU. THIS is the one to read
+     *                  first: with no GPU timestamp API anywhere in SDL3 it
+     *                  is the only in-engine signal distinguishing a
+     *                  GPU-bound frame from a CPU-bound one. It is included
+     *                  in render_ms().
+     *
+     * Written at the fence, so sim code may read them (never written while a
+     * sim is in flight).
+     */
+    float sim_ms() const { return sim_ms_; }
+    float render_ms() const { return render_ms_; }
+    float fence_ms() const { return fence_ms_; }
+    float present_wait_ms() const { return present_wait_ms_; }
+
 protected:
     /** Game-specific initialization (renderer, assets, scene). Not called by
      *  Application — the host must invoke it after init_engine(), before
@@ -287,7 +314,17 @@ protected:
     }
 
     void set_collect_render_stats(bool enabled);
-    const RenderStats& render_stats() const;
+
+    /**
+     * The last rendered frame's counters, or nullopt when collection is off
+     * (set_collect_render_stats(false), the default).
+     *
+     * The optional is the point: the old signature returned a reference to an
+     * all-zero struct when collection was off, which is indistinguishable
+     * from a genuinely empty frame — "0 draw calls" read as a renderer bug
+     * rather than as "you never asked".
+     */
+    std::optional<RenderStats> render_stats() const;
 
     /**
      * What the last rendered frame threw away: unknown model handles, skinned
@@ -403,6 +440,16 @@ private:
     bool packet_digest_enabled_ = false;
     uint64_t packet_digest_accum_ = 0;
     float fps_ = 0.0f;
+    // Phase timings (EMA-smoothed, alpha 0.2 — see sim_ms()). Written at the
+    // fence on the main thread with no sim in flight; read from anywhere.
+    float sim_ms_ = 0.0f;
+    float render_ms_ = 0.0f;
+    float fence_ms_ = 0.0f;
+    float present_wait_ms_ = 0.0f;
+    // Raw last-frame samples handed to the smoother at the next fence.
+    float last_sim_ms_ = 0.0f;
+    float last_render_ms_ = 0.0f;
+    float last_present_wait_ms_ = 0.0f;
     int frame_count_ = 0;
     uint64_t fps_timer_ = 0; // nanoseconds (SDL_GetTicksNS)
 

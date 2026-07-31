@@ -1,5 +1,7 @@
 #include "application.hpp"
 #include "bracken/core/assert.hpp"
+
+#include <chrono>
 #include "bracken/core/asset/file_watcher.hpp"
 #include "bracken/core/jobs/job_stage.hpp"
 #include "bracken/core/jobs/job_system.hpp"
@@ -149,6 +151,7 @@ void Application::kick_sim() {
 
 void Application::run_sim_job() {
     BRACKEN_PROFILE_ZONE("App::simulate");
+    const auto sim_begin = std::chrono::steady_clock::now();
     // Root of the sim stage. Every job submitted from here (host parallel_for
     // fan-outs, the EffectSystem update, Jolt's step jobs) inherits it through
     // JobNode::stage, so the tier assertions hold on any worker that ends up
@@ -201,6 +204,10 @@ void Application::run_sim_job() {
     // Filling → Sealed. The TaskHandle join publishes the sealed packet to
     // the main thread — no further handoff synchronization needed.
     fb.seal();
+
+    // Written by the job, read at the fence after the join publishes it — the
+    // same single-writer-per-phase discipline as the rest of the sim state.
+    last_sim_ms_ = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - sim_begin).count();
 }
 
 scene::FramePacket* Application::join_sim() {
@@ -234,6 +241,7 @@ scene::FramePacket* Application::join_sim() {
 
 void Application::frame_fence(uint64_t joined_frame_index) {
     BRACKEN_PROFILE_ZONE("App::frame_fence");
+    const auto fence_begin = std::chrono::steady_clock::now();
     // No sim in flight here — the pipeline's quiescent point.
     BRACKEN_ASSERT(!sim_in_flight_, "frame_fence with a sim job in flight");
 
@@ -285,6 +293,19 @@ void Application::frame_fence(uint64_t joined_frame_index) {
         scene_renderer_->request_screenshot(std::move(pending_screenshot_path_));
         pending_screenshot_path_.clear();
     }
+
+    // Phase timings settle here, at the pipeline's quiescent point: the sim
+    // just joined (so last_sim_ms_ is published), the previous frame's render
+    // is long finished, and nothing may read these while a sim runs.
+    // Exponentially smoothed — a raw per-frame number at 100+ fps flickers
+    // too fast to read and one hitching frame would own the readout.
+    constexpr float k_alpha = 0.2f;
+    const float fence_ms =
+        std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - fence_begin).count();
+    sim_ms_ += k_alpha * (last_sim_ms_ - sim_ms_);
+    render_ms_ += k_alpha * (last_render_ms_ - render_ms_);
+    present_wait_ms_ += k_alpha * (last_present_wait_ms_ - present_wait_ms_);
+    fence_ms_ += k_alpha * (fence_ms - fence_ms_);
 }
 
 void Application::run() {
@@ -333,7 +354,17 @@ void Application::run() {
         // Record + present, unchanged from Phase 3).
         if (scene_renderer_) {
             BRACKEN_PROFILE_ZONE("App::render");
+            const auto render_begin = std::chrono::steady_clock::now();
+            if (context_) {
+                context_->device().reset_present_wait();
+            }
             render_frame(*frame);
+            last_render_ms_ = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() -
+                                                                       render_begin)
+                                  .count();
+            // present_wait is a SUBSET of render_ms: the part of it the CPU
+            // spent blocked rather than working.
+            last_present_wait_ms_ = context_ ? context_->device().present_wait_ms() : 0.0f;
         }
 
         frame_packets().retire(*frame); // (6)
@@ -513,8 +544,11 @@ void Application::set_collect_render_stats(bool enabled) {
     scene_renderer_->set_collect_stats(enabled);
 }
 
-const RenderStats& Application::render_stats() const {
+std::optional<RenderStats> Application::render_stats() const {
     BRACKEN_CONTRACT(scene_renderer_ != nullptr, "render_stats() requires init_renderer() first");
+    if (!scene_renderer_->collect_stats()) {
+        return std::nullopt; // "you never asked", not "the frame was empty"
+    }
     return scene_renderer_->render_stats();
 }
 
@@ -592,6 +626,10 @@ bool Application::init_dev_ui() {
         // lands at the frame fence (see dev_ui.hpp's panel-data-safety note).
         [this](const GraphicsSettings& s) { request_graphics_settings(s); },
         &fps_,
+        &sim_ms_,
+        &render_ms_,
+        &fence_ms_,
+        &present_wait_ms_,
     };
     if (!dev_ui_->init(*context_, std::move(bindings))) {
         return false; // compiled out (stub) or backend init failed

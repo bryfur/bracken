@@ -34,6 +34,37 @@ bool combo_enum(const char* label, E& value, const char* const items[], int coun
     return changed;
 }
 
+/**
+ * value/budget as a bar with a "used / budget" overlay. These exist because
+ * every one of the caps they show used to fail silently: nothing anywhere
+ * reported how close a frame was to MAX_BONE_PALETTES or to filling the
+ * packet arena until it blew through and started dropping draws.
+ */
+void budget_bar(const char* label, double used, double budget, const char* unit = "") {
+    const float fraction = budget > 0.0 ? static_cast<float>(std::clamp(used / budget, 0.0, 1.0)) : 0.0f;
+    char overlay[64];
+    (void)std::snprintf(overlay, sizeof(overlay), "%.0f / %.0f%s", used, budget, unit);
+    // Amber past 75%, red past 90% — the point is to be noticed before the
+    // budget is exhausted, not after.
+    const ImVec4 color = fraction > 0.9f   ? ImVec4(0.85f, 0.25f, 0.25f, 1.0f)
+                         : fraction > 0.75f ? ImVec4(0.85f, 0.65f, 0.20f, 1.0f)
+                                            : ImVec4(0.30f, 0.55f, 0.80f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, color);
+    ImGui::ProgressBar(fraction, ImVec2(-FLT_MIN, 0.0f), overlay);
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::TextUnformatted(label);
+}
+
+/// One diagnostic counter, shown only when it is nonzero — a wall of zeros
+/// trains people to stop reading it.
+void diagnostic_row(const char* label, uint32_t count) {
+    if (count == 0) {
+        return;
+    }
+    ImGui::TextColored(ImVec4(0.90f, 0.55f, 0.20f, 1.0f), "%s: %u", label, count);
+}
+
 // ========== Stats ==========
 
 void draw_stats_tab(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
@@ -51,6 +82,18 @@ void draw_stats_tab(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
         ImGui::Text("Frame time: %.2f ms", fps > 0.0f ? static_cast<double>(1000.0f / fps) : 0.0);
     }
 
+    if (bindings.sim_ms && bindings.render_ms && bindings.fence_ms && bindings.present_wait_ms) {
+        ImGui::SeparatorText("Frame phases - CPU");
+        ImGui::Text("Simulate: %.2f ms", static_cast<double>(*bindings.sim_ms));
+        ImGui::Text("Render (record): %.2f ms", static_cast<double>(*bindings.render_ms));
+        ImGui::Text("  of which blocked on GPU: %.2f ms", static_cast<double>(*bindings.present_wait_ms));
+        ImGui::Text("Fence: %.2f ms", static_cast<double>(*bindings.fence_ms));
+        // Simulate overlaps the PREVIOUS frame's render (pipeline depth 2), so
+        // these deliberately do not sum to the frame time.
+        ImGui::TextDisabled("Simulate overlaps the previous frame's render;");
+        ImGui::TextDisabled("the phases do not sum to frame time.");
+    }
+
     if (bindings.scene_renderer != nullptr) {
         // The counters are only accumulated while collection is on; keep it
         // enabled while this tab is drawn so the readouts are live (the cost
@@ -63,17 +106,75 @@ void draw_stats_tab(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
         ImGui::SeparatorText("Render");
         ImGui::Text("Draw calls: %u", stats.draw_calls);
         ImGui::Text("Triangles: %u", stats.triangle_count);
+        ImGui::Text("Instances: %u", stats.instances_drawn);
         ImGui::Text("Entities rendered: %u", stats.entities_rendered);
         ImGui::Text("Entities culled: %u distance, %u frustum", stats.entities_distance_culled,
                     stats.entities_frustum_culled);
+        ImGui::Text("UI: %u vertices in %u draws", stats.ui_vertices, stats.ui_draws);
+        ImGui::Text("Local shadow tiles this frame: %u", stats.local_shadow_tiles_rendered);
         // Render-side snapshot counts (the live EffectSystem is sim-stage-
         // owned and may be mutating on a worker right now — never read it here).
         ImGui::Text("Particles: %u (in %u effects)",
                     static_cast<unsigned>(bindings.scene_renderer->frame_particle_count()),
                     static_cast<unsigned>(bindings.scene_renderer->frame_effect_count()));
-        ImGui::Spacing();
-        ImGui::TextDisabled("Per-pass GPU times are stubbed (SDL3 limitation);");
-        ImGui::TextDisabled("use Tracy (CPU) or RenderDoc/Nsight (GPU) for real numbers.");
+
+        ImGui::SeparatorText("Budgets");
+        budget_bar("Bone palettes", stats.bone_palettes_used, stats.bone_palettes_budget);
+        budget_bar("Packet arena", static_cast<double>(stats.packet_bytes_used) / 1024.0,
+                   static_cast<double>(stats.packet_bytes_capacity) / 1024.0, " KiB");
+        budget_bar("Lights binned", stats.lights_binned, stats.lights_submitted > 0 ? stats.lights_submitted : 1);
+
+        // Only shown when something was actually thrown away.
+        const bracken::FrameDiagnostics& diag = bindings.scene_renderer->frame_diagnostics();
+        if (diag.any()) {
+            ImGui::SeparatorText("Dropped this frame");
+            diagnostic_row("Draws with an unknown model handle", diag.draws_dropped_unknown_model);
+            diagnostic_row("Skinned draws with no skeleton", diag.skinned_dropped_no_skeleton);
+            diagnostic_row("Bone palettes over budget", diag.palettes_over_budget);
+            diagnostic_row("Effect models unresolved", diag.effect_models_unresolved);
+            diagnostic_row("Lights past MAX_LIGHTS", diag.lights_dropped);
+            diagnostic_row("Cluster light insertions dropped", diag.cluster_lights_dropped);
+            if (diag.camera_missing) {
+                ImGui::TextColored(ImVec4(0.90f, 0.35f, 0.25f, 1.0f),
+                                   "3D content but NO CAMERA - call frame().set_camera()");
+            }
+        }
+
+        if (!stats.pass_times_ms.empty()) {
+            ImGui::SeparatorText("Passes - CPU (record)");
+            // The column header is load-bearing: this is the cost of BUILDING
+            // each pass's command stream, not of executing it on the GPU. A
+            // pass can record in 40 us and cost 4 ms on the device.
+            if (ImGui::BeginTable("pass_times", 3, ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Pass");
+                ImGui::TableSetupColumn("CPU (record)");
+                ImGui::TableSetupColumn("GPU");
+                ImGui::TableHeadersRow();
+                for (const bracken::PassTiming& t : stats.pass_times_ms) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(t.name.data(), t.name.data() + t.name.size());
+                    ImGui::TableNextColumn();
+                    if (t.cpu_ms) {
+                        ImGui::Text("%.3f ms", static_cast<double>(*t.cpu_ms));
+                    } else {
+                        ImGui::TextDisabled("-");
+                    }
+                    ImGui::TableNextColumn();
+                    // nullopt, not 0.0: SDL3 has no timestamp query API, so
+                    // "unknown" is the honest answer and 0 ms would read as
+                    // "free".
+                    if (t.gpu_ms) {
+                        ImGui::Text("%.3f ms", static_cast<double>(*t.gpu_ms));
+                    } else {
+                        ImGui::TextDisabled("n/a");
+                    }
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TextDisabled("GPU-side cost needs RenderDoc/Nsight - SDL3 exposes no");
+            ImGui::TextDisabled("timestamp queries, so the engine cannot measure it.");
+        }
     }
 }
 
