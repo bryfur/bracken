@@ -47,6 +47,7 @@
 #include "bracken/scene/camera_jitter.hpp"
 #include "bracken/scene/camera_state.hpp"
 #include "bracken/scene/frame_packet.hpp"
+#include "bracken/scene/render_plan.hpp"
 #include "bracken/scene/transform_math.hpp"
 #include "glm/common.hpp"
 #include "glm/ext/matrix_float4x4.hpp"
@@ -607,10 +608,28 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
         env_ = frame.environment();
     }
 
+    // ===== The frame's pass plan =====
+    // Which passes run, and the frame-scoped cull constants — decided ONCE,
+    // here, from the settings + the sealed packet + what the sub-renderers
+    // can currently do (scene/render_plan.hpp). Everything below reads the
+    // plan instead of re-deriving a predicate, so there is exactly one
+    // definition of "is TAA on this frame". The plan is pure: the two
+    // invalidations it reports are performed at their original sites below,
+    // AFTER the minimized-window early-out, so a minimized frame still drops
+    // nothing.
+    RendererCaps caps;
+    caps.post_ready = post_->is_ready();
+    caps.taa_ready = taa_->is_ready();
+    caps.ibl_ready = ibl_ && ibl_->is_ready();
+    caps.camera_seen = have_frame_camera_;
+    caps.shadows_ready = shadow_map_->is_ready();
+    caps.shadow_cascades = shadow_map_->active_cascades();
+    const RenderPlan plan = plan_frame(gfx, frame, caps);
+
     // Cache frame-level state once (avoids repeated ternary/function calls)
-    frame_fog_active_ = gfx.fog_enabled;
-    frame_draw_dist_sq_ = gfx.get_draw_distance() * gfx.get_draw_distance();
-    frame_do_frustum_cull_ = gfx.frustum_culling;
+    frame_fog_active_ = plan.fog_active;
+    frame_draw_dist_sq_ = plan.draw_dist_sq;
+    frame_do_frustum_cull_ = plan.do_frustum_cull;
 
     // Scene/sky clocks are advanced by the SIM stage and carried in the
     // packet's engine section (docs/multithreading_plan.md Phase 4): adopt
@@ -669,26 +688,24 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                               "frame has 3D content but no camera was ever set - call frame().set_camera(); "
                               "the entire 3D pass is being skipped");
     }
-    bool has_content = frame.has_3d_content() && have_frame_camera_;
+    const bool has_content = plan.has_content;
     frame_prepass_active_ = false; // set by the HDR path when the prepass records
     // Reset the frame's AO texture to the white dummy: forward pipelines
     // always bind the slot, and GTAO's textures may have been recreated
     // since last frame (resize / quality change).
     frame_ao_texture_ = dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr;
-    // Sky IBL: active when the setting is on and the prefilter chain is
-    // alive; drives every scene shader's iblEnabled flag (the IBL sampler
+    // Sky IBL drives every scene shader's iblEnabled flag (the IBL sampler
     // slots are bound either way — dummies when inactive).
-    frame_ibl_active_ = gfx.ibl_enabled && ibl_ && ibl_->is_ready();
+    frame_ibl_active_ = plan.ibl_active;
     // Always render 3D through the HDR offscreen target so scene lighting stays
     // in linear HDR; the composite pass tonemaps + gamma-corrects to the swapchain.
-    bool use_hdr_path = post_->is_ready();
-    // TAA is active exactly when the settings ask for it AND the resolve can
-    // actually run (offscreen HDR path + history targets alive). It drives the
-    // sub-pixel camera jitter: jitter without a resolve to integrate the
-    // samples would just shimmer, so every other mode renders unjittered.
-    const bool taa_active = gfx.aa_mode == AAMode::TAA && use_hdr_path && taa_->is_ready();
+    const bool use_hdr_path = plan.use_hdr_path;
+    // TAA drives the sub-pixel camera jitter: jitter without a resolve to
+    // integrate the samples would just shimmer, so every other mode renders
+    // unjittered.
+    const bool taa_active = plan.taa_active;
     taa_jitter_enabled_ = taa_active;
-    if (!taa_active) {
+    if (plan.invalidate_taa_history) {
         // Any gap (mode switch, fallback path) stales the accumulated
         // history; drop it so re-enabling TAA restarts cleanly.
         taa_->invalidate_history();
@@ -696,7 +713,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     // Auto exposure follows the same gap policy: any frame its passes cannot
     // record (setting off, fallback path, no 3D content) stales the adapted
     // EV — snap to the metered target when it comes back.
-    if (!gfx.auto_exposure || !use_hdr_path || !has_content) {
+    if (plan.invalidate_auto_exposure) {
         auto_exposure_->invalidate();
     }
     // Set when a late swapchain acquire fails: composite + UI are skipped but
@@ -743,7 +760,9 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
 
         // Update cascade matrices FIRST so we can extract per-cascade light frustums
         // and use them to cull shadow casters per cascade in build_instance_batches.
-        const bool shadows_on = shadow_map_->is_ready() && gfx.shadow_mode != ShadowMode::Off;
+        // plan.active_cascades is the single "shadows on" answer (it is 0
+        // exactly when the atlas is unavailable or the mode is Off).
+        const bool shadows_on = plan.active_cascades > 0;
         if (shadows_on) {
             // Near plane recovered from the reversed-Z RH_ZO projection
             // (n = m32 / (m22 + 1); under standard-Z it was m32/m22).
@@ -753,8 +772,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             const float cam_near = std::max(camera.projection[3][2] / (camera.projection[2][2] + 1.0f), 0.1f);
             const float shadow_far = std::min(gfx.get_draw_distance(), gfx.shadow_distance);
             shadow_map_->update(camera.view, camera.projection, light_dir_, cam_near, shadow_far);
-            const int active = shadow_map_->active_cascades();
-            for (int c = 0; c < active; ++c) {
+            for (int c = 0; c < plan.active_cascades; ++c) {
                 shadow_cascade_frustums_[c].extract_from_matrix(shadow_map_->cascades()[c].light_view_projection);
             }
         }
@@ -763,7 +781,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
 
         // Build instance batches (cull for main + per-cascade shadows) and
         // resolve the skinned commands against the packet-owned palettes.
-        build_instance_batches(frame, camera, frame_frustum_);
+        build_instance_batches(frame, camera, frame_frustum_, plan.active_cascades);
         pack_bone_palettes(frame, camera);
 
         // Grass chunk culling/visibility prep (upload happens below).
@@ -2075,16 +2093,12 @@ void SceneRenderer::prep_instance_batches(core::jobs::JobSystem& js, std::span<c
 }
 
 void SceneRenderer::build_instance_batches(const FramePacket& frame, const CameraState& camera,
-                                           const Frustum& frustum) {
+                                           const Frustum& frustum, int active_cascades) {
     BRACKEN_PROFILE_ZONE_COLOR("SceneRenderer::build_instance_batches", 0x27AE60);
 
-    // Shadow state: which cascades are active, and their light frustums.
-    // Mirror render_frame's shadows_on gate — with shadow_mode == 0 the shadow
-    // passes never run (and the cascade frustums are stale), so don't bin,
-    // pack, or upload any shadow instances.
-    const GraphicsSettings& gfx = graphics_ ? *graphics_ : default_graphics_;
-    const int active_cascades =
-        (shadow_map_->is_ready() && gfx.shadow_mode != ShadowMode::Off) ? shadow_map_->active_cascades() : 0;
+    // `active_cascades` comes from the frame's RenderPlan, which is also what
+    // gates the shadow passes themselves — with shadows off the cascade
+    // frustums are stale, so nothing may be binned, packed or uploaded.
 
     PrepParams p;
     p.models = model_manager_.get();

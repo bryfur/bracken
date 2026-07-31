@@ -407,7 +407,8 @@ private:
     void render_model_command_inner(const ModelDrawCommand& cmd, const CameraState& camera);
     void render_skinned_model_command_inner(const SkinnedDrawCommand& cmd, Model& model, const CameraState& camera,
                                             uint32_t palette_offset);
-    void build_instance_batches(const FramePacket& frame, const CameraState& camera, const Frustum& frustum);
+    void build_instance_batches(const FramePacket& frame, const CameraState& camera, const Frustum& frustum,
+                                int active_cascades);
     void upload_instance_buffers(SDL_GPUCopyPass* copy_pass);
     void pack_bone_palettes(const FramePacket& frame, const CameraState& camera);
     void upload_bone_palettes(SDL_GPUCopyPass* copy_pass, const FramePacket& frame);

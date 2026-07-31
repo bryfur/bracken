@@ -271,6 +271,36 @@ kick/join edges order the handoff. Hosts that bypass `run()` may still
 drive the Phase-2 sequential flow directly (acquire → build → seal →
 `render_frame` → retire).
 
+### Which passes run this frame — `scene/render_plan.hpp`
+
+`plan_frame(const GraphicsSettings&, const FramePacket&, RendererCaps)` is
+the authoritative "which passes run this frame" decision point, evaluated
+once at the top of `render_frame` and read by everything downstream:
+`has_content`, `use_hdr_path`, `taa_active`, `ibl_active`, `fog_active`,
+`do_frustum_cull`, `draw_dist_sq` and `active_cascades` (which **is** the
+"shadows on" predicate — `ShadowMap::active_cascades()` is clamped to
+[1, `CSM_MAX_CASCADES`], so a zero means the atlas is unavailable or the
+host set `ShadowMode::Off`). It is **pure**: `RendererCaps` carries the four
+sub-renderer readiness bits plus the sticky "a camera was ever set" flag,
+which is why the whole tree is testable headless
+(`scene/render_plan.test.cpp`).
+
+Two decisions deliberately stay in `render_frame`: the minimized-window
+early-out (it must sit between `begin_frame()` and `end_frame()` so the
+command-buffer lifecycle stays balanced) and the mid-frame TAA history drop
+for a jittered frame whose prepass/velocity target turned out unavailable.
+The plan also *reports* rather than performs its two invalidations
+(`invalidate_taa_history`, `invalidate_auto_exposure`) — `render_frame`
+makes those calls, after the minimized early-out, so a minimized frame drops
+nothing.
+
+`RenderPlan` is the **immutable half only**. Three frame-scoped renderer
+members are written mid-frame, after the camera/frustum state is final —
+`frame_prepass_active_` (the prepass reports whether it recorded),
+`frame_ao_texture_` (GTAO publishes its output) and
+`frame_shadow_uniforms_` — and therefore cannot live in a const struct built
+before those passes run.
+
 ### Pass order inside `SceneRenderer::render_frame`
 
 (`scene/scene_renderer.cpp`; each GPU section has a matching debug group +
