@@ -1,4 +1,4 @@
-// GOLDEN-VALUE tests for the SceneRenderer CPU-prepare cores.
+// GOLDEN-VALUE tests for the CPU Prepare cores (scene::ScenePrep).
 //
 // scene_prep_parity.test.cpp next door proves the prep cores are BIT-IDENTICAL
 // at any worker count. That is a strong property and a weak test: it compares
@@ -44,7 +44,7 @@
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/frustum.hpp"
 #include "bracken/scene/motion_history.hpp"
-#include "bracken/scene/scene_renderer.hpp"
+#include "bracken/scene/scene_prep.hpp"
 #include "bracken/scene/transform_math.hpp"
 
 #include <array>
@@ -142,7 +142,7 @@ struct GoldenWorld {
     FramePacket packet{1 << 16};
     MotionHistory history;
     Frustum main_frustum{};
-    std::array<Frustum, SceneRenderer::MAX_SHADOW_CASCADES> cascades{};
+    std::array<Frustum, ScenePrep::MAX_SHADOW_CASCADES> cascades{};
     std::array<BonePaletteId, 3> palettes{};
 
     GoldenWorld() {
@@ -169,8 +169,8 @@ struct GoldenWorld {
         build_packet();
     }
 
-    SceneRenderer::PrepParams params(int active_cascades = 2) const {
-        SceneRenderer::PrepParams p;
+    ScenePrep::PrepParams params(int active_cascades = 2) const {
+        ScenePrep::PrepParams p;
         p.models = &models;
         p.motion_history = &history;
         p.camera_pos = glm::vec3(0.0f);
@@ -267,19 +267,19 @@ enum SkinnedIndex : std::size_t {
 struct PrepOutputs {
     std::vector<std::vector<gpu::InstanceData>> bins;
     std::vector<ModelHandle> touched;
-    std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, SceneRenderer::MAX_SHADOW_CASCADES> shadow_bins;
-    std::array<std::vector<ModelHandle>, SceneRenderer::MAX_SHADOW_CASCADES> shadow_touched;
+    std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, ScenePrep::MAX_SHADOW_CASCADES> shadow_bins;
+    std::array<std::vector<ModelHandle>, ScenePrep::MAX_SHADOW_CASCADES> shadow_touched;
     std::vector<const ModelDrawCommand*> non_instanced;
     FrameStatsPartial stats;
 
-    SceneRenderer::InstanceBinOutputs bindings() {
-        return SceneRenderer::InstanceBinOutputs{bins, touched, shadow_bins, shadow_touched, non_instanced, stats};
+    ScenePrep::InstanceBinOutputs bindings() {
+        return ScenePrep::InstanceBinOutputs{bins, touched, shadow_bins, shadow_touched, non_instanced, stats};
     }
 };
 
-void run_binning(jobs::JobSystem& js, const GoldenWorld& world, PrepOutputs& out, SceneRenderer::PrepScratch& scratch) {
-    const SceneRenderer::InstanceBinOutputs bindings = out.bindings();
-    SceneRenderer::prep_instance_batches(js, world.packet.model_commands(), world.params(), scratch, bindings);
+void run_binning(jobs::JobSystem& js, const GoldenWorld& world, PrepOutputs& out, ScenePrep::PrepScratch& scratch) {
+    const ScenePrep::InstanceBinOutputs bindings = out.bindings();
+    ScenePrep::prep_instance_batches(js, world.packet.model_commands(), world.params(), scratch, bindings);
 }
 
 /// The base_instance walk, expressed exactly as upload_instance_buffers packs
@@ -316,7 +316,7 @@ std::vector<PackedBatch> packed_batches(const std::vector<std::vector<gpu::Insta
 TEST(ScenePrepGolden, MainViewCullCountsAreExact) {
     GoldenWorld world;
     jobs::JobSystem js; // uninitialized: pure serial reference path
-    SceneRenderer::PrepScratch scratch;
+    ScenePrep::PrepScratch scratch;
     PrepOutputs out;
     run_binning(js, world, out, scratch);
 
@@ -336,7 +336,7 @@ TEST(ScenePrepGolden, MainViewCullCountsAreExact) {
 TEST(ScenePrepGolden, MainViewBinMembershipAndOrder) {
     GoldenWorld world;
     jobs::JobSystem js;
-    SceneRenderer::PrepScratch scratch;
+    ScenePrep::PrepScratch scratch;
     PrepOutputs out;
     run_binning(js, world, out, scratch);
 
@@ -373,7 +373,7 @@ TEST(ScenePrepGolden, MainViewBinMembershipAndOrder) {
 TEST(ScenePrepGolden, InstanceDataBytesAreDerivedNotCopied) {
     GoldenWorld world;
     jobs::JobSystem js;
-    SceneRenderer::PrepScratch scratch;
+    ScenePrep::PrepScratch scratch;
     PrepOutputs out;
     run_binning(js, world, out, scratch);
 
@@ -412,7 +412,7 @@ TEST(ScenePrepGolden, InstanceDataBytesAreDerivedNotCopied) {
 TEST(ScenePrepGolden, BaseInstanceOffsetsSurviveAnUnresolvableBin) {
     GoldenWorld world;
     jobs::JobSystem js;
-    SceneRenderer::PrepScratch scratch;
+    ScenePrep::PrepScratch scratch;
     PrepOutputs out;
     run_binning(js, world, out, scratch);
 
@@ -445,7 +445,7 @@ TEST(ScenePrepGolden, BaseInstanceOffsetsSurviveAnUnresolvableBin) {
 TEST(ScenePrepGolden, ShadowCascadeZeroCastRules) {
     GoldenWorld world;
     jobs::JobSystem js;
-    SceneRenderer::PrepScratch scratch;
+    ScenePrep::PrepScratch scratch;
     PrepOutputs out;
     run_binning(js, world, out, scratch);
 
@@ -481,7 +481,7 @@ TEST(ScenePrepGolden, ShadowCascadeZeroCastRules) {
 TEST(ScenePrepGolden, BoundlessCommandCastsIntoEveryCascade) {
     GoldenWorld world;
     jobs::JobSystem js;
-    SceneRenderer::PrepScratch scratch;
+    ScenePrep::PrepScratch scratch;
     PrepOutputs out;
     run_binning(js, world, out, scratch);
 
@@ -503,18 +503,18 @@ TEST(ScenePrepGolden, BoundlessCommandCastsIntoEveryCascade) {
 TEST(ScenePrepGolden, ShadowViewsContributeNoStats) {
     GoldenWorld world;
     jobs::JobSystem js;
-    SceneRenderer::PrepScratch scratch;
+    ScenePrep::PrepScratch scratch;
 
     PrepOutputs with_shadows;
     {
-        const SceneRenderer::InstanceBinOutputs b = with_shadows.bindings();
-        SceneRenderer::prep_instance_batches(js, world.packet.model_commands(), world.params(2), scratch, b);
+        const ScenePrep::InstanceBinOutputs b = with_shadows.bindings();
+        ScenePrep::prep_instance_batches(js, world.packet.model_commands(), world.params(2), scratch, b);
     }
     PrepOutputs no_shadows;
     {
-        SceneRenderer::PrepScratch scratch2;
-        const SceneRenderer::InstanceBinOutputs b = no_shadows.bindings();
-        SceneRenderer::prep_instance_batches(js, world.packet.model_commands(), world.params(0), scratch2, b);
+        ScenePrep::PrepScratch scratch2;
+        const ScenePrep::InstanceBinOutputs b = no_shadows.bindings();
+        ScenePrep::prep_instance_batches(js, world.packet.model_commands(), world.params(0), scratch2, b);
     }
 
     EXPECT_EQ(with_shadows.stats.entities_rendered, no_shadows.stats.entities_rendered);
@@ -535,10 +535,10 @@ TEST(ScenePrepGolden, ShadowViewsContributeNoStats) {
 TEST(ScenePrepGolden, SkinnedResolveDropsAndOffsets) {
     GoldenWorld world;
     jobs::JobSystem js;
-    SceneRenderer::PrepScratch scratch;
-    std::vector<SceneRenderer::ResolvedSkinnedEntry> resolved;
+    ScenePrep::PrepScratch scratch;
+    std::vector<ScenePrep::ResolvedSkinnedEntry> resolved;
     FrameStatsPartial stats;
-    SceneRenderer::prep_resolve_skinned(js, world.packet.skinned_commands(), world.packet.palettes(), world.params(),
+    ScenePrep::prep_resolve_skinned(js, world.packet.skinned_commands(), world.packet.palettes(), world.params(),
                                         scratch.skinned, resolved, stats);
 
     ASSERT_EQ(world.packet.skinned_commands().size(), SK_COUNT);
@@ -581,12 +581,12 @@ TEST(ScenePrepGolden, SkinnedResolveDropsAndOffsets) {
 TEST(ScenePrepGolden, PrevPaletteOffsetIsGatedOnBufferValidity) {
     GoldenWorld world;
     jobs::JobSystem js;
-    SceneRenderer::PrepScratch scratch;
-    SceneRenderer::PrepParams p = world.params();
+    ScenePrep::PrepScratch scratch;
+    ScenePrep::PrepParams p = world.params();
     p.prev_palette_valid = false;
-    std::vector<SceneRenderer::ResolvedSkinnedEntry> resolved;
+    std::vector<ScenePrep::ResolvedSkinnedEntry> resolved;
     FrameStatsPartial stats;
-    SceneRenderer::prep_resolve_skinned(js, world.packet.skinned_commands(), world.packet.palettes(), p,
+    ScenePrep::prep_resolve_skinned(js, world.packet.skinned_commands(), world.packet.palettes(), p,
                                         scratch.skinned, resolved, stats);
     ASSERT_EQ(resolved.size(), 3u);
     EXPECT_EQ(resolved[2].prev_palette_offset, gpu::PrepassModelUniforms::NO_PREV_PALETTE);
@@ -625,7 +625,7 @@ TEST(ScenePrepGolden, PaletteCopyProducesTheConcatenatedStream) {
     // Sentinel-fill so any byte NOT covered by a palette range is detectable.
     const glm::mat4 sentinel(-98765.0f);
     std::vector<glm::mat4> packed(PALETTE_MATRIX_TOTAL, sentinel);
-    SceneRenderer::prep_copy_palettes(js, world.packet.palettes(), packed.data());
+    ScenePrep::prep_copy_palettes(js, world.packet.palettes(), packed.data());
 
     // Expected: palette p's joint j holds mat4(p * 100 + j + 1), written at
     // PALETTE_OFFSETS[p] + j. Every slot is covered exactly once.
@@ -650,7 +650,7 @@ TEST(ScenePrepGolden, GoldensHoldUnderTheFanOut) {
     GoldenWorld world;
     jobs::JobSystem js4;
     js4.init(4);
-    SceneRenderer::PrepScratch scratch;
+    ScenePrep::PrepScratch scratch;
     PrepOutputs out;
     run_binning(js4, world, out, scratch);
 
@@ -663,9 +663,9 @@ TEST(ScenePrepGolden, GoldensHoldUnderTheFanOut) {
               (std::vector<PackedBatch>{{H_CUBE, 0, 3}, {H_SLAB, 3, 2}, {H_UNKNOWN, 5, 1}}));
     EXPECT_EQ(out.shadow_touched[1], (std::vector<ModelHandle>{H_UNKNOWN}));
 
-    std::vector<SceneRenderer::ResolvedSkinnedEntry> resolved;
+    std::vector<ScenePrep::ResolvedSkinnedEntry> resolved;
     FrameStatsPartial stats;
-    SceneRenderer::prep_resolve_skinned(js4, world.packet.skinned_commands(), world.packet.palettes(), world.params(),
+    ScenePrep::prep_resolve_skinned(js4, world.packet.skinned_commands(), world.packet.palettes(), world.params(),
                                         scratch.skinned, resolved, stats);
     ASSERT_EQ(resolved.size(), 3u);
     EXPECT_EQ(stats.diagnostics.skinned_dropped_no_skeleton, 2u);

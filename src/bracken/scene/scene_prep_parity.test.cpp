@@ -1,4 +1,4 @@
-// Determinism parity tests for the SceneRenderer CPU-prepare fan-out
+// Determinism parity tests for the CPU Prepare fan-out (scene::ScenePrep)
 // (docs/multithreading_plan.md §4.3 / §6.2): the prep cores must produce
 // BIT-IDENTICAL outputs at any worker count. A synthetic sealed FramePacket
 // (deterministic LCG transforms/bounds, a mix of culled/visible/instanced/
@@ -7,9 +7,10 @@
 // output (bin contents AND order, touched lists, non-instanced list, stats,
 // resolved skinned entries, palette copy bytes) is compared byte-for-byte.
 //
-// The cores are device-free statics on SceneRenderer precisely so this test
-// can reach them without a GPU device (models are registered into a
-// ModelManager with no device set — prep only reads bounds/skeleton).
+// The cores are device-free statics on ScenePrep precisely so this test can
+// reach them without a GPU device (models are registered into a ModelManager
+// with no device set — prep only reads bounds/skeleton). ScenePrep owns no
+// device, context or sub-renderer, so there is nothing else it COULD reach.
 
 #include <gtest/gtest.h>
 
@@ -20,7 +21,7 @@
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/frustum.hpp"
 #include "bracken/scene/motion_history.hpp"
-#include "bracken/scene/scene_renderer.hpp"
+#include "bracken/scene/scene_prep.hpp"
 
 #include <array>
 #include <cstddef>
@@ -78,11 +79,11 @@ struct PrepWorld {
 
     CameraState camera{glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f), glm::vec3(0.0f)};
     Frustum main_frustum{};
-    std::array<Frustum, SceneRenderer::MAX_SHADOW_CASCADES> cascade_frustums{};
+    std::array<Frustum, ScenePrep::MAX_SHADOW_CASCADES> cascade_frustums{};
     int active_cascades = 3;
 
-    SceneRenderer::PrepParams params(bool collect_stats = true) const {
-        SceneRenderer::PrepParams p;
+    ScenePrep::PrepParams params(bool collect_stats = true) const {
+        ScenePrep::PrepParams p;
         p.models = &models;
         p.motion_history = &history;
         p.camera_pos = camera.position;
@@ -203,31 +204,31 @@ void build_world(PrepWorld& w, size_t model_count, size_t skinned_count) {
 struct PrepRun {
     std::vector<std::vector<gpu::InstanceData>> bins;
     std::vector<ModelHandle> touched;
-    std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, SceneRenderer::MAX_SHADOW_CASCADES> shadow_bins;
-    std::array<std::vector<ModelHandle>, SceneRenderer::MAX_SHADOW_CASCADES> shadow_touched;
+    std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, ScenePrep::MAX_SHADOW_CASCADES> shadow_bins;
+    std::array<std::vector<ModelHandle>, ScenePrep::MAX_SHADOW_CASCADES> shadow_touched;
     std::vector<const ModelDrawCommand*> non_instanced;
     FrameStatsPartial stats;
-    std::vector<SceneRenderer::ResolvedSkinnedEntry> skinned;
+    std::vector<ScenePrep::ResolvedSkinnedEntry> skinned;
     FrameStatsPartial skinned_stats;
     std::vector<glm::mat4> palette_copy;
 };
 
-void run_prep(jobs::JobSystem& js, const PrepWorld& w, SceneRenderer::PrepScratch& scratch, PrepRun& run) {
-    const SceneRenderer::PrepParams p = w.params();
-    const SceneRenderer::InstanceBinOutputs out{run.bins,          run.touched,       run.shadow_bins,
+void run_prep(jobs::JobSystem& js, const PrepWorld& w, ScenePrep::PrepScratch& scratch, PrepRun& run) {
+    const ScenePrep::PrepParams p = w.params();
+    const ScenePrep::InstanceBinOutputs out{run.bins,          run.touched,       run.shadow_bins,
                                                 run.shadow_touched, run.non_instanced, run.stats};
     run.stats = {};
-    SceneRenderer::prep_instance_batches(js, w.packet.model_commands(), p, scratch, out);
+    ScenePrep::prep_instance_batches(js, w.packet.model_commands(), p, scratch, out);
 
     run.skinned_stats = {};
-    SceneRenderer::prep_resolve_skinned(js, w.packet.skinned_commands(), w.packet.palettes(), p, scratch.skinned,
+    ScenePrep::prep_resolve_skinned(js, w.packet.skinned_commands(), w.packet.palettes(), p, scratch.skinned,
                                         run.skinned, run.skinned_stats);
 
     // Sentinel-fill so bytes NOT covered by any palette range must also match
     // (a stray out-of-range write would differ from the reference).
     run.palette_copy.assign(w.packet.palette_matrix_total(), glm::mat4(-12345.0f));
     if (!run.palette_copy.empty()) {
-        SceneRenderer::prep_copy_palettes(js, w.packet.palettes(), run.palette_copy.data());
+        ScenePrep::prep_copy_palettes(js, w.packet.palettes(), run.palette_copy.data());
     }
 }
 
@@ -246,7 +247,7 @@ void expect_runs_identical(const PrepRun& a, const PrepRun& b, const char* label
     }
     EXPECT_EQ(a.touched, b.touched);
 
-    for (int c = 0; c < SceneRenderer::MAX_SHADOW_CASCADES; ++c) {
+    for (int c = 0; c < ScenePrep::MAX_SHADOW_CASCADES; ++c) {
         ASSERT_EQ(a.shadow_bins[c].size(), b.shadow_bins[c].size()) << "cascade " << c;
         for (size_t h = 0; h < a.shadow_bins[c].size(); ++h) {
             ASSERT_EQ(a.shadow_bins[c][h].size(), b.shadow_bins[c][h].size()) << "cascade " << c << " bin " << h;
@@ -327,9 +328,9 @@ TEST(ScenePrepParity, WorkerCountInvariance) {
     jobs::JobSystem js4;
     js4.init(4);
 
-    SceneRenderer::PrepScratch scratch_serial;
-    SceneRenderer::PrepScratch scratch1;
-    SceneRenderer::PrepScratch scratch4;
+    ScenePrep::PrepScratch scratch_serial;
+    ScenePrep::PrepScratch scratch1;
+    ScenePrep::PrepScratch scratch4;
     PrepRun serial;
     PrepRun run1;
     PrepRun run4;
@@ -365,14 +366,14 @@ TEST(ScenePrepParity, ScratchReuseAcrossFrames) {
     jobs::JobSystem js4;
     js4.init(4);
 
-    SceneRenderer::PrepScratch reused;
+    ScenePrep::PrepScratch reused;
     PrepRun big_run;
     run_prep(js4, big, reused, big_run); // dirty the pool
 
     PrepRun reused_run;
     run_prep(js4, small, reused, reused_run);
 
-    SceneRenderer::PrepScratch fresh;
+    ScenePrep::PrepScratch fresh;
     PrepRun fresh_run;
     run_prep(js4, small, fresh, fresh_run);
 
@@ -384,14 +385,14 @@ TEST(ScenePrepParity, ScratchReuseAcrossFrames) {
 TEST(ScenePrepParity, SmallSceneStaysInlineAndIdentical) {
     PrepWorld w;
     build_world(w, 12, 3);
-    ASSERT_LE(w.packet.model_commands().size(), SceneRenderer::PREP_COMMAND_GRAIN);
+    ASSERT_LE(w.packet.model_commands().size(), ScenePrep::PREP_COMMAND_GRAIN);
 
     jobs::JobSystem js_serial;
     jobs::JobSystem js4;
     js4.init(4);
 
-    SceneRenderer::PrepScratch scratch_serial;
-    SceneRenderer::PrepScratch scratch4;
+    ScenePrep::PrepScratch scratch_serial;
+    ScenePrep::PrepScratch scratch4;
     PrepRun serial;
     PrepRun run4;
     run_prep(js_serial, w, scratch_serial, serial);
@@ -416,21 +417,21 @@ TEST(ScenePrepParity, StatsOffParity) {
     jobs::JobSystem js4;
     js4.init(4);
 
-    SceneRenderer::PrepScratch s_on;
-    SceneRenderer::PrepScratch s_off;
+    ScenePrep::PrepScratch s_on;
+    ScenePrep::PrepScratch s_off;
     PrepRun on;
     PrepRun off;
     run_prep(js4, w, s_on, on);
 
     {
-        const SceneRenderer::PrepParams p = w.params(/*collect_stats=*/false);
-        const SceneRenderer::InstanceBinOutputs out{off.bins,          off.touched,       off.shadow_bins,
+        const ScenePrep::PrepParams p = w.params(/*collect_stats=*/false);
+        const ScenePrep::InstanceBinOutputs out{off.bins,          off.touched,       off.shadow_bins,
                                                     off.shadow_touched, off.non_instanced, off.stats};
-        SceneRenderer::prep_instance_batches(js4, w.packet.model_commands(), p, s_off, out);
-        SceneRenderer::prep_resolve_skinned(js4, w.packet.skinned_commands(), w.packet.palettes(), p, s_off.skinned,
+        ScenePrep::prep_instance_batches(js4, w.packet.model_commands(), p, s_off, out);
+        ScenePrep::prep_resolve_skinned(js4, w.packet.skinned_commands(), w.packet.palettes(), p, s_off.skinned,
                                             off.skinned, off.skinned_stats);
         off.palette_copy.assign(w.packet.palette_matrix_total(), glm::mat4(-12345.0f));
-        SceneRenderer::prep_copy_palettes(js4, w.packet.palettes(), off.palette_copy.data());
+        ScenePrep::prep_copy_palettes(js4, w.packet.palettes(), off.palette_copy.data());
     }
 
     // Zeroed counters, identical everything else.

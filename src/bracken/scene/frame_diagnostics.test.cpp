@@ -8,7 +8,7 @@
 // Application::frame_diagnostics(), and what the smoke run prints next to the
 // packet digest.
 //
-// Everything here is device-free: the prep cores are static on SceneRenderer
+// Everything here is device-free: the prep cores are static on ScenePrep
 // (see scene_prep_parity.test.cpp) and ClusterGrid::begin_frame/add_*/build
 // touch no GPU buffers, so the whole drop surface is testable headless.
 
@@ -22,6 +22,7 @@
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/frustum.hpp"
 #include "bracken/scene/motion_history.hpp"
+#include "bracken/scene/scene_prep.hpp"
 #include "bracken/scene/scene_renderer.hpp"
 
 #include <array>
@@ -56,10 +57,10 @@ struct DiagWorld {
     FramePacket packet{1 << 20};
     MotionHistory history;
     Frustum main_frustum{};
-    std::array<Frustum, SceneRenderer::MAX_SHADOW_CASCADES> cascade_frustums{};
+    std::array<Frustum, ScenePrep::MAX_SHADOW_CASCADES> cascade_frustums{};
 
-    SceneRenderer::PrepParams params() const {
-        SceneRenderer::PrepParams p;
+    ScenePrep::PrepParams params() const {
+        ScenePrep::PrepParams p;
         p.models = &models;
         p.motion_history = &history;
         p.camera_pos = glm::vec3(0.0f);
@@ -76,24 +77,24 @@ struct DiagWorld {
 
 FrameStatsPartial run_model_prep(DiagWorld& w) {
     jobs::JobSystem js; // uninitialized: serial inline path
-    SceneRenderer::PrepScratch scratch;
+    ScenePrep::PrepScratch scratch;
     std::vector<std::vector<gpu::InstanceData>> bins;
     std::vector<ModelHandle> touched;
-    std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, SceneRenderer::MAX_SHADOW_CASCADES> shadow_bins;
-    std::array<std::vector<ModelHandle>, SceneRenderer::MAX_SHADOW_CASCADES> shadow_touched;
+    std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, ScenePrep::MAX_SHADOW_CASCADES> shadow_bins;
+    std::array<std::vector<ModelHandle>, ScenePrep::MAX_SHADOW_CASCADES> shadow_touched;
     std::vector<const ModelDrawCommand*> non_instanced;
     FrameStatsPartial stats;
-    const SceneRenderer::InstanceBinOutputs out{bins, touched, shadow_bins, shadow_touched, non_instanced, stats};
-    SceneRenderer::prep_instance_batches(js, w.packet.model_commands(), w.params(), scratch, out);
+    const ScenePrep::InstanceBinOutputs out{bins, touched, shadow_bins, shadow_touched, non_instanced, stats};
+    ScenePrep::prep_instance_batches(js, w.packet.model_commands(), w.params(), scratch, out);
     return stats;
 }
 
 FrameStatsPartial run_skinned_prep(DiagWorld& w) {
     jobs::JobSystem js;
-    SceneRenderer::PrepScratch scratch;
-    std::vector<SceneRenderer::ResolvedSkinnedEntry> resolved;
+    ScenePrep::PrepScratch scratch;
+    std::vector<ScenePrep::ResolvedSkinnedEntry> resolved;
     FrameStatsPartial stats;
-    SceneRenderer::prep_resolve_skinned(js, w.packet.skinned_commands(), w.packet.palettes(), w.params(),
+    ScenePrep::prep_resolve_skinned(js, w.packet.skinned_commands(), w.packet.palettes(), w.params(),
                                         scratch.skinned, resolved, stats);
     return stats;
 }
@@ -302,16 +303,16 @@ TEST(FrameDiagnosticsTest, CountsAreIdenticalAtAnyWorkerCount) {
     auto run_with = [&](unsigned workers) {
         jobs::JobSystem js;
         js.init(workers);
-        SceneRenderer::PrepScratch scratch;
+        ScenePrep::PrepScratch scratch;
         std::vector<std::vector<gpu::InstanceData>> bins;
         std::vector<ModelHandle> touched;
-        std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, SceneRenderer::MAX_SHADOW_CASCADES> shadow_bins;
-        std::array<std::vector<ModelHandle>, SceneRenderer::MAX_SHADOW_CASCADES> shadow_touched;
+        std::array<std::vector<std::vector<gpu::ShadowInstanceData>>, ScenePrep::MAX_SHADOW_CASCADES> shadow_bins;
+        std::array<std::vector<ModelHandle>, ScenePrep::MAX_SHADOW_CASCADES> shadow_touched;
         std::vector<const ModelDrawCommand*> non_instanced;
         FrameStatsPartial stats;
-        const SceneRenderer::InstanceBinOutputs out{bins,          touched,       shadow_bins,
+        const ScenePrep::InstanceBinOutputs out{bins,          touched,       shadow_bins,
                                                     shadow_touched, non_instanced, stats};
-        SceneRenderer::prep_instance_batches(js, w.packet.model_commands(), w.params(), scratch, out);
+        ScenePrep::prep_instance_batches(js, w.packet.model_commands(), w.params(), scratch, out);
         js.shutdown();
         return stats.diagnostics.draws_dropped_unknown_model;
     };

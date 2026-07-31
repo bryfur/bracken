@@ -858,7 +858,28 @@ reading the tables — epoch reclamation by construction, no reader locks.
 
 The Prepare work inside `SceneRenderer::render_frame` — everything
 view-dependent computed on the CPU from the sealed packet — is jobified
-(plan §4.3). The loops that fan out:
+(plan §4.3).
+
+**The tier boundary is a type: `scene::ScenePrep`** (`scene/scene_prep.hpp`).
+The renderer's three prep cores — `prep_instance_batches`,
+`prep_resolve_skinned`, `prep_copy_palettes` — plus their params, scratch
+pools and outputs live on it, and `ScenePrep` has **no `GPUDevice`, no
+`RenderContext`, no sub-renderer pointer and no state at all** (it is not
+even instantiable). That is the enforcement: a prep core structurally cannot
+reach a main-thread-tier API, so the contract is checked by the compiler
+instead of by a reviewer reading a comment. Its inputs are exactly what is
+worker-safe on a sealed frame — const `ModelManager` lookups, const
+`MotionHistory` lookups, spans over packet memory, by-value frame state.
+**`ScenePrep` must never gain a `RenderContext*`, a `GPUDevice*` or a
+sub-renderer pointer "for convenience"**: that silently re-opens the tier.
+Whatever needs a device is main-thread work and belongs on the other side of
+the boundary, in `scene/scene_renderer_upload.cpp` — which is also why the
+palette copy takes a plain `glm::mat4*` and the mapping/upload around it
+stays on `SceneRenderer`. The renderer keeps three thin adapters
+(`build_instance_batches`, `pack_bone_palettes`, `upload_bone_palettes`)
+that gather its own members and call across.
+
+The loops that fan out:
 
 - **per-view culling + instance batching**: main view and the active CSM
   cascades — disjoint outputs (per-cascade shadow bins), one job per cascade
@@ -920,6 +941,14 @@ different jobs, and both are needed:
   agree on. That last one is asserted with **two model types and an
   unresolvable handle present at once** — the only configuration in which a
   packing/draw-walk desync changes a number rather than nothing.
+- `scene/instance_batch_walk.test.cpp` — the **draw side** of that same
+  agreement: `SceneRenderer::for_each_instance_batch` is the one definition
+  of the packing order (ascending `ModelHandle`, running `base_instance`),
+  used by the packer and all three instanced draw walks now that they live in
+  different translation units. The test pins the visited (handle,
+  `base_instance`) pairs by value, including a middle bin that does not draw
+  — the case where a bin was packed but its handle no longer resolves, so the
+  walk must skip the draw and still advance past its range.
 
 ### JobSystem internals (Phase 1 rewrite)
 
