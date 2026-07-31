@@ -514,7 +514,7 @@ Default world extents 32000×32000 are a documented load-bearing constant (`docs
 
 - `set_window_mode(window_mode, resolution_index)`: no-op if window absent or both values unchanged (transitions are expensive). Mode `0` = windowed (`SDL_SetWindowFullscreenMode(win, nullptr)` + `SDL_SetWindowFullscreen(win, false)`); `1` = borderless fullscreen (null mode + fullscreen true); `2` = exclusive: matches `available_resolutions_[resolution_index]` against `SDL_GetFullscreenDisplayModes` by `w`, `h`, and `pixel_density`; if no match is found it still calls `SDL_SetWindowFullscreen(win, true)` without setting a display mode (silent fallback to borderless-like behavior). Ends with `update_viewport()`.
 - `max_vsync_mode()`: `2` if the device supports `SDL_GPU_PRESENTMODE_MAILBOX`, else `1` if `SDL_GPU_PRESENTMODE_VSYNC`, else `0`. (`SceneRenderer::max_vsync_mode()` returns `1` when it has no context.)
-- `set_vsync_mode(mode)`: clamps `mode = std::min(mode, max_vsync_mode())`, no-op if unchanged; maps 0→`SDL_GPU_PRESENTMODE_IMMEDIATE`, 1→`VSYNC`, 2→`MAILBOX`; failure of `set_swapchain_parameters` is logged via `SDL_Log`, not returned.
+- `set_vsync_mode(mode)`: clamps `mode = std::min(mode, max_vsync_mode())`, no-op if unchanged; maps 0→`SDL_GPU_PRESENTMODE_IMMEDIATE`, 1→`VSYNC`, 2→`MAILBOX`; failure of `set_swapchain_parameters` is logged (`BRACKEN_LOG_WARN`, tag `"render"`), not returned.
 - `available_resolutions()` (`Application` level) copies `RenderContext`'s display-mode list into `Application::DisplayMode{int w, h}` (pixel density is dropped at this boundary; `RenderContext` keeps it for exclusive-mode matching).
 - `screen_width()`/`screen_height()` return `RenderContext::width()/height()` (current drawable size).
 
@@ -807,30 +807,36 @@ Macros (variadic, category first, then a `std::format` string + args): `BRACKEN_
 
 #### Data structures and state
 
-`Logger` holds `mutable std::mutex mutex_`, `std::vector<Entry> sinks_` where `Entry { SinkHandle id; std::shared_ptr<LogSink> sink; }`, `SinkHandle next_id_ = 1`, `LogLevel min_level_ = LogLevel::Info`. The constructor (private) opens SDL's per-category filter fully — `SDL_SetLogPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_TRACE)` — so `set_min_level()` is the single level knob, then installs one `StdoutSink` with id 1; the first user `add_sink` therefore returns 2. Sink ids are never reused (monotonic counter; no overflow handling — `uint32_t`).
+`Logger` holds `mutable std::mutex mutex_`, `std::vector<Entry> sinks_` where `Entry { SinkHandle id; std::shared_ptr<LogSink> sink; }`, `SinkHandle next_id_ = 1`, and `std::atomic<LogLevel> min_level_{LogLevel::Info}`. The mutex guards `sinks_`/`next_id_` **only**; `min_level_` is deliberately outside it (protocol documented at the declaration): relaxed store in `set_min_level`, relaxed load in `min_level`/`should_log`. The value is self-contained — nothing else is published with it — so a racing level change costs at most one extra or one missing line around the switch, which is the semantics a level knob has anyway. The constructor (private) opens SDL's per-category filter fully — `SDL_SetLogPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_TRACE)` — so `set_min_level()` is the single level knob, then installs one `StdoutSink` with id 1; the first user `add_sink` therefore returns 2. Sink ids are never reused (monotonic counter; no overflow handling — `uint32_t`).
 
 #### Behavior
 
-- **Filtering**: `should_log(level)` returns `level >= min_level_ && min_level_ != LogLevel::Off`, under the mutex. Default minimum is `Info`. `detail::log_formatted` checks `should_log` *before* calling `std::format`, so formatting cost is skipped for filtered messages; macro argument expressions are still evaluated by the caller.
+- **Filtering**: `should_log(level)` returns `level >= min && min != LogLevel::Off` from a **single** relaxed load of `min_level_` (so the two comparisons cannot disagree about which level they are testing) — lock-free, and callable from every worker without serializing on the global mutex. Default minimum is `Info`. `detail::log_formatted` checks `should_log` *before* calling `std::format`, so formatting cost is skipped for filtered messages; macro argument expressions are still evaluated by the caller.
 - **Dispatch**: `dispatch()` snapshots the sink `shared_ptr`s into a local vector under the lock, then calls `write()` on each **outside** the lock (explicit comment: avoids deadlock if a sink logs re-entrantly). A `nullptr` category is replaced with `"general"` at dispatch time.
 - **`StdoutSink::write`**: builds `"[category] msg"` (no prefix when category is null/empty) and calls `SDL_LogMessage(SDL_LOG_CATEGORY_APPLICATION, prio, "%s", body)`. Level→SDL priority map: Trace→`SDL_LOG_PRIORITY_TRACE`, Debug→`DEBUG`, Info→`INFO`, Warn→`WARN`, Error→`ERROR`, Fatal→`CRITICAL`, default→`INFO`. SDL3's own per-category priority threshold (default Info for the application category) is opened to `TRACE` in the `Logger` constructor, so engine-level Trace/Debug that pass `should_log` reach stdout.
 
 #### Threading and lifetime contracts
 
-- All `Logger` state transitions are mutex-guarded; `docs/architecture.md` states "Logger sinks are thread-safe" (meaning the logger machinery — concurrent logging from 8 threads is tested in `logger.test.cpp` `ThreadSafeConcurrentLogging`).
+- Sink-list transitions (`add_sink`/`remove_sink`/`clear_sinks`/`dispatch`'s snapshot) are mutex-guarded; the level knob is atomic and lock-free. `docs/architecture.md` states "Logger sinks are thread-safe" (meaning the logger machinery — concurrent logging from 8 threads is tested in `logger.test.cpp` `ThreadSafeConcurrentLogging`). `should_log`/`set_min_level`/`min_level` are `noexcept` and now genuinely cannot throw: they no longer take a lock inside a `noexcept` function.
 - Because sink writes happen outside the lock, a sink's `write()` may run concurrently on multiple threads; sink implementations must be internally synchronized (the test `CapturingSink` carries its own mutex).
 - `remove_sink`/`clear_sinks` do not synchronize with in-flight dispatches: a concurrently running `dispatch` holds `shared_ptr` snapshots, so a removed sink can receive at most the in-flight batch after removal returns, and is destroyed only when the last snapshot drops.
 - Singleton lifetime: function-local static, constructed on first use, destroyed at static destruction — logging from other static destructors after that point is undefined.
 
 #### Performance characteristics
 
-Every non-filtered log takes: one mutex lock for `should_log`, one `std::format` heap allocation, one mutex lock + snapshot vector allocation in `dispatch`, then per-sink virtual calls. Filtered logs cost one mutex lock. There is no async/buffered path and no category-based filtering (level only, global).
+Every non-filtered log takes: one relaxed atomic load for `should_log`, one `std::format` heap allocation, one mutex lock + snapshot vector allocation in `dispatch`, then per-sink virtual calls. Filtered logs cost one relaxed atomic load and nothing else. There is no async/buffered path and no category-based filtering (level only, global).
 
 #### Known limitations
 
 - No timestamp, thread-id, or source-location decoration is added by the core logger (SDL may add its own prefix on the default sink).
 - No file sink is provided in-tree; `StdoutSink` is the only concrete sink.
 - Level is global — per-category verbosity is not supported.
+
+#### Discipline: one log channel
+
+`Logger` is the engine's **only** log channel. Engine sources under `src/bracken/` may not call `SDL_Log`, `std::cerr` or `std::cout`; the sole exemptions are `core/logger.cpp` (the bridge itself, via `SDL_LogMessage`) and `core/assert.hpp` (the abort path, which must print when the logger may itself be the failure). `src/bracken/core/logger_discipline.test.cpp` scans the tree and fails on any reintroduction; `tools/logdiff.sh [<rev>]` diffs the normalized set of message bodies against a git revision, which is what makes a log-severity/tag change reviewable without hiding an accidentally dropped message.
+
+Each engine `.cpp` names its category once as a file-local `constexpr const char* LOG_TAG` in an anonymous namespace (pattern: `render/water_renderer.cpp`), so a subsystem's messages are filterable as a group by a host sink.
 
 ### Assertions and main-thread checks (`src/bracken/core/assert.hpp`, `assert.cpp`)
 

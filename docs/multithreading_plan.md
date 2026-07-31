@@ -479,10 +479,14 @@ Concretely, per component:
   packet is in flight — the pipeline's natural quiescent state gives us
   epoch-based reclamation for free, which is why no hazard pointers, RCU
   library, or reader locks are needed anywhere.
-- **Logger** keeps its mutex for now (cold-ish path, correct, snapshot-then-
-  write-unlocked); if Tracy ever shows contention from chatty workers it
-  upgrades to an MPSC ring drained on the main thread — decided by
-  measurement, not preemptively.
+- **Logger** keeps its mutex for the **sink list** (cold path, correct,
+  snapshot-then-write-unlocked). The level check no longer takes it:
+  `should_log` is on every worker's fast path and is `noexcept`, so a
+  `lock_guard` there was both a global serialization point and a latent
+  `std::terminate`; `min_level_` is now a relaxed `std::atomic<LogLevel>`
+  with its protocol at the declaration. If Tracy ever shows contention from
+  chatty workers the *dispatch* side upgrades to an MPSC ring drained on the
+  main thread — decided by measurement, not preemptively.
 
 **Memory-model discipline**, because clever atomics without rigor are worse
 than mutexes:

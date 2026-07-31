@@ -885,7 +885,13 @@ that never brought up a renderer).
   provide their own fence).
 - **`EffectDefinition`s** referenced by `spawn_effect` are long-lived asset
   data and must outlive their spawned instances.
-- **`Logger`** sinks are thread-safe.
+- **`Logger`** sinks are thread-safe. It is also the engine's *only* log
+  channel — no engine source calls `SDL_Log`/`std::cerr`/`std::cout`
+  (enforced by `core/logger_discipline.test.cpp`; the exemptions are
+  `core/logger.cpp`, which is the SDL bridge, and `core/assert.hpp`, which
+  must still print on the abort path). Each `.cpp` carries a file-local
+  `LOG_TAG` category. The mutex guards the sink list; `should_log` is a
+  lock-free relaxed load of an atomic level.
 - GPU resource owners (`PipelineRegistry`, buffers, textures) are
   non-copyable/non-movable and must be destroyed before the `GPUDevice`.
 

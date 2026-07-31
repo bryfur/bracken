@@ -209,6 +209,9 @@ if(BRACKEN_BUILD_TESTS)
         bracken_target_warnings(bracken_tests)
         target_link_libraries(bracken_tests PRIVATE bracken GTest::gtest_main)
         target_include_directories(bracken_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+        # Source-scanning tests (logger_discipline) need the tree they are
+        # policing. Absent (e.g. a relocated test binary) they GTEST_SKIP.
+        target_compile_definitions(bracken_tests PRIVATE BRACKEN_REPO_ROOT="${PROJECT_SOURCE_DIR}")
 
         include(GoogleTest)
         gtest_discover_tests(bracken_tests)

@@ -45,8 +45,12 @@ Gameplay concepts were deliberately hoisted out of the engine:
 - `InputHandler` is raw input only (mouse, keyboard, gamepad axes, key edges).
   Game-specific actions belong in the host.
 - `CameraController` exposes only generic shake/focus/fov-bias primitives.
-- Core utilities live in `core/`: `logger` (over `SDL_Log`, thread-safe sinks,
-  `std::format`), `assert`, `result`, `handle`, `hash` (`StringId`, fnv1a).
+- Core utilities live in `core/`: `logger` (default sink writes through SDL's
+  logging, thread-safe sinks, `std::format`), `assert`, `result`, `handle`,
+  `hash` (`StringId`, fnv1a). The logger is the engine's *single* log channel:
+  engine code never calls `SDL_Log`/`std::cerr` directly, because anything
+  that does is invisible to a host `LogSink` — which is how the entire GPU and
+  renderer boot-failure stream used to escape hosts unnoticed.
 
 Keep it this way. No combat/inventory/skill/ECS types in engine headers.
 (Physics is no longer on that list — it became engine infrastructure by the

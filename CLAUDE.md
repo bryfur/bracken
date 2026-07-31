@@ -92,7 +92,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 
 | Module | Namespace | What's there |
 |---|---|---|
-| `core/` | `bracken::core` | logger, asserts, `Result`, `Handle`, `hash`/`StringId`, Tracy profiler hooks |
+| `core/` | `bracken::core` | logger (**the engine's only log channel**), asserts, `Result`, `Handle`, `hash`/`StringId`, Tracy profiler hooks |
 | `core/jobs/` | `core::jobs` | `JobSystem` (**always-on** lock-free work-stealing pool — Chase–Lev deques, `atomic::wait` parking), `TaskGroup`, `parallel_for`, task handles. Worker count via `BRACKEN_WORKERS` (=1 is single-worker debug mode, same code path) |
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload; opt-in via `BRACKEN_HOT_RELOAD=1`) + `AssetRegistry` (host-facing utility — engine systems register on the watcher directly) |
 | `memory/` | `bracken::memory` | arena allocator, frame allocator |
@@ -212,6 +212,17 @@ draws it.
   `init()` chains where failure is fatal and the log is the diagnostic.
   Existing `bool`+log APIs stay as they are until touched — do not
   mass-convert.
+- **Logging**: `BRACKEN_LOG_{TRACE,DEBUG,INFO,WARN,ERROR,FATAL}(LOG_TAG, ...)`
+  only. `SDL_Log`, `std::cerr` and `std::cout` are **banned** in engine
+  sources — they bypass `core::Logger` and are therefore invisible to a host's
+  `LogSink` and to `set_min_level`. `core/logger_discipline.test.cpp` fails the
+  suite on any reintroduction (exemptions: `core/logger.cpp`, the SDL bridge;
+  `core/assert.hpp`, the abort path). Each `.cpp` declares its category once as
+  a file-local `constexpr const char* LOG_TAG` in an anonymous namespace.
+  Pick the severity honestly: a failed resource creation is `ERROR`, a
+  fallback/degradation is `WARN`, per-item boot chatter is `DEBUG`. When
+  editing log calls in bulk, `tools/logdiff.sh [<rev>]` proves no message body
+  was lost.
 - Shaders are `{name}.vert.hlsl` / `{name}.frag.hlsl` / `{name}.comp.hlsl`
   (entry points `VSMain` / `PSMain` / `CSMain`), `.hlsli` for shared
   includes. See [src/bracken/shaders/README.md](src/bracken/shaders/README.md).

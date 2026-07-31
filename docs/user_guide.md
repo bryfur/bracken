@@ -733,7 +733,7 @@ These utilities are header-mostly and have no GPU or SDL-window dependencies (th
 
 ### Logging
 
-The engine logs through a process-wide singleton `bracken::core::Logger` (`src/bracken/core/logger.hpp`). You almost never talk to it directly — use the macros:
+The engine logs through a process-wide singleton `bracken::core::Logger` (`src/bracken/core/logger.hpp`). **This is the engine's only log channel** — every diagnostic the engine emits, including GPU/pipeline/shader/renderer boot failures, goes through it, so a sink you install sees all of them and `set_min_level` genuinely silences all of them. (Engine sources may not call `SDL_Log`, `std::cerr` or `std::cout`; `src/bracken/core/logger_discipline.test.cpp` enforces that.) You almost never talk to the logger directly — use the macros:
 
 ```cpp
 #include "bracken/core/logger.hpp"
@@ -743,7 +743,7 @@ BRACKEN_LOG_WARN("render", "texture {} exceeds budget by {} bytes", name, overfl
 BRACKEN_LOG_ERROR("settings", "Failed to save settings to {}", path);
 ```
 
-There is one macro per severity: `BRACKEN_LOG_TRACE`, `BRACKEN_LOG_DEBUG`, `BRACKEN_LOG_INFO`, `BRACKEN_LOG_WARN`, `BRACKEN_LOG_ERROR`, `BRACKEN_LOG_FATAL`. The first argument is a free-form **category** string (`"app"`, `"render"`, `"assert"`, `"playground"`, ...); the rest is a `std::format` format string plus arguments — formatting errors are compile-time errors because the macros take `std::format_string`. Passing `nullptr` as the category is tolerated; sinks then receive `"general"`.
+There is one macro per severity: `BRACKEN_LOG_TRACE`, `BRACKEN_LOG_DEBUG`, `BRACKEN_LOG_INFO`, `BRACKEN_LOG_WARN`, `BRACKEN_LOG_ERROR`, `BRACKEN_LOG_FATAL`. The first argument is a free-form **category** string (engine subsystems use one short tag per file, held in a file-local `constexpr const char* LOG_TAG`: `"app"`, `"gpu"`, `"render"`, `"scene"`, `"terrain"`, `"shadows"`, `"grass"`, `"taa"`, `"gtao"`, `"bloom"`, `"post"`, `"fog"`, `"exposure"`, `"lights"`, `"water"`, `"ui"`, `"text"`, `"effect"`, `"model"`, `"jobs"`, `"hot_reload"`, `"assert"`, ...); the rest is a `std::format` format string plus arguments — formatting errors are compile-time errors because the macros take `std::format_string`. Passing `nullptr` as the category is tolerated; sinks then receive `"general"`.
 
 `BRACKEN_LOG_FATAL` only logs — it does **not** abort. If you want "log and die", use `BRACKEN_VERIFY` (below).
 
@@ -801,6 +801,7 @@ Notes on sinks:
 - `add_sink` takes a `std::shared_ptr<LogSink>` and returns a `Logger::SinkHandle` (a `uint32_t`) for later `remove_sink`. `clear_sinks()` removes everything **including the default stdout sink** — re-add a `StdoutSink` if you still want console output (the test fixture in `src/bracken/core/logger.test.cpp` does this in `TearDown`).
 - `LogSink` is non-copyable and non-movable; always hold it by `shared_ptr`.
 - The logger is thread-safe, and it deliberately calls `write()` **outside** its internal lock (so a sink may itself log without deadlocking). Consequence: your `write()` can be called from multiple threads concurrently — make it internally thread-safe, like the mutex in `CapturingSink` above.
+- The internal mutex guards the **sink list only**. The level check (`should_log`) is a lock-free relaxed load of an atomic, so a filtered-out message on a worker thread costs one atomic load and never contends with the other workers.
 
 #### Gotchas
 

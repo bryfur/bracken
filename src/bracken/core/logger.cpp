@@ -73,18 +73,19 @@ Logger& Logger::instance() {
 }
 
 void Logger::set_min_level(LogLevel level) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    min_level_ = level;
+    min_level_.store(level, std::memory_order_relaxed);
 }
 
 LogLevel Logger::min_level() const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return min_level_;
+    return min_level_.load(std::memory_order_relaxed);
 }
 
 bool Logger::should_log(LogLevel level) const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return level >= min_level_ && min_level_ != LogLevel::Off;
+    // Lock-free by design — see the min_level_ declaration for the protocol.
+    // One load, so the two comparisons cannot disagree about which level they
+    // are testing.
+    const LogLevel min = min_level_.load(std::memory_order_relaxed);
+    return level >= min && min != LogLevel::Off;
 }
 
 Logger::SinkHandle Logger::add_sink(std::shared_ptr<LogSink> sink) {
