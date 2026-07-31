@@ -6268,9 +6268,13 @@ Dev-overlay stats come from the packet, not the live system: `SceneRenderer::fra
 #### Public API
 
 ```cpp
-glm::mat4 build_particle_transform(const bracken::systems::Particle& particle, const glm::vec3& center_offset);
+// render/particle_transform.hpp — generic over anything with .position/.rotation/.scale
+template <typename ParticleT>
+glm::mat4 build_particle_transform_of(const ParticleT& particle, const glm::vec3& center_offset);
+
+// render/effect_renderer.hpp — the sealed-packet form, which is the render path
 glm::mat4 build_particle_transform(const bracken::scene::EffectParticleSnapshot& particle,
-                                   const glm::vec3& center_offset);   // sealed-packet form (the render path)
+                                   const glm::vec3& center_offset);
 
 class EffectRenderer {  // non-copyable, non-movable
 public:
@@ -6289,7 +6293,7 @@ Call ordering contract: `ensure_models_uploaded` outside any pass → `upload_pa
 
 #### `build_particle_transform`
 
-Composes `translate(position) * rotY * rotX * rotZ * scale(s) * translate(-center_offset)` directly: one sin/cos pair per axis, `R = Ry*Rx*Rz` written column-major, columns scaled by `s`, translation `position - R * (center_offset * s)`. `effect_renderer.test.cpp` pins bit-near equivalence (1e-3) against the naive chained `glm::translate/rotate/scale` reference across a position/rotation/scale/center sweep, plus the invariant that the model-space center maps exactly onto `particle.position`.
+Composes `translate(position) * rotY * rotX * rotZ * scale(s) * translate(-center_offset)` directly: one sin/cos pair per axis, `R = Ry*Rx*Rz` written column-major, columns scaled by `s`, translation `position - R * (center_offset * s)`. `effect_renderer.test.cpp` pins bit-near equivalence (1e-3) against the naive chained `glm::translate/rotate/scale` reference across a position/rotation/scale/center sweep, plus the invariant that the model-space center maps exactly onto `particle.position`, plus exact agreement between the shipping `EffectParticleSnapshot` overload and the template. There is no longer a `systems::Particle` overload: the render path never sees a live particle, so the header does not depend on `systems/` — the sweep instantiates `build_particle_transform_of` against `systems::Particle` directly.
 
 #### `init` / resources
 

@@ -1,10 +1,13 @@
 #include "bracken/render/effect_renderer.hpp"
+#include "bracken/render/particle_transform.hpp"
+#include "bracken/systems/effect_system.hpp"
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>
 #include <memory>
 
 using bracken::render::build_particle_transform;
+using bracken::render::build_particle_transform_of;
 using bracken::systems::Particle;
 
 namespace bracken::render {
@@ -51,13 +54,13 @@ void expect_mat4_near(const glm::mat4& actual, const glm::mat4& expected, float 
 
 TEST(BuildParticleTransform, DefaultParticleWithNoCenterIsIdentity) {
     Particle p;
-    expect_mat4_near(build_particle_transform(p, glm::vec3(0.0f)), glm::mat4(1.0f), 1e-6f);
+    expect_mat4_near(build_particle_transform_of(p, glm::vec3(0.0f)), glm::mat4(1.0f), 1e-6f);
 }
 
 TEST(BuildParticleTransform, TranslationOnly) {
     Particle p;
     p.position = {10.0f, -3.5f, 42.0f};
-    expect_mat4_near(build_particle_transform(p, glm::vec3(0.0f)),
+    expect_mat4_near(build_particle_transform_of(p, glm::vec3(0.0f)),
                      glm::translate(glm::mat4(1.0f), p.position), 1e-6f);
 }
 
@@ -80,9 +83,34 @@ TEST(BuildParticleTransform, MatchesNaiveGlmChain) {
                     p.position = pos;
                     p.rotation = rot;
                     p.scale = s;
-                    expect_mat4_near(build_particle_transform(p, c), reference_transform(p, c), 1e-3f);
+                    expect_mat4_near(build_particle_transform_of(p, c), reference_transform(p, c), 1e-3f);
                 }
             }
+        }
+    }
+}
+
+// The render path composes from the sealed packet's snapshot, never from a
+// live particle. Pin that the shipping overload is the same math as the
+// template the sweep above verifies against the naive glm chain — otherwise
+// the sweep proves something the renderer does not run.
+TEST(BuildParticleTransform, SnapshotOverloadMatchesTheTemplate) {
+    const glm::vec3 rotations[] = {{0, 0, 0}, {0.3f, 1.1f, -2.2f}, {6.5f, -4.25f, 2.75f}};
+    const glm::vec3 centers[] = {{0, 0, 0}, {1.5f, -0.75f, 2.25f}};
+
+    for (const auto& rot : rotations) {
+        for (const auto& c : centers) {
+            bracken::scene::EffectParticleSnapshot snap;
+            snap.position = {12.0f, 34.0f, -56.0f};
+            snap.rotation = rot;
+            snap.scale = 2.5f;
+            expect_mat4_near(build_particle_transform(snap, c), build_particle_transform_of(snap, c), 0.0f);
+
+            Particle live;
+            live.position = snap.position;
+            live.rotation = snap.rotation;
+            live.scale = snap.scale;
+            expect_mat4_near(build_particle_transform(snap, c), build_particle_transform_of(live, c), 0.0f);
         }
     }
 }
@@ -96,7 +124,7 @@ TEST(BuildParticleTransform, CenterOffsetMapsModelCenterToParticlePosition) {
     p.scale = 2.5f;
     const glm::vec3 center(3.0f, -1.0f, 0.5f);
 
-    const glm::vec4 mapped = build_particle_transform(p, center) * glm::vec4(center, 1.0f);
+    const glm::vec4 mapped = build_particle_transform_of(p, center) * glm::vec4(center, 1.0f);
     EXPECT_NEAR(mapped.x, p.position.x, 1e-3f);
     EXPECT_NEAR(mapped.y, p.position.y, 1e-3f);
     EXPECT_NEAR(mapped.z, p.position.z, 1e-3f);

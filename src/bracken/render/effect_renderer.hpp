@@ -6,8 +6,8 @@
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/model_loader.hpp"
+#include "bracken/render/particle_transform.hpp"
 #include "bracken/scene/frame_packet.hpp" // Effect{Emitter,Particle}Snapshot
-#include "bracken/systems/effect_system.hpp"
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <memory>
@@ -21,16 +21,12 @@ namespace bracken::render {
 
 namespace gpu = bracken::gpu;
 
-/// Compose a particle's world transform: translate(position) * rotY * rotX *
-/// rotZ * scale * translate(-center_offset). The rotation is built directly
-/// from the Euler angles (one sin/cos pair per axis) instead of chained
-/// glm::rotate 4x4 multiplies; exposed as a free function so tests can pin
-/// equivalence with the naive glm chain.
-glm::mat4 build_particle_transform(const bracken::systems::Particle& particle, const glm::vec3& center_offset);
-
-/// Sealed-packet form: identical math over a frame's EffectParticleSnapshot
-/// (the render path — particles reach the renderer only through the packet's
-/// effect-instance snapshot).
+/// The render path's particle transform: identical math over a frame's
+/// EffectParticleSnapshot (particles reach the renderer only through the
+/// sealed packet's effect-instance snapshot). Out-of-line so the hot inner
+/// loop below is not the only thing pinning the composition; the generic form
+/// is `build_particle_transform_of` in particle_transform.hpp, which is what
+/// the test instantiates against a live systems::Particle.
 glm::mat4 build_particle_transform(const bracken::scene::EffectParticleSnapshot& particle,
                                    const glm::vec3& center_offset);
 

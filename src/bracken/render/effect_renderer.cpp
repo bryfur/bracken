@@ -4,6 +4,7 @@
 #include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
+#include "bracken/effect_definition.hpp" // EmitterDefinition, read when resolving models
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/model_loader.hpp"
@@ -32,48 +33,9 @@ constexpr float PARTICLE_EMISSIVE_BOOST = 2.0f;
 
 } // anonymous namespace
 
-namespace {
-
-// Shared core of both build_particle_transform overloads: any particle type
-// exposing .position / .rotation (euler radians) / .scale.
-template<typename ParticleT>
-glm::mat4 build_particle_transform_impl(const ParticleT& particle, const glm::vec3& center_offset) {
-    // Equivalent to translate(position) * rotate(Y) * rotate(X) * rotate(Z) *
-    // scale(s) * translate(-center_offset), composed directly: one sin/cos
-    // pair per axis instead of three chained 4x4 rotate multiplies
-    // (effect_renderer.test.cpp pins equivalence with the glm chain).
-    const float sx = std::sin(particle.rotation.x), cx = std::cos(particle.rotation.x);
-    const float sy = std::sin(particle.rotation.y), cy = std::cos(particle.rotation.y);
-    const float sz = std::sin(particle.rotation.z), cz = std::cos(particle.rotation.z);
-
-    // R = Ry * Rx * Rz, column-major (glm), column vectors.
-    const glm::mat3 rotation(
-        // column 0
-        cy * cz + sy * sx * sz, cx * sz, -sy * cz + cy * sx * sz,
-        // column 1
-        -cy * sz + sy * sx * cz, cx * cz, sy * sz + cy * sx * cz,
-        // column 2
-        sy * cx, -sx, cy * cx);
-
-    const float s = particle.scale;
-    glm::mat4 model_mat(1.0f);
-    model_mat[0] = glm::vec4(rotation[0] * s, 0.0f);
-    model_mat[1] = glm::vec4(rotation[1] * s, 0.0f);
-    model_mat[2] = glm::vec4(rotation[2] * s, 0.0f);
-    // T * R * S * T(-center): translation = position - R * (center * s).
-    model_mat[3] = glm::vec4(particle.position - rotation * (center_offset * s), 1.0f);
-    return model_mat;
-}
-
-} // anonymous namespace
-
-glm::mat4 build_particle_transform(const bracken::systems::Particle& particle, const glm::vec3& center_offset) {
-    return build_particle_transform_impl(particle, center_offset);
-}
-
 glm::mat4 build_particle_transform(const bracken::scene::EffectParticleSnapshot& particle,
                                    const glm::vec3& center_offset) {
-    return build_particle_transform_impl(particle, center_offset);
+    return build_particle_transform_of(particle, center_offset);
 }
 
 EffectRenderer::EffectRenderer() = default;
