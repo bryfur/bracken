@@ -5,6 +5,8 @@
 #include "bracken/gpu/gpu_texture.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/graphics_settings.hpp"
+// Needed in full: the inline instance-batch walk dereferences ModelManager/Model.
+#include "bracken/model_loader.hpp"
 #include "bracken/render/environment.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
 #include "bracken/render/lighting/local_shadows.hpp"

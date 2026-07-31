@@ -9,6 +9,12 @@
 #include <unordered_map>
 #include <vector>
 
+// The model identity contract: ModelHandle / INVALID_MODEL_HANDLE. Kept in the
+// leaf `contracts/` layer so the frame packet can name a model without pulling
+// the GPU resource headers below in behind it; re-exported here so every
+// existing `#include "bracken/model_loader.hpp"` still sees both names.
+#include "bracken/contracts/model_handle.hpp"
+
 // Include GPU abstraction headers for proper type definitions
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
@@ -27,9 +33,7 @@ class FileWatcher;
 
 namespace bracken {
 
-// Integer handle for O(1) model lookup (replaces string-based lookups in hot paths)
-using ModelHandle = uint32_t;
-static constexpr ModelHandle INVALID_MODEL_HANDLE = 0;
+// ModelHandle / INVALID_MODEL_HANDLE: contracts/model_handle.hpp.
 
 // Use canonical vertex types from gpu module
 using gpu::SkinnedVertex;

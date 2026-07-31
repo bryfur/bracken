@@ -2,7 +2,7 @@
 
 #include "bracken/core/assert.hpp"
 #include "bracken/memory/arena.hpp"
-#include "bracken/model_loader.hpp" // ModelHandle
+#include "bracken/contracts/model_handle.hpp"
 #include "bracken/render/environment.hpp"
 #include "bracken/render/lighting/light.hpp"
 #include "bracken/scene/camera_state.hpp"
