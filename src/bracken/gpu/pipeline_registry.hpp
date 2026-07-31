@@ -29,6 +29,11 @@ class ShaderManager;
  * - Shader compilation and management
  * - Proper resource cleanup on shutdown
  *
+ * What each pipeline *is* lives in the catalogue (`gpu/pipeline_catalog.hpp`),
+ * one constexpr row per PipelineType; this class names no individual pipeline
+ * and holds no per-pipeline knowledge beyond the cache key. Adding a pipeline
+ * is adding a row.
+ *
  * Thread-safety tiers (see docs/multithreading_plan.md §6.1):
  * - **main-thread (asserted)**: init, shutdown, preload_all_pipelines,
  *   invalidate_all, set_swapchain_format, enable_hot_reload,
@@ -193,8 +198,10 @@ public:
      *
      * Main-thread (asserted). Ideally called before pipelines are created. If
      * called after, only the pipelines that actually target the swapchain
-     * format (UI, Text, Composite, Fxaa) are affected; scene/HDR/post
-     * pipelines render to fixed-format offscreen targets and stay cached.
+     * format are affected — which the catalogue answers
+     * (`pipeline_targets_swapchain`), today {UI, Text, Composite, Fxaa};
+     * scene/HDR/post pipelines render to fixed-format offscreen targets and
+     * stay cached.
      * When the registry is already preloaded the affected pipelines are
      * re-created eagerly here (not lazily on next access), so hot-path
      * lookups stay read-only.
@@ -251,72 +258,20 @@ private:
     GPUPipeline* create_and_cache_pipeline(PipelineType type);
     GPUComputePipeline* create_and_cache_compute_pipeline(ComputePipelineType type);
 
-    // Dispatch to the per-type creator (the static enumeration).
+    // Build one pipeline from its catalogue row (pipeline_catalog.hpp): resolve
+    // the row's shaders through the ShaderManager, then hand the built config
+    // to the GPU layer. The registry itself names no pipeline.
     std::unique_ptr<GPUPipeline> create_pipeline_uncached(PipelineType type);
     std::unique_ptr<GPUComputePipeline> create_compute_pipeline_uncached(ComputePipelineType type);
 
-    // TEMPORARY (refactor phase 6c commit 1): walk every creator with canonical
-    // formats and write the resulting GPU state to `out_path`, so the tabulated
-    // catalogue that replaces the creators can be diffed against it field by
-    // field. Driven by BRACKEN_DUMP_PIPELINE_GOLDEN; deleted in commit 3.
-    void dump_config_golden(const std::string& out_path);
-
-    // Pipeline creation methods. The model-family creators take the glTF
-    // material variant flags (alphaMode BLEND -> alpha_blend, doubleSided ->
-    // no back-face culling). depth_equal selects the post-prepass forward
-    // variant (depth test EQUAL, writes off); mutually exclusive with
-    // alpha_blend (BLEND draws are excluded from the prepass).
-    std::unique_ptr<GPUPipeline> create_model_pipeline(bool alpha_blend = false, bool double_sided = false,
-                                                       bool depth_equal = false);
-    std::unique_ptr<GPUPipeline> create_skinned_model_pipeline(bool alpha_blend = false, bool double_sided = false,
-                                                               bool depth_equal = false);
-    std::unique_ptr<GPUPipeline> create_terrain_pipeline(bool depth_equal = false);
-    std::unique_ptr<GPUPipeline> create_skybox_pipeline();
-    std::unique_ptr<GPUPipeline> create_grid_pipeline();
-    std::unique_ptr<GPUPipeline> create_ui_pipeline();
-    std::unique_ptr<GPUPipeline> create_text_pipeline();
-    std::unique_ptr<GPUPipeline> create_particle_pipeline();
-    std::unique_ptr<GPUPipeline> create_grass_pipeline(bool depth_equal = false);
-    std::unique_ptr<GPUPipeline> create_instanced_model_pipeline(bool double_sided = false, bool depth_equal = false);
-
-    // Depth-prepass creators (position-only VS + shared velocity fragment).
-    std::unique_ptr<GPUPipeline> create_prepass_model_pipeline(bool double_sided = false);
-    std::unique_ptr<GPUPipeline> create_prepass_skinned_model_pipeline(bool double_sided = false);
-    std::unique_ptr<GPUPipeline> create_prepass_instanced_model_pipeline(bool double_sided = false);
-    std::unique_ptr<GPUPipeline> create_prepass_terrain_pipeline();
-    // Alpha-MASK prepass variants: texcoord passthrough + alpha-tested
-    // fragment so foliage writes depth (GTAO + velocity coverage). Always
-    // no-cull — MASK foliage is double-sided in practice.
-    std::unique_ptr<GPUPipeline> create_prepass_model_masked_pipeline();
-    std::unique_ptr<GPUPipeline> create_prepass_instanced_model_masked_pipeline();
-    std::unique_ptr<GPUPipeline> create_prepass_grass_pipeline();
-    std::unique_ptr<GPUPipeline> create_instanced_shadow_model_pipeline();
-    std::unique_ptr<GPUPipeline> create_shadow_model_pipeline();
-    std::unique_ptr<GPUPipeline> create_shadow_skinned_model_pipeline();
-    std::unique_ptr<GPUPipeline> create_shadow_terrain_pipeline();
-    std::unique_ptr<GPUPipeline> create_local_shadow_clear_pipeline();
-    std::unique_ptr<GPUPipeline> create_gtao_pipeline();
-    std::unique_ptr<GPUPipeline> create_gtao_temporal_pipeline();
-    std::unique_ptr<GPUPipeline> create_gtao_upsample_pipeline();
-    std::unique_ptr<GPUPipeline> create_blur_ao_pipeline();
-    std::unique_ptr<GPUPipeline> create_composite_pipeline();
-    std::unique_ptr<GPUPipeline> create_bloom_downsample_pipeline();
-    std::unique_ptr<GPUPipeline> create_bloom_upsample_pipeline();
-    std::unique_ptr<GPUPipeline> create_volumetric_fog_pipeline();
-    std::unique_ptr<GPUPipeline> create_fxaa_pipeline();
-    std::unique_ptr<GPUPipeline> create_taa_resolve_pipeline();
-    std::unique_ptr<GPUPipeline> create_taa_sharpen_pipeline();
-    std::unique_ptr<GPUPipeline> create_sky_capture_pipeline();
-    std::unique_ptr<GPUPipeline> create_ibl_specular_prefilter_pipeline();
-    std::unique_ptr<GPUPipeline> create_ibl_irradiance_pipeline();
-    std::unique_ptr<GPUPipeline> create_ibl_brdf_lut_pipeline();
-    std::unique_ptr<GPUPipeline> create_water_pipeline();
-
-    // Compute pipeline creators (declared ComputeResources are validated
-    // against SPIR-V reflection at creation — see gpu_compute.hpp).
-    std::unique_ptr<GPUComputePipeline> create_exposure_histogram_pipeline();
-    std::unique_ptr<GPUComputePipeline> create_exposure_adapt_pipeline();
-    std::unique_ptr<GPUComputePipeline> create_water_sim_pipeline();
+    // The formats catalogue rows are resolved against. Only the swapchain
+    // entry can change while the app is running (set_swapchain_format).
+    PipelineFormats formats() const {
+        return {.swapchain = swapchain_format_,
+                .scene_color = scene_color_format_,
+                .velocity = velocity_format_,
+                .depth = depth_format_};
+    }
 
     GPUDevice* device_ = nullptr;
     SDL_GPUTextureFormat swapchain_format_ = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;

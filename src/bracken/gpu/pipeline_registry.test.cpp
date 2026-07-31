@@ -21,9 +21,9 @@ namespace bracken::gpu {
 namespace {
 
 TEST(PipelineEnumeration, EveryGraphicsTypeHasAName) {
-    // pipeline_type_to_string is maintained alongside the creation switch in
-    // create_pipeline_uncached — a new PipelineType that returns "Unknown"
-    // here is a type the enumeration (and therefore preload) forgot.
+    // The name comes from the type's catalogue row (gpu/pipeline_catalog.hpp),
+    // so "Unknown" here means the row is missing and preload would fail on it.
+    // The row's *contents* are checked in gpu/pipeline_catalog.test.cpp.
     std::set<std::string> names;
     for (int i = 0; i < static_cast<int>(PipelineType::Count); ++i) {
         auto type = static_cast<PipelineType>(i);
