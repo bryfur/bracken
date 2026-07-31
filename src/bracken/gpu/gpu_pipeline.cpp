@@ -1,14 +1,18 @@
 #include "gpu_pipeline.hpp"
 #include "bracken/core/assert.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_types.hpp"
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_gpu.h"
 #include "SDL3/SDL_stdinc.h"
 #include <memory>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::gpu {
+
+namespace {
+constexpr const char* LOG_TAG = "gpu";
+} // namespace
 
 // =============================================================================
 // PipelineConfig Implementation
@@ -113,7 +117,7 @@ std::unique_ptr<GPUPipeline> GPUPipeline::create(GPUDevice& device, const Pipeli
     // GPUDevice::release_graphics_pipeline.
     BRACKEN_ASSERT_MAIN_THREAD();
     if (!config.vertex_shader || !config.fragment_shader) {
-        SDL_Log("GPUPipeline::create: Missing shaders");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUPipeline::create: Missing shaders");
         return nullptr;
     }
 
@@ -188,7 +192,7 @@ std::unique_ptr<GPUPipeline> GPUPipeline::create(GPUDevice& device, const Pipeli
     // Create the pipeline
     pipeline->pipeline_ = device.create_graphics_pipeline(pipeline_info);
     if (!pipeline->pipeline_) {
-        SDL_Log("GPUPipeline::create: Failed to create pipeline: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUPipeline::create: Failed to create pipeline: {}", SDL_GetError());
         return nullptr;
     }
 

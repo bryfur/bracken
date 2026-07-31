@@ -1,5 +1,6 @@
 #include "gpu_texture.hpp"
 #include "bracken/core/assert.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_types.hpp"
 #include "SDL3/SDL_error.h"
@@ -12,11 +13,14 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <SDL3/SDL_log.h>
 #include <SDL3_image/SDL_image.h>
 #include <string>
 
 namespace bracken::gpu {
+
+namespace {
+constexpr const char* LOG_TAG = "gpu";
+} // namespace
 
 // =============================================================================
 // GPUTexture Implementation
@@ -93,7 +97,8 @@ size_t GPUTexture::get_bytes_per_pixel(SDL_GPUTextureFormat format) {
         case SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT:
             return 8;
         default:
-            SDL_Log("GPUTexture::get_bytes_per_pixel: unsupported format %d", static_cast<int>(format));
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::get_bytes_per_pixel: unsupported format {}",
+                              static_cast<int>(format));
             return 0;
     }
 }
@@ -109,8 +114,9 @@ bool GPUTexture::reload_from_file(const std::string& path, bool generate_mipmaps
     // wash out color textures.
     TextureFormat creation_format = from_sdl_format(format_);
     if (to_sdl_format(creation_format) != format_) {
-        SDL_Log("GPUTexture::reload_from_file: cannot reload '%s': texture format %d has no TextureFormat mapping",
-                path.c_str(), static_cast<int>(format_));
+        BRACKEN_LOG_ERROR(
+            LOG_TAG, "GPUTexture::reload_from_file: cannot reload '{}': texture format {} has no TextureFormat mapping",
+            path.c_str(), static_cast<int>(format_));
         return false;
     }
     auto fresh = load_from_file(*device_, path, generate_mipmaps, creation_format);
@@ -138,7 +144,7 @@ std::unique_ptr<GPUTexture> GPUTexture::load_from_file(GPUDevice& device, const 
     // Load image via SDL_image
     SDL_Surface* surface = IMG_Load(path.c_str());
     if (!surface) {
-        SDL_Log("GPUTexture::load_from_file: Failed to load '%s': %s", path.c_str(), SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::load_from_file: Failed to load '{}': {}", path.c_str(), SDL_GetError());
         return nullptr;
     }
 
@@ -147,7 +153,7 @@ std::unique_ptr<GPUTexture> GPUTexture::load_from_file(GPUDevice& device, const 
     SDL_DestroySurface(surface);
 
     if (!converted) {
-        SDL_Log("GPUTexture::load_from_file: Failed to convert surface: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::load_from_file: Failed to convert surface: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -183,7 +189,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
 
     texture->texture_ = device.create_texture(tex_info);
     if (!texture->texture_) {
-        SDL_Log("GPUTexture::create_2d: Failed to create texture: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d: Failed to create texture: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -192,7 +198,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
         // Create transfer buffer
         size_t bytes_per_pixel = get_bytes_per_pixel(texture->format_);
         if (bytes_per_pixel == 0) {
-            SDL_Log("GPUTexture::create_2d: Cannot upload pixels for unsupported format");
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d: Cannot upload pixels for unsupported format");
             return nullptr;
         }
         size_t data_size = static_cast<size_t>(width) * static_cast<size_t>(height) * bytes_per_pixel;
@@ -202,14 +208,14 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
 
         SDL_GPUTransferBuffer* transfer = device.create_transfer_buffer(transfer_info);
         if (!transfer) {
-            SDL_Log("GPUTexture::create_2d: Failed to create transfer buffer: %s", SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d: Failed to create transfer buffer: {}", SDL_GetError());
             return nullptr;
         }
 
         // Map and copy
         void* mapped = device.map_transfer_buffer(transfer, false);
         if (!mapped) {
-            SDL_Log("GPUTexture::create_2d: Failed to map transfer buffer: %s", SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d: Failed to map transfer buffer: {}", SDL_GetError());
             device.release_transfer_buffer(transfer);
             return nullptr;
         }
@@ -219,14 +225,14 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
         // Upload via copy pass
         SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device.handle());
         if (!cmd) {
-            SDL_Log("GPUTexture::create_2d: Failed to acquire command buffer: %s", SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d: Failed to acquire command buffer: {}", SDL_GetError());
             device.release_transfer_buffer(transfer);
             return nullptr;
         }
 
         SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(cmd);
         if (!copy_pass) {
-            SDL_Log("GPUTexture::create_2d: Failed to begin copy pass: %s", SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d: Failed to begin copy pass: {}", SDL_GetError());
             SDL_CancelGPUCommandBuffer(cmd);
             device.release_transfer_buffer(transfer);
             return nullptr;
@@ -287,7 +293,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
 
     texture->texture_ = device.create_texture(tex_info);
     if (!texture->texture_) {
-        SDL_Log("GPUTexture::create_2d: Failed to create texture: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d: Failed to create texture: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -315,7 +321,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_render_target(GPUDevice& device, 
 
     texture->texture_ = device.create_texture(tex_info);
     if (!texture->texture_) {
-        SDL_Log("GPUTexture::create_render_target: Failed to create texture: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_render_target: Failed to create texture: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -342,7 +348,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_depth(GPUDevice& device, int widt
 
     texture->texture_ = device.create_texture(tex_info);
     if (!texture->texture_) {
-        SDL_Log("GPUTexture::create_depth: Failed to create texture: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_depth: Failed to create texture: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -371,7 +377,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_depth_array(GPUDevice& device, in
 
     texture->texture_ = device.create_texture(tex_info);
     if (!texture->texture_) {
-        SDL_Log("GPUTexture::create_depth_array: Failed to create texture: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_depth_array: Failed to create texture: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -406,7 +412,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d_array(GPUDevice& device, int w
 
     texture->texture_ = device.create_texture(tex_info);
     if (!texture->texture_) {
-        SDL_Log("GPUTexture::create_2d_array: Failed to create texture: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d_array: Failed to create texture: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -418,7 +424,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d_array(GPUDevice& device, int w
     if (layer_data) {
         size_t bytes_per_pixel = get_bytes_per_pixel(texture->format_);
         if (bytes_per_pixel == 0) {
-            SDL_Log("GPUTexture::create_2d_array: Cannot upload layers for unsupported format");
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d_array: Cannot upload layers for unsupported format");
             return nullptr;
         }
         size_t layer_size = static_cast<size_t>(width) * height * bytes_per_pixel;
@@ -429,13 +435,15 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d_array(GPUDevice& device, int w
 
         SDL_GPUTransferBuffer* transfer = device.create_transfer_buffer(transfer_info);
         if (!transfer) {
-            SDL_Log("GPUTexture::create_2d_array: Failed to create transfer buffer: %s", SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d_array: Failed to create transfer buffer: {}",
+                              SDL_GetError());
             return nullptr;
         }
 
         void* mapped = device.map_transfer_buffer(transfer, false);
         if (!mapped) {
-            SDL_Log("GPUTexture::create_2d_array: Failed to map transfer buffer: %s", SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d_array: Failed to map transfer buffer: {}",
+                              SDL_GetError());
             device.release_transfer_buffer(transfer);
             return nullptr;
         }
@@ -449,14 +457,15 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d_array(GPUDevice& device, int w
 
         SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device.handle());
         if (!cmd) {
-            SDL_Log("GPUTexture::create_2d_array: Failed to acquire command buffer: %s", SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d_array: Failed to acquire command buffer: {}",
+                              SDL_GetError());
             device.release_transfer_buffer(transfer);
             return nullptr;
         }
 
         SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(cmd);
         if (!copy_pass) {
-            SDL_Log("GPUTexture::create_2d_array: Failed to begin copy pass: %s", SDL_GetError());
+            BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d_array: Failed to begin copy pass: {}", SDL_GetError());
             SDL_CancelGPUCommandBuffer(cmd);
             device.release_transfer_buffer(transfer);
             return nullptr;
@@ -516,7 +525,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_cube(GPUDevice& device, int size,
 
     texture->texture_ = device.create_texture(tex_info);
     if (!texture->texture_) {
-        SDL_Log("GPUTexture::create_cube: Failed to create texture: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_cube: Failed to create texture: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -543,7 +552,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_depth_stencil(GPUDevice& device, 
 
     texture->texture_ = device.create_texture(tex_info);
     if (!texture->texture_) {
-        SDL_Log("GPUTexture::create_depth_stencil: Failed to create texture: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_depth_stencil: Failed to create texture: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -552,18 +561,18 @@ std::unique_ptr<GPUTexture> GPUTexture::create_depth_stencil(GPUDevice& device, 
 
 void GPUTexture::upload(SDL_GPUCommandBuffer* cmd, const void* pixels, int width, int height) {
     if (!cmd || !pixels || !device_ || !texture_) {
-        SDL_Log("GPUTexture::upload: Invalid parameters");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::upload: Invalid parameters");
         return;
     }
 
     if (width != width_ || height != height_) {
-        SDL_Log("GPUTexture::upload: Dimension mismatch");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::upload: Dimension mismatch");
         return;
     }
 
     size_t bytes_per_pixel = get_bytes_per_pixel(format_);
     if (bytes_per_pixel == 0) {
-        SDL_Log("GPUTexture::upload: Unsupported texture format, upload rejected");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::upload: Unsupported texture format, upload rejected");
         return;
     }
     size_t data_size = static_cast<size_t>(width) * static_cast<size_t>(height) * bytes_per_pixel;
@@ -574,13 +583,13 @@ void GPUTexture::upload(SDL_GPUCommandBuffer* cmd, const void* pixels, int width
 
     SDL_GPUTransferBuffer* transfer = device_->create_transfer_buffer(transfer_info);
     if (!transfer) {
-        SDL_Log("GPUTexture::upload: Failed to create transfer buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::upload: Failed to create transfer buffer: {}", SDL_GetError());
         return;
     }
 
     void* mapped = device_->map_transfer_buffer(transfer, false);
     if (!mapped) {
-        SDL_Log("GPUTexture::upload: Failed to map transfer buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::upload: Failed to map transfer buffer: {}", SDL_GetError());
         device_->release_transfer_buffer(transfer);
         return;
     }
@@ -589,7 +598,7 @@ void GPUTexture::upload(SDL_GPUCommandBuffer* cmd, const void* pixels, int width
 
     SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(cmd);
     if (!copy_pass) {
-        SDL_Log("GPUTexture::upload: Failed to begin copy pass: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::upload: Failed to begin copy pass: {}", SDL_GetError());
         device_->release_transfer_buffer(transfer);
         return;
     }
@@ -729,7 +738,7 @@ std::unique_ptr<GPUSampler> GPUSampler::create(GPUDevice& device, const SamplerC
 
     sampler->sampler_ = device.create_sampler(sampler_info);
     if (!sampler->sampler_) {
-        SDL_Log("GPUSampler::create: Failed to create sampler: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUSampler::create: Failed to create sampler: {}", SDL_GetError());
         return nullptr;
     }
 

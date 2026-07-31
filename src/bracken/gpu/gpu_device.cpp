@@ -1,16 +1,20 @@
 #include "gpu_device.hpp"
 #include "bracken/core/assert.hpp"
+#include "bracken/core/logger.hpp"
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_gpu.h"
 #include "SDL3/SDL_stdinc.h"
 #include "SDL3/SDL_video.h"
 #include <cstdint>
 #include <cstdlib>
-#include <SDL3/SDL_log.h>
 #include <SDL3/SDL_properties.h>
 #include <string>
 
 namespace bracken::gpu {
+
+namespace {
+constexpr const char* LOG_TAG = "gpu";
+} // namespace
 
 GPUDevice::~GPUDevice() {
     shutdown();
@@ -21,7 +25,7 @@ bool GPUDevice::init(SDL_Window* window, bool prefer_low_power) {
     // test binaries bind "main" on first use — see core::bind_main_thread.
     BRACKEN_ASSERT_MAIN_THREAD();
     if (device_) {
-        SDL_Log("GPUDevice::init: Already initialized");
+        BRACKEN_LOG_WARN(LOG_TAG, "GPUDevice::init: Already initialized");
         return false;
     }
 
@@ -41,8 +45,8 @@ bool GPUDevice::init(SDL_Window* window, bool prefer_low_power) {
         debug_mode = debug_env[0] != '\0' && SDL_strcmp(debug_env, "0") != 0 &&
                      SDL_strcasecmp(debug_env, "false") != 0 && SDL_strcasecmp(debug_env, "off") != 0;
     }
-    SDL_Log("GPUDevice::init: GPU validation %s (%s)", debug_mode ? "enabled" : "disabled",
-            debug_env ? "from BRACKEN_GPU_DEBUG" : "build default");
+    BRACKEN_LOG_INFO(LOG_TAG, "GPUDevice::init: GPU validation {} ({})", debug_mode ? "enabled" : "disabled",
+                     debug_env ? "from BRACKEN_GPU_DEBUG" : "build default");
 
     // Create the GPU device with automatic backend selection
     // SDL3 will choose the best available backend (Metal on macOS, Vulkan/D3D12 on others).
@@ -58,23 +62,23 @@ bool GPUDevice::init(SDL_Window* window, bool prefer_low_power) {
     SDL_DestroyProperties(props);
 
     if (prefer_low_power) {
-        SDL_Log("GPUDevice::init: prefer_low_power requested (energy-efficient adapter preferred)");
+        BRACKEN_LOG_INFO(LOG_TAG, "GPUDevice::init: prefer_low_power requested (energy-efficient adapter preferred)");
     }
 
     if (!device_) {
-        SDL_Log("GPUDevice::init: Failed to create GPU device: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUDevice::init: Failed to create GPU device: {}", SDL_GetError());
         return false;
     }
 
     // Claim the window for the GPU device
     if (!SDL_ClaimWindowForGPUDevice(device_, window_)) {
-        SDL_Log("GPUDevice::init: Failed to claim window: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUDevice::init: Failed to claim window: {}", SDL_GetError());
         SDL_DestroyGPUDevice(device_);
         device_ = nullptr;
         return false;
     }
 
-    SDL_Log("GPUDevice::init: Initialized with driver '%s'", driver_name().c_str());
+    BRACKEN_LOG_INFO(LOG_TAG, "GPUDevice::init: Initialized with driver '{}'", driver_name().c_str());
     return true;
 }
 
@@ -93,7 +97,7 @@ void GPUDevice::shutdown() {
         device_ = nullptr;
         window_ = nullptr;
 
-        SDL_Log("GPUDevice::shutdown: Device destroyed");
+        BRACKEN_LOG_INFO(LOG_TAG, "GPUDevice::shutdown: Device destroyed");
     }
 }
 
@@ -104,7 +108,7 @@ SDL_GPUCommandBuffer* GPUDevice::begin_frame() {
 
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device_);
     if (!cmd) {
-        SDL_Log("GPUDevice::begin_frame: Failed to acquire command buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUDevice::begin_frame: Failed to acquire command buffer: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -126,7 +130,7 @@ bool GPUDevice::end_frame_and_wait(SDL_GPUCommandBuffer* cmd) {
 
     SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!fence) {
-        SDL_Log("GPUDevice::end_frame_and_wait: submit failed: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUDevice::end_frame_and_wait: submit failed: {}", SDL_GetError());
         return false;
     }
     SDL_WaitForGPUFences(device_, true, &fence, 1);
@@ -139,8 +143,8 @@ SDL_GPUTexture* GPUDevice::acquire_swapchain_texture(SDL_GPUCommandBuffer* cmd, 
     // SDL contract: must run on the thread that created the window.
     BRACKEN_ASSERT_MAIN_THREAD();
     if (!cmd || !window_) {
-        SDL_Log("GPUDevice::acquire_swapchain_texture: cmd=%p window=%p", reinterpret_cast<void*>(cmd),
-                reinterpret_cast<void*>(window_));
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUDevice::acquire_swapchain_texture: cmd={} window={}",
+                          reinterpret_cast<void*>(cmd), reinterpret_cast<void*>(window_));
         return nullptr;
     }
 
@@ -151,7 +155,7 @@ SDL_GPUTexture* GPUDevice::acquire_swapchain_texture(SDL_GPUCommandBuffer* cmd, 
     // Use waiting version to avoid memory bloat from accumulated command buffers
     // See: https://wiki.libsdl.org/SDL3/SDL_WaitAndAcquireGPUSwapchainTexture
     if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, window_, &swapchain_texture, &w, &h)) {
-        SDL_Log("GPUDevice::acquire_swapchain_texture: SDL call failed: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUDevice::acquire_swapchain_texture: SDL call failed: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -357,11 +361,11 @@ bool GPUDevice::set_swapchain_parameters(SDL_GPUPresentMode present_mode) {
     }
 
     if (!SDL_SetGPUSwapchainParameters(device_, window_, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, present_mode)) {
-        SDL_Log("GPUDevice::set_swapchain_parameters: present_mode=%d not supported: %s",
-                static_cast<int>(present_mode), SDL_GetError());
+        BRACKEN_LOG_WARN(LOG_TAG, "GPUDevice::set_swapchain_parameters: present_mode={} not supported: {}",
+                         static_cast<int>(present_mode), SDL_GetError());
         return false;
     }
-    SDL_Log("GPUDevice::set_swapchain_parameters: present_mode=%d", static_cast<int>(present_mode));
+    BRACKEN_LOG_INFO(LOG_TAG, "GPUDevice::set_swapchain_parameters: present_mode={}", static_cast<int>(present_mode));
     return true;
 }
 

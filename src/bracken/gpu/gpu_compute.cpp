@@ -1,12 +1,12 @@
 #include "gpu_compute.hpp"
 #include "bracken/core/assert.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_shader.hpp"
 #include "SDL3/SDL_error.h"
 #include <cstdint>
 #include <fstream>
 #include <ios>
 #include <memory>
-#include <SDL3/SDL_log.h>
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3_shadercross/SDL_shadercross.h>
 #include <string>
@@ -14,6 +14,10 @@
 #include <vector>
 
 namespace bracken::gpu {
+
+namespace {
+constexpr const char* LOG_TAG = "gpu";
+} // namespace
 
 // =============================================================================
 // GPUComputePipeline
@@ -88,24 +92,24 @@ std::unique_ptr<GPUComputePipeline> GPUComputePipeline::load_spirv(GPUDevice& de
                                                                    const ComputeResources& resources) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
-        SDL_Log("GPUComputePipeline::load_spirv: Failed to open '%s'", path.c_str());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::load_spirv: Failed to open '{}'", path.c_str());
         return nullptr;
     }
     const std::streamsize size = file.tellg();
     if (size <= 0) {
-        SDL_Log("GPUComputePipeline::load_spirv: Empty file '%s'", path.c_str());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::load_spirv: Empty file '{}'", path.c_str());
         return nullptr;
     }
     file.seekg(0, std::ios::beg);
     std::vector<uint8_t> bytecode(static_cast<size_t>(size));
     if (!file.read(reinterpret_cast<char*>(bytecode.data()), size)) {
-        SDL_Log("GPUComputePipeline::load_spirv: Failed to read '%s'", path.c_str());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::load_spirv: Failed to read '{}'", path.c_str());
         return nullptr;
     }
 
     auto pipeline = create_from_spirv(device, bytecode, entry_point, resources);
     if (pipeline) {
-        SDL_Log("GPUComputePipeline::load_spirv: Loaded '%s' successfully", path.c_str());
+        BRACKEN_LOG_DEBUG(LOG_TAG, "GPUComputePipeline::load_spirv: Loaded '{}' successfully", path.c_str());
     }
     return pipeline;
 }
@@ -122,7 +126,7 @@ std::unique_ptr<GPUComputePipeline> GPUComputePipeline::create_from_spirv(GPUDev
         return nullptr;
     }
     if (spirv_bytecode.empty()) {
-        SDL_Log("GPUComputePipeline::create_from_spirv: Empty bytecode");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::create_from_spirv: Empty bytecode");
         return nullptr;
     }
 
@@ -137,22 +141,24 @@ std::unique_ptr<GPUComputePipeline> GPUComputePipeline::create_from_spirv(GPUDev
     ComputeResources reflected;
     uint32_t threadcount[3] = {1, 1, 1};
     if (!reflect_spirv_resources(spirv_bytecode, reflected, threadcount)) {
-        SDL_Log("GPUComputePipeline::create_from_spirv: SPIR-V reflection failed (%s); compute pipelines "
-                "cannot be created without reflection (threadgroup size is only known to the module)",
-                SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG,
+                          "GPUComputePipeline::create_from_spirv: SPIR-V reflection failed ({}); compute pipelines "
+                          "cannot be created without reflection (threadgroup size is only known to the module)",
+                          SDL_GetError());
         return nullptr;
     }
     if (reflected != resources) {
-        SDL_Log("GPUComputePipeline::create_from_spirv: ERROR: declared resource counts do not match SPIR-V "
-                "(entry '%s'): samplers %u/%u, ro_storage_textures %u/%u, ro_storage_buffers %u/%u, "
-                "rw_storage_textures %u/%u, rw_storage_buffers %u/%u, uniform_buffers %u/%u "
-                "(declared/reflected). Using reflected counts; fix the caller.",
-                entry_point.c_str(), resources.num_samplers, reflected.num_samplers,
-                resources.num_readonly_storage_textures, reflected.num_readonly_storage_textures,
-                resources.num_readonly_storage_buffers, reflected.num_readonly_storage_buffers,
-                resources.num_readwrite_storage_textures, reflected.num_readwrite_storage_textures,
-                resources.num_readwrite_storage_buffers, reflected.num_readwrite_storage_buffers,
-                resources.num_uniform_buffers, reflected.num_uniform_buffers);
+        BRACKEN_LOG_ERROR(LOG_TAG,
+                          "GPUComputePipeline::create_from_spirv: declared resource counts do not match SPIR-V "
+                          "(entry '{}'): samplers {}/{}, ro_storage_textures {}/{}, ro_storage_buffers {}/{}, "
+                          "rw_storage_textures {}/{}, rw_storage_buffers {}/{}, uniform_buffers {}/{} "
+                          "(declared/reflected). Using reflected counts; fix the caller.",
+                          entry_point.c_str(), resources.num_samplers, reflected.num_samplers,
+                          resources.num_readonly_storage_textures, reflected.num_readonly_storage_textures,
+                          resources.num_readonly_storage_buffers, reflected.num_readonly_storage_buffers,
+                          resources.num_readwrite_storage_textures, reflected.num_readwrite_storage_textures,
+                          resources.num_readwrite_storage_buffers, reflected.num_readwrite_storage_buffers,
+                          resources.num_uniform_buffers, reflected.num_uniform_buffers);
     }
     pipeline->resources_ = reflected;
     pipeline->threadcount_[0] = threadcount[0];
@@ -185,7 +191,7 @@ std::unique_ptr<GPUComputePipeline> GPUComputePipeline::create_from_spirv(GPUDev
         SDL_ShaderCross_CompileComputePipelineFromSPIRV(device.handle(), &spirv_info, &metadata, 0);
     SDL_DestroyProperties(props);
     if (!pipeline->pipeline_) {
-        SDL_Log("GPUComputePipeline::create_from_spirv: SPIRV->GPU failed: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::create_from_spirv: SPIRV->GPU failed: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -207,7 +213,7 @@ ComputePass ComputePass::begin(SDL_GPUCommandBuffer* cmd,
     pass.pass_ = SDL_BeginGPUComputePass(cmd, rw_textures.data(), static_cast<Uint32>(rw_textures.size()),
                                          rw_buffers.data(), static_cast<Uint32>(rw_buffers.size()));
     if (!pass.pass_) {
-        SDL_Log("ComputePass::begin: SDL_BeginGPUComputePass failed: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "ComputePass::begin: SDL_BeginGPUComputePass failed: {}", SDL_GetError());
     }
     return pass;
 }

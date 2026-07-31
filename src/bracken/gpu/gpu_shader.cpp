@@ -1,5 +1,6 @@
 #include "gpu_shader.hpp"
 #include "bracken/core/assert.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "SDL3/SDL_error.h"
 #include <cstddef>
@@ -7,7 +8,6 @@
 #include <fstream>
 #include <ios>
 #include <memory>
-#include <SDL3/SDL_log.h>
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3_shadercross/SDL_shadercross.h>
 #include <sstream>
@@ -16,6 +16,10 @@
 #include <vector>
 
 namespace bracken::gpu {
+
+namespace {
+constexpr const char* LOG_TAG = "gpu";
+} // namespace
 
 // Static member initialization
 bool GPUShader::s_compiler_initialized = false;
@@ -62,12 +66,13 @@ bool GPUShader::init_compiler() {
     }
 
     if (!SDL_ShaderCross_Init()) {
-        SDL_Log("GPUShader::init_compiler: Failed to initialize SDL_shadercross: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUShader::init_compiler: Failed to initialize SDL_shadercross: {}",
+                          SDL_GetError());
         return false;
     }
 
     s_compiler_initialized = true;
-    SDL_Log("GPUShader::init_compiler: SDL_shadercross initialized");
+    BRACKEN_LOG_INFO(LOG_TAG, "GPUShader::init_compiler: SDL_shadercross initialized");
     return true;
 }
 
@@ -75,7 +80,7 @@ void GPUShader::shutdown_compiler() {
     if (s_compiler_initialized) {
         SDL_ShaderCross_Quit();
         s_compiler_initialized = false;
-        SDL_Log("GPUShader::shutdown_compiler: SDL_shadercross shutdown");
+        BRACKEN_LOG_INFO(LOG_TAG, "GPUShader::shutdown_compiler: SDL_shadercross shutdown");
     }
 }
 
@@ -86,13 +91,13 @@ bool GPUShader::is_compiler_available() {
 std::vector<uint8_t> GPUShader::read_file(const std::string& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
-        SDL_Log("GPUShader::read_file: Failed to open '%s'", path.c_str());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUShader::read_file: Failed to open '{}'", path.c_str());
         return {};
     }
 
     std::streamsize size = file.tellg();
     if (size <= 0) {
-        SDL_Log("GPUShader::read_file: Empty file '%s'", path.c_str());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUShader::read_file: Empty file '{}'", path.c_str());
         return {};
     }
 
@@ -100,7 +105,7 @@ std::vector<uint8_t> GPUShader::read_file(const std::string& path) {
     std::vector<uint8_t> buffer(static_cast<size_t>(size));
 
     if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
-        SDL_Log("GPUShader::read_file: Failed to read '%s'", path.c_str());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUShader::read_file: Failed to read '{}'", path.c_str());
         return {};
     }
 
@@ -117,7 +122,7 @@ std::unique_ptr<GPUShader> GPUShader::load_spirv(GPUDevice& device, const std::s
 
     auto shader = create_from_spirv(device, bytecode, stage, entry_point, resources);
     if (shader) {
-        SDL_Log("GPUShader::load_spirv: Loaded '%s' successfully", path.c_str());
+        BRACKEN_LOG_DEBUG(LOG_TAG, "GPUShader::load_spirv: Loaded '{}' successfully", path.c_str());
     }
     return shader;
 }
@@ -159,14 +164,14 @@ std::unique_ptr<GPUShader> GPUShader::create_from_spirv(GPUDevice& device, const
     BRACKEN_ASSERT_MAIN_THREAD();
 
     if (spirv_bytecode.empty()) {
-        SDL_Log("GPUShader::create_from_spirv: Empty bytecode");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUShader::create_from_spirv: Empty bytecode");
         return nullptr;
     }
 
     if (stage == ShaderStage::Compute) {
         // SDL3 GPU compute shaders are whole pipelines, not SDL_GPUShaders.
-        SDL_Log("GPUShader::create_from_spirv: compute shaders do not produce SDL_GPUShaders; "
-                "use GPUComputePipeline (gpu_compute.hpp)");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUShader::create_from_spirv: compute shaders do not produce SDL_GPUShaders; "
+                                   "use GPUComputePipeline (gpu_compute.hpp)");
         return nullptr;
     }
 
@@ -182,17 +187,20 @@ std::unique_ptr<GPUShader> GPUShader::create_from_spirv(GPUDevice& device, const
     ShaderResources reflected;
     if (reflect_spirv_resources(spirv_bytecode, reflected)) {
         if (reflected != resources) {
-            SDL_Log("GPUShader::create_from_spirv: ERROR: declared resource counts do not match SPIR-V "
-                    "(entry '%s'): samplers %u/%u, storage_textures %u/%u, storage_buffers %u/%u, "
-                    "uniform_buffers %u/%u (declared/reflected). Using reflected counts; fix the caller.",
-                    entry_point.c_str(), resources.num_samplers, reflected.num_samplers,
-                    resources.num_storage_textures, reflected.num_storage_textures, resources.num_storage_buffers,
-                    reflected.num_storage_buffers, resources.num_uniform_buffers, reflected.num_uniform_buffers);
+            BRACKEN_LOG_ERROR(LOG_TAG,
+                              "GPUShader::create_from_spirv: declared resource counts do not match SPIR-V "
+                              "(entry '{}'): samplers {}/{}, storage_textures {}/{}, storage_buffers {}/{}, "
+                              "uniform_buffers {}/{} (declared/reflected). Using reflected counts; fix the caller.",
+                              entry_point.c_str(), resources.num_samplers, reflected.num_samplers,
+                              resources.num_storage_textures, reflected.num_storage_textures,
+                              resources.num_storage_buffers, reflected.num_storage_buffers,
+                              resources.num_uniform_buffers, reflected.num_uniform_buffers);
             effective = reflected;
         }
     } else {
-        SDL_Log("GPUShader::create_from_spirv: SPIR-V reflection failed (%s); using declared resource counts",
-                SDL_GetError());
+        BRACKEN_LOG_WARN(LOG_TAG,
+                         "GPUShader::create_from_spirv: SPIR-V reflection failed ({}); using declared resource counts",
+                         SDL_GetError());
     }
     shader->resources_ = effective;
 
@@ -223,7 +231,7 @@ std::unique_ptr<GPUShader> GPUShader::create_from_spirv(GPUDevice& device, const
     SDL_DestroyProperties(props);
 
     if (!shader->shader_) {
-        SDL_Log("GPUShader::create_from_spirv: SPIRV->GPU failed: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUShader::create_from_spirv: SPIRV->GPU failed: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -274,12 +282,14 @@ GPUShader* ShaderManager::get(const std::string& path, ShaderStage stage, const 
         // get the first-baked shader (load-order dependent misbinding).
         const ShaderResources& cached = it->second->resources();
         if (!(cached == resources)) {
-            SDL_Log("ShaderManager::get: ERROR: '%s' requested with resource counts differing from the cached "
-                    "shader: samplers %u/%u, storage_textures %u/%u, storage_buffers %u/%u, uniform_buffers %u/%u "
-                    "(requested/cached). Returning the cached shader; reconcile the call sites.",
-                    path.c_str(), resources.num_samplers, cached.num_samplers, resources.num_storage_textures,
-                    cached.num_storage_textures, resources.num_storage_buffers, cached.num_storage_buffers,
-                    resources.num_uniform_buffers, cached.num_uniform_buffers);
+            BRACKEN_LOG_ERROR(
+                LOG_TAG,
+                "ShaderManager::get: '{}' requested with resource counts differing from the cached "
+                "shader: samplers {}/{}, storage_textures {}/{}, storage_buffers {}/{}, uniform_buffers {}/{} "
+                "(requested/cached). Returning the cached shader; reconcile the call sites.",
+                path.c_str(), resources.num_samplers, cached.num_samplers, resources.num_storage_textures,
+                cached.num_storage_textures, resources.num_storage_buffers, cached.num_storage_buffers,
+                resources.num_uniform_buffers, cached.num_uniform_buffers);
         }
         return it->second.get();
     }
@@ -288,7 +298,7 @@ GPUShader* ShaderManager::get(const std::string& path, ShaderStage stage, const 
     BRACKEN_ASSERT_MAIN_THREAD();
     auto shader = GPUShader::load_spirv(device_, path, stage, entry_point, resources);
     if (!shader) {
-        SDL_Log("ShaderManager: Failed to load '%s'", path.c_str());
+        BRACKEN_LOG_ERROR(LOG_TAG, "ShaderManager: Failed to load '{}'", path.c_str());
         return nullptr;
     }
 
@@ -328,14 +338,15 @@ bool ShaderManager::reload(const std::string& path) {
         cache_.erase(key);
     }
 
-    SDL_Log("ShaderManager: Marked '%s' for reload (%zu variants)", path.c_str(), keys_to_remove.size());
+    BRACKEN_LOG_INFO(LOG_TAG, "ShaderManager: Marked '{}' for reload ({} variants)", path.c_str(),
+                     keys_to_remove.size());
     return !keys_to_remove.empty();
 }
 
 int ShaderManager::reload_all() {
     int count = static_cast<int>(cache_.size());
     clear_cache();
-    SDL_Log("ShaderManager: Cleared %d shaders for reload", count);
+    BRACKEN_LOG_INFO(LOG_TAG, "ShaderManager: Cleared {} shaders for reload", count);
     return count;
 }
 

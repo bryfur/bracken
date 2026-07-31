@@ -8,11 +8,14 @@
 #include "SDL3/SDL_gpu.h"
 #include <memory>
 #include <SDL3/SDL_filesystem.h>
-#include <SDL3/SDL_log.h>
 #include <string>
 #include <utility>
 
 namespace bracken::gpu {
+
+namespace {
+constexpr const char* LOG_TAG = "gpu";
+} // namespace
 
 // =============================================================================
 // PipelineRegistry Implementation
@@ -26,7 +29,7 @@ bool PipelineRegistry::init(GPUDevice& device) {
     // GPU resource creation/destruction is main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
     if (device_) {
-        SDL_Log("PipelineRegistry: Already initialized");
+        BRACKEN_LOG_WARN(LOG_TAG, "PipelineRegistry: Already initialized");
         return false;
     }
 
@@ -41,13 +44,13 @@ bool PipelineRegistry::init(GPUDevice& device) {
         shader_path_ = std::string(base_path) + "shaders/";
     } else {
         shader_path_ = "shaders/";
-        SDL_Log("PipelineRegistry: SDL_GetBasePath failed, using relative path");
+        BRACKEN_LOG_WARN(LOG_TAG, "PipelineRegistry: SDL_GetBasePath failed, using relative path");
     }
 
     // Create shader manager (shaders are pre-compiled to SPIRV at build time)
     shader_manager_ = std::make_unique<ShaderManager>(device);
 
-    SDL_Log("PipelineRegistry: Initialized with shader path: %s", shader_path_.c_str());
+    BRACKEN_LOG_INFO(LOG_TAG, "PipelineRegistry: Initialized with shader path: {}", shader_path_.c_str());
 
     return true;
 }
@@ -63,12 +66,12 @@ void PipelineRegistry::shutdown() {
     shader_manager_.reset();
     device_ = nullptr;
     preloaded_ = false;
-    SDL_Log("PipelineRegistry: Shutdown complete");
+    BRACKEN_LOG_INFO(LOG_TAG, "PipelineRegistry: Shutdown complete");
 }
 
 GPUPipeline* PipelineRegistry::get_pipeline(PipelineType type) {
     if (!device_) {
-        SDL_Log("PipelineRegistry: Not initialized");
+        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: Not initialized");
         return nullptr;
     }
 
@@ -88,19 +91,20 @@ GPUPipeline* PipelineRegistry::create_and_cache_pipeline(PipelineType type) {
     // this off the main thread is a contract violation, not just a race.
     BRACKEN_ASSERT_MAIN_THREAD();
     if (preloaded_) {
-        BRACKEN_LOG_WARN("gpu", "PipelineRegistry: lazy creation of {} pipeline after preload — "
-                                "the static pipeline enumeration is missing this variant",
+        BRACKEN_LOG_WARN(LOG_TAG,
+                         "PipelineRegistry: lazy creation of {} pipeline after preload — "
+                         "the static pipeline enumeration is missing this variant",
                          pipeline_type_to_string(type));
     }
 
     std::unique_ptr<GPUPipeline> pipeline = create_pipeline_uncached(type);
 
     if (!pipeline) {
-        SDL_Log("PipelineRegistry: Failed to create %s pipeline", pipeline_type_to_string(type));
+        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: Failed to create {} pipeline", pipeline_type_to_string(type));
         return nullptr;
     }
 
-    SDL_Log("PipelineRegistry: Created %s pipeline", pipeline_type_to_string(type));
+    BRACKEN_LOG_DEBUG(LOG_TAG, "PipelineRegistry: Created {} pipeline", pipeline_type_to_string(type));
 
     ++creation_count_;
     auto* result = pipeline.get();
@@ -281,7 +285,7 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_pipeline_uncached(Pipeline
             pipeline = create_water_pipeline();
             break;
         default:
-            SDL_Log("PipelineRegistry: Unknown pipeline type %d", static_cast<int>(type));
+            BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: Unknown pipeline type {}", static_cast<int>(type));
             return nullptr;
     }
 
@@ -290,7 +294,7 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_pipeline_uncached(Pipeline
 
 GPUComputePipeline* PipelineRegistry::get_compute_pipeline(ComputePipelineType type) {
     if (!device_) {
-        SDL_Log("PipelineRegistry: Not initialized");
+        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: Not initialized");
         return nullptr;
     }
 
@@ -307,19 +311,21 @@ GPUComputePipeline* PipelineRegistry::create_and_cache_compute_pipeline(ComputeP
     // Same guarded creation contract as create_and_cache_pipeline.
     BRACKEN_ASSERT_MAIN_THREAD();
     if (preloaded_) {
-        BRACKEN_LOG_WARN("gpu", "PipelineRegistry: lazy creation of {} compute pipeline after preload — "
-                                "the static pipeline enumeration is missing this variant",
+        BRACKEN_LOG_WARN(LOG_TAG,
+                         "PipelineRegistry: lazy creation of {} compute pipeline after preload — "
+                         "the static pipeline enumeration is missing this variant",
                          compute_pipeline_type_to_string(type));
     }
 
     std::unique_ptr<GPUComputePipeline> pipeline = create_compute_pipeline_uncached(type);
 
     if (!pipeline) {
-        SDL_Log("PipelineRegistry: Failed to create %s compute pipeline", compute_pipeline_type_to_string(type));
+        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: Failed to create {} compute pipeline",
+                          compute_pipeline_type_to_string(type));
         return nullptr;
     }
 
-    SDL_Log("PipelineRegistry: Created %s compute pipeline", compute_pipeline_type_to_string(type));
+    BRACKEN_LOG_DEBUG(LOG_TAG, "PipelineRegistry: Created {} compute pipeline", compute_pipeline_type_to_string(type));
 
     ++creation_count_;
     auto* result = pipeline.get();
@@ -336,7 +342,7 @@ std::unique_ptr<GPUComputePipeline> PipelineRegistry::create_compute_pipeline_un
         case ComputePipelineType::WaterSim:
             return create_water_sim_pipeline();
         default:
-            SDL_Log("PipelineRegistry: Unknown compute pipeline type %d", static_cast<int>(type));
+            BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: Unknown compute pipeline type {}", static_cast<int>(type));
             return nullptr;
     }
 }
@@ -344,23 +350,25 @@ std::unique_ptr<GPUComputePipeline> PipelineRegistry::create_compute_pipeline_un
 bool PipelineRegistry::preload_all_pipelines() {
     BRACKEN_ASSERT_MAIN_THREAD();
     if (!device_) {
-        SDL_Log("PipelineRegistry: preload_all_pipelines called before init");
+        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: preload_all_pipelines called before init");
         return false;
     }
-    SDL_Log("PipelineRegistry: Preloading all pipelines...");
+    BRACKEN_LOG_INFO(LOG_TAG, "PipelineRegistry: Preloading all pipelines...");
 
     bool success = true;
     for (int i = 0; i < static_cast<int>(PipelineType::Count); ++i) {
         auto type = static_cast<PipelineType>(i);
         if (!get_pipeline(type)) {
-            SDL_Log("PipelineRegistry: Failed to preload %s pipeline", pipeline_type_to_string(type));
+            BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: Failed to preload {} pipeline",
+                              pipeline_type_to_string(type));
             success = false;
         }
     }
     for (int i = 0; i < static_cast<int>(ComputePipelineType::Count); ++i) {
         auto type = static_cast<ComputePipelineType>(i);
         if (!get_compute_pipeline(type)) {
-            SDL_Log("PipelineRegistry: Failed to preload %s compute pipeline", compute_pipeline_type_to_string(type));
+            BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry: Failed to preload {} compute pipeline",
+                              compute_pipeline_type_to_string(type));
             success = false;
         }
     }
@@ -371,7 +379,8 @@ bool PipelineRegistry::preload_all_pipelines() {
     // failed to create here will fail identically on a lazy retry.
     preloaded_ = true;
 
-    SDL_Log("PipelineRegistry: Preloaded %zu pipelines", pipelines_.size() + compute_pipelines_.size());
+    BRACKEN_LOG_INFO(LOG_TAG, "PipelineRegistry: Preloaded {} pipelines",
+                     pipelines_.size() + compute_pipelines_.size());
     return success;
 }
 
@@ -384,7 +393,7 @@ void PipelineRegistry::invalidate_all() {
         shader_manager_->clear_cache();
     }
     preloaded_ = false; // caller must preload_all_pipelines() again
-    SDL_Log("PipelineRegistry: All pipelines invalidated");
+    BRACKEN_LOG_INFO(LOG_TAG, "PipelineRegistry: All pipelines invalidated");
 }
 
 void PipelineRegistry::set_swapchain_format(SDL_GPUTextureFormat format) {
@@ -404,7 +413,9 @@ void PipelineRegistry::set_swapchain_format(SDL_GPUTextureFormat format) {
     for (PipelineType type : swapchain_dependent) {
         invalidated += pipelines_.erase(type);
     }
-    SDL_Log("PipelineRegistry: Swapchain format changed, invalidated %zu swapchain-dependent pipelines", invalidated);
+    BRACKEN_LOG_INFO(LOG_TAG,
+                     "PipelineRegistry: Swapchain format changed, invalidated {} swapchain-dependent pipelines",
+                     invalidated);
 
     // Keep the pre-creation contract: if the registry was already preloaded,
     // re-create the affected pipelines now instead of leaving lazy creation
@@ -414,8 +425,9 @@ void PipelineRegistry::set_swapchain_format(SDL_GPUTextureFormat format) {
         preloaded_ = false;
         for (PipelineType type : swapchain_dependent) {
             if (!create_and_cache_pipeline(type)) {
-                SDL_Log("PipelineRegistry: Failed to re-create %s pipeline after swapchain format change",
-                        pipeline_type_to_string(type));
+                BRACKEN_LOG_ERROR(LOG_TAG,
+                                  "PipelineRegistry: Failed to re-create {} pipeline after swapchain format change",
+                                  pipeline_type_to_string(type));
             }
         }
         preloaded_ = true;
@@ -748,8 +760,9 @@ std::unique_ptr<GPUPipeline> PipelineRegistry::create_ui_pipeline() {
     fs_resources.num_uniform_buffers = 1; // has_texture flag
     fs_resources.num_samplers = 1;        // texture sampler (even if not always used)
 
-    SDL_Log("PipelineRegistry: Creating UI shaders with vs_uniforms=%d, fs_uniforms=%d, fs_samplers=%d",
-            vs_resources.num_uniform_buffers, fs_resources.num_uniform_buffers, fs_resources.num_samplers);
+    BRACKEN_LOG_DEBUG(LOG_TAG,
+                      "PipelineRegistry: Creating UI shaders with vs_uniforms={}, fs_uniforms={}, fs_samplers={}",
+                      vs_resources.num_uniform_buffers, fs_resources.num_uniform_buffers, fs_resources.num_samplers);
 
     auto* vs = shader_manager_->get(shader_path_ + "ui.vert.spv", ShaderStage::Vertex, "VSMain", vs_resources);
     auto* fs = shader_manager_->get(shader_path_ + "ui.frag.spv", ShaderStage::Fragment, "PSMain", fs_resources);

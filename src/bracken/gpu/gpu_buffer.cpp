@@ -1,14 +1,18 @@
 #include "gpu_buffer.hpp"
 #include "bracken/core/assert.hpp"
+#include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_gpu.h"
 #include "SDL3/SDL_stdinc.h"
 #include <cstring>
 #include <memory>
-#include <SDL3/SDL_log.h>
 
 namespace bracken::gpu {
+
+namespace {
+constexpr const char* LOG_TAG = "gpu";
+} // namespace
 
 GPUBuffer::~GPUBuffer() {
     if (device_) {
@@ -89,7 +93,7 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_static(GPUDevice& device, Type type
     // command buffer). Destruction asserts inside GPUDevice::release_*.
     BRACKEN_ASSERT_MAIN_THREAD();
     if (!data || size == 0) {
-        SDL_Log("GPUBuffer::create_static: Invalid parameters");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::create_static: Invalid parameters");
         return nullptr;
     }
 
@@ -105,7 +109,7 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_static(GPUDevice& device, Type type
 
     buffer->buffer_ = device.create_buffer(buf_info);
     if (!buffer->buffer_) {
-        SDL_Log("GPUBuffer::create_static: Failed to create buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::create_static: Failed to create buffer: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -116,7 +120,7 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_static(GPUDevice& device, Type type
 
     SDL_GPUTransferBuffer* transfer = device.create_transfer_buffer(transfer_info);
     if (!transfer) {
-        SDL_Log("GPUBuffer::create_static: Failed to create transfer buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::create_static: Failed to create transfer buffer: {}", SDL_GetError());
         device.release_buffer(buffer->buffer_);
         return nullptr;
     }
@@ -124,7 +128,7 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_static(GPUDevice& device, Type type
     // Map, copy, unmap
     void* mapped = device.map_transfer_buffer(transfer, false);
     if (!mapped) {
-        SDL_Log("GPUBuffer::create_static: Failed to map transfer buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::create_static: Failed to map transfer buffer: {}", SDL_GetError());
         device.release_transfer_buffer(transfer);
         device.release_buffer(buffer->buffer_);
         return nullptr;
@@ -135,7 +139,7 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_static(GPUDevice& device, Type type
     // Upload to GPU via copy pass
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device.handle());
     if (!cmd) {
-        SDL_Log("GPUBuffer::create_static: Failed to acquire command buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::create_static: Failed to acquire command buffer: {}", SDL_GetError());
         device.release_transfer_buffer(transfer);
         device.release_buffer(buffer->buffer_);
         return nullptr;
@@ -143,7 +147,7 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_static(GPUDevice& device, Type type
 
     SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(cmd);
     if (!copy_pass) {
-        SDL_Log("GPUBuffer::create_static: Failed to begin copy pass: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::create_static: Failed to begin copy pass: {}", SDL_GetError());
         SDL_CancelGPUCommandBuffer(cmd);
         device.release_transfer_buffer(transfer);
         device.release_buffer(buffer->buffer_);
@@ -173,7 +177,7 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_dynamic(GPUDevice& device, Type typ
     // GPU resource creation is main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
     if (size == 0) {
-        SDL_Log("GPUBuffer::create_dynamic: Invalid size");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::create_dynamic: Invalid size");
         return nullptr;
     }
 
@@ -189,7 +193,7 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_dynamic(GPUDevice& device, Type typ
 
     buffer->buffer_ = device.create_buffer(buf_info);
     if (!buffer->buffer_) {
-        SDL_Log("GPUBuffer::create_dynamic: Failed to create buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::create_dynamic: Failed to create buffer: {}", SDL_GetError());
         return nullptr;
     }
 
@@ -200,7 +204,7 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_dynamic(GPUDevice& device, Type typ
 
     buffer->transfer_buffer_ = device.create_transfer_buffer(transfer_info);
     if (!buffer->transfer_buffer_) {
-        SDL_Log("GPUBuffer::create_dynamic: Failed to create transfer buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::create_dynamic: Failed to create transfer buffer: {}", SDL_GetError());
         device.release_buffer(buffer->buffer_);
         return nullptr;
     }
@@ -210,13 +214,13 @@ std::unique_ptr<GPUBuffer> GPUBuffer::create_dynamic(GPUDevice& device, Type typ
 
 void GPUBuffer::update(SDL_GPUCommandBuffer* cmd, const void* data, size_t size, size_t offset) {
     if (!cmd) {
-        SDL_Log("GPUBuffer::update: Invalid parameters");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::update: Invalid parameters");
         return;
     }
 
     SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(cmd);
     if (!copy_pass) {
-        SDL_Log("GPUBuffer::update: Failed to begin copy pass: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::update: Failed to begin copy pass: {}", SDL_GetError());
         return;
     }
     update(copy_pass, data, size, offset);
@@ -225,25 +229,25 @@ void GPUBuffer::update(SDL_GPUCommandBuffer* cmd, const void* data, size_t size,
 
 void GPUBuffer::update(SDL_GPUCopyPass* copy_pass, const void* data, size_t size, size_t offset) {
     if (!transfer_buffer_) {
-        SDL_Log("GPUBuffer::update: Not a dynamic buffer");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::update: Not a dynamic buffer");
         return;
     }
 
     if (!copy_pass || !data) {
-        SDL_Log("GPUBuffer::update: Invalid parameters");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::update: Invalid parameters");
         return;
     }
 
     if (offset + size > size_) {
-        SDL_Log("GPUBuffer::update: Data exceeds buffer size (data=%zu + offset=%zu = %zu > buffer=%zu)", size, offset,
-                offset + size, size_);
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::update: Data exceeds buffer size (data={} + offset={} = {} > buffer={})",
+                          size, offset, offset + size, size_);
         return;
     }
 
     // Map, copy, unmap (with cycle=true for double-buffering)
     void* mapped = device_->map_transfer_buffer(transfer_buffer_, true);
     if (!mapped) {
-        SDL_Log("GPUBuffer::update: Failed to map transfer buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::update: Failed to map transfer buffer: {}", SDL_GetError());
         return;
     }
     std::memcpy(static_cast<char*>(mapped) + offset, data, size);
@@ -263,12 +267,12 @@ void GPUBuffer::update(SDL_GPUCopyPass* copy_pass, const void* data, size_t size
 
 GPUBuffer::Mapping GPUBuffer::map() {
     if (!transfer_buffer_) {
-        SDL_Log("GPUBuffer::map: Not a dynamic buffer");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::map: Not a dynamic buffer");
         return {};
     }
     void* mapped = device_->map_transfer_buffer(transfer_buffer_, true); // cycle=true, matching update()
     if (!mapped) {
-        SDL_Log("GPUBuffer::map: Failed to map transfer buffer: %s", SDL_GetError());
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::map: Failed to map transfer buffer: {}", SDL_GetError());
         return {};
     }
     return Mapping(this, mapped);
@@ -304,19 +308,20 @@ void GPUBuffer::Mapping::release() {
 
 void GPUBuffer::Mapping::upload(SDL_GPUCopyPass* copy_pass, size_t size, size_t offset) {
     if (!buffer_ || !data_) {
-        SDL_Log("GPUBuffer::Mapping::upload: Not mapped");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::Mapping::upload: Not mapped");
         return;
     }
     GPUBuffer* buffer = buffer_;
     release(); // unmap before recording the copy
 
     if (!copy_pass) {
-        SDL_Log("GPUBuffer::Mapping::upload: Invalid copy pass");
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUBuffer::Mapping::upload: Invalid copy pass");
         return;
     }
     if (offset + size > buffer->size_) {
-        SDL_Log("GPUBuffer::Mapping::upload: Data exceeds buffer size (data=%zu + offset=%zu = %zu > buffer=%zu)",
-                size, offset, offset + size, buffer->size_);
+        BRACKEN_LOG_ERROR(LOG_TAG,
+                          "GPUBuffer::Mapping::upload: Data exceeds buffer size (data={} + offset={} = {} > buffer={})",
+                          size, offset, offset + size, buffer->size_);
         return;
     }
 
