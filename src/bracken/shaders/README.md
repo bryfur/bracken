@@ -28,60 +28,25 @@ changes.
 
 ## Pipeline → shader map
 
-Which shaders each `PipelineType` (`gpu/pipeline_registry.cpp`) actually
-loads. Note the shared shaders: the skinned pipeline reuses `model.frag`,
-and every post-process pass reuses `fullscreen.vert`.
+**The map lives in the code, in one place:
+[`gpu/pipeline_catalog.cpp`](../gpu/pipeline_catalog.cpp).** Each
+`PipelineType` and `ComputePipelineType` has exactly one `PipelineDesc` /
+`ComputePipelineDesc` row naming its shader(s), the resource counts they
+declare, its vertex layout and its fixed-function state; a missing row is a
+compile error. This file used to carry a second, hand-maintained copy of that
+table, which is exactly the kind of thing that drifts — read the rows instead.
 
-| Pipeline | Vertex | Fragment |
-|---|---|---|
-| Model (+ DoubleSided/Blend variants) | `model.vert` | `model.frag` |
-| SkinnedModel (+ DoubleSided/Blend variants) | `skinned_model.vert` | `model.frag` |
-| InstancedModel (+ DoubleSided variant) | `model_instanced.vert` | `model_instanced.frag` |
-| Terrain | `terrain.vert` | `terrain.frag` |
-| Grass | `grass.vert` | `grass.frag` |
-| Skybox | `skybox.vert` | `skybox.frag` |
-| Water | `water.vert` | `water.frag` |
-| Particle | `particle.vert` | `particle.frag` |
-| Grid | `grid.vert` | `grid.frag` |
-| UI | `ui.vert` | `ui.frag` |
-| Text | `text.vert` | `text.frag` |
-| ShadowModel | `shadow_depth.vert` | `shadow_depth.frag` |
-| InstancedShadowModel | `shadow_depth_instanced.vert` | `shadow_depth.frag` |
-| ShadowSkinnedModel | `shadow_skinned.vert` | `shadow_depth_opaque.frag` |
-| ShadowTerrain | `shadow_terrain.vert` | `shadow_depth_opaque.frag` |
-| LocalShadowClear | `fullscreen.vert` | `shadow_depth_opaque.frag` |
-| DepthPrepassModel (+ DoubleSided) | `prepass_model.vert` | `prepass_velocity.frag` |
-| DepthPrepassSkinnedModel (+ DoubleSided) | `prepass_skinned.vert` | `prepass_velocity.frag` |
-| DepthPrepassInstancedModel (+ DoubleSided) | `prepass_instanced.vert` | `prepass_velocity.frag` |
-| DepthPrepassTerrain | `prepass_terrain.vert` | `prepass_velocity.frag` |
-| DepthPrepassGrass | `prepass_grass.vert` | `prepass_velocity.frag` |
-| DepthPrepassModelMasked | `prepass_model_masked.vert` | `prepass_velocity_masked.frag` |
-| DepthPrepassInstancedModelMasked | `prepass_instanced_masked.vert` | `prepass_velocity_masked.frag` |
-| GTAO | `fullscreen.vert` | `gtao.frag` |
-| GTAOTemporal | `fullscreen.vert` | `gtao_temporal.frag` |
-| GTAOUpsample | `fullscreen.vert` | `gtao_upsample.frag` |
-| BlurAO | `fullscreen.vert` | `blur_ao.frag` |
-| BloomDownsample | `fullscreen.vert` | `bloom_downsample.frag` |
-| BloomUpsample | `fullscreen.vert` | `bloom_upsample.frag` |
-| VolumetricFog | `fullscreen.vert` | `volumetric_fog.frag` |
-| Composite | `fullscreen.vert` | `composite.frag` |
-| Fxaa | `fullscreen.vert` | `fxaa.frag` |
-| TaaResolve | `fullscreen.vert` | `taa_resolve.frag` |
-| TaaSharpen | `fullscreen.vert` | `taa_sharpen.frag` |
-| SkyCapture | `fullscreen.vert` | `sky_capture.frag` |
-| IblSpecularPrefilter | `fullscreen.vert` | `ibl_prefilter.frag` |
-| IblIrradiance | `fullscreen.vert` | `ibl_irradiance.frag` |
-| IblBrdfLut | `fullscreen.vert` | `ibl_brdf_lut.frag` |
+Worth knowing without opening the file: shaders are shared. The skinned
+pipeline reuses `model.frag`, all eight depth-prepass pipelines reuse
+`prepass_velocity.frag` (or `prepass_velocity_masked.frag` for the alpha-MASK
+pair), the shadow casters share `shadow_depth.frag` /
+`shadow_depth_opaque.frag`, and every post-process and IBL pass reuses
+`fullscreen.vert`.
 
-Compute pipelines (`ComputePipelineType`, same registry/hot-reload
-lifecycle; one `.comp.hlsl` is the whole pipeline — there is no separate
-vertex/fragment pair):
-
-| Compute pipeline | Shader | Threadgroup |
-|---|---|---|
-| ExposureHistogram | `exposure_histogram.comp` | 16×16×1 |
-| ExposureAdapt | `exposure_adapt.comp` | 256×1×1 |
-| WaterSim (compute) | — | `water_sim.comp` |
+A compute pipeline is one `.comp.hlsl` — there is no vertex/fragment pair, and
+its threadgroup size is never written down on the C++ side: it comes from the
+module's `[numthreads]` via SPIR-V reflection, which is why compute pipeline
+creation *requires* reflection to succeed.
 
 The model-family material variants (`ModelDoubleSided`, `ModelBlend`,
 `ModelBlendDoubleSided`, `SkinnedModel*`, `InstancedModelDoubleSided`) load

@@ -1810,7 +1810,8 @@ File map:
 | `src/bracken/gpu/gpu_shader.hpp/.cpp` | `ShaderStage`, `ShaderResources`, `GPUShader`, `ShaderManager` |
 | `src/bracken/gpu/gpu_pipeline.hpp/.cpp` | `PipelineConfig`, `GPUPipeline` |
 | `src/bracken/gpu/gpu_compute.hpp/.cpp` | `ComputeResources`, `GPUComputePipeline`, `ComputePass` |
-| `src/bracken/gpu/pipeline_registry.hpp/.cpp` | `PipelineType` (53 values), `ComputePipelineType` (2), `PipelineRegistry` |
+| `src/bracken/gpu/pipeline_catalog.hpp/.cpp` | `PipelineType` (56 values), `ComputePipelineType` (3), `PipelineDesc`/`ComputePipelineDesc` + the catalogue table, `VertexLayout`, `TargetFormat`, `PipelineFormats`, `build_pipeline_config` |
+| `src/bracken/gpu/pipeline_registry.hpp/.cpp` | `PipelineRegistry` — cache, pre-creation contract, invalidation, hot reload |
 | `src/bracken/gpu/gpu_uniforms.hpp` | CPU mirrors of every HLSL cbuffer + storage-buffer records |
 | `src/bracken/gpu/gpu_types.hpp` | Vertex formats, `TextureFormat`, `BlendMode`, vertex-attribute helpers |
 | `src/bracken/gpu/gpu_debug.hpp/.cpp` | `GPUDebugGroup`, `GPUTimestampPool` (CPU record timings; GPU timings unavailable), `GPUTimerScope`, macros |
@@ -2039,10 +2040,10 @@ Semantics: `create_from_spirv` REQUIRES reflection (`SDL_ShaderCross_ReflectComp
 
 Purpose: cached creation of every engine pipeline — **pre-created at init** as of Phase 1 of `docs/multithreading_plan.md` (the registry knows the full set; `get_pipeline` is a read-only lookup in the steady state, and creation/hot-reload paths are main-thread-asserted — this deletes the old first-touch lazy-creation race instead of locking it); single owner of the `ShaderManager`; shader hot-reload hook. Non-copyable/non-movable. Owned by `scene::SceneRenderer` (`pipeline_registry()` accessor).
 
-`enum class PipelineType` — 53 values + `Count`:
-`Model`, `SkinnedModel`, `Terrain`, `Skybox`, `Grid`, `UI`, `Text`, `Particle`, `Grass`, `InstancedModel`, `InstancedShadowModel`, `ShadowModel`, `ShadowSkinnedModel`, `ShadowTerrain`, `LocalShadowClear`, `GTAO`, `GTAOTemporal`, `GTAOUpsample`, `BlurAO`, `Composite`, `BloomDownsample`, `BloomUpsample`, `VolumetricFog`, `Fxaa`, `TaaResolve`, `TaaSharpen`, `SkyCapture`, `IblSpecularPrefilter`, `IblIrradiance`, `IblBrdfLut`, `ModelDoubleSided`, `ModelBlend`, `ModelBlendDoubleSided`, `SkinnedModelDoubleSided`, `SkinnedModelBlend`, `SkinnedModelBlendDoubleSided`, `InstancedModelDoubleSided`, the 8 `DepthPrepass*` types, and the 8 `*DepthEqual` forward variants. `pipeline_type_to_string()` provides debug names.
+`enum class PipelineType` — 56 values + `Count` (declared in `gpu/pipeline_catalog.hpp`):
+`Model`, `SkinnedModel`, `Terrain`, `Skybox`, `Grid`, `UI`, `Text`, `Particle`, `Grass`, `InstancedModel`, `InstancedShadowModel`, `ShadowModel`, `ShadowSkinnedModel`, `ShadowTerrain`, `LocalShadowClear`, `GTAO`, `GTAOTemporal`, `GTAOUpsample`, `BlurAO`, `Composite`, `BloomDownsample`, `BloomUpsample`, `VolumetricFog`, `Fxaa`, `TaaResolve`, `TaaSharpen`, `SkyCapture`, `IblSpecularPrefilter`, `IblIrradiance`, `IblBrdfLut`, `ModelDoubleSided`, `ModelBlend`, `ModelBlendDoubleSided`, `SkinnedModelDoubleSided`, `SkinnedModelBlend`, `SkinnedModelBlendDoubleSided`, `InstancedModelDoubleSided`, the 8 `DepthPrepass*` types, the 8 `*DepthEqual` forward variants, the 2 `DepthPrepass*Masked` types, and `Water`. `pipeline_type_to_string()` returns the type's catalogue row name.
 
-`enum class ComputePipelineType` — 2 values + `Count`: `ExposureHistogram`, `ExposureAdapt` (`compute_pipeline_type_to_string()` for debug names). Compute pipelines live in a sibling cache (`get_compute_pipeline(type)` → `GPUComputePipeline*`, lazy + cached, uncached failures retried) and share the graphics lifecycle: `preload_all_pipelines()` iterates both enums, `invalidate_all()`/`reload_all_pipelines()`/hot-reload clear both caches, `cached_pipeline_count()` counts both. Declared `ComputeResources` are validated against `SDL_ShaderCross_ReflectComputeSPIRV` at creation (same "declared resource counts do not match SPIR-V" error contract as graphics; see `gpu_compute.hpp` below).
+`enum class ComputePipelineType` — 3 values + `Count`: `ExposureHistogram`, `ExposureAdapt`, `WaterSim` (`compute_pipeline_type_to_string()` for debug names; like the graphics enum it and its `ComputePipelineDesc` rows live in `gpu/pipeline_catalog.hpp`). Compute pipelines live in a sibling cache (`get_compute_pipeline(type)` → `GPUComputePipeline*`, lazy + cached, uncached failures retried) and share the graphics lifecycle: `preload_all_pipelines()` iterates both enums, `invalidate_all()`/`reload_all_pipelines()`/hot-reload clear both caches, `cached_pipeline_count()` counts both. Declared `ComputeResources` are validated against `SDL_ShaderCross_ReflectComputeSPIRV` at creation (same "declared resource counts do not match SPIR-V" error contract as graphics; see `gpu_compute.hpp` below).
 
 API:
 
@@ -2050,7 +2051,6 @@ API:
 [[nodiscard]] bool init(GPUDevice&);      // false if already initialized
 void shutdown();                           // clears pipelines, destroys ShaderManager
 GPUPipeline* get_pipeline(PipelineType);   // read-only lookup after init pre-creation; nullptr on failure
-GPUPipeline* get_model_pipeline() ... get_ibl_brdf_lut_pipeline();  // 29 convenience accessors
 [[nodiscard]] bool preload_all_pipelines();// iterates 0..Count; false if any failed
 size_t cached_pipeline_count() const;
 void invalidate_all();                     // clears pipeline cache AND shader cache
@@ -2079,7 +2079,7 @@ Shader path resolution (`init()`): `SDL_GetBasePath() + "shaders/"`, fallback `"
 
 Hot-reload: `enable_hot_reload(watcher)` registers `watcher.watch_directory(shader_path_, ".spv", callback)` once (subsequent calls no-op); the callback runs `reload_all_pipelines()` — coarse (all 53 graphics + 2 compute pipelines rebuilt on any `.spv` change) but correct; previous pipelines are released by SDL after in-flight command buffers finish. Requires `init()` first (warn + no-op otherwise). The engine wires this in `Application` when `BRACKEN_HOT_RELOAD=1`.
 
-Per-pipeline configuration summary (from the `create_*` methods in `pipeline_registry.cpp`; shader files relative to `shader_path()`; "resources" = `ShaderResources` as `{uniform_buffers, samplers, storage_buffers}`):
+Per-pipeline configuration summary (from the catalogue rows in `pipeline_catalog.cpp`; shader files relative to `shader_path()`; "resources" = `ShaderResources` as `{uniform_buffers, samplers, storage_buffers}`):
 
 | Pipeline | Shaders (VS / FS) | VS res | FS res | Vertex input | Key state |
 |---|---|---|---|---|---|
@@ -2364,7 +2364,7 @@ All single-buffer, slot 0, `SDL_GPU_VERTEXINPUTRATE_VERTEX`, pitch `sizeof(T)`:
 - `SkinnedVertex` — `Vertex3D` attributes + loc 5 `UBYTE4` joints (`uint8_t[4]`, read as `uint4 : BLENDINDICES` in HLSL), loc 6 `FLOAT4` weights.
 - `Vertex2D` — loc 0 `FLOAT2` position, 1 `FLOAT2` texcoord, 2 `FLOAT4` color.
 
-Custom layouts declared inline in `pipeline_registry.cpp`: terrain `pos3/uv2/color4/normal3` (pitch 48 B = 12 floats), grid `pos3/color4` (pitch 28 B, `LINELIST` primitive), skybox `pos3` only (pitch 12 B), text `pos2/uv2` (pitch 16 B).
+Custom layouts are named `gpu::VertexLayout` cases applied in `pipeline_catalog.cpp`: `Terrain` `pos3/uv2/color4/normal3` (pitch 48 B = 12 floats), `Grid` `pos3/color4` (pitch 28 B, `LINELIST` primitive), `Position3` (skybox, pitch 12 B), `Text` `pos2/uv2` (pitch 16 B), `Position2` (water grid, pitch 8 B), plus the position-only / position+texcoord / position+skin prepass subsets of the shared vertex formats.
 
 ### `PipelineRegistry` — `src/bracken/gpu/pipeline_registry.{hpp,cpp}`
 
@@ -2375,16 +2375,16 @@ Custom layouts declared inline in `pipeline_registry.cpp`: terrain `pos3/uv2/col
 - `GPUPipeline* get_pipeline(PipelineType)` — `nullptr` + log if uninitialized; cache hit returns; otherwise dispatches a `switch` to the matching `create_*` method, logs success/failure, caches on success. `cached_pipeline_count()` exposes the cache size.
 - `[[nodiscard]] bool preload_all_pipelines()` — iterates `0 .. PipelineType::Count`, returns `false` if **any** failed (but continues through all; each failure logged).
 - `invalidate_all()` — clears the pipeline cache **and** the shader cache.
-- `set_swapchain_format(fmt)` — no-op if unchanged; otherwise erases only the swapchain-dependent pipelines `{UI, Text, Composite, Fxaa}` (constexpr list in the .cpp). Called each frame-ish by `SceneRenderer` (`scene/scene_renderer.cpp:120`). A new swapchain-targeting pipeline type must be added to this list.
+- `set_swapchain_format(fmt)` — no-op if unchanged; otherwise erases only the swapchain-dependent pipelines, which it derives from the catalogue (`pipeline_targets_swapchain(type)`, i.e. `desc.color == TargetFormat::Swapchain`) — today `{UI, Text, Composite, Fxaa}`, pinned by `gpu/pipeline_catalog.test.cpp`. Called each frame-ish by `SceneRenderer` (`scene/scene_renderer.cpp:120`). A new swapchain-targeting pipeline type needs no edit here: giving its row `TargetFormat::Swapchain` is enough.
 - `enable_hot_reload(core::asset::FileWatcher&)` — warns if called pre-`init`; idempotent (ignores second watcher); `watch_directory(shader_path_, ".spv", cb)` where the callback logs and calls `reload_all_pipelines()` (= `invalidate_all()` + `preload_all_pipelines()`, warning on partial failure). `reload_all_pipelines()` is public for tests/diagnostics. `Application::init_renderer` wires this (plus model hot-reload) whenever the global `FileWatcher` is running, which `Application::init_engine` starts only when env `BRACKEN_HOT_RELOAD=1` (`src/bracken/application.cpp`). `FileWatcher` marshals callbacks onto the main thread via `poll_main_thread()` (run in `Application::run()`), so pipeline rebuilds safely touch GPU state.
 
-#### `PipelineType` — 53 values
+#### `PipelineType` — 56 values
 
-30 base types (`Model`, `SkinnedModel`, `Terrain`, `Skybox`, `Grid`, `UI`, `Text`, `Particle`, `Grass`, `InstancedModel`, `InstancedShadowModel`, `ShadowModel`, `ShadowSkinnedModel`, `ShadowTerrain`, `LocalShadowClear`, `GTAO`, `GTAOTemporal`, `GTAOUpsample`, `BlurAO`, `Composite`, `BloomDownsample`, `BloomUpsample`, `VolumetricFog`, `Fxaa`, `TaaResolve`, `TaaSharpen`, `SkyCapture`, `IblSpecularPrefilter`, `IblIrradiance`, `IblBrdfLut`) + 7 model-family material variants (`ModelDoubleSided`, `ModelBlend`, `ModelBlendDoubleSided`, `SkinnedModelDoubleSided`, `SkinnedModelBlend`, `SkinnedModelBlendDoubleSided`, `InstancedModelDoubleSided`) + 8 `DepthPrepass*` + 8 `*DepthEqual` variants, + `Count`. Variants reuse the base `create_model_pipeline(alpha_blend, double_sided)` / `create_skinned_model_pipeline(...)` / `create_instanced_model_pipeline(double_sided)` with flags — same shader pair, different fixed-function state (`Blend` ⇒ `alpha_blended()` i.e. depth write off, host sorts back-to-front; `DoubleSided` ⇒ `no_cull()`). glTF alphaMode MASK is *not* a pipeline variant: it is the `alphaCutoff` field of the lighting cbuffer (0 disables the discard). `pipeline_type_to_string()` provides debug names. Per-type convenience getters (`get_model_pipeline()` etc.) exist for the 29 pre-P5 base types (`LocalShadowClear` goes through `get_pipeline`).
+30 base types (`Model`, `SkinnedModel`, `Terrain`, `Skybox`, `Grid`, `UI`, `Text`, `Particle`, `Grass`, `InstancedModel`, `InstancedShadowModel`, `ShadowModel`, `ShadowSkinnedModel`, `ShadowTerrain`, `LocalShadowClear`, `GTAO`, `GTAOTemporal`, `GTAOUpsample`, `BlurAO`, `Composite`, `BloomDownsample`, `BloomUpsample`, `VolumetricFog`, `Fxaa`, `TaaResolve`, `TaaSharpen`, `SkyCapture`, `IblSpecularPrefilter`, `IblIrradiance`, `IblBrdfLut`) + 7 model-family material variants (`ModelDoubleSided`, `ModelBlend`, `ModelBlendDoubleSided`, `SkinnedModelDoubleSided`, `SkinnedModelBlend`, `SkinnedModelBlendDoubleSided`, `InstancedModelDoubleSided`) + 8 `DepthPrepass*` + 8 `*DepthEqual` variants + `Water`, + `Count`. The enum and its per-type data live in `gpu/pipeline_catalog.hpp`, not in the registry: each value has exactly one `PipelineDesc` row (shader pair, declared `ShaderResources`, `VertexLayout`, `TargetFormat`, cull/blend/depth state), `static_assert`ed to cover `Count`, and `pipeline_type_to_string()` is that row's `name`. Variants share their base row's shader pair and differ only in fixed-function state (`Blend` ⇒ `BlendMode::Alpha` with depth write off, host sorts back-to-front; `DoubleSided` ⇒ `SDL_GPU_CULLMODE_NONE`; `DepthEqual` ⇒ `SDL_GPU_COMPAREOP_EQUAL` with depth write off). glTF alphaMode MASK is *not* a pipeline variant for forward draws: it is the `alphaCutoff` field of the lighting cbuffer (0 disables the discard) — only the prepass has dedicated `*Masked` rows. There are no per-type convenience getters; everything goes through `get_pipeline(PipelineType)`.
 
 #### Pipeline table (shaders, declared resources, key state)
 
-VS/FS resource counts below are the `ShaderResources` declared in each `create_*` (order: uniform buffers `u`, samplers `s`, storage buffers `b`). Color format: `scene` = RGBA16F, `swap` = swapchain, `R8` = R8_UNORM, `RGBA16F` = bloom/fog chain, `—` = depth-only (`INVALID`).
+VS/FS resource counts below are the `ShaderResources` declared in each catalogue row (`gpu/pipeline_catalog.cpp`, order: uniform buffers `u`, samplers `s`, storage buffers `b`); the table there is the source of truth and `gpu/pipeline_catalog.test.cpp` pins it against a captured golden. Color format: `scene` = RGBA16F, `swap` = swapchain, `R8` = R8_UNORM, `RGBA16F` = bloom/fog chain, `—` = depth-only (`INVALID`).
 
 | Pipeline | VS / FS | VS res | FS res | State highlights | Color |
 |---|---|---|---|---|---|
@@ -3724,7 +3724,7 @@ The animation module's output crosses into rendering through packet-allocated bo
 
 ## Terrain & Grass Rendering
 
-This chapter specifies the terrain subsystem (`bracken::render::TerrainRenderer`, `src/bracken/render/terrain_renderer.{hpp,cpp}`), the grass subsystem (`bracken::render::GrassRenderer`, `src/bracken/render/grass_renderer.{hpp,cpp}`), their shared heightmap data structure (`bracken::Heightmap`, `src/bracken/heightmap.hpp`), their HLSL shaders (`src/bracken/shaders/terrain.{vert,frag}.hlsl`, `shadow_terrain.vert.hlsl`, `grass.{vert,frag}.hlsl`), and their pipeline/binding contracts (`src/bracken/gpu/pipeline_registry.cpp`).
+This chapter specifies the terrain subsystem (`bracken::render::TerrainRenderer`, `src/bracken/render/terrain_renderer.{hpp,cpp}`), the grass subsystem (`bracken::render::GrassRenderer`, `src/bracken/render/grass_renderer.{hpp,cpp}`), their shared heightmap data structure (`bracken::Heightmap`, `src/bracken/heightmap.hpp`), their HLSL shaders (`src/bracken/shaders/terrain.{vert,frag}.hlsl`, `shadow_terrain.vert.hlsl`, `grass.{vert,frag}.hlsl`), and their pipeline/binding contracts (`src/bracken/gpu/pipeline_catalog.cpp`).
 
 Both renderers are owned by `scene::SceneRenderer` (`src/bracken/scene/scene_renderer.hpp`: members `terrain_`, `grass_renderer_`; accessors `terrain()` → `render::TerrainRenderer&`, `grass()` → `render::GrassRenderer*`). Both are non-copyable and non-movable; all methods are single-threaded (render-thread) with no internal synchronization.
 
@@ -3844,7 +3844,7 @@ Shared by main and shadow passes. The culling core is the pure static `cull_tile
 
 #### Main-pass binding contract (`render`)
 
-Pipeline: `PipelineRegistry::get_terrain_pipeline()` — vertex shader `terrain.vert.spv`, fragment `terrain.frag.spv`; declared resources VS: 1 UBO; FS: 3 UBOs, 4 samplers, 3 storage buffers. `config.opaque()` (default cull `SDL_GPU_CULLMODE_BACK`, depth write on, `GREATER_OR_EQUAL` reversed-Z), color `RGBA16F` scene format, depth `D32_FLOAT`.
+Pipeline: `PipelineType::Terrain` — vertex shader `terrain.vert.spv`, fragment `terrain.frag.spv`; declared resources VS: 1 UBO; FS: 3 UBOs, 9 samplers, 4 storage buffers. Default cull `SDL_GPU_CULLMODE_BACK`, depth write on, `GREATER_OR_EQUAL` reversed-Z, color `RGBA16F` scene format, depth `D32_FLOAT`. (Row in `gpu/pipeline_catalog.cpp`; that table is the source of truth.)
 
 | Slot | Stage | Content | Pushed/bound by |
 |---|---|---|---|
@@ -3873,7 +3873,7 @@ Constants: `TERRAIN_METALLIC = 0.0`, `TERRAIN_AO = 1.0`, `TEX_SCALE = 0.01` (bas
 
 #### Shadow-pass contract (`render_shadow`)
 
-Pipeline `get_shadow_terrain_pipeline()`: VS `shadow_terrain.vert.spv` (1 UBO), FS `shadow_depth_opaque.frag.spv` (no resources), terrain vertex layout, `opaque().no_cull().with_depth_bias(1.25f, 1.75f)`, `enable_depth_clip = false` (pancaking), `depth_compare_op = LESS_OR_EQUAL` (**shadow cascades stay standard-Z**, unlike the reversed-Z scene), color format `SDL_GPU_TEXTUREFORMAT_INVALID` (depth-only), depth `D32_FLOAT`. `no_cull` is required because terrain is single-sided.
+Pipeline `PipelineType::ShadowTerrain`: VS `shadow_terrain.vert.spv` (1 UBO), FS `shadow_depth_opaque.frag.spv` (no resources), terrain vertex layout, opaque, `SDL_GPU_CULLMODE_NONE`, depth bias (1.25, 1.75), `depth_clip = false` (pancaking), `depth_compare = LESS_OR_EQUAL` (**shadow cascades stay standard-Z**, unlike the reversed-Z scene), color format `SDL_GPU_TEXTUREFORMAT_INVALID` (depth-only), depth `D32_FLOAT`. `no_cull` is required because terrain is single-sided.
 
 `render_shadow` prefers the low-LOD mesh and falls back to the main mesh if the shadow buffers are absent; pushes `ShadowTerrainUniforms` at vertex uniform 0; per-cascade frustum culls the shadow tiles with the same row/run merging. Called once per cascade by `SceneRenderer::render_shadow_passes`.
 
@@ -3951,7 +3951,7 @@ Runs inside the frame's consolidated `FrameUploads` copy pass, before any render
 
 Early-outs (all silent): not initialized / null pass/cmd; blade buffers missing; **heightmap texture or sampler unset** (grass requires `set_heightmap` first); empty visible-chunk set. Pipeline lookup failure logs.
 
-Pipeline `get_grass_pipeline()`: VS `grass.vert.spv` (1 UBO, 2 samplers, 1 storage buffer), FS `grass.frag.spv` (3 UBOs, 2 samplers, 3 storage buffers); `with_vertex3d().opaque().no_cull()` — grass blades are double-sided; scene `RGBA16F` + `D32_FLOAT` targets. Vertex layout is the shared `gpu::Vertex3D` (position, normal, texcoord, color, tangent) even though the shader consumes only position/normal/texCoord/color.
+Pipeline `PipelineType::Grass`: VS `grass.vert.spv` (1 UBO, 2 samplers, 1 storage buffer), FS `grass.frag.spv` (3 UBOs, 7 samplers, 4 storage buffers); `Vertex3D` layout, opaque, `SDL_GPU_CULLMODE_NONE` — grass blades are double-sided; scene `RGBA16F` + `D32_FLOAT` targets. Vertex layout is the shared `gpu::Vertex3D` (position, normal, texcoord, color, tangent) even though the shader consumes only position/normal/texCoord/color.
 
 Binding contract:
 
@@ -4433,7 +4433,7 @@ last `update()`; member default 1200.0f).
 
 #### Shadow render passes (SceneRenderer)
 
-- Pipelines (`src/bracken/gpu/pipeline_registry.cpp`): `ShadowModel`
+- Pipelines (`src/bracken/gpu/pipeline_catalog.cpp`): `ShadowModel`
   (`shadow_depth.vert` + alpha-testing `shadow_depth.frag`),
   `InstancedShadowModel` (`shadow_depth_instanced.vert` + same frag),
   `ShadowSkinnedModel` (`shadow_skinned.vert` + no-alpha
@@ -6332,7 +6332,7 @@ No sorting of batches or particles is performed — unnecessary under commutativ
 
 ### GPU contract
 
-#### Pipeline (`PipelineType::Particle`, `src/bracken/gpu/pipeline_registry.cpp` `create_particle_pipeline`)
+#### Pipeline (`PipelineType::Particle`, its row in `src/bracken/gpu/pipeline_catalog.cpp`)
 
 - Shaders: `particle.vert.spv` / `particle.frag.spv` (entry `VSMain`/`PSMain`). VS resources: 2 uniform buffers (camera b0, batch b1), 1 storage buffer. FS resources: 1 uniform buffer, 1 sampler.
 - Vertex layout: standard `with_vertex3d()` (locations: 0 position, 1 normal, 2 texcoord, 3 color, 4 tangent); the VS consumes only 0, 2, 3 (particles are unlit).
@@ -6505,7 +6505,7 @@ Copy passes must precede the render pass (SDL3 GPU forbids nesting), hence the s
 1. Forward every `QueuedTextDraw` to `TextRenderer::queue_text_draw` (builds glyph quads CPU-side; may rasterize new glyphs into the CPU atlas).
 2. Copy passes: `vertex_buffer_->update(...)` for the primitive batch; `text_renderer_->create_pending_textures(cmd)` (= atlas dirty-band upload); `text_renderer_->upload_queued_text(cmd)` (atlas flush no-op + text vertex upload).
 3. Render pass on the swapchain: `load_op = clear_background ? CLEAR : LOAD`, `store_op = STORE`, `clear_color = {0.1f, 0.1f, 0.15f, 1.0f}`; full-screen viewport (depth 0–1) and scissor; no depth-stencil target.
-4. Bind `PipelineRegistry::get_ui_pipeline()` — if unavailable, logs via `SDL_Log`, ends the pass, clears state, returns (frame keeps whatever was on the swapchain).
+4. Bind `PipelineRegistry::get_pipeline(PipelineType::UI)` — if unavailable, logs via `SDL_Log`, ends the pass, clears state, returns (frame keeps whatever was on the swapchain).
 5. Push `gpu::UIScreenUniforms{width, height}` (vertex slot 0).
 6. Draw the primitive batch as one `SDL_DrawGPUPrimitives` per **texture-switch range** (`DrawRange`): solid primitives and `draw_textured_quad` ranges interleave in submission order; `UIFragmentUniforms{hasTexture}` is re-pushed and the fragment sampler re-bound only when the range's texture state changes (solid ranges bind the 1×1 white dummy).
 7. `text_renderer_->draw_queued_text(cmd, render_pass)` (binds the Text pipeline internally).
@@ -6580,7 +6580,7 @@ void draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass); // DU
 
 - `queue_text_draw` appends quads to the shared `batch_vertices_` staging vector and records `TextRun{ size_t first_vertex; uint32_t vertex_count; uint32_t color; }`. New glyphs land in the CPU atlas immediately, so **new strings render the same frame** (uploaded by the next copy-pass flush).
 - `upload_queued_text` = `flush_atlas` + one `vertex_buffer_->update` for all runs.
-- `draw_queued_text` binds `PipelineRegistry::get_text_pipeline()` once, pushes the projection (vertex uniform slot 0), binds the atlas+sampler (fragment sampler slot 0) and the vertex buffer once, then walks runs **merging contiguous same-color runs into single draws**; the color uniform (fragment slot 0) is pushed only on change. Draws are `SDL_DrawGPUPrimitives(count, 1, first_vertex, 0)`. Clears `queued_runs_` and `batch_vertices_` afterward (also on every early-out).
+- `draw_queued_text` binds `PipelineRegistry::get_pipeline(PipelineType::Text)` once, pushes the projection (vertex uniform slot 0), binds the atlas+sampler (fragment sampler slot 0) and the vertex buffer once, then walks runs **merging contiguous same-color runs into single draws**; the color uniform (fragment slot 0) is pushed only on change. Draws are `SDL_DrawGPUPrimitives(count, 1, first_vertex, 0)`. Clears `queued_runs_` and `batch_vertices_` afterward (also on every early-out).
 - Text color decoding: `core::unpack_color(color)` — the engine-wide **ARGB** convention, identical to the shape primitives.
 
 #### Measurement
@@ -7009,7 +7009,7 @@ Per terminal branch: `leaf_count` cards placed like child branches (`U[leaf_star
 
 Built in `TreeGenerator::generate` when `leaf_clumps` is non-empty. Purpose (per source comments): the leaf mesh is ~60–70% of tree triangles but contributes mostly dappled shadow coverage, so leaves get `cast_shadows = false` and the proxy — `shadow_only = true, cast_shadows = true` — carries the shadow silhouette at far lower cost (~10× less alpha-test overdraw).
 
-Per clump: three mutually perpendicular unit quads (XY/XZ/YZ planes, spanning ±1 pre-scale), scaled by `half = max(clump.half_extent * 1.05, vec3(0.8)) * size_var` with `size_var ∈ [0.95, 1.30)`, rotated by a hash-driven quat (`yaw ∈ [0, 2π)`, `pitch/roll ∈ [-0.75, 0.75]`), positioned at the clump centroid. Each quad is emitted with **both winding orders** (shadow pipelines cull front faces — `cull_front()` with depth bias `1.25/1.75` in `src/bracken/gpu/pipeline_registry.cpp`), so per clump: 12 vertices, 36 indices (12 triangles); the `reserve` calls match. The proxy shares `leaf_texture_path` (loaded again into its own `texture_pixels`) so `shadow_depth.frag.hlsl` can alpha-test (`if (hasTexture == 1) ... if (alpha < 0.5) discard`); untextured proxies cast solid quads. Vertex color is white.
+Per clump: three mutually perpendicular unit quads (XY/XZ/YZ planes, spanning ±1 pre-scale), scaled by `half = max(clump.half_extent * 1.05, vec3(0.8)) * size_var` with `size_var ∈ [0.95, 1.30)`, rotated by a hash-driven quat (`yaw ∈ [0, 2π)`, `pitch/roll ∈ [-0.75, 0.75]`), positioned at the clump centroid. Each quad is emitted with **both winding orders** (shadow pipelines cull front faces — `SDL_GPU_CULLMODE_FRONT` with depth bias `1.25/1.75` in `src/bracken/gpu/pipeline_catalog.cpp`), so per clump: 12 vertices, 36 indices (12 triangles); the `reserve` calls match. The proxy shares `leaf_texture_path` (loaded again into its own `texture_pixels`) so `shadow_depth.frag.hlsl` can alpha-test (`if (hasTexture == 1) ... if (alpha < 0.5) discard`); untextured proxies cast solid quads. Vertex color is white.
 
 #### Model assembly
 

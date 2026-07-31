@@ -169,7 +169,7 @@ void PostProcessStack::render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::Pip
                                              SDL_GPUTexture* target, SDL_GPUTexture* bloom_texture,
                                              SDL_GPUTexture* fog_texture, const CompositeParams& params) {
     BRACKEN_PROFILE_ZONE_COLOR("PostProcessStack::render_composite_pass", 0x16A085);
-    auto* pipeline = pipelines.get_composite_pipeline();
+    auto* pipeline = pipelines.get_pipeline(gpu::PipelineType::Composite);
     if (!pipeline || !target) {
         return;
     }
@@ -253,7 +253,7 @@ void PostProcessStack::render_fxaa_pass(SDL_GPUCommandBuffer* cmd, SDL_GPUTextur
     if (!cached_pipelines_ || !swapchain_target || !ldr_target_) {
         return;
     }
-    auto* pipeline = cached_pipelines_->get_fxaa_pipeline();
+    auto* pipeline = cached_pipelines_->get_pipeline(gpu::PipelineType::Fxaa);
     if (!pipeline) {
         return;
     }

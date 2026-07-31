@@ -161,10 +161,10 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
     if (!is_ready() || !cmd) {
         return;
     }
-    auto* gtao_pipeline = pipelines.get_gtao_pipeline();
-    auto* temporal_pipeline = pipelines.get_gtao_temporal_pipeline();
-    auto* blur_pipeline = pipelines.get_blur_ao_pipeline();
-    auto* upsample_pipeline = pipelines.get_gtao_upsample_pipeline();
+    auto* gtao_pipeline = pipelines.get_pipeline(gpu::PipelineType::GTAO);
+    auto* temporal_pipeline = pipelines.get_pipeline(gpu::PipelineType::GTAOTemporal);
+    auto* blur_pipeline = pipelines.get_pipeline(gpu::PipelineType::BlurAO);
+    auto* upsample_pipeline = pipelines.get_pipeline(gpu::PipelineType::GTAOUpsample);
     if (!gtao_pipeline || !temporal_pipeline || !blur_pipeline || !upsample_pipeline) {
         return;
     }

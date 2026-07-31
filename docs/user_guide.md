@@ -2013,7 +2013,7 @@ GPUShader* vs = shaders.get_vertex("shaders/model.vert.spv", "VSMain", vs_res);
 GPUShader* fs = shaders.get_fragment("shaders/model.frag.spv", "PSMain", fs_res);
 ```
 
-`ShaderResources` counts (`num_samplers`, `num_storage_textures`, `num_storage_buffers`, `num_uniform_buffers`) tell SDL how many of each resource the stage binds. They are **validated against SPIR-V reflection at load**: a mismatch logs an error (`declared resource counts do not match SPIR-V`) and the reflected counts win, so a stale hand-maintained count can't silently break rendering. Copy the counts from the corresponding `create_*_pipeline` method in `src/bracken/gpu/pipeline_registry.cpp` when reusing engine shaders (and fix the caller if the error fires).
+`ShaderResources` counts (`num_samplers`, `num_storage_textures`, `num_storage_buffers`, `num_uniform_buffers`) tell SDL how many of each resource the stage binds. They are **validated against SPIR-V reflection at load**: a mismatch logs an error (`declared resource counts do not match SPIR-V`) and the reflected counts win, so a stale hand-maintained count can't silently break rendering. Copy the counts from the shader's catalogue row in `src/bracken/gpu/pipeline_catalog.cpp` when reusing engine shaders (and fix the caller if the error fires).
 
 Other notes:
 
@@ -2034,7 +2034,7 @@ bracken_copy_shaders(my_game)   # copies compiled .spv into <exe dir>/shaders/
 
 ### Pipelines: `PipelineConfig` and `GPUPipeline`
 
-`PipelineConfig` (`src/bracken/gpu/gpu_pipeline.hpp`) is a plain struct with fluent helpers. This is a real engine pipeline, adapted from `PipelineRegistry::create_model_pipeline`:
+`PipelineConfig` (`src/bracken/gpu/gpu_pipeline.hpp`) is a plain struct with fluent helpers. This is a real engine pipeline, adapted from the `Model` row of the catalogue (`src/bracken/gpu/pipeline_catalog.cpp`):
 
 ```cpp
 #include "bracken/gpu/gpu_pipeline.hpp"
@@ -2055,7 +2055,7 @@ pipeline->bind(render_pass);
 
 Builder methods (all return `*this` for chaining; later calls override earlier ones):
 
-- Vertex layouts: `with_vertex3d()` (5 attributes), `with_skinned_vertex()` (7, incl. `UBYTE4` joints), `with_vertex2d()` (3, for UI). For custom layouts, fill `vertex_buffers`/`vertex_attributes` directly (see the terrain/grid/text pipelines in `pipeline_registry.cpp`).
+- Vertex layouts: `with_vertex3d()` (5 attributes), `with_skinned_vertex()` (7, incl. `UBYTE4` joints), `with_vertex2d()` (3, for UI). For custom layouts, fill `vertex_buffers`/`vertex_attributes` directly (the engine's own set is enumerated by `gpu::VertexLayout` and applied in `pipeline_catalog.cpp` — see the terrain/grid/text cases).
 - Blend/depth: `opaque()`, `alpha_blended()` (depth test on, **depth write off**), `additive()` (same depth behavior; blend factors are `SRC_ALPHA, ONE` — shaders that want pure `ONE, ONE` write alpha 1.0).
 - `no_depth()` disables depth test, write, **and the depth target itself**.
 - Culling: `no_cull()`, `cull_front()` (default is back-face culling, CCW front).
@@ -2070,7 +2070,7 @@ Depth-only pipelines (shadow passes): set `config.color_format = SDL_GPU_TEXTURE
 
 ### The engine's pipeline cache: `PipelineRegistry`
 
-`PipelineRegistry` (`src/bracken/gpu/pipeline_registry.hpp`) creates and caches one `GPUPipeline` per `PipelineType` — 53 types covering scene, UI, shadow (including the local-shadow tile clear), post-processing (including the GTAO/GTAOTemporal/GTAOUpsample/BlurAO chain, the TAA resolve/sharpen pair, and the IBL prefilter passes), glTF material variants, and the depth-prepass/velocity + post-prepass depth-EQUAL variants — plus one `GPUComputePipeline` per `ComputePipelineType` (2: the auto-exposure histogram/adapt pair) with the same lazy-create/preload/hot-reload lifecycle, via `get_compute_pipeline()`. `SceneRenderer` owns one; get it via `scene_renderer.pipeline_registry()`.
+`PipelineRegistry` (`src/bracken/gpu/pipeline_registry.hpp`) creates and caches one `GPUPipeline` per `PipelineType` — 56 types covering scene, UI, shadow (including the local-shadow tile clear), water, post-processing (including the GTAO/GTAOTemporal/GTAOUpsample/BlurAO chain, the TAA resolve/sharpen pair, and the IBL prefilter passes), glTF material variants, and the depth-prepass/velocity + post-prepass depth-EQUAL variants — plus one `GPUComputePipeline` per `ComputePipelineType` (3: the auto-exposure histogram/adapt pair and the water wave sim) with the same lazy-create/preload/hot-reload lifecycle, via `get_compute_pipeline()`. What each of those pipelines *is* comes from its catalogue row (`gpu/pipeline_catalog.hpp`); the registry is the cache and lifecycle only. `SceneRenderer` owns one; get it via `scene_renderer.pipeline_registry()`.
 
 ```cpp
 #include "bracken/gpu/pipeline_registry.hpp"
@@ -2081,7 +2081,7 @@ if (!registry.init(device)) { /* fatal */ }
 
 // Lazy: created on first access, cached after.
 GPUPipeline* model = registry.get_pipeline(PipelineType::Model);
-GPUPipeline* ui    = registry.get_ui_pipeline();      // convenience accessor
+GPUPipeline* ui    = registry.get_pipeline(PipelineType::UI);
 
 // During loading, avoid first-use hitches:
 if (!registry.preload_all_pipelines()) { /* at least one failed - logged */ }
@@ -2357,14 +2357,13 @@ At runtime SDL_shadercross converts the SPIR-V to whatever the backend wants: Vu
 
 ### Pipelines: `PipelineRegistry` and `PipelineConfig`
 
-`gpu::PipelineRegistry` (`src/bracken/gpu/pipeline_registry.hpp`) is the central owner of all 29 graphics pipelines (`PipelineType::Count`). `SceneRenderer` creates and preloads it during `init`; hosts usually only interact with it for hot-reload or when adding a new pipeline type.
+`gpu::PipelineRegistry` (`src/bracken/gpu/pipeline_registry.hpp`) is the central owner of every graphics pipeline (`PipelineType::Count`). It is the cache and lifecycle only — what each pipeline *is* lives one row per type in the catalogue, `src/bracken/gpu/pipeline_catalog.hpp`, so **adding a pipeline is adding a row** (plus the enum value; a missing row is a compile error). `SceneRenderer` creates and preloads the registry during `init`; hosts usually only interact with it for hot-reload or when adding a new pipeline type.
 
 ```cpp
 gpu::PipelineRegistry registry;
 if (!registry.init(device)) { /* fatal */ }
 
 gpu::GPUPipeline* model = registry.get_pipeline(gpu::PipelineType::Model); // lazy-created
-// or: registry.get_model_pipeline();
 
 if (!registry.preload_all_pipelines()) { /* one or more failed; each is logged */ }
 
@@ -4144,7 +4143,7 @@ The whole scene uses reversed-Z (near → depth 1, far → depth 0,
 `GREATER_OR_EQUAL`), but the shadow cascade passes deliberately stay
 **standard-Z** — atlas cleared to `1.0`, pipelines and the compare sampler use
 `LESS_OR_EQUAL` (`src/bracken/render/shadow_map.cpp`,
-`src/bracken/gpu/pipeline_registry.cpp`). The cascades render through
+`src/bracken/gpu/pipeline_catalog.cpp`). The cascades render through
 **orthographic** projections whose depth is already distributed linearly, so
 reversed-Z would fix nothing; and all the receiver bias / PCF / PCSS math in
 `shadow_common.hlsli` is calibrated for near=0/far=1. Don't "fix" this.
@@ -4160,7 +4159,8 @@ reversed-Z would fix nothing; and all the receiver bias / PCF / PCSS math in
   camera rotation *and* translation. If you write your own caster pass, don't
   re-derive matrices per draw — use `cascades()[i].light_view_projection`.
 - Shadow-caster pipelines front-face cull with a depth bias of
-  `(1.25, 1.75)` (`src/bracken/gpu/pipeline_registry.cpp`); single-sided
+  `(1.25, 1.75)` — one named constant, `k_shadow_bias` in
+  `src/bracken/gpu/pipeline_catalog.cpp`; single-sided
   geometry that is open toward the light can leak.
 - Tall casters outside a cascade slice (towers, mountains) still shadow it:
   each cascade's light-space depth range is padded by 300 world units

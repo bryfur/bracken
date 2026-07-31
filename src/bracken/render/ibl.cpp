@@ -160,7 +160,7 @@ void IBL::render_brdf_lut(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipe
     if (brdf_lut_rendered_) {
         return;
     }
-    auto* pipeline = pipelines.get_ibl_brdf_lut_pipeline();
+    auto* pipeline = pipelines.get_pipeline(gpu::PipelineType::IblBrdfLut);
     if (!pipeline) {
         return;
     }
@@ -199,17 +199,17 @@ void IBL::execute_unit(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelin
 
     switch (desc.kind) {
         case UnitKind::CaptureFace:
-            pipeline = pipelines.get_sky_capture_pipeline();
+            pipeline = pipelines.get_pipeline(gpu::PipelineType::SkyCapture);
             target_tex = capture_->handle();
             break;
         case UnitKind::SpecularFaceMip:
-            pipeline = pipelines.get_ibl_specular_prefilter_pipeline();
+            pipeline = pipelines.get_pipeline(gpu::PipelineType::IblSpecularPrefilter);
             target_tex = specular_->handle();
             target_mip = desc.mip;
             bind_capture = true;
             break;
         case UnitKind::IrradianceFace:
-            pipeline = pipelines.get_ibl_irradiance_pipeline();
+            pipeline = pipelines.get_pipeline(gpu::PipelineType::IblIrradiance);
             target_tex = irradiance_->handle();
             bind_capture = true;
             break;

@@ -454,7 +454,7 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
         return;
     }
 
-    if (!pipeline_registry_->get_instanced_model_pipeline() || !instance_storage_buffer_) {
+    if (!pipeline_registry_->get_pipeline(gpu::PipelineType::InstancedModel) || !instance_storage_buffer_) {
         return;
     }
 
@@ -911,7 +911,7 @@ void SceneRenderer::render_debug_lines(const CameraState& camera) {
         return;
     }
 
-    gpu::GPUPipeline* pipeline = pipeline_registry_->get_grid_pipeline();
+    gpu::GPUPipeline* pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::Grid);
     if (!pipeline) {
         return;
     }

@@ -254,8 +254,8 @@ void SceneRenderer::shutdown() {
 }
 
 void SceneRenderer::init_pipelines() {
-    auto* model_pipeline = pipeline_registry_->get_model_pipeline();
-    auto* skinned_pipeline = pipeline_registry_->get_skinned_model_pipeline();
+    auto* model_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::Model);
+    auto* skinned_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::SkinnedModel);
 
     if (!model_pipeline || !skinned_pipeline) {
         BRACKEN_LOG_WARN(LOG_TAG, "Some pipelines failed to preload");

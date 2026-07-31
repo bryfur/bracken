@@ -96,8 +96,8 @@ void TAA::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, gp
     if (!is_ready()) {
         return;
     }
-    auto* resolve_pipeline = pipelines.get_taa_resolve_pipeline();
-    auto* sharpen_pipeline = pipelines.get_taa_sharpen_pipeline();
+    auto* resolve_pipeline = pipelines.get_pipeline(gpu::PipelineType::TaaResolve);
+    auto* sharpen_pipeline = pipelines.get_pipeline(gpu::PipelineType::TaaSharpen);
     if (!resolve_pipeline || !sharpen_pipeline) {
         return;
     }

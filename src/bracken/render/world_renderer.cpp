@@ -63,7 +63,7 @@ void WorldRenderer::render_skybox(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer*
         return;
     }
 
-    auto* pipeline = pipeline_registry_->get_skybox_pipeline();
+    auto* pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::Skybox);
     if (!pipeline) {
         return;
     }

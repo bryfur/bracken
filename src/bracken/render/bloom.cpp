@@ -130,8 +130,8 @@ void Bloom::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, S
         return;
     }
 
-    auto* downsample_pipeline = registry.get_bloom_downsample_pipeline();
-    auto* upsample_pipeline = registry.get_bloom_upsample_pipeline();
+    auto* downsample_pipeline = registry.get_pipeline(gpu::PipelineType::BloomDownsample);
+    auto* upsample_pipeline = registry.get_pipeline(gpu::PipelineType::BloomUpsample);
     if (!downsample_pipeline || !upsample_pipeline) {
         return;
     }

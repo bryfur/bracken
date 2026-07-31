@@ -302,7 +302,7 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
     // Bind UI pipeline - MUST succeed before drawing
     gpu::GPUPipeline* ui_pipeline = nullptr;
     if (pipeline_registry_) {
-        ui_pipeline = pipeline_registry_->get_ui_pipeline();
+        ui_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::UI);
     }
 
     if (!ui_pipeline) {

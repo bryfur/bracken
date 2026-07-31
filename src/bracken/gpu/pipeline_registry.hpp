@@ -106,37 +106,6 @@ public:
      */
     GPUPipeline* get_pipeline(PipelineType type);
 
-    // Convenience accessors for common pipeline types
-    GPUPipeline* get_model_pipeline() { return get_pipeline(PipelineType::Model); }
-    GPUPipeline* get_skinned_model_pipeline() { return get_pipeline(PipelineType::SkinnedModel); }
-    GPUPipeline* get_terrain_pipeline() { return get_pipeline(PipelineType::Terrain); }
-    GPUPipeline* get_skybox_pipeline() { return get_pipeline(PipelineType::Skybox); }
-    GPUPipeline* get_ui_pipeline() { return get_pipeline(PipelineType::UI); }
-    GPUPipeline* get_grass_pipeline() { return get_pipeline(PipelineType::Grass); }
-    GPUPipeline* get_particle_pipeline() { return get_pipeline(PipelineType::Particle); }
-    GPUPipeline* get_text_pipeline() { return get_pipeline(PipelineType::Text); }
-    GPUPipeline* get_grid_pipeline() { return get_pipeline(PipelineType::Grid); }
-    GPUPipeline* get_instanced_model_pipeline() { return get_pipeline(PipelineType::InstancedModel); }
-    GPUPipeline* get_instanced_shadow_model_pipeline() { return get_pipeline(PipelineType::InstancedShadowModel); }
-    GPUPipeline* get_shadow_model_pipeline() { return get_pipeline(PipelineType::ShadowModel); }
-    GPUPipeline* get_shadow_skinned_model_pipeline() { return get_pipeline(PipelineType::ShadowSkinnedModel); }
-    GPUPipeline* get_shadow_terrain_pipeline() { return get_pipeline(PipelineType::ShadowTerrain); }
-    GPUPipeline* get_gtao_pipeline() { return get_pipeline(PipelineType::GTAO); }
-    GPUPipeline* get_gtao_temporal_pipeline() { return get_pipeline(PipelineType::GTAOTemporal); }
-    GPUPipeline* get_gtao_upsample_pipeline() { return get_pipeline(PipelineType::GTAOUpsample); }
-    GPUPipeline* get_blur_ao_pipeline() { return get_pipeline(PipelineType::BlurAO); }
-    GPUPipeline* get_composite_pipeline() { return get_pipeline(PipelineType::Composite); }
-    GPUPipeline* get_bloom_downsample_pipeline() { return get_pipeline(PipelineType::BloomDownsample); }
-    GPUPipeline* get_bloom_upsample_pipeline() { return get_pipeline(PipelineType::BloomUpsample); }
-    GPUPipeline* get_volumetric_fog_pipeline() { return get_pipeline(PipelineType::VolumetricFog); }
-    GPUPipeline* get_fxaa_pipeline() { return get_pipeline(PipelineType::Fxaa); }
-    GPUPipeline* get_taa_resolve_pipeline() { return get_pipeline(PipelineType::TaaResolve); }
-    GPUPipeline* get_taa_sharpen_pipeline() { return get_pipeline(PipelineType::TaaSharpen); }
-    GPUPipeline* get_sky_capture_pipeline() { return get_pipeline(PipelineType::SkyCapture); }
-    GPUPipeline* get_ibl_specular_prefilter_pipeline() { return get_pipeline(PipelineType::IblSpecularPrefilter); }
-    GPUPipeline* get_ibl_irradiance_pipeline() { return get_pipeline(PipelineType::IblIrradiance); }
-    GPUPipeline* get_ibl_brdf_lut_pipeline() { return get_pipeline(PipelineType::IblBrdfLut); }
-
     /**
      * @brief Get a compute pipeline by type
      *

@@ -443,7 +443,7 @@ void TextRenderer::draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass
         return;
     }
 
-    auto* text_pipeline = pipeline_registry_->get_text_pipeline();
+    auto* text_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::Text);
     if (!text_pipeline) {
         queued_runs_.clear();
         batch_vertices_.clear();

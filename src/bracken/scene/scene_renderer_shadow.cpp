@@ -47,7 +47,7 @@ void SceneRenderer::render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_
         return;
     }
 
-    auto* pipeline = pipeline_registry_->get_instanced_shadow_model_pipeline();
+    auto* pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::InstancedShadowModel);
     if (!pipeline) {
         return;
     }
@@ -200,7 +200,7 @@ void SceneRenderer::render_shadow_passes() {
         // Render non-instanced static models into shadow map.
         // Per-cascade frustum cull so near cascades don't draw distant casters.
         if (!static_scratch.empty()) {
-            auto* shadow_pipeline = pipeline_registry_->get_shadow_model_pipeline();
+            auto* shadow_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::ShadowModel);
             if (shadow_pipeline) {
                 shadow_pipeline->bind(shadow_pass);
                 SDL_GPUTexture* last_tex = nullptr;
@@ -266,7 +266,7 @@ void SceneRenderer::render_shadow_passes() {
         // Bone palettes were uploaded once in the frame copy pass; each draw
         // only pushes the small transform uniform with its palette offset.
         if (!skinned_scratch.empty() && current_bone_palette_buffer()) {
-            auto* shadow_skinned_pipeline = pipeline_registry_->get_shadow_skinned_model_pipeline();
+            auto* shadow_skinned_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::ShadowSkinnedModel);
             if (shadow_skinned_pipeline) {
                 shadow_skinned_pipeline->bind(shadow_pass);
                 SDL_GPUBuffer* palette_buf = current_bone_palette_buffer()->handle();
@@ -364,8 +364,8 @@ void SceneRenderer::render_local_shadow_passes(const FramePacket& frame, const C
     BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "LocalShadowPass");
 
     auto* clear_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::LocalShadowClear);
-    auto* model_pipeline = pipeline_registry_->get_shadow_model_pipeline();
-    auto* skinned_pipeline = pipeline_registry_->get_shadow_skinned_model_pipeline();
+    auto* model_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::ShadowModel);
+    auto* skinned_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::ShadowSkinnedModel);
     if (!clear_pipeline || !model_pipeline) {
         return;
     }

@@ -23,7 +23,7 @@ Root namespace `bracken`, one sub-namespace per module.
 | `core/jobs/` | `core::jobs` | `JobSystem` (always-on lock-free work-stealing pool — Chase–Lev deques, MPSC injection, pooled job nodes), `TaskGroup`, `parallel_for`, `TaskHandle` |
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload poller); `AssetRegistry` (typed, stable handles — a host-facing utility: no engine system instantiates it) |
 | `memory/` | `memory` | `Arena` (bump + destructor registration), `FrameAllocator` |
-| `gpu/` | `gpu` | `GPUDevice`, `GPUBuffer`, `GPUTexture`, `ShaderManager`, `GPUPipeline`, `GPUComputePipeline`/`ComputePass` (`gpu_compute.hpp`), `PipelineRegistry`, `gpu_uniforms.hpp` (CPU↔GPU contract), `gpu_debug.hpp` |
+| `gpu/` | `gpu` | `GPUDevice`, `GPUBuffer`, `GPUTexture`, `ShaderManager`, `GPUPipeline`, `GPUComputePipeline`/`ComputePass` (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) + `pipeline_catalog.hpp` (what each pipeline *is*), `gpu_uniforms.hpp` (CPU↔GPU contract), `gpu_debug.hpp` |
 | `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `color_grading.hpp` |
 | `render/lighting/` | `render::lighting` | `ClusterGrid` (CPU light binning), `LocalShadowMap`/`LocalShadowSelector` (budgeted point/spot shadow atlas + tile cache), and the cluster/atlas **budget constants** in `light.hpp` (the light *structs* are `contracts/light.hpp`) |
 | `render_graph/` | `render_graph` | pass scheduler (topo-sort, transient pool) — **in-tree, tested, not wired into `SceneRenderer`** |
@@ -126,8 +126,10 @@ and benchmarks exempt — cross-layer contract tests like
   (`contracts/environment.hpp`) are linear. The scene renders into a linear HDR
   target; the composite pass tonemaps (ACES et al.) + gamma-corrects to the
   swapchain. sRGB textures are converted on sample.
-- **Texture formats** (`gpu/pipeline_registry.hpp`): swapchain
-  `R8G8B8A8_UNORM`, HDR scene color `R16G16B16A16_FLOAT`, depth `D32_FLOAT`.
+- **Texture formats** (`PipelineRegistry`'s members, surfaced to the catalogue
+  as `gpu::PipelineFormats`): swapchain `R8G8B8A8_UNORM`, HDR scene color
+  `R16G16B16A16_FLOAT`, depth `D32_FLOAT`. Only the swapchain entry changes at
+  runtime.
 
 ---
 
@@ -624,8 +626,28 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
 
 ## GPU layer
 
-- **`PipelineRegistry`** (`gpu/pipeline_registry.hpp`) lazily creates and
-  caches one `GPUPipeline` per `PipelineType` (53 types, including the
+- **Registry vs catalogue.** These are two files on purpose.
+  **`gpu/pipeline_catalog.hpp`** is the catalogue: one `constexpr`
+  `PipelineDesc` row per `PipelineType` (56) and one `ComputePipelineDesc` per
+  `ComputePipelineType` (3), carrying the shader pair, the resource counts
+  those shaders declare, the vertex layout (`VertexLayout`), the render target
+  (`TargetFormat`) and the fixed-function state — cull, blend, the depth
+  triple, depth clip, depth bias. `build_pipeline_config(desc, formats)` turns
+  a row plus the frame's texture formats into a `PipelineConfig`; it is pure,
+  so the whole catalogue is testable headless. A missing row is a **compile
+  error** (`static_assert` on the table size), and the table is where the
+  reversed-Z story is reviewable as one column: cascades stay standard-Z
+  (`LESS_OR_EQUAL`), the `*DepthEqual` variants are `EQUAL` with writes off,
+  `LocalShadowClear` is `ALWAYS`, everything else is `GREATER_OR_EQUAL`.
+  `gpu/pipeline_catalog.test.cpp` diffs every row field-by-field against
+  `gpu/pipeline_config_golden.inc` — a text golden captured from the
+  hand-written creators that preceded the table — and additionally pins those
+  depth rules. It is the only mechanical check in the tree that sees GPU
+  *state*; the packet digest hashes what the host described, not what the GPU
+  was told to do.
+- **`PipelineRegistry`** (`gpu/pipeline_registry.hpp`) is the cache and
+  lifecycle around that catalogue, and names no pipeline itself. It lazily
+  creates and caches one `GPUPipeline` per `PipelineType` (including the
   model-family `DoubleSided`/`Blend` material variants, the 8 `DepthPrepass*`
   pipelines that write the RG16F velocity target, the 8 `*DepthEqual`
   forward variants used after the prepass, the
@@ -635,13 +657,15 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
   `IblBrdfLut`) that render into cubemap faces, and `LocalShadowClear` —
   the per-tile depth clear of the local-shadow atlas). Scene pipelines
   target the HDR format; UI/Text/Composite/Fxaa target the swapchain
-  format and are the only ones invalidated when the swapchain format changes.
+  format and are the only ones invalidated when the swapchain format changes
+  — which `set_swapchain_format` now *asks the catalogue*
+  (`pipeline_targets_swapchain`) rather than reading from a hand-kept list.
   The registry also caches one `GPUComputePipeline` per `ComputePipelineType`
-  (2: `ExposureHistogram`/`ExposureAdapt`) with the same lazy-create /
-  preload / invalidate / hot-reload lifecycle.
-  `preload_all_pipelines()` avoids first-use hitches.
-  The full pipeline → shader-pair table lives in
-  [shaders/README.md](../src/bracken/shaders/README.md).
+  (3: `ExposureHistogram`/`ExposureAdapt`/`WaterSim`) with the same
+  lazy-create / preload / invalidate / hot-reload lifecycle.
+  `preload_all_pipelines()` avoids first-use hitches. Lookups are by
+  `get_pipeline(PipelineType)` / `get_compute_pipeline(ComputePipelineType)`;
+  there are no per-type convenience accessors.
 - **Compute** (`gpu/gpu_compute.hpp`): `GPUComputePipeline` compiles a
   `.comp.spv` module straight into an `SDL_GPUComputePipeline` via
   SDL_shadercross (there is no `SDL_GPUShader` for compute) and exposes the

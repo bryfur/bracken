@@ -820,7 +820,7 @@ void TerrainRenderer::render_shadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffe
         return;
     }
 
-    auto* pipeline = pipeline_registry_->get_shadow_terrain_pipeline();
+    auto* pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::ShadowTerrain);
     if (!pipeline) {
         return;
     }
