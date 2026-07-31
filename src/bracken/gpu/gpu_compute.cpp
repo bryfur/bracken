@@ -2,6 +2,7 @@
 #include "bracken/core/assert.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_shader.hpp"
+#include "bracken/gpu/pipeline_golden_capture.hpp" // TEMPORARY: phase 6c commit 1
 #include "SDL3/SDL_error.h"
 #include <cstdint>
 #include <fstream>
@@ -90,6 +91,11 @@ bool GPUComputePipeline::reflect_spirv_resources(const std::vector<uint8_t>& spi
 std::unique_ptr<GPUComputePipeline> GPUComputePipeline::load_spirv(GPUDevice& device, const std::string& path,
                                                                    const std::string& entry_point,
                                                                    const ComputeResources& resources) {
+    // TEMPORARY (refactor phase 6c commit 1): golden capture. See
+    // gpu/pipeline_golden_capture.hpp.
+    if (golden::g_compute_hook) {
+        golden::g_compute_hook(path, entry_point, resources);
+    }
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
         BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::load_spirv: Failed to open '{}'", path.c_str());

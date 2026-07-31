@@ -505,6 +505,12 @@ private:
     std::unique_ptr<GPUPipeline> create_pipeline_uncached(PipelineType type);
     std::unique_ptr<GPUComputePipeline> create_compute_pipeline_uncached(ComputePipelineType type);
 
+    // TEMPORARY (refactor phase 6c commit 1): walk every creator with canonical
+    // formats and write the resulting GPU state to `out_path`, so the tabulated
+    // catalogue that replaces the creators can be diffed against it field by
+    // field. Driven by BRACKEN_DUMP_PIPELINE_GOLDEN; deleted in commit 3.
+    void dump_config_golden(const std::string& out_path);
+
     // Pipeline creation methods. The model-family creators take the glTF
     // material variant flags (alphaMode BLEND -> alpha_blend, doubleSided ->
     // no back-face culling). depth_equal selects the post-prepass forward

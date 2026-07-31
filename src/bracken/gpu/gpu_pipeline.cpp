@@ -3,6 +3,7 @@
 #include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_types.hpp"
+#include "bracken/gpu/pipeline_golden_capture.hpp" // TEMPORARY: phase 6c commit 1
 #include "SDL3/SDL_error.h"
 #include "SDL3/SDL_gpu.h"
 #include "SDL3/SDL_stdinc.h"
@@ -113,6 +114,12 @@ GPUPipeline& GPUPipeline::operator=(GPUPipeline&& other) noexcept {
 }
 
 std::unique_ptr<GPUPipeline> GPUPipeline::create(GPUDevice& device, const PipelineConfig& config) {
+    // TEMPORARY (refactor phase 6c commit 1): golden capture of the configs the
+    // hand-written creators produce. Null in every normal run; removed in
+    // commit 3 with the creators themselves.
+    if (golden::g_config_hook) {
+        golden::g_config_hook(config);
+    }
     // GPU pipeline creation is main-thread tier. Destruction asserts inside
     // GPUDevice::release_graphics_pipeline.
     BRACKEN_ASSERT_MAIN_THREAD();

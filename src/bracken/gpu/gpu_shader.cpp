@@ -2,6 +2,7 @@
 #include "bracken/core/assert.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_device.hpp"
+#include "bracken/gpu/pipeline_golden_capture.hpp" // TEMPORARY: phase 6c commit 1
 #include "SDL3/SDL_error.h"
 #include <cstddef>
 #include <cstdint>
@@ -272,6 +273,11 @@ GPUShader* ShaderManager::get_fragment(const std::string& path, const std::strin
 
 GPUShader* ShaderManager::get(const std::string& path, ShaderStage stage, const std::string& entry_point,
                               const ShaderResources& resources) {
+    // TEMPORARY (refactor phase 6c commit 1): golden capture — records which
+    // shader each hand-written creator asks for, cache hits included.
+    if (golden::g_shader_hook) {
+        golden::g_shader_hook(path, stage, resources);
+    }
     std::string key = make_cache_key(path, stage, entry_point);
 
     // Check cache
