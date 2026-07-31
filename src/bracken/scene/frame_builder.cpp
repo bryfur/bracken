@@ -364,18 +364,20 @@ void FrameBuilder::Lane::add_spot_light(const bracken::render::lighting::SpotLig
 }
 
 void FrameBuilder::Lane::add_billboard_3d(float world_x, float world_y, float world_z, float width, float fill_ratio,
-                                          uint32_t fill_color, uint32_t bg_color, uint32_t frame_color) {
+                                          bracken::core::Color fill_color, bracken::core::Color bg_color,
+                                          bracken::core::Color frame_color) {
     assert_filling();
     new (push_slot(billboards_))
         BillboardDrawCommand{world_x, world_y, world_z, width, fill_ratio, fill_color, bg_color, frame_color};
 }
 
-void FrameBuilder::Lane::add_debug_line(const glm::vec3& start, const glm::vec3& end, uint32_t color) {
+void FrameBuilder::Lane::add_debug_line(const glm::vec3& start, const glm::vec3& end, bracken::core::Color color) {
     assert_filling();
     new (push_slot(debug_lines_)) DebugLineDrawCommand{start, end, color};
 }
 
-void FrameBuilder::Lane::add_debug_sphere(const glm::vec3& center, float radius, uint32_t color, int segments) {
+void FrameBuilder::Lane::add_debug_sphere(const glm::vec3& center, float radius, bracken::core::Color color,
+                                          int segments) {
     // Mirrors RenderScene::add_debug_sphere: three circle outlines (XZ, XY, YZ).
     const float step = 2.0f * 3.14159265358979f / static_cast<float>(segments);
 
@@ -402,7 +404,7 @@ void FrameBuilder::Lane::add_debug_sphere(const glm::vec3& center, float radius,
     }
 }
 
-void FrameBuilder::Lane::add_debug_box(const glm::vec3& min, const glm::vec3& max, uint32_t color) {
+void FrameBuilder::Lane::add_debug_box(const glm::vec3& min, const glm::vec3& max, bracken::core::Color color) {
     // Mirrors RenderScene::add_debug_box: 12 AABB edges.
     const glm::vec3 c[8] = {
         {min.x, min.y, min.z}, {max.x, min.y, min.z}, {max.x, min.y, max.z}, {min.x, min.y, max.z},
@@ -432,39 +434,42 @@ void FrameBuilder::Lane::spawn_effect(const bracken::EffectDefinition* definitio
 // UiLane
 // ============================================================================
 
-void FrameBuilder::UiLane::add_filled_rect(float x, float y, float w, float h, uint32_t color) {
+void FrameBuilder::UiLane::add_filled_rect(float x, float y, float w, float h, bracken::core::Color color) {
     lane_->assert_filling();
     new (lane_->push_slot(lane_->ui_)) UiCommand{UiFilledRectCommand{x, y, w, h, color}};
 }
 
-void FrameBuilder::UiLane::add_rect_outline(float x, float y, float w, float h, uint32_t color, float line_width) {
+void FrameBuilder::UiLane::add_rect_outline(float x, float y, float w, float h, bracken::core::Color color,
+                                            float line_width) {
     lane_->assert_filling();
     new (lane_->push_slot(lane_->ui_)) UiCommand{UiRectOutlineCommand{x, y, w, h, color, line_width}};
 }
 
-void FrameBuilder::UiLane::add_circle(float x, float y, float radius, uint32_t color, int segments) {
+void FrameBuilder::UiLane::add_circle(float x, float y, float radius, bracken::core::Color color, int segments) {
     lane_->assert_filling();
     new (lane_->push_slot(lane_->ui_)) UiCommand{UiCircleCommand{x, y, radius, color, segments}};
 }
 
-void FrameBuilder::UiLane::add_circle_outline(float x, float y, float radius, uint32_t color, float line_width,
-                                              int segments) {
+void FrameBuilder::UiLane::add_circle_outline(float x, float y, float radius, bracken::core::Color color,
+                                              float line_width, int segments) {
     lane_->assert_filling();
     new (lane_->push_slot(lane_->ui_)) UiCommand{UiCircleOutlineCommand{x, y, radius, color, line_width, segments}};
 }
 
-void FrameBuilder::UiLane::add_line(float x1, float y1, float x2, float y2, uint32_t color, float line_width) {
+void FrameBuilder::UiLane::add_line(float x1, float y1, float x2, float y2, bracken::core::Color color,
+                                    float line_width) {
     lane_->assert_filling();
     new (lane_->push_slot(lane_->ui_)) UiCommand{UiLineCommand{x1, y1, x2, y2, color, line_width}};
 }
 
-void FrameBuilder::UiLane::add_text(std::string_view text, float x, float y, float scale, uint32_t color) {
+void FrameBuilder::UiLane::add_text(std::string_view text, float x, float y, float scale,
+                                    bracken::core::Color color) {
     lane_->assert_filling();
     new (lane_->push_slot(lane_->ui_)) UiCommand{UiTextCommand{lane_->store_text(text), x, y, scale, color}};
 }
 
 float FrameBuilder::UiLane::add_text_wrapped(std::string_view text, float x, float y, float max_width, float scale,
-                                             uint32_t color, float line_height) {
+                                             bracken::core::Color color, float line_height) {
     // Mirrors UIScene::add_text_wrapped (approximate 8px * scale char width).
     constexpr float CHAR_WIDTH_BASE = 8.0f;
     const float char_w = CHAR_WIDTH_BASE * scale;
@@ -498,8 +503,8 @@ float FrameBuilder::UiLane::add_text_wrapped(std::string_view text, float x, flo
     return cur_y - y;
 }
 
-void FrameBuilder::UiLane::add_button(float x, float y, float w, float h, std::string_view label, uint32_t color,
-                                      bool selected) {
+void FrameBuilder::UiLane::add_button(float x, float y, float w, float h, std::string_view label,
+                                      bracken::core::Color color, bool selected) {
     lane_->assert_filling();
     new (lane_->push_slot(lane_->ui_)) UiCommand{UiButtonCommand{x, y, w, h, lane_->store_text(label), color, selected}};
 }

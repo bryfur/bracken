@@ -3,6 +3,8 @@
 #include "bracken/core/color.hpp"
 
 #include <cstdint>
+#include <ios>
+#include <type_traits>
 
 using bracken::core::pack_color;
 using bracken::core::unpack_color;
@@ -70,6 +72,59 @@ TEST(ColorRoundTrip, UnpackThenPackIsIdentity) {
                        static_cast<uint8_t>(c.b * 255.0f + 0.5f), static_cast<uint8_t>(c.a * 255.0f + 0.5f));
         EXPECT_EQ(repacked, word);
     }
+}
+
+// ---------------------------------------------------------------------------
+// core::Color — the packed word as a type. It exists so a signature can say
+// WHICH of the engine's three color conventions a parameter uses; these pin
+// that it is byte-for-byte the word it replaced and loses nothing round-tripping.
+// ---------------------------------------------------------------------------
+
+using bracken::core::Color;
+
+TEST(ColorType, IsTheWordItReplaced) {
+    static_assert(sizeof(Color) == sizeof(uint32_t));
+    static_assert(std::is_trivially_copyable_v<Color>);
+    static_assert(std::is_standard_layout_v<Color>);
+    // Implicit from the packed literal: existing hex call sites keep working.
+    const Color c = 0xFF30FF60u;
+    EXPECT_EQ(c.argb, 0xFF30FF60u);
+}
+
+TEST(ColorType, DecodeMatchesTheFreeFunction) {
+    // to_linear() must be exactly unpack_color — every renderer decodes one
+    // way, and a second decode with a different byte order is the bug this
+    // whole convention exists to prevent.
+    for (uint32_t word : {0x00000000u, 0xFFFFFFFFu, 0x12345678u, 0xFF30FF60u, 0xB0101418u}) {
+        EXPECT_EQ(Color{word}.to_linear(), unpack_color(word)) << std::hex << word;
+    }
+}
+
+TEST(ColorType, FromLinearRoundTripsEveryChannelValue) {
+    // Rounding, not truncation: a truncating quantizer loses a step on most
+    // channel values, which shows up as a UI color drifting one bit darker
+    // every time it passes through the type.
+    for (int v = 0; v <= 255; ++v) {
+        const auto b = static_cast<uint8_t>(v);
+        const Color c = Color::rgba8(b, b, b, b);
+        EXPECT_EQ(Color::from_linear(c.to_linear()), c) << v;
+    }
+}
+
+TEST(ColorType, FromLinearClampsOutOfRange) {
+    // HDR values do not belong in a packed color; saturating is the honest
+    // answer, and it is why draw tints and light colors are NOT this type.
+    EXPECT_EQ(Color::from_linear({4.0f, -2.0f, 0.0f, 1.0f}).argb, 0xFFFF0000u);
+}
+
+TEST(ColorType, NamedConstantsAreConstexpr) {
+    static_assert(Color::white().argb == 0xFFFFFFFFu);
+    static_assert(Color::black().argb == 0xFF000000u);
+    static_assert(Color::transparent().argb == 0x00000000u);
+    static_assert(Color::rgba8(0x12, 0x34, 0x56, 0x78).argb == pack_color(0x12, 0x34, 0x56, 0x78));
+    static_assert(Color::rgb(1.0f, 0.0f, 0.0f).argb == 0xFFFF0000u);
+    static_assert(Color::white() == Color{0xFFFFFFFFu});
+    SUCCEED();
 }
 
 TEST(ColorHelpers, AreConstexpr) {

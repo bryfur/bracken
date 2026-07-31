@@ -2627,7 +2627,7 @@ struct EffectSpawnCommand   { const bracken::EffectDefinition* definition;
                               glm::vec3 position{0,0,0}, direction{1,0,0}; };
 ```
 
-UI commands: `UiFilledRectCommand`, `UiRectOutlineCommand`, `UiCircleCommand`, `UiCircleOutlineCommand`, `UiLineCommand`, `UiTextCommand`, `UiButtonCommand` — `UiCommandData` is a `std::variant` of those seven (in that order), wrapped in `struct UiCommand { UiCommandData data; is<T>(); get<T>(); }`. `UiTextCommand::text` / `UiButtonCommand::label` are `std::string_view`s over **packet-arena copies** made at emit time — no `std::string`, no heap, valid until the packet retires. All `uint32_t color` fields are packed ARGB (`bracken/core/color.hpp`).
+UI commands: `UiFilledRectCommand`, `UiRectOutlineCommand`, `UiCircleCommand`, `UiCircleOutlineCommand`, `UiLineCommand`, `UiTextCommand`, `UiButtonCommand` — `UiCommandData` is a `std::variant` of those seven (in that order), wrapped in `struct UiCommand { UiCommandData data; is<T>(); get<T>(); }`. `UiTextCommand::text` / `UiButtonCommand::label` are `std::string_view`s over **packet-arena copies** made at emit time — no `std::string`, no heap, valid until the packet retires. All color fields are `core::Color` — the packed-ARGB word of `bracken/core/color.hpp`, implicitly constructible from a `uint32_t` literal.
 
 `BonePaletteId` semantics: opaque while the frame is Filling (an internal lane/allocation-order encoding — any lane may use an id allocated on another lane, provided the allocation happened-before the use). At seal every id stored in a command is remapped to a **dense index into `FramePacket::palettes()`**, assigned in deterministic (lane-index, allocation-order) order. **Ids held by the host across `seal()` are stale** — only re-read them from sealed commands.
 
@@ -2643,7 +2643,7 @@ Internal API (builder/ring/coordinator — public with a banner, not for host co
 
 Emission is multi-lane: `Lane& lane(uint32_t i)` returns one writer's private stream (tier `owned` — one thread at a time; cache-line(128)-padded header; chunked storage with one `reserve_block` `fetch_add` per chunk and private bumps per item). `FrameBuilder` itself mirrors every `Lane` emit plus `ui()` as `lane(0)` forwards — single-threaded hosts never see a lane. Concurrent emission fans out one lane per job; **determinism**: `seal()` merges lanes in (lane-index, emission-order) order, so the merged frame is byte-identical at any worker count *if lanes are keyed by job/chunk index, never thread id*.
 
-`Lane` emit API (mirrors the retired `RenderScene` one-for-one; colors packed ARGB):
+`Lane` emit API (mirrors the retired `RenderScene` one-for-one; colors are `core::Color`):
 
 - `draw_model(handle, transform, tint = {1,1,1,1}, DrawFlags flags = DrawFlags::None, motion_id = 0)`
 - `draw_skinned(handle, transform, BonePaletteId palette, tint = {1,1,1,1}, DrawFlags flags = DrawFlags::None, motion_id = 0)` — an invalid id drops the draw with a warning.
@@ -6403,7 +6403,7 @@ Threading/lifetime: the whole path is main-thread-only (`BRACKEN_ASSERT_MAIN_THR
 
 ### UI command recording — `FrameBuilder::UiLane` → `FramePacket::ui_commands()`
 
-Command payload structs (`src/bracken/scene/frame_packet.hpp`), all trivially copyable, all colors packed ARGB `uint32_t`:
+Command payload structs (`src/bracken/scene/frame_packet.hpp`), all trivially copyable, all colors `core::Color` (the packed-ARGB word):
 
 ```cpp
 struct UiFilledRectCommand   { float x, y, w, h; uint32_t color; };
@@ -6491,7 +6491,7 @@ Vertex generation per call (CPU, appends to `std::vector<UIVertex> vertex_batch_
 | `draw_line` | 6 | quad extruded ±`line_width/2` along the normal; silently dropped when length < 0.001 |
 | `draw_button` | 30 + queued text | filled rect + outline (border `0xFFFFFFFF`/3 px when selected, `0xFF888888`/2 px otherwise) + centered label queued via `draw_text` at color `0xFFFFFFFF`, scale 1.0, centered with `TextRenderer::get_text_width/height` |
 
-Color decoding: every packed `uint32_t` color/tint goes through `core::unpack_color` (`bracken/core/color.hpp`) — the **single engine-wide ARGB `0xAARRGGBB`** convention shared by UI primitives, textured-quad tints, text, buttons, 3D billboards, and debug lines.
+Color decoding: every packed color/tint is a `core::Color` and decodes through `Color::to_linear()` (== `core::unpack_color`, `bracken/core/color.hpp`) — the **single engine-wide ARGB `0xAARRGGBB`** convention shared by UI primitives, textured-quad tints, text, buttons, 3D billboards, and debug lines. `TextRenderer` still takes the raw `uint32_t` one level down; `UIRenderer::draw_text` passes `color.argb`.
 
 `draw_text` appends `QueuedTextDraw{ std::string_view text; float x, y; uint32_t color; float scale; }` — the view is **not copied**; the characters must remain valid until `execute()` returns. Packet-arena text satisfies this because the sealed `FramePacket` stays alive (Consuming) through `render_frame` and is only retired afterwards.
 

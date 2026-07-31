@@ -1,5 +1,7 @@
 #pragma once
 
+#include "bracken/core/color.hpp"
+
 #include <glm/glm.hpp>
 #include <memory>
 #include <SDL3/SDL_gpu.h>
@@ -88,14 +90,15 @@ public:
      */
     void execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, bool clear_background = false);
 
-    // Primitive drawing. All `uint32_t color`/`tint` parameters are packed
-    // ARGB (0xAARRGGBB) — the engine-wide convention, see bracken/core/color.hpp.
-    void draw_filled_rect(float x, float y, float w, float h, uint32_t color);
-    void draw_rect_outline(float x, float y, float w, float h, uint32_t color, float line_width = 2.0f);
-    void draw_circle(float x, float y, float radius, uint32_t color, int segments = 24);
-    void draw_circle_outline(float x, float y, float radius, uint32_t color, float line_width = 2.0f,
+    // Primitive drawing. Every `color`/`tint` is a core::Color — the packed
+    // ARGB (0xAARRGGBB) word of bracken/core/color.hpp, implicitly
+    // constructible from one so hex literals still read as colors.
+    void draw_filled_rect(float x, float y, float w, float h, core::Color color);
+    void draw_rect_outline(float x, float y, float w, float h, core::Color color, float line_width = 2.0f);
+    void draw_circle(float x, float y, float radius, core::Color color, int segments = 24);
+    void draw_circle_outline(float x, float y, float radius, core::Color color, float line_width = 2.0f,
                              int segments = 24);
-    void draw_line(float x1, float y1, float x2, float y2, uint32_t color, float line_width = 2.0f);
+    void draw_line(float x1, float y1, float x2, float y2, core::Color color, float line_width = 2.0f);
 
     /**
      * Draw a textured quad (image widget). The texture is not copied or
@@ -105,17 +108,18 @@ public:
      * sampled sub-rectangle (defaults cover the whole texture). A null
      * texture falls back to a solid `tint` quad.
      */
-    void draw_textured_quad(SDL_GPUTexture* texture, float x, float y, float w, float h, uint32_t tint = 0xFFFFFFFF,
-                            float u0 = 0.0f, float v0 = 0.0f, float u1 = 1.0f, float v1 = 1.0f);
+    void draw_textured_quad(SDL_GPUTexture* texture, float x, float y, float w, float h,
+                            core::Color tint = core::Color::white(), float u0 = 0.0f, float v0 = 0.0f,
+                            float u1 = 1.0f, float v1 = 1.0f);
 
-    // Text drawing. `color` is packed ARGB, decoded identically to the shape
-    // primitives. The referenced characters are NOT copied: `text` must stay
-    // valid until execute() runs (FramePacket arena storage satisfies this —
-    // the packet is retired only after the frame is rendered).
-    void draw_text(std::string_view text, float x, float y, uint32_t color, float scale = 1.0f);
+    // Text drawing. `color` is decoded identically to the shape primitives.
+    // The referenced characters are NOT copied: `text` must stay valid until
+    // execute() runs (FramePacket arena storage satisfies this — the packet
+    // is retired only after the frame is rendered).
+    void draw_text(std::string_view text, float x, float y, core::Color color, float scale = 1.0f);
 
     // Composite UI elements. `label` must stay valid until execute() (see draw_text).
-    void draw_button(float x, float y, float w, float h, const std::string& label, uint32_t color, bool selected);
+    void draw_button(float x, float y, float w, float h, const std::string& label, core::Color color, bool selected);
 
     // Text measurement against the real font metrics (for centering,
     // alignment and wrapping). Both return 0 before init() / when no font
@@ -196,7 +200,7 @@ private:
     struct QueuedTextDraw {
         std::string_view text;
         float x{}, y{};
-        uint32_t color{};
+        core::Color color{};
         float scale{};
     };
     std::vector<QueuedTextDraw> queued_text_draws_;

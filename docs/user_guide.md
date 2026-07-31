@@ -2737,7 +2737,7 @@ fb.add_billboard_3d(pos.x, pos.y + 28.0f, pos.z,
                     /*frame_color=*/0xFFFFD080);
 ```
 
-A billboard is a screen-space progress bar (fill + background + 1px frame) anchored at a world position — health bars, capture progress. The renderer projects it, scales with distance (clamped ×0.3–×1.5), and drops it when behind the camera or well outside the viewport. Colors use the UI renderer's `0xAARRGGBB` packing (same values as every 2D UI command).
+A billboard is a screen-space progress bar (fill + background + 1px frame) anchored at a world position — health bars, capture progress. The renderer projects it, scales with distance (clamped ×0.3–×1.5), and drops it when behind the camera or well outside the viewport. Colors are `core::Color` — the `0xAARRGGBB` packing used by every 2D UI command.
 
 #### Particle effect spawns
 
@@ -2756,7 +2756,7 @@ fb.add_debug_sphere(player_pos_ + glm::vec3(0, 95, 0), 65.0f, 0xFF30FF60); // 3 
 fb.add_debug_box(aabb_min, aabb_max, 0xFFFFFFFF);                          // 12 edges
 ```
 
-Colors are packed **ARGB** `0xAARRGGBB` — the single engine-wide convention (`bracken/core/color.hpp`), identical to every UI/text/billboard color parameter. Lines render in-world (depth-tested via the grid pipeline) after all other 3D content. Sphere = 3 axis-aligned circle outlines (`segments` line segments each, default 16); box = 12 AABB edges.
+Colors are `core::Color`, the packed **ARGB** `0xAARRGGBB` convention (`bracken/core/color.hpp`), identical to every UI/text/billboard color parameter. Lines render in-world (depth-tested via the grid pipeline) after all other 3D content. Sphere = 3 axis-aligned circle outlines (`segments` line segments each, default 16); box = 12 AABB edges.
 
 ### 2D UI (`fb.ui()`)
 
@@ -5573,7 +5573,16 @@ A button is a composite: filled rect in `color`, a border (white `0xFFFFFFFF`, 3
 
 ### Colors: one packed format everywhere
 
-Every packed `uint32_t` color in the engine — shapes, outlines, lines, buttons, billboards, text, textured-quad tints, and 3D debug lines — is **ARGB `0xAARRGGBB`** (`0xFFFF0000` opaque red, `0x80000000` half-transparent black). The single pack/unpack pair lives in `bracken/core/color.hpp` (`core::pack_color` / `core::unpack_color`); every renderer decodes through it, so a color literal means the same thing in every API.
+Every packed color in the engine — shapes, outlines, lines, buttons, billboards, text, textured-quad tints, and 3D debug lines — is **ARGB `0xAARRGGBB`** (`0xFFFF0000` opaque red, `0x80000000` half-transparent black), and its type is **`core::Color`** (`bracken/core/color.hpp`). `Color` is exactly that 4-byte word and converts implicitly from one, so every hex literal you already write keeps working; what the type buys you is that a signature now says *which* color convention it takes. The engine has three and they are not interchangeable: `core::Color` (packed 8-bit ARGB — UI, billboards, debug lines), a **linear `glm::vec4`** draw tint, and a **linear `glm::vec3`** light color. The last two carry more than 8 bits per channel and may exceed 1.0, so they are deliberately *not* `Color`.
+
+```cpp
+Color::white();  Color::black();  Color::transparent();
+Color::rgba8(0xFF, 0xC0, 0x40);          // 8-bit channels, no transfer function
+Color::rgb(1.0f, 0.75f, 0.25f);          // normalized -> quantized to 8 bits
+c.to_linear();                           // glm::vec4 in [0,1] — the single decode
+```
+
+No sRGB transfer is applied anywhere: `to_linear()` is channel/255, because these colors are authored directly in the engine's linear space. The free `core::pack_color` / `core::unpack_color` pair is unchanged and is what `Color` is built on.
 
 One parameter-order trap remains: `UiLane::add_text(text, x, y, scale, color)` but the internal `UIRenderer::draw_text(text, x, y, color, scale)`. If you ever call the renderer directly, don't copy argument lists from frame-building code.
 
@@ -5646,7 +5655,7 @@ Contracts you must honor:
 
 For measurement, `UIRenderer::text_width(text, scale)` / `text_height(scale)` wrap the glyph metrics directly (0 when no font loaded); the underlying `render::TextRenderer` (`src/bracken/render/text_renderer.hpp`) also exposes `get_text_width`/`get_text_height` via `ui.text_renderer()`.
 
-`UIRenderer::draw_textured_quad(texture, x, y, w, h, tint, ...)` draws an arbitrary `SDL_GPUTexture*` in the UI pass (tint is packed ARGB via `core/color.hpp`) — useful for minimaps, portraits, or render-target previews.
+`UIRenderer::draw_textured_quad(texture, x, y, w, h, tint, ...)` draws an arbitrary `SDL_GPUTexture*` in the UI pass (tint is a `core::Color`, packed ARGB — `core/color.hpp`) — useful for minimaps, portraits, or render-target previews.
 
 Text drawing is exclusively the batched flow the engine uses (`queue_text_draw` → `upload_queued_text` before the pass → `draw_queued_text` inside it); the legacy immediate paths were removed.
 

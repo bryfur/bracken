@@ -5,6 +5,7 @@
 #include "bracken/contracts/light.hpp"
 #include "bracken/contracts/model_handle.hpp"
 #include "bracken/core/assert.hpp"
+#include "bracken/core/color.hpp"
 #include "bracken/memory/arena.hpp"
 #include "bracken/scene/draw_flags.hpp"
 
@@ -120,26 +121,23 @@ struct BonePalette {
 
 /**
  * Billboard UI element positioned in 3D world space (projected + distance-
- * scaled by the renderer). Colors are packed ARGB (0xAARRGGBB) — see
- * bracken/core/color.hpp.
+ * scaled by the renderer). core::Color is the engine's packed ARGB word
+ * (0xAARRGGBB) — see bracken/core/color.hpp.
  */
 struct BillboardDrawCommand {
     float world_x, world_y, world_z;
     float width;
     float fill_ratio;
-    uint32_t fill_color;  // packed ARGB
-    uint32_t bg_color;    // packed ARGB
-    uint32_t frame_color; // packed ARGB
+    bracken::core::Color fill_color;
+    bracken::core::Color bg_color;
+    bracken::core::Color frame_color;
 };
 
-/**
- * Debug line command: a single colored line segment in world space.
- * color is packed ARGB (0xAARRGGBB).
- */
+/** Debug line command: a single colored line segment in world space. */
 struct DebugLineDrawCommand {
     glm::vec3 start;
     glm::vec3 end;
-    uint32_t color;
+    bracken::core::Color color;
 };
 
 /**
@@ -188,39 +186,40 @@ struct EffectParticleSnapshot {
 };
 
 // ---------------------------------------------------------------------------
-// UI commands (mirror the retired UIScene commands). All `uint32_t color`
-// fields are packed ARGB (0xAARRGGBB) — see bracken/core/color.hpp. Text is
+// UI commands (mirror the retired UIScene commands). Every color is a
+// core::Color — the engine's packed ARGB word, see bracken/core/color.hpp
+// (these are NOT the linear glm::vec4 a draw tint carries). Text is
 // stored as string_views over packet-arena copies: no std::string, no heap,
 // no lifetime contract beyond the packet itself.
 // ---------------------------------------------------------------------------
 
 struct UiFilledRectCommand {
     float x, y, w, h;
-    uint32_t color;
+    bracken::core::Color color;
 };
 
 struct UiRectOutlineCommand {
     float x, y, w, h;
-    uint32_t color;
+    bracken::core::Color color;
     float line_width = 2.0f;
 };
 
 struct UiCircleCommand {
     float x, y, radius;
-    uint32_t color;
+    bracken::core::Color color;
     int segments = 24;
 };
 
 struct UiCircleOutlineCommand {
     float x, y, radius;
-    uint32_t color;
+    bracken::core::Color color;
     float line_width = 2.0f;
     int segments = 24;
 };
 
 struct UiLineCommand {
     float x1, y1, x2, y2;
-    uint32_t color;
+    bracken::core::Color color;
     float line_width = 2.0f;
 };
 
@@ -229,14 +228,14 @@ struct UiTextCommand {
     std::string_view text;
     float x{}, y{};
     float scale = 1.0f;
-    uint32_t color = 0xFFFFFFFF;
+    bracken::core::Color color = bracken::core::Color::white();
 };
 
 /** Button render command; `label` points into the packet arena. */
 struct UiButtonCommand {
     float x{}, y{}, w{}, h{};
     std::string_view label;
-    uint32_t color{};
+    bracken::core::Color color{};
     bool selected = false;
     uint8_t _pad0[3] = {0, 0, 0};
 };

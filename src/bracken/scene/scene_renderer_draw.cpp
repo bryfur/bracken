@@ -876,7 +876,7 @@ void SceneRenderer::upload_debug_lines(const FramePacket& frame, SDL_GPUCopyPass
     debug_line_scratch_.resize(vertex_count * 7);
     float* dst = debug_line_scratch_.data();
     for (const auto& line : lines) {
-        const glm::vec4 c = core::unpack_color(line.color);
+        const glm::vec4 c = line.color.to_linear();
 
         // Start vertex
         *dst++ = line.start.x;

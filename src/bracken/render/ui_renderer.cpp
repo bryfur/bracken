@@ -254,7 +254,7 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
     // Phase 1: Queue all text draws for batched rendering
     if (text_renderer_ && text_renderer_->is_ready()) {
         for (const auto& td : queued_text_draws_) {
-            text_renderer_->queue_text_draw(td.text, td.x, td.y, td.color, td.scale);
+            text_renderer_->queue_text_draw(td.text, td.x, td.y, td.color.argb, td.scale);
         }
     }
 
@@ -398,16 +398,16 @@ void UIRenderer::draw_quad(float x, float y, float w, float h, const glm::vec4& 
     range.vertex_count += 6;
 }
 
-void UIRenderer::draw_textured_quad(SDL_GPUTexture* texture, float x, float y, float w, float h, uint32_t tint,
+void UIRenderer::draw_textured_quad(SDL_GPUTexture* texture, float x, float y, float w, float h, core::Color tint,
                                     float u0, float v0, float u1, float v1) {
     if (!texture) {
         // No texture: degrade to a solid quad in the tint color
-        draw_quad(x, y, w, h, core::unpack_color(tint));
+        draw_quad(x, y, w, h, tint.to_linear());
         return;
     }
 
     DrawRange& range = range_for(texture);
-    const glm::vec4 c = core::unpack_color(tint);
+    const glm::vec4 c = tint.to_linear();
 
     UIVertex tl = {x, y, u0, v0, c.r, c.g, c.b, c.a};
     UIVertex tr = {x + w, y, u1, v0, c.r, c.g, c.b, c.a};
@@ -425,20 +425,20 @@ void UIRenderer::draw_textured_quad(SDL_GPUTexture* texture, float x, float y, f
     range.vertex_count += 6;
 }
 
-void UIRenderer::draw_filled_rect(float x, float y, float w, float h, uint32_t color) {
-    draw_quad(x, y, w, h, core::unpack_color(color));
+void UIRenderer::draw_filled_rect(float x, float y, float w, float h, core::Color color) {
+    draw_quad(x, y, w, h, color.to_linear());
 }
 
-void UIRenderer::draw_rect_outline(float x, float y, float w, float h, uint32_t color, float line_width) {
-    glm::vec4 c = core::unpack_color(color);
+void UIRenderer::draw_rect_outline(float x, float y, float w, float h, core::Color color, float line_width) {
+    glm::vec4 c = color.to_linear();
     draw_quad(x, y, w, line_width, c);                  // Top
     draw_quad(x, y + h - line_width, w, line_width, c); // Bottom
     draw_quad(x, y, line_width, h, c);                  // Left
     draw_quad(x + w - line_width, y, line_width, h, c); // Right
 }
 
-void UIRenderer::draw_circle(float x, float y, float radius, uint32_t color, int segments) {
-    glm::vec4 c = core::unpack_color(color);
+void UIRenderer::draw_circle(float x, float y, float radius, core::Color color, int segments) {
+    glm::vec4 c = color.to_linear();
     DrawRange& range = range_for(nullptr);
 
     constexpr float PI = 3.14159265359f;
@@ -457,7 +457,8 @@ void UIRenderer::draw_circle(float x, float y, float radius, uint32_t color, int
     }
 }
 
-void UIRenderer::draw_circle_outline(float x, float y, float radius, uint32_t color, float line_width, int segments) {
+void UIRenderer::draw_circle_outline(float x, float y, float radius, core::Color color, float line_width,
+                                     int segments) {
     if (line_width <= 0.0f || radius <= 0.0f || segments <= 0) {
         return;
     }
@@ -470,7 +471,7 @@ void UIRenderer::draw_circle_outline(float x, float y, float radius, uint32_t co
         return;
     }
 
-    glm::vec4 c = core::unpack_color(color);
+    glm::vec4 c = color.to_linear();
     DrawRange& range = range_for(nullptr);
 
     constexpr float PI = 3.14159265359f;
@@ -507,8 +508,8 @@ void UIRenderer::draw_circle_outline(float x, float y, float radius, uint32_t co
     }
 }
 
-void UIRenderer::draw_line(float x1, float y1, float x2, float y2, uint32_t color, float line_width) {
-    glm::vec4 c = core::unpack_color(color);
+void UIRenderer::draw_line(float x1, float y1, float x2, float y2, core::Color color, float line_width) {
+    glm::vec4 c = color.to_linear();
 
     float dx = x2 - x1;
     float dy = y2 - y1;
@@ -542,7 +543,7 @@ void UIRenderer::draw_line(float x1, float y1, float x2, float y2, uint32_t colo
     range.vertex_count += 6;
 }
 
-void UIRenderer::draw_text(std::string_view text, float x, float y, uint32_t color, float scale) {
+void UIRenderer::draw_text(std::string_view text, float x, float y, core::Color color, float scale) {
     if (!text.empty()) {
         // Queue text draw for later execution (during execute() phase).
         // Stores a view — the caller keeps the string alive until execute().
@@ -550,10 +551,10 @@ void UIRenderer::draw_text(std::string_view text, float x, float y, uint32_t col
     }
 }
 
-void UIRenderer::draw_button(float x, float y, float w, float h, const std::string& label, uint32_t color,
+void UIRenderer::draw_button(float x, float y, float w, float h, const std::string& label, core::Color color,
                              bool selected) {
     draw_filled_rect(x, y, w, h, color);
-    uint32_t border_color = selected ? 0xFFFFFFFF : 0xFF888888;
+    const core::Color border_color = selected ? core::Color::white() : core::Color{0xFF888888};
     draw_rect_outline(x, y, w, h, border_color, selected ? 3.0f : 2.0f);
 
     if (text_renderer_ && text_renderer_->is_ready() && !label.empty()) {

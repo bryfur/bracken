@@ -120,7 +120,7 @@ uint64_t packet_digest(const FramePacket& packet) {
     for (const auto& d : packet.debug_lines()) {
         hash_vec3(h, d.start);
         hash_vec3(h, d.end);
-        hash_u32(h, d.color);
+        hash_u32(h, d.color.argb);
     }
 
     // Effect spawns carry a host-owned definition POINTER. Addresses move with
@@ -169,14 +169,14 @@ uint64_t packet_digest(const FramePacket& packet) {
                     hash_f32(h, cmd.x);
                     hash_f32(h, cmd.y);
                     hash_f32(h, cmd.scale);
-                    hash_u32(h, cmd.color);
+                    hash_u32(h, cmd.color.argb);
                 } else if constexpr (std::is_same_v<T, UiButtonCommand>) {
                     hash_str(h, cmd.label);
                     hash_f32(h, cmd.x);
                     hash_f32(h, cmd.y);
                     hash_f32(h, cmd.w);
                     hash_f32(h, cmd.h);
-                    hash_u32(h, cmd.color);
+                    hash_u32(h, cmd.color.argb);
                     hash_u32(h, cmd.selected ? 1u : 0u);
                 } else {
                     // The remaining UI commands are pure 4-byte-member PODs.

@@ -160,15 +160,19 @@ public:
          */
         [[nodiscard]] BonePaletteAllocation alloc_bone_palette(uint32_t joint_count);
 
-        /** Mirrors of the RenderScene light/billboard/debug emits. Colors are
-         *  packed ARGB (0xAARRGGBB) — see bracken/core/color.hpp. */
+        /** Mirrors of the RenderScene light/billboard/debug emits.
+         *  bracken::core::Color is the packed ARGB word (0xAARRGGBB) and
+         *  converts implicitly from one, so hex literals still read as
+         *  colors — the type is there to say which of the engine's three
+         *  color conventions this parameter uses. */
         void add_point_light(const bracken::render::lighting::PointLight& light);
         void add_spot_light(const bracken::render::lighting::SpotLight& light);
         void add_billboard_3d(float world_x, float world_y, float world_z, float width, float fill_ratio,
-                              uint32_t fill_color, uint32_t bg_color, uint32_t frame_color);
-        void add_debug_line(const glm::vec3& start, const glm::vec3& end, uint32_t color);
-        void add_debug_sphere(const glm::vec3& center, float radius, uint32_t color, int segments = 16);
-        void add_debug_box(const glm::vec3& min, const glm::vec3& max, uint32_t color);
+                              bracken::core::Color fill_color, bracken::core::Color bg_color,
+                              bracken::core::Color frame_color);
+        void add_debug_line(const glm::vec3& start, const glm::vec3& end, bracken::core::Color color);
+        void add_debug_sphere(const glm::vec3& center, float radius, bracken::core::Color color, int segments = 16);
+        void add_debug_box(const glm::vec3& min, const glm::vec3& max, bracken::core::Color color);
 
         /** Queue a particle effect spawn (mirror of add_particle_effect_spawn;
          *  consumed exactly once from the sealed packet). */
@@ -269,13 +273,15 @@ public:
      */
     class UiLane {
     public:
-        void add_filled_rect(float x, float y, float w, float h, uint32_t color);
-        void add_rect_outline(float x, float y, float w, float h, uint32_t color, float line_width = 2.0f);
-        void add_circle(float x, float y, float radius, uint32_t color, int segments = 24);
-        void add_circle_outline(float x, float y, float radius, uint32_t color, float line_width = 2.0f,
+        void add_filled_rect(float x, float y, float w, float h, bracken::core::Color color);
+        void add_rect_outline(float x, float y, float w, float h, bracken::core::Color color,
+                              float line_width = 2.0f);
+        void add_circle(float x, float y, float radius, bracken::core::Color color, int segments = 24);
+        void add_circle_outline(float x, float y, float radius, bracken::core::Color color, float line_width = 2.0f,
                                 int segments = 24);
-        void add_line(float x1, float y1, float x2, float y2, uint32_t color, float line_width = 2.0f);
-        void add_text(std::string_view text, float x, float y, float scale = 1.0f, uint32_t color = 0xFFFFFFFF);
+        void add_line(float x1, float y1, float x2, float y2, bracken::core::Color color, float line_width = 2.0f);
+        void add_text(std::string_view text, float x, float y, float scale = 1.0f,
+                      bracken::core::Color color = bracken::core::Color::white());
 
         /**
          * Word-wrapped text (mirror of UIScene::add_text_wrapped). Returns
@@ -283,9 +289,10 @@ public:
          * line_height defaults to 18 * scale.
          */
         float add_text_wrapped(std::string_view text, float x, float y, float max_width, float scale = 1.0f,
-                               uint32_t color = 0xFFFFFFFF, float line_height = 0.0f);
+                               bracken::core::Color color = bracken::core::Color::white(),
+                               float line_height = 0.0f);
 
-        void add_button(float x, float y, float w, float h, std::string_view label, uint32_t color,
+        void add_button(float x, float y, float w, float h, std::string_view label, bracken::core::Color color,
                         bool selected = false);
 
     private:
@@ -335,16 +342,17 @@ public:
     void add_point_light(const bracken::render::lighting::PointLight& light) { lane(0).add_point_light(light); }
     void add_spot_light(const bracken::render::lighting::SpotLight& light) { lane(0).add_spot_light(light); }
     void add_billboard_3d(float world_x, float world_y, float world_z, float width, float fill_ratio,
-                          uint32_t fill_color, uint32_t bg_color, uint32_t frame_color) {
+                          bracken::core::Color fill_color, bracken::core::Color bg_color,
+                          bracken::core::Color frame_color) {
         lane(0).add_billboard_3d(world_x, world_y, world_z, width, fill_ratio, fill_color, bg_color, frame_color);
     }
-    void add_debug_line(const glm::vec3& start, const glm::vec3& end, uint32_t color) {
+    void add_debug_line(const glm::vec3& start, const glm::vec3& end, bracken::core::Color color) {
         lane(0).add_debug_line(start, end, color);
     }
-    void add_debug_sphere(const glm::vec3& center, float radius, uint32_t color, int segments = 16) {
+    void add_debug_sphere(const glm::vec3& center, float radius, bracken::core::Color color, int segments = 16) {
         lane(0).add_debug_sphere(center, radius, color, segments);
     }
-    void add_debug_box(const glm::vec3& min, const glm::vec3& max, uint32_t color) {
+    void add_debug_box(const glm::vec3& min, const glm::vec3& max, bracken::core::Color color) {
         lane(0).add_debug_box(min, max, color);
     }
     void spawn_effect(const bracken::EffectDefinition* definition, const glm::vec3& position,
