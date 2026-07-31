@@ -1,17 +1,12 @@
 #include "scene_renderer.hpp"
 #include "scene_renderer_internal.hpp"
-#include "bracken/animation/animation_types.hpp" // MAX_BONES
 #include "bracken/core/assert.hpp"
-#include "bracken/core/color.hpp"
 #include "bracken/core/jobs/job_system.hpp"
-#include "bracken/core/jobs/parallel_for.hpp"
-#include "bracken/core/jobs/task_group.hpp"
 #include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_debug.hpp"
-#include "bracken/gpu/gpu_pipeline.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
@@ -36,7 +31,6 @@
 #include "frustum.hpp"
 #include "SDL3/SDL_gpu.h"
 #include "SDL3/SDL_video.h"
-#include <SDL3_image/SDL_image.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -1279,86 +1273,6 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
         capture_screenshot_and_end_frame();
     } else {
         end_frame();
-    }
-}
-
-void SceneRenderer::capture_screenshot_and_end_frame() {
-    const std::string path = std::move(pending_screenshot_path_);
-    pending_screenshot_path_.clear();
-
-    const uint32_t w = static_cast<uint32_t>(context_->width());
-    const uint32_t h = static_cast<uint32_t>(context_->height());
-    gpu::GPUDevice& device = context_->device();
-
-    SDL_GPUTransferBufferCreateInfo tb_info{};
-    tb_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
-    tb_info.size = w * h * 4;
-    SDL_GPUTransferBuffer* transfer = device.create_transfer_buffer(tb_info);
-    if (!transfer) {
-        BRACKEN_LOG_ERROR(LOG_TAG, "Screenshot: failed to create download buffer: {}", SDL_GetError());
-        end_frame();
-        return;
-    }
-
-    // Record the download on this frame's command buffer, then submit with a
-    // fence and block — the transfer buffer is only coherent after the GPU is
-    // done. Copy passes can't nest in render passes; all passes ended above.
-    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(context_->current_command_buffer());
-    SDL_GPUTextureRegion src{};
-    src.texture = current_swapchain_;
-    src.w = w;
-    src.h = h;
-    src.d = 1;
-    SDL_GPUTextureTransferInfo dst{};
-    dst.transfer_buffer = transfer;
-    SDL_DownloadFromGPUTexture(copy, &src, &dst);
-    SDL_EndGPUCopyPass(copy);
-
-    const SDL_GPUTextureFormat gpu_format = context_->swapchain_format();
-    current_swapchain_ = nullptr;
-    if (!context_->end_frame_and_wait()) {
-        device.release_transfer_buffer(transfer);
-        return;
-    }
-
-    SDL_PixelFormat pixel_format;
-    switch (gpu_format) {
-    case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM:
-    case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB:
-        pixel_format = SDL_PIXELFORMAT_BGRA32;
-        break;
-    case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM:
-    case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB:
-        pixel_format = SDL_PIXELFORMAT_RGBA32;
-        break;
-    default:
-        BRACKEN_LOG_WARN(LOG_TAG, "Screenshot: unexpected swapchain format {}, assuming RGBA8",
-                         static_cast<int>(gpu_format));
-        pixel_format = SDL_PIXELFORMAT_RGBA32;
-        break;
-    }
-
-    bool saved = false;
-    if (void* pixels = device.map_transfer_buffer(transfer, false)) {
-        SDL_Surface* surface =
-            SDL_CreateSurfaceFrom(static_cast<int>(w), static_cast<int>(h), pixel_format, pixels, static_cast<int>(w * 4));
-        if (surface) {
-            // RGB24 drops the alpha channel — swapchain alpha is undefined and
-            // would render the PNG transparent in viewers.
-            if (SDL_Surface* rgb = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGB24)) {
-                saved = IMG_SavePNG(rgb, path.c_str());
-                SDL_DestroySurface(rgb);
-            }
-            SDL_DestroySurface(surface);
-        }
-        device.unmap_transfer_buffer(transfer);
-    }
-    device.release_transfer_buffer(transfer);
-
-    if (saved) {
-        BRACKEN_LOG_INFO(LOG_TAG, "SceneRenderer: screenshot saved to '{}' ({}x{})", path.c_str(), w, h);
-    } else {
-        BRACKEN_LOG_ERROR(LOG_TAG, "Screenshot: failed to save '{}': {}", path, SDL_GetError());
     }
 }
 

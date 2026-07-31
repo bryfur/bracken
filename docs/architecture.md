@@ -306,6 +306,24 @@ before those passes run.
 (`scene/scene_renderer.cpp`; each GPU section has a matching debug group +
 timer label, so RenderDoc captures read in this order.)
 
+`SceneRenderer`'s implementation is **one class across six translation
+units** — no interface change, and the pass *sequence* below still lives as
+one linear script in `render_frame`:
+
+| File | Holds |
+|---|---|
+| `scene/scene_renderer.cpp` | init/shutdown/lifecycle/setters + the `render_frame` orchestration script |
+| `scene/scene_renderer_upload.cpp` | the per-frame GPU uploads (instances, bone palettes) — the **main-thread side** of the Prepare tier boundary; everything here takes an `SDL_GPUCopyPass*` |
+| `scene/scene_renderer_prepass.cpp` | the depth prepass + its instanced/static/skinned draw walks |
+| `scene/scene_renderer_draw.cpp` | the main pass: `render_3d_scene`, model/skinned/instanced/transparent draws, the model-family pipeline binds, UI, billboards, debug lines |
+| `scene/scene_renderer_shadow.cpp` | CSM cascade passes, the instanced shadow walk, local (point/spot) tile passes, `bind_shadow_data` / `bind_cluster_lights` |
+| `scene/scene_renderer_capture.cpp` | the screenshot download + PNG encode (the only GPU download + fence block in the renderer) |
+
+`scene/scene_renderer_internal.hpp` carries what more than one of them needs
+and no host should see (`LOG_TAG`, the `apply_mesh_material` template). It
+does **not** carry the class's private member declarations — C++ requires
+those inside the class definition, so `scene_renderer.hpp` keeps them.
+
 1. **CPU prep** — capture the frame's unjittered view-projection (and apply
    the TAA sub-pixel Halton(2,3) jitter to the draw projection — applied
    exactly when `aa_mode == AAMode::TAA` and the TAA resolve can run;

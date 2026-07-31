@@ -96,6 +96,45 @@ module follows the boot-time `bool init()` + log error-handling convention.
 
 ---
 
+## Decision record — 2026-07-31: no per-pass objects in the renderer
+
+**Decision.** `SceneRenderer`'s implementation is split across six
+translation units (see architecture.md) and the Prepare stage is extracted as
+a type (`scene::ScenePrep`), but the passes themselves are **not** turned into
+objects. There is no `DepthPrepassPass`, `ShadowCascadePass`, `LocalShadowPass`
+or `ForwardScenePass`, and there will not be one without a new argument.
+
+**Why.** The pass *sequence* is load-bearing, not incidental: `render_frame`
+carries ~20 explicit, commented ordering decisions (uploads before any render
+pass because copy passes cannot nest; IBL refresh before the forward pass so
+same-frame draws sample the newest faces; water after the opaque scene but
+before TAA; the late swapchain acquire; GTAO between the prepass and the
+forward pass). That is the same reason `render_graph/` is deliberately not in
+the frame path. The sequence therefore has to stay one linear script whatever
+else changes, and pass objects buy nothing but 6–10 back-reference members
+each while turning `main_render_pass_`, the prepass flag and the pipeline-
+variant flags into cross-type invariants — strictly worse than the
+entry-order dependency they would be replacing.
+
+**What was done instead.** The two extractions that change a real property:
+`RenderPlan` (the pass-selection tree becomes pure and testable) and
+`ScenePrep` (the thread-tier boundary becomes a type that structurally cannot
+violate itself). The TU split is navigability and parallel compilation, and
+is honest about being nothing more.
+
+**Named, deferred, not re-derivable from scratch each time.**
+`FrameView`/`FramePassState` — collapsing the ~22 frame-scoped header members
+into an immutable half and a mutable half — is the prerequisite for anything
+further and is worth doing, but only after the above has held. The naive
+"build one immutable view and pass it everywhere" version is *wrong*:
+`frame_prepass_active_`, `frame_ao_texture_` and `frame_shadow_uniforms_` are
+written mid-frame, after the camera state is final. `FrameGeometry`,
+`ModelBindState` (four verbatim copies of the slot-1/2/6/7/10 bind sequence),
+`PostChain` and `ScreenshotCapture`-as-a-type are worth doing only if a
+measured need appears.
+
+---
+
 ## Decision record — 2026-07-18: natively multithreaded engine
 
 **Decision.** Bracken is rebuilt as a natively multithreaded engine — the
