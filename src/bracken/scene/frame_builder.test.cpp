@@ -5,6 +5,7 @@
 #include "bracken/effects/effect_definition.hpp"
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -17,6 +18,7 @@
 #include <variant>
 #include <vector>
 
+using bracken::testing::FrameAccess;
 using namespace bracken::scene;
 using bracken::render::lighting::PointLightDesc;
 using bracken::render::lighting::SpotLightDesc;
@@ -144,7 +146,7 @@ TEST(FrameBuilder, EmitsEveryCommandTypeWithExactValues) {
     fb.add_billboard_3d(7, 8, 9, 46.0f, 0.5f, 0xFFFFC040, 0x60000000, 0xFFFFD080);
     fb.add_debug_line({0, 0, 0}, {1, 1, 1}, 0xFF30FF60);
     fb.spawn_effect(&effect_def, {10, 11, 12}, {0, 1, 0});
-    fb.seal();
+    FrameAccess::seal(fb);
 
     ASSERT_EQ(p.model_commands().size(), 1u);
     const ModelDrawCommand& mc = p.model_commands()[0];
@@ -207,7 +209,7 @@ TEST(FrameBuilder, DebugSphereAndBoxExpandLikeRenderScene) {
     FrameBuilder fb(p);
     fb.add_debug_sphere({0, 0, 0}, 1.0f, 0xFF0000FF, 16); // 3 circles * 16 segments
     fb.add_debug_box({0, 0, 0}, {1, 1, 1}, 0xFF00FF00);   // 12 edges
-    fb.seal();
+    FrameAccess::seal(fb);
     EXPECT_EQ(p.debug_lines().size(), 3u * 16u + 12u);
 }
 
@@ -222,8 +224,8 @@ TEST(FrameBuilder, SingularStateAndToggles) {
     fb.set_draw_skybox(false);
     fb.set_draw_ground(false);
     fb.set_draw_grass(false);
-    fb.set_frame_timing(0.016f, 3.5, 210);
-    fb.seal();
+    FrameAccess::set_frame_timing(fb, 0.016f, 3.5, 210);
+    FrameAccess::seal(fb);
 
     EXPECT_TRUE(p.has_camera());
     EXPECT_EQ(p.camera().position, glm::vec3(1, 2, 3));
@@ -242,7 +244,7 @@ TEST(FrameBuilder, SingularStateAndToggles) {
 TEST(FrameBuilder, EmptySealedFrameHasDefaults) {
     FramePacket p;
     FrameBuilder fb(p);
-    fb.seal();
+    FrameAccess::seal(fb);
     EXPECT_TRUE(p.model_commands().empty());
     EXPECT_TRUE(p.skinned_commands().empty());
     EXPECT_TRUE(p.ui_commands().empty());
@@ -263,7 +265,7 @@ TEST(FrameBuilder, ChunkSpillPreservesOrderAndCount) {
     for (uint32_t i = 0; i < N; ++i) {
         fb.draw_model(i + 1, translation(float(i), 0, 0), {1, 1, 1, 1}, DrawFlags::None, i);
     }
-    fb.seal();
+    FrameAccess::seal(fb);
     ASSERT_EQ(p.model_commands().size(), N);
     for (uint32_t i = 0; i < N; ++i) {
         EXPECT_EQ(p.model_commands()[i].motion_id, i);
@@ -284,7 +286,7 @@ TEST(FrameBuilder, LaneMergeOrderIsLaneMajor) {
     fb.lane(1).add_debug_line({1, 0, 0}, {1, 1, 0}, 100);
     fb.lane(0).add_debug_line({0, 0, 1}, {0, 1, 1}, 1);
     fb.lane(2).add_debug_line({2, 0, 1}, {2, 1, 1}, 201);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     ASSERT_EQ(p.debug_lines().size(), 5u);
     EXPECT_EQ(p.debug_lines()[0].color, 0u);   // lane 0, first
@@ -315,7 +317,7 @@ TEST(FrameBuilder, PaletteAllocationIsAlignedAndOffsetsPrefixSum) {
         }
         fb.draw_skinned(uint32_t(a + 1), glm::mat4(1.0f), allocs[a].id);
     }
-    fb.seal();
+    FrameAccess::seal(fb);
 
     // Merged in (lane, allocation) order == allocation order here.
     ASSERT_EQ(p.palettes().size(), 3u);
@@ -349,7 +351,7 @@ TEST(FrameBuilder, PaletteIdFromAnotherLaneIsUsable) {
     pal.matrices[1] = glm::mat4(1.0f);
     fb.lane(1).draw_skinned(5, glm::mat4(1.0f), pal.id); // used from lane 1
     fb.lane(0).draw_skinned(6, glm::mat4(1.0f), pal.id);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     ASSERT_EQ(p.palettes().size(), 1u);
     ASSERT_EQ(p.skinned_commands().size(), 2u);
@@ -371,7 +373,7 @@ TEST(FrameBuilder, PaletteBudgetFailsVisiblyAtBuildTime) {
     EXPECT_FALSE(over.valid());
     EXPECT_TRUE(over.matrices.empty());
     fb.draw_skinned(2, glm::mat4(1.0f), over.id);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_EQ(p.palettes().size(), FramePacket::MAX_BONE_PALETTES);
     EXPECT_EQ(p.skinned_commands().size(), FramePacket::MAX_BONE_PALETTES);
@@ -392,7 +394,7 @@ TEST(FrameBuilder, UiCommandsMirrorUiScene) {
     ui.add_line(1, 2, 3, 4, 0xFFFFFFFF, 4.0f);
     ui.add_text("bracken playground", 22, 20, 1.0f, 0xFFFFD080);
     ui.add_button(15, 16, 17, 18, "OK", 0xFF808080, true);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     ASSERT_EQ(p.ui_commands().size(), 7u);
     ASSERT_TRUE(p.ui_commands()[0].is<UiFilledRectCommand>());
@@ -421,7 +423,7 @@ TEST(FrameBuilder, UiTextIsCopiedIntoPacketMemory) {
     fb.ui().add_text(long_text, 0, 20);
     transient.assign("clobbered!!");
     long_text.assign("gone");
-    fb.seal();
+    FrameAccess::seal(fb);
 
     ASSERT_EQ(p.ui_commands().size(), 2u);
     EXPECT_EQ(p.ui_commands()[0].get<UiTextCommand>().text, "short lived");
@@ -437,7 +439,7 @@ TEST(FrameBuilder, UiTextWrappedMatchesUiSceneAlgorithm) {
     // second space: ["aaa bbb", "ccc"], height 2 * 18.
     const float height = fb.ui().add_text_wrapped("aaa bbb ccc", 10, 10, 64.0f);
     EXPECT_EQ(height, 36.0f);
-    fb.seal();
+    FrameAccess::seal(fb);
     ASSERT_EQ(p.ui_commands().size(), 2u);
     EXPECT_EQ(p.ui_commands()[0].get<UiTextCommand>().text, "aaa bbb");
     EXPECT_EQ(p.ui_commands()[0].get<UiTextCommand>().y, 10.0f);
@@ -480,8 +482,8 @@ void build_deterministic_frame(bracken::core::jobs::JobSystem& js, FramePacket& 
         });
     }
     js.wait(group); // all lane writes happen-before the seal
-    fb.set_frame_timing(0.016f, 1.0, 7);
-    fb.seal();
+    FrameAccess::set_frame_timing(fb, 0.016f, 1.0, 7);
+    FrameAccess::seal(fb);
 }
 
 } // namespace
@@ -532,7 +534,7 @@ TEST(FrameBuilder, MultiLaneMergeIsDeterministicAndContentComplete) {
     EXPECT_EQ(run1, canonical_bytes(p2));
 
     // Run 3: ring-style reuse of packet 1 (reset + rebuild) — still identical.
-    p1.reset();
+    FrameAccess::reset(p1);
     build_deterministic_frame(js, p1);
     EXPECT_EQ(run1, canonical_bytes(p1));
 
@@ -551,7 +553,7 @@ TEST(FrameBuilderDeathTest, EmitAfterSealAsserts) {
         {
             FramePacket p;
             FrameBuilder fb(p);
-            fb.seal();
+            FrameAccess::seal(fb);
             fb.draw_model(1, glm::mat4(1.0f));
         },
         "outside the Filling state");
@@ -563,7 +565,7 @@ TEST(FrameBuilderDeathTest, UiEmitAfterSealAsserts) {
             FramePacket p;
             FrameBuilder fb(p);
             auto ui = fb.ui();
-            fb.seal();
+            FrameAccess::seal(fb);
             ui.add_text("late", 0, 0);
         },
         "outside the Filling state");
@@ -574,7 +576,7 @@ TEST(FrameBuilderDeathTest, SetCameraAfterSealAsserts) {
         {
             FramePacket p;
             FrameBuilder fb(p);
-            fb.seal();
+            FrameAccess::seal(fb);
             fb.set_camera(CameraState{glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f), glm::vec3(0)});
         },
         "outside the Filling state");
@@ -585,8 +587,8 @@ TEST(FrameBuilderDeathTest, SealTwiceAsserts) {
         {
             FramePacket p;
             FrameBuilder fb(p);
-            fb.seal();
-            fb.seal();
+            FrameAccess::seal(fb);
+            FrameAccess::seal(fb);
         },
         "seal called twice");
 }

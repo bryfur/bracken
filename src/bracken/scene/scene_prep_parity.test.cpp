@@ -22,6 +22,7 @@
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/motion_history.hpp"
 #include "bracken/scene/scene_prep.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <array>
 #include <cstddef>
@@ -34,6 +35,7 @@
 #include <string>
 #include <vector>
 
+using bracken::testing::FrameAccess;
 using namespace bracken;
 using namespace bracken::scene;
 namespace jobs = bracken::core::jobs;
@@ -197,7 +199,7 @@ void build_world(PrepWorld& w, size_t model_count, size_t skinned_count) {
         const uint32_t motion_id = (rng.next_bits(1u) == 0) ? 1u + (rng.next_u32() % 200u) : 0u;
         fb.draw_skinned(h, make_transform(rng), alloc.id, {1, 1, 1, 1}, DrawFlags::None, motion_id);
     }
-    fb.seal();
+    FrameAccess::seal(fb);
 }
 
 // ---------------------------------------------------------------------------

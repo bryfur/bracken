@@ -7,6 +7,7 @@
 #include "bracken/input_handler.hpp"
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -14,6 +15,7 @@
 #include <SDL3/SDL_events.h>
 #include <vector>
 
+using bracken::testing::FrameAccess;
 using bracken::InputHandler;
 using bracken::InputSnapshot;
 using bracken::SimFeedback;
@@ -57,14 +59,17 @@ TEST(SimFrame, AccessorsExposeFrameContexts) {
     EXPECT_FLOAT_EQ(sim.dt(), 0.016f);
     EXPECT_DOUBLE_EQ(sim.time(), 1.25);
     EXPECT_EQ(sim.frame_index(), 7u);
-    EXPECT_EQ(&sim.frame(), &fb);
+    // sim.frame() is a FrameSink over the builder handed in — the host half
+    // of it and nothing else (seal()/set_frame_timing() are not reachable).
+    sim.frame().draw_model(bracken::ModelHandle{9}, glm::mat4(1.0f));
+    EXPECT_EQ(fb.lane_count(), 1u);
     // input() is the exact snapshot handed in — by reference, no copy.
     EXPECT_EQ(&sim.input(), &input);
     EXPECT_FLOAT_EQ(sim.input().camera_yaw, 42.0f);
     EXPECT_TRUE(sim.input().mouse_left_pressed);
 
-    fb.seal();
-    packet.reset();
+    FrameAccess::seal(fb);
+    FrameAccess::reset(packet);
 }
 
 TEST(SimFrame, EmissionThroughFrameReachesSealedPacket) {
@@ -75,11 +80,11 @@ TEST(SimFrame, EmissionThroughFrameReachesSealedPacket) {
 
     sim.frame().draw_model(bracken::ModelHandle{3}, glm::mat4(1.0f));
     sim.frame().ui().add_text("hello", 1.0f, 2.0f);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_EQ(packet.model_commands().size(), 1u);
     EXPECT_EQ(packet.ui_commands().size(), 1u);
-    packet.reset();
+    FrameAccess::reset(packet);
 }
 
 // --- Feedback (set_camera_forward) ---
@@ -97,8 +102,8 @@ TEST(SimFrame, SetCameraForwardRecordsFeedback) {
     EXPECT_FLOAT_EQ(feedback.camera_forward_x, 0.6f);
     EXPECT_FLOAT_EQ(feedback.camera_forward_z, -0.8f);
 
-    fb.seal();
-    packet.reset();
+    FrameAccess::seal(fb);
+    FrameAccess::reset(packet);
 }
 
 TEST(SimFrame, SetCameraForwardWithoutFeedbackIsNoop) {
@@ -107,8 +112,8 @@ TEST(SimFrame, SetCameraForwardWithoutFeedbackIsNoop) {
     InputSnapshot input;
     SimFrame sim(fb, input, 0.016f, 0.0, 0, nullptr);
     sim.set_camera_forward(1.0f, 0.0f); // must not crash
-    fb.seal();
-    packet.reset();
+    FrameAccess::seal(fb);
+    FrameAccess::reset(packet);
 }
 
 // --- Threading surface ---
@@ -125,8 +130,8 @@ TEST_F(SimFrameJobsTest, ParallelForIndexFormCoversRangeExactlyOnce) {
         ASSERT_EQ(hits[i], 1) << "index " << i;
     }
 
-    fb.seal();
-    packet.reset();
+    FrameAccess::seal(fb);
+    FrameAccess::reset(packet);
 }
 
 TEST_F(SimFrameJobsTest, ParallelForRangeFormMutatesElements) {
@@ -141,8 +146,8 @@ TEST_F(SimFrameJobsTest, ParallelForRangeFormMutatesElements) {
         ASSERT_EQ(values[i], 6) << "index " << i;
     }
 
-    fb.seal();
-    packet.reset();
+    FrameAccess::seal(fb);
+    FrameAccess::reset(packet);
 }
 
 TEST_F(SimFrameJobsTest, RunAsyncJoinsThroughHostOwnedGroup) {
@@ -158,8 +163,8 @@ TEST_F(SimFrameJobsTest, RunAsyncJoinsThroughHostOwnedGroup) {
     JobSystem::instance().wait(group);
     EXPECT_EQ(ran.load(std::memory_order_relaxed), 2);
 
-    fb.seal();
-    packet.reset();
+    FrameAccess::seal(fb);
+    FrameAccess::reset(packet);
 }
 
 // --- Engine-internal builder API (the sim-stage tail's tools) ---
@@ -176,24 +181,24 @@ TEST(FrameBuilderEngine, ForEachEffectSpawnWalksLaneMajorOrder) {
     fb.lane(0).spawn_effect(&def_a, {1.0f, 2.0f, 3.0f});
 
     std::vector<const bracken::EffectDefinition*> order;
-    fb.for_each_effect_spawn([&](const bracken::scene::EffectSpawnCommand& s) { order.push_back(s.definition); });
+    FrameAccess::for_each_effect_spawn(fb, [&](const bracken::scene::EffectSpawnCommand& s) { order.push_back(s.definition); });
     ASSERT_EQ(order.size(), 2u);
     EXPECT_EQ(order[0], &def_a);
     EXPECT_EQ(order[1], &def_b);
 
-    fb.seal();
+    FrameAccess::seal(fb);
     // seal() merges the same lane-major order into the packet view.
     ASSERT_EQ(packet.effect_spawns().size(), 2u);
     EXPECT_EQ(packet.effect_spawns()[0].definition, &def_a);
     EXPECT_EQ(packet.effect_spawns()[1].definition, &def_b);
-    packet.reset();
+    FrameAccess::reset(packet);
 }
 
 TEST(FrameBuilderEngine, EngineFrameSectionRoundTripsThroughSeal) {
     FramePacket packet;
     FrameBuilder fb(packet);
 
-    auto alloc = fb.alloc_effect_snapshot(1, 2);
+    auto alloc = FrameAccess::alloc_effect_snapshot(fb, 1, 2);
     ASSERT_EQ(alloc.emitters.size(), 1u);
     ASSERT_EQ(alloc.particles.size(), 2u);
     alloc.emitters[0] = {nullptr, 0, 2};
@@ -201,8 +206,8 @@ TEST(FrameBuilderEngine, EngineFrameSectionRoundTripsThroughSeal) {
     alloc.particles[0].opacity = 0.5f;
     alloc.particles[1].position = {4.0f, 5.0f, 6.0f};
     alloc.particles[1].scale = 2.0f;
-    fb.set_engine_frame(/*scene_time=*/1.5f, /*sky_time=*/0.25f, /*effect_instance_count=*/3);
-    fb.seal();
+    FrameAccess::set_engine_frame(fb, /*scene_time=*/1.5f, /*sky_time=*/0.25f, /*effect_instance_count=*/3);
+    FrameAccess::seal(fb);
 
     EXPECT_TRUE(packet.has_engine_frame());
     EXPECT_FLOAT_EQ(packet.scene_time(), 1.5f);
@@ -214,27 +219,27 @@ TEST(FrameBuilderEngine, EngineFrameSectionRoundTripsThroughSeal) {
     EXPECT_FLOAT_EQ(packet.effect_particles()[0].opacity, 0.5f);
     EXPECT_FLOAT_EQ(packet.effect_particles()[1].scale, 2.0f);
 
-    packet.reset();
+    FrameAccess::reset(packet);
     // The engine section resets with the packet.
     FrameBuilder fb2(packet);
-    fb2.seal();
+    FrameAccess::seal(fb2);
     EXPECT_FALSE(packet.has_engine_frame());
     EXPECT_EQ(packet.effect_emitters().size(), 0u);
     EXPECT_EQ(packet.effect_particles().size(), 0u);
     EXPECT_EQ(packet.effect_instance_count(), 0u);
-    packet.reset();
+    FrameAccess::reset(packet);
 }
 
 TEST(FrameBuilderEngine, EmptyEffectSnapshotRegistersEmptySpans) {
     FramePacket packet;
     FrameBuilder fb(packet);
-    auto alloc = fb.alloc_effect_snapshot(0, 0);
+    auto alloc = FrameAccess::alloc_effect_snapshot(fb, 0, 0);
     EXPECT_TRUE(alloc.emitters.empty());
     EXPECT_TRUE(alloc.particles.empty());
-    fb.seal();
+    FrameAccess::seal(fb);
     EXPECT_TRUE(packet.effect_emitters().empty());
     EXPECT_TRUE(packet.effect_particles().empty());
-    packet.reset();
+    FrameAccess::reset(packet);
 }
 
 // --- EffectSystem::snapshot_into (the sim-stage tail itself) ---
@@ -262,7 +267,7 @@ TEST(EffectSystemSnapshot, SnapshotMatchesLiveSystem) {
     FramePacket packet;
     FrameBuilder fb(packet);
     system.snapshot_into(fb);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     ASSERT_EQ(packet.effect_emitters().size(), 1u);
     ASSERT_EQ(packet.effect_particles().size(), system.particle_count());
@@ -281,7 +286,7 @@ TEST(EffectSystemSnapshot, SnapshotMatchesLiveSystem) {
         EXPECT_FLOAT_EQ(s.opacity, live[i].opacity) << i;
         EXPECT_EQ(s.color, live[i].color) << i;
     }
-    packet.reset();
+    FrameAccess::reset(packet);
 }
 
 // --- InputSnapshot copy (headless: synthesized events, no SDL video) ---

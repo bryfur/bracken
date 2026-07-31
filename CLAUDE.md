@@ -100,7 +100,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) over `pipeline_catalog.hpp` (one `constexpr` row per `PipelineType`: shaders, resources, vertex layout, target, depth/blend state), `gpu_uniforms.hpp` (CPU↔GPU contract) |
 | `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO, TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
-| `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
+| `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
 | `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
 | `systems/` | `bracken::systems` | camera controller/system |
 | `effects/` | *(namespaces unchanged)* | the particle-effect triad in one place: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage owned: spawned/updated/snapshotted inside the sim job), `EffectRenderer` (draws the packet snapshot) |
@@ -115,7 +115,7 @@ Render(i)), frame timing, and input. Consumers subclass it and override
 `on_init`/`on_simulate(SimFrame&)`/`on_shutdown` (plus optional
 `on_main_frame(MainFrame&)` and `on_event`). There is no
 `on_update`/`on_render`: the host *describes* a frame through
-`SimFrame::frame()`'s `FrameBuilder` — from a pool job — and the engine
+`SimFrame::frame()`'s `FrameSink` — from a pool job — and the engine
 draws it.
 
 ### Key patterns
@@ -126,16 +126,29 @@ draws it.
   scene pipelines compare `GREATER_OR_EQUAL` and clear depth to 0.0. The
   shadow-cascade passes deliberately stay standard-Z — see architecture.md).
 - Frame data flows one way, by value: in `on_simulate` the host fills a
-  `scene::FramePacket` through `sim.frame()`'s `scene::FrameBuilder` (3D
+  `scene::FramePacket` through `sim.frame()`'s **`scene::FrameSink`** (3D
   draws, lights, UI, effect spawns, camera/environment), the engine's
   sim-stage tail appends the effect-instance snapshot + scene/sky clocks and
-  `seal()`s, and the renderer consumes `const FramePacket&`. Everything is
-  copied or packet-allocated (bone palettes via `alloc_bone_palette`, UI text
-  copied into the packet arena) — **no host-lifetime contracts** cross the
-  boundary. A packet is consumed exactly once, then retired to its
+  `seal()`s, and the renderer consumes `const FramePacket&`. `FrameSink` is
+  the host half of `FrameBuilder`; the sim-stage tail (`seal`,
+  `set_frame_timing`, `alloc_effect_snapshot`, `set_engine_frame`, the
+  staged-environment reads, `packet()`) and `FramePacket`'s lifecycle
+  (`begin_fill`/`begin_consume`/`reset`/`reserve_block`) are **private** —
+  friends are `Application`, `systems::EffectSystem` and
+  `testing::FrameAccess`. Everything is copied or packet-allocated (bone
+  palettes via `alloc_bone_palette`, UI text copied into the packet arena),
+  with **two named lifetime exceptions**: `EffectSpawnCommand::definition`
+  and `EffectEmitterSnapshot::definition` are host-owned pointers that must
+  outlive every instance spawned from them (documented at the top of
+  `scene/frame_packet.hpp`; null is a `BRACKEN_CONTRACT` at emit and at
+  consume). A packet is consumed exactly once, then retired to its
   `PacketRing`. `BonePaletteId`s held by the host across `seal()` are stale;
-  only re-read them from sealed commands. Do not call `seal()` or
-  `set_frame_timing` from `on_simulate` — the engine does both.
+  only re-read them from sealed commands.
+- Hosts can unit-test their own frame code headlessly:
+  `bracken/testing/frame_test.hpp` ships `testing::TestFrame` (build a frame
+  through a `FrameSink`, `seal()`, read back typed views + `digest()`) and
+  `testing::FrameAccess` (the friend escape hatch for the engine tail). No
+  GPU, no window.
 - All lighting is **linear-space**; `render::EnvironmentState` colors are
   linear, the composite pass tonemaps to the swapchain.
 - Animation is per-instance: an `AnimationPlayer` + `AnimationStateMachine`.

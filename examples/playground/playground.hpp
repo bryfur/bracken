@@ -9,7 +9,7 @@
 #include "bracken/heightmap.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/physics/physics_world.hpp"
-#include "bracken/scene/frame_builder.hpp"
+#include "bracken/scene/frame_sink.hpp"
 #include "day_weather.hpp"
 #include <glm/glm.hpp>
 #include <string>
@@ -150,7 +150,7 @@ private:
                                        // rain layer/splash/ripple emission
     void update_physics(float dt); // kinematic pusher, kick, step, readback
     void build_frame(bracken::SimFrame& sim); // describe the frame via sim.frame()
-    void build_ui(bracken::scene::FrameBuilder& fb);
+    void build_ui(bracken::scene::FrameSink& fb);
 
     // Fence-side (on_main_frame; main thread, no sim in flight):
     void sync_dev_panel(); // apply panel edits + refresh the panel snapshot

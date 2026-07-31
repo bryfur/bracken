@@ -11,6 +11,16 @@
 #include <string_view>
 #include <thread>
 
+namespace bracken {
+class Application;
+}
+namespace bracken::systems {
+class EffectSystem;
+}
+namespace bracken::testing {
+struct FrameAccess;
+}
+
 namespace bracken::scene {
 
 /**
@@ -368,15 +378,38 @@ public:
     void set_draw_skybox(bool draw);
     void set_draw_ground(bool draw);
     void set_draw_grass(bool draw);
-    /** Frame timing carried by the packet (dt for effects/animation advance,
-     *  accumulated time, monotonically increasing frame index). */
-    void set_frame_timing(float dt, double time, uint64_t frame_index);
 
+    [[nodiscard]] bool sealed() const { return sealed_; }
+
+private:
     // ---- Engine-internal sim-stage API (Application's sim-job tail; not
     // ---- for host code) --------------------------------------------------
     //
     // All of it runs single-threaded on the sim job AFTER on_simulate
     // returned and every host emission job was joined, and BEFORE seal().
+    //
+    // PRIVATE, not merely documented as internal. The rule used to be prose —
+    // "Do NOT call seal() or set_frame_timing()" on SimFrame::frame() — and
+    // the only enforcement was a BRACKEN_ASSERT, so a shipped game that sealed
+    // early republished a packet the renderer was already consuming with no
+    // diagnostic at all. The friends below are the complete list of code that
+    // legitimately runs the tail:
+    //
+    //   Application            — the sim-job tail itself (spawn drain, clocks,
+    //                            timing stamp, seal);
+    //   systems::EffectSystem  — snapshot_into() calls alloc_effect_snapshot;
+    //                            it is NOT reached through Application, so
+    //                            friending Application alone does not compile;
+    //   testing::FrameAccess   — the published escape hatch that lets a host
+    //                            (and the engine's own tests) drive a frame
+    //                            headlessly. See bracken/testing/frame_test.hpp.
+    friend class bracken::Application;
+    friend class bracken::systems::EffectSystem;
+    friend struct bracken::testing::FrameAccess;
+
+    /** Frame timing carried by the packet (dt for effects/animation advance,
+     *  accumulated time, monotonically increasing frame index). */
+    void set_frame_timing(float dt, double time, uint64_t frame_index);
 
     /**
      * Walk every effect spawn emitted this fill in deterministic (lane-index,
@@ -436,10 +469,8 @@ public:
      */
     void seal();
 
-    [[nodiscard]] bool sealed() const { return sealed_; }
     [[nodiscard]] FramePacket& packet() { return *packet_; }
 
-private:
     template<typename T> [[nodiscard]] std::span<const T> merge_chain(Chain<T> Lane::* member);
     [[nodiscard]] std::span<const SkinnedDrawCommand> merge_skinned(const uint32_t* palette_base);
 

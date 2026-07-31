@@ -18,10 +18,12 @@
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/render_plan.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <glm/glm.hpp>
 #include <string>
 
+using bracken::testing::FrameAccess;
 using namespace bracken;
 using namespace bracken::scene;
 
@@ -35,7 +37,7 @@ FramePacket& content_packet() {
     if (!built) {
         FrameBuilder fb(p);
         fb.set_draw_ground(true);
-        fb.seal();
+        FrameAccess::seal(fb);
         built = true;
     }
     return p;
@@ -51,7 +53,7 @@ FramePacket& empty_packet() {
         fb.set_draw_skybox(false);
         fb.set_draw_ground(false);
         fb.set_draw_grass(false);
-        fb.seal();
+        FrameAccess::seal(fb);
         built = true;
     }
     return p;

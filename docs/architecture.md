@@ -51,6 +51,8 @@ core                                          sink: fan-out 0, includes nothing 
             effects, systems
               @root                           application.hpp, sim_frame.hpp, input
                 dev
+                testing                       frame_test.hpp: host-facing, nothing
+                                              in-tree includes it
 ```
 
 Two things this diagram does not hide:
@@ -284,7 +286,25 @@ and the packet walks a `Retired → Filling → Sealed → Consuming → Retired
 state machine with debug asserts on both directions (writes only while
 Filling, reads only after seal).
 
-`FrameBuilder` (`scene/frame_builder.hpp`) is the **only** write interface.
+`FrameBuilder` (`scene/frame_builder.hpp`) is the **only** write interface,
+and hosts see exactly half of it: `SimFrame::frame()` returns a
+`scene::FrameSink` (`scene/frame_sink.hpp`), a pointer-sized non-owning view
+that forwards the host surface — draws, lights, billboards, debug shapes,
+effect spawns, `ui()`, `lane()`, camera/environment/toggles — and nothing
+else. The engine's **sim-stage tail** (`seal`, `set_frame_timing`,
+`alloc_effect_snapshot`, `set_engine_frame`, `for_each_effect_spawn`, the
+staged-environment reads, `packet()`) is *private* on `FrameBuilder`, as are
+`FramePacket`'s lifecycle and raw allocator (`begin_fill`, `begin_consume`,
+`reset`, `reserve_block`, `take_palette_slot`, the drop counters). The friend
+lists are the complete set of code that may run them: `Application` (the sim
+tail and the abandon-on-throw path), `systems::EffectSystem`
+(`snapshot_into` calls `alloc_effect_snapshot`, and is *not* reached through
+`Application`), `scene::PacketRing` (stage handoff), and
+`testing::FrameAccess` (the published escape hatch,
+`bracken/testing/frame_test.hpp`). Before this the rule was a doc comment
+plus a `BRACKEN_ASSERT`, so a shipped game that sealed early republished a
+packet the renderer was already consuming, silently.
+
 Its emit methods mirror the retired `RenderScene`/`UIScene` API one-for-one
 (`draw_model`, `draw_skinned`, `add_point_light`, `add_billboard_3d`,
 `add_debug_line/sphere/box`, `spawn_effect`, `ui().add_text(...)`, …).
@@ -315,15 +335,23 @@ Per-draw options are `scene::DrawFlags` (`scene/draw_flags.hpp`) — a named
 `SkinnedDrawCommand::flags`. They replace two adjacent anonymous `bool`
 parameters that were silently transposable at every call site.
 
-**There are no host-lifetime contracts.** Everything crossing the boundary
-is by value or packet-allocated: bone palettes live in packet memory
+**Everything crossing the boundary is by value or packet-allocated, with two
+named exceptions.** Bone palettes live in packet memory
 (`fb.alloc_bone_palette(joint_count)` returns a writable `span<glm::mat4>` +
 a `BonePaletteId` for `draw_skinned` — the old non-owning
 `bone_matrices` span over host storage is gone), and UI text/labels are
-copied into the packet arena at emit time. The two deliberate exceptions are
-long-lived asset pointers, not per-frame state: `EffectSpawnCommand::
-definition` (`EffectDefinition` must outlive spawned instances) and
-`ModelHandle`s. `BonePaletteId`s are opaque while filling and remapped to
+copied into the packet arena at emit time. The exceptions are long-lived
+asset pointers, not per-frame state: `EffectSpawnCommand::definition` and
+`EffectEmitterSnapshot::definition`, both raw pointers into host storage and
+the second retained across frames by the `EffectSystem`. **An
+`EffectDefinition` handed to `spawn_effect` must outlive every instance
+spawned from it.** Null is a `BRACKEN_CONTRACT` at emit and at consume; a
+*dangling* one is only covered by the host's ownership discipline, which is
+why the rule is written at the top of `scene/frame_packet.hpp` (where that
+comment used to claim, falsely, that a sealed packet carried no lifetime
+contract at all). Handle-ising the two pointers behind an `EffectLibrary` is
+the real fix and is deferred — see `docs/refactor_plan.md` §6. `ModelHandle`s
+are values and carry nothing. `BonePaletteId`s are opaque while filling and remapped to
 dense `FramePacket::palettes()` indices at seal — ids held by the host across
 `seal()` are stale; only re-read them from sealed commands. Each
 `BonePalette` record carries a prefix-summed `matrix_offset` that is exactly
@@ -1117,7 +1145,8 @@ that never brought up a renderer).
 - **`FileWatcher`** (`core/asset/file_watcher.hpp`): polls on a background
   `std::jthread`, but callbacks fire only from `poll_main_thread()` on the
   main loop — watcher callbacks may therefore safely touch GPU state.
-- **Frame data carries no host-lifetime contracts** (Phase 2): everything a
+- **Frame data carries host-lifetime contracts only for the two named effect
+  definition pointers** (Phase 2, corrected in Phase 8): everything else a
   `FramePacket` holds is by value or packet-allocated, the packet outlives
   its own consumption by construction, and `render_frame` takes it `const`.
   The old bone-matrix-span and spawn-drain contracts are deleted. What
@@ -1126,8 +1155,11 @@ that never brought up a renderer).
   next acquire of that slot (under `run()` this is the loop order — retire(i)
   precedes kick(i+2)'s acquire on the main thread; ring-driving hosts
   provide their own fence).
-- **`EffectDefinition`s** referenced by `spawn_effect` are long-lived asset
-  data and must outlive their spawned instances.
+- **`EffectDefinition`s** referenced by `spawn_effect`, and the
+  `EmitterDefinition`s reached from `EffectEmitterSnapshot`, are long-lived
+  host asset data and must outlive their spawned instances. These are the
+  packet's only host-lifetime exceptions and are stated as such at the top of
+  `scene/frame_packet.hpp`; null is a `BRACKEN_CONTRACT` at emit and consume.
 - **`Logger`** sinks are thread-safe. It is also the engine's *only* log
   channel — no engine source calls `SDL_Log`/`std::cerr`/`std::cout`
   (enforced by `core/logger_discipline.test.cpp`; the exemptions are

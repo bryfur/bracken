@@ -4,7 +4,7 @@
 #include "bracken/core/jobs/parallel_for.hpp"
 #include "bracken/core/jobs/task_group.hpp"
 #include "bracken/input_handler.hpp" // InputSnapshot
-#include "bracken/scene/frame_builder.hpp"
+#include "bracken/scene/frame_sink.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -53,7 +53,7 @@ public:
      *  the frame contexts. Host code never constructs SimFrames. */
     SimFrame(scene::FrameBuilder& builder, const InputSnapshot& input, float dt, double time, uint64_t frame_index,
              SimFeedback* feedback = nullptr)
-        : builder_(&builder), input_(&input), feedback_(feedback), dt_(dt), time_(time), frame_index_(frame_index) {}
+        : sink_(builder), input_(&input), feedback_(feedback), dt_(dt), time_(time), frame_index_(frame_index) {}
 
     SimFrame(const SimFrame&) = delete;
     SimFrame& operator=(const SimFrame&) = delete;
@@ -79,14 +79,19 @@ public:
     [[nodiscard]] const InputSnapshot& input() const { return *input_; }
 
     /**
-     * The frame's FrameBuilder — the ONLY way render state leaves the game
-     * (draws, lights, UI, camera, environment, effect spawns). Emit from the
-     * frame's root code, or fan emission out across builder lanes with your
-     * own run_async jobs (one lane per job — see FrameBuilder's lane
-     * contract). Do NOT call seal() or set_frame_timing(): the engine seals
-     * the packet (after its sim-stage tail) and stamped the timing at kick.
+     * The frame's sink — the ONLY way render state leaves the game (draws,
+     * lights, UI, camera, environment, effect spawns). Emit from the frame's
+     * root code, or fan emission out across lanes with your own run_async
+     * jobs (one lane per job — see FrameBuilder's lane contract).
+     *
+     * scene::FrameSink is the HOST half of the frame builder and nothing
+     * else. The engine's sim-stage tail — seal(), set_frame_timing(), the
+     * effect snapshot, the engine-frame stamp — is not reachable through it.
+     * That rule used to be this comment ("Do NOT call seal()"), enforced by a
+     * debug assert; a shipped game that sealed early republished a packet the
+     * renderer was already consuming, silently. Now it does not compile.
      */
-    [[nodiscard]] scene::FrameBuilder& frame() { return *builder_; }
+    [[nodiscard]] scene::FrameSink& frame() { return sink_; }
 
     /**
      * Data-parallel loop over [begin, end): body(i) per index, fanned out on
@@ -148,7 +153,7 @@ public:
     }
 
 private:
-    scene::FrameBuilder* builder_;
+    scene::FrameSink sink_;
     const InputSnapshot* input_;
     SimFeedback* feedback_;
     float dt_;

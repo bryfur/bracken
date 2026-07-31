@@ -170,9 +170,12 @@ void Application::run_sim_job() {
     // deterministic (lane, emission) order — the drain the renderer used to
     // do, moved to the sim side.
     fb.for_each_effect_spawn([this](const EffectSpawnCommand& spawn) {
-        if (spawn.definition != nullptr) {
-            effect_system_->spawn_effect(spawn.definition, spawn.position, spawn.direction);
-        }
+        // Consume side of the packet's host-lifetime exception. The emitter
+        // instances the EffectSystem builds from this pointer outlive the
+        // packet, so a bad one surfaces later, on the render thread, far from
+        // the frame that emitted it. Loud here instead.
+        BRACKEN_CONTRACT(spawn.definition != nullptr, "FramePacket effect spawn with a null EffectDefinition");
+        effect_system_->spawn_effect(spawn.definition, spawn.position, spawn.direction);
     });
 
     // Particle update on the pool (nested fork-join from inside this job is

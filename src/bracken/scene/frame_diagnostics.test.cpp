@@ -24,6 +24,7 @@
 #include "bracken/scene/motion_history.hpp"
 #include "bracken/scene/scene_prep.hpp"
 #include "bracken/scene/scene_renderer.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <array>
 #include <glm/glm.hpp>
@@ -32,6 +33,7 @@
 #include <string>
 #include <vector>
 
+using bracken::testing::FrameAccess;
 using namespace bracken;
 using namespace bracken::scene;
 namespace jobs = bracken::core::jobs;
@@ -112,7 +114,7 @@ TEST(FrameDiagnosticsTest, UnknownModelHandleIsCountedOncePerDraw) {
     fb.draw_model(good, glm::mat4(1.0f));
     fb.draw_model(bogus, glm::mat4(1.0f));
     fb.draw_model(bogus, glm::translate(glm::mat4(1.0f), glm::vec3(1.0f)));
-    fb.seal();
+    FrameAccess::seal(fb);
 
     // The two bogus draws SURVIVE the packet (an out-of-range handle is not
     // INVALID_MODEL_HANDLE, so the builder cannot know) and die at prep.
@@ -129,7 +131,7 @@ TEST(FrameDiagnosticsTest, InvalidHandleIsRefusedAtEmitTime) {
     FrameBuilder fb(w.packet);
     fb.draw_model(INVALID_MODEL_HANDLE, glm::mat4(1.0f));
     fb.draw_model(INVALID_MODEL_HANDLE, glm::mat4(1.0f));
-    fb.seal();
+    FrameAccess::seal(fb);
 
     // Never became a command: named at the frame that emitted it, not three
     // stages downstream.
@@ -145,7 +147,7 @@ TEST(FrameDiagnosticsTest, CleanFrameCountsNothing) {
     for (int i = 0; i < 8; ++i) {
         fb.draw_model(good, glm::mat4(1.0f));
     }
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_FALSE(w.packet.build_diagnostics().any());
     EXPECT_FALSE(run_model_prep(w).diagnostics.any());
@@ -169,7 +171,7 @@ TEST(FrameDiagnosticsTest, SkinnedDrawWithNoSkeletonIsCounted) {
         }
         fb.draw_skinned(h, glm::mat4(1.0f), alloc.id);
     }
-    fb.seal();
+    FrameAccess::seal(fb);
 
     const FrameStatsPartial stats = run_skinned_prep(w);
     EXPECT_EQ(stats.diagnostics.skinned_dropped_no_skeleton, 2u);
@@ -191,7 +193,7 @@ TEST(FrameDiagnosticsTest, PaletteBudgetOverrunIsCountedAndSummarized) {
         // The over-budget ids are invalid, so these draws are refused too.
         fb.draw_skinned(rigged, glm::mat4(1.0f), alloc.id);
     }
-    fb.seal();
+    FrameAccess::seal(fb);
 
     const auto build_diag = w.packet.build_diagnostics();
     EXPECT_EQ(build_diag.palettes_over_budget, k_over);
@@ -209,7 +211,7 @@ TEST(FrameDiagnosticsTest, ThreeDContentWithoutACameraIsDetected) {
     const ModelHandle good = w.models.register_model("good", make_model(false));
     FrameBuilder fb(w.packet);
     fb.draw_model(good, glm::mat4(1.0f));
-    fb.seal();
+    FrameAccess::seal(fb);
 
     ASSERT_TRUE(w.packet.has_3d_content());
     EXPECT_TRUE(SceneRenderer::frame_needs_camera(w.packet, /*have_camera=*/false));
@@ -223,7 +225,7 @@ TEST(FrameDiagnosticsTest, EmptyFrameWithoutACameraIsNotAProblem) {
     fb.set_draw_skybox(false);
     fb.set_draw_ground(false);
     fb.set_draw_grass(false);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     ASSERT_FALSE(w.packet.has_3d_content());
     EXPECT_FALSE(SceneRenderer::frame_needs_camera(w.packet, /*have_camera=*/false));
@@ -296,7 +298,7 @@ TEST(FrameDiagnosticsTest, CountsAreIdenticalAtAnyWorkerCount) {
         fb.draw_model(i % 3 == 0 ? static_cast<ModelHandle>(7777) : good,
                       glm::translate(glm::mat4(1.0f), glm::vec3(static_cast<float>(i) * 0.01f, 0.0f, 0.0f)));
     }
-    fb.seal();
+    FrameAccess::seal(fb);
 
     const uint32_t expected = 4000u / 3u + 1u; // i % 3 == 0 over [0, 4000)
 

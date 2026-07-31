@@ -9,6 +9,7 @@
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/frame_packet_ring.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 
+using bracken::testing::FrameAccess;
 using bracken::InputHandler;
 using bracken::InputSnapshot;
 using bracken::core::jobs::JobSystem;
@@ -85,7 +87,7 @@ void fill_and_seal(FrameBuilder& fb, uint64_t frame) {
     fb.draw_skinned(static_cast<bracken::ModelHandle>(200), glm::mat4(1.0f), pal.id);
     fb.ui().add_text("frame " + std::to_string(frame), 4.0f, 8.0f);
     fb.set_draw_skybox(frame % 2 == 0);
-    fb.seal();
+    FrameAccess::seal(fb);
 }
 
 /// Walk one sealed packet and count every deviation from frame `frame`'s
@@ -177,7 +179,8 @@ TEST_F(FramePipelineTest, SimJobFillsNextPacketWhileMainReadsSealedPrevious) {
     auto kick = [&](uint64_t frame) {
         FramePacket& p = ring.acquire_for_fill();
         builder = std::make_unique<FrameBuilder>(p, k_lanes);
-        builder->set_frame_timing(k_dt, static_cast<double>(frame) * k_dt, frame); // stamped at kick, like run()
+        // stamped at kick, like run()
+        FrameAccess::set_frame_timing(*builder, k_dt, static_cast<double>(frame) * k_dt, frame);
         in_flight = &p;
         FrameBuilder& fb = *builder;
         task = js.submit([&fb, frame] { fill_and_seal(fb, frame); });
@@ -223,7 +226,7 @@ TEST_F(FramePipelineTest, ThrowingSimJobRethrowsAtJoinAndPacketIsAbandonable) {
 
     FramePacket& p = ring.acquire_for_fill();
     auto builder = std::make_unique<FrameBuilder>(p, k_lanes);
-    builder->set_frame_timing(k_dt, 0.0, 0);
+    FrameAccess::set_frame_timing(*builder, k_dt, 0.0, 0);
     FrameBuilder& fb = *builder;
     TaskHandle task = js.submit([&fb] {
         fb.draw_model(static_cast<bracken::ModelHandle>(1), glm::mat4(1.0f)); // partial fill
@@ -234,8 +237,8 @@ TEST_F(FramePipelineTest, ThrowingSimJobRethrowsAtJoinAndPacketIsAbandonable) {
     // Abandon the partial packet exactly as Application::run does: drop the
     // builder, reset the packet (any state -> Retired).
     EXPECT_EQ(p.state(), FramePacket::State::Filling);
-    builder.reset();
-    p.reset();
+    builder.reset(); // drop the unique_ptr's FrameBuilder
+    FrameAccess::reset(p);
     EXPECT_EQ(p.state(), FramePacket::State::Retired);
 
     // Both slots (the untouched one at frame 0, then the ABANDONED one at
@@ -248,7 +251,7 @@ TEST_F(FramePipelineTest, ThrowingSimJobRethrowsAtJoinAndPacketIsAbandonable) {
             ASSERT_EQ(&q, &p); // the abandoned slot, cycled back for reuse
         }
         FrameBuilder clean(q, k_lanes);
-        clean.set_frame_timing(k_dt, static_cast<double>(frame) * k_dt, frame);
+        FrameAccess::set_frame_timing(clean, k_dt, static_cast<double>(frame) * k_dt, frame);
         TaskHandle t = js.submit([&clean, frame] { fill_and_seal(clean, frame); });
         js.wait(t);
         EXPECT_EQ(count_mismatches(q, frame), 0) << "post-abandon frame " << frame;
@@ -321,7 +324,7 @@ TEST_F(FramePipelineTest, PreviousPacketEffectSnapshotIsBitStableWhileSimAdvance
     auto kick = [&](uint64_t frame) {
         FramePacket& p = ring.acquire_for_fill();
         builder = std::make_unique<FrameBuilder>(p);
-        builder->set_frame_timing(k_dt, static_cast<double>(frame) * k_dt, frame);
+        FrameAccess::set_frame_timing(*builder, k_dt, static_cast<double>(frame) * k_dt, frame);
         in_flight = &p;
         FrameBuilder& fb = *builder;
         // The Application sim-job tail: update the live system, snapshot into
@@ -329,9 +332,9 @@ TEST_F(FramePipelineTest, PreviousPacketEffectSnapshotIsBitStableWhileSimAdvance
         task = js.submit([&fb, &system, frame] {
             system.update(k_dt); // nested fork-join on the pool
             system.snapshot_into(fb);
-            fb.set_engine_frame(static_cast<float>(frame + 1) * k_dt, static_cast<float>(frame + 1) * k_dt,
+            FrameAccess::set_engine_frame(fb, static_cast<float>(frame + 1) * k_dt, static_cast<float>(frame + 1) * k_dt,
                                 static_cast<uint32_t>(system.effect_count()));
-            fb.seal();
+            FrameAccess::seal(fb);
         });
     };
 

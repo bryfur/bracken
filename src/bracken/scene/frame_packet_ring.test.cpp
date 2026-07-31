@@ -3,12 +3,14 @@
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/frame_packet_ring.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <thread>
 
+using bracken::testing::FrameAccess;
 using namespace bracken::scene;
 
 // ---------------------------------------------------------------------------
@@ -31,7 +33,7 @@ TEST(PacketRing, AcquireForFillAlternatesSlots) {
         FramePacket& p = ring.acquire_for_fill();
         seen[frame] = &p;
         FrameBuilder fb(p);
-        fb.seal();
+        FrameAccess::seal(fb);
         ring.retire(p); // sequential flow: retire straight from Sealed
     }
     EXPECT_NE(seen[0], seen[1]);
@@ -45,8 +47,8 @@ TEST(PacketRing, FullPublishAcquireRetireCycle) {
         FramePacket& p = ring.acquire_for_fill();
         FrameBuilder fb(p);
         fb.draw_model(static_cast<bracken::ModelHandle>(frame + 1), glm::mat4(1.0f));
-        fb.set_frame_timing(0.016f, static_cast<double>(frame) * 0.016, frame);
-        fb.seal();
+        FrameAccess::set_frame_timing(fb, 0.016f, static_cast<double>(frame) * 0.016, frame);
+        FrameAccess::seal(fb);
         ring.publish(p);
         EXPECT_TRUE(ring.has_sealed());
 
@@ -87,8 +89,8 @@ TEST(PacketRing, ReuseResetsContentAndSingularState) {
         fb.draw_skinned(2, glm::mat4(1.0f), pal.id);
         fb.ui().add_text("frame zero", 0, 0);
         fb.set_draw_skybox(false);
-        fb.set_frame_timing(0.5f, 9.0, 1234);
-        fb.seal();
+        FrameAccess::set_frame_timing(fb, 0.5f, 9.0, 1234);
+        FrameAccess::seal(fb);
     }
     ring.publish(p0);
     ring.retire(*ring.try_acquire_sealed());
@@ -98,7 +100,7 @@ TEST(PacketRing, ReuseResetsContentAndSingularState) {
     FramePacket& p1 = ring.acquire_for_fill();
     {
         FrameBuilder fb(p1);
-        fb.seal();
+        FrameAccess::seal(fb);
     }
     ring.retire(p1);
 
@@ -107,7 +109,7 @@ TEST(PacketRing, ReuseResetsContentAndSingularState) {
     {
         FrameBuilder fb(p0_again);
         fb.draw_model(9, glm::mat4(2.0f));
-        fb.seal();
+        FrameAccess::seal(fb);
     }
     ASSERT_EQ(p0_again.model_commands().size(), 1u);
     EXPECT_EQ(p0_again.model_commands()[0].model_handle, 9u);
@@ -129,7 +131,7 @@ TEST(PacketRing, ReuseKeepsArenaCapacityStable) {
             fb.draw_model(1, glm::mat4(1.0f));
             fb.add_debug_line({0, 0, 0}, {1, 1, 1}, 0xFF00FF00);
         }
-        fb.seal();
+        FrameAccess::seal(fb);
         caps[frame] = p.bytes_capacity();
         ring.retire(p);
     }
@@ -180,8 +182,8 @@ TEST(PacketRing, CrossThreadPublishAcquireHandsOffEveryFrameInOrder) {
         FramePacket& p = ring.acquire_for_fill();
         FrameBuilder fb(p);
         fb.draw_model(1, glm::mat4(1.0f), {1, 1, 1, 1}, DrawFlags::None, static_cast<uint32_t>(frame));
-        fb.set_frame_timing(0.016f, static_cast<double>(frame), frame);
-        fb.seal();
+        FrameAccess::set_frame_timing(fb, 0.016f, static_cast<double>(frame), frame);
+        FrameAccess::seal(fb);
         ring.publish(p);
     }
 

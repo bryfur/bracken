@@ -326,7 +326,7 @@ Run it after any change that could affect rendering. You can also open `playgrou
 - **`on_init`/`on_shutdown` are not called by `run()`** — your `main()` must drive them (see the playground's `start()`/`stop()` wrappers).
 - `EffectDefinition`s referenced by `spawn_effect` must **outlive all spawned instances** — make them long-lived members, not locals.
 - `BonePaletteId`s from `alloc_bone_palette` are only valid within the frame they were allocated in — allocate, write the matrices, and `draw_skinned` within the same `on_simulate`; never cache an id across frames.
-- Never call `fb.seal()` or `fb.set_frame_timing(...)` from `on_simulate` — the engine stamps timing at kick and seals after its own sim-stage tail.
+- You **cannot** call `fb.seal()` or `fb.set_frame_timing(...)` from `on_simulate`: `sim.frame()` returns a `scene::FrameSink`, which carries the host surface and nothing else. The engine stamps timing at kick and seals after its own sim-stage tail. (This used to be a rule in prose backed by a debug assert; a release build that sealed early republished a packet the renderer was already consuming, silently.)
 - Never read live game state from a DevUI panel body — panels draw while the next `on_simulate` runs; snapshot in `on_main_frame` instead.
 - The smoke screenshot and interactive F12 screenshots stall the GPU for that frame — debug/test only.
 - `--smoke` frame counts must be positive integers; an invalid or non-positive value after `--smoke` is rejected with an error and exit code 2.
@@ -367,7 +367,7 @@ The hooks:
 | Hook | Required | When/where it runs | Notes |
 |---|---|---|---|
 | `on_init()` | yes (pure virtual) | **you** call it, after `init_engine()`; main thread | Call `init_renderer(...)` here. Return `false` to abort boot. |
-| `on_simulate(SimFrame&)` | yes | once per frame, **as a job on the worker pool**, overlapped with the previous frame's rendering | Simulate with `sim.dt()`/`sim.input()`, describe the frame via `sim.frame()`. Tier sim-stage: nothing reachable from here may touch GPU/SDL/main-thread APIs (debug asserts enforce). Do not `seal()` or `set_frame_timing`. |
+| `on_simulate(SimFrame&)` | yes | once per frame, **as a job on the worker pool**, overlapped with the previous frame's rendering | Simulate with `sim.dt()`/`sim.input()`, describe the frame via `sim.frame()` (a `scene::FrameSink`). Tier sim-stage: nothing reachable from here may touch GPU/SDL/main-thread APIs (debug asserts enforce). `seal()`/`set_frame_timing` are not reachable. |
 | `on_main_frame(MainFrame&)` | no | once per frame at the **frame fence** (main thread, no sim in flight) | The only safe place to read live game state from the main thread — snapshot values here for DevUI panels; window/screenshot work. Most games never override it. |
 | `on_shutdown()` | no | **you** call it, after `run()` returns; main thread | Call `shutdown_renderer()` here. |
 | `on_event(const SDL_Event&)` | no | per SDL event, during the pump (main thread, no sim in flight), before `InputHandler` sees it | Return `true` to consume the event. Touching host state here is safe. |
@@ -477,7 +477,7 @@ The headline contract (details in [Scene: Cameras, Culling, FramePacket & SceneR
 
 Need parallelism? `sim.parallel_for(begin, end, body)` / `sim.parallel_for(range, body)` fan a loop out on the engine pool and join before returning (small counts run inline — write it whenever you have thousands of anything). `sim.run_async(group, fn)` submits against a host-owned `core::jobs::TaskGroup` you must join before touching results. One rule: `parallel_for` bodies must **not** emit into the builder — emit from your frame's root code, or from `run_async` jobs that each own an explicit `fb.lane(i)`.
 
-Hosts that bypass `run()` entirely (tools, tests) can still drive the sequential Phase-2 flow themselves: `frame_packets().acquire_for_fill()` → `FrameBuilder fb(packet)` → emit + `set_frame_timing` → `fb.seal()` → `render_frame(packet)` → `frame_packets().retire(packet)`.
+Hosts that bypass `run()` entirely (tools, tests) can still drive the sequential Phase-2 flow themselves: `frame_packets().acquire_for_fill()` → `FrameBuilder fb(packet)` → emit → `testing::FrameAccess::set_frame_timing(fb, ...)` / `::seal(fb)` → `render_frame(packet)` → `frame_packets().retire(packet)`. The tail is private on `FrameBuilder`; `bracken/testing/frame_test.hpp` is where the capability is published — see "Testing your frame code" in the Scene chapter.
 
 Other facade pass-throughs on `Application` you will use from these hooks: `models()` (the `ModelManager`; const lookups are worker-safe, loading is main-thread), `set_heightmap(...)` / `get_terrain_height(x, z)` (worker-safe), `camera()` (the `systems::CameraController` — sim-stage under `run()`), `effect_system()` (sim-stage owned; you normally just `fb.spawn_effect`), `scene_renderer()`, and `gpu_driver_name()`. They are documented in their own chapters.
 
@@ -2564,7 +2564,7 @@ Under `Application::run()` the engine owns the packet ring and the acquire → b
 void PlaygroundGame::on_simulate(bracken::SimFrame& sim) {
     // ... simulation first (movement, animation, IK) ...
 
-    scene::FrameBuilder& fb = sim.frame();          // engine-acquired, engine-sealed
+    scene::FrameSink& fb = sim.frame();             // engine-acquired, engine-sealed
 
     fb.set_camera(camera().get_camera_state());
     fb.set_draw_skybox(graphics_settings().skybox_enabled);
@@ -2586,7 +2586,7 @@ void PlaygroundGame::on_simulate(bracken::SimFrame& sim) {
 }
 ```
 
-(Hosts that bypass `run()` — tools, tests — drive the same cycle by hand: `frame_packets().acquire_for_fill()`, `FrameBuilder fb(packet)`, emit + `set_frame_timing`, `fb.seal()`, `render_frame(packet)`, `frame_packets().retire(packet)`.)
+(Hosts that bypass `run()` — tools, tests — drive the same cycle by hand: `frame_packets().acquire_for_fill()`, `FrameBuilder fb(packet)`, emit, then `testing::FrameAccess::set_frame_timing`/`::seal`, `render_frame(packet)`, `frame_packets().retire(packet)`.)
 
 The packet's storage is a per-frame arena that is reset (memory retained) at retire, so the steady-state frame allocates nothing. A `FrameBuilder` is **spent after `seal()`** — never stash the reference (or the old packet's spans) beyond `on_simulate`.
 
@@ -2594,7 +2594,7 @@ Contracts to know up front:
 
 - **`render_frame` takes the packet by `const&`** and consumes it exactly once. There is no mutation of your state and no queue draining — effect spawns, palettes, UI text all live inside the packet.
 - **`render_frame` runs on the main thread** (guarded by `BRACKEN_ASSERT_MAIN_THREAD()` in debug builds); **builder emission is sim-stage** — `on_simulate` and jobs it fans out to (one `fb.lane(i)` per job; the plain `fb.` conveniences are lane 0, for the frame's root code).
-- **Write-after-seal is a bug and asserts in debug** — every builder emit checks the packet is still Filling; every packet read checks it is sealed. Do not call `seal()`/`set_frame_timing` yourself under `run()`.
+- **Write-after-seal is a bug and is a `BRACKEN_CONTRACT`** — every builder emit checks the packet is still Filling; every packet read checks it is sealed. Under `run()` you cannot reach `seal()`/`set_frame_timing` at all: `sim.frame()` hands you a `FrameSink`.
 
 ### Cameras and projection (`CameraState`)
 
@@ -2855,6 +2855,45 @@ Runs after UI, before submit — this is how Dear ImGui overlays hook in. **Sing
 #### Accessors
 
 `context()`, `terrain()`, `models()` (the `ModelManager` — load/register models here), `grass()`, `pipeline_registry()`, `get_terrain_height(x, z)`, and `effect_system()` (read-only view of particles; null until `init()` succeeds).
+
+### Testing your frame code (`bracken/testing/frame_test.hpp`)
+
+`FrameBuilder`/`FramePacket` are your game's entire output surface, and they need no GPU, no window and no SDL. The engine ships a fixture so you can unit-test the code that describes your frames:
+
+```cpp
+#include "bracken/testing/frame_test.hpp"
+
+TEST(MyGame, DescribesThreeOrbs) {
+    bracken::testing::TestFrame frame;
+    my_game.describe_frame(frame.sink(), /*orbs=*/3);   // your own function, unchanged
+    frame.seal();
+
+    ASSERT_EQ(frame.draws().size(), 3u);
+    EXPECT_EQ(frame.draws()[0].model_handle, orb_handle);
+    EXPECT_EQ(frame.point_lights().size(), 3u);
+    EXPECT_EQ(frame.ui_text()[0], "orbs");
+}
+```
+
+Write your frame code against `scene::FrameSink&` (which is what `sim.frame()` returns) and it is directly testable — `frame.sink()` hands you the same type.
+
+`TestFrame` gives you:
+
+| | |
+|---|---|
+| `sink()` | the `FrameSink` to hand to your frame code |
+| `builder()` | the `FrameBuilder` underneath, for multi-lane emission |
+| `set_frame_timing(dt, time, index)` / `seal()` | what the engine does around `on_simulate` |
+| `draws()`, `skinned_draws()`, `point_lights()`, `spot_lights()`, `billboards()`, `debug_lines()`, `effect_spawns()`, `ui_commands()`, `ui_text()` | typed read-back of the sealed frame |
+| `build_diagnostics()` | what the fill refused (invalid handles, invalid palette ids, palettes over budget) |
+| `digest()` | the exact CPU-side hash of every sealed command |
+| `packet()` | the `FramePacket` itself |
+
+`TestFrame(packet)` binds to a packet you already own (a `PacketRing` slot, say) instead of allocating one; `TestFrame(lane_count)` gives you lanes for fan-out tests.
+
+**`digest()` is the cheapest regression gate you will ever add.** It is the same `scene::packet_digest` the playground's `--smoke` run prints: exact, driver-independent, and unaffected by anything that is not in the frame you described. Pin it in a test and any accidental change to what your game draws — a transposed `DrawFlags` bit, a light that moved, a UI string that picked up a wall-clock value — fails immediately, with no image comparison and no tolerance to tune.
+
+The header also exposes `testing::FrameAccess`, the friend hatch for the engine's sim-stage tail (`seal`, `set_frame_timing`, `alloc_effect_snapshot`, `set_engine_frame`) and for `FramePacket`'s lifecycle (`begin_fill`, `begin_consume`, `reset`, `reserve_block`). Those are private on their own types precisely so game code cannot reach them mid-frame; a test owns the whole lifecycle, so the capability is published here rather than left public everywhere.
 
 ### Limits and silent behaviors (quick reference)
 

@@ -19,22 +19,49 @@
 #include <variant>
 
 namespace bracken {
+class Application;
 struct EffectDefinition;
 struct EmitterDefinition;
+}
+namespace bracken::testing {
+struct FrameAccess;
 }
 
 namespace bracken::scene {
 
 class FrameBuilder;
+class PacketRing;
 
 // ============================================================================
 // Frame command payloads
 //
-// Everything below is by value or packet-allocated: no field references host
-// storage, so a sealed FramePacket carries no lifetime contract whatsoever
+// Everything below is by value or packet-allocated, with TWO NAMED EXCEPTIONS
 // (docs/multithreading_plan.md §3.3). All structs are trivially copyable and
 // laid out padding-free (explicit `_pad` bytes, zeroed by their initializers)
 // so lane merges are memcpys and a merged frame is byte-deterministic.
+//
+// THE LIFETIME EXCEPTIONS. This comment used to claim a sealed FramePacket
+// "carries no lifetime contract whatsoever". That was false, and being false
+// in the one place a host would look for the rule is worse than not stating it:
+//
+//   EffectSpawnCommand::definition   -> const EffectDefinition*
+//   EffectEmitterSnapshot::definition -> const EmitterDefinition*
+//
+// Both are raw pointers into HOST-OWNED storage, and the second is retained
+// across frames by the EffectSystem (an emitter outlives the packet that
+// spawned it). The contract is therefore: **an EffectDefinition handed to
+// spawn_effect must outlive every instance spawned from it** — in practice,
+// for the lifetime of the engine. Free one while its particles are alive and
+// the effect renderer dereferences freed memory during a render pass, on
+// another thread, with no diagnostic.
+//
+// Everything else really is copied: bone palettes and UI text live in the
+// packet arena, ModelHandles are values. Handle-ising the two definition
+// pointers (an EffectLibrary owning them, ids in the packet) is the real fix
+// and is deferred with a named trigger — see docs/refactor_plan.md §6. Until
+// then the consume sites BRACKEN_CONTRACT-check for null, which catches the
+// zero-initialized mistake but not a dangling one; only the host's ownership
+// discipline covers that, which is why it is written down here.
 // ============================================================================
 
 /**
@@ -499,7 +526,20 @@ public:
     [[nodiscard]] std::size_t bytes_used() const noexcept { return arena_.bytes_used(); }
     [[nodiscard]] std::size_t bytes_capacity() const noexcept { return arena_.bytes_capacity(); }
 
-    // ---- Internal API (FrameBuilder / PacketRing / stage coordinator; not for host code) ----
+private:
+    // ---- Internal API (FrameBuilder / PacketRing / stage coordinator; not
+    // ---- for host code) ----
+    //
+    // Private for the same reason FrameBuilder's sim-stage tail is: these are
+    // the packet's lifecycle and its raw allocator, and a host calling reset()
+    // or begin_consume() out of turn corrupts a frame another stage is reading,
+    // in release, with nothing pointing at the cause. The friends are the
+    // three pieces of engine machinery that own the lifecycle, plus the
+    // published test escape hatch (bracken/testing/frame_test.hpp).
+    friend class FrameBuilder;        // writes the sealed views + performs the Filling→Sealed publish
+    friend class PacketRing;          // stage handoff: begin_consume / reset
+    friend class bracken::Application; // abandons a partial fill when a sim job throws
+    friend struct bracken::testing::FrameAccess;
 
     /** Retired → Filling. Called by the FrameBuilder constructor. */
     void begin_fill();
@@ -545,9 +585,6 @@ public:
     void count_drop_invalid_handle() noexcept { drops_invalid_handle_.fetch_add(1, std::memory_order_relaxed); }
     void count_drop_invalid_palette() noexcept { drops_invalid_palette_.fetch_add(1, std::memory_order_relaxed); }
     void count_drop_palette_budget() noexcept { drops_palette_budget_.fetch_add(1, std::memory_order_relaxed); }
-
-private:
-    friend class FrameBuilder; // writes the sealed views + performs the Filling→Sealed publish
 
     struct SlabState {
         std::byte* base = nullptr;

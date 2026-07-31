@@ -16,10 +16,12 @@
 #include "bracken/core/assert.hpp"
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <glm/glm.hpp>
 #include <thread>
 
+using bracken::testing::FrameAccess;
 using namespace bracken;
 using namespace bracken::scene;
 
@@ -43,8 +45,8 @@ TEST(ContractsDeathTest, SealingTwiceAborts) {
         {
             FramePacket packet{1 << 16};
             FrameBuilder fb(packet);
-            fb.seal();
-            fb.seal();
+            FrameAccess::seal(fb);
+            FrameAccess::seal(fb);
         },
         "seal called twice");
 }
@@ -54,7 +56,7 @@ TEST(ContractsDeathTest, EmittingAfterSealAborts) {
         {
             FramePacket packet{1 << 16};
             FrameBuilder fb(packet);
-            fb.seal();
+            FrameAccess::seal(fb);
             fb.draw_model(static_cast<ModelHandle>(1), glm::mat4(1.0f));
         },
         "outside the Filling state");
@@ -84,7 +86,7 @@ TEST(Contracts, LaneMayChangeThreadsAcrossAJoin) {
     worker.join(); // the happens-before edge that makes the handoff safe
 
     fb.lane(0).draw_model(static_cast<ModelHandle>(8), glm::mat4(1.0f));
-    fb.seal();
+    FrameAccess::seal(fb);
 
     ASSERT_EQ(packet.model_commands().size(), 2u);
     EXPECT_EQ(packet.model_commands()[0].model_handle, 7u);

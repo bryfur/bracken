@@ -1930,7 +1930,7 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
     // below is copied or packet-allocated — nothing outlives this function on
     // the host side. The engine stamped the frame timing at kick and seals
     // the packet after its sim-stage tail; the host does neither.
-    scene::FrameBuilder& fb = sim.frame();
+    scene::FrameSink& fb = sim.frame();
     const auto& gs = graphics_settings();
 
     fb.set_camera(camera().get_camera_state());
@@ -2078,7 +2078,7 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
     build_ui(fb);
 }
 
-void PlaygroundGame::build_ui(scene::FrameBuilder& fb) {
+void PlaygroundGame::build_ui(scene::FrameSink& fb) {
     auto ui = fb.ui();
     ui.add_filled_rect(10, 10, 280, 122, 0xB0101418);
     ui.add_text("bracken playground", 22, 20, 1.0f, 0xFFFFD080);

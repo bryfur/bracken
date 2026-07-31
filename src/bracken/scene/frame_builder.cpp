@@ -434,6 +434,14 @@ void FrameBuilder::Lane::add_debug_box(const glm::vec3& min, const glm::vec3& ma
 void FrameBuilder::Lane::spawn_effect(const bracken::EffectDefinition* definition, const glm::vec3& position,
                                       const glm::vec3& direction) {
     assert_filling();
+    // One of the packet's two host-lifetime exceptions (see the frame-payload
+    // comment in frame_packet.hpp). A contract, not an assert: this is the
+    // host boundary, the pointer is retained past the frame that emitted it,
+    // and a null here used to travel all the way to the sim tail before being
+    // silently dropped — attributing the mistake to nothing.
+    BRACKEN_CONTRACT(definition != nullptr,
+                     "FrameBuilder::spawn_effect: null EffectDefinition. The definition is host-owned and must "
+                     "outlive every instance spawned from it");
     new (push_slot(effect_spawns_)) EffectSpawnCommand{definition, position, direction};
 }
 

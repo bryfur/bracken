@@ -2,6 +2,7 @@
 
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -10,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+using bracken::testing::FrameAccess;
 using namespace bracken::scene;
 
 namespace {
@@ -40,15 +42,15 @@ TEST(FramePacket, FreshPacketIsRetired) {
 
 TEST(FramePacket, BeginFillTransitionsToFilling) {
     FramePacket p;
-    p.begin_fill();
+    FrameAccess::begin_fill(p);
     EXPECT_EQ(p.state(), FramePacket::State::Filling);
 }
 
 TEST(FramePacket, ResetFromFillingReturnsToRetired) {
     FramePacket p;
-    p.begin_fill();
-    (void)p.reserve_block(64, 16);
-    p.reset();
+    FrameAccess::begin_fill(p);
+    (void)FrameAccess::reserve_block(p, 64, 16);
+    FrameAccess::reset(p);
     EXPECT_EQ(p.state(), FramePacket::State::Retired);
     EXPECT_EQ(p.bytes_used(), 0u);
 }
@@ -58,13 +60,13 @@ TEST(FramePacket, FullLifecycleFillSealConsumeRetire) {
     FrameBuilder fb(p); // Retired -> Filling
     EXPECT_EQ(p.state(), FramePacket::State::Filling);
     fb.draw_model(1, glm::mat4(1.0f));
-    fb.seal(); // Filling -> Sealed
+    FrameAccess::seal(fb); // Filling -> Sealed
     EXPECT_EQ(p.state(), FramePacket::State::Sealed);
     EXPECT_EQ(p.model_commands().size(), 1u); // reads legal in Sealed
-    p.begin_consume(); // Sealed -> Consuming
+    FrameAccess::begin_consume(p); // Sealed -> Consuming
     EXPECT_EQ(p.state(), FramePacket::State::Consuming);
     EXPECT_EQ(p.model_commands().size(), 1u); // and in Consuming
-    p.reset(); // Consuming -> Retired
+    FrameAccess::reset(p); // Consuming -> Retired
     EXPECT_EQ(p.state(), FramePacket::State::Retired);
 }
 
@@ -74,32 +76,32 @@ TEST(FramePacket, FullLifecycleFillSealConsumeRetire) {
 
 TEST(FramePacket, ReserveBlockHonorsAlignment) {
     FramePacket p;
-    p.begin_fill();
+    FrameAccess::begin_fill(p);
     const std::size_t aligns[] = {1, 2, 4, 8, 16, 32, 64, 128};
     std::vector<Range> ranges;
     for (int pass = 0; pass < 8; ++pass) {
         for (std::size_t align : aligns) {
             const std::size_t size = 24 + static_cast<std::size_t>(pass) * 7;
-            void* mem = p.reserve_block(size, align);
+            void* mem = FrameAccess::reserve_block(p, size, align);
             ASSERT_NE(mem, nullptr);
             EXPECT_EQ(reinterpret_cast<std::uintptr_t>(mem) % align, 0u) << "align " << align;
             ranges.push_back({reinterpret_cast<std::uintptr_t>(mem), reinterpret_cast<std::uintptr_t>(mem) + size});
         }
     }
     expect_disjoint(ranges);
-    p.reset();
+    FrameAccess::reset(p);
 }
 
 TEST(FramePacket, ReserveBlockSpansSlabRefills) {
     // Small initial arena; reservations well past the 64 KB slab size force
     // multiple refills. All blocks must stay disjoint and writable.
     FramePacket p(4096);
-    p.begin_fill();
+    FrameAccess::begin_fill(p);
     std::vector<Range> ranges;
     std::vector<uint32_t*> stamps;
     for (uint32_t i = 0; i < 300; ++i) {
         const std::size_t size = 1024;
-        auto* mem = static_cast<uint32_t*>(p.reserve_block(size, alignof(uint32_t)));
+        auto* mem = static_cast<uint32_t*>(FrameAccess::reserve_block(p, size, alignof(uint32_t)));
         ASSERT_NE(mem, nullptr);
         *mem = i; // stamp; verified after all reservations
         stamps.push_back(mem);
@@ -109,7 +111,7 @@ TEST(FramePacket, ReserveBlockSpansSlabRefills) {
     for (uint32_t i = 0; i < 300; ++i) {
         EXPECT_EQ(*stamps[i], i);
     }
-    p.reset();
+    FrameAccess::reset(p);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +123,7 @@ TEST(FramePacket, ReserveBlockContentionConservesAllBlocks) {
     constexpr unsigned PER_THREAD = 2000;
 
     FramePacket p;
-    p.begin_fill();
+    FrameAccess::begin_fill(p);
 
     std::vector<std::vector<Range>> per_thread(THREADS);
     std::vector<std::vector<uint32_t*>> stamps(THREADS);
@@ -133,7 +135,7 @@ TEST(FramePacket, ReserveBlockContentionConservesAllBlocks) {
             stamps[t].reserve(PER_THREAD);
             for (unsigned i = 0; i < PER_THREAD; ++i) {
                 const std::size_t size = 4 + ((t * 31 + i) % 253); // 4..256 bytes
-                auto* mem = static_cast<uint32_t*>(p.reserve_block(size, 4));
+                auto* mem = static_cast<uint32_t*>(FrameAccess::reserve_block(p, size, 4));
                 if (mem == nullptr) {
                     continue; // recorded as missing by the count check below
                 }
@@ -162,7 +164,7 @@ TEST(FramePacket, ReserveBlockContentionConservesAllBlocks) {
             ASSERT_EQ(*stamps[t][i], t * PER_THREAD + i) << "thread " << t << " block " << i << " corrupted";
         }
     }
-    p.reset();
+    FrameAccess::reset(p);
 }
 
 // ---------------------------------------------------------------------------
@@ -173,9 +175,9 @@ TEST(FramePacket, ResetReclaimsMemoryAndCapacityStabilizes) {
     FramePacket p;
     std::size_t cap_after_cycle2 = 0;
     for (int cycle = 0; cycle < 4; ++cycle) {
-        p.begin_fill();
+        FrameAccess::begin_fill(p);
         for (int i = 0; i < 100; ++i) {
-            (void)p.reserve_block(1024, 16);
+            (void)FrameAccess::reserve_block(p, 1024, 16);
         }
         const std::size_t cap = p.bytes_capacity();
         if (cycle == 2) {
@@ -184,7 +186,7 @@ TEST(FramePacket, ResetReclaimsMemoryAndCapacityStabilizes) {
             // Identical load after warm-up must not grow the arena further.
             EXPECT_EQ(cap, cap_after_cycle2);
         }
-        p.reset();
+        FrameAccess::reset(p);
         EXPECT_EQ(p.bytes_used(), 0u);
         EXPECT_EQ(p.state(), FramePacket::State::Retired);
     }
@@ -200,14 +202,14 @@ TEST(FramePacket, ResetClearsSealedContentAndSingularState) {
         fb.set_draw_grass(false);
         fb.set_camera(CameraState{glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f), glm::vec3(1, 2, 3)});
         fb.set_environment(bracken::render::EnvironmentState{});
-        fb.set_frame_timing(0.5f, 12.0, 99);
-        fb.seal();
+        FrameAccess::set_frame_timing(fb, 0.5f, 12.0, 99);
+        FrameAccess::seal(fb);
     }
-    p.reset();
+    FrameAccess::reset(p);
 
     // Refill with nothing: the sealed view must show pristine defaults.
     FrameBuilder fb2(p);
-    fb2.seal();
+    FrameAccess::seal(fb2);
     EXPECT_TRUE(p.model_commands().empty());
     EXPECT_TRUE(p.debug_lines().empty());
     EXPECT_TRUE(p.palettes().empty());
@@ -234,7 +236,7 @@ TEST(FramePacketDeathTest, ReadBeforeSealAsserts) {
     EXPECT_DEATH(
         {
             FramePacket p;
-            p.begin_fill();
+            FrameAccess::begin_fill(p);
             (void)p.model_commands();
         },
         "read before seal");
@@ -253,7 +255,7 @@ TEST(FramePacketDeathTest, ReserveBlockOutsideFillingAsserts) {
     EXPECT_DEATH(
         {
             FramePacket p; // Retired
-            (void)p.reserve_block(16, 16);
+            (void)FrameAccess::reserve_block(p, 16, 16);
         },
         "outside the Filling state");
 }
@@ -263,8 +265,8 @@ TEST(FramePacketDeathTest, ReserveBlockAfterSealAsserts) {
         {
             FramePacket p;
             FrameBuilder fb(p);
-            fb.seal();
-            (void)p.reserve_block(16, 16);
+            FrameAccess::seal(fb);
+            (void)FrameAccess::reserve_block(p, 16, 16);
         },
         "outside the Filling state");
 }
@@ -273,8 +275,8 @@ TEST(FramePacketDeathTest, BeginFillTwiceAsserts) {
     EXPECT_DEATH(
         {
             FramePacket p;
-            p.begin_fill();
-            p.begin_fill();
+            FrameAccess::begin_fill(p);
+            FrameAccess::begin_fill(p);
         },
         "not Retired");
 }
@@ -283,7 +285,7 @@ TEST(FramePacketDeathTest, BeginConsumeUnsealedAsserts) {
     EXPECT_DEATH(
         {
             FramePacket p;
-            p.begin_consume();
+            FrameAccess::begin_consume(p);
         },
         "not Sealed");
 }

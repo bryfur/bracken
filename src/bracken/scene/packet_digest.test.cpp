@@ -5,10 +5,12 @@
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/packet_digest.hpp"
+#include "bracken/testing/frame_test.hpp"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+using bracken::testing::FrameAccess;
 using namespace bracken::scene;
 
 namespace {
@@ -41,7 +43,7 @@ uint64_t digest_of(void (*build)(FrameBuilder&)) {
     FramePacket p;
     FrameBuilder fb(p);
     build(fb);
-    fb.seal();
+    FrameAccess::seal(fb);
     return packet_digest(p);
 }
 
@@ -54,10 +56,10 @@ TEST(PacketDigest, IdenticalFramesDigestIdentically) {
 TEST(PacketDigest, EmptyFrameIsStableAndNonZero) {
     FramePacket a;
     FrameBuilder fa(a);
-    fa.seal();
+    FrameAccess::seal(fa);
     FramePacket b;
     FrameBuilder fb(b);
-    fb.seal();
+    FrameAccess::seal(fb);
     EXPECT_EQ(packet_digest(a), packet_digest(b));
     EXPECT_NE(packet_digest(a), 0u);
 }
@@ -78,12 +80,12 @@ TEST(PacketDigest, DetectsChangedModelHandle) {
     FramePacket a;
     FrameBuilder fa(a);
     fa.draw_model(1, glm::mat4(1.0f));
-    fa.seal();
+    FrameAccess::seal(fa);
 
     FramePacket b;
     FrameBuilder fb(b);
     fb.draw_model(2, glm::mat4(1.0f)); // same transform, different asset
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_NE(packet_digest(a), packet_digest(b));
 }
@@ -93,12 +95,12 @@ TEST(PacketDigest, DetectsDroppedDraw) {
     FrameBuilder fa(a);
     fa.draw_model(1, glm::mat4(1.0f));
     fa.draw_model(2, glm::mat4(1.0f));
-    fa.seal();
+    FrameAccess::seal(fa);
 
     FramePacket b;
     FrameBuilder fb(b);
     fb.draw_model(1, glm::mat4(1.0f));
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_NE(packet_digest(a), packet_digest(b));
 }
@@ -110,12 +112,12 @@ TEST(PacketDigest, DetectsTransposedDrawFlags) {
     FramePacket a;
     FrameBuilder fa(a);
     fa.draw_model(1, glm::mat4(1.0f), {1, 1, 1, 1}, DrawFlags::ForceNonInstanced);
-    fa.seal();
+    FrameAccess::seal(fa);
 
     FramePacket b;
     FrameBuilder fb(b);
     fb.draw_model(1, glm::mat4(1.0f), {1, 1, 1, 1}, DrawFlags::NoFog);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_NE(packet_digest(a), packet_digest(b));
 }
@@ -126,14 +128,14 @@ TEST(PacketDigest, DetectsAddedSkinnedDrawFlag) {
     auto pa = fa.alloc_bone_palette(1);
     pa.matrices[0] = glm::mat4(1.0f);
     fa.draw_skinned(1, glm::mat4(1.0f), pa.id);
-    fa.seal();
+    FrameAccess::seal(fa);
 
     FramePacket b;
     FrameBuilder fb(b);
     auto pb = fb.alloc_bone_palette(1);
     pb.matrices[0] = glm::mat4(1.0f);
     fb.draw_skinned(1, glm::mat4(1.0f), pb.id, {1, 1, 1, 1}, DrawFlags::NoFog);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_NE(packet_digest(a), packet_digest(b));
 }
@@ -144,14 +146,14 @@ TEST(PacketDigest, DetectsChangedLightIntensity) {
     bracken::render::lighting::PointLightDesc la{};
     la.intensity = 1.0f;
     fa.add_point_light(la);
-    fa.seal();
+    FrameAccess::seal(fa);
 
     FramePacket b;
     FrameBuilder fb(b);
     bracken::render::lighting::PointLightDesc lb{};
     lb.intensity = 1.5f;
     fb.add_point_light(lb);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_NE(packet_digest(a), packet_digest(b));
 }
@@ -160,12 +162,12 @@ TEST(PacketDigest, DetectsChangedUiText) {
     FramePacket a;
     FrameBuilder fa(a);
     fa.ui().add_text("score 100", 0.0f, 0.0f, 1.0f, 0xFFFFFFFF);
-    fa.seal();
+    FrameAccess::seal(fa);
 
     FramePacket b;
     FrameBuilder fb(b);
     fb.ui().add_text("score 101", 0.0f, 0.0f, 1.0f, 0xFFFFFFFF);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     // The playground's live FPS readout was exactly this: a wall-clock-derived
     // string in the packet that made the smoke run irreproducible.
@@ -178,14 +180,14 @@ TEST(PacketDigest, DetectsChangedCameraPosition) {
     CameraState ca{};
     ca.position = {0, 0, 0};
     fa.set_camera(ca);
-    fa.seal();
+    FrameAccess::seal(fa);
 
     FramePacket b;
     FrameBuilder fb(b);
     CameraState cb{};
     cb.position = {0, 0, 0.5f};
     fb.set_camera(cb);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_NE(packet_digest(a), packet_digest(b));
 }
@@ -206,12 +208,12 @@ TEST(PacketDigest, DistinguishesSignedZero) {
     FramePacket a;
     FrameBuilder fa(a);
     fa.draw_model(1, pos_zero);
-    fa.seal();
+    FrameAccess::seal(fa);
 
     FramePacket b;
     FrameBuilder fb(b);
     fb.draw_model(1, neg_zero);
-    fb.seal();
+    FrameAccess::seal(fb);
 
     EXPECT_NE(packet_digest(a), packet_digest(b)); // ...distinct as bit patterns
 }

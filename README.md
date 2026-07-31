@@ -39,9 +39,10 @@ glm-typed API over vendored Jolt Physics). It builds as a static library
 - **Skeletal animation** (`src/bracken/animation/`) — playback with crossfade,
   data-driven state machines, two-bone IK (foot placement, body lean).
 - **Scene layer** (`src/bracken/scene/`) — cameras, frustum culling, the
-  immutable per-frame `FramePacket` snapshot (built via `FrameBuilder`,
-  recycled through a `PacketRing`) consumed by `SceneRenderer`, incl. 2D UI
-  commands.
+  immutable per-frame `FramePacket` snapshot (described through a
+  `FrameSink`, built by `FrameBuilder`, recycled through a `PacketRing`)
+  consumed by `SceneRenderer`, incl. 2D UI commands. Games can unit-test
+  their frame code headlessly with `bracken/testing/frame_test.hpp`.
 - **Particle effects** (`src/bracken/effects/`) —
   data-driven mesh-particle emitters (burst/continuous, orbital/arc paths,
   lifetime curves).

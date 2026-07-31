@@ -38,6 +38,7 @@
 
 #include "bracken/animation/animation_types.hpp"
 #include "bracken/contracts/frustum.hpp"
+#include "bracken/testing/frame_test.hpp"
 #include "bracken/contracts/render_stats.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/model_loader.hpp"
@@ -56,6 +57,7 @@
 #include <span>
 #include <vector>
 
+using bracken::testing::FrameAccess;
 using namespace bracken;
 using namespace bracken::scene;
 namespace jobs = bracken::core::jobs;
@@ -249,7 +251,7 @@ void GoldenWorld::build_packet() {
     fb.draw_skinned(H_SKINNED, at(0.0f, 900.0f, -50.0f), palettes[2], glm::vec4(1.0f), DrawFlags::None,
                     MOTION_SKINNED);                                        // 4: frustum-culled, has history
 
-    fb.seal();
+    FrameAccess::seal(fb);
 }
 
 enum SkinnedIndex : std::size_t {
