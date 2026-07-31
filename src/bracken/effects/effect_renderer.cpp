@@ -1,10 +1,10 @@
-#include "bracken/render/effect_renderer.hpp"
-#include "bracken/gpu/gpu_texture.hpp"
-#include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
-#include "bracken/effect_definition.hpp" // EmitterDefinition, read when resolving models
+#include "bracken/effects/effect_renderer.hpp"
+#include "bracken/gpu/gpu_texture.hpp"
+#include "bracken/gpu/gpu_uniforms.hpp"
+#include "bracken/effects/effect_definition.hpp" // EmitterDefinition, read when resolving models
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/model_loader.hpp"

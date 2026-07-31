@@ -1,4 +1,4 @@
-#include "bracken/systems/effect_system.hpp"
+#include "bracken/effects/effect_system.hpp"
 #include <cmath>
 #include <glm/gtc/constants.hpp>
 #include <gtest/gtest.h>

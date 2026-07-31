@@ -4,7 +4,7 @@
 // .position / .rotation (euler radians) / .scale".
 //
 // It lives in its own header so the effect renderer does not have to include
-// `systems/effect_system.hpp` just to declare an overload taking a live
+// `effect_system.hpp` just to declare an overload taking a live
 // `systems::Particle`. The production render path never sees a live particle —
 // particles reach the renderer only as the sealed packet's
 // `scene::EffectParticleSnapshot`. Only the test instantiates the live-particle

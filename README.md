@@ -42,7 +42,7 @@ glm-typed API over vendored Jolt Physics). It builds as a static library
   immutable per-frame `FramePacket` snapshot (built via `FrameBuilder`,
   recycled through a `PacketRing`) consumed by `SceneRenderer`, incl. 2D UI
   commands.
-- **Particle effects** (`src/bracken/systems/`, `effect_definition.hpp`) —
+- **Particle effects** (`src/bracken/effects/`) —
   data-driven mesh-particle emitters (burst/continuous, orbital/arc paths,
   lifetime curves).
 - **Procedural geometry** (`src/bracken/procedural/`) — tree and rock

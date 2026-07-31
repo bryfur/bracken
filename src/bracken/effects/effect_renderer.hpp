@@ -1,12 +1,12 @@
 #pragma once
 
+#include "bracken/effects/particle_transform.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/model_loader.hpp"
-#include "bracken/render/particle_transform.hpp"
 #include "bracken/scene/frame_packet.hpp" // Effect{Emitter,Particle}Snapshot
 #include <cstdint>
 #include <glm/glm.hpp>

@@ -871,7 +871,7 @@ and pass it through in `reload_from_file`.
 ### L34. Docs and comments describe the particle blend as ONE/ONE, but the configured factors are (SRC_ALPHA, ONE) with the shader forcing alpha to 1.0
 
 **Category:** doc-code-mismatch · **Reported by two areas:** gpu and effects (merged)
-**Locations:** `src/bracken/gpu/pipeline_registry.hpp:36`; `src/bracken/gpu/gpu_uniforms.hpp:339`; `src/bracken/render/effect_renderer.hpp:36`; `src/bracken/shaders/particle.vert.hlsl:67`; `docs/effects_system.md:102`; configured blend at `src/bracken/gpu/gpu_types.hpp:157-165`, contract at `src/bracken/shaders/particle.frag.hlsl:6`
+**Locations:** `src/bracken/gpu/pipeline_registry.hpp:36`; `src/bracken/gpu/gpu_uniforms.hpp:339`; `src/bracken/effects/effect_renderer.hpp:36`; `src/bracken/shaders/particle.vert.hlsl:67`; `docs/effects_system.md:102`; configured blend at `src/bracken/gpu/gpu_types.hpp:157-165`, contract at `src/bracken/shaders/particle.frag.hlsl:6`
 
 Five sites state "ONE/ONE additive" without noting it is only the effective
 behavior: `BlendMode::Additive` is configured as color (SRC_ALPHA, ONE), and
@@ -1828,7 +1828,7 @@ documented host-facing debug API with the grid mesh built lazily.
 ### H3. CONTINUOUS spawn loop does not validate `spawn_rate`: 0 silently yields one particle, negative values hang the update
 
 **Category:** hang-risk
-**Locations:** `src/bracken/systems/effect_system.hpp:174-177` (loop; sole read of `spawn_rate` at `:175`); `src/bracken/effect_definition.hpp:92`
+**Locations:** `src/bracken/effects/effect_system.hpp:174-177` (loop; sole read of `spawn_rate` at `:175`); `src/bracken/effects/effect_definition.hpp:92`
 
 The CONTINUOUS spawn loop computes `spawn_interval = 1.0f / def.spawn_rate`
 inside a `while (emitter.age >= emitter.next_spawn_time)` loop, with no
@@ -1849,7 +1849,7 @@ and negative rates.
 ### M26. EffectRenderer's emitter→model cache stores failed lookups permanently, so late-registered models never render for the rest of the run
 
 **Category:** latent-bug
-**Locations:** `src/bracken/render/effect_renderer.cpp:119`, `:131` (unconditional emplace), `:108` (only clear, in shutdown)
+**Locations:** `src/bracken/effects/effect_renderer.cpp:119`, `:131` (unconditional emplace), `:108` (only clear, in shutdown)
 
 `resolve_emitter_model` caches `EmitterDefinition* → ModelHandle` and
 emplaces the result even when the ModelManager lookup fails
@@ -1873,7 +1873,7 @@ cache-invalidation API called on model registration.
 ### L35. EffectRenderer class comment claims depth test LESS_OR_EQUAL; the Particle pipeline uses GREATER_OR_EQUAL (reversed-Z)
 
 **Category:** doc-code-mismatch
-**Locations:** `src/bracken/render/effect_renderer.hpp:36`; `src/bracken/gpu/pipeline_registry.cpp:600`
+**Locations:** `src/bracken/effects/effect_renderer.hpp:36`; `src/bracken/gpu/pipeline_registry.cpp:600`
 
 The pipeline sets `SDL_GPU_COMPAREOP_GREATER_OR_EQUAL; // reversed-Z`,
 consistent with the engine-wide convention; the registry's own comment is
@@ -1888,7 +1888,7 @@ someone "fixes" code to match a stale comment.
 ### L36. `EffectDefinition::duration` and `::loop` are never read by the runtime; docs list them as functional fields
 
 **Category:** dead-code
-**Locations:** `src/bracken/effect_definition.hpp:113-114`; completion logic at `src/bracken/systems/effect_system.hpp:71`, `:90`; `docs/effects_system.md:48`
+**Locations:** `src/bracken/effects/effect_definition.hpp:113-114`; completion logic at `src/bracken/effects/effect_system.hpp:71`, `:90`; `docs/effects_system.md:48`
 
 Effect completion is purely emitter-driven (emitter-level duration +
 particle death); `EffectInstance::age` is accumulated but never compared.
@@ -1904,7 +1904,7 @@ them as inert in the header and docs.
 ### L37. Effect `range`/`default_range` is plumbed all the way into `EmitterInstance::range` but never consumed
 
 **Category:** dead-code
-**Locations:** `src/bracken/systems/effect_system.hpp:64`; `src/bracken/systems/effect_system.cpp:35`, `:43`; `src/bracken/effect_definition.hpp:117`; `src/bracken/scene/render_scene.cpp:55`; `src/bracken/scene/scene_renderer.cpp:519`
+**Locations:** `src/bracken/effects/effect_system.hpp:64`; `src/bracken/effects/effect_system.cpp:35`, `:43`; `src/bracken/effects/effect_definition.hpp:117`; `src/bracken/scene/render_scene.cpp:55`; `src/bracken/scene/scene_renderer.cpp:519`
 
 The public API plumbs range through RenderScene → SceneRenderer →
 spawn_effect → every EmitterInstance, but no code reads
@@ -1920,7 +1920,7 @@ reserved/unused.
 ### L38. `EmitterDefinition::particle_type` is never read anywhere; "sprite" is a declared-but-unimplemented stub
 
 **Category:** dead-code
-**Locations:** `src/bracken/effect_definition.hpp:86`
+**Locations:** `src/bracken/effects/effect_definition.hpp:86`
 
 Only the declaration and a default-value test reference it; every particle
 renders as its emitter's mesh model. Already recorded in architecture.md's
@@ -1937,7 +1937,7 @@ sprite particles exist.
 ### L39. `Particle::model` is written at spawn but never read; the renderer resolves models per emitter
 
 **Category:** dead-code
-**Locations:** `src/bracken/systems/effect_system.hpp:37`; `src/bracken/systems/effect_system.cpp:80`; `src/bracken/render/effect_renderer.cpp:175`
+**Locations:** `src/bracken/effects/effect_system.hpp:37`; `src/bracken/effects/effect_system.cpp:80`; `src/bracken/effects/effect_renderer.cpp:175`
 
 `spawn_particles` sets `particle.model = &def.model` on every particle, but
 EffectRenderer resolves the model once per emitter and batches. The only

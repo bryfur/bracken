@@ -2,7 +2,7 @@
 
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
-#include "bracken/effect_definition.hpp"
+#include "bracken/effects/effect_definition.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>

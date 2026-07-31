@@ -17,19 +17,20 @@ Root namespace `bracken`, one sub-namespace per module.
 
 | Path | Namespace | Contents |
 |---|---|---|
-| `src/bracken/` (root) | `bracken` | `Application`, `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `Heightmap`, `effect_definition.hpp` |
+| `src/bracken/` (root) | `bracken` | `Application`, `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `Heightmap` |
 | `contracts/` | *(unchanged per type)* | the **leaf layer**: pure-data types two or more layers must agree on — `ModelHandle`, `EnvironmentState`, `CameraState`, `Frustum`, `velocity_math`, `PointLight`/`SpotLight`, `GraphicsSettings`, `RenderStats`. May include `core/`, glm and `<std>` and nothing else; namespaces are those of the owning module, not the directory. See [`contracts/README.md`](../src/bracken/contracts/README.md) |
 | `core/` | `core` | `Logger` (+`BRACKEN_LOG_*`), `assert.hpp`, `Result<T,E>`, `Handle` pools, `hash.hpp` (`StringId`, FNV-1a), `profiler.hpp` (Tracy macros) |
 | `core/jobs/` | `core::jobs` | `JobSystem` (always-on lock-free work-stealing pool — Chase–Lev deques, MPSC injection, pooled job nodes), `TaskGroup`, `parallel_for`, `TaskHandle` |
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload poller); `AssetRegistry` (typed, stable handles — a host-facing utility: no engine system instantiates it) |
 | `memory/` | `memory` | `Arena` (bump + destructor registration), `FrameAllocator` |
 | `gpu/` | `gpu` | `GPUDevice`, `GPUBuffer`, `GPUTexture`, `ShaderManager`, `GPUPipeline`, `GPUComputePipeline`/`ComputePass` (`gpu_compute.hpp`), `PipelineRegistry`, `gpu_uniforms.hpp` (CPU↔GPU contract), `gpu_debug.hpp` |
-| `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), effects, text, UI; `color_grading.hpp` |
+| `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `color_grading.hpp` |
 | `render/lighting/` | `render::lighting` | `ClusterGrid` (CPU light binning), `LocalShadowMap`/`LocalShadowSelector` (budgeted point/spot shadow atlas + tile cache), and the cluster/atlas **budget constants** in `light.hpp` (the light *structs* are `contracts/light.hpp`) |
 | `render_graph/` | `render_graph` | pass scheduler (topo-sort, transient pool) — **in-tree, tested, not wired into `SceneRenderer`** |
 | `scene/` | `scene` | `FramePacket` (immutable per-frame snapshot) + `FrameBuilder` (lane-based write interface) + `PacketRing` (SPSC handoff ring), `SceneRenderer` (frame orchestrator), `ScenePrep`, `RenderPlan`, `MotionHistory`, `transform_math.hpp` |
 | `animation/` | `animation` | `animation_types.hpp` (skeleton/clips/constants), `AnimationPlayer`, `AnimationStateMachine`, `ik_solver` |
-| `systems/` | `systems` | `CameraController` / `CameraSystem`, `EffectSystem` |
+| `systems/` | `systems` | `CameraController` / `CameraSystem` |
+| `effects/` | `bracken` + `systems` + `render` | the particle-effect triad, together at last: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage simulation), `EffectRenderer` + `particle_transform.hpp` (drawing). Namespaces are unchanged — the directory groups the feature, not the namespace |
 | `procedural/` | `procedural` | `tree_generator` (ez-tree algorithm), `rock_generator` (SDF + marching cubes) |
 | `physics/` | `physics` | `PhysicsWorld` (glm-only pimpl over vendored **Jolt Physics** — linked PRIVATE, Jolt never in public headers), internal `JoltJobSystem` bridge onto `core::jobs::JobSystem` (see "Physics" below) |
 | `shaders/` | — | HLSL sources → SPIR-V at build time; see [shaders/README.md](../src/bracken/shaders/README.md) |
@@ -47,7 +48,7 @@ core                                          sink: fan-out 0, includes nothing 
       model_loader.hpp, heightmap.hpp         asset-layer leaves, filed at the root
         render, render/lighting, procedural, physics
           scene                               FramePacket / FrameBuilder / PacketRing
-            systems
+            effects, systems
               @root                           application.hpp, sim_frame.hpp, input
                 dev
 ```

@@ -2312,7 +2312,7 @@ Rules of thumb (all enforced by example in the existing structs):
 
 Storage-buffer records are tightly packed (std430-style), no cbuffer padding rules — e.g. `gpu::ParticleInstanceData` is exactly `mat4 + vec4` = 80 bytes, mirrored by `struct ParticleInstance` in `particle.vert.hlsl`.
 
-Pushing uniforms at draw time (real code from `src/bracken/render/effect_renderer.cpp`):
+Pushing uniforms at draw time (real code from `src/bracken/effects/effect_renderer.cpp`):
 
 ```cpp
 gpu::InstancedCameraUniforms camera_uniforms = {};
@@ -5213,9 +5213,9 @@ Bracken ships a data-driven **mesh-particle** effects system: particles are smal
 
 | Layer | Files | Namespace | You touch it? |
 |---|---|---|---|
-| Definitions (pure data) | `src/bracken/effect_definition.hpp` | `bracken` | **Yes** — author these |
-| Runtime simulation | `src/bracken/systems/effect_system.hpp/.cpp` | `bracken::systems` | Only if you bypass `SceneRenderer` |
-| Rendering | `src/bracken/render/effect_renderer.hpp/.cpp` | `bracken::render` | No — owned by `SceneRenderer` |
+| Definitions (pure data) | `src/bracken/effects/effect_definition.hpp` | `bracken` | **Yes** — author these |
+| Runtime simulation | `src/bracken/effects/effect_system.hpp/.cpp` | `bracken::systems` | Only if you bypass `SceneRenderer` |
+| Rendering | `src/bracken/effects/effect_renderer.hpp/.cpp` | `bracken::render` | No — owned by `SceneRenderer` |
 
 Two important scoping facts up front (both from `docs/effects_system.md`):
 
@@ -5227,7 +5227,7 @@ Two important scoping facts up front (both from `docs/effects_system.md`):
 Three steps: register the particle model, build a definition, emit spawns through the frame builder. This is lifted from `examples/playground/playground.cpp` (the `pickup_burst_` effect):
 
 ```cpp
-#include "bracken/effect_definition.hpp"
+#include "bracken/effects/effect_definition.hpp"
 
 using namespace bracken;
 
@@ -5282,7 +5282,7 @@ The sim-job tail applies spawns **before** the `EffectSystem` update (`src/brack
 
 ### Authoring `EffectDefinition`s
 
-Everything lives in `src/bracken/effect_definition.hpp`. Defaults below are the struct initializers.
+Everything lives in `src/bracken/effects/effect_definition.hpp`. Defaults below are the struct initializers.
 
 #### `EffectDefinition`
 
@@ -5378,7 +5378,7 @@ struct RotationDefinition {
 };
 ```
 
-Angles are authored in degrees and converted to radians at spawn. With `face_velocity = true`, a particle moving faster than 0.01 units/sec yaws (`rotation.y`) toward its velocity **instead of** integrating `rotation_rate`; below that speed it falls back to `rotation_rate` integration (pinned by `FaceVelocityYawsTowardMovementDirection` / `FaceVelocityIgnoresNearZeroVelocity` in `src/bracken/systems/effect_system.test.cpp`).
+Angles are authored in degrees and converted to radians at spawn. With `face_velocity = true`, a particle moving faster than 0.01 units/sec yaws (`rotation.y`) toward its velocity **instead of** integrating `rotation_rate`; below that speed it falls back to `rotation_rate` integration (pinned by `FaceVelocityYawsTowardMovementDirection` / `FaceVelocityIgnoresNearZeroVelocity` in `src/bracken/effects/effect_system.test.cpp`).
 
 #### `AppearanceDefinition` — how particles look
 
@@ -5422,14 +5422,14 @@ Aggregate initialization order is `{type, start_value, end_value, fade_start}` �
 ### Particle models
 
 - Emitters reference models **by name** in the `ModelManager` — `ModelManager::get_handle(name)` resolves them. Load or `register_model` them **before the first spawn**.
-- **Gotcha — the lookup result is cached permanently.** `EffectRenderer` caches the name→handle resolution per `EmitterDefinition` address (`resolve_emitter_model` in `src/bracken/render/effect_renderer.cpp`), *including failures*. If the model wasn't registered when the effect first became active, you get one `Effect emitter '...' references unknown model '...'` warning and that emitter **never renders for the rest of the run**, even if you register the model later.
+- **Gotcha — the lookup result is cached permanently.** `EffectRenderer` caches the name→handle resolution per `EmitterDefinition` address (`resolve_emitter_model` in `src/bracken/effects/effect_renderer.cpp`), *including failures*. If the model wasn't registered when the effect first became active, you get one `Effect emitter '...' references unknown model '...'` warning and that emitter **never renders for the rest of the run**, even if you register the model later.
 - Unknown/missing models are a **silent visual drop**, not an error: the particles still simulate (and count in `particle_count()`); they just don't draw.
 - Meshes are drawn **recentered on their bounding-box center**, so the particle's `position` is the visual center of the mesh regardless of how the model was authored.
 - Mesh textures work: if a mesh has a base-color texture it is sampled; untextured meshes use a built-in 1×1 white fallback so the particle is exactly `color_tint`-colored.
 
 ### How particles are rendered (what you should expect on screen)
 
-You don't call the `EffectRenderer` yourself, but its behavior shapes how you author effects (`src/bracken/render/effect_renderer.cpp`, `src/bracken/shaders/particle.vert.hlsl` / `particle.frag.hlsl`):
+You don't call the `EffectRenderer` yourself, but its behavior shapes how you author effects (`src/bracken/effects/effect_renderer.cpp`, `src/bracken/shaders/particle.vert.hlsl` / `particle.frag.hlsl`):
 
 - **Unlit, unfogged, additive HDR.** Particles ignore all scene lighting and fog. They render into the HDR scene target with effectively (ONE, ONE) additive blending, after the skybox and sorted transparent meshes, with depth *test* on (occluded by opaques) and depth *write* off (they never occlude each other or anything else, and draw order between particles doesn't matter).
 - **Emissive boost ×2.** Fragment color is `baseColor.rgb * tint.rgb * 2.0` (`PARTICLE_EMISSIVE_BOOST` in `effect_renderer.cpp`), deliberately above the default bloom threshold (1.1) so effects glow.
@@ -5441,10 +5441,10 @@ When driven by the engine (the sim-job tail), particles are clamped to the terra
 
 ### Driving `EffectSystem` directly (no `SceneRenderer`)
 
-For headless simulation, tests, or a custom renderer, use `bracken::systems::EffectSystem` (`src/bracken/systems/effect_system.hpp`) directly:
+For headless simulation, tests, or a custom renderer, use `bracken::systems::EffectSystem` (`src/bracken/effects/effect_system.hpp`) directly:
 
 ```cpp
-#include "bracken/systems/effect_system.hpp"
+#include "bracken/effects/effect_system.hpp"
 
 bracken::systems::EffectSystem system;
 
@@ -5476,7 +5476,7 @@ Iteration structure for custom rendering: `EffectInstance` → `emitters` (`Emit
 
 - The DevUI Stats panel (F10 in the playground) shows `Particles: N (in M effects)` via `SceneRenderer::frame_effect_count()`/`frame_particle_count()` — counts cached from the rendered packet's snapshot (the live `EffectSystem` is sim-stage owned and is never read from the overlay).
 - With Tracy enabled, the live particle count is plotted as `effects.particles` once per update.
-- Benchmarks: `build/src/bracken/bracken_benchmarks --benchmark_filter=BM_Effect` (steady-state update at 1k/10k particles, burst spawn, per-curve-type evaluation — see `src/bracken/systems/effect_system.bench.cpp`).
+- Benchmarks: `build/src/bracken/bracken_benchmarks --benchmark_filter=BM_Effect` (steady-state update at 1k/10k particles, burst spawn, per-curve-type evaluation — see `src/bracken/effects/effect_system.bench.cpp`).
 
 ### Common mistakes checklist
 

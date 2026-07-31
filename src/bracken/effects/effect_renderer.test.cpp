@@ -1,6 +1,6 @@
-#include "bracken/render/effect_renderer.hpp"
-#include "bracken/render/particle_transform.hpp"
-#include "bracken/systems/effect_system.hpp"
+#include "bracken/effects/effect_renderer.hpp"
+#include "bracken/effects/effect_system.hpp"
+#include "bracken/effects/particle_transform.hpp"
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>

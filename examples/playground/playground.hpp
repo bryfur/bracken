@@ -5,7 +5,7 @@
 #include "bracken/animation/animation_types.hpp"
 #include "bracken/application.hpp"
 #include "bracken/contracts/environment.hpp"
-#include "bracken/effect_definition.hpp"
+#include "bracken/effects/effect_definition.hpp"
 #include "bracken/heightmap.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/physics/physics_world.hpp"

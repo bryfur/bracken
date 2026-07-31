@@ -6,9 +6,9 @@ otherwise) is the host's job** — the engine never does file I/O for effects.
 
 | Layer | Files | Namespace |
 |---|---|---|
-| Definitions (pure data) | `src/bracken/effect_definition.hpp` | `bracken` |
-| Runtime simulation | `src/bracken/systems/effect_system.hpp/.cpp` | `bracken::systems` |
-| Rendering | `src/bracken/render/effect_renderer.hpp/.cpp` | `bracken::render` |
+| Definitions (pure data) | `src/bracken/effects/effect_definition.hpp` | `bracken` |
+| Runtime simulation | `src/bracken/effects/effect_system.hpp/.cpp` | `bracken::systems` |
+| Rendering | `src/bracken/effects/effect_renderer.hpp/.cpp` | `bracken::render` |
 
 When using `Application`/`SceneRenderer`, the host only touches the first
 layer: build `EffectDefinition`s, then emit spawns through the frame builder
@@ -19,7 +19,7 @@ and draws particles as part of `render_frame`.
 ## Spawning effects (host side)
 
 ```cpp
-#include "bracken/effect_definition.hpp"
+#include "bracken/effects/effect_definition.hpp"
 
 // Definitions must outlive every effect spawned from them — the runtime
 // stores raw pointers into them. Keep them in a long-lived registry.
@@ -53,7 +53,7 @@ pools; the plain forms service `JobSystem::instance()`.
 
 ## Definition structures
 
-All in `effect_definition.hpp` (verbatim fields, defaults in parentheses):
+All in `effects/effect_definition.hpp` (verbatim fields, defaults in parentheses):
 
 - **`EffectDefinition`** — `name`, `emitters` (vector), `duration` (−1.0 =
   emitter-driven; when ≥ 0, emitters stop spawning once the effect has been
@@ -99,7 +99,7 @@ default 0.8, then blend to `end_value`).
 
 ## Runtime model
 
-`systems/effect_system.hpp`: `EffectInstance` → `EmitterInstance` →
+`effects/effect_system.hpp`: `EffectInstance` → `EmitterInstance` →
 `Particle`. Instances hold `const` pointers back into their definitions
 (hence the lifetime rule above). Per `update`:
 

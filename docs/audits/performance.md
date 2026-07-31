@@ -62,7 +62,7 @@ a Tracy capture as entity/particle/light counts grow.
 
 ### H1. Particle rendering: one draw call + 288 B uniform re-push per particle
 
-**Evidence:** `src/engine/render/effect_renderer.cpp:214-225` — inner loop per
+**Evidence:** `src/engine/effects/effect_renderer.cpp:214-225` — inner loop per
 particle:
 
 ```cpp
@@ -277,7 +277,7 @@ linearly with label count.**
 
 ### L1. Per-particle `sqrt` zero-tests and loop-invariant checks
 
-**Evidence:** `src/engine/systems/effect_system.cpp:217` —
+**Evidence:** `src/engine/effects/effect_system.cpp:217` —
 `if (glm::length(vel_def.gravity) > 0)` executes a `sqrt` per particle per
 frame to test a per-*emitter* constant; `effect_system.cpp:228` —
 `glm::length(particle.velocity) > 0.01f` is another per-particle `sqrt`
@@ -346,7 +346,7 @@ transform×bounds math (`scene_renderer.cpp:981-983` vs `1936-1937`).
 
 ### L7. `Particle` is a ~136-byte AoS record with type-specific cold fields
 
-**Evidence:** `systems/effect_system.hpp:20-47` — every particle carries
+**Evidence:** `effects/effect_system.hpp:20-47` — every particle carries
 orbit fields, arc fields, and a `const std::string* model` regardless of
 velocity type (132 B of fields, 136 B with tail padding);
 `update_particle` (`effect_system.cpp:158-245`) branches per

@@ -1065,7 +1065,7 @@ Compile-time-switched wrappers over the Tracy client so instrumentation can stay
 | `BRACKEN_PROFILE_ALLOC(ptr, sz)` / `BRACKEN_PROFILE_FREE(ptr)` | `TracyAlloc` / `TracyFree` | paired; used by `src/bracken/memory/arena.cpp:109,129,165` |
 | `BRACKEN_PROFILE_THREAD(name)` | `tracy::SetThreadName(name)` | used by `core/jobs/job_system.cpp:175` ("JobWorker") and `core/asset/file_watcher.cpp:226` ("FileWatcher") |
 
-Suggested zone-color palette (header comment; used consistently at engine call sites): `0x3D6E9E` update, `0x8E44AD` animation, `0x27AE60` culling/scene, `0xE67E22` shadows, `0xC0392B` main pass, `0x16A085` post-processing. Representative call sites: `animation/animation_state_machine.cpp:194` (0x8E44AD), `render/shadow_map.cpp:184` (0xE67E22), `render/terrain_renderer.cpp:457` (0xC0392B), `render/post_process_stack.cpp` composite (0x16A085), `systems/effect_system.cpp:62` (`BRACKEN_PROFILE_PLOT("effects.particles", ...)`).
+Suggested zone-color palette (header comment; used consistently at engine call sites): `0x3D6E9E` update, `0x8E44AD` animation, `0x27AE60` culling/scene, `0xE67E22` shadows, `0xC0392B` main pass, `0x16A085` post-processing. Representative call sites: `animation/animation_state_machine.cpp:194` (0x8E44AD), `render/shadow_map.cpp:184` (0xE67E22), `render/terrain_renderer.cpp:457` (0xC0392B), `render/post_process_stack.cpp` composite (0x16A085), `effects/effect_system.cpp:62` (`BRACKEN_PROFILE_PLOT("effects.particles", ...)`).
 
 #### Known limitations (documented in the header and `docs/architecture.md`)
 
@@ -6049,14 +6049,14 @@ Data-driven CPU-simulated, GPU-instanced mesh-particle effects. Three strictly l
 
 | Layer | Files | Namespace |
 |---|---|---|
-| Definitions (POD-style data, header-only) | `src/bracken/effect_definition.hpp` | `bracken` |
-| Runtime simulation | `src/bracken/systems/effect_system.hpp/.cpp` | `bracken::systems` |
-| Rendering | `src/bracken/render/effect_renderer.hpp/.cpp` | `bracken::render` |
+| Definitions (POD-style data, header-only) | `src/bracken/effects/effect_definition.hpp` | `bracken` |
+| Runtime simulation | `src/bracken/effects/effect_system.hpp/.cpp` | `bracken::systems` |
+| Rendering | `src/bracken/effects/effect_renderer.hpp/.cpp` | `bracken::render` |
 | Spawn commands + frame glue | `src/bracken/scene/frame_packet.hpp` (`EffectSpawnCommand`), `src/bracken/scene/frame_builder.hpp` (`spawn_effect`), `src/bracken/scene/scene_renderer.cpp` | `bracken::scene` |
 
 Design contract (`docs/effects_system.md`): the engine owns the structs, the simulation, and the rendering; **serialization/parsing of effect files is entirely the host's responsibility** — no effect file I/O exists anywhere in the engine.
 
-### Definition layer (`src/bracken/effect_definition.hpp`)
+### Definition layer (`src/bracken/effects/effect_definition.hpp`)
 
 Header-only, no dependencies beyond glm/`<string>`/`<vector>`. All types in namespace `bracken`.
 
@@ -6110,7 +6110,7 @@ Fields and defaults (exact): `type = DIRECTIONAL`, `speed = 100.0f` (units/sec),
 
 `name`; `emitters` (`std::vector<EmitterDefinition>`); `duration = -1.0f` — effect-level duration override: when `>= 0`, all emitters stop spawning once the effect has been alive this long, and the effect completes (is compacted away) as soon as its remaining particles die; `-1` (default) = emitter-driven completion.
 
-### Runtime layer (`src/bracken/systems/effect_system.hpp/.cpp`)
+### Runtime layer (`src/bracken/effects/effect_system.hpp/.cpp`)
 
 Namespace `bracken::systems`; re-exports the definition types via `using` declarations.
 
@@ -6227,7 +6227,7 @@ Note that ARC/ORBITAL also overwrite parts of `rotation` regardless of `Rotation
 
 #### Threading & performance
 
-Thread-safety tier: **owned, sim-stage in the engine path** — one owner calls `spawn_effect`/`update`/`snapshot_into`/`clear`; `update()` internally fans out INTEGRATE/COMPACT onto the given `JobSystem` and joins before returning, so nothing is touched by workers between updates. In the engine path the owner is `Application`'s **sim-job tail** (pool thread, per frame: apply the sealed builder's spawn commands → `update(js, dt, terrain sampler)` → `snapshot_into(fb)`); the renderer never touches the live system — it draws the packet's effect-instance snapshot. Output is bit-identical to a serial run at any worker count: spawning (the only RNG consumer) is serial, and the parallel phases write only disjoint per-particle/per-emitter state (pinned by `effect_system_parallel.test.cpp`, `init(1)` vs `init(4)` caller-owned pools). Cost per update is O(live particles) with vector erase-remove compaction per emitter per frame. Micro-benchmarks in `src/bracken/systems/effect_system.bench.cpp`: `BM_EffectUpdate` (steady-state 1k/10k particles), `BM_EffectUpdateParallel` (`{particles, workers}` on a caller-owned pool), `BM_EffectUpdateWithTerrain` (isolates sampler + clamp overhead), `BM_EffectSpawnBurst` (256-particle burst), `BM_CurveEvaluate` per `CurveType`. Profiler zones: `EffectSystem::spawn_effect` / `spawn_particles` / `compact_effects` (color `0x3D6E9E`).
+Thread-safety tier: **owned, sim-stage in the engine path** — one owner calls `spawn_effect`/`update`/`snapshot_into`/`clear`; `update()` internally fans out INTEGRATE/COMPACT onto the given `JobSystem` and joins before returning, so nothing is touched by workers between updates. In the engine path the owner is `Application`'s **sim-job tail** (pool thread, per frame: apply the sealed builder's spawn commands → `update(js, dt, terrain sampler)` → `snapshot_into(fb)`); the renderer never touches the live system — it draws the packet's effect-instance snapshot. Output is bit-identical to a serial run at any worker count: spawning (the only RNG consumer) is serial, and the parallel phases write only disjoint per-particle/per-emitter state (pinned by `effect_system_parallel.test.cpp`, `init(1)` vs `init(4)` caller-owned pools). Cost per update is O(live particles) with vector erase-remove compaction per emitter per frame. Micro-benchmarks in `src/bracken/effects/effect_system.bench.cpp`: `BM_EffectUpdate` (steady-state 1k/10k particles), `BM_EffectUpdateParallel` (`{particles, workers}` on a caller-owned pool), `BM_EffectUpdateWithTerrain` (isolates sampler + clamp overhead), `BM_EffectSpawnBurst` (256-particle burst), `BM_CurveEvaluate` per `CurveType`. Profiler zones: `EffectSystem::spawn_effect` / `spawn_particles` / `compact_effects` (color `0x3D6E9E`).
 
 ### Spawn commands (`src/bracken/scene/frame_packet.hpp` / `frame_builder.hpp`)
 
@@ -6263,7 +6263,7 @@ Render side, per frame (inside `SceneRenderer::render_frame`, main thread, over 
 
 Dev-overlay stats come from the packet, not the live system: `SceneRenderer::frame_effect_count()`/`frame_particle_count()` (cached from the rendered packet) feed the DevUI Stats tab's `Particles: N (in M effects)` line.
 
-### Rendering layer (`src/bracken/render/effect_renderer.hpp/.cpp`)
+### Rendering layer (`src/bracken/effects/effect_renderer.hpp/.cpp`)
 
 #### Public API
 
@@ -6272,7 +6272,7 @@ Dev-overlay stats come from the packet, not the live system: `SceneRenderer::fra
 template <typename ParticleT>
 glm::mat4 build_particle_transform_of(const ParticleT& particle, const glm::vec3& center_offset);
 
-// render/effect_renderer.hpp — the sealed-packet form, which is the render path
+// effects/effect_renderer.hpp — the sealed-packet form, which is the render path
 glm::mat4 build_particle_transform(const bracken::scene::EffectParticleSnapshot& particle,
                                    const glm::vec3& center_offset);
 

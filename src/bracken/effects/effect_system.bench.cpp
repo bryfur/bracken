@@ -3,8 +3,8 @@
 //
 // Run: ./build/src/bracken/bracken_benchmarks --benchmark_filter=BM_Effect
 #include "bracken/core/jobs/job_system.hpp"
-#include "bracken/effect_definition.hpp"
-#include "bracken/systems/effect_system.hpp"
+#include "bracken/effects/effect_definition.hpp"
+#include "bracken/effects/effect_system.hpp"
 #include <benchmark/benchmark.h>
 #include <cstdint>
 

@@ -11,7 +11,7 @@
 // would diverge the *instances*, not the worker counts. RNG-free spawns make
 // the comparison exact.
 #include "bracken/core/jobs/job_system.hpp"
-#include "bracken/systems/effect_system.hpp"
+#include "bracken/effects/effect_system.hpp"
 
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>

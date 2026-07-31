@@ -2,7 +2,7 @@
 
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/task_group.hpp"
-#include "bracken/effect_definition.hpp"
+#include "bracken/effects/effect_definition.hpp"
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
 
