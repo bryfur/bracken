@@ -8,6 +8,7 @@
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/render/render_context.hpp"
 #include "bracken/scene/frame_packet_ring.hpp"
+#include "bracken/scene/packet_digest.hpp"
 #include "bracken/scene/scene_renderer.hpp"
 #include "bracken/sim_frame.hpp"
 #include "bracken/systems/camera_system.hpp"
@@ -117,6 +118,14 @@ void Application::kick_sim() {
                                   static_cast<double>(SDL_NS_PER_SECOND));
     last_frame_time_ = now;
     dt = std::min(dt, 0.1f); // clamp huge jumps (debugger stalls, window drags)
+
+    // A pinned timestep replaces the measured delta outright, so simulated
+    // time becomes a pure function of frame index and a fixed-frame-count run
+    // is reproducible. last_frame_time_ is still updated above: restoring
+    // wall-clock timing mid-run must not hand the next frame a huge delta.
+    if (fixed_timestep_) {
+        dt = *fixed_timestep_;
+    }
 
     sim_dt_ = dt;
     sim_time_ += dt;
@@ -295,6 +304,13 @@ void Application::run() {
         }
         const uint64_t frame_index = frame->frame_index();
 
+        // Digest the packet here: it is sealed, and the renderer has not yet
+        // written the engine-owned fields (light shadow slots) that would make
+        // the value depend on whether the frame had been drawn.
+        if (packet_digest_enabled_) {
+            packet_digest_accum_ = packet_digest_accum_ * 1099511628211ULL ^ scene::packet_digest(*frame);
+        }
+
         frame_fence(frame_index); // (2)
 
         pump_events(); // (3)
@@ -464,6 +480,11 @@ int Application::screen_width() const {
 
 int Application::screen_height() const {
     return context_ ? context_->height() : 0;
+}
+
+void Application::set_fixed_timestep(std::optional<float> seconds) {
+    BRACKEN_ASSERT(!seconds || *seconds > 0.0f, "fixed timestep must be positive");
+    fixed_timestep_ = seconds;
 }
 
 void Application::set_collect_render_stats(bool enabled) {

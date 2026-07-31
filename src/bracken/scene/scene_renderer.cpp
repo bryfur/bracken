@@ -1407,8 +1407,8 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
 
     // Render non-instanced static models (attack animations, no-fog, etc.)
     if (!non_instanced_commands_.empty() && main_render_pass_ && bind_model_pipeline(false, frame_prepass_active_)) {
-        for (const auto* cmd : non_instanced_commands_) {
-            render_model_command_inner(*cmd, camera);
+        for (const auto* draw_cmd : non_instanced_commands_) {
+            render_model_command_inner(*draw_cmd, camera);
         }
     }
 

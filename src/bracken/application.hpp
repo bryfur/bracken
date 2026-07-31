@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <SDL3/SDL_events.h>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -161,7 +162,7 @@ protected:
      *  main thread, during the event pump (no sim in flight, so touching
      *  host state here is safe). Return true to consume the event (prevent
      *  InputHandler from seeing it). */
-    virtual bool on_event(const SDL_Event& event) { return false; }
+    virtual bool on_event([[maybe_unused]] const SDL_Event& event) { return false; }
 
     /** The live input handler. Tier: main-thread (on_event/on_main_frame/
      *  init paths only) — sim code reads SimFrame::input() instead. */
@@ -282,6 +283,46 @@ protected:
     const RenderStats& render_stats() const;
     std::string gpu_driver_name() const;
 
+    /** Pin the simulation timestep, decoupling simulated time from wall clock.
+     *
+     *  Normally `dt` is measured from the wall clock, so N rendered frames
+     *  cover a different amount of simulated time on every run — the machine's
+     *  load decides how far the world advances. That makes a fixed-frame-count
+     *  run (an integration test, a recorded demo, a golden-image capture)
+     *  irreproducible: a slower run simulates *further*, not just slower.
+     *
+     *  With a value set, every frame advances exactly `seconds` regardless of
+     *  how long it actually took to render, so frame N is always at simulated
+     *  time `N * seconds`. Rendering is unaffected — this changes what the sim
+     *  is told, not how fast the loop runs.
+     *
+     *  Pass `std::nullopt` to restore wall-clock timing (the default).
+     *  Tier: main-thread (set it in `on_init`, not mid-flight). */
+    void set_fixed_timestep(std::optional<float> seconds);
+
+    /** The pinned timestep, or `std::nullopt` when timing is wall-clock. */
+    [[nodiscard]] std::optional<float> fixed_timestep() const { return fixed_timestep_; }
+
+    /** Accumulate a running fingerprint of every frame this run describes.
+     *
+     *  Each sealed packet is hashed (see scene/packet_digest.hpp) after the
+     *  sim job joins and before it renders, and folded into a running value.
+     *  Two runs that describe the same frames produce the same number, so it
+     *  works as an exact regression gate — unlike render statistics or a
+     *  screenshot, which sit downstream of the GPU and move for driver
+     *  reasons that have nothing to do with a code change.
+     *
+     *  Pair it with set_fixed_timestep(): without a pinned timestep the frames
+     *  themselves differ run-to-run and the digest is expected to differ too.
+     *
+     *  Off by default — it walks every command of every frame, which a
+     *  shipping game should not pay for. Tier: main-thread. */
+    void set_packet_digest_enabled(bool enabled) { packet_digest_enabled_ = enabled; }
+
+    /** The accumulated frame fingerprint, or 0 if digesting was never enabled.
+     *  Tier: main-thread, or sim-stage/fence (never written mid-render). */
+    [[nodiscard]] uint64_t packet_digest() const { return packet_digest_accum_; }
+
     /** Capture the next rendered frame (UI included) to a PNG. The capturing
      *  frame blocks on the GPU — integration tests and debug only. Tier:
      *  sim-stage or main thread — the request is deferred and forwarded to
@@ -332,6 +373,15 @@ private:
     std::atomic<bool> running_{false};
 
     uint64_t last_frame_time_ = 0; // nanoseconds (SDL_GetTicksNS) at last kick
+    // When set, kick_sim() reports this dt instead of the wall-clock delta,
+    // making simulated time a pure function of frame index. See
+    // set_fixed_timestep(). Main-thread only; read at kick.
+    std::optional<float> fixed_timestep_;
+
+    // Rolling frame fingerprint. Zero until enabled, then folded once per
+    // joined packet — see set_packet_digest_enabled().
+    bool packet_digest_enabled_ = false;
+    uint64_t packet_digest_accum_ = 0;
     float fps_ = 0.0f;
     int frame_count_ = 0;
     uint64_t fps_timer_ = 0; // nanoseconds (SDL_GetTicksNS)

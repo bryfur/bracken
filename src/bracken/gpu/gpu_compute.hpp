@@ -1,6 +1,6 @@
 #pragma once
 
-#include "gpu_device.hpp"
+#include "bracken/gpu/gpu_device.hpp"
 #include <cstdint>
 #include <memory>
 #include <span>

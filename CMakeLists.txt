@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
+include(BrackenWarnings)
+
 include(FetchContent)
 
 # Build all vendored (FetchContent) dependencies as static libraries. A plain
@@ -54,6 +57,12 @@ endif()
 
 # Google Benchmark (micro-benchmarks for CPU-side systems)
 option(BRACKEN_BUILD_BENCHMARKS "Build bracken_benchmarks (Google Benchmark)" ON)
+if(BRACKEN_BUILD_BENCHMARKS AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    message(WARNING
+        "BRACKEN_BUILD_BENCHMARKS=ON with no CMAKE_BUILD_TYPE: benchmarks will compile "
+        "at -O0 with arena poisoning and live thread-tier asserts. Numbers measured in "
+        "this tree are not meaningful. Use `cmake --preset bench` (build-bench/) instead.")
+endif()
 if(BRACKEN_BUILD_BENCHMARKS)
     FetchContent_Declare(
         benchmark

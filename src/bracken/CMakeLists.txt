@@ -104,15 +104,21 @@ file(GLOB_RECURSE BRACKEN_SOURCES CONFIGURE_DEPENDS "*.cpp")
 # Exclude test and benchmark files from the engine library
 list(FILTER BRACKEN_SOURCES EXCLUDE REGEX ".*\\.(test|bench)\\.cpp$")
 add_library(bracken STATIC ${BRACKEN_SOURCES})
+bracken_target_warnings(bracken)
 
 # PROJECT_SOURCE_DIR (the engine root, where project(bracken) is declared) —
 # not CMAKE_SOURCE_DIR, which resolves to the super-project's root when the
 # engine is consumed via add_subdirectory.
-target_include_directories(bracken PUBLIC
-    ${PROJECT_SOURCE_DIR}/src
-    ${tinygltf_SOURCE_DIR}
-    ${SDL_shadercross_SOURCE_DIR}/include
-)
+target_include_directories(bracken PUBLIC ${PROJECT_SOURCE_DIR}/src)
+
+# SYSTEM: tinygltf's bundled json.hpp trips -Wdeprecated-literal-operator, and a
+# vendored header must never be able to fail our -Werror build.
+target_include_directories(bracken SYSTEM PUBLIC ${tinygltf_SOURCE_DIR})
+# NOTE: no SDL_shadercross include dir here. FetchContent populates
+# SDL3_shadercross_SOURCE_DIR (note the "3"), so the old
+# ${SDL_shadercross_SOURCE_DIR}/include entry expanded to a literal "/include"
+# and put a bogus -I on all 139 TUs. The real headers arrive via the
+# SDL3_shadercross::SDL3_shadercross-static INTERFACE include dirs below.
 
 target_compile_definitions(bracken PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)
 
@@ -189,6 +195,7 @@ if(BRACKEN_BUILD_BENCHMARKS)
     file(GLOB_RECURSE BRACKEN_BENCH_SOURCES CONFIGURE_DEPENDS "*.bench.cpp")
     if(BRACKEN_BENCH_SOURCES)
         add_executable(bracken_benchmarks ${BRACKEN_BENCH_SOURCES})
+        bracken_target_warnings(bracken_benchmarks)
         target_link_libraries(bracken_benchmarks PRIVATE bracken benchmark::benchmark_main)
         target_include_directories(bracken_benchmarks PRIVATE ${PROJECT_SOURCE_DIR}/src)
     endif()
@@ -199,6 +206,7 @@ if(BRACKEN_BUILD_TESTS)
     file(GLOB_RECURSE BRACKEN_TEST_SOURCES CONFIGURE_DEPENDS "*.test.cpp")
     if(BRACKEN_TEST_SOURCES)
         add_executable(bracken_tests ${BRACKEN_TEST_SOURCES})
+        bracken_target_warnings(bracken_tests)
         target_link_libraries(bracken_tests PRIVATE bracken GTest::gtest_main)
         target_include_directories(bracken_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

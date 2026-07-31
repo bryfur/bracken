@@ -15,13 +15,26 @@ using bracken::VelocityType;
 
 namespace {
 
-// Lazy thread-local PRNG. Avoids throwing std::random_device construction at
-// static-init time (which can't be caught) and keeps the generator MT-safe
-// without a mutex.
-float random_float(float min, float max) {
-    thread_local std::mt19937 gen{std::random_device{}()};
-    std::uniform_real_distribution<float> dist(min, max);
-    return dist(gen);
+// SplitMix64. The particle streams must be reproducible run-to-run AND
+// independent of which worker happens to run the sim job, so the generator
+// state lives on the emitter that draws from it rather than in a thread_local:
+// a thread_local mt19937 seeded from std::random_device gave a different
+// stream on every run and interleaved differently at different worker counts,
+// which put particle positions — and therefore the sealed packet — outside any
+// regression gate. Advancing a per-emitter counter makes each draw a pure
+// function of (emitter seed, draw index).
+uint64_t splitmix64(uint64_t& state) {
+    uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+float random_float(uint64_t& rng, float min, float max) {
+    // Top 24 bits → [0,1): exactly representable in a float mantissa, so the
+    // mapping carries no rounding surprise across platforms.
+    const float unit = static_cast<float>(splitmix64(rng) >> 40) / 16777216.0f;
+    return min + unit * (max - min);
 }
 
 } // anonymous namespace
@@ -61,6 +74,11 @@ int EffectSystem::spawn_effect(const EffectDefinition* definition, const glm::ve
         emitter.age = 0.0f;
         emitter.next_spawn_time = emitter_def.delay;
         emitter.has_spawned_burst = false;
+        // Deterministic seed: spawn order is itself deterministic under a
+        // fixed timestep, so keying on the monotonic spawn counter gives every
+        // emitter its own reproducible stream. The odd multiplier decorrelates
+        // adjacent emitters of the same effect.
+        emitter.rng = rng_seed_counter_++ * 0x9E3779B97F4A7C15ULL + 0x632BE59BD9B4E019ULL;
 
         effect.emitters.push_back(std::move(emitter));
     }
@@ -131,9 +149,9 @@ void EffectSystem::spawn_particles(EmitterInstance& emitter, int count) {
         // and therefore existing effects — bit-identical).
         particle.position = emitter.origin;
         if (def.spawn_volume.x > 0.0f || def.spawn_volume.y > 0.0f || def.spawn_volume.z > 0.0f) {
-            particle.position += glm::vec3(random_float(-def.spawn_volume.x, def.spawn_volume.x),
-                                           random_float(-def.spawn_volume.y, def.spawn_volume.y),
-                                           random_float(-def.spawn_volume.z, def.spawn_volume.z));
+            particle.position += glm::vec3(random_float(emitter.rng, -def.spawn_volume.x, def.spawn_volume.x),
+                                           random_float(emitter.rng, -def.spawn_volume.y, def.spawn_volume.y),
+                                           random_float(emitter.rng, -def.spawn_volume.z, def.spawn_volume.z));
         }
 
         // Lifetime
@@ -141,7 +159,7 @@ void EffectSystem::spawn_particles(EmitterInstance& emitter, int count) {
         particle.age = 0.0f;
 
         // Initial velocity
-        particle.velocity = calculate_initial_velocity(def.velocity, emitter.direction, i);
+        particle.velocity = calculate_initial_velocity(def.velocity, emitter.direction, emitter.rng);
 
         // Initial rotation
         particle.rotation = glm::radians(def.rotation.initial_rotation);
@@ -170,7 +188,7 @@ void EffectSystem::spawn_particles(EmitterInstance& emitter, int count) {
 }
 
 glm::vec3 EffectSystem::calculate_initial_velocity(const VelocityDefinition& vel_def, const glm::vec3& direction,
-                                                   int particle_index) {
+                                                   uint64_t& rng) {
     glm::vec3 velocity = {0, 0, 0};
 
     switch (vel_def.type) {
@@ -180,7 +198,7 @@ glm::vec3 EffectSystem::calculate_initial_velocity(const VelocityDefinition& vel
             // Apply spread angle
             if (vel_def.spread_angle > 0) {
                 float spread_rad = glm::radians(vel_def.spread_angle);
-                float angle_offset = random_float(-spread_rad, spread_rad);
+                float angle_offset = random_float(rng, -spread_rad, spread_rad);
 
                 // Rotate velocity by spread angle (simplified 2D rotation in XZ plane)
                 float cos_a = std::cos(angle_offset);
@@ -193,7 +211,7 @@ glm::vec3 EffectSystem::calculate_initial_velocity(const VelocityDefinition& vel
 
         case VelocityType::RADIAL: {
             // Random direction outward
-            float angle = random_float(0, glm::two_pi<float>());
+            float angle = random_float(rng, 0.0f, glm::two_pi<float>());
             velocity = glm::vec3(std::cos(angle) * vel_def.speed, 0, std::sin(angle) * vel_def.speed);
             break;
         }

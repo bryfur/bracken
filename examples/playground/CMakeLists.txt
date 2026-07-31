@@ -7,6 +7,7 @@ add_executable(playground
     character.cpp
     day_weather.cpp
 )
+bracken_target_warnings(playground)
 target_link_libraries(playground PRIVATE bracken)
 bracken_copy_shaders(playground)
 

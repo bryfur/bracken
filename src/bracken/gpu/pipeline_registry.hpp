@@ -1,9 +1,9 @@
 #pragma once
 
-#include "gpu_compute.hpp"
-#include "gpu_device.hpp"
-#include "gpu_pipeline.hpp"
-#include "gpu_shader.hpp"
+#include "bracken/gpu/gpu_compute.hpp"
+#include "bracken/gpu/gpu_device.hpp"
+#include "bracken/gpu/gpu_pipeline.hpp"
+#include "bracken/gpu/gpu_shader.hpp"
 #include <memory>
 #include <string>
 #include <unordered_map>

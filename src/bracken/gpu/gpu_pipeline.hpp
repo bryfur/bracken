@@ -1,7 +1,7 @@
 #pragma once
 
-#include "gpu_device.hpp"
-#include "gpu_types.hpp"
+#include "bracken/gpu/gpu_device.hpp"
+#include "bracken/gpu/gpu_types.hpp"
 #include <memory>
 #include <vector>
 

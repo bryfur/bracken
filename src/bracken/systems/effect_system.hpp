@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <glm/glm.hpp>
 #include <string>
 #include <type_traits>
@@ -68,6 +69,12 @@ struct EmitterInstance {
     // Spawn location and direction
     glm::vec3 origin = {0, 0, 0};
     glm::vec3 direction = {1, 0, 0};
+
+    // Per-emitter PRNG counter. Seeded deterministically at spawn from the
+    // owning EffectSystem's spawn sequence, so an emitter's particle stream
+    // depends only on when it was spawned — not on the wall clock and not on
+    // which worker steps it. Advanced by every random draw the emitter makes.
+    uint64_t rng = 0;
 
     // Check if emitter is still active
     bool is_active() const {
@@ -222,10 +229,12 @@ private:
     // effect has outlived EffectDefinition::duration.
     void spawn_phase(EmitterInstance& emitter, float dt, bool allow_spawn);
 
-    // SPAWN-phase only (serial): both draw from the thread_local RNG.
+    // SPAWN-phase only (serial): both draw from the owning emitter's
+    // deterministic RNG counter (EmitterInstance::rng), never a shared or
+    // thread_local generator.
     void spawn_particles(EmitterInstance& emitter, int count);
     glm::vec3 calculate_initial_velocity(const VelocityDefinition& vel_def, const glm::vec3& direction,
-                                         int particle_index);
+                                         uint64_t& rng);
 
     // Pure per-particle step: reads/writes only `particle` plus the const
     // definition — worker-safe; called from the INTEGRATE fan-out.
@@ -243,6 +252,10 @@ private:
     // Definitions already warned about for an invalid CONTINUOUS spawn_rate
     // (warn once per definition; definitions have stable addresses).
     std::unordered_set<const EmitterDefinition*> warned_bad_spawn_rate_;
+
+    // Monotonic emitter-seed source. Spawn order is deterministic, so this
+    // gives each emitter a reproducible, mutually decorrelated stream.
+    uint64_t rng_seed_counter_ = 0;
 
     // INTEGRATE/COMPACT scratch, rebuilt every update (members so steady
     // state doesn't reallocate): the frame's live (non-empty, valid) emitters

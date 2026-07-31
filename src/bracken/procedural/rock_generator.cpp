@@ -435,9 +435,6 @@ std::unique_ptr<Model> RockGenerator::generate(const RockParams& params) {
                 float v[8];
                 glm::vec3 p[8];
                 for (int i = 0; i < 8; i++) {
-                    int dx = (i & 1) ? 1 : 0;
-                    int dy = (i & 2) ? 1 : 0;
-                    int dz = (i & 4) ? 1 : 0;
                     // Standard marching cubes corner ordering
                     int cx = 0;
                     int cy = 0;

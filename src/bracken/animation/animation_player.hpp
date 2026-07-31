@@ -1,6 +1,6 @@
 #pragma once
 
-#include "animation_types.hpp"
+#include "bracken/animation/animation_types.hpp"
 #include <array>
 #include <span>
 #include <vector>

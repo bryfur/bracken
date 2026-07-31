@@ -21,6 +21,13 @@ constexpr bool is_pow2(std::size_t v) {
     return v != 0 && (v & (v - 1)) == 0;
 }
 
+// align_up() below is a mask-based round-up, which is only correct for
+// power-of-two alignments — so pin that here rather than trusting the
+// constants to stay well-formed. This also keeps is_pow2 referenced in
+// NDEBUG builds, where its only other use (a BRACKEN_ASSERT) compiles away.
+static_assert(is_pow2(k_cursor_align));
+static_assert(is_pow2(k_max_block_align));
+
 constexpr std::size_t align_up(std::size_t v, std::size_t a) {
     return (v + a - 1) & ~(a - 1);
 }

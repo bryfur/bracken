@@ -87,6 +87,7 @@ All options with their defaults (defined in the root `CMakeLists.txt` except the
 | `BRACKEN_PLAYGROUND_SMOKE_TEST` | `OFF` | Register `playground --smoke 240` as a ctest named `playground_smoke` (label `integration`, 180 s timeout). Needs a GPU + display, so off by default. |
 | `BRACKEN_ENABLE_DEV_UI` | `ON` | Build the Dear ImGui developer overlay (`bracken::dev::DevUI`). `OFF` compiles `DevUI` to a no-op stub and skips fetching/linking ImGui entirely. When `ON`, the engine defines `BRACKEN_DEV_UI=1` publicly (use it to guard panel bodies that call `ImGui::` directly). |
 | `BRACKEN_ENABLE_TRACY` | `OFF` | Fetch Tracy v0.11.1, link `TracyClient`, and define `BRACKEN_ENABLE_TRACY=1` publicly. OFF means zero overhead. |
+| `BRACKEN_WERROR` | top-level: `ON`<br>as subproject: `OFF` | Treat warnings as errors on the four first-party targets (`bracken`, `bracken_tests`, `bracken_benchmarks`, `playground`). Warning flags are applied **PRIVATE**, so consuming a game via `add_subdirectory` never inherits them — and the default flips to `OFF` off-top-level so a new compiler release can't break your build. |
 
 Example — a lean "shipping-style" configure:
 

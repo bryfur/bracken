@@ -230,14 +230,23 @@ Google Benchmark, `*.bench.cpp` next to units, auto-globbed), `BRACKEN_BUILD_EXA
 playground smoke run as a ctest; needs GPU + display), `BRACKEN_ENABLE_DEV_UI`
 (default ON — Dear ImGui developer overlay; OFF compiles `bracken::dev::DevUI`
 to a no-op stub and skips fetching ImGui), `BRACKEN_ENABLE_TRACY`
-(default OFF).
+(default OFF), `BRACKEN_WERROR` (default ON at top level, OFF when consumed via
+`add_subdirectory` — warnings are applied PRIVATE so a consuming game never
+inherits them; see `cmake/BrackenWarnings.cmake`).
 Env: `BRACKEN_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.
 `BRACKEN_WORKERS=<n>` sets the job-system worker count (unset/0 =
 `hardware_concurrency()-1`, min 1; `=1` is the single-worker debug mode —
 same code path, one worker).
 
-A `CMakePresets.json` (version 6) exists at the repo root: `default` maps to
-the primary `build/` tree; `tsan` is the ThreadSanitizer lane below.
+A `CMakePresets.json` (version 6) exists at the repo root. Four trees, all
+long-lived and coexisting — the no-clean-rebuild rule applies to each:
+
+| Preset | Tree | What it is for |
+|---|---|---|
+| `default` | `build/` | The primary incremental tree. No `CMAKE_BUILD_TYPE` → `-O0`. |
+| `tsan` | `build-tsan/` | ThreadSanitizer lane (below). Tests only. |
+| `rel` | `build-rel/` | RelWithDebInfo — the **only** lane that compiles the `NDEBUG` path, where `BRACKEN_ASSERT` and the debug-only thread-tier assertions vanish. Run it before relying on an assert for correctness. |
+| `bench` | `build-bench/` | Optimized benchmark lane. `build/` is `-O0` with arena poisoning and live tier asserts, so **numbers measured there are meaningless** — configure warns about this. |
 
 ### TSan lane
 

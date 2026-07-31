@@ -373,27 +373,27 @@ void PlaygroundGame::build_heightmap() {
             // banks pinned above it (so the flat water plane stays contained),
             // then a blend back into whatever the terrain was doing.
             {
-                const float d = std::abs(wx - river_center_x(wz));
+                const float river_d = std::abs(wx - river_center_x(wz));
                 // Dry floor for the strip flanking the channel: the raw hills
                 // dip below the water level in places, and the flat water
                 // plane would pool in any such dip inside the water region.
                 const float dry = RIVER_WATER_LEVEL + 12.0f;
-                if (d < RIVER_INFLUENCE) {
+                if (river_d < RIVER_INFLUENCE) {
                     const float bed = RIVER_WATER_LEVEL - RIVER_DEPTH;
                     const float bank = RIVER_WATER_LEVEL + RIVER_BANK_HEIGHT;
                     float channel;
-                    if (d < RIVER_HALF_WIDTH) {
+                    if (river_d < RIVER_HALF_WIDTH) {
                         // Parabolic bed: deepest at the centerline.
-                        const float t = d / RIVER_HALF_WIDTH;
+                        const float t = river_d / RIVER_HALF_WIDTH;
                         channel = glm::mix(bed, RIVER_WATER_LEVEL - 10.0f, t * t);
                     } else {
                         // Waterline up to the bank crest.
-                        const float t = glm::smoothstep(RIVER_HALF_WIDTH, RIVER_BANK_HALF_WIDTH, d);
+                        const float t = glm::smoothstep(RIVER_HALF_WIDTH, RIVER_BANK_HALF_WIDTH, river_d);
                         channel = glm::mix(RIVER_WATER_LEVEL - 10.0f, std::max(h, bank), t);
                     }
                     h = glm::mix(channel, std::max(h, dry),
-                                 glm::smoothstep(RIVER_BANK_HALF_WIDTH, RIVER_INFLUENCE, d));
-                } else if (d < RIVER_INFLUENCE + 700.0f) {
+                                 glm::smoothstep(RIVER_BANK_HALF_WIDTH, RIVER_INFLUENCE, river_d));
+                } else if (river_d < RIVER_INFLUENCE + 700.0f) {
                     h = std::max(h, dry);
                 }
             }
@@ -1258,6 +1258,16 @@ void PlaygroundGame::update_smoke_driver(float dt) {
 // apply_all_graphics_settings and the render-side touches are legal; the
 // env-var parsing happens once instead of from a pool job).
 void PlaygroundGame::setup_smoke_run() {
+    // Pin the timestep: the smoke run is a fixed FRAME count, so with
+    // wall-clock timing the amount of simulated time it covers depends on how
+    // fast the machine happens to be. Measured on this tree, three consecutive
+    // runs at 62/59/54 fps produced 1065/1091/1109 entities and 468/510/556
+    // draw calls — the slower the run, the further the world advanced. At a
+    // pinned 1/60 s, frame N is always simulated time N/60 and the run is
+    // reproducible, which is what makes it usable as a regression gate.
+    set_fixed_timestep(1.0f / 60.0f);
+    set_packet_digest_enabled(true);
+
     auto& gs = graphics_settings();
     // Persisted settings may have stored another AA mode: force TAA so the
     // smoke always exercises the temporal path (and the final screenshot
@@ -1554,6 +1564,9 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
             frame_, avg_fps, stats.draw_calls, stats.triangle_count, stats.entities_rendered, orbs_collected_,
             has_village_ ? 1 : 0, ibl_refreshes, local_tiles, ls_points, ls_spots,
             ev_state ? std::format("{:.2f}", ev_state->current_ev) : "n/a", gpu_driver_name());
+        // The hard regression gate. Unlike everything on the line above, this
+        // is computed entirely CPU-side, so it is exact and driver-independent.
+        std::cout << std::format("[smoke] packet_digest=0x{:016x}\n", packet_digest());
         quit();
     }
 }
@@ -2039,7 +2052,16 @@ void PlaygroundGame::build_ui(scene::FrameBuilder& fb) {
     auto ui = fb.ui();
     ui.add_filled_rect(10, 10, 280, 122, 0xB0101418);
     ui.add_text("bracken playground", 22, 20, 1.0f, 0xFFFFD080);
-    ui.add_text(std::format("FPS {:.0f}", fps()), 22, 44, 0.9f, 0xFFB8C4D0);
+    // The smoke run is a regression gate, and the packet it describes must be
+    // a pure function of the frame index. A live FPS readout is wall-clock
+    // derived, so drawing it would put a run-to-run-varying string into the
+    // packet — which the packet digest correctly reports as a difference. The
+    // measured rate is still printed in the "[smoke] OK" summary line.
+    if (smoke_frames_ > 0) {
+        ui.add_text("FPS --", 22, 44, 0.9f, 0xFFB8C4D0);
+    } else {
+        ui.add_text(std::format("FPS {:.0f}", fps()), 22, 44, 0.9f, 0xFFB8C4D0);
+    }
     ui.add_text(std::format("Orbs collected: {}", orbs_collected_), 22, 64, 0.9f, 0xFFFFC040);
     ui.add_text(std::format("Anim state: {}", anim_sm_.current_state()), 22, 84, 0.9f, 0xFFB8C4D0);
     ui.add_text(std::format("Pos {:.0f}, {:.0f}", player_pos_.x, player_pos_.z), 22, 104, 0.9f, 0xFF8894A0);

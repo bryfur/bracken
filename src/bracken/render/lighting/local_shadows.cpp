@@ -61,7 +61,6 @@ struct LightTraits;
 
 template <>
 struct LightTraits<PointLight> {
-    static constexpr int FACES = 6;
     static constexpr uint8_t FULL = POINT_FULL_MASK;
     static PointLight& stored(auto& g) { return g.point; }
     static const PointLight& stored(const auto& g) { return g.point; }
@@ -73,7 +72,6 @@ struct LightTraits<PointLight> {
 
 template <>
 struct LightTraits<SpotLight> {
-    static constexpr int FACES = 1;
     static constexpr uint8_t FULL = SPOT_FULL_MASK;
     static SpotLight& stored(auto& g) { return g.spot; }
     static const SpotLight& stored(const auto& g) { return g.spot; }

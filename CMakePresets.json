@@ -28,11 +28,35 @@
                 "BRACKEN_BUILD_EXAMPLES": "OFF",
                 "BRACKEN_BUILD_BENCHMARKS": "OFF"
             }
+        },
+        {
+            "name": "rel",
+            "displayName": "Release-ish (build-rel/)",
+            "description": "RelWithDebInfo tree — the only lane that exercises the NDEBUG path, where BRACKEN_ASSERT and the debug-only thread-tier assertions compile out. Run it before shipping any change that relies on an assert for correctness. Coexists with build/ and build-tsan/.",
+            "inherits": "default",
+            "binaryDir": "${sourceDir}/build-rel",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        },
+        {
+            "name": "bench",
+            "displayName": "Benchmarks (build-bench/)",
+            "description": "Optimized tree for bracken_benchmarks. The default build/ tree has no CMAKE_BUILD_TYPE, so it compiles at -O0 with live asserts — any number measured there is meaningless. Always benchmark here.",
+            "inherits": "default",
+            "binaryDir": "${sourceDir}/build-bench",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "BRACKEN_BUILD_BENCHMARKS": "ON",
+                "BRACKEN_BUILD_EXAMPLES": "OFF"
+            }
         }
     ],
     "buildPresets": [
         { "name": "default", "configurePreset": "default" },
-        { "name": "tsan", "configurePreset": "tsan" }
+        { "name": "tsan", "configurePreset": "tsan" },
+        { "name": "rel", "configurePreset": "rel" },
+        { "name": "bench", "configurePreset": "bench" }
     ],
     "testPresets": [
         {
@@ -47,6 +71,11 @@
             "environment": {
                 "TSAN_OPTIONS": "halt_on_error=0 second_deadlock_stack=1"
             }
+        },
+        {
+            "name": "rel",
+            "configurePreset": "rel",
+            "output": { "outputOnFailure": true }
         }
     ]
 }

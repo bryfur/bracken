@@ -1,6 +1,6 @@
 #pragma once
 
-#include "animation_player.hpp"
+#include "bracken/animation/animation_player.hpp"
 #include <cstdint>
 #include <string>
 #include <unordered_map>

@@ -323,8 +323,6 @@ TEST(RotationSmoother, WrappingShortPath) {
     // The short path goes from 3.1 -> PI -> -3.1 (increasing angle, wrapping)
     // So the smoother should have moved AWAY from zero (toward +PI or beyond)
     // rather than taking the long path through 0
-    float dist_to_target_through_zero = std::abs(near_pi) + std::abs(near_neg_pi); // ~6.2
-    float dist_from_current_through_zero = std::abs(smoother.current) + std::abs(near_neg_pi);
     // The smoother should still be near PI (took the short path, not the long way through 0)
     EXPECT_GT(std::abs(smoother.current), 1.5f);
 }
