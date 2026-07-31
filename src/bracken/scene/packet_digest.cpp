@@ -2,8 +2,8 @@
 
 #include "bracken/contracts/camera_state.hpp"
 #include "bracken/contracts/environment.hpp"
+#include "bracken/contracts/light.hpp"
 #include "bracken/effect_definition.hpp"
-#include "bracken/render/lighting/light.hpp"
 #include "bracken/scene/frame_packet.hpp"
 
 #include <bit>

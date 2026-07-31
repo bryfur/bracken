@@ -2725,7 +2725,7 @@ fb.add_spot_light({origin, /*radius=*/1400.0f, dir,
                    /*casts_shadows=*/true});
 ```
 
-Types are `render::lighting::PointLight` / `SpotLight` (`src/bracken/render/lighting/light.hpp`), copied by value into the packet; spot cone angles are passed as **cosines** (inner, outer). Intensity is radiometric — falloff is inverse-square in world units, so a light meant to read against the default sun (`sun_intensity` 3.0) needs `intensity ≈ 3 × distance²`. Lights feed the clustered-forward binning; the frame cap is `MAX_LIGHTS = 256` (point + spot combined).
+Types are `render::lighting::PointLight` / `SpotLight` (`src/bracken/contracts/light.hpp`), copied by value into the packet; spot cone angles are passed as **cosines** (inner, outer). Intensity is radiometric — falloff is inverse-square in world units, so a light meant to read against the default sun (`sun_intensity` 3.0) needs `intensity ≈ 3 × distance²`. Lights feed the clustered-forward binning; the frame cap is `MAX_LIGHTS = 256` (point + spot combined).
 
 **Local light shadows** (`casts_shadows = true`): opt a light into the per-frame shadow budget (`GraphicsSettings::local_shadow_point_budget`/`_spot_budget`, defaults 4 + 2). Each frame the engine picks the highest-priority casters (score = intensity × radius / camera distance, with eviction hysteresis so lights don't pop at the boundary) and renders them into a shared D32 atlas — 6 perspective cube-face tiles per point light, 1 per spot. Tiles are **cached**: they re-render only when the light moves/changes or a dynamic caster (skinned, or a model submitted with nonzero `motion_id`) enters the light radius, capped at 6 tiles/frame (round-robin) so many moving lights degrade to slightly stale shadows, never a hitch. Non-selected casters and lights whose tiles haven't rendered yet simply fall back to unshadowed. Casters are model + skinned commands (`mesh.cast_shadows` respected); terrain and grass never cast local shadows. **Gotcha**: emissive "bulb" geometry that encloses its own light (the playground's orbs) must set `mesh.cast_shadows = false`, or the shadow map — rendered from inside the bulb — occludes everything. Leave `shadow_slot` alone; the engine overwrites it every frame.
 
@@ -3917,12 +3917,12 @@ target and tonemapping happens at composite (see
 
 #### Light types and parameters
 
-The light structs live in `src/bracken/render/lighting/light.hpp`
+The light structs live in `src/bracken/contracts/light.hpp`
 (namespace `bracken::render::lighting`). They are plain PODs whose layout is
 mirrored byte-for-byte by the shaders — do not reorder or extend them.
 
 ```cpp
-#include "bracken/render/lighting/light.hpp"
+#include "bracken/contracts/light.hpp"
 
 struct PointLight {
     glm::vec3 position;         // world space
@@ -3995,7 +3995,7 @@ void MyGame::on_simulate(bracken::SimFrame& sim) {
 #### Limits and silent behaviors
 
 - **`MAX_LIGHTS = 256`** point + spot lights combined per frame
-  (`src/bracken/render/lighting/light.hpp`). Lights added past the cap are
+  (`src/bracken/render/lighting/light.hpp` — the cap; the structs are `src/bracken/contracts/light.hpp`). Lights added past the cap are
   **silently ignored** — no log, no error
   (`ClusterGrid::add_point_light`/`add_spot_light` just return).
 - **`MAX_LIGHTS_PER_CLUSTER = 128`** lights affecting a single screen cluster.

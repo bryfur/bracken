@@ -3,6 +3,7 @@
 #include "character.hpp"
 #include "scene_layout.hpp"
 #include "bracken/animation/ik_solver.hpp"
+#include "bracken/contracts/light.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/dev/dev_ui.hpp"
@@ -14,7 +15,6 @@
 #include "bracken/render/terrain_renderer.hpp"
 #include "bracken/render/water_renderer.hpp"
 #include "bracken/scene/scene_renderer.hpp"
-#include "bracken/render/lighting/light.hpp"
 #include "bracken/systems/camera_controller.hpp"
 #include <SDL3/SDL_timer.h>
 #include <algorithm>

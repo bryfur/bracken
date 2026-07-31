@@ -198,6 +198,10 @@ draws it.
   `MAX_LIGHTS = 256`, `MAX_LIGHTS_PER_CLUSTER = 128`. Local light shadows:
   one 8×8-tile D32 atlas — point budget ≤ 8 (6 face tiles each), spot ≤ 16,
   ≤ 6 tile re-renders per frame (`render/lighting/local_shadows.hpp`).
+  The *budgets* live there; the light **structs** `PointLight`/`SpotLight`/
+  `LightHeader` are `contracts/light.hpp` (host-facing data contract — the
+  frame packet carries them, so they must not drag the renderer in).
+  `render/lighting/light.hpp` includes it, so both spellings keep working.
 - Formats (`gpu/pipeline_registry.hpp`): swapchain `RGBA8_UNORM`, HDR scene
   `RGBA16F`, depth `D32_FLOAT`.
 
