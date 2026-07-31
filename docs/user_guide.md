@@ -141,6 +141,8 @@ Tests live next to their unit as `*.test.cpp` anywhere under `src/bracken/` and 
 
 When adding new engine logic, add a `*.test.cpp` next to the unit — it is picked up automatically by an incremental build.
 
+Every test in `bracken_tests` is headless: no GPU device, no window, no display. Two of them read files the build points them at via compile definitions — `BRACKEN_REPO_ROOT` (source-scanning tests such as the logger-discipline check) and `BRACKEN_SHADER_SPV_DIR` (`gpu/uniform_layout.test.cpp`, which reflects the compiled `.spv` files). If the path is missing, e.g. for a relocated test binary, those tests `GTEST_SKIP` rather than fail.
+
 If you configured with `-DBRACKEN_PLAYGROUND_SMOKE_TEST=ON` (and have a GPU + display), the integration test runs under ctest too:
 
 ```bash
@@ -2128,7 +2130,7 @@ Rules when editing or adding a uniform struct:
 - `struct alignas(16) MyUniforms { ... };` and total size a multiple of 16.
 - Follow HLSL cbuffer packing: 16-byte registers; **a `float3` followed by a `float` packs into one register, two consecutive `float3`s do not** — always pair every `glm::vec3` with a scalar or explicit `float _padding`.
 - Pad with *named scalars*, not arrays: an HLSL `float pad[3]` strides at 16 bytes per element and desynchronizes the layout (see the comment on `UIFragmentUniforms` / `ShadowFragUniforms`).
-- Update the HLSL cbuffer and the C++ struct **in the same change**, and add offset/size assertions to `src/bracken/gpu/gpu_uniforms.test.cpp` — that test file pins `sizeof` and `offsetof` for every struct and is the safety net.
+- Update the HLSL cbuffer and the C++ struct **in the same change**, and add a `BRACKEN_HLSL_CBUFFER(T, size)` + one `BRACKEN_HLSL_FIELD(T, field, offset)` line per field directly after the struct (`gpu/hlsl_packing.hpp`). Those are `static_assert`s: a layout change becomes a compile error in the same translation unit, and the straddle check catches a `glm::vec3` that crossed a 16-byte register. Then add a row to `UNIFORM_TABLE` in `src/bracken/gpu/uniform_layout.test.cpp`, which reflects the **compiled SPIR-V** and fails when the shader and the mirror disagree — an unlisted cbuffer fails it too.
 
 Storage-buffer record structs live in the same header but pack tightly (std430-style, no cbuffer padding): `InstanceData`, `ShadowInstanceData`, `ParticleInstanceData`. Useful constants: `ShadowDataUniforms::shadowEnabled` is `0` off / `1` PCF / `2` PCSS.
 
@@ -2305,8 +2307,8 @@ Rules of thumb (all enforced by example in the existing structs):
 
 - Mind HLSL 16-byte register packing: `float3` followed by `float` packs into one register; two consecutive `float3`s do **not**. Every `glm::vec3` in the mirrors is followed by a scalar or explicit `float _paddingN`.
 - Pad with **named scalars, not arrays**: an HLSL `cbuffer` array like `float _pad[3]` strides at 16 bytes per element and desynchronizes the layout. See `gpu::UIFragmentUniforms` / `gpu::ShadowFragUniforms` (three named `int`/`float` pads each).
-- Total size must be a multiple of 16 (verified for all structs in `src/bracken/gpu/gpu_uniforms.test.cpp`).
-- **When you add or reorder a field, change both files in the same commit**, and extend the `offsetof`/`sizeof` tests in `gpu_uniforms.test.cpp` — they are the guard rail (e.g. `TEST(ModelLightingUniformsLayout, FieldOffsets)` pins all 29 offsets of the 224-byte lighting cbuffer).
+- Total size must be a multiple of 16 (asserted for every struct by the `BRACKEN_HLSL_CBUFFER` block that follows it).
+- **When you add or reorder a field, change both files in the same commit.** The CPU side is pinned by `static_assert`: `BRACKEN_HLSL_CBUFFER` (size + alignment) and one `BRACKEN_HLSL_FIELD` per field (offset + no 16-byte-register straddle), both from `gpu/hlsl_packing.hpp`. Forgetting the shader side is caught at test time by `src/bracken/gpu/uniform_layout.test.cpp`, which reads the compiled `.spv` and compares the cbuffer's declared byte extent to `sizeof(T)`. `gpu_uniforms.test.cpp` no longer carries offset assertions — it keeps only the cross-module default-value checks a `static_assert` cannot express.
 
 Storage-buffer records are tightly packed (std430-style), no cbuffer padding rules — e.g. `gpu::ParticleInstanceData` is exactly `mat4 + vec4` = 80 bytes, mirrored by `struct ParticleInstance` in `particle.vert.hlsl`.
 
@@ -2463,7 +2465,7 @@ float4 PSMain(PSInput input) : SV_Target {
 
 **2. Build.** `cmake --build build` — the `CONFIGURE_DEPENDS` glob picks the file up, compiles `vignette.frag.spv`, and the copy target stages it.
 
-**3. Add the CPU uniform mirror** in `src/bracken/gpu/gpu_uniforms.hpp`, plus layout tests in `src/bracken/gpu/gpu_uniforms.test.cpp`:
+**3. Add the CPU uniform mirror** in `src/bracken/gpu/gpu_uniforms.hpp`, with its `BRACKEN_HLSL_CBUFFER`/`BRACKEN_HLSL_FIELD` static-assert block, and a row in `UNIFORM_TABLE` in `src/bracken/gpu/uniform_layout.test.cpp`:
 
 ```cpp
 /** Vignette pass fragment uniforms (set 3, b0) */
@@ -2473,6 +2475,16 @@ struct alignas(16) VignetteUniforms {
     float _pad1 = 0.0f;
     float _pad2 = 0.0f;
 };
+BRACKEN_HLSL_CBUFFER(VignetteUniforms, 16);
+BRACKEN_HLSL_FIELD(VignetteUniforms, strength, 0);
+BRACKEN_HLSL_FIELD(VignetteUniforms, _pad0, 4);
+BRACKEN_HLSL_FIELD(VignetteUniforms, _pad1, 8);
+BRACKEN_HLSL_FIELD(VignetteUniforms, _pad2, 12);
+```
+
+```cpp
+// src/bracken/gpu/uniform_layout.test.cpp, in UNIFORM_TABLE:
+ROW("vignette.frag.spv", 3, 0, gpu::VignetteUniforms),
 ```
 
 **4. Register the pipeline** in `src/bracken/gpu/pipeline_registry.hpp/.cpp` — four edits, all following existing patterns:
@@ -6859,15 +6871,20 @@ Contracts you must honor:
 
 ### Testing DevUI code headlessly
 
-`src/bracken/dev/dev_ui.test.cpp` shows the approach: all DevUI unit tests
-are **headless** — no `init()`, no GPU, no window, nothing that touches the
-ImGui backend. Six tests pin the no-op-safety contract identically in both
-build configurations (`BRACKEN_ENABLE_DEV_UI=ON` and the stub); four more
-(`DevUIPanels.*`, ON-only) exercise the panel bodies through the
+`src/bracken/dev/dev_ui.test.cpp` and `src/bracken/dev/dev_panels.test.cpp`
+show the approach: all DevUI unit tests are **headless** — no `init()`, no
+GPU, no window, nothing that touches the ImGui backend. The six tests in
+`dev_ui.test.cpp` pin the no-op-safety contract identically in both build
+configurations (`BRACKEN_ENABLE_DEV_UI=ON` and the stub); the sixteen
+`DevPanels.*` tests (ON-only) exercise the panel bodies through the
 `draw_builtin_panels(bindings, state)` seam with a real ImGui context but no
 GPU backend — pinning tab visibility (e.g. the Graphics tab hides without an
-apply callback) and per-instance `PanelState` (FPS history doesn't leak
-between instances).
+apply callback), per-instance `PanelState` (FPS history doesn't leak between
+instances), and the "read from the owner, don't write back" rule that keeps
+the Environment/Graphics/Camera tabs from stomping host state on every frame
+the overlay is open. A tab other than the first only draws its body when
+selected, so the harness forces the tab under test selected and asserts that
+it was — otherwise a "changes nothing" test would pass by drawing nothing.
 
 ```cpp
 #include <gtest/gtest.h>

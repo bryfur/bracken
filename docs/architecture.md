@@ -556,6 +556,17 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
 - **Uniform contract**: every HLSL cbuffer has an `alignas(16)` CPU mirror in
   `gpu/gpu_uniforms.hpp`, annotated with its `(set, binding)`. They must match
   **byte-for-byte** — this is the most common way to break rendering silently.
+  Two nets enforce it. (1) Each struct is followed by a
+  `BRACKEN_HLSL_CBUFFER` + `BRACKEN_HLSL_FIELD` block (`gpu/hlsl_packing.hpp`)
+  pinning `sizeof`, `alignof`, every field offset, and the "no member ≤ 16 B
+  straddles a 16-byte register" rule — so a CPU-side layout change is a
+  compile error in the same translation unit. (2) `gpu/uniform_layout.test.cpp`
+  parses the **compiled SPIR-V** in the staged shader directory (explicit
+  Offset/ArrayStride/MatrixStride decorations — no HLSL packing rules are
+  reimplemented) and compares each block's declared byte extent against
+  `sizeof(T)`, plus each `StructuredBuffer` element stride against its CPU
+  record. Its table is required to be exhaustive: a uniform block in any
+  staged `.spv` that no row covers fails the test.
   `ClusterParams` is intentionally duplicated between
   `render/lighting/light_cluster.hpp` and `gpu_uniforms.hpp` to avoid a header
   dependency; keep both in sync.
@@ -858,6 +869,27 @@ contract, §6.2 of the plan):
   sites pass `JobSystem::instance()`), so parity tests can construct
   caller-owned pools (`init(1)` vs `init(4)`) and assert bit-identical
   outputs per stage.
+
+The renderer's prep cores are covered by two test files with deliberately
+different jobs, and both are needed:
+
+- `scene/scene_prep_parity.test.cpp` — **determinism**: a large synthetic
+  packet prepared at 0/1/4 workers, compared byte for byte. It proves the
+  outputs do not depend on the worker count. It does not, and cannot, say
+  what the outputs should be.
+- `scene/scene_renderer_prep.test.cpp` — **correctness**: a tiny hand-built
+  scene (camera at the origin, ortho frustums, axis-aligned bounds,
+  pure-translation transforms) whose every expectation is a number derived
+  from the rules in the source. It pins the cull counts, bin membership and
+  order, the `InstanceData` bytes, the shadow cast rules (including the two
+  that look like redundancy: a command with **no bounds** casts into every
+  cascade, and a main-frustum-culled command still casts if the light
+  frustum sees it), the skinned drop counters and palette offsets, the packed
+  palette stream, and the per-batch `base_instance` that the instance-buffer
+  packing loop and each of the three instanced draw walks must independently
+  agree on. That last one is asserted with **two model types and an
+  unresolvable handle present at once** — the only configuration in which a
+  packing/draw-walk desync changes a number rather than nothing.
 
 ### JobSystem internals (Phase 1 rewrite)
 

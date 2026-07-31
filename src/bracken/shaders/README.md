@@ -324,3 +324,17 @@ layouts must match **byte-for-byte** — when adding or reordering cbuffer
 fields, update both sides in the same change and mind HLSL packing rules
 (16-byte registers; a `float3` followed by `float` packs, two `float3`s do
 not).
+
+Both directions are tested. The CPU side is pinned by the
+`BRACKEN_HLSL_CBUFFER` / `BRACKEN_HLSL_FIELD` static-assert block after each
+struct in `gpu_uniforms.hpp` (see `gpu/hlsl_packing.hpp`), so a layout edit
+there fails to compile. Agreement with *this* directory is checked by
+`src/bracken/gpu/uniform_layout.test.cpp`, which reads the **compiled**
+`.spv` files and compares each cbuffer's declared byte extent to `sizeof(T)`.
+Two consequences when editing shaders:
+
+- Declare trailing padding explicitly (named scalars, never arrays) so the
+  cbuffer's declared extent equals the CPU struct's `sizeof` — the test
+  requires exact equality, not "rounds up to the same multiple of 16".
+- A **new** `cbuffer` needs a row in that test's `UNIFORM_TABLE` naming the
+  CPU struct behind it; an unlisted uniform block fails the test.

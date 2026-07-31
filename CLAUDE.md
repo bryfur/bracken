@@ -142,7 +142,13 @@ draws it.
   animation update, before render submission.
 - CPU uniform structs in `gpu/gpu_uniforms.hpp` must match their HLSL cbuffer
   counterparts **byte-for-byte** (`alignas(16)`, HLSL packing rules). This is
-  the most common way to silently break rendering.
+  the most common way to silently break rendering. Both halves are now
+  checked: a `BRACKEN_HLSL_CBUFFER` / `BRACKEN_HLSL_FIELD` block
+  (`gpu/hlsl_packing.hpp`) follows every struct, so a CPU-side layout edit is
+  a **compile error in the same TU**; and `gpu/uniform_layout.test.cpp`
+  reflects the **compiled SPIR-V** and fails when a cbuffer and its mirror
+  disagree. Adding a cbuffer to a shader without a row in that test's table
+  also fails.
 - Engine code is **game-agnostic**: no gameplay concepts (combat, inventory,
   skills) belong in engine headers. `InputHandler` is raw input only;
   `CameraController` exposes generic shake/focus/fov primitives.

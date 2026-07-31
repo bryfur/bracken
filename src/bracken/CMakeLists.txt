@@ -217,6 +217,11 @@ if(BRACKEN_BUILD_TESTS)
         # Source-scanning tests (logger_discipline) need the tree they are
         # policing. Absent (e.g. a relocated test binary) they GTEST_SKIP.
         target_compile_definitions(bracken_tests PRIVATE BRACKEN_REPO_ROOT="${PROJECT_SOURCE_DIR}")
+        # uniform_layout.test.cpp reflects the COMPILED SPIR-V to check that
+        # every CPU uniform struct matches the cbuffer the shader declares.
+        # Absent (relocated binary) it GTEST_SKIPs.
+        target_compile_definitions(bracken_tests PRIVATE BRACKEN_SHADER_SPV_DIR="${BRACKEN_SHADER_OUTPUT_DIR}")
+        add_dependencies(bracken_tests compile_shaders)
 
         include(GoogleTest)
         gtest_discover_tests(bracken_tests)

@@ -1814,7 +1814,8 @@ File map:
 | `src/bracken/gpu/gpu_uniforms.hpp` | CPU mirrors of every HLSL cbuffer + storage-buffer records |
 | `src/bracken/gpu/gpu_types.hpp` | Vertex formats, `TextureFormat`, `BlendMode`, vertex-attribute helpers |
 | `src/bracken/gpu/gpu_debug.hpp/.cpp` | `GPUDebugGroup`, `GPUTimestampPool` (CPU record timings; GPU timings unavailable), `GPUTimerScope`, macros |
-| Tests | `gpu_types.test.cpp`, `gpu_uniforms.test.cpp`, `gpu_pipeline.test.cpp`, `gpu_compute.test.cpp` (layout/config/reflection assertions; no GPU required) |
+| `src/bracken/gpu/hlsl_packing.hpp` | `straddles_register` (consteval) + the `BRACKEN_HLSL_CBUFFER`/`BRACKEN_HLSL_STRUCT`/`BRACKEN_HLSL_FIELD` static-assert macros used after every struct in `gpu_uniforms.hpp` |
+| Tests | `gpu_types.test.cpp`, `gpu_uniforms.test.cpp` (cross-module DEFAULT values only — layout is `static_assert`ed in the header), `uniform_layout.test.cpp` (CPU structs vs the compiled SPIR-V), `gpu_pipeline.test.cpp`, `gpu_compute.test.cpp`, `gpu_logging.test.cpp`, `gpu_resource_lifetime.test.cpp` (create/release failure paths; no GPU required) |
 
 ### GPUDevice (`src/bracken/gpu/gpu_device.hpp`)
 
@@ -2126,45 +2127,45 @@ Every HLSL cbuffer has exactly one `alignas(16)` CPU mirror struct; layouts must
 
 SDL3 GPU binding order (from `src/bracken/shaders/README.md`, expressed as `[[vk::binding(slot, set)]]` in HLSL): **vertex** — set 0 = sampled textures, storage textures, storage buffers; set 1 = uniform buffers. **Fragment** — set 2 = sampled textures, storage textures, storage buffers; set 3 = uniform buffers. **Compute** — set 0 = sampled textures, READ-ONLY storage textures, READ-ONLY storage buffers; set 1 = READ-WRITE storage textures, READ-WRITE storage buffers (bound at `SDL_BeginGPUComputePass`); set 2 = uniform buffers.
 
-HLSL packing rules that the mirrors encode: 16-byte registers; a `float3` followed by a scalar packs into one register, two consecutive `float3`s do not; padding must be **named scalars**, never arrays (an HLSL `float pad[N]` strides at 16 B/element). `src/bracken/gpu/gpu_uniforms.test.cpp` pins `alignof == 16`, `sizeof % 16 == 0`, and exact `offsetof` for every struct — extend it when adding fields.
+HLSL packing rules that the mirrors encode: 16-byte registers; a `float3` followed by a scalar packs into one register, two consecutive `float3`s do not; padding must be **named scalars**, never arrays (an HLSL `float pad[N]` strides at 16 B/element). The first two rules are machine-checked: a `BRACKEN_HLSL_CBUFFER(T, size)` + per-field `BRACKEN_HLSL_FIELD(T, field, offset)` block follows each struct in `gpu_uniforms.hpp` (macros in `gpu/hlsl_packing.hpp`), pinning `alignof == 16`, `sizeof % 16 == 0`, every offset, and `!straddles_register(offset, size)` — all as `static_assert`, so drift is a compile error. Agreement with the shaders is checked at test time by `src/bracken/gpu/uniform_layout.test.cpp`, which parses the compiled `.spv` files.
 
-Cbuffer mirror inventory (binding as annotated in the header; sizes verified by tests where noted †):
+Cbuffer mirror inventory (binding as annotated in the header). Every size below is machine-checked twice: `static_assert` in `gpu_uniforms.hpp`, and against the compiled SPIR-V in `src/bracken/gpu/uniform_layout.test.cpp`.
 
 | Struct | Binding | Size | Notable fields / defaults |
 |---|---|---|---|
-| `ModelTransformUniforms` | vertex set 1, b0 | 288 † | `model/view/projection/normalMatrix`, `cameraPos`, `paletteOffset` at offset 272 + 12-byte pad (index into the frame's bone-palette SSBO; read only by `skinned_model.vert.hlsl`) |
-| `ModelLightingUniforms` | fragment set 3, b0 | 224 † | hemisphere ambient (`ambientSky`/`ambientGround`), fog params, PBR factors (`roughnessFactor = 0.85`), `alphaCutoff = 0` (0 disables MASK alpha test), `screenAOTexelX/Y` (SV_Position → screen-AO UV), `iblEnabled` (sky-IBL vs hemisphere ambient), `screenAOEnabled` (0 for MASK/BLEND — no background-AO bleed onto foliage) |
-| `SkyboxFragmentUniforms` | fragment set 3, b0 | 192 † | `invViewProjection`, sun/zenith/horizon/ground/fog colors + cloud coverage/density/scale + haze strength (linear, from `bracken::render::EnvironmentState`) |
-| `SkyCaptureUniforms` | fragment set 3, b0 | 176 † | IBL sky-capture face basis (`faceForward/Right/Up`) + the same atmosphere/cloud fields as the skybox; `time` is the sky-time snapshot at refresh start so all six faces render one cloud state |
-| `IblFilterUniforms` | fragment set 3, b0 | 48 † | face basis + `roughness` (specular prefilter mip; ignored by irradiance) + `sourceSize` (mip-bias) |
-| `PrepassModelUniforms` | vertex set 1, b0 | 400 † | depth-prepass model/skinned uniforms: jittered `projection` + UNJITTERED curr/prev view-projections, `prevModel`, `paletteOffset`/`prevPaletteOffset` (`NO_PREV_PALETTE = 0xFFFFFFFF` ⇒ reuse current palette) |
-| `PrepassCameraUniforms` | vertex set 1, b0 | 256 † | shared by the instanced + terrain prepass shaders: jittered `projection` + unjittered curr/prev view-projections (grass keeps its own `GrassUniforms`, byte-identical to the forward one) |
-| `TaaResolveUniforms` | fragment set 3, b0 | 176 † | `feedbackMax = 0.9`, `varianceGamma = 1.0`, `historyValid` 0 on gaps; curr-inverse/prev unjittered view-projections for the depth-reprojection fallback |
-| `TaaSharpenUniforms` | fragment set 3, b0 | 16 † | `sharpenStrength = 0.25` (0 = pass-through); applied to the resolved output only, never the history |
+| `ModelTransformUniforms` | vertex set 1, b0 | 288 | `model/view/projection/normalMatrix`, `cameraPos`, `paletteOffset` at offset 272 + 12-byte pad (index into the frame's bone-palette SSBO; read only by `skinned_model.vert.hlsl`) |
+| `ModelLightingUniforms` | fragment set 3, b0 | 224 | hemisphere ambient (`ambientSky`/`ambientGround`), fog params, PBR factors (`roughnessFactor = 0.85`), `alphaCutoff = 0` (0 disables MASK alpha test), `screenAOTexelX/Y` (SV_Position → screen-AO UV), `iblEnabled` (sky-IBL vs hemisphere ambient), `screenAOEnabled` (0 for MASK/BLEND — no background-AO bleed onto foliage) |
+| `SkyboxFragmentUniforms` | fragment set 3, b0 | 192 | `invViewProjection`, sun/zenith/horizon/ground/fog colors + cloud coverage/density/scale + haze strength (linear, from `bracken::render::EnvironmentState`) |
+| `SkyCaptureUniforms` | fragment set 3, b0 | 176 | IBL sky-capture face basis (`faceForward/Right/Up`) + the same atmosphere/cloud fields as the skybox; `time` is the sky-time snapshot at refresh start so all six faces render one cloud state |
+| `IblFilterUniforms` | fragment set 3, b0 | 48 | face basis + `roughness` (specular prefilter mip; ignored by irradiance) + `sourceSize` (mip-bias) |
+| `PrepassModelUniforms` | vertex set 1, b0 | 400 | depth-prepass model/skinned uniforms: jittered `projection` + UNJITTERED curr/prev view-projections, `prevModel`, `paletteOffset`/`prevPaletteOffset` (`NO_PREV_PALETTE = 0xFFFFFFFF` ⇒ reuse current palette) |
+| `PrepassCameraUniforms` | vertex set 1, b0 | 256 | shared by the instanced + terrain prepass shaders: jittered `projection` + unjittered curr/prev view-projections (grass keeps its own `GrassUniforms`, byte-identical to the forward one) |
+| `TaaResolveUniforms` | fragment set 3, b0 | 176 | `feedbackMax = 0.9`, `varianceGamma = 1.0`, `historyValid` 0 on gaps; curr-inverse/prev unjittered view-projections for the depth-reprojection fallback |
+| `TaaSharpenUniforms` | fragment set 3, b0 | 16 | `sharpenStrength = 0.25` (0 = pass-through); applied to the resolved output only, never the history |
 | `GridVertexUniforms` | vertex set 1, b0 | 64 | `viewProjection` |
 | `UIScreenUniforms` | vertex set 1, b0 | 16 | `width`, `height` |
-| `UIFragmentUniforms` | fragment set 3, b0 | 16 † | `hasTexture` + 3 named int pads |
+| `UIFragmentUniforms` | fragment set 3, b0 | 16 | `hasTexture` + 3 named int pads |
 | `InstancedCameraUniforms` | vertex set 1, b0 | 144 | shared by `model_instanced.vert.hlsl` and `particle.vert.hlsl` |
-| `InstancedLightingUniforms` | fragment set 3, b0 | 208 † | `ModelLightingUniforms` minus `tintColor` (tint is per-instance) |
+| `InstancedLightingUniforms` | fragment set 3, b0 | 208 | `ModelLightingUniforms` minus `tintColor` (tint is per-instance) |
 | `InstancedShadowUniforms` | vertex set 1, b0 | 64 | `lightViewProjection` |
 | `ShadowTransformUniforms` | vertex set 1, b0 | 128 | `lightViewProjection`, `model` |
-| `ShadowSkinnedTransformUniforms` | vertex set 1, b0 | 144 † | + `paletteOffset` |
+| `ShadowSkinnedTransformUniforms` | vertex set 1, b0 | 144 | + `paletteOffset` |
 | `ShadowTerrainUniforms` | vertex set 1, b0 | 64 | terrain verts already world-space |
-| `ShadowFragUniforms` | fragment set 3, b0 | 16 † | `hasTexture` (alpha-tested casters) |
-| `ShadowDataUniforms` | fragment set 3, b1 | 336 † | per-cascade `lightViewProjection[4]`, splits/texel/depth-range vec4s; `shadowEnabled`: 0 = off, 1 = PCF, 2 = PCSS; 2×2 atlas, cascade i at quadrant (i%2, i/2) |
-| `GTAOUniforms` | fragment set 3, b0 | 176 † | defaults `radius = 4.0` (world units), `falloffRange = 0.615`, `thinOccluderCompensation = 0.2`, `maxDistance = 12000`; `radiusScale` = `ao_radius`, `temporalRotation/Offset` = per-frame golden-ratio jitter |
-| `GtaoTemporalUniforms` | fragment set 3, b0 | 32 † | `feedbackMax = 0.9`, `depthRejectScale = 10`; `historyValid` 0 on first frame/resize/mode gaps |
-| `GtaoUpsampleUniforms` | fragment set 3, b0 | 32 † | joint-bilateral upsample constants + `strength` (`ao_strength`, applied as a power curve) |
-| `BlurUniforms` | fragment set 3, b0 | 32 † | `sharpness = 40`; `depthA = proj[2][2]`, `depthB = proj[3][2]` linearize depth (`viewZ = |B/(depth+A)|`, valid for standard and reversed-Z); `maxDistance` must equal `GTAOUniforms::maxDistance` (asserted in tests) |
-| `CompositeUniforms` | fragment set 3, b0 | 112 † | `bloomStrength = 0.25` (tracks `GraphicsSettings::bloom_strength`, the source of truth), `exposure = 1` (manual bias), `tonemapMode = 0`, `contrast = 1`, `saturation = 1`; `lowResTexelSize`/`depthA`/`depthB` drive the joint-bilateral fog upsample (0 ⇒ plain bilinear); `autoExposureEnabled = 0` gates the exp2(EV) multiply from the exposure-state SSBO; `whiteBalanceEnabled = 0` + `whiteBalance = (1,1,1)` gate the pre-tonemap LMS white balance; `cdlEnabled = 0` + `cdlSlope/Offset/Power = (1,0,1)` gate the post-tonemap ASC-CDL — all-neutral defaults are pixel-identical to the ungraded path; AO is no longer composited here |
-| `FxaaUniforms` | fragment set 3, b0 | 16 † | `invScreenSize`; operates on post-tonemap LDR |
-| `ExposureHistogramUniforms` | **compute** set 2, b0 | 16 † | `width`/`height` (scene extent), `minLog2Luma = −10`, `invLog2Range = 1/26` — the 256-bin log2-luminance mapping (CPU mirror `render/auto_exposure.hpp::exposure_bin_from_luma`) |
-| `ExposureAdaptUniforms` | **compute** set 2, b0 | 48 † | `minLog2Luma = −10`, `log2Range = 26`, `deltaTime`, `firstFrame` (≠0 ⇒ snap), `speedUp = 1.5`/`speedDown = 2.5` EV/s, `minEv = −4`/`maxEv = 4`, `lowPercentile = 0.60`/`highPercentile = 0.05`, `log2TargetGray = −1.80` (`AutoExposure::DEFAULT_LOG2_TARGET_GRAY`) |
-| `ParticleFragmentUniforms` | fragment set 3, b0 | 16 † | `emissiveBoost = 1`; pushed once per pass |
-| `ParticleBatchUniforms` | vertex set 1, b1 | 16 † | `instanceOffset` into per-frame particle SSBO |
-| `BloomDownsampleUniforms` | fragment set 3, b0 | 32 † | `threshold = 0.8` compared against **post-exposure** luminance; `isFirstPass = 1`, `exposure = 1` |
+| `ShadowFragUniforms` | fragment set 3, b0 | 16 | `hasTexture` (alpha-tested casters) |
+| `ShadowDataUniforms` | fragment set 3, b1 | 336 | per-cascade `lightViewProjection[4]`, splits/texel/depth-range vec4s; `shadowEnabled`: 0 = off, 1 = PCF, 2 = PCSS; 2×2 atlas, cascade i at quadrant (i%2, i/2) |
+| `GTAOUniforms` | fragment set 3, b0 | 176 | defaults `radius = 4.0` (world units), `falloffRange = 0.615`, `thinOccluderCompensation = 0.2`, `maxDistance = 12000`; `radiusScale` = `ao_radius`, `temporalRotation/Offset` = per-frame golden-ratio jitter |
+| `GtaoTemporalUniforms` | fragment set 3, b0 | 32 | `feedbackMax = 0.9`, `depthRejectScale = 10`; `historyValid` 0 on first frame/resize/mode gaps |
+| `GtaoUpsampleUniforms` | fragment set 3, b0 | 32 | joint-bilateral upsample constants + `strength` (`ao_strength`, applied as a power curve) |
+| `BlurUniforms` | fragment set 3, b0 | 32 | `sharpness = 40`; `depthA = proj[2][2]`, `depthB = proj[3][2]` linearize depth (`viewZ = |B/(depth+A)|`, valid for standard and reversed-Z); `maxDistance` must equal `GTAOUniforms::maxDistance` (asserted in tests) |
+| `CompositeUniforms` | fragment set 3, b0 | 112 | `bloomStrength = 0.25` (tracks `GraphicsSettings::bloom_strength`, the source of truth), `exposure = 1` (manual bias), `tonemapMode = 0`, `contrast = 1`, `saturation = 1`; `lowResTexelSize`/`depthA`/`depthB` drive the joint-bilateral fog upsample (0 ⇒ plain bilinear); `autoExposureEnabled = 0` gates the exp2(EV) multiply from the exposure-state SSBO; `whiteBalanceEnabled = 0` + `whiteBalance = (1,1,1)` gate the pre-tonemap LMS white balance; `cdlEnabled = 0` + `cdlSlope/Offset/Power = (1,0,1)` gate the post-tonemap ASC-CDL — all-neutral defaults are pixel-identical to the ungraded path; AO is no longer composited here |
+| `FxaaUniforms` | fragment set 3, b0 | 16 | `invScreenSize`; operates on post-tonemap LDR |
+| `ExposureHistogramUniforms` | **compute** set 2, b0 | 16 | `width`/`height` (scene extent), `minLog2Luma = −10`, `invLog2Range = 1/26` — the 256-bin log2-luminance mapping (CPU mirror `render/auto_exposure.hpp::exposure_bin_from_luma`) |
+| `ExposureAdaptUniforms` | **compute** set 2, b0 | 48 | `minLog2Luma = −10`, `log2Range = 26`, `deltaTime`, `firstFrame` (≠0 ⇒ snap), `speedUp = 1.5`/`speedDown = 2.5` EV/s, `minEv = −4`/`maxEv = 4`, `lowPercentile = 0.60`/`highPercentile = 0.05`, `log2TargetGray = −1.80` (`AutoExposure::DEFAULT_LOG2_TARGET_GRAY`) |
+| `ParticleFragmentUniforms` | fragment set 3, b0 | 16 | `emissiveBoost = 1`; pushed once per pass |
+| `ParticleBatchUniforms` | vertex set 1, b1 | 16 | `instanceOffset` into per-frame particle SSBO |
+| `BloomDownsampleUniforms` | fragment set 3, b0 | 32 | `threshold = 0.8` compared against **post-exposure** luminance; `isFirstPass = 1`, `exposure = 1` |
 | `BloomUpsampleUniforms` | fragment set 3, b0 | 16 | `bloomRadius = 1` |
-| `VolumetricFogUniforms` | fragment set 3, b0 | 448 † | per-cascade matrices/bias for god rays; defaults `fogDensity = 0.0015`, `scatterStrength = 0.25`, `fogHeight = 100`, `fogFalloff = 0.005`, `startDist = 100`, `maxDist = 3000`, `godRaysEnabled = 1` |
+| `VolumetricFogUniforms` | fragment set 3, b0 | 448 | per-cascade matrices/bias for god rays; defaults `fogDensity = 0.0015`, `scatterStrength = 0.25`, `fogHeight = 100`, `fogFalloff = 0.005`, `startDist = 100`, `maxDist = 3000`, `godRaysEnabled = 1` |
 | (clustered lighting) | fragment set 3, b2 | 192 | defined by `render::lighting::ClusterParams` (`light_cluster.hpp`) — `SceneRenderer` pushes that struct directly; `gpu_uniforms.hpp` deliberately carries no mirror |
 
 Storage-buffer record structs (tight std430-style packing, no `alignas(16)`, no cbuffer padding rules):
@@ -2173,7 +2174,7 @@ Storage-buffer record structs (tight std430-style packing, no `alignas(16)`, no 
 |---|---|---|
 | `InstanceData` | 224 (`model` + `normalMatrix` + `tint` + `noFog` + 3 pads + `prevModel`) | `model_instanced.vert.hlsl` + `prepass_instanced.vert.hlsl` instance SSBO (`prevModel` = previous-frame model matrix; == `model` for statics) |
 | `ShadowInstanceData` | 64 (`model`) | `shadow_depth_instanced.vert.hlsl` |
-| `ParticleInstanceData` | 80 † (`model` + `color`; `color.a` = opacity folded into rgb by the VS — additive blending) | `particle.vert.hlsl` |
+| `ParticleInstanceData` | 80 (`model` + `color`; `color.a` = opacity folded into rgb by the VS — additive blending) | `particle.vert.hlsl` |
 
 Skinned palettes: there is **no GPU-side bone-count constant**; palettes are packed in the `FramePacket` at build time and uploaded by `SceneRenderer` in `palettes()` order into one per-frame `StructuredBuffer<float4x4>` (vertex set 0, binding 0) indexed by `paletteOffset` (= `BonePalette::matrix_offset`). `MAX_BONES = 128` caps only the CPU-side arrays (`animation/animation_types.hpp`); `MAX_BONE_PALETTES = 1024` (`scene/frame_packet.hpp`) caps palettes per frame, enforced at build time in `alloc_bone_palette`.
 
@@ -2435,45 +2436,45 @@ CPU-side slot mapping: `SDL_PushGPUVertexUniformData(cmd, i, ...)` → `(i, 1)`;
 
 ### CPU↔GPU uniform contract — `src/bracken/gpu/gpu_uniforms.hpp`
 
-Every cbuffer has an `alignas(16)` CPU mirror annotated with its `(set, binding)`; layouts must match byte-for-byte. Alignment and size-multiple-of-16 for all structs, plus exact `offsetof` layouts for the trickiest ones, are pinned by `src/bracken/gpu/gpu_uniforms.test.cpp`. Inventory (sizes verified by tests where noted †):
+Every cbuffer has an `alignas(16)` CPU mirror annotated with its `(set, binding)`; layouts must match byte-for-byte. Size, alignment and **every** field offset are pinned by the `BRACKEN_HLSL_CBUFFER`/`BRACKEN_HLSL_FIELD` `static_assert` block that follows each struct in the header (`gpu/hlsl_packing.hpp`); the sizes below are additionally checked against the compiled shaders by `src/bracken/gpu/uniform_layout.test.cpp`. Inventory:
 
 | CPU struct | (set, binding) | Shader cbuffer | Size |
 |---|---|---|---|
-| `ModelTransformUniforms` | (1, b0) | `model.vert` / `skinned_model.vert` `TransformUniforms` | 288 † |
-| `ModelLightingUniforms` | (3, b0) | `model.frag` `LightingUniforms` | 224 † (`iblEnabled` at offset 216 †) |
+| `ModelTransformUniforms` | (1, b0) | `model.vert` / `skinned_model.vert` `TransformUniforms` | 288 |
+| `ModelLightingUniforms` | (3, b0) | `model.frag` `LightingUniforms` | 224 (`iblEnabled` at offset 216) |
 | `InstancedCameraUniforms` | (1, b0) | `model_instanced.vert` / `particle.vert` `CameraUniforms` | 144 |
-| `InstancedLightingUniforms` | (3, b0) | `model_instanced.frag` (no `tintColor` — per-instance) | 208 † (`iblEnabled` at offset 200 †) |
-| `SkyboxFragmentUniforms` | (3, b0) | `skybox.frag` `SkyUniforms` | 192 † |
-| `SkyCaptureUniforms` | (3, b0) | `sky_capture.frag` `SkyCaptureUniforms` | 176 † |
-| `IblFilterUniforms` | (3, b0) | `ibl_prefilter.frag` / `ibl_irradiance.frag` `IblFilterUniforms` | 48 † |
+| `InstancedLightingUniforms` | (3, b0) | `model_instanced.frag` (no `tintColor` — per-instance) | 208 (`iblEnabled` at offset 200) |
+| `SkyboxFragmentUniforms` | (3, b0) | `skybox.frag` `SkyUniforms` | 192 |
+| `SkyCaptureUniforms` | (3, b0) | `sky_capture.frag` `SkyCaptureUniforms` | 176 |
+| `IblFilterUniforms` | (3, b0) | `ibl_prefilter.frag` / `ibl_irradiance.frag` `IblFilterUniforms` | 48 |
 | `GridVertexUniforms` | (1, b0) | `grid.vert` | 64 |
 | `UIScreenUniforms` | (1, b0) | `ui.vert` | 16 |
-| `UIFragmentUniforms` | (3, b0) | `ui.frag` `UIFragmentUniforms` | 16 † |
-| `PrepassModelUniforms` | (1, b0) | `prepass_model.vert` / `prepass_skinned.vert` `PrepassTransformUniforms` | 400 † |
-| `PrepassCameraUniforms` | (1, b0) | `prepass_instanced.vert` / `prepass_terrain.vert` `PrepassCameraUniforms` | 256 † |
-| `TaaResolveUniforms` | (3, b0) | `taa_resolve.frag` | 176 † |
-| `TaaSharpenUniforms` | (3, b0) | `taa_sharpen.frag` | 16 † |
+| `UIFragmentUniforms` | (3, b0) | `ui.frag` `UIFragmentUniforms` | 16 |
+| `PrepassModelUniforms` | (1, b0) | `prepass_model.vert` / `prepass_skinned.vert` `PrepassTransformUniforms` | 400 |
+| `PrepassCameraUniforms` | (1, b0) | `prepass_instanced.vert` / `prepass_terrain.vert` `PrepassCameraUniforms` | 256 |
+| `TaaResolveUniforms` | (3, b0) | `taa_resolve.frag` | 176 |
+| `TaaSharpenUniforms` | (3, b0) | `taa_sharpen.frag` | 16 |
 | `ShadowTransformUniforms` | (1, b0) | `shadow_depth.vert` | 128 |
-| `ShadowSkinnedTransformUniforms` | (1, b0) | `shadow_skinned.vert` | 144 † |
+| `ShadowSkinnedTransformUniforms` | (1, b0) | `shadow_skinned.vert` | 144 |
 | `ShadowTerrainUniforms` / `InstancedShadowUniforms` | (1, b0) | `shadow_terrain.vert` / `shadow_depth_instanced.vert` | 64 |
-| `ShadowFragUniforms` | (3, b0) | `shadow_depth.frag` | 16 † |
-| `ShadowDataUniforms` | (3, b1) | every shadow-receiving frag (`ShadowUniforms`) | 336 † |
-| `GTAOUniforms` | (3, b0) | `gtao.frag` | 176 † |
-| `GtaoTemporalUniforms` | (3, b0) | `gtao_temporal.frag` | 32 † |
-| `GtaoUpsampleUniforms` | (3, b0) | `gtao_upsample.frag` | 32 † |
-| `BlurUniforms` | (3, b0) | `blur_ao.frag` | 32 † |
-| `CompositeUniforms` | (3, b0) | `composite.frag` | 112 † |
-| `FxaaUniforms` | (3, b0) | `fxaa.frag` | 16 † |
-| `BloomDownsampleUniforms` | (3, b0) | `bloom_downsample.frag` | 32 † |
+| `ShadowFragUniforms` | (3, b0) | `shadow_depth.frag` | 16 |
+| `ShadowDataUniforms` | (3, b1) | every shadow-receiving frag (`ShadowUniforms`) | 336 |
+| `GTAOUniforms` | (3, b0) | `gtao.frag` | 176 |
+| `GtaoTemporalUniforms` | (3, b0) | `gtao_temporal.frag` | 32 |
+| `GtaoUpsampleUniforms` | (3, b0) | `gtao_upsample.frag` | 32 |
+| `BlurUniforms` | (3, b0) | `blur_ao.frag` | 32 |
+| `CompositeUniforms` | (3, b0) | `composite.frag` | 112 |
+| `FxaaUniforms` | (3, b0) | `fxaa.frag` | 16 |
+| `BloomDownsampleUniforms` | (3, b0) | `bloom_downsample.frag` | 32 |
 | `BloomUpsampleUniforms` | (3, b0) | `bloom_upsample.frag` | 16 |
-| `VolumetricFogUniforms` | (3, b0) | `volumetric_fog.frag` | 448 † |
-| `ExposureHistogramUniforms` | compute (2, b0) | `exposure_histogram.comp` | 16 † |
-| `ExposureAdaptUniforms` | compute (2, b0) | `exposure_adapt.comp` | 48 † |
-| `ParticleFragmentUniforms` | (3, b0) | `particle.frag` | 16 † |
-| `ParticleBatchUniforms` | (1, b1) | `particle.vert` `BatchUniforms` | 16 † |
+| `VolumetricFogUniforms` | (3, b0) | `volumetric_fog.frag` | 448 |
+| `ExposureHistogramUniforms` | compute (2, b0) | `exposure_histogram.comp` | 16 |
+| `ExposureAdaptUniforms` | compute (2, b0) | `exposure_adapt.comp` | 48 |
+| `ParticleFragmentUniforms` | (3, b0) | `particle.frag` | 16 |
+| `ParticleBatchUniforms` | (1, b1) | `particle.vert` `BatchUniforms` | 16 |
 | `render::lighting::ClusterParams` (`light_cluster.hpp` — no `gpu_uniforms.hpp` mirror by design) | (3, b2) | `cluster_lighting.hlsli` `ClusterParamsCB` | 192 |
 
-Storage-buffer record mirrors (tight packing, no cbuffer rules): `InstanceData` (mat4 `model` + mat4 `normalMatrix` + vec4 `tint` + float `noFog` + `float _pad[3]` + mat4 `prevModel` = 224 bytes; read by both the forward and depth-prepass instanced shaders), `ShadowInstanceData` (mat4 `model`, 64 bytes), `ParticleInstanceData` (mat4 + vec4 = 80 †).
+Storage-buffer record mirrors (tight packing, no cbuffer rules): `InstanceData` (mat4 `model` + mat4 `normalMatrix` + vec4 `tint` + float `noFog` + `float _pad[3]` + mat4 `prevModel` = 224 bytes; read by both the forward and depth-prepass instanced shaders), `ShadowInstanceData` (mat4 `model`, 64 bytes), `ParticleInstanceData` (mat4 + vec4 = 80).
 
 Packing rules the mirrors follow (and any new struct must): every `glm::vec3` is chased by a scalar or named pad so no field straddles a 16-byte register; padding is **named scalars, never arrays** (HLSL cbuffer arrays stride at 16 B — a `float _pad[3]` on the HLSL side would declare a 52-byte block; see the comment in `ui.frag.hlsl` and the `ShadowFragUniformsLayout` test); total size a multiple of 16.
 
@@ -2801,7 +2802,7 @@ Main-pass skinned draws (`render_skinned_model_command_inner`): `ModelTransformU
 - Vertex b0: `ModelTransformUniforms` (per draw) or `InstancedCameraUniforms` (per pass); vertex storage slot 0: bone palette SSBO (skinned) or instance SSBO (instanced).
 - Fragment b0: `ModelLightingUniforms`/`InstancedLightingUniforms` (lazy, memcmp-deduped; invalidated by `reset_model_bind_state()` after every pipeline bind); b1: `ShadowDataUniforms` (frame-cached); b2: `ClusterParams` (slot 2 reserved across all main-pass fragment shaders).
 - Fragment samplers: 0 base color, 1–2 shadow atlas (compare + raw), 3 normal, 4 metallic-roughness, 5 emissive, 6 screen AO (1×1 white dummy when AO is off/BLEND), 7–9 sky-IBL chain (irradiance cube / prefiltered specular cube / BRDF LUT; typed dummies when IBL is off), 10 local-shadow atlas + comparison sampler (CSM atlas as filler when local shadows are unavailable). Slot 0 is always bound (unbound slots are UB); per-slot last-bound texture tracking (`last_frag_tex_`) skips redundant binds.
-- CPU structs in `gpu/gpu_uniforms.hpp` must match their HLSL cbuffers byte-for-byte.
+- CPU structs in `gpu/gpu_uniforms.hpp` must match their HLSL cbuffers byte-for-byte (compile-time `static_assert` block per struct; SPIR-V cross-check in `uniform_layout.test.cpp`).
 
 #### RenderStats
 
@@ -4850,7 +4851,7 @@ brightness far more than ground light (intended for day/night; use
 
 ## Model PBR Surface Shading
 
-This chapter specifies the shading algorithm applied to every model draw in the main HDR pass — static (`model.vert.hlsl` + `model.frag.hlsl`), instanced (`model_instanced.vert.hlsl` + `model_instanced.frag.hlsl`), skinned (`skinned_model.vert.hlsl` + the shared `model.frag.hlsl`), and their DoubleSided/Blend pipeline variants — plus the shared shader libraries `pbr.hlsli` and `lighting.hlsli` and the CPU-side per-draw uniform/texture population in `src/bracken/scene/scene_renderer.cpp`. The uniform ABI mirrors live in `src/bracken/gpu/gpu_uniforms.hpp` and are layout-tested in `src/bracken/gpu/gpu_uniforms.test.cpp`. All lighting math is linear-space; output is linear HDR radiance into the `RGBA16F` scene target (tonemapping happens in the composite pass).
+This chapter specifies the shading algorithm applied to every model draw in the main HDR pass — static (`model.vert.hlsl` + `model.frag.hlsl`), instanced (`model_instanced.vert.hlsl` + `model_instanced.frag.hlsl`), skinned (`skinned_model.vert.hlsl` + the shared `model.frag.hlsl`), and their DoubleSided/Blend pipeline variants — plus the shared shader libraries `pbr.hlsli` and `lighting.hlsli` and the CPU-side per-draw uniform/texture population in `src/bracken/scene/scene_renderer.cpp`. The uniform ABI mirrors live in `src/bracken/gpu/gpu_uniforms.hpp`, are layout-`static_assert`ed there, and are checked against the compiled shaders in `src/bracken/gpu/uniform_layout.test.cpp`. All lighting math is linear-space; output is linear HDR radiance into the `RGBA16F` scene target (tonemapping happens in the composite pass).
 
 ### File map and include graph
 
@@ -5119,7 +5120,7 @@ The skinned resolve walks each `SkinnedDrawCommand`: invalid palette ids and unr
 
 ### Uniform ABI — exact layouts
 
-All structs `alignas(16)`; layouts locked by `src/bracken/gpu/gpu_uniforms.test.cpp`. Every `vec3` is followed by a scalar so no field straddles a 16-byte HLSL register.
+All structs `alignas(16)`; layouts locked by `static_assert` in `gpu_uniforms.hpp` itself (`BRACKEN_HLSL_CBUFFER`/`BRACKEN_HLSL_FIELD`) and cross-checked against the compiled SPIR-V by `src/bracken/gpu/uniform_layout.test.cpp`. Every `vec3` is followed by a scalar so no field straddles a 16-byte HLSL register — a rule the `BRACKEN_HLSL_FIELD` macro now enforces directly.
 
 #### gpu::ModelLightingUniforms — 224 bytes (model.frag.hlsl `LightingUniforms`, set 3 b0)
 
@@ -7593,7 +7594,8 @@ The developer overlay is the entire `src/bracken/dev/` module, namespace
 | `src/bracken/dev/dev_ui.cpp` | Full implementation **and** the no-op stub, selected by `#if defined(BRACKEN_DEV_UI) && BRACKEN_DEV_UI` |
 | `src/bracken/dev/dev_panels.hpp` | Internal seam: `bracken::dev::detail::draw_builtin_panels(const DevUI::Bindings&, DevUI::PanelState&)` |
 | `src/bracken/dev/dev_panels.cpp` | Built-in "Bracken Dev" window (tabs: Stats, Environment, Graphics, Camera); stubbed together with `dev_ui.cpp` |
-| `src/bracken/dev/dev_ui.test.cpp` | Headless GoogleTest suite (10 tests: 6 no-op-contract tests valid in both configurations, plus 4 ON-only `DevUIPanels.*` panel-body tests driving `draw_builtin_panels` with a real ImGui context and no GPU backend) |
+| `src/bracken/dev/dev_ui.test.cpp` | Headless GoogleTest suite: 6 `DevUI` no-op-contract tests, valid in both configurations |
+| `src/bracken/dev/dev_panels.test.cpp` | Headless GoogleTest suite: 16 ON-only `DevPanels.*` panel-body tests driving `draw_builtin_panels` with a real ImGui context and no GPU backend |
 
 Integration points outside the module: `Application::init_dev_ui()` /
 `Application::dev_ui()` (`src/bracken/application.{hpp,cpp}`), the
@@ -8116,10 +8118,11 @@ is a documented harmless no-op in stub builds.
 `detail::draw_builtin_panels` is an empty function in the stub half of
 `dev_panels.cpp`.
 
-### Headless test approach (`src/bracken/dev/dev_ui.test.cpp`)
+### Headless test approach
 
-All six tests are headless — no `init()`, no GPU, no window, no ImGui
-backend contact — so **every expectation must hold identically in both
+Split across two files. `src/bracken/dev/dev_ui.test.cpp` holds the six
+`DevUI` lifecycle tests — no `init()`, no GPU, no window, no ImGui backend
+contact — so **every expectation must hold identically in both
 configurations** (full and stub). They pin the no-op-safety contract:
 
 | Test | Contract pinned |
@@ -8130,13 +8133,35 @@ configurations** (full and stub). They pin the no-op-safety contract:
 | `ProcessEventReturnsFalseWhenUninitialized` | uninitialized never consumes, even when `visible_ == true` |
 | `RenderIsNoOpWhenUninitialized` | `render(nullptr, nullptr)` safe, visible or not |
 | `ShutdownWithoutInitIsSafe` | `shutdown()` idempotent without prior `init` |
-| `DevUIPanels.GraphicsTabHiddenWithoutApplyCallback` † | Graphics tab hides when `apply_settings` is empty |
-| `DevUIPanels.GraphicsTabShownWithSettingsAndApply` † | Graphics tab shows with both settings + apply bound |
-| `DevUIPanels.FpsHistoryIsPerInstanceState` † | FPS plot history lives in `PanelState`, not shared statics |
-| `DevUIPanels.CameraTabDrawsWithoutPushingFramingSetters` † | Camera tab re-reads controller values rather than pushing stale slider state |
 
-† ON-only (`BRACKEN_ENABLE_DEV_UI=ON`): these drive `draw_builtin_panels`
-with a real ImGui context but no GPU backend.
+`src/bracken/dev/dev_panels.test.cpp` holds the panel-body tests. They are
+**ON-only** (`BRACKEN_ENABLE_DEV_UI=ON`): they drive `draw_builtin_panels`
+through a real ImGui context (core only — `RendererHasTextures` makes
+`NewFrame` software-build the font atlas; `EndFrame` without `Render()`
+discards the frame) with no SDL/GPU backend, no window and no device. Tabs
+other than the first only draw their BODY when selected, so the harness
+forces the tab under test selected and then asserts it really is selected —
+a "drawing this tab changes nothing" test cannot pass by never drawing it.
+The bound `SceneRenderer` is default-constructed and never `init()`ed.
+
+| Test | Contract pinned |
+|---|---|
+| `NoBindingsDrawsNoTabs` | every tab's bindings are its precondition |
+| `AllFourTabsAppearWhenFullyBound` | Stats / Environment / Graphics / Camera all surface |
+| `StatsTabAppearsWithFpsAlone` | Stats has two independent reasons to exist (fps OR renderer) |
+| `GraphicsTabHiddenWithoutApplyCallback` | Graphics tab hides when `apply_settings` is empty |
+| `GraphicsTabShownWithSettingsAndApply` | Graphics tab shows with both settings + apply bound |
+| `FpsHistoryIsPerInstanceState` | FPS plot history lives in `PanelState`, not shared statics |
+| `FpsHistoryCursorWrapsWithoutOverrunning` | the 120-sample plot is a ring, cursor never leaves the array |
+| `StatsTabEnablesCollectionAndNeverDisablesIt` | Stats turns `set_collect_stats(true)` on and never back off |
+| `PartialTimingBindingsDrawNothingAndDoNotCrash` | phase breakdown is all-or-nothing across the four timing pointers |
+| `FullTimingBindingsDraw` | all four bound ⇒ the breakdown draws |
+| `EnvironmentTabDrawsWithoutMutatingEnvironment` | drawing leaves `EnvironmentState` byte-identical (no sun round-trip drift) |
+| `EnvironmentTabSurvivesDegenerateSunDirection` | zero-length `sun_dir` produces no NaN |
+| `GraphicsTabDoesNotApplyOrEditWithoutInteraction` | no `apply_settings` call and no struct edit without a widget change |
+| `GraphicsTabLeavesOutOfRangeEnumsAlone` | `combo_enum` clamps for display only, never writes back |
+| `CameraTabDrawsWithoutPushingFramingSetters` | Camera tab re-reads controller values rather than pushing stale slider state; fires no shake |
+| `CameraTabSurvivesStraightDownForward` | the asin clamp in the yaw/pitch readout |
 
 Tests are auto-globbed into `bracken_tests` per the repo convention.
 Anything requiring `init()` is integration-test territory: the playground

@@ -17,6 +17,13 @@ cbuffer BloomDownsampleUniforms : register(b0, space3) {
     float threshold;       // post-exposure luminance threshold (first pass only)
     float isFirstPass;     // 1.0 for first pass (apply threshold), 0.0 otherwise
     float exposure;        // composite-pass exposure, applied before thresholding
+    // The CPU struct (gpu::BloomDownsampleUniforms) pads to 32 bytes and the
+    // engine pushes all 32, so the cbuffer declares the pad too — same
+    // convention as ShadowFragUniforms / UIFragmentUniforms. Named scalars,
+    // not float[3]: a cbuffer array would stride at 16 B per element.
+    float _padding0;
+    float _padding1;
+    float _padding2;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
