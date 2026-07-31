@@ -1,4 +1,5 @@
 #include "scene_renderer.hpp"
+#include "scene_renderer_internal.hpp"
 #include "bracken/animation/animation_types.hpp" // MAX_BONES
 #include "bracken/core/assert.hpp"
 #include "bracken/core/color.hpp"
@@ -58,42 +59,8 @@
 
 namespace bracken::scene {
 
-namespace {
-constexpr const char* LOG_TAG = "scene";
-} // namespace
-
 namespace gpu = bracken::gpu;
 namespace render = bracken::render;
-
-// Fill the per-mesh material fields shared by ModelLightingUniforms and
-// InstancedLightingUniforms (identical field names in both structs).
-template <typename U>
-static inline void apply_mesh_material(U& u, const Mesh& mesh) {
-    const PBRMaterial& mat = mesh.material;
-    u.hasTexture = (mesh.has_texture && mesh.texture) ? 1 : 0;
-    u.hasNormalMap = mat.normal_texture ? 1 : 0;
-    u.normalScale = mat.normal_scale;
-    u.baseColorFactor = mat.base_color_factor;
-    u.metallicFactor = mat.metallic_factor;
-    u.roughnessFactor = mat.roughness_factor;
-    u.occlusionStrength = mat.occlusion_strength;
-    u.hasMRMap = mat.metallic_roughness_texture ? 1.0f : 0.0f;
-    u.emissiveFactor = mat.emissive_factor;
-    u.hasEmissiveMap = mat.emissive_texture ? 1.0f : 0.0f;
-    u.hasPackedOcclusion = mat.has_packed_occlusion ? 1.0f : 0.0f;
-    // glTF alphaMode: only MASK materials alpha-test; OPAQUE/BLEND must not
-    // discard, which a cutoff of 0 guarantees in the shader.
-    u.alphaCutoff = (mat.alpha_mode == AlphaMode::Mask) ? mat.alpha_cutoff : 0.0f;
-    // Screen-space AO comes from the depth prepass. OPAQUE meshes are always
-    // in it, and MASK meshes join via the alpha-tested prepass variants (so
-    // foliage both receives and casts screen AO — leaf-on-leaf occlusion is
-    // what separates a canopy from a flat blob). BLEND meshes write no
-    // prepass depth, so the AO texel under them describes the geometry
-    // behind them; they skip the AO term. Skinned MASK meshes are the one
-    // gap (no masked skinned prepass variant) — they'd sample the AO of
-    // whatever is behind them, which for a moving character is benign.
-    u.screenAOEnabled = (mat.alpha_mode != AlphaMode::Blend) ? 1.0f : 0.0f;
-}
 
 SceneRenderer::SceneRenderer()
     : pipeline_registry_(std::make_unique<gpu::PipelineRegistry>()),
@@ -1832,96 +1799,6 @@ void SceneRenderer::build_instance_batches(const FramePacket& frame, const Camer
     stats_partial.merge_into(render_stats_, frame_diagnostics_);
 }
 
-void SceneRenderer::upload_instance_buffers(SDL_GPUCopyPass* copy_pass) {
-    if (!copy_pass) {
-        return;
-    }
-
-    // Upload main instance buffer
-    size_t total_instances = 0;
-    for (ModelHandle h : instance_batches_touched_) {
-        total_instances += instance_batches_[h].size();
-    }
-    if (collect_stats_) {
-        render_stats_.instances_drawn = static_cast<uint32_t>(total_instances);
-    }
-
-    if (total_instances > 0) {
-        size_t required_size = total_instances * sizeof(gpu::InstanceData);
-
-        if (!instance_storage_buffer_ || instance_storage_capacity_ < required_size) {
-            instance_storage_capacity_ = required_size * 2; // over-allocate
-            instance_storage_buffer_ = gpu::GPUBuffer::create_dynamic(context_->device(), gpu::GPUBuffer::Type::Storage,
-                                                                      instance_storage_capacity_);
-            if (!instance_storage_buffer_) {
-                BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create instance storage buffer");
-                instance_storage_capacity_ = 0;
-            }
-        }
-
-        if (instance_storage_buffer_) {
-            // Pack in ascending handle order — must match the iteration order in
-            // render_instanced_models so base_instance offsets line up. Bins are
-            // written straight into the mapped transfer buffer (one pass over
-            // the data instead of bin -> pack scratch -> transfer buffer).
-            if (gpu::GPUBuffer::Mapping mapping = instance_storage_buffer_->map()) {
-                auto* dst = static_cast<gpu::InstanceData*>(mapping.data());
-                (void)for_each_instance_batch(
-                    instance_batches_, 0,
-                    [&](ModelHandle, const std::vector<gpu::InstanceData>& instances, uint32_t) {
-                        std::memcpy(dst, instances.data(), instances.size() * sizeof(gpu::InstanceData));
-                        dst += instances.size();
-                    });
-                mapping.upload(copy_pass, required_size);
-            }
-        }
-    }
-
-    // Upload shadow instance buffer (per-cascade sections packed contiguously).
-    // Layout: [cascade 0 instances][cascade 1 instances]... each cascade in ascending handle order.
-    size_t total_shadow = 0;
-    for (int c = 0; c < MAX_SHADOW_CASCADES; ++c) {
-        for (ModelHandle h : shadow_batches_touched_[c]) {
-            total_shadow += shadow_instance_batches_[c][h].size();
-        }
-    }
-
-    if (total_shadow > 0) {
-        size_t required_size = total_shadow * sizeof(gpu::ShadowInstanceData);
-
-        if (!shadow_instance_storage_buffer_ || shadow_instance_storage_capacity_ < required_size) {
-            shadow_instance_storage_capacity_ = required_size * 2;
-            shadow_instance_storage_buffer_ = gpu::GPUBuffer::create_dynamic(
-                context_->device(), gpu::GPUBuffer::Type::Storage, shadow_instance_storage_capacity_);
-            if (!shadow_instance_storage_buffer_) {
-                BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create shadow instance storage buffer");
-                shadow_instance_storage_capacity_ = 0;
-                shadow_cascade_base_instance_ = {0, 0, 0, 0};
-                return;
-            }
-        }
-
-        // Cascade sections packed contiguously, straight into the mapped
-        // transfer buffer (same single-pass packing as the main instances).
-        if (gpu::GPUBuffer::Mapping mapping = shadow_instance_storage_buffer_->map()) {
-            auto* dst = static_cast<gpu::ShadowInstanceData*>(mapping.data());
-            uint32_t packed = 0;
-            for (int c = 0; c < MAX_SHADOW_CASCADES; ++c) {
-                shadow_cascade_base_instance_[c] = packed;
-                packed = for_each_instance_batch(
-                    shadow_instance_batches_[c], packed,
-                    [&](ModelHandle, const std::vector<gpu::ShadowInstanceData>& instances, uint32_t) {
-                        std::memcpy(dst, instances.data(), instances.size() * sizeof(gpu::ShadowInstanceData));
-                        dst += instances.size();
-                    });
-            }
-            mapping.upload(copy_pass, required_size);
-        }
-    } else {
-        shadow_cascade_base_instance_ = {0, 0, 0, 0};
-    }
-}
-
 // ============================================================================
 // Bone Palettes
 // ============================================================================
@@ -1959,43 +1836,6 @@ void SceneRenderer::pack_bone_palettes(const FramePacket& frame, const CameraSta
     ScenePrep::prep_resolve_skinned(core::jobs::JobSystem::instance(), cmds, frame.palettes(), p,
                                     prep_scratch_.skinned, skinned_resolved_, stats_partial);
     stats_partial.merge_into(render_stats_, frame_diagnostics_);
-}
-
-void SceneRenderer::upload_bone_palettes(SDL_GPUCopyPass* copy_pass, const FramePacket& frame) {
-    if (!copy_pass || bone_palette_matrix_count_ == 0) {
-        return;
-    }
-
-    // Upload into the CURRENT slot of the double buffer; the other slot still
-    // holds last frame's palettes for the skinned prepass' prev-pose reads.
-    auto& buffer = bone_palette_buffers_[bone_palette_current_];
-    auto& capacity = bone_palette_capacities_[bone_palette_current_];
-
-    const size_t required_size = bone_palette_matrix_count_ * sizeof(glm::mat4);
-    if (!buffer || capacity < required_size) {
-        // Grow geometrically with a floor of 64 KB (~16 palettes of 64 joints).
-        capacity = std::max(required_size * 2, static_cast<size_t>(64 * 1024));
-        buffer = gpu::GPUBuffer::create_dynamic(context_->device(), gpu::GPUBuffer::Type::Storage, capacity);
-        if (!buffer) {
-            BRACKEN_LOG_ERROR(LOG_TAG, "Failed to create bone palette storage buffer");
-            capacity = 0;
-            return;
-        }
-    }
-
-    // Copy each palette straight from packet memory into the mapped transfer
-    // buffer at its prefix-summed matrix_offset — the offsets were assigned
-    // serially at seal in palettes() order, so destination offsets line up
-    // with every draw's palette offset by construction (and the copies
-    // parallelize over disjoint ranges — see prep_copy_palettes).
-    gpu::GPUBuffer::Mapping mapping = buffer->map();
-    if (!mapping) {
-        BRACKEN_LOG_ERROR(LOG_TAG, "Failed to map bone palette transfer buffer");
-        return;
-    }
-    ScenePrep::prep_copy_palettes(core::jobs::JobSystem::instance(), frame.palettes(),
-                                  static_cast<glm::mat4*>(mapping.data()));
-    mapping.upload(copy_pass, required_size);
 }
 
 void SceneRenderer::render_instanced_models(const CameraState& camera) {
