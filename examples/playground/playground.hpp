@@ -4,11 +4,11 @@
 #include "bracken/animation/animation_state_machine.hpp"
 #include "bracken/animation/animation_types.hpp"
 #include "bracken/application.hpp"
+#include "bracken/contracts/environment.hpp"
 #include "bracken/effect_definition.hpp"
 #include "bracken/heightmap.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/physics/physics_world.hpp"
-#include "bracken/render/environment.hpp"
 #include "bracken/scene/frame_builder.hpp"
 #include "day_weather.hpp"
 #include <glm/glm.hpp>

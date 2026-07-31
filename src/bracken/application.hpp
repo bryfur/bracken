@@ -1,7 +1,7 @@
 #pragma once
 
+#include "bracken/contracts/graphics_settings.hpp"
 #include "bracken/core/assert.hpp"
-#include "bracken/graphics_settings.hpp"
 #include "bracken/input_handler.hpp"
 #include "bracken/sim_frame.hpp"
 #include <atomic>
@@ -13,8 +13,8 @@
 #include <string>
 #include <vector>
 
+#include "bracken/contracts/render_stats.hpp"
 #include "bracken/core/jobs/task_handle.hpp"
-#include "bracken/render_stats.hpp"
 
 namespace bracken {
 

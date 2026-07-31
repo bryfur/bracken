@@ -1,4 +1,4 @@
-#include "bracken/scene/frustum.hpp"
+#include "bracken/contracts/frustum.hpp"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <gtest/gtest.h>

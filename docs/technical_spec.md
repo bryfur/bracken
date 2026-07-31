@@ -245,7 +245,7 @@ Threading contract: `init_engine()` calls `core::bind_main_thread()`; `BRACKEN_A
 
 `apply_all_graphics_settings` (lines 255–272): stores the settings, always calls `set_graphics_settings` (cheap), but gates the expensive setters on diffs against `last_applied_settings_`: `set_anisotropic_filter` (sampler rebuild) only when `anisotropic_filter` changed, `set_vsync_mode` (swapchain reconfigure) only when `vsync_mode` changed, `set_window_mode` (fullscreen transition) only when `window_mode`/`resolution_index` changed. First call applies everything.
 
-`GraphicsSettings` (`src/bracken/graphics_settings.hpp`): plain struct with `[[nodiscard]] bool save(path)/load(path)`, `clamp_to_valid_ranges()` applied by `load()` at the trust boundary, `CURRENT_SETTINGS_VERSION = 2` with lighting-value migration for older files. Enums with stable serialized integer values: `ShadowMode {Off=0, PCF=1, PCSS=2}`, `AOMode {Off=0, GTAO_Half=1, GTAO_Full=2}`, `AAMode {Off=0, FXAA=1, TAA=2}`, `TonemapMode {ACESFitted=0, ACESNarkowicz=1, Reinhard=2, None=3}`. Notable defaults: `shadow_mode=PCSS`, `ao_mode=GTAO_Half`, `aa_mode=TAA` (fresh settings only — persisted files keep their stored mode), `bloom_enabled=true` (`bloom_threshold=1.1`, post-exposure HDR luminance), `volumetric_fog=false`, `god_rays=false`, `vsync_mode=2` (mailbox; clamped to `max_vsync_mode()` at apply), `anisotropic_filter=4` (16×), `draw_distance=3` (=4000 via `get_draw_distance()`'s clamped table {500,1000,2000,4000,8000,16000,32000}), `window_mode=0` (windowed).
+`GraphicsSettings` (`src/bracken/contracts/graphics_settings.hpp`): plain struct with `[[nodiscard]] bool save(path)/load(path)`, `clamp_to_valid_ranges()` applied by `load()` at the trust boundary, `CURRENT_SETTINGS_VERSION = 2` with lighting-value migration for older files. Enums with stable serialized integer values: `ShadowMode {Off=0, PCF=1, PCSS=2}`, `AOMode {Off=0, GTAO_Half=1, GTAO_Full=2}`, `AAMode {Off=0, FXAA=1, TAA=2}`, `TonemapMode {ACESFitted=0, ACESNarkowicz=1, Reinhard=2, None=3}`. Notable defaults: `shadow_mode=PCSS`, `ao_mode=GTAO_Half`, `aa_mode=TAA` (fresh settings only — persisted files keep their stored mode), `bloom_enabled=true` (`bloom_threshold=1.1`, post-exposure HDR luminance), `volumetric_fog=false`, `god_rays=false`, `vsync_mode=2` (mailbox; clamped to `max_vsync_mode()` at apply), `anisotropic_filter=4` (16×), `draw_distance=3` (=4000 via `get_draw_distance()`'s clamped table {500,1000,2000,4000,8000,16000,32000}), `window_mode=0` (windowed).
 
 #### Dev UI wiring (`init_dev_ui`, `application.cpp:276–305`)
 
@@ -260,7 +260,7 @@ Always constructs the `DevUI` object first (so `dev_ui()` and event/render calls
 - Unit tests: `*.test.cpp` next to their unit, auto-globbed into `bracken_tests`, registered individually via `gtest_discover_tests`. Run: `ctest --test-dir build --output-on-failure`, or the binary directly with `--gtest_filter`. Binary path: `build/src/bracken/bracken_tests`.
 - Benchmarks: `*.bench.cpp` next to their unit, auto-globbed into `bracken_benchmarks` (linked to `benchmark::benchmark_main`, so no `main` needed in bench files). Binary path: `build/src/bracken/bracken_benchmarks`; `--benchmark_filter=<regex>` selects a subset.
 - Integration test: the playground smoke run (below); optionally a ctest named `playground_smoke` (label `integration`, timeout 180 s, working directory = the playground binary dir) when `BRACKEN_PLAYGROUND_SMOKE_TEST=ON`.
-- `RenderStats` (`src/bracken/render_stats.hpp`), consumed by the smoke summary and dev-UI Stats panel: counters (`draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`, `ui_draws`, `local_shadow_tiles_rendered`), budgets (`packet_bytes_used/capacity`, `bone_palettes_used/budget`, `lights_submitted/binned`) and `std::vector<PassTiming> pass_times_ms`. Collection is opt-in via `set_collect_render_stats(bool)`; `Application::render_stats()` returns `std::optional<RenderStats>`, `nullopt` while off.
+- `RenderStats` (`src/bracken/contracts/render_stats.hpp`), consumed by the smoke summary and dev-UI Stats panel: counters (`draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`, `ui_draws`, `local_shadow_tiles_rendered`), budgets (`packet_bytes_used/capacity`, `bone_palettes_used/budget`, `lights_submitted/binned`) and `std::vector<PassTiming> pass_times_ms`. Collection is opt-in via `set_collect_render_stats(bool)`; `Application::render_stats()` returns `std::optional<RenderStats>`, `nullopt` while off.
 - `FrameDiagnostics` (same header), via `Application::frame_diagnostics()`: every drop path the frame took (`draws_dropped_unknown_model`, `skinned_dropped_no_skeleton`, `palettes_over_budget`, `effect_models_unresolved`, `lights_dropped`, `cluster_lights_dropped`, `camera_missing`). Accumulated unconditionally — not gated on `set_collect_render_stats`.
 - `PassTiming { std::string_view name; std::optional<float> cpu_ms, gpu_ms; }`: `cpu_ms` is the real CPU cost of RECORDING the pass (`core::PassTimeline`); `gpu_ms` is `nullopt` — SDL3 exposes no timestamp query API.
 
@@ -327,7 +327,7 @@ Demonstrates the minimum viable in-code asset pipeline: `build_character_model()
 
 ## Application Lifecycle, Main Loop & Input
 
-Scope: `src/bracken/application.hpp`/`.cpp`, `src/bracken/input_handler.hpp`/`.cpp`, `src/bracken/input_state.hpp`, `src/bracken/graphics_settings.hpp`/`.cpp`, `src/bracken/render_stats.hpp`. All types live in namespace `bracken` (no sub-namespace). This layer is the host-facing boundary: it owns SDL, drives the frame, and forwards everything rendering-related to opaque owned subsystems (`render::RenderContext`, `scene::SceneRenderer`, `systems::CameraSystem`, `dev::DevUI`).
+Scope: `src/bracken/application.hpp`/`.cpp`, `src/bracken/input_handler.hpp`/`.cpp`, `src/bracken/input_state.hpp`, `src/bracken/contracts/graphics_settings.hpp`/`.cpp`, `src/bracken/contracts/render_stats.hpp`. All types live in namespace `bracken` (no sub-namespace). This layer is the host-facing boundary: it owns SDL, drives the frame, and forwards everything rendering-related to opaque owned subsystems (`render::RenderContext`, `scene::SceneRenderer`, `systems::CameraSystem`, `dev::DevUI`).
 
 ### Application (`src/bracken/application.hpp`)
 
@@ -635,7 +635,7 @@ Action state (attacking, sprinting, abilities, ...) is the host's to own — `In
 
 `normalize_move_dir` clamps the vector's magnitude to 1.0 (dividing both components by the length when `len > 1.0f`) and returns the resulting magnitude; sub-unit magnitudes (analog partial tilt) pass through untouched, zero stays zero. Fully covered by `src/bracken/input_state.test.cpp`. No serialization or protocol knowledge in this struct by design.
 
-### GraphicsSettings (`src/bracken/graphics_settings.hpp`, `.cpp`)
+### GraphicsSettings (`src/bracken/contracts/graphics_settings.hpp`, `.cpp`)
 
 Plain aggregate + text-file persistence. Enum modes are `enum class : int` with **stable explicit underlying values** — they are the on-disk integers and the GPU-uniform integers; serialize with `static_cast<int>` only at those two boundaries.
 
@@ -710,7 +710,7 @@ Opens `std::ofstream`; `false` if it can't open. Writes every field as `key=valu
 
 `clamp_to_valid_ranges()` is also public for hosts that mutate fields from untrusted input directly.
 
-### RenderStats (`src/bracken/render_stats.hpp`)
+### RenderStats (`src/bracken/contracts/render_stats.hpp`)
 
 ```cpp
 struct RenderStats {
@@ -1091,7 +1091,7 @@ Google Benchmark file (built into `bracken_benchmarks` when `BRACKEN_BUILD_BENCH
 - Tests: `job_system.test.cpp`, `parallel_for.test.cpp` (same directory) — including the race-shaped stress tests each lock-free primitive lands with — plus `src/bracken/animation/animation_parallel.test.cpp` (serial-vs-parallel equivalence for `AnimationPlayer::update`)
 - Benchmarks: `BM_SerialSum` / `BM_ParallelForSum` in `src/bracken/core/core.bench.cpp`
 
-**Contract with the rest of the engine (always-on infrastructure):** `Application::init_engine()` (`src/bracken/application.cpp`) calls `JobSystem::instance().init(workers)` unconditionally, **before `SDL_Init`**, where `workers` comes from the `BRACKEN_WORKERS` env var (unset/`0` → pool default `hardware_concurrency() - 1` min 1; positive value used as-is — `=1` is the single-worker debug mode, same code path; negative/unparsable → WARN + default). Teardown is first-in: `Application::shutdown_renderer()` calls `JobSystem::instance().shutdown()` at its top, before any GPU teardown, so no in-flight or queued job can touch a subsystem being destroyed; `shutdown_engine()` repeats the (idempotent) call as a safety net for hosts that never brought up a renderer. `SceneRenderer::render_frame` snapshots `pending_count()` into `RenderStats::jobs_pending` (`src/bracken/render_stats.hpp`) when stats collection is on. Rationale and phase roadmap: `docs/multithreading_plan.md`; the superseding decision record is in `docs/engine_design_notes.md` (2026-07-18). `docs/architecture.md` (Threading & lifetime contracts) carries the thread-safety tier table.
+**Contract with the rest of the engine (always-on infrastructure):** `Application::init_engine()` (`src/bracken/application.cpp`) calls `JobSystem::instance().init(workers)` unconditionally, **before `SDL_Init`**, where `workers` comes from the `BRACKEN_WORKERS` env var (unset/`0` → pool default `hardware_concurrency() - 1` min 1; positive value used as-is — `=1` is the single-worker debug mode, same code path; negative/unparsable → WARN + default). Teardown is first-in: `Application::shutdown_renderer()` calls `JobSystem::instance().shutdown()` at its top, before any GPU teardown, so no in-flight or queued job can touch a subsystem being destroyed; `shutdown_engine()` repeats the (idempotent) call as a safety net for hosts that never brought up a renderer. `SceneRenderer::render_frame` snapshots `pending_count()` into `RenderStats::jobs_pending` (`src/bracken/contracts/render_stats.hpp`) when stats collection is on. Rationale and phase roadmap: `docs/multithreading_plan.md`; the superseding decision record is in `docs/engine_design_notes.md` (2026-07-18). `docs/architecture.md` (Threading & lifetime contracts) carries the thread-safety tier table.
 
 **Determinism contract:** one code path at every worker count — `BRACKEN_WORKERS=1` and `=N` runs must be bit-identical; merges of parallel partials are ordered by chunk index, never thread id.
 
@@ -2521,7 +2521,7 @@ Module `bracken::scene`, sources under `src/bracken/scene/`. This layer defines 
 
 ### CameraState and the projection convention
 
-`src/bracken/scene/camera_state.hpp` — a POD aggregate, no methods:
+`src/bracken/contracts/camera_state.hpp` — a POD aggregate, no methods:
 
 ```cpp
 struct CameraState {
@@ -2551,7 +2551,7 @@ i.e. **reversed-Z via swapped near/far arguments** in an `RH_ZO` perspective (`G
 
 ### Plane and Frustum
 
-`src/bracken/scene/frustum.hpp` / `frustum.cpp`.
+`src/bracken/contracts/frustum.hpp` / `frustum.cpp`.
 
 ```cpp
 struct Plane {
@@ -2806,7 +2806,7 @@ Main-pass skinned draws (`render_skinned_model_command_inner`): `ModelTransformU
 
 #### RenderStats
 
-`bracken::RenderStats` (`src/bracken/render_stats.hpp`): `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`/`ui_draws`, `local_shadow_tiles_rendered`, the `*_used`/`*_budget` pairs, and `pass_times_ms` (`std::vector<PassTiming>` — `cpu_ms` real, `gpu_ms` `nullopt`; SDL3 has no per-pass timestamps). Collected only when `set_collect_stats(true)`; reset at the top of each `render_frame`. `SceneRenderer::frame_diagnostics()` (`FrameDiagnostics`) is reset and accumulated every frame regardless of that flag.
+`bracken::RenderStats` (`src/bracken/contracts/render_stats.hpp`): `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`/`ui_draws`, `local_shadow_tiles_rendered`, the `*_used`/`*_budget` pairs, and `pass_times_ms` (`std::vector<PassTiming>` — `cpu_ms` real, `gpu_ms` `nullopt`; SDL3 has no per-pass timestamps). Collected only when `set_collect_stats(true)`; reset at the top of each `render_frame`. `SceneRenderer::frame_diagnostics()` (`FrameDiagnostics`) is reset and accumulated every frame regardless of that flag.
 
 #### Threading & lifetime
 
@@ -4335,7 +4335,7 @@ playground smoke line: `selector().tiles_rendered_last_frame()`,
 ### The directional sun
 
 Not part of the cluster system: `EnvironmentState::sun_dir` / `sun_color`
-(`src/bracken/render/environment.hpp`, `sun_dir` = direction light travels,
+(`src/bracken/contracts/environment.hpp`, `sun_dir` = direction light travels,
 default `normalize(-0.5, -0.8, -0.3)`, colors linear) is evaluated
 unconditionally per fragment, scaled by `GraphicsSettings::sun_intensity`
 (default 3.0). `GraphicsSettings::ambient_strength` (default 0.45) sets the
@@ -4659,7 +4659,7 @@ projections. Zeros degrade to plain bilinear weighting in-shader.
   `lerp(1, visibility, distanceFade)` to `ao_raw_`.
 - **Temporal** (`gtao_temporal.frag.hlsl`): reprojects the previous history
   at `prev_uv = uv - velocity` (engine velocity convention,
-  `scene/velocity_math.hpp`); rejects on relative linear-depth mismatch
+  `contracts/velocity_math.hpp`); rejects on relative linear-depth mismatch
   against the depth stored in the history G channel (`feedback =
   feedbackMax · saturate(1 - relDiff · depthRejectScale)`); off-screen
   prev_uv or `historyValid == 0` fall back to the current AO. Writes
@@ -5268,7 +5268,7 @@ Technical specification for the atmosphere and post-processing subsystems:
 `render::VolumetricFog`, `render::Bloom`, the HDR-scene/composite contract,
 and `render::RenderContext`. Source of truth:
 
-- `src/bracken/render/environment.hpp`
+- `src/bracken/contracts/environment.hpp`
 - `src/bracken/render/world_renderer.hpp` / `.cpp`
 - `src/bracken/render/volumetric_fog.hpp` / `.cpp` / `.test.cpp`
 - `src/bracken/render/bloom.hpp` / `.cpp`
@@ -5291,7 +5291,7 @@ set 2 = sampled textures/storage, set 3 = uniform buffers — see
 
 ### EnvironmentState
 
-`src/bracken/render/environment.hpp`. Purpose: single source of truth for
+`src/bracken/contracts/environment.hpp`. Purpose: single source of truth for
 sun, sky gradient, clouds/haze, hemisphere ambient, distance fog, volumetric
 fog, and color grading.
 
@@ -6662,14 +6662,14 @@ The camera subsystem produces per-frame `view` / `projection` matrices and a cam
 | `src/bracken/systems/camera_system.hpp` | `CameraSystem` concrete implementation, `CameraShake` |
 | `src/bracken/systems/camera_system.cpp` | update pipeline, spring math, projection construction |
 | `src/bracken/systems/camera_system.test.cpp` | behavioral tests (convergence, shake, clamps, terrain, projection aspect) |
-| `src/bracken/scene/camera_state.hpp` | `scene::CameraState` — the camera→renderer data contract |
-| `src/bracken/scene/camera_state.test.cpp` | pins the reversed-Z projection idiom and near-plane recovery formula |
+| `src/bracken/contracts/camera_state.hpp` | `scene::CameraState` — the camera→renderer data contract |
+| `src/bracken/contracts/camera_state.test.cpp` | pins the reversed-Z projection idiom and near-plane recovery formula |
 
 Everything is in namespace `bracken::systems` except `CameraState` (`bracken::scene`).
 
 ### Public API surface
 
-#### `scene::CameraState` (`src/bracken/scene/camera_state.hpp`)
+#### `scene::CameraState` (`src/bracken/contracts/camera_state.hpp`)
 
 ```cpp
 struct CameraState {
@@ -7930,7 +7930,7 @@ hides instead (pinned by `DevUIPanels.GraphicsTabHiddenWithoutApplyCallback`).
   drawn**, and deliberately never resets it — hosts (e.g. the playground
   smoke driver) enable collection themselves and auto-disabling on overlay
   close would stomp their setting. Reads `SceneRenderer::render_stats()`
-  (`bracken::RenderStats`, `src/bracken/render_stats.hpp`: `draw_calls`,
+  (`bracken::RenderStats`, `src/bracken/contracts/render_stats.hpp`: `draw_calls`,
   `triangle_count`, `entities_rendered`, `entities_distance_culled`,
   `entities_frustum_culled`; also `jobs_pending` and `pass_times_ms`, which
   the tab does not display). Shows `Particles: N (in M effects)` from
@@ -7965,7 +7965,7 @@ near-zero `to_sun` falls back to `(0,1,0)`. Recomposition on slider change:
 elevation −89…89°.
 
 Fields edited (all on `bracken::render::EnvironmentState`,
-`src/bracken/render/environment.hpp`): `sun_color`; `sky_zenith`,
+`src/bracken/contracts/environment.hpp`): `sun_color`; `sky_zenith`,
 `sky_horizon`, `ground_color`, `ambient_sky`, `ambient_ground`; a
 "Clouds & haze" block with `cloud_coverage` (0–1), `cloud_density` (0–2),
 `cloud_scale` (0.25–4), `cloud_speed` (0–8), `haze_strength` (0–1.5) and a
@@ -8005,7 +8005,7 @@ if (changed && bindings.apply_settings) {
 
 — push-on-change-only (the host apply path diffs internally, but the panel
 avoids calling it every frame). Settings edited (`bracken::GraphicsSettings`,
-`src/bracken/graphics_settings.hpp`):
+`src/bracken/contracts/graphics_settings.hpp`):
 
 - Enum combos: `shadow_mode` (`ShadowMode` Off/PCF/PCSS), `ao_mode`
   (`AOMode` Off/GTAO Half/GTAO Full), `aa_mode` (`AAMode` Off/FXAA/TAA), `tonemap_mode`

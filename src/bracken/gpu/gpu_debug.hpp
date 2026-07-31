@@ -1,7 +1,7 @@
 #pragma once
 
 #include "bracken/core/pass_timeline.hpp"
-#include "bracken/render_stats.hpp" // PassTiming
+#include "bracken/contracts/render_stats.hpp" // PassTiming
 
 #include <cstddef>
 #include <SDL3/SDL_gpu.h>

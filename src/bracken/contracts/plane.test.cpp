@@ -1,4 +1,4 @@
-#include "bracken/scene/frustum.hpp"
+#include "bracken/contracts/frustum.hpp"
 #include <cmath>
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>

@@ -483,7 +483,7 @@ Other facade pass-throughs on `Application` you will use from these hooks: `mode
 
 ### GraphicsSettings
 
-`bracken::GraphicsSettings` (`src/bracken/graphics_settings.hpp`) is a plain struct of user-facing quality knobs, persisted as a `key=value` text file. `Application` owns one instance:
+`bracken::GraphicsSettings` (`src/bracken/contracts/graphics_settings.hpp`) is a plain struct of user-facing quality knobs, persisted as a `key=value` text file. `Application` owns one instance:
 
 ```cpp
 auto& gs = graphics_settings();     // the persisted instance (loaded at init_renderer)
@@ -548,7 +548,7 @@ s.bloom_strength = 0.5f;
 if (!s.save(path)) { /* directory missing / not writable */ }
 ```
 
-Format and parser facts you can rely on (all covered by `src/bracken/graphics_settings.test.cpp`):
+Format and parser facts you can rely on (all covered by `src/bracken/contracts/graphics_settings.test.cpp`):
 
 - Lines are `key=value`; empty lines and lines starting with `#` are skipped; unknown keys are silently ignored.
 - Booleans: anything other than `"0"` reads as `true` (so `true`, `yes`, `42` are all true).
@@ -662,7 +662,7 @@ One gamepad at a time: the first recognized gamepad is opened at startup or on h
 
 ### RenderStats
 
-`bracken::RenderStats` (`src/bracken/render_stats.hpp`) is a plain struct of per-frame counters. Collection is **off by default** — enable it, render at least one frame, then read:
+`bracken::RenderStats` (`src/bracken/contracts/render_stats.hpp`) is a plain struct of per-frame counters. Collection is **off by default** — enable it, render at least one frame, then read:
 
 ```cpp
 // adapted from examples/playground/playground.cpp (smoke driver)
@@ -2599,7 +2599,7 @@ Contracts to know up front:
 
 ### Cameras and projection (`CameraState`)
 
-`scene::CameraState` (`src/bracken/scene/camera_state.hpp`) is a plain struct — the game computes it, the renderer consumes it:
+`scene::CameraState` (`src/bracken/contracts/camera_state.hpp`) is a plain struct — the game computes it, the renderer consumes it:
 
 ```cpp
 struct CameraState {
@@ -2629,7 +2629,7 @@ If you drive your own camera, you must follow the engine's projection convention
 projection_matrix_ = glm::perspective(glm::radians(current_fov_), aspect, 15000.0f, 5.0f);
 ```
 
-The test `src/bracken/scene/camera_state.test.cpp` (`ProjectionIsRightHandedReversedZeroToOneDepth`, `ReversedZKeepsDistantDepthsDistinct`) pins this behavior down and is the best executable reference.
+The test `src/bracken/contracts/camera_state.test.cpp` (`ProjectionIsRightHandedReversedZeroToOneDepth`, `ReversedZKeepsDistantDepthsDistinct`) pins this behavior down and is the best executable reference.
 
 Common mistakes:
 
@@ -2639,10 +2639,10 @@ Common mistakes:
 
 ### Frustum culling (`Frustum`, `Plane`)
 
-`scene::Frustum` (`src/bracken/scene/frustum.hpp`) extracts six planes from any view-projection matrix (Gribb-Hartmann method) and offers two intersection tests:
+`scene::Frustum` (`src/bracken/contracts/frustum.hpp`) extracts six planes from any view-projection matrix (Gribb-Hartmann method) and offers two intersection tests:
 
 ```cpp
-#include "bracken/scene/frustum.hpp"
+#include "bracken/contracts/frustum.hpp"
 
 scene::Frustum frustum;
 frustum.extract_from_matrix(cam.view_projection);
@@ -2651,9 +2651,9 @@ bool visible_sphere = frustum.intersects_sphere(center, radius);
 bool visible_box    = frustum.intersects_aabb(min_corner, max_corner);
 ```
 
-It works unchanged for perspective, orthographic (shadow-map style), standard-Z, and reversed-Z matrices — under reversed-Z the two depth planes swap near/far roles, but the extracted plane *set* is identical, so culling results match a standard-Z frustum exactly (proven in `src/bracken/scene/frustum.test.cpp`, `ReversedZFrustumTest.MatchesStandardZFrustumOnSamplePoints`).
+It works unchanged for perspective, orthographic (shadow-map style), standard-Z, and reversed-Z matrices — under reversed-Z the two depth planes swap near/far roles, but the extracted plane *set* is identical, so culling results match a standard-Z frustum exactly (proven in `src/bracken/contracts/frustum.test.cpp`, `ReversedZFrustumTest.MatchesStandardZFrustumOnSamplePoints`).
 
-You normally don't call this yourself for world content: `SceneRenderer` extracts the main-camera frustum once per frame and culls every packet draw command with it (plus an independent frustum per shadow cascade). Culling is controlled by `GraphicsSettings::frustum_culling` (default `true`, `src/bracken/graphics_settings.hpp`). Distance culling is always on and uses the XZ-plane distance to `GraphicsSettings::get_draw_distance()` — note it ignores height, so an object directly above the camera is never distance-culled.
+You normally don't call this yourself for world content: `SceneRenderer` extracts the main-camera frustum once per frame and culls every packet draw command with it (plus an independent frustum per shadow cascade). Culling is controlled by `GraphicsSettings::frustum_culling` (default `true`, `src/bracken/contracts/graphics_settings.hpp`). Distance culling is always on and uses the XZ-plane distance to `GraphicsSettings::get_draw_distance()` — note it ignores height, so an object directly above the camera is never distance-culled.
 
 `scene::Plane` is public too (normal + distance, `distance_to_point`, `normalize`) if you need half-space tests for gameplay.
 
@@ -3786,8 +3786,8 @@ All per-frame environment and lighting plumbing is done by `SceneRenderer` — y
 
 | Knob | Where | Default | Effect |
 |---|---|---|---|
-| `ambient_strength`, `sun_intensity` | `GraphicsSettings` (`src/bracken/graphics_settings.hpp`), forwarded via `TerrainRenderer::set_lighting_tunables` | 0.45 / 3.0 (settings); renderer-side defaults 0.5 / 1.0 | shadow-region lift, sun multiplier |
-| fog + sun/ambient colors | `render::EnvironmentState` (`src/bracken/render/environment.hpp`), forwarded via `set_environment` once per frame | see header | atmospheric fog, hemisphere ambient |
+| `ambient_strength`, `sun_intensity` | `GraphicsSettings` (`src/bracken/contracts/graphics_settings.hpp`), forwarded via `TerrainRenderer::set_lighting_tunables` | 0.45 / 3.0 (settings); renderer-side defaults 0.5 / 1.0 | shadow-region lift, sun multiplier |
+| fog + sun/ambient colors | `render::EnvironmentState` (`src/bracken/contracts/environment.hpp`), forwarded via `set_environment` once per frame | see header | atmospheric fog, hemisphere ambient |
 | `anisotropic_filter` | `GraphicsSettings` int 0–4 → `SceneRenderer::set_anisotropic_filter` maps to 1/2/4/8/16× → `TerrainRenderer::set_anisotropic_filter(float)` | 4 (=16×); the terrain's init-time sampler is 8× | material texture sharpness at grazing angles |
 | `draw_distance` | `GraphicsSettings` (index 0–6 → 500…32000) | 3 (=4000) | also caps grass view distance |
 
@@ -3910,7 +3910,7 @@ manually.
 
 All light colors are **linear** — the scene renders into an RGBA16F HDR
 target and tonemapping happens at composite (see
-`src/bracken/render/environment.hpp`). Intensities are HDR: values well above
+`src/bracken/contracts/environment.hpp`). Intensities are HDR: values well above
 1.0 are normal and give bloom/tonemapping headroom.
 
 ### Dynamic lights (point & spot)
@@ -4025,7 +4025,7 @@ fixed at 0.1 and the far plane tracks `GraphicsSettings::get_draw_distance()`
 ### The sun (directional light)
 
 The sun is *not* a clustered light — it is part of
-`render::EnvironmentState` (`src/bracken/render/environment.hpp`), applied to
+`render::EnvironmentState` (`src/bracken/contracts/environment.hpp`), applied to
 every fragment, and it is the only light with *cascaded* shadow maps (point
 and spot lights get budgeted atlas shadows via `casts_shadows` — see the
 local-shadow notes under [Dynamic lights](#dynamic-lights-point--spot) and
@@ -4038,7 +4038,7 @@ env.sun_dir   = glm::normalize(glm::vec3(-0.5f, -0.8f, -0.3f)); // direction lig
 env.sun_color = {1.0f, 0.95f, 0.9f};                            // linear tint
 ```
 
-Two `GraphicsSettings` fields scale it (`src/bracken/graphics_settings.hpp`):
+Two `GraphicsSettings` fields scale it (`src/bracken/contracts/graphics_settings.hpp`):
 
 - `sun_intensity` (default `3.0f`) — HDR multiplier on the sun.
 - `ambient_strength` (default `0.45f`) — how much hemisphere ambient survives
@@ -4054,11 +4054,11 @@ from sun toward the ground), not the vector toward the sun. The full
 #### Settings-level control (the normal path)
 
 Everything a game usually needs is in `GraphicsSettings`
-(`src/bracken/graphics_settings.hpp`), applied via
+(`src/bracken/contracts/graphics_settings.hpp`), applied via
 `Application::apply_all_graphics_settings()`:
 
 ```cpp
-#include "bracken/graphics_settings.hpp"
+#include "bracken/contracts/graphics_settings.hpp"
 
 auto& gs = graphics_settings();
 gs.shadow_mode       = bracken::ShadowMode::PCSS; // Off / PCF / PCSS (default PCSS)
@@ -4461,7 +4461,7 @@ Two objects feed every model draw's `LightingUniforms` (built per draw in `Scene
 Live-editable through `SceneRenderer::environment()` (`src/bracken/scene/scene_renderer.hpp`); all colors linear:
 
 ```cpp
-#include "bracken/render/environment.hpp"
+#include "bracken/contracts/environment.hpp"
 
 auto& env = scene_renderer().environment();
 env.sun_dir       = glm::normalize(glm::vec3(-0.5f, -0.8f, -0.3f)); // direction light TRAVELS
@@ -4477,7 +4477,7 @@ Note the sun convention: `sun_dir` is the direction light *travels*; the shader 
 
 #### GraphicsSettings — intensity and shadow-fill
 
-From `src/bracken/graphics_settings.hpp`, applied via `SceneRenderer::set_graphics_settings`:
+From `src/bracken/contracts/graphics_settings.hpp`, applied via `SceneRenderer::set_graphics_settings`:
 
 - `sun_intensity` (default **3.0**) — HDR multiplier on `sun_color` for the direct term. Deliberately >1 so bloom and the tonemapper have headroom.
 - `ambient_strength` (default **0.45**) — how much hemisphere ambient survives inside shadow. In fully lit areas ambient is at full strength; in full shadow it is multiplied by `ambient_strength` (`ambientLift = lerp(ambientStrength, 1, shadow)` in the fragment shaders). 0 = pitch-black shadows, 1 = shadows only remove the direct term. This "ambient dims with shadow" behavior is an art-direction choice to avoid a flat fill-light look — if your shadows look too dark or too flat, this is the knob.
@@ -4609,7 +4609,7 @@ and the composite/tonemap pass that produces the final swapchain image; and
 
 Relevant source:
 
-- `src/bracken/render/environment.hpp` — `EnvironmentState`
+- `src/bracken/contracts/environment.hpp` — `EnvironmentState`
 - `src/bracken/render/world_renderer.hpp/.cpp` — skybox + debug grid
 - `src/bracken/render/volumetric_fog.hpp/.cpp` — volumetric fog / god rays
 - `src/bracken/render/bloom.hpp/.cpp` — bloom mip chain
@@ -4676,7 +4676,7 @@ direct-to-swapchain pass with no prepass or post-processing — see
 
 ### EnvironmentState — the atmosphere's single source of truth
 
-`bracken::render::EnvironmentState` (`src/bracken/render/environment.hpp`) is
+`bracken::render::EnvironmentState` (`src/bracken/contracts/environment.hpp`) is
 one plain struct that describes the sun, sky gradient, ambient,
 distance fog, and volumetric fog. The scene layer pushes it into every
 sub-renderer (world/skybox, terrain, grass, volumetric fog, model lighting)
@@ -4695,7 +4695,7 @@ reference — that is the DevUI Environment tab's main-thread live-edit path,
 used when a frame stages nothing; mutations take effect next frame.)
 
 ```cpp
-#include "bracken/render/environment.hpp"
+#include "bracken/contracts/environment.hpp"
 
 // Inside on_simulate (env_ is a host member):
 bracken::render::EnvironmentState& env = env_;
@@ -5694,7 +5694,7 @@ And while building the frame:
 sim.frame().set_camera(camera().get_camera_state());
 ```
 
-`get_camera_state()` builds a `scene::CameraState` (`src/bracken/scene/camera_state.hpp`) — `view`, `projection`, `view_projection = projection * view`, and `position` — which is the entire contract between the camera and `SceneRenderer`. Nothing forces you to use `CameraSystem`; any code that can fill a `CameraState` can drive the renderer.
+`get_camera_state()` builds a `scene::CameraState` (`src/bracken/contracts/camera_state.hpp`) — `view`, `projection`, `view_projection = projection * view`, and `position` — which is the entire contract between the camera and `SceneRenderer`. Nothing forces you to use `CameraSystem`; any code that can fill a `CameraState` can drive the renderer.
 
 You can also construct a `CameraSystem` directly (no GPU or window needed) — the unit tests do exactly that (`src/bracken/systems/camera_system.test.cpp`):
 
@@ -6632,7 +6632,7 @@ two `DevUI` instances never share widget state).
 #### Stats
 
 - FPS with a 120-sample scrolling history plot and derived frame time (ms).
-- Render counters from `RenderStats` (`src/bracken/render_stats.hpp`): draw
+- Render counters from `RenderStats` (`src/bracken/contracts/render_stats.hpp`): draw
   calls, triangles, entities rendered, entities distance/frustum-culled.
 - Particle/effect counts from the rendered packet's effect-instance snapshot
   (`SceneRenderer::frame_particle_count()`/`frame_effect_count()`).
@@ -6688,7 +6688,7 @@ tab edits — see below).
 
 #### Graphics
 
-Edits your `GraphicsSettings` struct (`src/bracken/graphics_settings.hpp`)
+Edits your `GraphicsSettings` struct (`src/bracken/contracts/graphics_settings.hpp`)
 directly, then — only on frames where a widget actually changed something —
 pushes the whole struct through the host's apply path
 (`Application::request_graphics_settings`, applied with internal diffing at

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "bracken/graphics_settings.hpp"
+#include "bracken/contracts/graphics_settings.hpp"
 #include "bracken/scene/frame_packet.hpp"
 
 namespace bracken::scene {

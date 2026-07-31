@@ -1,9 +1,9 @@
 #pragma once
 
+#include "bracken/contracts/environment.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
-#include "bracken/render/environment.hpp"
 #include <glm/glm.hpp>
 #include <memory>
 #include <SDL3/SDL_gpu.h>

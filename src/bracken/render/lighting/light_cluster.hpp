@@ -1,9 +1,9 @@
 #pragma once
 
+#include "bracken/contracts/camera_state.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/render/lighting/light.hpp"
-#include "bracken/scene/camera_state.hpp"
 #include <array>
 #include <cstdint>
 #include <glm/glm.hpp>

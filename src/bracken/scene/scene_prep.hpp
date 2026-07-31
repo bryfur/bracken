@@ -1,10 +1,10 @@
 #pragma once
 
+#include "bracken/contracts/frustum.hpp"
+#include "bracken/contracts/render_stats.hpp"
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
-#include "bracken/render_stats.hpp"
 #include "bracken/scene/frame_packet.hpp"
-#include "bracken/scene/frustum.hpp"
 #include "bracken/scene/motion_history.hpp"
 
 #include <array>

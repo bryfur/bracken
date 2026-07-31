@@ -1,4 +1,5 @@
 #include "grass_renderer.hpp"
+#include "bracken/contracts/frustum.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/core/jobs/job_system.hpp"
@@ -10,7 +11,6 @@
 #include "bracken/gpu/gpu_texture.hpp"
 #include "bracken/gpu/gpu_types.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
-#include "bracken/scene/frustum.hpp"
 #include "SDL3/SDL_gpu.h"
 #include <algorithm>
 #include <bit>

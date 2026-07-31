@@ -2,10 +2,10 @@
 
 #if defined(BRACKEN_DEV_UI) && BRACKEN_DEV_UI
 
-#include "bracken/graphics_settings.hpp"
+#include "bracken/contracts/environment.hpp"
+#include "bracken/contracts/graphics_settings.hpp"
+#include "bracken/contracts/render_stats.hpp"
 #include "bracken/render/auto_exposure.hpp"
-#include "bracken/render/environment.hpp"
-#include "bracken/render_stats.hpp"
 #include "bracken/scene/scene_renderer.hpp"
 #include "bracken/systems/camera_controller.hpp"
 #include <algorithm>

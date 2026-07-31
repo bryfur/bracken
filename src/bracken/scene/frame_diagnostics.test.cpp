@@ -14,13 +14,13 @@
 
 #include <gtest/gtest.h>
 
+#include "bracken/contracts/frustum.hpp"
+#include "bracken/contracts/render_stats.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
-#include "bracken/render_stats.hpp"
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
-#include "bracken/scene/frustum.hpp"
 #include "bracken/scene/motion_history.hpp"
 #include "bracken/scene/scene_prep.hpp"
 #include "bracken/scene/scene_renderer.hpp"

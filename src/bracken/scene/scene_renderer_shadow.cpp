@@ -11,6 +11,7 @@
 #include "scene_renderer.hpp"
 #include "scene_renderer_internal.hpp"
 
+#include "bracken/contracts/frustum.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_debug.hpp"
@@ -24,7 +25,6 @@
 #include "bracken/render/shadow_map.hpp"
 #include "bracken/render/terrain_renderer.hpp"
 #include "bracken/scene/frame_packet.hpp"
-#include "bracken/scene/frustum.hpp"
 #include "bracken/scene/scene_prep.hpp"
 #include "bracken/scene/transform_math.hpp"
 

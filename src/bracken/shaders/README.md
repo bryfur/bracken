@@ -103,7 +103,7 @@ The `DepthPrepass*` pipelines render every glTF alphaMode OPAQUE draw
 scene depth target plus an RG16F velocity target before the forward pass.
 The shared `prepass_velocity.frag` writes **UV-space motion vectors,
 current minus previous** (`prev_uv = uv - velocity` reprojects; CPU
-reference: `src/bracken/scene/velocity_math.hpp`), computed from UNJITTERED
+reference: `src/bracken/contracts/velocity_math.hpp`), computed from UNJITTERED
 view-projection matrices carried alongside the (possibly TAA-jittered) draw
 projection. Skinned prepass draws bind TWO palette buffers (vertex set 0,
 bindings 0/1: current + previous frame); `prevPaletteOffset == 0xFFFFFFFF`

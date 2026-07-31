@@ -1,4 +1,5 @@
 #include "terrain_renderer.hpp"
+#include "bracken/contracts/frustum.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/core/jobs/job_system.hpp"
@@ -14,7 +15,6 @@
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/heightmap.hpp"
 #include "bracken/memory/arena.hpp"
-#include "bracken/scene/frustum.hpp"
 #include "glm/ext/matrix_float4x4.hpp"
 #include "glm/ext/vector_float2.hpp"
 #include "glm/ext/vector_float3.hpp"

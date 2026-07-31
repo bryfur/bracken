@@ -20,9 +20,9 @@
 
 #if defined(BRACKEN_DEV_UI) && BRACKEN_DEV_UI
 
+#include "bracken/contracts/environment.hpp"
+#include "bracken/contracts/graphics_settings.hpp"
 #include "bracken/dev/dev_panels.hpp"
-#include "bracken/graphics_settings.hpp"
-#include "bracken/render/environment.hpp"
 #include "bracken/scene/scene_renderer.hpp"
 #include "bracken/systems/camera_controller.hpp"
 

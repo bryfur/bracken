@@ -1,9 +1,9 @@
 #include <benchmark/benchmark.h>
 
+#include "bracken/contracts/camera_state.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/render/lighting/light.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
-#include "bracken/scene/camera_state.hpp"
 
 #include <glm/ext/matrix_clip_space.hpp>
 

@@ -92,6 +92,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 
 | Module | Namespace | What's there |
 |---|---|---|
+| `contracts/` | *(each type keeps its own)* | the **leaf layer** — pure-data types two layers must agree on: `ModelHandle`, `EnvironmentState`, `CameraState`, `Frustum`, `velocity_math`, `PointLight`/`SpotLight`, `GraphicsSettings`, `RenderStats`. May include `core/`, glm and `<std>` and nothing else; a header's directory and its namespace are independent here. This is what makes the header graph a DAG — see `contracts/README.md` and architecture.md "Module layering" |
 | `core/` | `bracken::core` | logger (**the engine's only log channel**), asserts, `Result`, `Handle`, `hash`/`StringId`, Tracy profiler hooks |
 | `core/jobs/` | `core::jobs` | `JobSystem` (**always-on** lock-free work-stealing pool — Chase–Lev deques, `atomic::wait` parking), `TaskGroup`, `parallel_for`, task handles. Worker count via `BRACKEN_WORKERS` (=1 is single-worker debug mode, same code path) |
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload; opt-in via `BRACKEN_HOT_RELOAD=1`) + `AssetRegistry` (host-facing utility — engine systems register on the watcher directly) |
@@ -99,7 +100,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry`, `gpu_uniforms.hpp` (CPU↔GPU contract) |
 | `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO, TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), effects, text, UI; `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
-| `scene/` | `bracken::scene` | cameras, frustum culling, transforms, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
+| `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
 | `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
 | `systems/` | `bracken::systems` | camera controller/system, particle `EffectSystem` (sim-stage owned: spawned/updated/snapshotted inside the sim job; the renderer draws the packet snapshot) |
 | `procedural/` | `bracken::procedural` | tree + rock generators |

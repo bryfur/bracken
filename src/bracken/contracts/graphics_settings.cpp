@@ -1,4 +1,4 @@
-#include "bracken/graphics_settings.hpp"
+#include "bracken/contracts/graphics_settings.hpp"
 
 #include <fstream>
 #include <unordered_map>

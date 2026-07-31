@@ -1,8 +1,8 @@
 #pragma once
 
+#include "bracken/contracts/environment.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
-#include "bracken/render/environment.hpp"
 #include <SDL3/SDL_gpu.h>
 #include <array>
 #include <cstdint>

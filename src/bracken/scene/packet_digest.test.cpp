@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "bracken/contracts/camera_state.hpp"
 #include "bracken/render/lighting/light.hpp"
-#include "bracken/scene/camera_state.hpp"
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/packet_digest.hpp"

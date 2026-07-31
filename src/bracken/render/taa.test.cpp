@@ -1,5 +1,5 @@
+#include "bracken/contracts/velocity_math.hpp"
 #include "bracken/render/taa.hpp"
-#include "bracken/scene/velocity_math.hpp"
 #include <glm/gtc/matrix_transform.hpp>
 #include <gtest/gtest.h>
 

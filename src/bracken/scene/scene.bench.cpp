@@ -1,5 +1,5 @@
+#include "bracken/contracts/frustum.hpp"
 #include "bracken/heightmap.hpp"
-#include "bracken/scene/frustum.hpp"
 #include "bracken/scene/transform_math.hpp"
 #include <benchmark/benchmark.h>
 #include <cstddef>

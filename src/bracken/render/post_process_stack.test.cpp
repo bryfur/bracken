@@ -1,7 +1,7 @@
-#include "bracken/render/post_process_stack.hpp"
-#include "bracken/graphics_settings.hpp"
+#include "bracken/contracts/environment.hpp"
+#include "bracken/contracts/graphics_settings.hpp"
 #include "bracken/render/color_grading.hpp"
-#include "bracken/render/environment.hpp"
+#include "bracken/render/post_process_stack.hpp"
 #include <gtest/gtest.h>
 
 using namespace bracken::render;

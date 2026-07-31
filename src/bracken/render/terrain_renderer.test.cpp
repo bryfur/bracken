@@ -7,8 +7,8 @@
 
 #include "bracken/render/terrain_renderer.hpp"
 
+#include "bracken/contracts/frustum.hpp"
 #include "bracken/core/jobs/job_system.hpp"
-#include "bracken/scene/frustum.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>

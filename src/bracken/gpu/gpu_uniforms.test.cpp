@@ -14,8 +14,8 @@
 // GraphicsSettings, render/auto_exposure.hpp constants), and the neutral-
 // default invariants the shaders rely on to stay pixel-identical.
 
+#include "bracken/contracts/environment.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
-#include "bracken/render/environment.hpp"
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>
 

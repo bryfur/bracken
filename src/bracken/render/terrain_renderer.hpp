@@ -1,12 +1,12 @@
 #pragma once
 
+#include "bracken/contracts/environment.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/heightmap.hpp"
-#include "bracken/render/environment.hpp"
 #include <cstddef>
 #include <glm/glm.hpp>
 #include <memory>

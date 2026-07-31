@@ -1,4 +1,4 @@
-#include "bracken/render_stats.hpp"
+#include "bracken/contracts/render_stats.hpp"
 
 #include <array>
 #include <gtest/gtest.h>

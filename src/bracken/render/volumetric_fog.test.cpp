@@ -4,9 +4,9 @@
 
 #include "bracken/render/volumetric_fog.hpp"
 
-#include "bracken/render/environment.hpp"
+#include "bracken/contracts/camera_state.hpp"
+#include "bracken/contracts/environment.hpp"
 #include "bracken/render/shadow_map.hpp"
-#include "bracken/scene/camera_state.hpp"
 #include <glm/gtc/matrix_transform.hpp>
 #include <gtest/gtest.h>
 

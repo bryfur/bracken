@@ -1541,7 +1541,7 @@ it at the push site and add sizeof/offsetof static_asserts against
 ### L49. GTAOUniforms tunables other than `radiusScale` are compile-time constants unreachable through GraphicsSettings
 
 **Category:** api-quirk
-**Locations:** `src/bracken/gpu/gpu_uniforms.hpp:271`, `:280` (defaults); `src/bracken/render/ambient_occlusion.cpp:277`, `:320`; `src/bracken/scene/scene_renderer.cpp:694`; `src/bracken/graphics_settings.hpp:91`
+**Locations:** `src/bracken/gpu/gpu_uniforms.hpp:271`, `:280` (defaults); `src/bracken/render/ambient_occlusion.cpp:277`, `:320`; `src/bracken/scene/scene_renderer.cpp:694`; `src/bracken/contracts/graphics_settings.hpp:91`
 
 Both AO passes build `gpu::GTAOUniforms uniforms = {}` and assign only
 projection/screen/radiusScale/kernel — radius (4.0), bias (0.01),
@@ -1707,7 +1707,7 @@ functions.
 ### L1. `EnvironmentState` lives in `namespace bracken`, but CLAUDE.md/architecture.md/user_guide.md call it `render::EnvironmentState`
 
 **Category:** doc-code-mismatch
-**Locations:** `src/bracken/render/environment.hpp:5`, `:16`; `CLAUDE.md:93`; `docs/architecture.md:70`; `docs/user_guide.md:2722`, `:3691`, `:3916`, `:6303`
+**Locations:** `src/bracken/contracts/environment.hpp:5`, `:16`; `CLAUDE.md:93`; `docs/architecture.md:70`; `docs/user_guide.md:2722`, `:3691`, `:3916`, `:6303`
 
 The struct is declared directly in `namespace bracken` although the file
 lives under render/; engine code uses it unqualified (enclosing-namespace
@@ -1738,7 +1738,7 @@ the comment.
 ### L30. `CompositeParams`/`CompositeUniforms` default bloom strength (0.35) disagrees with GraphicsSettings default (0.25)
 
 **Category:** api-quirk
-**Locations:** `src/bracken/render/ambient_occlusion.hpp:72`; `src/bracken/gpu/gpu_uniforms.hpp:309`; `src/bracken/graphics_settings.hpp:66`; overwrite at `src/bracken/scene/scene_renderer.cpp:742`
+**Locations:** `src/bracken/render/ambient_occlusion.hpp:72`; `src/bracken/gpu/gpu_uniforms.hpp:309`; `src/bracken/contracts/graphics_settings.hpp:66`; overwrite at `src/bracken/scene/scene_renderer.cpp:742`
 
 The normal frame path always overwrites the param from settings, so the 0.35
 defaults are live only when a host drives the composite pass directly — and

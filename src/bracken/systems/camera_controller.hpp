@@ -1,6 +1,6 @@
 #pragma once
 
-#include "bracken/scene/camera_state.hpp"
+#include "bracken/contracts/camera_state.hpp"
 #include <functional>
 #include <glm/glm.hpp>
 

@@ -1,11 +1,11 @@
 #pragma once
 
+#include "bracken/contracts/camera_state.hpp"
+#include "bracken/contracts/environment.hpp"
+#include "bracken/contracts/model_handle.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/memory/arena.hpp"
-#include "bracken/contracts/model_handle.hpp"
-#include "bracken/render/environment.hpp"
 #include "bracken/render/lighting/light.hpp"
-#include "bracken/scene/camera_state.hpp"
 
 #include <atomic>
 #include <cstddef>

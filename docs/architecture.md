@@ -17,21 +17,74 @@ Root namespace `bracken`, one sub-namespace per module.
 
 | Path | Namespace | Contents |
 |---|---|---|
-| `src/bracken/` (root) | `bracken` | `Application`, `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `GraphicsSettings`, `Heightmap`, `RenderStats`, `effect_definition.hpp` |
+| `src/bracken/` (root) | `bracken` | `Application`, `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `Heightmap`, `effect_definition.hpp` |
+| `contracts/` | *(unchanged per type)* | the **leaf layer**: pure-data types two or more layers must agree on — `ModelHandle`, `EnvironmentState`, `CameraState`, `Frustum`, `velocity_math`, `PointLight`/`SpotLight`, `GraphicsSettings`, `RenderStats`. May include `core/`, glm and `<std>` and nothing else; namespaces are those of the owning module, not the directory. See [`contracts/README.md`](../src/bracken/contracts/README.md) |
 | `core/` | `core` | `Logger` (+`BRACKEN_LOG_*`), `assert.hpp`, `Result<T,E>`, `Handle` pools, `hash.hpp` (`StringId`, FNV-1a), `profiler.hpp` (Tracy macros) |
 | `core/jobs/` | `core::jobs` | `JobSystem` (always-on lock-free work-stealing pool — Chase–Lev deques, MPSC injection, pooled job nodes), `TaskGroup`, `parallel_for`, `TaskHandle` |
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload poller); `AssetRegistry` (typed, stable handles — a host-facing utility: no engine system instantiates it) |
 | `memory/` | `memory` | `Arena` (bump + destructor registration), `FrameAllocator` |
 | `gpu/` | `gpu` | `GPUDevice`, `GPUBuffer`, `GPUTexture`, `ShaderManager`, `GPUPipeline`, `GPUComputePipeline`/`ComputePass` (`gpu_compute.hpp`), `PipelineRegistry`, `gpu_uniforms.hpp` (CPU↔GPU contract), `gpu_debug.hpp` |
-| `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), effects, text, UI; `environment.hpp`, `color_grading.hpp` |
-| `render/lighting/` | `render::lighting` | `PointLight`/`SpotLight`, `ClusterGrid` (CPU light binning), `LocalShadowMap`/`LocalShadowSelector` (budgeted point/spot shadow atlas + tile cache) |
+| `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), effects, text, UI; `color_grading.hpp` |
+| `render/lighting/` | `render::lighting` | `ClusterGrid` (CPU light binning), `LocalShadowMap`/`LocalShadowSelector` (budgeted point/spot shadow atlas + tile cache), and the cluster/atlas **budget constants** in `light.hpp` (the light *structs* are `contracts/light.hpp`) |
 | `render_graph/` | `render_graph` | pass scheduler (topo-sort, transient pool) — **in-tree, tested, not wired into `SceneRenderer`** |
-| `scene/` | `scene` | `FramePacket` (immutable per-frame snapshot) + `FrameBuilder` (lane-based write interface) + `PacketRing` (SPSC handoff ring), `SceneRenderer` (frame orchestrator), `CameraState`, `Frustum`, `MotionHistory`, `transform_math.hpp` |
+| `scene/` | `scene` | `FramePacket` (immutable per-frame snapshot) + `FrameBuilder` (lane-based write interface) + `PacketRing` (SPSC handoff ring), `SceneRenderer` (frame orchestrator), `ScenePrep`, `RenderPlan`, `MotionHistory`, `transform_math.hpp` |
 | `animation/` | `animation` | `animation_types.hpp` (skeleton/clips/constants), `AnimationPlayer`, `AnimationStateMachine`, `ik_solver` |
 | `systems/` | `systems` | `CameraController` / `CameraSystem`, `EffectSystem` |
 | `procedural/` | `procedural` | `tree_generator` (ez-tree algorithm), `rock_generator` (SDF + marching cubes) |
 | `physics/` | `physics` | `PhysicsWorld` (glm-only pimpl over vendored **Jolt Physics** — linked PRIVATE, Jolt never in public headers), internal `JoltJobSystem` bridge onto `core::jobs::JobSystem` (see "Physics" below) |
 | `shaders/` | — | HLSL sources → SPIR-V at build time; see [shaders/README.md](../src/bracken/shaders/README.md) |
+
+### Module layering
+
+The engine's **header** graph is a DAG, and
+`core/module_layering.test.cpp` keeps it one. Reading downward, every edge
+points from a layer to one below it:
+
+```
+core                                          sink: fan-out 0, includes nothing in-tree
+  core/jobs, core/asset, memory, contracts    contracts: core + glm + <std> only
+    gpu, animation
+      model_loader.hpp, heightmap.hpp         asset-layer leaves, filed at the root
+        render, render/lighting, procedural, physics
+          scene                               FramePacket / FrameBuilder / PacketRing
+            systems
+              @root                           application.hpp, sim_frame.hpp, input
+                dev
+```
+
+Two things this diagram does not hide:
+
+- **The root directory is not a layer.** It holds the top of the stack
+  (`application.hpp`, `sim_frame.hpp`, the input pair) *and* two dependency
+  leaves that `render/` and `scene/` reach up for by path — `model_loader.hpp`
+  and `heightmap.hpp`. That is untidy, and a `model/` directory would tidy it,
+  but no header in the root's top half is included by any header in `render/`,
+  `scene/` or `systems/`, so it closes no cycle. Honest summary: acyclic, with
+  two files filed one directory too high.
+- **`.cpp` files are excluded**, and only from this claim. `application.cpp`,
+  `dev/dev_panels.cpp` and `scene/scene_renderer*.cpp` all reach downward into
+  the modules they orchestrate, which produces residual module cycles at *link*
+  level. A `.cpp` cannot participate in a compile cycle, so those cost nothing
+  and are deliberately not chased.
+
+Why it matters: until this was made a DAG the production module graph had a
+six-module strongly-connected component — `{@root, dev, render, render/lighting,
+scene, systems}` — with 21 elementary cycles of length ≤ 4, and **zero**
+file-level include cycles, which is why nothing in the build ever complained.
+The cause was not wrong names, it was pure-data types filed under whichever
+module happened to author them: `EnvironmentState` under `render/` although the
+frame packet carries one, `CameraState`/`Frustum` under `scene/` although every
+sub-renderer takes them, `GraphicsSettings`/`RenderStats` at the root although
+`scene/` reads and writes them. Each misfiling reversed the direction of a real
+dependency edge. Moving them to `contracts/` reverses those edges back;
+namespaces were deliberately left alone, so it cost include lines and nothing
+else.
+
+The three checked properties are: the header module graph has no cycle; nothing
+under `contracts/` includes anything but `bracken/core/*`, `bracken/contracts/*`,
+glm and `<std>`; and `core/`, `memory/` and `gpu/` never include upward (tests
+and benchmarks exempt — cross-layer contract tests like
+`gpu/uniform_layout.test.cpp` exist precisely to check that the layers agree).
 
 ---
 
@@ -61,7 +114,7 @@ Root namespace `bracken`, one sub-namespace per module.
     (under standard-Z it was `m[3][2]/m[2][2]`).
   - `Frustum::extract_from_matrix` is convention-agnostic: the two depth-plane
     rows swap near/far roles under reversed-Z but the extracted plane set (and
-    thus culling) is identical (`scene/frustum.cpp`).
+    thus culling) is identical (`contracts/frustum.cpp`).
   - **Exception: shadow cascades stay standard-Z** (clear 1.0,
     `LESS_OR_EQUAL` pipelines + compare sampler, `orthoRH_ZO` light
     projections). Their orthographic depth is already linear, so reversed-Z
@@ -69,7 +122,7 @@ Root namespace `bracken`, one sub-namespace per module.
   Never mix in `-1..1`-depth projection helpers, and never build a
   depth-tested scene pass with a standard (non-reversed) projection.
 - **Linear-space lighting**: all colors in `render::EnvironmentState`
-  (`render/environment.hpp`) are linear. The scene renders into a linear HDR
+  (`contracts/environment.hpp`) are linear. The scene renders into a linear HDR
   target; the composite pass tonemaps (ACES et al.) + gamma-corrects to the
   swapchain. sRGB textures are converted on sample.
 - **Texture formats** (`gpu/pipeline_registry.hpp`): swapchain
@@ -403,7 +456,7 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    position-only into the scene depth target plus an RG16F **velocity**
    target (screen-sized, cleared to zero; `SceneRenderer::velocity_texture()`).
    Velocity = UV-space delta, **current minus previous**, computed from
-   UNJITTERED matrices (`scene/velocity_math.hpp` is the CPU reference;
+   UNJITTERED matrices (`contracts/velocity_math.hpp` is the CPU reference;
    consumers reproject with `prev_uv = uv - velocity`). Statics use the
    previous view-projection with their current model matrix; objects
    submitted with a nonzero `motion_id` get their previous model matrix (and,
@@ -562,7 +615,7 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
 
 ### Frustum culling
 
-`scene/frustum.hpp` extracts planes from `view_projection`. Culling runs on
+`contracts/frustum.hpp` extracts planes from `view_projection`. Culling runs on
 the CPU for the main view and independently per shadow cascade during
 instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
 

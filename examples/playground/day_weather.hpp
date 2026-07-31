@@ -16,7 +16,7 @@
 
 #include <glm/vec3.hpp>
 
-#include "bracken/render/environment.hpp"
+#include "bracken/contracts/environment.hpp"
 
 namespace playground {
 

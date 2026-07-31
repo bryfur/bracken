@@ -5,8 +5,8 @@
 
 #include "bracken/render/grass_renderer.hpp"
 
+#include "bracken/contracts/frustum.hpp"
 #include "bracken/core/jobs/job_system.hpp"
-#include "bracken/scene/frustum.hpp"
 #include <algorithm>
 #include <cstring>
 #include <glm/glm.hpp>

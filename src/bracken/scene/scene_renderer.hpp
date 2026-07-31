@@ -1,19 +1,19 @@
 #pragma once
 
+#include "bracken/contracts/graphics_settings.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_debug.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
-#include "bracken/graphics_settings.hpp"
 // Needed in full: the inline instance-batch walk dereferences ModelManager/Model.
+#include "bracken/contracts/camera_state.hpp"
+#include "bracken/contracts/environment.hpp"
+#include "bracken/contracts/frustum.hpp"
+#include "bracken/contracts/render_stats.hpp"
 #include "bracken/model_loader.hpp"
-#include "bracken/render/environment.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
 #include "bracken/render/lighting/local_shadows.hpp"
-#include "bracken/render_stats.hpp"
-#include "bracken/scene/camera_state.hpp"
 #include "bracken/scene/frame_packet.hpp"
-#include "bracken/scene/frustum.hpp"
 #include "bracken/scene/motion_history.hpp"
 #include "bracken/scene/scene_prep.hpp"
 #include <array>
