@@ -103,6 +103,41 @@ TEST(PacketDigest, DetectsDroppedDraw) {
     EXPECT_NE(packet_digest(a), packet_digest(b));
 }
 
+// The reason DrawFlags could be introduced as a pure re-encoding: each named
+// bit is hashed on its own, so transposing ForceNonInstanced and NoFog during
+// a mechanical conversion moves the digest instead of quietly moving the image.
+TEST(PacketDigest, DetectsTransposedDrawFlags) {
+    FramePacket a;
+    FrameBuilder fa(a);
+    fa.draw_model(1, glm::mat4(1.0f), {1, 1, 1, 1}, DrawFlags::ForceNonInstanced);
+    fa.seal();
+
+    FramePacket b;
+    FrameBuilder fb(b);
+    fb.draw_model(1, glm::mat4(1.0f), {1, 1, 1, 1}, DrawFlags::NoFog);
+    fb.seal();
+
+    EXPECT_NE(packet_digest(a), packet_digest(b));
+}
+
+TEST(PacketDigest, DetectsAddedSkinnedDrawFlag) {
+    FramePacket a;
+    FrameBuilder fa(a);
+    auto pa = fa.alloc_bone_palette(1);
+    pa.matrices[0] = glm::mat4(1.0f);
+    fa.draw_skinned(1, glm::mat4(1.0f), pa.id);
+    fa.seal();
+
+    FramePacket b;
+    FrameBuilder fb(b);
+    auto pb = fb.alloc_bone_palette(1);
+    pb.matrices[0] = glm::mat4(1.0f);
+    fb.draw_skinned(1, glm::mat4(1.0f), pb.id, {1, 1, 1, 1}, DrawFlags::NoFog);
+    fb.seal();
+
+    EXPECT_NE(packet_digest(a), packet_digest(b));
+}
+
 TEST(PacketDigest, DetectsChangedLightIntensity) {
     FramePacket a;
     FrameBuilder fa(a);

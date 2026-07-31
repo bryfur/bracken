@@ -1966,8 +1966,8 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
         auto palette = fb.alloc_bone_palette(joints);
         if (palette.valid()) {
             anim_player_.write_palette(palette.matrices);
-            fb.draw_skinned(player_model_, player_transform_, palette.id, {1.0f, 1.0f, 1.0f, 1.0f}, false,
-                            MOTION_ID_PLAYER);
+            fb.draw_skinned(player_model_, player_transform_, palette.id, {1.0f, 1.0f, 1.0f, 1.0f},
+                            scene::DrawFlags::None, MOTION_ID_PLAYER);
         }
     }
 
@@ -1983,8 +1983,8 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
     for (size_t orb_index = 0; orb_index < orbs_.size(); ++orb_index) {
         const auto& orb = orbs_[orb_index];
         glm::vec3 pos = orb.pos + glm::vec3(0, 10.0f * std::sin(time_ * 2.0f + orb.bob_phase), 0);
-        fb.draw_model(orb_model_, glm::translate(glm::mat4(1.0f), pos), {1.0f, 1.0f, 1.0f, 1.0f}, false, false,
-                      MOTION_ID_ORB_BASE + static_cast<uint32_t>(orb_index));
+        fb.draw_model(orb_model_, glm::translate(glm::mat4(1.0f), pos), {1.0f, 1.0f, 1.0f, 1.0f},
+                      scene::DrawFlags::None, MOTION_ID_ORB_BASE + static_cast<uint32_t>(orb_index));
         // casts_shadows: the orbs move (bob + respawn), constantly exercising
         // the local-shadow tile cache invalidation. Only the closest few win
         // the per-frame point budget; the rest fall back to unshadowed.

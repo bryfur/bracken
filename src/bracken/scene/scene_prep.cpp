@@ -84,7 +84,7 @@ static void bin_main_chunk(std::span<const ModelDrawCommand> cmds, size_t begin,
             stats.entities_rendered++;
         }
 
-        if (cmd.force_non_instanced) {
+        if (has(cmd.flags, DrawFlags::ForceNonInstanced)) {
             non_instanced.push_back(&cmd);
             continue;
         }
@@ -93,7 +93,7 @@ static void bin_main_chunk(std::span<const ModelDrawCommand> cmds, size_t begin,
         instance.model = cmd.transform;
         instance.normalMatrix = compute_normal_matrix(cmd.transform);
         instance.tint = cmd.tint;
-        instance.noFog = cmd.no_fog ? 1.0f : 0.0f;
+        instance.noFog = has(cmd.flags, DrawFlags::NoFog) ? 1.0f : 0.0f;
         // Motion vectors: previous-frame transform from the motion history
         // (per-instance motion_id); statics fall back to the current
         // transform, i.e. camera-only velocity.
@@ -120,7 +120,7 @@ static void bin_main_chunk(std::span<const ModelDrawCommand> cmds, size_t begin,
 // cascade's light frustum. Semantics mirror the serial walk exactly:
 // - distance-culled commands cast nothing;
 // - main-frustum-culled commands cast only with bounds and only when
-//   instanced (force_non_instanced casters draw via the non-instanced path);
+//   instanced (ForceNonInstanced casters draw via the non-instanced path);
 // - main-visible instanced commands cast when boundless or intersecting.
 static void bin_shadow_chunk(std::span<const ModelDrawCommand> cmds, size_t begin, size_t end,
                              const ScenePrep::PrepParams& p, int cascade,
@@ -153,9 +153,9 @@ static void bin_shadow_chunk(std::span<const ModelDrawCommand> cmds, size_t begi
 
         bool casts = false;
         if (!main_visible) {
-            casts = !cmd.force_non_instanced && have_bounds &&
+            casts = !has(cmd.flags, DrawFlags::ForceNonInstanced) && have_bounds &&
                     light_frustum.intersects_sphere(world_center, world_radius);
-        } else if (!cmd.force_non_instanced) {
+        } else if (!has(cmd.flags, DrawFlags::ForceNonInstanced)) {
             casts = !have_bounds || light_frustum.intersects_sphere(world_center, world_radius);
         }
         if (!casts) {

@@ -175,7 +175,10 @@ void build_world(PrepWorld& w, size_t model_count, size_t skinned_count) {
         const bool no_fog = rng.next_bits(7u) == 0;
         const uint32_t motion_id = (rng.next_bits(3u) == 0) ? 1u + (rng.next_u32() % 200u) : 0u;
         const glm::vec4 tint(rng.next_float01(), rng.next_float01(), rng.next_float01(), 1.0f);
-        fb.draw_model(h, make_transform(rng), tint, non_instanced, no_fog, motion_id);
+        fb.draw_model(h, make_transform(rng), tint,
+                      (non_instanced ? DrawFlags::ForceNonInstanced : DrawFlags::None) |
+                          (no_fog ? DrawFlags::NoFog : DrawFlags::None),
+                      motion_id);
     }
     FrameBuilder::BonePaletteAllocation shared{};
     for (size_t i = 0; i < skinned_count; ++i) {
@@ -192,7 +195,7 @@ void build_world(PrepWorld& w, size_t model_count, size_t skinned_count) {
             shared = alloc;
         }
         const uint32_t motion_id = (rng.next_bits(1u) == 0) ? 1u + (rng.next_u32() % 200u) : 0u;
-        fb.draw_skinned(h, make_transform(rng), alloc.id, {1, 1, 1, 1}, false, motion_id);
+        fb.draw_skinned(h, make_transform(rng), alloc.id, {1, 1, 1, 1}, DrawFlags::None, motion_id);
     }
     fb.seal();
 }

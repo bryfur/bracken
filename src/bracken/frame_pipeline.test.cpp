@@ -66,7 +66,8 @@ void fill_and_seal(FrameBuilder& fb, uint64_t frame) {
             glm::mat4 xf(1.0f);
             xf[0][0] = static_cast<float>(frame + 1);
             xf[1][1] = static_cast<float>(j + 1);
-            lane.draw_model(static_cast<bracken::ModelHandle>(100 + j), xf, {1.0f, 1.0f, 1.0f, 1.0f}, false, false,
+            lane.draw_model(static_cast<bracken::ModelHandle>(100 + j), xf, {1.0f, 1.0f, 1.0f, 1.0f},
+                            bracken::scene::DrawFlags::None,
                             static_cast<uint32_t>(frame * k_lanes + j + 1));
             lane.add_debug_line({static_cast<float>(frame), static_cast<float>(j), 0.0f},
                                 {static_cast<float>(j), static_cast<float>(frame), 1.0f},

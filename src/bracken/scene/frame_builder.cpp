@@ -303,7 +303,7 @@ std::string_view FrameBuilder::Lane::store_text(std::string_view text) {
 }
 
 void FrameBuilder::Lane::draw_model(bracken::ModelHandle handle, const glm::mat4& transform, const glm::vec4& tint,
-                                    bool force_non_instanced, bool no_fog, uint32_t motion_id) {
+                                    DrawFlags flags, uint32_t motion_id) {
     assert_filling();
     // Validate at EMIT time, the same treatment draw_skinned gives palettes:
     // a command carrying INVALID_MODEL_HANDLE can never draw, and catching it
@@ -314,11 +314,11 @@ void FrameBuilder::Lane::draw_model(bracken::ModelHandle handle, const glm::mat4
         packet_->count_drop_invalid_handle();
         return;
     }
-    new (push_slot(models_)) ModelDrawCommand{handle, motion_id, transform, tint, force_non_instanced, no_fog};
+    new (push_slot(models_)) ModelDrawCommand{handle, motion_id, transform, tint, flags};
 }
 
 void FrameBuilder::Lane::draw_skinned(bracken::ModelHandle handle, const glm::mat4& transform, BonePaletteId palette,
-                                      const glm::vec4& tint, bool no_fog, uint32_t motion_id) {
+                                      const glm::vec4& tint, DrawFlags flags, uint32_t motion_id) {
     assert_filling();
     if (handle == bracken::INVALID_MODEL_HANDLE) {
         packet_->count_drop_invalid_handle();
@@ -328,7 +328,7 @@ void FrameBuilder::Lane::draw_skinned(bracken::ModelHandle handle, const glm::ma
         packet_->count_drop_invalid_palette();
         return;
     }
-    new (push_slot(skinned_)) SkinnedDrawCommand{handle, motion_id, transform, tint, palette, no_fog};
+    new (push_slot(skinned_)) SkinnedDrawCommand{handle, motion_id, transform, tint, palette, flags};
 }
 
 FrameBuilder::BonePaletteAllocation FrameBuilder::Lane::alloc_bone_palette(uint32_t joint_count) {

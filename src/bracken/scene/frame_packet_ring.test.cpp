@@ -179,7 +179,7 @@ TEST(PacketRing, CrossThreadPublishAcquireHandsOffEveryFrameInOrder) {
         }
         FramePacket& p = ring.acquire_for_fill();
         FrameBuilder fb(p);
-        fb.draw_model(1, glm::mat4(1.0f), {1, 1, 1, 1}, false, false, static_cast<uint32_t>(frame));
+        fb.draw_model(1, glm::mat4(1.0f), {1, 1, 1, 1}, DrawFlags::None, static_cast<uint32_t>(frame));
         fb.set_frame_timing(0.016f, static_cast<double>(frame), frame);
         fb.seal();
         ring.publish(p);

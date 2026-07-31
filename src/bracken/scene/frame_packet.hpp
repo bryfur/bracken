@@ -6,6 +6,7 @@
 #include "bracken/contracts/model_handle.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/memory/arena.hpp"
+#include "bracken/scene/draw_flags.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -67,9 +68,9 @@ struct ModelDrawCommand {
     uint32_t motion_id = 0;
     glm::mat4 transform;
     glm::vec4 tint = {1.0f, 1.0f, 1.0f, 1.0f};
-    bool force_non_instanced = false;
-    bool no_fog = false;
-    uint8_t _pad0[2] = {0, 0};
+    /** Named replacement for the pair of trailing bools this command used to
+     *  carry (scene/draw_flags.hpp); same four bytes, no pad. */
+    DrawFlags flags = DrawFlags::None;
 };
 
 /**
@@ -87,9 +88,20 @@ struct SkinnedDrawCommand {
     glm::mat4 transform;
     glm::vec4 tint = {1.0f, 1.0f, 1.0f, 1.0f};
     BonePaletteId palette{};
-    bool no_fog = false;
-    uint8_t _pad0[3] = {0, 0, 0};
+    /** See ModelDrawCommand::flags. DrawFlags::ForceNonInstanced is inert
+     *  here: skinned draws are never instanced. */
+    DrawFlags flags = DrawFlags::None;
 };
+
+// The lane merge is a memcpy and frame_builder.test.cpp compares packets by
+// raw bytes, so these two must stay exactly as wide as their members —
+// a compiler-inserted pad byte is a nondeterministic byte in a gated frame.
+static_assert(sizeof(ModelDrawCommand) == 2 * sizeof(uint32_t) + sizeof(glm::mat4) + sizeof(glm::vec4) +
+                                              sizeof(DrawFlags),
+              "ModelDrawCommand grew padding");
+static_assert(sizeof(SkinnedDrawCommand) == 3 * sizeof(uint32_t) + sizeof(glm::mat4) + sizeof(glm::vec4) +
+                                                sizeof(DrawFlags),
+              "SkinnedDrawCommand grew padding");
 
 /**
  * One packed bone palette of a sealed frame. `matrices` points at packet

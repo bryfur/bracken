@@ -371,7 +371,8 @@ void SceneRenderer::render_model_command_inner(const ModelDrawCommand& cmd, cons
     transform_uniforms.cameraPos = camera.position;
     transform_uniforms.normalMatrix = compute_normal_matrix(model_mat);
 
-    bool fog_active = !cmd.no_fog && frame_fog_active_;
+    const bool no_fog = has(cmd.flags, DrawFlags::NoFog);
+    bool fog_active = !no_fog && frame_fog_active_;
 
     gpu::ModelLightingUniforms lighting_uniforms = make_model_lighting(camera, fog_active);
     lighting_uniforms.tintColor = cmd.tint;
@@ -407,7 +408,7 @@ void SceneRenderer::render_model_command_inner(const ModelDrawCommand& cmd, cons
 
         // glTF alphaMode BLEND: defer to the sorted transparent pass.
         if (mesh.material.alpha_mode == AlphaMode::Blend) {
-            queue_transparent_mesh(mesh, model_mat, transform_uniforms.normalMatrix, cmd.tint, cmd.no_fog,
+            queue_transparent_mesh(mesh, model_mat, transform_uniforms.normalMatrix, cmd.tint, no_fog,
                                    INVALID_PALETTE_OFFSET, *model, camera);
             continue;
         }
@@ -608,7 +609,8 @@ void SceneRenderer::render_skinned_model_command_inner(const SkinnedDrawCommand&
     transform_uniforms.normalMatrix = compute_normal_matrix(model_mat);
     transform_uniforms.paletteOffset = palette_offset;
 
-    bool fog_active = !cmd.no_fog && frame_fog_active_;
+    const bool no_fog = has(cmd.flags, DrawFlags::NoFog);
+    bool fog_active = !no_fog && frame_fog_active_;
 
     gpu::ModelLightingUniforms lighting_uniforms = make_model_lighting(camera, fog_active);
     lighting_uniforms.tintColor = cmd.tint;
@@ -643,7 +645,7 @@ void SceneRenderer::render_skinned_model_command_inner(const SkinnedDrawCommand&
 
         // glTF alphaMode BLEND: defer to the sorted transparent pass.
         if (mesh.material.alpha_mode == AlphaMode::Blend) {
-            queue_transparent_mesh(mesh, model_mat, transform_uniforms.normalMatrix, cmd.tint, cmd.no_fog,
+            queue_transparent_mesh(mesh, model_mat, transform_uniforms.normalMatrix, cmd.tint, no_fog,
                                    palette_offset, model, camera);
             continue;
         }

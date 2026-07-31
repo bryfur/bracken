@@ -124,12 +124,14 @@ public:
      */
     class alignas(bracken::core::jobs::k_cache_line) Lane {
     public:
-        /** Mirror of RenderScene::add_model — static model draw. An
-         *  INVALID_MODEL_HANDLE drops the draw at emit time and is counted in
+        /** Mirror of RenderScene::add_model — static model draw. `tint` is a
+         *  LINEAR RGBA multiplier (not a packed color); `flags` is the named
+         *  bit set from scene/draw_flags.hpp. An INVALID_MODEL_HANDLE drops
+         *  the draw at emit time and is counted in
          *  FramePacket::build_diagnostics() (summarized once at seal). */
         void draw_model(bracken::ModelHandle handle, const glm::mat4& transform,
-                        const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, bool force_non_instanced = false,
-                        bool no_fog = false, uint32_t motion_id = 0);
+                        const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, DrawFlags flags = DrawFlags::None,
+                        uint32_t motion_id = 0);
 
         /**
          * Skinned model draw referencing a packet palette (see
@@ -137,9 +139,11 @@ public:
          * allocation happened-before this call. An invalid handle or an
          * invalid id (over-budget allocation) drops the draw at emit time and
          * is counted in FramePacket::build_diagnostics().
+         * DrawFlags::ForceNonInstanced is inert here (skinned draws never
+         * instance); DrawFlags::NoFog applies.
          */
         void draw_skinned(bracken::ModelHandle handle, const glm::mat4& transform, BonePaletteId palette,
-                          const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, bool no_fog = false,
+                          const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, DrawFlags flags = DrawFlags::None,
                           uint32_t motion_id = 0);
 
         /**
@@ -316,13 +320,14 @@ public:
     // ---- Single-threaded conveniences: forward to lane(0) ----
 
     void draw_model(bracken::ModelHandle handle, const glm::mat4& transform,
-                    const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, bool force_non_instanced = false,
-                    bool no_fog = false, uint32_t motion_id = 0) {
-        lane(0).draw_model(handle, transform, tint, force_non_instanced, no_fog, motion_id);
+                    const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, DrawFlags flags = DrawFlags::None,
+                    uint32_t motion_id = 0) {
+        lane(0).draw_model(handle, transform, tint, flags, motion_id);
     }
     void draw_skinned(bracken::ModelHandle handle, const glm::mat4& transform, BonePaletteId palette,
-                      const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, bool no_fog = false, uint32_t motion_id = 0) {
-        lane(0).draw_skinned(handle, transform, palette, tint, no_fog, motion_id);
+                      const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f}, DrawFlags flags = DrawFlags::None,
+                      uint32_t motion_id = 0) {
+        lane(0).draw_skinned(handle, transform, palette, tint, flags, motion_id);
     }
     [[nodiscard]] BonePaletteAllocation alloc_bone_palette(uint32_t joint_count) {
         return lane(0).alloc_bone_palette(joint_count);

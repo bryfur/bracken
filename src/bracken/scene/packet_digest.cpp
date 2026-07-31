@@ -81,8 +81,12 @@ uint64_t packet_digest(const FramePacket& packet) {
         hash_u32(h, c.motion_id);
         hash_mat4(h, c.transform);
         hash_vec4(h, c.tint);
-        hash_u32(h, c.force_non_instanced ? 1u : 0u);
-        hash_u32(h, c.no_fog ? 1u : 0u);
+        // Bit by named bit, not the packed word: DrawFlags replaced two bools
+        // whose 0/1 words are what the pre-flags baseline digest was taken
+        // over, and a re-encoding of the same frame must not move the gate.
+        // A NEW flag is therefore invisible here until it is added below.
+        hash_u32(h, has(c.flags, DrawFlags::ForceNonInstanced) ? 1u : 0u);
+        hash_u32(h, has(c.flags, DrawFlags::NoFog) ? 1u : 0u);
     }
 
     hash_u32(h, static_cast<uint32_t>(packet.skinned_commands().size()));
@@ -92,7 +96,7 @@ uint64_t packet_digest(const FramePacket& packet) {
         hash_mat4(h, c.transform);
         hash_vec4(h, c.tint);
         hash_u32(h, c.palette.value);
-        hash_u32(h, c.no_fog ? 1u : 0u);
+        hash_u32(h, has(c.flags, DrawFlags::NoFog) ? 1u : 0u);
     }
 
     // Palette CONTENTS, not the arena addresses they live at: the pointer is

@@ -2601,9 +2601,8 @@ struct ModelDrawCommand {
     bracken::ModelHandle model_handle;   // 0 = invalid
     uint32_t motion_id = 0;              // nonzero = moving object, pairs N with N-1 in MotionHistory
     glm::mat4 transform;
-    glm::vec4 tint = {1,1,1,1};
-    bool force_non_instanced = false;    // opt out of instanced batching
-    bool no_fog = false;                 // disable distance fog for this draw
+    glm::vec4 tint = {1,1,1,1};          // LINEAR RGBA multiplier, not a packed core::Color
+    DrawFlags flags = DrawFlags::None;   // ForceNonInstanced | NoFog (scene/draw_flags.hpp)
 };                                       // NOTE: field order differs from the retired ModelCommand
 
 struct SkinnedDrawCommand {
@@ -2612,7 +2611,7 @@ struct SkinnedDrawCommand {
     glm::mat4 transform;
     glm::vec4 tint = {1,1,1,1};
     BonePaletteId palette;               // packet palette — replaces the old non-owning bone span
-    bool no_fog = false;
+    DrawFlags flags = DrawFlags::None;   // NoFog applies; ForceNonInstanced is inert (never instanced)
 };
 
 struct BonePalette {                     // one packed palette of a sealed frame
@@ -2646,8 +2645,8 @@ Emission is multi-lane: `Lane& lane(uint32_t i)` returns one writer's private st
 
 `Lane` emit API (mirrors the retired `RenderScene` one-for-one; colors packed ARGB):
 
-- `draw_model(handle, transform, tint = {1,1,1,1}, force_non_instanced = false, no_fog = false, motion_id = 0)`
-- `draw_skinned(handle, transform, BonePaletteId palette, tint = {1,1,1,1}, no_fog = false, motion_id = 0)` — an invalid id drops the draw with a warning.
+- `draw_model(handle, transform, tint = {1,1,1,1}, DrawFlags flags = DrawFlags::None, motion_id = 0)`
+- `draw_skinned(handle, transform, BonePaletteId palette, tint = {1,1,1,1}, DrawFlags flags = DrawFlags::None, motion_id = 0)` — an invalid id drops the draw with a warning.
 - `[[nodiscard]] alloc_bone_palette(joint_count /* 1..=animation::MAX_BONES */)` → `BonePaletteAllocation { std::span<glm::mat4> matrices; BonePaletteId id; bool valid(); }` — 16-byte-aligned **uninitialized** packet memory; the host writes every matrix before seal. Budget `FramePacket::MAX_BONE_PALETTES = 1024` per frame; over-budget allocations log an error and return an invalid allocation (empty span) — the visible build-time failure replacing the old render-time silent drop. One palette may be shared by many draws, across lanes (allocation must happen-before use) — reusing the id replaces the renderer's old pointer-dedupe of shared palettes.
 - `add_point_light(const PointLight&)` / `add_spot_light(const SpotLight&)` (`PointLight` = position/radius/color/intensity + `casts_shadows` opt-in; `SpotLight` adds direction + `inner_cos`/`outer_cos`; both carry an engine-written `shadow_slot` hosts must leave alone; `src/bracken/contracts/light.hpp`).
 - `add_billboard_3d(wx, wy, wz, width, fill_ratio, fill_color, bg_color, frame_color)`
@@ -2751,7 +2750,7 @@ Preconditions: main thread (`BRACKEN_ASSERT_MAIN_THREAD()`); `frame` is a sealed
 
 #### render_3d_scene — in-pass draw order
 
-Within the main/offscreen pass (every scene draw also binds the frame's screen-AO texture and the 3-slot sky-IBL chain — real maps or typed dummies): (1) terrain (if `should_draw_ground()`; shadow atlas bound twice — compare sampler for hardware PCF + raw sampler for PCSS blocker search); (2) grass (if flag + `gfx.grass_enabled`); (3) instanced static models; (4) non-instanced static models (`force_non_instanced` survivors); (5) skinned models (resolved list; per-draw XZ distance + sphere frustum cull; pipeline/shadow/palette SSBO bound once lazily before the first visible draw); (6) skybox (if flag + `gfx.skybox_enabled`) — drawn after opaques so only unwritten pixels shade; (7) sorted transparent models; (8) particle effects (additive HDR, depth-test on / write off); (9) debug lines. `transparent_draws_` is cleared at entry to drop stale entries from an aborted pass.
+Within the main/offscreen pass (every scene draw also binds the frame's screen-AO texture and the 3-slot sky-IBL chain — real maps or typed dummies): (1) terrain (if `should_draw_ground()`; shadow atlas bound twice — compare sampler for hardware PCF + raw sampler for PCSS blocker search); (2) grass (if flag + `gfx.grass_enabled`); (3) instanced static models; (4) non-instanced static models (`DrawFlags::ForceNonInstanced` survivors); (5) skinned models (resolved list; per-draw XZ distance + sphere frustum cull; pipeline/shadow/palette SSBO bound once lazily before the first visible draw); (6) skybox (if flag + `gfx.skybox_enabled`) — drawn after opaques so only unwritten pixels shade; (7) sorted transparent models; (8) particle effects (additive HDR, depth-test on / write off); (9) debug lines. `transparent_draws_` is cleared at entry to drop stale entries from an aborted pass.
 
 #### Instanced batching (static models)
 
@@ -2760,7 +2759,7 @@ Within the main/offscreen pass (every scene draw also binds the frame's screen-A
 1. XZ-plane distance cull: `dx² + dz² > frame_draw_dist_sq_` → `entities_distance_culled++`, skip (height ignored).
 2. Bounds resolve (only when frustum culling or shadows are active): `world_center = transform * model->bounding_center`, `world_radius = model->bounding_half_diag * max_scale_factor(transform)`. Unresolvable model ⇒ no bounds ⇒ no frustum cull (command passes through).
 3. Main-view sphere cull. A command that fails main-view culling **still bins into shadow cascades** whose light frustum intersects it (off-screen casters still cast).
-4. `force_non_instanced` survivors collect into `non_instanced_commands_` (drawn individually and shadow-rendered via the non-instanced shadow path).
+4. `DrawFlags::ForceNonInstanced` survivors collect into `non_instanced_commands_` (drawn individually and shadow-rendered via the non-instanced shadow path).
 5. Otherwise emit `gpu::InstanceData{model, normalMatrix (via compute_normal_matrix), tint, noFog, pad, prevModel}` into the per-handle bin (`prevModel` from `MotionHistory` via the command's `motion_id`, or `model` when static), and `gpu::ShadowInstanceData{model}` into each intersecting cascade's bin.
 
 Data structure: `instance_batches_` is a dense `std::vector<std::vector<InstanceData>>` indexed directly by `ModelHandle` (handles are dense indices into `ModelManager`'s slot array); `instance_batches_touched_` records first-touched handles so per-frame clearing is O(touched), capacity preserved. Shadow batches replicate this per cascade (`shadow_instance_batches_[4]`, `shadow_batches_touched_[4]`; `MAX_SHADOW_CASCADES = 4`, static-asserted equal to `render::CSM_MAX_CASCADES`).
@@ -5079,7 +5078,7 @@ Per-fragment algorithm, in order (`PSMain`):
 gpu::ModelLightingUniforms SceneRenderer::make_model_lighting(const CameraState& camera, bool fog_active) const;
 ```
 
-Populates from `EnvironmentState env_` (accessor `SceneRenderer::environment()`) and `GraphicsSettings`: `lightDir = env_.sun_dir`, `lightColor = env_.sun_color`, `ambientSky/ambientGround = env_.ambient_sky/ambient_ground`, `tintColor = vec4(1)`, fog fields from `env_.fog_color_horizon/fog_color_sun/fog_start/fog_end/fog_height_falloff`, `fogEnabled = fog_active`, `cameraPos = camera.position`, `ambientStrength = gfx.ambient_strength` (default 0.45), `sunIntensity = gfx.sun_intensity` (default 3.0). `frame_fog_active_` is latched once per frame from `gfx.fog_enabled`; per-draw `fog_active` is `!cmd.no_fog && frame_fog_active_` for static, skinned, and transparent draws, and global-with-per-instance-`noFog` for instanced.
+Populates from `EnvironmentState env_` (accessor `SceneRenderer::environment()`) and `GraphicsSettings`: `lightDir = env_.sun_dir`, `lightColor = env_.sun_color`, `ambientSky/ambientGround = env_.ambient_sky/ambient_ground`, `tintColor = vec4(1)`, fog fields from `env_.fog_color_horizon/fog_color_sun/fog_start/fog_end/fog_height_falloff`, `fogEnabled = fog_active`, `cameraPos = camera.position`, `ambientStrength = gfx.ambient_strength` (default 0.45), `sunIntensity = gfx.sun_intensity` (default 3.0). `frame_fog_active_` is latched once per frame from `gfx.fog_enabled`; per-draw `fog_active` is `!has(cmd.flags, DrawFlags::NoFog) && frame_fog_active_` for static, skinned, and transparent draws, and global-with-per-instance-`noFog` for instanced.
 
 #### apply_mesh_material — per-mesh material fields
 
@@ -5162,7 +5161,7 @@ Identical to `ModelLightingUniforms` minus the `tintColor` vec4 (tint is per-ins
 
 #### gpu::InstanceData (vertex set 0 binding 0 SSBO)
 
-`model` mat4 (0), `normalMatrix` mat4 (64), `tint` vec4 (128), `noFog` float (144) + 3 pad floats, `prevModel` mat4 (160) = 224-byte stride, matching the HLSL `InstanceData` struct field-for-field (shared by the forward and depth-prepass instanced shaders). Populated in `build_instance_batches` (`normalMatrix = compute_normal_matrix(cmd.transform)`, `tint = cmd.tint`, `noFog = cmd.no_fog ? 1 : 0`).
+`model` mat4 (0), `normalMatrix` mat4 (64), `tint` vec4 (128), `noFog` float (144) + 3 pad floats, `prevModel` mat4 (160) = 224-byte stride, matching the HLSL `InstanceData` struct field-for-field (shared by the forward and depth-prepass instanced shaders). Populated in `build_instance_batches` (`normalMatrix = compute_normal_matrix(cmd.transform)`, `tint = cmd.tint`, `noFog = has(cmd.flags, DrawFlags::NoFog) ? 1 : 0`).
 
 ### Threading, lifetime, and error handling
 
@@ -5612,7 +5611,7 @@ shaders (not a pass). Helpers:
 
 CPU plumbing: `gpu::ModelLightingUniforms` carries `fogColor`, `fogSunColor`,
 `fogStart`, `fogEnd`, `fogHeightFalloff`, `fogEnabled` (int). Per-draw
-disable: `ModelDrawCommand::no_fog`; global: `GraphicsSettings::fog_enabled`
+disable: `DrawFlags::NoFog`; global: `GraphicsSettings::fog_enabled`
 (cached per frame as `SceneRenderer::frame_fog_active_`).
 
 ### VolumetricFog
@@ -7100,7 +7099,7 @@ All: `resolution = 40`, `scale = 1.0`. Passing `seed == 0` selects the preset's 
 ### Renderer integration contract
 
 - **Registration:** `ModelManager::register_model(name, std::unique_ptr<Model>)` (`src/bracken/model_loader.hpp/.cpp`) takes ownership, calls `ModelLoader::upload_to_gpu` when a device is set (static vertex/index `GPUBuffer`s; `texture_pixels` → `RGBA8_SRGB` texture with mipmaps), then **frees CPU-side vertices/indices/texture pixels** (`cached_index_count` preserves the draw count). `model_paths_` gets an empty entry, so `reload_model` returns `false` and hot-reload never touches procedural models.
-- **Submission:** `FrameBuilder::draw_model(handle, transform, tint, force_non_instanced, no_fog, motion_id)` (`src/bracken/scene/frame_builder.hpp`). `SceneRenderer::build_instance_batches` bins static commands per `ModelHandle`, frustum-culls with `Model::bounding_center/half_diag`, and produces per-cascade shadow instance batches; rendering is one `SDL_DrawGPUIndexedPrimitives(..., instance_count, ...)` per mesh per model type via the `model_instanced` pipelines.
+- **Submission:** `FrameBuilder::draw_model(handle, transform, tint, flags, motion_id)` (`src/bracken/scene/frame_builder.hpp`). `SceneRenderer::build_instance_batches` bins static commands per `ModelHandle`, frustum-culls with `Model::bounding_center/half_diag`, and produces per-cascade shadow instance batches; rendering is one `SDL_DrawGPUIndexedPrimitives(..., instance_count, ...)` per mesh per model type via the `model_instanced` pipelines.
 - **Mesh flag consumption** (`src/bracken/scene/scene_renderer.cpp`): `shadow_only` meshes are skipped in every main-pass path (non-instanced ~line 1169, instanced ~1626, skinned ~1810); `cast_shadows == false` meshes are skipped in every shadow path (~1735, ~2215, ~2283). This is exactly the tree's leaf/proxy split.
 - **Material handling:** generated meshes use a default-constructed `PBRMaterial` (`metallic_factor = 0`, `roughness_factor = 0.85`, `alpha_mode = Opaque`, `double_sided = false`). `apply_mesh_material` therefore sends `alphaCutoff = 0` (no discard in `model.frag.hlsl`/`model_instanced.frag.hlsl`) and the back-face-culling pipeline variant. The shadow passes independently alpha-test any mesh with a bound texture at a hardcoded 0.5 (`gpu::ShadowFragUniforms::hasTexture`, `shadow_depth.frag.hlsl`).
 - **Untextured color path:** shaders use `input.vertexColor * baseColorFactor * tintColor` when `hasTexture == 0`.

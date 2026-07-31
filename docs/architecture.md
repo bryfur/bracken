@@ -301,6 +301,12 @@ host-unique nonzero id lets the velocity prepass pair this frame's transform
 (and skinned palette) with last frame's via `scene::MotionHistory`; id 0 is
 treated as static (camera-only velocity).
 
+Per-draw options are `scene::DrawFlags` (`scene/draw_flags.hpp`) — a named
+`uint32_t` bit set (`None`, `ForceNonInstanced`, `NoFog`) with `|`, `&` and
+`has(set, flag)`, stored as one word in `ModelDrawCommand::flags` /
+`SkinnedDrawCommand::flags`. They replace two adjacent anonymous `bool`
+parameters that were silently transposable at every call site.
+
 **There are no host-lifetime contracts.** Everything crossing the boundary
 is by value or packet-allocated: bone palettes live in packet memory
 (`fb.alloc_bone_palette(joint_count)` returns a writable `span<glm::mat4>` +

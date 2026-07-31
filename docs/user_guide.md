@@ -2688,10 +2688,10 @@ Every packet starts each frame with all three flags `true` (a freshly retired pa
 ```cpp
 fb.draw_model(handle, transform);                          // ModelHandle from ModelManager
 fb.draw_model(handle, transform, /*tint=*/{1,0.5f,0.5f,1},
-              /*force_non_instanced=*/false, /*no_fog=*/false, /*motion_id=*/0);
+              scene::DrawFlags::ForceNonInstanced | scene::DrawFlags::NoFog, /*motion_id=*/0);
 ```
 
-Handles are resolved once at load/spawn time (`models().load_model(...)` / `models().register_model(...)`); commands are handle-only so the per-frame path does zero string work. All commands for the same `ModelHandle` are automatically batched into one instanced draw per mesh. `force_non_instanced = true` opts a command out of instancing (it renders through the individual-draw path — use for one-offs that need it). `no_fog = true` disables distance fog for that command. `tint` multiplies the material's base color. A nonzero `motion_id` (host-unique per moving object) lets the velocity prepass pair this frame's transform with last frame's for correct motion vectors; 0 means static.
+Handles are resolved once at load/spawn time (`models().load_model(...)` / `models().register_model(...)`); commands are handle-only so the per-frame path does zero string work. All commands for the same `ModelHandle` are automatically batched into one instanced draw per mesh. `DrawFlags::ForceNonInstanced` opts a command out of instancing (it renders through the individual-draw path — use for one-offs that need it). `DrawFlags::NoFog` disables distance fog for that command. The two used to be adjacent anonymous `bool`s; swapping them compiled silently and changed the image. `tint` multiplies the material's base color and is a **linear** RGBA value, not a packed `core::Color`. A nonzero `motion_id` (host-unique per moving object) lets the velocity prepass pair this frame's transform with last frame's for correct motion vectors; 0 means static.
 
 #### Skinned models and packet bone palettes
 
@@ -4438,17 +4438,17 @@ The relevant signatures (`src/bracken/scene/frame_builder.hpp`):
 ```cpp
 void draw_model(bracken::ModelHandle handle, const glm::mat4& transform,
                 const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f},
-                bool force_non_instanced = false, bool no_fog = false,
+                DrawFlags flags = DrawFlags::None,
                 uint32_t motion_id = 0);
 
 void draw_skinned(bracken::ModelHandle handle, const glm::mat4& transform,
                   BonePaletteId palette,
                   const glm::vec4& tint = {1.0f, 1.0f, 1.0f, 1.0f},
-                  bool no_fog = false, uint32_t motion_id = 0);
+                  DrawFlags flags = DrawFlags::None, uint32_t motion_id = 0);
 ```
 
 - **`tint`** multiplies the resolved base color (texture path *and* vertex-color path), including alpha. It is a linear-space multiplier. For instanced draws the tint rides per-instance in the instance storage buffer, so instances of one model can be tinted individually at no extra draw cost.
-- **`no_fog`** exempts the draw from atmospheric fog (per-instance for instanced draws) — available on both `draw_model` and `draw_skinned` (`ModelDrawCommand::no_fog` / `SkinnedDrawCommand::no_fog`).
+- **`flags`** is `scene::DrawFlags` (`src/bracken/scene/draw_flags.hpp`), a named bit set with `|`, `&` and `has(set, flag)`: `DrawFlags::NoFog` exempts the draw from atmospheric fog (per-instance for instanced draws), `DrawFlags::ForceNonInstanced` keeps the command off the instanced path (inert on `draw_skinned`, which never instances). It is stored as one `uint32_t` in `ModelDrawCommand::flags` / `SkinnedDrawCommand::flags`.
 - **`palette`** comes from `fb.alloc_bone_palette(joint_count)` — packet-owned memory you fill with skinning matrices before `seal()`; no host storage is referenced after the emit (see the Scene and Animation chapters).
 - The palette budget is `MAX_BONE_PALETTES = 1024` per frame (`src/bracken/scene/frame_packet.hpp`), **enforced at allocation** (error log + invalid id; invalid-id draws are dropped with a warning).
 
@@ -4803,8 +4803,8 @@ horizon at every sun elevation.
 Controls:
 
 - **Global toggle**: `GraphicsSettings::fog_enabled` (default `true`).
-- **Per-draw opt-out**: `ModelDrawCommand::no_fog` /
-  `FrameBuilder::draw_model(...)`'s no-fog path — useful for UI-ish 3D elements.
+- **Per-draw opt-out**: `scene::DrawFlags::NoFog` on `FrameBuilder::draw_model` /
+  `draw_skinned` (stored as `ModelDrawCommand::flags`) — useful for UI-ish 3D elements.
 - Everything else via `EnvironmentState` fields above.
 
 Distance fog is not a pass; it costs nothing extra to leave on.

@@ -123,12 +123,13 @@ TEST(FrameBuilder, EmitsEveryCommandTypeWithExactValues) {
     FramePacket p;
     FrameBuilder fb(p);
 
-    fb.draw_model(42, translation(1, 2, 3), {0.5f, 0.6f, 0.7f, 0.8f}, true, true, 77);
+    fb.draw_model(42, translation(1, 2, 3), {0.5f, 0.6f, 0.7f, 0.8f},
+                  DrawFlags::ForceNonInstanced | DrawFlags::NoFog, 77);
     auto pal = fb.alloc_bone_palette(2);
     ASSERT_TRUE(pal.valid());
     pal.matrices[0] = glm::mat4(2.0f);
     pal.matrices[1] = glm::mat4(3.0f);
-    fb.draw_skinned(43, translation(4, 5, 6), pal.id, {0.1f, 0.2f, 0.3f, 0.4f}, true, 78);
+    fb.draw_skinned(43, translation(4, 5, 6), pal.id, {0.1f, 0.2f, 0.3f, 0.4f}, DrawFlags::NoFog, 78);
     fb.add_point_light(PointLight{{1, 2, 3}, 320.0f, {1.0f, 0.7f, 0.3f}, 12000.0f, true});
     fb.add_spot_light(SpotLight{{4, 5, 6}, 1400.0f, {0, -1, 0}, 0.95f, {1, 1, 1}, 0.9f, 5000.0f, false});
     fb.add_billboard_3d(7, 8, 9, 46.0f, 0.5f, 0xFFFFC040, 0x60000000, 0xFFFFD080);
@@ -141,8 +142,8 @@ TEST(FrameBuilder, EmitsEveryCommandTypeWithExactValues) {
     EXPECT_EQ(mc.model_handle, 42u);
     EXPECT_EQ(mc.transform, translation(1, 2, 3));
     EXPECT_EQ(mc.tint, glm::vec4(0.5f, 0.6f, 0.7f, 0.8f));
-    EXPECT_TRUE(mc.force_non_instanced);
-    EXPECT_TRUE(mc.no_fog);
+    EXPECT_TRUE(has(mc.flags, DrawFlags::ForceNonInstanced));
+    EXPECT_TRUE(has(mc.flags, DrawFlags::NoFog));
     EXPECT_EQ(mc.motion_id, 77u);
 
     ASSERT_EQ(p.skinned_commands().size(), 1u);
@@ -150,7 +151,7 @@ TEST(FrameBuilder, EmitsEveryCommandTypeWithExactValues) {
     EXPECT_EQ(sc.model_handle, 43u);
     EXPECT_EQ(sc.transform, translation(4, 5, 6));
     EXPECT_EQ(sc.tint, glm::vec4(0.1f, 0.2f, 0.3f, 0.4f));
-    EXPECT_TRUE(sc.no_fog);
+    EXPECT_TRUE(has(sc.flags, DrawFlags::NoFog));
     EXPECT_EQ(sc.motion_id, 78u);
     ASSERT_TRUE(sc.palette.valid());
     EXPECT_EQ(sc.palette.value, 0u); // first (only) merged palette
@@ -243,7 +244,7 @@ TEST(FrameBuilder, ChunkSpillPreservesOrderAndCount) {
     FramePacket p;
     FrameBuilder fb(p);
     for (uint32_t i = 0; i < N; ++i) {
-        fb.draw_model(i + 1, translation(float(i), 0, 0), {1, 1, 1, 1}, false, false, i);
+        fb.draw_model(i + 1, translation(float(i), 0, 0), {1, 1, 1, 1}, DrawFlags::None, i);
     }
     fb.seal();
     ASSERT_EQ(p.model_commands().size(), N);
@@ -447,7 +448,7 @@ void build_deterministic_frame(bracken::core::jobs::JobSystem& js, FramePacket& 
             FrameBuilder::Lane& lane = fb.lane(i);
             for (uint32_t j = 0; j < k_det_per_lane; ++j) {
                 const uint32_t tag = i * 100000 + j;
-                lane.draw_model(i * 1000 + j + 1, glm::mat4(float(j + 1)), {1, 1, 1, 1}, false, false, tag);
+                lane.draw_model(i * 1000 + j + 1, glm::mat4(float(j + 1)), {1, 1, 1, 1}, DrawFlags::None, tag);
                 lane.add_debug_line({float(i), 0, 0}, {0, float(j), 0}, tag);
                 if (j % k_det_palette_stride == 0) {
                     auto pal = lane.alloc_bone_palette(4);
@@ -455,7 +456,7 @@ void build_deterministic_frame(bracken::core::jobs::JobSystem& js, FramePacket& 
                         for (uint32_t m = 0; m < 4; ++m) {
                             pal.matrices[m] = glm::mat4(float(i + j + m));
                         }
-                        lane.draw_skinned(i + 1, glm::mat4(float(j + 1)), pal.id, {1, 1, 1, 1}, false, tag);
+                        lane.draw_skinned(i + 1, glm::mat4(float(j + 1)), pal.id, {1, 1, 1, 1}, DrawFlags::None, tag);
                     }
                 }
             }

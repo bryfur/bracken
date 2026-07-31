@@ -223,10 +223,10 @@ void GoldenWorld::build_packet() {
     fb.draw_model(H_UNKNOWN, at(0.0f, 0.0f, -50.0f), tint_for(CMD_UNKNOWN));
     fb.draw_model(H_CUBE, at(0.0f, 0.0f, -300.0f), tint_for(CMD_TOO_FAR));
     fb.draw_model(H_CUBE, at(0.0f, 0.0f, 50.0f), tint_for(CMD_BEHIND));
-    fb.draw_model(H_CUBE, at(5.0f, 0.0f, -50.0f), tint_for(CMD_NON_INSTANCED), /*force_non_instanced=*/true);
+    fb.draw_model(H_CUBE, at(5.0f, 0.0f, -50.0f), tint_for(CMD_NON_INSTANCED), DrawFlags::ForceNonInstanced);
     fb.draw_model(H_SLAB, at(-10.0f, 0.0f, -50.0f), tint_for(CMD_SLAB_LEFT));
-    fb.draw_model(H_CUBE, at(2.0f, 0.0f, -50.0f), tint_for(CMD_CUBE_MOVING), false, false, MOTION_STATIC_MODEL);
-    fb.draw_model(H_CUBE, at(3.0f, 0.0f, -50.0f), tint_for(CMD_CUBE_NO_FOG), false, /*no_fog=*/true);
+    fb.draw_model(H_CUBE, at(2.0f, 0.0f, -50.0f), tint_for(CMD_CUBE_MOVING), DrawFlags::None, MOTION_STATIC_MODEL);
+    fb.draw_model(H_CUBE, at(3.0f, 0.0f, -50.0f), tint_for(CMD_CUBE_NO_FOG), DrawFlags::NoFog);
     fb.draw_model(H_CUBE, at(0.0f, 900.0f, -50.0f), tint_for(CMD_HIGH_ABOVE));
 
     // Palettes: three allocations, prefix-summed offsets 0 / 3 / 8. Every
@@ -246,7 +246,7 @@ void GoldenWorld::build_packet() {
     fb.draw_skinned(H_CUBE, at(0.0f, 0.0f, -50.0f), palettes[1]);            // 1: no skeleton -> dropped
     fb.draw_skinned(H_UNKNOWN, at(0.0f, 0.0f, -50.0f), palettes[1]);         // 2: no model    -> dropped
     fb.draw_skinned(H_SKINNED, at(0.0f, 0.0f, -300.0f), palettes[1]);        // 3: distance-culled
-    fb.draw_skinned(H_SKINNED, at(0.0f, 900.0f, -50.0f), palettes[2], glm::vec4(1.0f), false,
+    fb.draw_skinned(H_SKINNED, at(0.0f, 900.0f, -50.0f), palettes[2], glm::vec4(1.0f), DrawFlags::None,
                     MOTION_SKINNED);                                        // 4: frustum-culled, has history
 
     fb.seal();
@@ -364,7 +364,7 @@ TEST(ScenePrepGolden, MainViewBinMembershipAndOrder) {
     EXPECT_EQ(out.bins[H_SLAB][1].tint, tint_for(CMD_SLAB_LEFT));
     EXPECT_EQ(out.bins[H_UNKNOWN][0].tint, tint_for(CMD_UNKNOWN));
 
-    // force_non_instanced bypasses the bins entirely and keeps its command
+    // ForceNonInstanced bypasses the bins entirely and keeps its command
     // pointer (into the sealed packet) rather than being copied.
     ASSERT_EQ(out.non_instanced.size(), 1u);
     EXPECT_EQ(out.non_instanced[0], &world.packet.model_commands()[CMD_NON_INSTANCED]);
@@ -467,7 +467,7 @@ TEST(ScenePrepGolden, ShadowCascadeZeroCastRules) {
     EXPECT_EQ(out.shadow_bins[0][H_CUBE][3].model, at(3.0f, 0.0f, -50.0f));
 
     // Never a shadow instance: the distance-culled command, the
-    // force_non_instanced command (it draws through the per-draw shadow path),
+    // ForceNonInstanced command (it draws through the per-draw shadow path),
     // and the one placed outside the cascade volume.
     for (const gpu::ShadowInstanceData& inst : out.shadow_bins[0][H_CUBE]) {
         EXPECT_NE(inst.model, at(0.0f, 0.0f, -300.0f));
