@@ -2015,8 +2015,14 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
         const glm::vec3 right = glm::normalize(glm::cross(fwd, glm::vec3(0, 1, 0)));
         const glm::vec3 origin = player_pos_ + glm::vec3(0, 140, 0) + right * 160.0f - fwd * 40.0f;
         const glm::vec3 dir = glm::normalize(player_pos_ + glm::vec3(0, 40, 0) - origin);
-        fb.add_spot_light({origin, 1400.0f, dir, std::cos(glm::radians(18.0f)),
-                           {0.9f, 0.95f, 1.0f}, std::cos(glm::radians(32.0f)), 200000.0f, true});
+        fb.add_spot_light({.position = origin,
+                           .radius = 1400.0f,
+                           .direction = dir,
+                           .inner_angle = core::Degrees{18.0f},
+                           .outer_angle = core::Degrees{32.0f},
+                           .color = {0.9f, 0.95f, 1.0f},
+                           .intensity = 200000.0f,
+                           .casts_shadows = true});
     }
 
     for (const auto& pos : pending_pickup_bursts_) {

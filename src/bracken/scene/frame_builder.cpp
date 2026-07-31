@@ -353,14 +353,21 @@ FrameBuilder::BonePaletteAllocation FrameBuilder::Lane::alloc_bone_palette(uint3
     return {std::span<glm::mat4>(matrices, joint_count), id};
 }
 
-void FrameBuilder::Lane::add_point_light(const bracken::render::lighting::PointLight& light) {
+void FrameBuilder::Lane::add_point_light(const bracken::render::lighting::PointLightDesc& light) {
     assert_filling();
-    new (push_slot(point_lights_)) bracken::render::lighting::PointLight{light};
+    // Desc -> GPU POD. The engine owns _pad0/_pad1 and shadow_slot; a host
+    // never names them, which is the whole reason the descriptor exists.
+    new (push_slot(point_lights_)) bracken::render::lighting::PointLight{
+        light.position, light.radius, light.color, light.intensity, light.casts_shadows};
 }
 
-void FrameBuilder::Lane::add_spot_light(const bracken::render::lighting::SpotLight& light) {
+void FrameBuilder::Lane::add_spot_light(const bracken::render::lighting::SpotLightDesc& light) {
     assert_filling();
-    new (push_slot(spot_lights_)) bracken::render::lighting::SpotLight{light};
+    // The cone cosines are taken HERE — every host used to write
+    // std::cos(glm::radians(x)) itself, and the shader wants the cosine.
+    new (push_slot(spot_lights_)) bracken::render::lighting::SpotLight{
+        light.position,   light.radius,          light.direction, std::cos(light.inner_angle.radians()),
+        light.color,      std::cos(light.outer_angle.radians()),  light.intensity, light.casts_shadows};
 }
 
 void FrameBuilder::Lane::add_billboard_3d(float world_x, float world_y, float world_z, float width, float fill_ratio,

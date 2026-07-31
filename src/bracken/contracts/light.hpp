@@ -13,10 +13,61 @@
 // Namespace is unchanged (`bracken::render::lighting`): moving a file here is an
 // include-line rewrite, never a rename. See contracts/README.md.
 
+#include "bracken/core/angle.hpp"
+
 #include <cstdint>
 #include <glm/glm.hpp>
 
 namespace bracken::render::lighting {
+
+// ---------------------------------------------------------------------------
+// What a host hands the engine
+//
+// These are the types FrameBuilder::add_point_light / add_spot_light take. They
+// exist because the GPU-layout PODs below are NOT a host-facing API and never
+// were: they carry `_pad0`, `_pad1` and `shadow_slot`, all engine-written, and
+// hosts were aggregate-initializing straight across them positionally. Adding
+// a field to the GPU struct — or reordering two — silently changed the meaning
+// of every positional initializer in every game using the engine, with no
+// diagnostic anywhere.
+//
+// The descriptors carry only what a host actually decides, in a fixed order,
+// and spot cones are stated as ANGLES: the engine takes the cosine. That
+// deletes the `std::cos(glm::radians(18.0f))` every call site used to write
+// (and the class of bug where one of the two cones got the radians and the
+// other got the degrees).
+// ---------------------------------------------------------------------------
+
+struct PointLightDesc {
+    glm::vec3 position{0.0f};
+    float radius = 0.0f;
+    /// LINEAR RGB chromaticity, not a packed core::Color — lighting is
+    /// linear-space throughout and 8 bits per channel is not enough here.
+    glm::vec3 color{1.0f};
+    /// Radiometric: falls off with inverse square in world units.
+    float intensity = 0.0f;
+    /// Opt in to the per-frame local-shadow budget. The engine picks the
+    /// winners and writes the atlas slot; a host never sees one.
+    bool casts_shadows = false;
+};
+
+struct SpotLightDesc {
+    glm::vec3 position{0.0f};
+    float radius = 0.0f;
+    glm::vec3 direction{0.0f, -1.0f, 0.0f};
+    /// Cone half-angles from the axis; inner is the full-brightness core,
+    /// outer the cutoff. inner <= outer (an inverted pair is not rejected —
+    /// it simply produces no falloff band).
+    core::Degrees inner_angle{};
+    core::Degrees outer_angle{};
+    glm::vec3 color{1.0f};
+    float intensity = 0.0f;
+    bool casts_shadows = false;
+};
+
+// ---------------------------------------------------------------------------
+// What the GPU reads back
+// ---------------------------------------------------------------------------
 
 // Std140-compatible POD layouts mirrored exactly in clusters.hlsli.
 // Sizes are static_asserted in light_cluster.cpp.

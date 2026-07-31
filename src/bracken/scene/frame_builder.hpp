@@ -165,8 +165,8 @@ public:
          *  converts implicitly from one, so hex literals still read as
          *  colors — the type is there to say which of the engine's three
          *  color conventions this parameter uses. */
-        void add_point_light(const bracken::render::lighting::PointLight& light);
-        void add_spot_light(const bracken::render::lighting::SpotLight& light);
+        void add_point_light(const bracken::render::lighting::PointLightDesc& light);
+        void add_spot_light(const bracken::render::lighting::SpotLightDesc& light);
         void add_billboard_3d(float world_x, float world_y, float world_z, float width, float fill_ratio,
                               bracken::core::Color fill_color, bracken::core::Color bg_color,
                               bracken::core::Color frame_color);
@@ -339,8 +339,8 @@ public:
     [[nodiscard]] BonePaletteAllocation alloc_bone_palette(uint32_t joint_count) {
         return lane(0).alloc_bone_palette(joint_count);
     }
-    void add_point_light(const bracken::render::lighting::PointLight& light) { lane(0).add_point_light(light); }
-    void add_spot_light(const bracken::render::lighting::SpotLight& light) { lane(0).add_spot_light(light); }
+    void add_point_light(const bracken::render::lighting::PointLightDesc& light) { lane(0).add_point_light(light); }
+    void add_spot_light(const bracken::render::lighting::SpotLightDesc& light) { lane(0).add_spot_light(light); }
     void add_billboard_3d(float world_x, float world_y, float world_z, float width, float fill_ratio,
                           bracken::core::Color fill_color, bracken::core::Color bg_color,
                           bracken::core::Color frame_color) {

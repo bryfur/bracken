@@ -301,6 +301,14 @@ host-unique nonzero id lets the velocity prepass pair this frame's transform
 (and skinned palette) with last frame's via `scene::MotionHistory`; id 0 is
 treated as static (camera-only velocity).
 
+Lights are submitted as **host descriptors**, not as the GPU-layout PODs:
+`add_point_light` takes `render::lighting::PointLightDesc`, `add_spot_light`
+takes `SpotLightDesc` (both in `contracts/light.hpp`), and the builder
+converts. The PODs carry `_pad0`, `_pad1` and the engine-written
+`shadow_slot`, which hosts were aggregate-initializing positionally straight
+across; the descriptors carry only what a host decides, and spot cones are
+`core::Degrees` half-angles with the cosine taken inside the builder.
+
 Per-draw options are `scene::DrawFlags` (`scene/draw_flags.hpp`) — a named
 `uint32_t` bit set (`None`, `ForceNonInstanced`, `NoFog`) with `|`, `&` and
 `has(set, flag)`, stored as one word in `ModelDrawCommand::flags` /

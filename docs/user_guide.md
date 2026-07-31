@@ -2718,13 +2718,17 @@ The palette lives **inside the packet**: `alloc_bone_palette(joint_count)` retur
 fb.add_point_light({pos, /*radius=*/320.0f, /*color=*/{1.0f, 0.72f, 0.30f},
                     /*intensity=*/12000.0f, /*casts_shadows=*/true});
 
-fb.add_spot_light({origin, /*radius=*/1400.0f, dir,
-                   std::cos(glm::radians(18.0f)), {0.9f, 0.95f, 1.0f},
-                   std::cos(glm::radians(32.0f)), /*intensity=*/200000.0f,
-                   /*casts_shadows=*/true});
+fb.add_spot_light({.position      = origin,
+                   .radius        = 1400.0f,
+                   .direction     = dir,
+                   .inner_angle   = core::Degrees{18.0f},
+                   .outer_angle   = core::Degrees{32.0f},
+                   .color         = {0.9f, 0.95f, 1.0f},
+                   .intensity     = 200000.0f,
+                   .casts_shadows = true});
 ```
 
-Types are `render::lighting::PointLight` / `SpotLight` (`src/bracken/contracts/light.hpp`), copied by value into the packet; spot cone angles are passed as **cosines** (inner, outer). Intensity is radiometric — falloff is inverse-square in world units, so a light meant to read against the default sun (`sun_intensity` 3.0) needs `intensity ≈ 3 × distance²`. Lights feed the clustered-forward binning; the frame cap is `MAX_LIGHTS = 256` (point + spot combined).
+Types are `render::lighting::PointLightDesc` / `SpotLightDesc` (`src/bracken/contracts/light.hpp`). These are **host descriptors**, deliberately not the GPU-layout `PointLight`/`SpotLight` PODs they convert into: those carry `_pad0`, `_pad1` and the engine-written `shadow_slot`, and hosts used to aggregate-initialize positionally straight across them — so reordering a field in the GPU struct silently changed the meaning of every initializer in every game. A descriptor carries only what you decide. Spot cones are stated as **angles** (`core::Degrees`, half-angle from the axis); `add_spot_light` takes the cosine, so the `std::cos(glm::radians(...))` every call site used to write is gone. Intensity is radiometric — falloff is inverse-square in world units, so a light meant to read against the default sun (`sun_intensity` 3.0) needs `intensity ≈ 3 × distance²`. Lights feed the clustered-forward binning; the frame cap is `MAX_LIGHTS = 256` (point + spot combined).
 
 **Local light shadows** (`casts_shadows = true`): opt a light into the per-frame shadow budget (`GraphicsSettings::local_shadow_point_budget`/`_spot_budget`, defaults 4 + 2). Each frame the engine picks the highest-priority casters (score = intensity × radius / camera distance, with eviction hysteresis so lights don't pop at the boundary) and renders them into a shared D32 atlas — 6 perspective cube-face tiles per point light, 1 per spot. Tiles are **cached**: they re-render only when the light moves/changes or a dynamic caster (skinned, or a model submitted with nonzero `motion_id`) enters the light radius, capped at 6 tiles/frame (round-robin) so many moving lights degrade to slightly stale shadows, never a hitch. Non-selected casters and lights whose tiles haven't rendered yet simply fall back to unshadowed. Casters are model + skinned commands (`mesh.cast_shadows` respected); terrain and grass never cast local shadows. **Gotcha**: emissive "bulb" geometry that encloses its own light (the playground's orbs) must set `mesh.cast_shadows = false`, or the shadow map — rendered from inside the bulb — occludes everything. Leave `shadow_slot` alone; the engine overwrites it every frame.
 
@@ -3979,15 +3983,15 @@ void MyGame::on_simulate(bracken::SimFrame& sim) {
     auto& fb = sim.frame();
     fb.set_camera(camera().get_camera_state());
 
-    // Point light: {position, radius, color, intensity, casts_shadows}
+    // PointLightDesc: {position, radius, color, intensity, casts_shadows}
     fb.add_point_light({orb_pos, 320.0f, {1.0f, 0.72f, 0.30f}, 12000.0f, true});
 
-    // Spot light: {position, radius, direction, inner_cos, color,
-    //              outer_cos, intensity, casts_shadows}
+    // SpotLightDesc: {position, radius, direction, inner_angle, outer_angle,
+    //                 color, intensity, casts_shadows} — angles, not cosines
     glm::vec3 dir = camera().get_forward();
     fb.add_spot_light({player_pos_ + glm::vec3(0, 150, 0), 1400.0f, dir,
-                       std::cos(glm::radians(18.0f)), {0.9f, 0.95f, 1.0f},
-                       std::cos(glm::radians(32.0f)), 200000.0f, true});
+                       core::Degrees{18.0f}, core::Degrees{32.0f},
+                       {0.9f, 0.95f, 1.0f}, 200000.0f, true});
 }
 ```
 

@@ -6,9 +6,11 @@
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <glm/trigonometric.hpp>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -16,8 +18,8 @@
 #include <vector>
 
 using namespace bracken::scene;
-using bracken::render::lighting::PointLight;
-using bracken::render::lighting::SpotLight;
+using bracken::render::lighting::PointLightDesc;
+using bracken::render::lighting::SpotLightDesc;
 
 namespace {
 
@@ -130,8 +132,15 @@ TEST(FrameBuilder, EmitsEveryCommandTypeWithExactValues) {
     pal.matrices[0] = glm::mat4(2.0f);
     pal.matrices[1] = glm::mat4(3.0f);
     fb.draw_skinned(43, translation(4, 5, 6), pal.id, {0.1f, 0.2f, 0.3f, 0.4f}, DrawFlags::NoFog, 78);
-    fb.add_point_light(PointLight{{1, 2, 3}, 320.0f, {1.0f, 0.7f, 0.3f}, 12000.0f, true});
-    fb.add_spot_light(SpotLight{{4, 5, 6}, 1400.0f, {0, -1, 0}, 0.95f, {1, 1, 1}, 0.9f, 5000.0f, false});
+    fb.add_point_light(PointLightDesc{{1, 2, 3}, 320.0f, {1.0f, 0.7f, 0.3f}, 12000.0f, true});
+    fb.add_spot_light(SpotLightDesc{{4, 5, 6},
+                                    1400.0f,
+                                    {0, -1, 0},
+                                    bracken::core::Degrees{18.0f},
+                                    bracken::core::Degrees{32.0f},
+                                    {1, 1, 1},
+                                    5000.0f,
+                                    false});
     fb.add_billboard_3d(7, 8, 9, 46.0f, 0.5f, 0xFFFFC040, 0x60000000, 0xFFFFD080);
     fb.add_debug_line({0, 0, 0}, {1, 1, 1}, 0xFF30FF60);
     fb.spawn_effect(&effect_def, {10, 11, 12}, {0, 1, 0});
@@ -169,7 +178,15 @@ TEST(FrameBuilder, EmitsEveryCommandTypeWithExactValues) {
     EXPECT_EQ(p.point_lights()[0].radius, 320.0f);
     EXPECT_TRUE(p.point_lights()[0].casts_shadows);
     ASSERT_EQ(p.spot_lights().size(), 1u);
-    EXPECT_EQ(p.spot_lights()[0].inner_cos, 0.95f);
+    // The descriptor states ANGLES; the builder is what takes the cosine, and
+    // it must take it exactly the way every host used to write it by hand.
+    EXPECT_EQ(p.spot_lights()[0].inner_cos, std::cos(glm::radians(18.0f)));
+    EXPECT_EQ(p.spot_lights()[0].outer_cos, std::cos(glm::radians(32.0f)));
+    EXPECT_EQ(p.spot_lights()[0].intensity, 5000.0f);
+    EXPECT_FALSE(p.spot_lights()[0].casts_shadows);
+    // Engine-written fields the descriptor deliberately does not expose.
+    EXPECT_EQ(p.spot_lights()[0].shadow_slot, -1);
+    EXPECT_EQ(p.point_lights()[0].shadow_slot, -1);
 
     ASSERT_EQ(p.billboards().size(), 1u);
     EXPECT_EQ(p.billboards()[0].width, 46.0f);

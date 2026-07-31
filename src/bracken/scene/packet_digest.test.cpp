@@ -20,7 +20,7 @@ void fill_reference_frame(FrameBuilder& fb) {
     fb.draw_model(1, glm::translate(glm::mat4(1.0f), glm::vec3(1.0f, 2.0f, 3.0f)));
     fb.draw_model(2, glm::scale(glm::mat4(1.0f), glm::vec3(2.0f)));
 
-    bracken::render::lighting::PointLight light{};
+    bracken::render::lighting::PointLightDesc light{};
     light.position = {10.0f, 5.0f, -2.0f};
     light.radius = 25.0f;
     light.color = {1.0f, 0.5f, 0.25f};
@@ -141,14 +141,14 @@ TEST(PacketDigest, DetectsAddedSkinnedDrawFlag) {
 TEST(PacketDigest, DetectsChangedLightIntensity) {
     FramePacket a;
     FrameBuilder fa(a);
-    bracken::render::lighting::PointLight la{};
+    bracken::render::lighting::PointLightDesc la{};
     la.intensity = 1.0f;
     fa.add_point_light(la);
     fa.seal();
 
     FramePacket b;
     FrameBuilder fb(b);
-    bracken::render::lighting::PointLight lb{};
+    bracken::render::lighting::PointLightDesc lb{};
     lb.intensity = 1.5f;
     fb.add_point_light(lb);
     fb.seal();
