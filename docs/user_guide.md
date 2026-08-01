@@ -193,18 +193,13 @@ The engine's root `CMakeLists.txt` sets `BUILD_SHARED_LIBS OFF` as a plain (non-
 
 There is **no `on_update`/`on_render`**: you don't render — you *describe* a frame through `sim.frame()`'s `FrameBuilder` and the engine draws it. `on_simulate` **runs as a job on the engine's worker pool, overlapped with the previous frame's rendering** — write it as straight-line single-threaded code; the engine handles the packet ring, timing, sealing, and rendering around it.
 
-**Important:** `Application` never calls `on_init`/`on_shutdown` itself — `run()` only drives `on_simulate`/`on_main_frame`/`on_event`. Your `main()` drives the full boot sequence, and since the hooks are `protected`, the playground exposes tiny public wrappers. Minimal skeleton, adapted from `examples/playground/`:
+**Important:** `run()` drives only `on_simulate`/`on_main_frame`/`on_event`. Your `main()` drives the boot sequence, through `Application`'s public `start()`/`stop()` — they call the protected `on_init`/`on_shutdown` hooks for you (`stop()` is a no-op when `start()` failed, so the bail-out path below is safe). Minimal skeleton, adapted from `examples/playground/`:
 
 ```cpp
 #include "bracken/application.hpp"   // includes sim_frame.hpp (SimFrame/MainFrame)
 #include "bracken/systems/camera_controller.hpp"
 
 class MyGame : public bracken::Application {
-public:
-    // Public wrappers so main() can drive the protected lifecycle hooks.
-    bool start() { return on_init(); }
-    void stop() { on_shutdown(); }
-
 protected:
     bool on_init() override {
         // window w/h, title, then world_width/world_height (default 32000 x 32000)
@@ -372,7 +367,7 @@ The hooks:
 | `on_shutdown()` | no | **you** call it, after `run()` returns; main thread | Call `shutdown_renderer()` here. |
 | `on_event(const SDL_Event&)` | no | per SDL event, during the pump (main thread, no sim in flight), before `InputHandler` sees it | Return `true` to consume the event. Touching host state here is safe. |
 
-**Gotcha — `on_init`/`on_shutdown` are not called automatically.** `Application::run()` calls only `on_simulate`/`on_main_frame`/`on_event`. The canonical boot sequence (from `examples/playground/main.cpp`) drives the rest explicitly:
+**`run()` is the frame loop, not the lifecycle.** It calls only `on_simulate`/`on_main_frame`/`on_event`; `start()`/`stop()` drive `on_init`/`on_shutdown`. The canonical boot sequence (from `examples/playground/main.cpp`):
 
 ```cpp
 // adapted from examples/playground/main.cpp
@@ -561,7 +556,7 @@ Format and parser facts you can rely on (all covered by `src/bracken/contracts/g
 
 `Application` owns one `bracken::InputHandler` (`src/bracken/input_handler.hpp`), reachable via the protected `input()` accessor. It is deliberately **raw**: mouse, keyboard, controller, and camera-relative movement axes only. Game actions (attack, sprint, skills, panel toggles) belong in a client-side bindings layer, not the engine.
 
-**How you read it in the pipelined loop:** the live handler is main-thread tier (`on_event`/`on_main_frame`/init only). Your frame code reads **`sim.input()`** — a by-value `bracken::InputSnapshot` taken at the frame's kick. The snapshot mirrors the handler's getters as **public fields** (the port from the old getter API is mostly "delete the parens": `in.move_forward()` → `in.move_forward`, `in.get_camera_yaw()` → `in.camera_yaw`, `in.mouse_left_pressed()` → `in.mouse_left_pressed`), embeds the derived `InputState` as `in.state`, and keeps one function: `in.was_key_just_pressed(scancode)`.
+**How you read it in the pipelined loop:** the live handler is main-thread tier (`on_event`/`on_main_frame`/init only). Your frame code reads **`sim.input()`** — a by-value `bracken::InputSnapshot` taken at the frame's kick. The snapshot mirrors the handler's getters as **public fields** (the port from the old getter API is mostly "delete the parens": `in.move_forward()` → `in.move_forward`, `in.get_camera_yaw()` → `in.camera_yaw`, `in.mouse_left_pressed()` → `in.mouse_left_pressed`), embeds the derived `InputState` as `in.state`, and keeps two functions: `in.was_key_just_pressed(scancode)` and `in.key_held(scancode)`.
 
 #### One-shot key presses
 
@@ -575,7 +570,13 @@ if (in.was_key_just_pressed(SDL_SCANCODE_F12))
     request_screenshot(std::format("screenshot_{:03d}.png", screenshot_counter_++));
 ```
 
-For *held* movement keys, the snapshot carries the level state (`in.move_forward` etc.). Polling SDL directly (`SDL_GetKeyboardState`) is main-thread-only — do it in `on_event`/`on_main_frame` and mirror what you need into host state, never from `on_simulate`.
+For *held* keys, use `in.key_held(SDL_Scancode)` — the snapshot polls the whole keyboard at kick, so a run modifier is one call:
+
+```cpp
+running_ = in.key_held(SDL_SCANCODE_LSHIFT) || in.key_held(SDL_SCANCODE_RSHIFT);
+```
+
+Because it is **polled**, not tracked from events, a key-up an overlay swallowed cannot latch it on (hosts that mirrored held state from `on_event` themselves hit exactly that bug). While the dev overlay owns the keyboard, `key_held` reads all-false — the same muting the polled movement axes get. The named movement axes (`in.move_forward` etc.) are still there and still include controller input. Polling SDL directly (`SDL_GetKeyboardState`) remains main-thread-only, never from `on_simulate`.
 
 #### Mouse buttons and position
 
@@ -587,7 +588,7 @@ if (in.mouse_left_held)     { /* level state */ }
 if (in.mouse_right_pressed) { /* press edge */ }
 ```
 
-**Gotcha:** unlike key edges, mouse-button edges are **not** cleared by the main loop — the live handler's `clear_mouse_edges()` contract survives, and it is a main-thread call: clear them from `on_main_frame` (or `on_event`) once your UI/game logic has had its look. Forgetting it makes `mouse_left_pressed` stick to `true` in every snapshot.
+The edges are **consumed by the snapshot that copies them**, exactly as the text-input buffer is: one click is one frame's `mouse_left_pressed`, with nothing for the host to clear. A UI layer that reads the *live* handler after the kick (rather than the snapshot) calls `input().retain_mouse_edges()` first — a one-shot opt-out that leaves the edges in place for that one snapshot.
 
 Mouse position updates on every motion event regardless of mode, so UI hover/drag logic works even while menus are open.
 
@@ -715,9 +716,7 @@ dev_ui().set_toggle_key(SDL_SCANCODE_F10); // safe even when dev_ui_ok == false
 
 ### Common mistakes checklist
 
-- Forgetting that `on_init`/`on_shutdown` are host-driven — nothing renders because `init_renderer` never ran.
-- Ignoring the `[[nodiscard]]` results of `init_engine()`, `init_renderer()`, `GraphicsSettings::save()/load()`.
-- Not calling `clear_mouse_edges()` (from a main-thread hook) — click edges latch forever in every snapshot.
+- Ignoring the `[[nodiscard]]` results of `init_engine()`, `start()`, `init_renderer()`, `GraphicsSettings::save()/load()`.
 - Calling `set_keyboard_captured()` yourself — the main loop overwrites it every frame.
 - Never calling `sim.set_camera_forward(...)` — WASD moves relative to -Z instead of the camera.
 - Mutating `graphics_settings()` fields without calling `request_graphics_settings()` (or `apply_all_graphics_settings()` from a main-thread hook) — the renderer never sees the change (until something else applies).

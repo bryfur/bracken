@@ -83,6 +83,21 @@ bool Application::init_engine() {
     return true;
 }
 
+bool Application::start() {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    started_ = on_init();
+    return started_;
+}
+
+void Application::stop() {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    if (!started_) {
+        return; // never came up (or already taken down) — nothing to unwind
+    }
+    started_ = false;
+    on_shutdown();
+}
+
 void Application::pump_events() {
     BRACKEN_PROFILE_ZONE("App::poll_events");
     input_.reset_camera_deltas();

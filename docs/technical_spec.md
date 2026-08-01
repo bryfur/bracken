@@ -184,7 +184,7 @@ public:
     float fps() const;
 ```
 
-Protected hooks (the subclass contract): pure virtual `on_init()` and `on_simulate(SimFrame&)`; optional `on_shutdown()`, `on_main_frame(MainFrame&)`, and `on_event(const SDL_Event&) -> bool` (return `true` to consume before `InputHandler::process_event`). There is **no `on_update`/`on_render`** — `on_simulate` runs as a pool job overlapped with the previous frame's rendering and describes the frame through `SimFrame::frame()`'s `FrameBuilder`; `on_main_frame` runs at the frame fence. **`run()` does not call `on_init`/`on_shutdown`** — the host `main()` drives the sequence `init_engine() → on_init() → run() → on_shutdown() → shutdown_engine()` (the playground exposes public `start()`/`stop()` wrappers for the protected hooks).
+Protected hooks (the subclass contract): pure virtual `on_init()` and `on_simulate(SimFrame&)`; optional `on_shutdown()`, `on_main_frame(MainFrame&)`, and `on_event(const SDL_Event&) -> bool` (return `true` to consume before `InputHandler::process_event`). There is **no `on_update`/`on_render`** — `on_simulate` runs as a pool job overlapped with the previous frame's rendering and describes the frame through `SimFrame::frame()`'s `FrameBuilder`; `on_main_frame` runs at the frame fence. **`run()` does not call `on_init`/`on_shutdown`** — the public `start()`/`stop()` do, and the host `main()` drives the sequence `init_engine() → start() → run() → stop() → shutdown_engine()`. `stop()` is a no-op unless `start()` returned `true`, and runs `on_shutdown()` at most once.
 
 Protected rendering facade (all forwarding to owned subsystems, `src/bracken/application.cpp`):
 
@@ -340,7 +340,7 @@ class Application {
 public:
     Application();                       // = default
     virtual ~Application();              // = default
-    [[nodiscard]] bool init_engine();    // SDL init; call before on_init()
+    [[nodiscard]] bool init_engine();    // SDL init; call before start()
     void run();                          // main loop until quit()
     void shutdown_engine();              // SDL teardown; call after on_shutdown()
     void quit();                         // sets running_ = false
@@ -348,12 +348,12 @@ public:
 };
 ```
 
-Note the asymmetry: `run()` drives `on_simulate`/`on_main_frame`/`on_event` per frame, but **never** invokes `on_init`/`on_shutdown` — the host driver calls those around `run()` (see `examples/playground/main.cpp`, which exposes them via public `start()`/`stop()` wrappers). `quit()` is worker-safe (`running_` is a relaxed atomic flag — it publishes nothing; all cross-thread data movement rides the sim kick/join edges).
+Note the asymmetry: `run()` drives `on_simulate`/`on_main_frame`/`on_event` per frame, but **never** invokes `on_init`/`on_shutdown` — the public `start()`/`stop()` do, and the host driver calls those around `run()` (see `examples/playground/main.cpp`). `quit()` is worker-safe (`running_` is a relaxed atomic flag — it publishes nothing; all cross-thread data movement rides the sim kick/join edges).
 
 #### Protected virtual hooks
 
 ```cpp
-virtual bool on_init() = 0;                            // main thread, host-invoked, GPU ready, no sim in flight
+virtual bool on_init() = 0;                            // main thread, driven by start(), GPU ready, no sim in flight
 virtual void on_shutdown() {}                          // ditto
 virtual void on_simulate(SimFrame& sim) = 0;           // POOL JOB, overlapped with the previous frame's rendering (tier sim-stage)
 virtual void on_main_frame(MainFrame& mf) {}           // main thread, at the frame fence (no sim in flight)
@@ -365,7 +365,7 @@ virtual bool on_event(const SDL_Event& event) { return false; } // main thread, 
 `SimFrame` — the host's view of one simulation frame; tier `sim-stage`; valid only for the duration of `on_simulate` (never store a pointer to it or to `input()`). Non-copyable/movable. Engine-internal constructor `SimFrame(FrameBuilder&, const InputSnapshot&, float dt, double time, uint64_t frame_index, SimFeedback* = nullptr)` — tests may hand-build one (feedback null ⇒ `set_camera_forward` is a no-op).
 
 - `float dt()` — computed at kick, clamped 0.1 s; identical to the packet's dt. `double time()` — accumulated dt. `uint64_t frame_index()` — monotonic, 0 on the first frame.
-- `const InputSnapshot& input()` — the frame's immutable input snapshot, taken on the main thread at this frame's kick (`InputHandler::snapshot()`, which also drains the text-input buffer). `InputSnapshot` (`input_handler.hpp`) embeds the derived `InputState` as `.state` plus public fields mirroring the old `InputHandler` getters — `mouse_x/mouse_y`, `mouse_left_held/pressed/released`, `mouse_right_pressed`, `camera_yaw/camera_pitch/camera_zoom_delta`, `move_forward/backward/left/right`, `menu_*_pressed`, `text_input` (drained delta) + `text_backspace/enter/escape_pressed`, `has_controller/controller_primary/secondary` — and `was_key_just_pressed(SDL_Scancode)` (the one member that keeps function form).
+- `const InputSnapshot& input()` — the frame's immutable input snapshot, taken on the main thread at this frame's kick (`InputHandler::snapshot()`, which also drains the text-input buffer). `InputSnapshot` (`input_handler.hpp`) embeds the derived `InputState` as `.state` plus public fields mirroring the old `InputHandler` getters — `mouse_x/mouse_y`, `mouse_left_held/pressed/released`, `mouse_right_pressed`, `camera_yaw/camera_pitch/camera_zoom_delta`, `move_forward/backward/left/right`, `menu_*_pressed`, `text_input` (drained delta) + `text_backspace/enter/escape_pressed`, `has_controller/controller_primary/secondary` — plus `keys_held` (a `std::bitset<SDL_SCANCODE_COUNT>` of polled level state) — and two members that keep function form, `was_key_just_pressed(SDL_Scancode)` and `key_held(SDL_Scancode)`.
 - `scene::FrameSink& frame()` — the frame's host write surface (a pointer-sized non-owning view of the frame's `FrameBuilder`, 16 engine-fixed lanes); the ONLY way render state leaves the game. It forwards draws/lights/billboards/debug/spawns/`ui()`/`lane()`/camera/environment/toggles. `seal()` and `set_frame_timing` are **not members of it** and are private on `FrameBuilder` — the engine does both.
 - `parallel_for(begin, end, body(i), grain = 0)` and `parallel_for(range, body(elem&), grain = 0)` — delegate to `core::jobs::parallel_for(JobSystem::instance(), …)`, joined before returning; nested fork-join supported; small ranges run inline. Bodies must **not** emit into a builder lane another job is using (no automatic lane assignment — emit from root code or via `run_async` jobs with explicit `fb.lane(i)`).
 - `run_async(TaskGroup& group, std::function<void()>)` — host-owned group; the host must join it (`JobSystem::instance().wait(group)`) before touching results; frame-scoped groups must be joined before `on_simulate` returns.
@@ -474,7 +474,7 @@ See "The pipelined main loop" earlier in this document for the full per-iteratio
   - `input_.post_process_events()`.
 - Profile zones: `App::join_sim`, `App::frame_fence`, `App::on_main_frame`, `App::poll_events`, `App::render` on the main thread; `App::simulate` / `App::on_simulate` inside the sim job; `BRACKEN_PROFILE_FRAME()` per loop iteration.
 
-Mouse-button edge flags are **not** cleared by the loop (unlike key/menu/zoom edges) — clearing them after UI consumption is the host's responsibility (`InputHandler::clear_mouse_edges()`; the snapshot carries the edge state as taken at kick).
+Mouse-button edge flags are consumed by `InputHandler::snapshot()` — the snapshot that copies an edge owns it, so one click is exactly one sim frame's edge. `InputHandler::retain_mouse_edges()` is a one-shot opt-out for a UI layer that reads the live handler after the kick; `clear_mouse_edges()` / `consume_mouse_left_pressed()` remain for hosts that drive their own loop.
 
 #### shutdown_engine()
 
@@ -557,6 +557,7 @@ Engine-level raw input: mouse, keyboard, one controller, camera-orbit accumulati
 | stick digital threshold | `±0.5` on post-deadzone axes | `update_input_from_keyboard` |
 | change-detection epsilon | `0.01f` on move/attack dirs | `post_process_events` |
 | key-edge storage | `std::array<bool, SDL_SCANCODE_COUNT>` | `key_just_pressed_` |
+| held-key storage (snapshot only) | `std::bitset<SDL_SCANCODE_COUNT>` | `InputSnapshot::keys_held` |
 
 #### Construction / destruction
 
@@ -604,7 +605,7 @@ The constructor runs when `Application` is constructed (i.e. **before** `init_en
 | `was_key_just_pressed(sc)` | non-repeat KEY_DOWN | `clear_key_edges()` — called by `Application::run` (or `process_events()`) each frame |
 | `menu_*_pressed()` | events (see above) | `clear_menu_inputs()` — called by the app loop each frame |
 | `get_camera_zoom_delta()` | wheel / RB | `reset_camera_deltas()` — called by the app loop each frame (yaw/pitch are *not* deltas and persist) |
-| `mouse_left_pressed/released`, `mouse_right_pressed` | button events | **host**: `clear_mouse_edges()` (or `consume_mouse_left_pressed()` for the left-press edge alone). Never cleared by the loop. |
+| `mouse_left_pressed/released`, `mouse_right_pressed` | button events | `snapshot()` consumes them (opt out for one snapshot with `retain_mouse_edges()`); `clear_mouse_edges()` / `consume_mouse_left_pressed()` remain for manual loops. |
 | `mouse_left_held()` | level state | button-up event |
 | `text_backspace/enter/escape_pressed()` | key events in text mode | **host**: `clear_text_events()`; also reset by `set_text_input_enabled()` transitions |
 | `take_text_input()` | TEXT_INPUT events | self-clearing (move + clear) |
@@ -750,12 +751,12 @@ This layer predates the `core::Result` convention and uses `bool` + `BRACKEN_LOG
 
 - **No fixed timestep**: variable `dt` clamped at 0.1 s; long stalls silently compress simulated time.
 - `fps()` is a once-per-second integer frame count, `0.0f` for the first second.
-- `on_init`/`on_shutdown` are never invoked by `Application` — a host that forgets to drive them gets a null-deref in the first facade call, not a diagnostic.
+- `on_init`/`on_shutdown` are reached only through `start()`/`stop()` — a host that forgets to call `start()` gets a null-deref in the first facade call, not a diagnostic.
 - Facade methods are guarded by `BRACKEN_CONTRACT` (live in release unless `-DBRACKEN_ENABLE_CONTRACTS=OFF`): calling one before `init_renderer()` aborts with the member's name instead of segfaulting.
 - `PassTiming::gpu_ms` is always `nullopt` (SDL3 has no timestamp queries); `cpu_ms` measures command recording, not GPU execution.
 - Exclusive fullscreen with an unmatched `resolution_index` warns and falls back to borderless fullscreen (stale exclusive modes are cleared).
 - `set_vsync_mode` silently clamps to the supported maximum.
-- Mouse-button edges are never auto-cleared — a host that skips `clear_mouse_edges()` sees latched edges.
+- Held-key state (`InputSnapshot::keys_held` / `key_held(sc)`) is polled from `SDL_GetKeyboardState` at snapshot time and reads all-false while `set_keyboard_captured(true)` is in effect.
 - `set_keyboard_captured` is overwritten every frame by `Application::run`.
 - `GraphicsSettings::load` does not trim key whitespace; float fields are never clamped; booleans treat any non-`"0"` string as true.
 - `god_rays` requiring `volumetric_fog` is enforced downstream in the renderer (god rays are also force-disabled when shadows are off), not by `GraphicsSettings`.

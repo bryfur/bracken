@@ -151,13 +151,14 @@ it:
   overlapped with the previous frame's rendering (tier `sim-stage` — see
   Threading & lifetime contracts); `on_main_frame` runs at the frame fence
   on the main thread with no sim in flight.
-- Boot sequence — **host-driven**: `Application` never calls `on_init()` or
-  `on_shutdown()` itself; `run()` drives only
-  `on_simulate`/`on_main_frame`/`on_event`. The host calls `init_engine()` →
-  its own `on_init()` (which typically calls `init_renderer(width, height,
-  title, world_width = 32000, world_height = 32000)`) → `run()` → its own
-  `on_shutdown()` (typically calling `shutdown_renderer()`) →
-  `shutdown_engine()` — see the playground's `start()`/`stop()` wrappers.
+- Boot sequence — **host-driven, engine-owned entry points**: `run()` drives
+  only `on_simulate`/`on_main_frame`/`on_event`; the surrounding lifecycle is
+  `init_engine()` → `start()` → `run()` → `stop()` → `shutdown_engine()`.
+  `Application::start()`/`stop()` are public and call the protected
+  `on_init()` (which typically calls `init_renderer(width, height, title,
+  world_width = 32000, world_height = 32000)`) / `on_shutdown()` (typically
+  `shutdown_renderer()`) hooks; `stop()` is a no-op unless `start()` returned
+  true, and runs `on_shutdown()` at most once.
   `on_init`/`on_shutdown` run on the main thread with the GPU available and
   no sim in flight. `quit()` is worker-safe (`running_` is atomic) and stops
   the loop at the next iteration.

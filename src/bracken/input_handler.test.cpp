@@ -2,7 +2,9 @@
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_keycode.h>
+#include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_scancode.h>
+#include <cstdint>
 #include <gtest/gtest.h>
 
 using bracken::InputHandler;
@@ -140,4 +142,90 @@ TEST(InputHandlerKeyEdges, EdgeIsScancodeIndexedAndRepeatFree) {
 
     h.process_event(key_down(SDL_SCANCODE_W, SDLK_W, /*repeat=*/true));
     EXPECT_FALSE(h.was_key_just_pressed(SDL_SCANCODE_W));
+}
+
+// --- Held-key level state (P9: the snapshot carries state, not just edges) ---
+
+TEST(InputHandlerHeldKeys, SnapshotKeyHeldIsScancodeBoundsChecked) {
+    bracken::InputSnapshot s;
+    EXPECT_FALSE(s.key_held(SDL_SCANCODE_LSHIFT));
+    s.keys_held[SDL_SCANCODE_LSHIFT] = true;
+    EXPECT_TRUE(s.key_held(SDL_SCANCODE_LSHIFT));
+    EXPECT_FALSE(s.key_held(SDL_SCANCODE_RSHIFT));
+    // Out-of-range scancodes read false instead of walking off the bitset.
+    EXPECT_FALSE(s.key_held(static_cast<SDL_Scancode>(-1)));
+    EXPECT_FALSE(s.key_held(static_cast<SDL_Scancode>(SDL_SCANCODE_COUNT)));
+}
+
+TEST(InputHandlerHeldKeys, CapturedKeyboardReportsNothingHeld) {
+    InputHandler h;
+    // Whatever the real keyboard is doing while the suite runs, an overlay
+    // that owns the keyboard must mute the polled held state — the same rule
+    // the polled movement axes follow.
+    h.set_keyboard_captured(true);
+    const bracken::InputSnapshot s = h.snapshot();
+    EXPECT_TRUE(s.keys_held.none());
+}
+
+// --- snapshot() consumes the mouse edges it copies (P9) ---
+
+namespace {
+
+SDL_Event mouse_button(uint32_t type, uint8_t button) {
+    SDL_Event e{};
+    e.type = type;
+    e.button.button = button;
+    e.button.x = 4.0f;
+    e.button.y = 8.0f;
+    e.button.down = (type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+    return e;
+}
+
+} // namespace
+
+TEST(InputHandlerMouseEdges, SnapshotConsumesTheEdgesItCopies) {
+    InputHandler h;
+    h.process_event(mouse_button(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT));
+    h.process_event(mouse_button(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT));
+    EXPECT_TRUE(h.mouse_left_pressed());
+
+    const bracken::InputSnapshot first = h.snapshot();
+    EXPECT_TRUE(first.mouse_left_pressed);
+    EXPECT_TRUE(first.mouse_right_pressed);
+
+    // One click is exactly one snapshot's edge: the handler's edges are gone...
+    EXPECT_FALSE(h.mouse_left_pressed());
+    EXPECT_FALSE(h.mouse_right_pressed());
+    const bracken::InputSnapshot second = h.snapshot();
+    EXPECT_FALSE(second.mouse_left_pressed);
+    EXPECT_FALSE(second.mouse_right_pressed);
+    // ...but the LEVEL state is not an edge and survives.
+    EXPECT_TRUE(second.mouse_left_held);
+}
+
+TEST(InputHandlerMouseEdges, RetainMouseEdgesSpansExactlyOneSnapshot) {
+    InputHandler h;
+    h.process_event(mouse_button(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT));
+
+    h.retain_mouse_edges();
+    const bracken::InputSnapshot kept = h.snapshot();
+    EXPECT_TRUE(kept.mouse_left_pressed);
+    EXPECT_TRUE(h.mouse_left_pressed()); // still there for the UI layer
+
+    // One-shot: the next snapshot consumes as usual.
+    const bracken::InputSnapshot consumed = h.snapshot();
+    EXPECT_TRUE(consumed.mouse_left_pressed);
+    EXPECT_FALSE(h.mouse_left_pressed());
+}
+
+TEST(InputHandlerMouseEdges, ReleaseEdgeIsAlsoConsumed) {
+    InputHandler h;
+    h.process_event(mouse_button(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT));
+    (void)h.snapshot();
+    h.process_event(mouse_button(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_LEFT));
+
+    const bracken::InputSnapshot s = h.snapshot();
+    EXPECT_TRUE(s.mouse_left_released);
+    EXPECT_FALSE(s.mouse_left_held);
+    EXPECT_FALSE(h.mouse_left_released());
 }

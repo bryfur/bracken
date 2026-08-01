@@ -11,6 +11,7 @@
 #include "SDL3/SDL_stdinc.h"
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -573,6 +574,27 @@ InputSnapshot InputHandler::snapshot() {
     s.controller_secondary = controller_secondary_;
 
     s.key_just_pressed = key_just_pressed_;
+
+    // Held keys, POLLED (not event-tracked): an overlay that consumes a
+    // key-up event cannot latch a modifier on, which is exactly the bug hosts
+    // hit when they tracked "shift is down" from on_event themselves. Muted
+    // while an overlay owns the keyboard, for the same reason the polled
+    // movement axes are (update_input_from_keyboard).
+    if (const bool* keys = SDL_GetKeyboardState(nullptr); keys != nullptr && !keyboard_captured_) {
+        for (std::size_t i = 0; i < static_cast<std::size_t>(SDL_SCANCODE_COUNT); ++i) {
+            s.keys_held[i] = keys[i];
+        }
+    }
+
+    // Consume the mouse edges this snapshot just copied: they belong to
+    // exactly one frame, and the sim stage cannot clear them (the snapshot is
+    // immutable and the live handler is main-thread tier). retain_mouse_edges()
+    // is the one-shot opt-out for a UI layer that reads the handler directly.
+    if (retain_mouse_edges_) {
+        retain_mouse_edges_ = false;
+    } else {
+        clear_mouse_edges();
+    }
     return s;
 }
 

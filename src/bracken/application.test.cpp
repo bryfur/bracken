@@ -26,9 +26,17 @@ public:
     int main_frames = 0;
     int quit_at_frame = -1;  // quit() from sim when sim_frames reaches this
     int throw_at_frame = -1; // throw from sim when sim_frames reaches this
+    int inits = 0;
+    int shutdowns = 0;
+    bool init_result = true;
 
 protected:
-    bool on_init() override { return true; }
+    bool on_init() override {
+        ++inits;
+        return init_result;
+    }
+
+    void on_shutdown() override { ++shutdowns; }
 
     void on_simulate(SimFrame& sim) override {
         ++sim_frames;
@@ -82,4 +90,28 @@ TEST_F(ApplicationPipelineTest, SimExceptionIsRethrownOnTheMainThreadAtJoin) {
     app.quit_at_frame = 4;
     app.run();
     EXPECT_GE(app.sim_frames, 4);
+}
+
+// ===== Boot: start()/stop() drive the protected hooks =====
+
+TEST_F(ApplicationPipelineTest, StartRunsOnInitAndStopRunsOnShutdownExactlyOnce) {
+    HeadlessApp app;
+    EXPECT_TRUE(app.start());
+    EXPECT_EQ(app.inits, 1);
+    EXPECT_EQ(app.shutdowns, 0);
+    app.stop();
+    EXPECT_EQ(app.shutdowns, 1);
+    app.stop(); // idempotent: a second teardown must not re-run on_shutdown
+    EXPECT_EQ(app.shutdowns, 1);
+}
+
+TEST_F(ApplicationPipelineTest, StopIsANoOpWhenStartFailed) {
+    HeadlessApp app;
+    app.init_result = false;
+    EXPECT_FALSE(app.start());
+    EXPECT_EQ(app.inits, 1);
+    // The canonical main() bails to shutdown_engine() here; a host that calls
+    // stop() anyway must not unwind a game that never came up.
+    app.stop();
+    EXPECT_EQ(app.shutdowns, 0);
 }

@@ -1107,21 +1107,6 @@ void PlaygroundGame::on_simulate(SimFrame& sim) {
     build_frame(sim);
 }
 
-bool PlaygroundGame::on_event(const SDL_Event& event) {
-    // Run/walk needs HELD shift state, which the InputSnapshot's edge flags
-    // don't carry — and SDL_GetKeyboardState is pump territory, off-limits to
-    // sim code. Track it here during the event pump (no sim in flight); the
-    // sim job reads the plain bool via the same kick edge as the snapshot.
-    // (A key-up swallowed by the DevUI while it captures the keyboard can
-    // leave shift latched — worst case the character runs instead of walks.)
-    if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
-        if (event.key.scancode == SDL_SCANCODE_LSHIFT || event.key.scancode == SDL_SCANCODE_RSHIFT) {
-            shift_held_ = (event.type == SDL_EVENT_KEY_DOWN);
-        }
-    }
-    return false; // never consumed — InputHandler still sees everything
-}
-
 void PlaygroundGame::handle_input(const SimFrame& sim) {
     const auto& in = sim.input();
 
@@ -1189,16 +1174,13 @@ void PlaygroundGame::handle_input(const SimFrame& sim) {
     if (in.move_left) dir -= right;
     move_dir_ = glm::length(dir) > 0.001f ? glm::normalize(dir) : glm::vec3(0.0f);
 
-    running_input_ = shift_held_; // held state tracked in on_event (see there)
+    running_input_ = in.key_held(SDL_SCANCODE_LSHIFT) || in.key_held(SDL_SCANCODE_RSHIFT);
 
     if (in.mouse_left_pressed && attack_timer_ <= 0.0f) {
         attack_timer_ = ATTACK_DURATION;
         pending_attack_arc_ = true;
         camera().add_directional_shake(forward_from_yaw(facing_.current), 6.0f, 0.15f);
     }
-    // No clear_mouse_edges() here: the snapshot is immutable; on_main_frame
-    // clears the live handler's edges once per fence so each click is exactly
-    // one snapshot's edge (the pipelined mirror of the old host-side clear).
 }
 
 void PlaygroundGame::update_smoke_driver(float dt) {
@@ -2123,12 +2105,6 @@ void PlaygroundGame::on_main_frame(bracken::MainFrame& mf) {
         }
         pending_ripples_.clear();
     }
-
-    // One click = exactly one snapshot's mouse edge: the engine's pump never
-    // clears the handler's mouse-edge flags (UI layers own their consumption),
-    // so clear them here each fence — the pipelined mirror of the old
-    // host-side clear_mouse_edges() call at the end of handle_input.
-    input().clear_mouse_edges();
 
     if (smoke_frames_ > 0) {
         update_smoke_fence(mf);

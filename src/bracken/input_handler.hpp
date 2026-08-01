@@ -6,6 +6,8 @@
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_scancode.h>
 #include <array>
+#include <bitset>
+#include <cstddef>
 #include <string>
 
 namespace bracken {
@@ -29,7 +31,9 @@ struct InputSnapshot {
     /// Derived camera-relative movement/aim state (InputHandler::get_input).
     InputState state{};
 
-    // Raw mouse position + button edges (mirror of the mouse getters).
+    // Raw mouse position + button edges (mirror of the mouse getters). The
+    // edges are CONSUMED by the snapshot that copies them (see
+    // InputHandler::snapshot), so one click is exactly one snapshot's edge.
     float mouse_x = 0.0f;
     float mouse_y = 0.0f;
     bool mouse_left_held = false;
@@ -72,8 +76,21 @@ struct InputSnapshot {
     /// (InputHandler::was_key_just_pressed).
     std::array<bool, SDL_SCANCODE_COUNT> key_just_pressed{};
 
+    /// LEVEL (held-down) state by physical scancode, polled at snapshot time.
+    /// Read it through key_held(); the bitset is public only because the whole
+    /// snapshot is plain data. A bitset, not another array<bool>, because the
+    /// snapshot is copied into every sim frame — 64 bytes instead of 512.
+    std::bitset<SDL_SCANCODE_COUNT> keys_held{};
+
     [[nodiscard]] bool was_key_just_pressed(SDL_Scancode scancode) const {
         return scancode >= 0 && scancode < SDL_SCANCODE_COUNT && key_just_pressed[scancode];
+    }
+
+    /// Is the key held down right now? Edges (was_key_just_pressed) fire once;
+    /// this is the state a run modifier or a charge-up needs. Polled from the
+    /// keyboard, so a key-up swallowed by an overlay cannot latch it on.
+    [[nodiscard]] bool key_held(SDL_Scancode scancode) const {
+        return scancode >= 0 && scancode < SDL_SCANCODE_COUNT && keys_held[static_cast<std::size_t>(scancode)];
     }
 };
 
@@ -104,10 +121,19 @@ public:
     const bracken::InputState& get_input() const { return current_input_; }
 
     // Build the frame's by-value InputSnapshot for the sim stage. Call on the
-    // main thread after post_process_events(); non-const because it DRAINS
-    // the pending text-input buffer into the snapshot (take_text_input
-    // semantics — the sim stage is the text consumer).
+    // main thread after post_process_events(); non-const because it CONSUMES
+    // what it copies:
+    //   - the pending text-input buffer (take_text_input semantics), and
+    //   - the mouse-button edges, so one click is exactly one snapshot's edge
+    //     (retain_mouse_edges() opts the next snapshot out — see there).
+    // Also polls the keyboard for the snapshot's held-key state (keys_held).
     [[nodiscard]] InputSnapshot snapshot();
+
+    // Ask the NEXT snapshot() not to consume the mouse-button edges, so a UI
+    // layer that reads them off the live handler after the snapshot still
+    // sees the click. One-shot: call it every frame you need it. Without it
+    // the edges belong to the snapshot that copied them.
+    void retain_mouse_edges() { retain_mouse_edges_ = true; }
 
     // Check if input changed since last frame
     bool input_changed() const { return input_changed_; }
@@ -255,6 +281,9 @@ private:
     bool left_mouse_pressed_edge_ = false;
     bool left_mouse_released_edge_ = false;
     bool right_mouse_pressed_edge_ = false;
+    // One-shot opt-out of snapshot()'s mouse-edge consumption (see
+    // retain_mouse_edges()); cleared by the snapshot it applies to.
+    bool retain_mouse_edges_ = false;
     float left_mouse_press_x_ = 0.0f;
     float left_mouse_press_y_ = 0.0f;
 

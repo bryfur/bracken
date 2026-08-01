@@ -44,10 +44,6 @@ class PlaygroundGame : public bracken::Application {
 public:
     explicit PlaygroundGame(int smoke_frames = -1) : smoke_frames_(smoke_frames) {}
 
-    // Public wrappers so main() can drive the protected lifecycle hooks.
-    bool start() { return on_init(); }
-    void stop() { on_shutdown(); }
-
     /** Where the smoke run saves its screenshot (main() verifies it after). */
     static constexpr const char* SMOKE_SCREENSHOT_PATH = "playground_smoke.png";
 
@@ -56,7 +52,6 @@ protected:
     void on_shutdown() override;
     void on_simulate(bracken::SimFrame& sim) override;
     void on_main_frame(bracken::MainFrame& mf) override;
-    bool on_event(const SDL_Event& event) override;
 
 private:
     struct Orb {
@@ -235,11 +230,6 @@ private:
     bracken::animation::FootIKSmoother foot_smoother_;
     glm::mat4 player_transform_{1.0f};
     float attack_timer_ = 0.0f;
-    // Held run modifier, tracked in on_event (the pump — no sim in flight)
-    // because the InputSnapshot carries key EDGES, not held state, and
-    // SDL_GetKeyboardState is off-limits to sim code. Read by the sim job one
-    // kick later, ordered by the same edges as the snapshot itself.
-    bool shift_held_ = false;
 
     // River (wave sim). The WaterRenderer is render-side: sim code queues
     // ripple impulses here and on_main_frame forwards them at the fence

@@ -93,22 +93,25 @@ struct Heightmap;
  * facade. There is no on_update/on_render: the host does not "render" — it
  * DESCRIBES a frame through SimFrame::frame() and the engine draws it.
  *
- * Lifecycle is host-driven: run() drives only the per-frame hooks; the host
- * must itself call init_engine() then on_init() before run(), and
- * on_shutdown() then shutdown_engine() after it (as the playground's
- * start()/stop() wrappers do). on_init/on_shutdown run on the main thread
- * with the GPU available and no sim in flight — their contracts are
- * unchanged.
+ * Lifecycle: init_engine() -> start() -> run() -> stop() -> shutdown_engine().
+ * start()/stop() are the public drivers for the protected on_init/on_shutdown
+ * hooks; run() drives only the per-frame hooks. on_init/on_shutdown run on
+ * the main thread with the GPU available and no sim in flight — their
+ * contracts are unchanged.
  */
 class Application {
 public:
     Application();
     virtual ~Application();
 
-    /** Initialize SDL subsystems + the job-system pool. The host must call
-     *  this, then its own on_init(), before run() — Application never
-     *  invokes on_init() itself. Main thread (binds the main-thread assert). */
+    /** Initialize SDL subsystems + the job-system pool. Call this, then
+     *  start(), before run(). Main thread (binds the main-thread assert). */
     [[nodiscard]] bool init_engine();
+
+    /** Bring the game up: calls the protected on_init() hook. Call after
+     *  init_engine() and before run(); returns what on_init() returned.
+     *  Main thread. */
+    [[nodiscard]] bool start();
 
     /** Run the pipelined main loop until quit() is called. Drives only
      *  on_simulate/on_main_frame/on_event — never on_init/on_shutdown. Joins
@@ -116,8 +119,12 @@ public:
      *  pipeline. Rethrows the first exception a sim job raised. */
     void run();
 
-    /** Shut down SDL. The host must call its own on_shutdown() first —
-     *  Application never invokes on_shutdown() itself. */
+    /** Take the game down: calls the protected on_shutdown() hook, at most
+     *  once and only if start() succeeded. Call after run() and before
+     *  shutdown_engine(). Main thread. */
+    void stop();
+
+    /** Shut down SDL + the job-system pool. Call after stop(). */
     void shutdown_engine();
 
     /** Request the main loop to stop. Tier: worker-safe — callable from the
@@ -156,14 +163,12 @@ public:
     float present_wait_ms() const { return present_wait_ms_; }
 
 protected:
-    /** Game-specific initialization (renderer, assets, scene). Not called by
-     *  Application — the host must invoke it after init_engine(), before
-     *  run(). Main thread, GPU available, no sim in flight. */
+    /** Game-specific initialization (renderer, assets, scene). Driven by
+     *  start(). Main thread, GPU available, no sim in flight. */
     virtual bool on_init() = 0;
 
-    /** Game-specific shutdown. Not called by Application — the host must
-     *  invoke it after run() returns, before shutdown_engine(). Main thread,
-     *  GPU available, no sim in flight. */
+    /** Game-specific shutdown. Driven by stop(). Main thread, GPU available,
+     *  no sim in flight. */
     virtual void on_shutdown() {}
 
     /**
@@ -428,6 +433,11 @@ private:
     // relaxed loads at the loop head. Publishes nothing — it is a pure flag;
     // all cross-thread data movement rides the sim kick/join edges.
     std::atomic<bool> running_{false};
+
+    // start() succeeded — stop() runs on_shutdown() only then, and only once,
+    // so the canonical main() (bail out to shutdown_engine() when start()
+    // fails) cannot tear down a game that never came up.
+    bool started_ = false;
 
     uint64_t last_frame_time_ = 0; // nanoseconds (SDL_GetTicksNS) at last kick
     // When set, kick_sim() reports this dt instead of the wall-clock delta,
