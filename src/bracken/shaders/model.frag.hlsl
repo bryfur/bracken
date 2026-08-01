@@ -50,6 +50,15 @@ cbuffer LightingUniforms {
     float iblEnabled;       // 1 = sky IBL ambient (samplers 7-9), 0 = hemisphere fallback
     float screenAOEnabled;  // 0 for MASK/BLEND: not in the depth prepass, so the AO
                             // texel under them belongs to the geometry behind them
+    // Ray-traced sun shadow mask (render/rt_renderer.hpp). 0 = off, and the
+    // CSM result is used unchanged. Shares screenAOTexel* for its UV: both are
+    // SV_Position.xy * (1 / render-target size), which is a normalized
+    // full-screen coordinate, so a half-resolution mask samples correctly and
+    // the linear sampler upsamples it for free.
+    float rtShadowEnabled;
+    float _rtPad0;
+    float _rtPad1;
+    float _rtPad2;
 };
 
 [[vk::binding(1, 3)]]
@@ -101,7 +110,13 @@ SamplerState emissiveSampler;
 // Full-res screen-space GTAO (R8, 1 = unoccluded), computed before this pass
 // from the prepass depth. Bound to a 1x1 white dummy when AO is off.
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
-Texture2D<float> screenAOTexture;
+// Screen-space lighting terms, ONE binding for two of them because the
+// fragment stage is at its 10-sampler ceiling (an 11th fails to legalize):
+//   R = ambient occlusion (GTAO)
+//   G = sun visibility from ray-traced shadows, read only when rtShadowEnabled
+// With RT shadows off this is GTAO's R8 texture unchanged and G is never read;
+// with them on it is the RT pass's RG8 output, which passes AO through in R.
+Texture2D<float4> screenAOTexture;
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
 SamplerState screenAOSampler;
 
@@ -121,6 +136,7 @@ SamplerState iblSpecularSampler;
 Texture2D<float4> iblBrdfLut;
 [[vk::combinedImageSampler]][[vk::binding(9, 2)]]
 SamplerState iblBrdfLutSampler;
+
 
 // Local (point/spot) shadow atlas + comparison sampler: declared by
 // cluster_lighting.hlsli at this shader's LAST sampler slot (10).
@@ -189,6 +205,16 @@ float4 PSMain(PSInput input) : SV_Target {
 
     float shadow = calcShadow(input.fragPos, N_geo, L, input.viewDepth, input.position.xy);
 
+    // Ray-traced shadows REPLACE the cascade result rather than multiplying
+    // with it: multiplying would double-darken everywhere the two agree, and
+    // tracing exists because it is the more accurate answer. The cascades stay
+    // as the fallback when it is off.
+    if (rtShadowEnabled > 0.5) {
+        float2 rtUV = input.position.xy * float2(screenAOTexelX, screenAOTexelY);
+        shadow = screenAOTexture.SampleLevel(screenAOSampler, rtUV, 0).g;
+    }
+
+
     // Direct lighting: full PBR BRDF (material AO only occludes ambient).
     float3 directLight = lightColor * sunIntensity * shadow;
     float3 direct = evaluatePBR(N, V, L, directLight, baseColor.rgb, metallic, roughness, 1.0);
@@ -200,7 +226,7 @@ float4 PSMain(PSInput input) : SV_Target {
     float screenAO = 1.0;
     if (screenAOEnabled > 0.5) {
         screenAO = screenAOTexture.Sample(
-            screenAOSampler, input.position.xy * float2(screenAOTexelX, screenAOTexelY));
+            screenAOSampler, input.position.xy * float2(screenAOTexelX, screenAOTexelY)).r;
     }
     float aoCombined = min(matAO, screenAO);
 

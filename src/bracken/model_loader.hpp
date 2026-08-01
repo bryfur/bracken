@@ -286,7 +286,17 @@ private:
 public:
     /// Create GPU buffers/textures for every un-uploaded mesh and free the
     /// CPU-side copies. Main-thread tier (asserted): GPU resource creation.
-    static void upload_to_gpu(gpu::GPUDevice& device, Model& model);
+    /**
+     * Upload a model's geometry and textures.
+     *
+     * @param retain_cpu_geometry keep the vertex/index arrays after upload.
+     *        Ray tracing needs them (its BVH is built from them) and so does
+     *        LOD generation; everything else does not, and a scene's vertex
+     *        data is usually the largest CPU allocation in the process — hence
+     *        opt-in rather than default.
+     */
+    static void upload_to_gpu(gpu::GPUDevice& device, Model& model,
+                              bool retain_cpu_geometry = false);
     /// Release the model's GPU resources. Main-thread tier (asserted).
     static void free_gpu_resources(Model& model);
 };
@@ -407,6 +417,12 @@ public:
     /// building an acceleration structure over the whole scene needs.
     [[nodiscard]] std::size_t model_count() const noexcept;
 
+    /** Keep CPU-side geometry on every subsequently loaded model. Set before
+     *  loading if ray tracing will be used — its acceleration structure is
+     *  built from those arrays, and they are gone by the time it asks. */
+    void set_retain_cpu_geometry(bool retain) noexcept { retain_cpu_geometry_ = retain; }
+    [[nodiscard]] bool retains_cpu_geometry() const noexcept { return retain_cpu_geometry_; }
+
     /**
      * Register a pre-built model (e.g. procedurally generated). Takes
      * ownership, uploads to the GPU when a device is set, and finishes the
@@ -441,6 +457,7 @@ public:
 
 private:
     gpu::GPUDevice* device_ = nullptr;
+    bool retain_cpu_geometry_ = false;
     // Slot 0 is reserved (INVALID_MODEL_HANDLE), models start at index 1
     std::vector<std::unique_ptr<Model>> models_;
     std::vector<std::string> model_paths_; // parallel to models_; "" for procedural

@@ -92,6 +92,7 @@ public:
      */
     void render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, SDL_GPUTexture* target,
                                SDL_GPUTexture* bloom_texture, SDL_GPUTexture* fog_texture,
+                               SDL_GPUTexture* rt_reflection_texture,
                                const CompositeParams& params);
 
     /**

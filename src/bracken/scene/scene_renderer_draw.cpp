@@ -348,6 +348,12 @@ gpu::ModelLightingUniforms SceneRenderer::make_model_lighting(const CameraState&
     u.screenAOTexelX = 1.0f / static_cast<float>(std::max(context_->width(), 1));
     u.screenAOTexelY = 1.0f / static_cast<float>(std::max(context_->height(), 1));
     u.iblEnabled = frame_ibl_active_ ? 1.0f : 0.0f;
+    // Ray-traced sun shadows: the mask rides in G of the screen-space term
+    // texture that frame_ao_texture_ points at (the RT pass substituted it for
+    // GTAO's output and passed AO through in R). One texture, because this
+    // stage is at its 10-sampler ceiling.
+    u.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
+
     return u;
 }
 

@@ -107,7 +107,10 @@ public:
 
     /** Record the traced passes. Each is skipped entirely when its feature is
      *  off or the acceleration structure is not ready. */
-    void render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, gpu::GPUTexture& normal,
+    /// `ao_input` is the screen-space AO the shadow pass passes through in R
+    /// (see rt_shadow.comp.hlsl); raw SDL handle because that is how the
+    /// renderer already carries this texture between passes.
+    void render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_GPUTexture* ao_input,
                 const FrameParams& params, const RtShadowSettings& shadows,
                 const RtReflectionSettings& reflections);
 

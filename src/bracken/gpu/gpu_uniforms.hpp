@@ -85,8 +85,14 @@ struct alignas(16) ModelLightingUniforms {
     // their screen position belongs to whatever is BEHIND them — sampling it
     // stamps the background's AO onto foliage ("see-through" canopies).
     float screenAOEnabled = 1.0f;
+    // 1 = take the sun shadow from the ray-traced mask instead of the cascades
+    // (render/rt_renderer.hpp). Off by default; the CSM path is unchanged.
+    float rtShadowEnabled = 0.0f;
+    float _rtPad0 = 0.0f;
+    float _rtPad1 = 0.0f;
+    float _rtPad2 = 0.0f;
 };
-BRACKEN_HLSL_CBUFFER(ModelLightingUniforms, 224);
+BRACKEN_HLSL_CBUFFER(ModelLightingUniforms, 240);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, lightDir, 0);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, _padding0, 12);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, lightColor, 16);
@@ -121,6 +127,8 @@ BRACKEN_HLSL_FIELD(ModelLightingUniforms, screenAOTexelX, 208);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, screenAOTexelY, 212);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, iblEnabled, 216);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, screenAOEnabled, 220);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtShadowEnabled, 224);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, _rtPad0, 228);
 
 /**
  * Skybox fragment shader uniforms - matches skybox.frag.hlsl SkyUniforms (set 3, b0)

@@ -167,7 +167,9 @@ void PostProcessStack::end_offscreen_pass() {
 
 void PostProcessStack::render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines,
                                              SDL_GPUTexture* target, SDL_GPUTexture* bloom_texture,
-                                             SDL_GPUTexture* fog_texture, const CompositeParams& params) {
+                                             SDL_GPUTexture* fog_texture,
+                                             SDL_GPUTexture* rt_reflection_texture,
+                                             const CompositeParams& params) {
     BRACKEN_PROFILE_ZONE_COLOR("PostProcessStack::render_composite_pass", 0x16A085);
     auto* pipeline = pipelines.get_pipeline(gpu::PipelineType::Composite);
     if (!pipeline || !target) {
@@ -227,7 +229,7 @@ void PostProcessStack::render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::Pip
     SDL_GPUTexture* bloom_tex = bloom_texture ? bloom_texture : offscreen_color_->handle();
     SDL_GPUTexture* fog_tex = fog_texture ? fog_texture : offscreen_color_->handle();
 
-    SDL_GPUTextureSamplerBinding bindings[4] = {};
+    SDL_GPUTextureSamplerBinding bindings[5] = {};
     bindings[0].texture = offscreen_color_->handle();
     bindings[0].sampler = linear_clamp_sampler_;
     bindings[1].texture = bloom_tex;
@@ -237,7 +239,12 @@ void PostProcessStack::render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::Pip
     // Full-res depth drives the joint bilateral upsample of the fog.
     bindings[3].texture = offscreen_depth_->handle();
     bindings[3].sampler = nearest_clamp_sampler_;
-    SDL_BindGPUFragmentSamplers(pass, 0, bindings, 4);
+    // Traced reflections, or the transparent dummy when ray tracing is off —
+    // the composite adds rgb*a, so a zero alpha makes it a no-op.
+    bindings[4].texture = rt_reflection_texture ? rt_reflection_texture
+                                                : offscreen_color_->handle();
+    bindings[4].sampler = linear_clamp_sampler_;
+    SDL_BindGPUFragmentSamplers(pass, 0, bindings, 5);
 
     // Exposure state (or the zeroed dummy) as the pass's only fragment SSBO.
     SDL_BindGPUFragmentStorageBuffers(pass, 0, &exposure_buffer, 1);

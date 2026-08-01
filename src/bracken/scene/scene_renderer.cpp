@@ -177,6 +177,17 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
         BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize post-process stack (HDR path disabled)");
     }
 
+    // Ray tracing. Created unconditionally but inert: with both features off
+    // it allocates nothing, builds no acceleration structure, and its render()
+    // returns before touching the GPU.
+    rt_renderer_ = std::make_unique<render::RtRenderer>();
+    if (!rt_renderer_->init(context_->device(), *pipeline_registry_)) {
+        BRACKEN_LOG_WARN("scene", "ray tracing unavailable; rt_shadows/rt_reflections will no-op");
+        rt_renderer_.reset();
+    } else {
+        rt_renderer_->resize(context_->device(), w, h);
+    }
+
     if (!gtao_->init(context_->device(), w, h, gfx.ao_mode != AOMode::GTAO_Full)) {
         BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize GTAO (AO disabled)");
     }
@@ -973,6 +984,46 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 gtao_->invalidate_history();
             }
 
+            // Ray-traced sun shadows. Dispatched after GTAO because it reads
+            // the AO result and passes it through in R, writing sun visibility
+            // in G — the lighting pass samples ONE texture for both, since its
+            // fragment stage is at the 10-sampler ceiling. Substituting
+            // frame_ao_texture_ is the entire integration: every draw that
+            // already binds AO now gets the traced shadow with it.
+            if ((gfx.rt_shadows || gfx.rt_reflections) && rt_renderer_ &&
+                post_->offscreen_depth() && cmd) {
+                BRACKEN_PROFILE_ZONE_COLOR("RT shadows", 0x8E44AD);
+                BRACKEN_GPU_SCOPE(cmd, "RT shadows");
+                render::RtRenderer::FrameParams rp;
+                rp.inv_view_proj = glm::inverse(draw_camera.view_projection);
+                rp.camera_position = draw_camera.position;
+                rp.environment = env_;
+                rp.screen_width = context_->width();
+                rp.screen_height = context_->height();
+
+                render::RtShadowSettings rs;
+                rs.enabled = gfx.rt_shadows;
+                render::RtReflectionSettings rr;
+                rr.enabled = gfx.rt_reflections;
+
+                SDL_GPUTexture* ao_for_rt =
+                    frame_ao_texture_ != nullptr
+                        ? frame_ao_texture_
+                        : (dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr);
+                if (ao_for_rt != nullptr) {
+                    rt_renderer_->render(cmd, *post_->offscreen_depth(), ao_for_rt, rp, rs, rr);
+                    if (rt_renderer_->stats().shadows_traced &&
+                        rt_renderer_->shadow_mask() != nullptr) {
+                        frame_ao_texture_ = rt_renderer_->shadow_mask()->handle();
+                        frame_rt_shadows_active_ = true;
+                    }
+                    if (rt_renderer_->stats().reflections_traced &&
+                        rt_renderer_->reflection_target() != nullptr) {
+                        frame_rt_reflection_texture_ = rt_renderer_->reflection_target()->handle();
+                    }
+                }
+            }
+
             {
                 BRACKEN_PROFILE_ZONE_COLOR("HDROffscreen", 0xC0392B);
                 BRACKEN_GPU_SCOPE(cmd, "HDROffscreen");
@@ -1175,6 +1226,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     BRACKEN_GPU_SCOPE(cmd, "Composite");
                     BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "Composite");
                     post_->render_composite_pass(cmd, *pipeline_registry_, composite_target, bloom_tex, fog_tex,
+                                                 frame_rt_reflection_texture_,
                                                composite_params);
                 }
 
@@ -1358,6 +1410,29 @@ void SceneRenderer::pack_bone_palettes(const FramePacket& frame, const CameraSta
     ScenePrep::prep_resolve_skinned(core::jobs::JobSystem::instance(), cmds, frame.palettes(), p,
                                     prep_scratch_.skinned, skinned_resolved_, stats_partial);
     stats_partial.merge_into(render_stats_, frame_diagnostics_);
+}
+
+} // namespace bracken::scene
+
+namespace bracken::scene {
+
+void SceneRenderer::build_raytracing_scene(const ModelManager& models, bool want_attributes) {
+    if (!rt_renderer_ || context_ == nullptr) {
+        return;
+    }
+    rt_renderer_->build_scene(context_->device(), models, want_attributes);
+}
+
+void SceneRenderer::set_raytracing_instances(
+    std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
+    if (rt_renderer_) {
+        rt_renderer_->set_instances(instances);
+    }
+}
+
+const render::RtStats& SceneRenderer::raytracing_stats() const {
+    static const render::RtStats k_empty{};
+    return rt_renderer_ ? rt_renderer_->stats() : k_empty;
 }
 
 } // namespace bracken::scene

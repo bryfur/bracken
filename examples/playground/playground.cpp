@@ -200,6 +200,13 @@ bool PlaygroundGame::on_init() {
     // A/B hook: PLAYGROUND_LOD=1 builds LOD chains for the flora, 0 (the
     // default, see playground.hpp) skips them, so the two runs differ in
     // exactly one thing.
+    // Ray tracing needs CPU-side geometry to build its BVH from, and models
+    // release it at upload — so the decision has to be made BEFORE anything
+    // loads, not when the structure is built.
+    if (const char* rt = SDL_getenv("PLAYGROUND_RT"); rt != nullptr) {
+        rt_mode_ = rt;
+    }
+
     if (const char* env = SDL_getenv("PLAYGROUND_LOD"); env != nullptr) {
         lod_disabled_ = env[0] == '0';
     }
@@ -211,6 +218,13 @@ bool PlaygroundGame::on_init() {
 
     if (!init_renderer(1600, 900, "bracken playground", WORLD, WORLD)) {
         return false;
+    }
+
+    // Before ANY model loads: ray tracing builds its BVH from CPU-side
+    // geometry, and upload releases it. The decision cannot wait until the
+    // structure is built, because by then the data is gone.
+    if (!rt_mode_.empty()) {
+        models().set_retain_cpu_geometry(true);
     }
 
     // Dear ImGui developer overlay (F10). In stub builds
@@ -355,6 +369,33 @@ bool PlaygroundGame::on_init() {
     // Reuse an existing small mesh as the carried lantern rather than adding
     // an asset the repo does not have.
     lantern_model_ = models().get_handle("lantern");
+
+    // --- Ray tracing (opt-in) -----------------------------------------
+    // PLAYGROUND_RT=shadows | reflections | both. Off unless asked for: this
+    // is software ray tracing over a BVH, and it is not free.
+    if (!rt_mode_.empty()) {
+        const std::string& mode = rt_mode_;
+        auto edit = edit_graphics_settings();
+        auto& gs = *edit;
+        gs.rt_shadows = mode == "shadows" || mode == "both";
+        gs.rt_reflections = mode == "reflections" || mode == "both";
+        if (gs.rt_shadows || gs.rt_reflections) {
+            scene_renderer().build_raytracing_scene(models(), gs.rt_reflections);
+            std::vector<std::pair<bracken::ModelHandle, glm::mat4>> rt_instances;
+            if (has_village_) {
+                rt_instances.emplace_back(village_model_, village_transform_);
+            }
+            for (const Prop& prop : props_) {
+                rt_instances.emplace_back(prop.model, prop.transform);
+            }
+            scene_renderer().set_raytracing_instances(rt_instances);
+            const auto& st = scene_renderer().raytracing_stats();
+            BRACKEN_LOG_INFO("playground", "RT: shadows={} reflections={} accel={:.1f} MB",
+                             gs.rt_shadows, gs.rt_reflections,
+                             static_cast<double>(st.acceleration_bytes) / (1024.0 * 1024.0));
+            request_graphics_settings(gs);
+        }
+    }
 
     // --- Tier 3: nav grid ---------------------------------------------
     {
@@ -1779,6 +1820,15 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
         // The hard regression gate. Unlike everything on the line above, this
         // is computed entirely CPU-side, so it is exact and driver-independent.
         std::cout << std::format("[smoke] packet_digest=0x{:016x}\n", packet_digest());
+        {   // Ray-tracing evidence: whether the passes actually ran, not just
+            // whether the frame survived them.
+            const auto& rt = scene_renderer().raytracing_stats();
+            std::cout << std::format(
+                "[smoke] rt shadows_traced={} reflections_traced={} shadow_rays={} "
+                "reflection_rays={} accel={:.1f}MB\n",
+                rt.shadows_traced, rt.reflections_traced, rt.shadow_rays, rt.reflection_rays,
+                static_cast<double>(rt.acceleration_bytes) / (1024.0 * 1024.0));
+        }
         // Tier-3 evidence: that the controller left the ground, that the nav
         // grid built, and that the villager actually pathed somewhere.
         std::cout << std::format(

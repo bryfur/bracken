@@ -69,13 +69,16 @@ cbuffer RtShadowUniforms : register(b0, space2) {
 };
 
 [[vk::binding(0, 0)]] Texture2D<float> sceneDepth : register(t0, space0);
-[[vk::binding(1, 0)]] Texture2D<float4> sceneNormal : register(t1, space0);
+[[vk::binding(1, 0)]] Texture2D<float> aoInput : register(t1, space0);
 [[vk::binding(2, 0)]] StructuredBuffer<BvhNode> tlasNodes : register(t2, space0);
 [[vk::binding(3, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t3, space0);
 [[vk::binding(4, 0)]] StructuredBuffer<BvhNode> blasNodes : register(t4, space0);
 [[vk::binding(5, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t5, space0);
 
-[[vk::binding(0, 1)]] RWTexture2D<float> shadowMask : register(u0, space1);
+// RG8: R = the ambient occlusion read straight through from GTAO, G = sun
+// visibility. Two terms in one texture because the lighting pass's fragment
+// stage is at its 10-sampler ceiling and cannot take another binding.
+[[vk::binding(0, 1)]] RWTexture2D<float2> shadowMask : register(u0, space1);
 
 // Slab test. Returns the near hit distance, or a miss as tNear > tFar.
 // Branchless min/max: a per-lane branch here would serialize the warp on the
@@ -207,6 +210,32 @@ bool sceneOccluded(float3 origin, float3 dir, float tMax) {
     return false;
 }
 
+// World-space position at a depth texel, for normal reconstruction.
+float3 worldAt(int2 c, uint2 size) {
+    float d = sceneDepth.Load(int3(c, 0));
+    float2 ndc = (float2(c) + 0.5) / float2(size) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float4 w = mul(invViewProj, float4(ndc, d, 1.0));
+    return w.xyz / w.w;
+}
+
+// Geometric normal from neighbouring depth taps. Picks the closer neighbour on
+// each axis so a depth discontinuity does not smear the normal across it,
+// which would put shadow halos on every silhouette.
+float3 reconstructNormal(int2 c, uint2 size) {
+    float3 p = worldAt(c, size);
+    float3 px = worldAt(int2(min(c.x + 1, int(size.x) - 1), c.y), size);
+    float3 nx = worldAt(int2(max(c.x - 1, 0), c.y), size);
+    float3 py = worldAt(int2(c.x, min(c.y + 1, int(size.y) - 1)), size);
+    float3 ny = worldAt(int2(c.x, max(c.y - 1, 0)), size);
+
+    float3 dx = length(px - p) < length(p - nx) ? (px - p) : (p - nx);
+    float3 dy = length(py - p) < length(p - ny) ? (py - p) : (p - ny);
+    float3 n = cross(dy, dx);
+    float len = length(n);
+    return len > 1e-6 ? n / len : float3(0.0, 1.0, 0.0);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= outputSize.x || tid.y >= outputSize.y) {
@@ -226,11 +255,14 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // and casting a ray from the far plane is the single most expensive way to
     // learn that.
     if (depth <= 0.0) {
-        shadowMask[coord] = 1.0;
+        shadowMask[coord] = float2(aoInput.Load(int3(depthCoord, 0)), 1.0);
         return;
     }
 
-    float3 normal = normalize(sceneNormal.Load(int3(depthCoord, 0)).xyz * 2.0 - 1.0);
+    // Normal reconstructed from depth rather than read from a G-buffer, for
+    // the same reason GTAO does it: the engine has no normal target, and four
+    // extra depth taps are cheaper than adding a full-res normal write.
+    float3 normal = reconstructNormal(depthCoord, depthSize);
     float3 toLight = -sunDirection; // sunDirection is where light TRAVELS
 
     // A surface facing away from the sun is already unlit by N.L in the
@@ -238,7 +270,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // the dot product already said.
     float ndotl = dot(normal, toLight);
     if (ndotl <= 0.0) {
-        shadowMask[coord] = 0.0;
+        shadowMask[coord] = float2(aoInput.Load(int3(depthCoord, 0)), 0.0);
         return;
     }
 
@@ -256,5 +288,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float3 rayOrigin = worldPos + normal * (normalBias * (1.0 + slope * 4.0)) +
                        toLight * depthBias;
 
-    shadowMask[coord] = sceneOccluded(rayOrigin, toLight, rayMaxDistance) ? 0.0 : 1.0;
+    float visibility = sceneOccluded(rayOrigin, toLight, rayMaxDistance) ? 0.0 : 1.0;
+    shadowMask[coord] = float2(aoInput.Load(int3(depthCoord, 0)), visibility);
 }

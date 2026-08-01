@@ -889,7 +889,8 @@ bool ModelLoader::load_glb_impl(const std::string& path, std::span<const std::by
     return true;
 }
 
-void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model) {
+void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model,
+                                bool retain_cpu_geometry) {
     BRACKEN_PROFILE_ZONE("ModelLoader::upload_to_gpu");
     // GPU resource creation is main-thread tier (buffers + textures).
     BRACKEN_ASSERT_MAIN_THREAD();
@@ -984,13 +985,20 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model) {
         // Cache index count before freeing CPU-side geometry data
         mesh.cached_index_count = static_cast<uint32_t>(mesh.indices.size());
 
-        // Free CPU-side vertex/index data - it's on the GPU now
-        mesh.vertices.clear();
-        mesh.vertices.shrink_to_fit();
-        mesh.skinned_vertices.clear();
-        mesh.skinned_vertices.shrink_to_fit();
-        mesh.indices.clear();
-        mesh.indices.shrink_to_fit();
+        // Free CPU-side vertex/index data - it's on the GPU now.
+        //
+        // Unless something still needs it: ray tracing builds its BVH from
+        // these arrays, and LOD generation simplifies them. Retention is
+        // opt-in because for most games this memory is pure waste — a scene's
+        // vertex data is typically the largest CPU allocation there is.
+        if (!retain_cpu_geometry) {
+            mesh.vertices.clear();
+            mesh.vertices.shrink_to_fit();
+            mesh.skinned_vertices.clear();
+            mesh.skinned_vertices.shrink_to_fit();
+            mesh.indices.clear();
+            mesh.indices.shrink_to_fit();
+        }
     }
 }
 
@@ -1043,12 +1051,12 @@ ModelHandle ModelManager::load_model_with_lods(const std::string& name, const st
     (void)build_lods(handle, ratios, thresholds);
 
     if (device_) {
-        ModelLoader::upload_to_gpu(*device_, *get_model(handle));
+        ModelLoader::upload_to_gpu(*device_, *get_model(handle), retain_cpu_geometry_);
         // Levels were appended after the base, so uploading them here keeps
         // the "CPU geometry is freed at upload" rule uniform across all of them.
         for (ModelHandle lod : get_model(handle)->lod_handles) {
             if (Model* m = get_model(lod)) {
-                ModelLoader::upload_to_gpu(*device_, *m);
+                ModelLoader::upload_to_gpu(*device_, *m, retain_cpu_geometry_);
             }
         }
         // Share the base's albedo with every level, now that it exists.
@@ -1071,7 +1079,7 @@ ModelHandle ModelManager::load_model(const std::string& name, const std::string&
     if (ModelLoader::load_glb(path, *model)) {
         // Upload to GPU if device is available
         if (device_) {
-            ModelLoader::upload_to_gpu(*device_, *model);
+            ModelLoader::upload_to_gpu(*device_, *model, retain_cpu_geometry_);
         }
 
         ModelHandle handle = static_cast<ModelHandle>(models_.size());
@@ -1289,7 +1297,7 @@ core::Result<ModelHandle, ModelRegisterError> ModelManager::register_model(const
     model->loaded = true;
 
     if (device_) {
-        ModelLoader::upload_to_gpu(*device_, *model);
+        ModelLoader::upload_to_gpu(*device_, *model, retain_cpu_geometry_);
         for (const auto& mesh : model->meshes) {
             if (!mesh.uploaded) {
                 BRACKEN_LOG_ERROR("model", "register_model('{}'): {}", name,

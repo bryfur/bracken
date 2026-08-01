@@ -323,6 +323,7 @@ private:
     bool lod_disabled_ = true;
     // PLAYGROUND_ASYNC=0 restores serial model loading (the A/B baseline).
     bool async_load_disabled_ = false;
+    std::string rt_mode_; // PLAYGROUND_RT: shadows | reflections | both
     float ambient_ripple_timer_ = 0.0f; // occasional ambient rings on the river
 
     // Game state

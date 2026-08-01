@@ -12,6 +12,7 @@
 #include "bracken/contracts/render_stats.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
+#include "bracken/render/rt_renderer.hpp"
 #include "bracken/render/lighting/local_shadows.hpp"
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/motion_history.hpp"
@@ -179,6 +180,24 @@ public:
      *  Mutations take effect next frame: render_frame re-propagates env_ to
      *  every sub-renderer at the top of each frame. */
     render::EnvironmentState& environment() { return env_; }
+
+    /**
+     * Build the ray-tracing acceleration structure over the loaded models.
+     *
+     * Call once after models are loaded, and only if rt_shadows or
+     * rt_reflections will be used — nothing is built otherwise. `want_attributes`
+     * must be true if reflections may be enabled this session; see
+     * render::RtRenderer.
+     *
+     * Models release their CPU geometry at GPU upload, so this needs models
+     * that still have it (the same constraint load_model_with_lods documents).
+     */
+    void build_raytracing_scene(const ModelManager& models, bool want_attributes);
+
+    /// Per-frame instance list for the TLAS. Static scenes can call this once.
+    void set_raytracing_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances);
+
+    [[nodiscard]] const render::RtStats& raytracing_stats() const;
 
     /** Effect/particle counts of the LAST CONSUMED packet's effect-instance
      *  snapshot — render-side data, safe for the dev overlay to read while
@@ -454,6 +473,12 @@ private:
     std::unique_ptr<gpu::GPUTexture> depth_texture_;
     SDL_GPUSampler* default_sampler_ = nullptr;
     std::unique_ptr<gpu::GPUTexture> dummy_white_texture_;    // 1x1 white for binding slots that need a texture
+
+    // Compute-shader ray tracing. Null-checked everywhere: both features are
+    // off by default and nothing is built unless one is on.
+    std::unique_ptr<render::RtRenderer> rt_renderer_; // created in init()
+    bool frame_rt_shadows_active_ = false;
+    SDL_GPUTexture* frame_rt_reflection_texture_ = nullptr;
     std::unique_ptr<gpu::GPUTexture> default_normal_texture_; // 1x1 (128,128,255) flat tangent-space normal
     std::unique_ptr<gpu::GPUTexture> dummy_black_texture_;    // 1x1 black emissive fallback
     std::unique_ptr<gpu::GPUTexture> dummy_black_cube_;       // 1x1x6 black cube for the IBL slots when
