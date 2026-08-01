@@ -1050,4 +1050,29 @@ BRACKEN_HLSL_FIELD(ExposureAdaptUniforms, _pad0, 44);
 // render::lighting::ClusterParams (light_cluster.hpp) — SceneRenderer pushes
 // that struct directly; there is deliberately no mirror here.
 
+/**
+ * Ray-traced shadow compute uniforms — matches rt_shadow.comp.hlsl
+ * RtShadowUniforms (set 2, b0). Used by: render::RtShadowRenderer.
+ */
+struct alignas(16) RtShadowUniforms {
+    glm::mat4 invViewProj;    // clip -> world, for depth reconstruction
+    glm::vec3 sunDirection;   // direction light TRAVELS
+    float rayMaxDistance;     // ray length; shorter is cheaper and misses less
+    glm::vec3 cameraPosition;
+    float normalBias;         // offset along the normal against self-shadowing
+    glm::uvec2 outputSize;    // mask resolution (may be half the screen)
+    uint32_t tlasNodeCount;   // 0 = no acceleration structure this frame
+    float depthBias;
+};
+
+BRACKEN_HLSL_CBUFFER(RtShadowUniforms, 112);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, invViewProj, 0);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, sunDirection, 64);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, rayMaxDistance, 76);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, cameraPosition, 80);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, normalBias, 92);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, outputSize, 96);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, tlasNodeCount, 104);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, depthBias, 108);
+
 } // namespace bracken::gpu

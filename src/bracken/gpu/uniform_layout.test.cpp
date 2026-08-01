@@ -450,6 +450,7 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("prepass_grass.vert.spv", 1, 0, render::GrassVertexUniforms),
     ROW("grass.frag.spv", 3, 0, render::GrassLightingUniforms),
     ROW("water_sim.comp.spv", 2, 0, render::WaterRenderer::SimUniforms),
+    ROW("rt_shadow.comp.spv", 2, 0, gpu::RtShadowUniforms),
     ROW("water.vert.spv", 1, 0, render::WaterRenderer::VertexUniforms),
     ROW("water.frag.spv", 3, 0, render::WaterRenderer::FragmentUniforms),
 

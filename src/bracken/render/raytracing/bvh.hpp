@@ -1,0 +1,157 @@
+#pragma once
+
+#include <cstdint>
+#include <glm/glm.hpp>
+#include <span>
+#include <vector>
+
+namespace bracken::render::rt {
+
+/**
+ * One BVH node, laid out for GPU traversal.
+ *
+ * 32 bytes exactly, so two nodes share a cache line and a traversal step
+ * touching a node and its sibling costs one fetch. Every field placement here
+ * is a bandwidth decision, not a style one:
+ *
+ *  - The right child is NOT stored. Siblings are emitted adjacently, so
+ *    `right == left_first + 1`. That is 4 bytes saved per node, and 4 bytes is
+ *    the difference between 32 and 36, which is the difference between two
+ *    nodes per cache line and one.
+ *  - `count == 0` marks an interior node, so the leaf test is a compare
+ *    against zero rather than a flag bit that has to be masked out.
+ */
+struct BvhNode {
+    glm::vec3 bounds_min{0.0f};
+    /// Interior: index of the LEFT child (right is left+1). Leaf: first
+    /// primitive index.
+    uint32_t left_first = 0;
+    glm::vec3 bounds_max{0.0f};
+    /// 0 = interior node; otherwise the number of primitives in this leaf.
+    uint32_t count = 0;
+};
+static_assert(sizeof(BvhNode) == 32, "BvhNode must stay 32 bytes: two per cache line");
+
+/**
+ * A triangle in traversal form: origin plus two edges.
+ *
+ * Stored as v0/e1/e2 rather than v0/v1/v2 because Möller–Trumbore wants the
+ * edges, and precomputing them removes two vector subtractions from the
+ * innermost loop of the whole system. Same 36 bytes either way, so it is free.
+ *
+ * The trailing floats pad to 48 bytes (three 16-byte vectors), which keeps
+ * every triangle 16-byte aligned for the GPU. The padding is not wasted: it
+ * carries the source primitive id, which reflections need to look up a
+ * material and shadows simply ignore.
+ */
+struct BvhTriangle {
+    glm::vec3 v0{0.0f};
+    float pad0 = 0.0f;
+    glm::vec3 e1{0.0f}; ///< v1 - v0
+    uint32_t prim_id = 0;
+    glm::vec3 e2{0.0f}; ///< v2 - v0
+    float pad2 = 0.0f;
+};
+static_assert(sizeof(BvhTriangle) == 48, "BvhTriangle must stay 16-byte aligned for the GPU");
+
+/**
+ * A bottom-level acceleration structure: one BVH over one model's triangles,
+ * in the model's own space.
+ *
+ * BLAS-per-model is the decision that makes software ray tracing fit in memory
+ * here at all. The playground draws 6.2M triangles, but only ~600k of them are
+ * unique — the rest is instancing. A flat world BVH would be ~300 MB of
+ * triangles alone; one BLAS per model is ~29 MB, built once at load and shared
+ * by every instance.
+ */
+struct Blas {
+    std::vector<BvhNode> nodes;
+    std::vector<BvhTriangle> triangles;
+    glm::vec3 bounds_min{0.0f};
+    glm::vec3 bounds_max{0.0f};
+
+    [[nodiscard]] bool empty() const noexcept { return nodes.empty(); }
+    [[nodiscard]] std::size_t node_bytes() const noexcept { return nodes.size() * sizeof(BvhNode); }
+    [[nodiscard]] std::size_t triangle_bytes() const noexcept {
+        return triangles.size() * sizeof(BvhTriangle);
+    }
+};
+
+struct BvhBuildStats {
+    uint32_t node_count = 0;
+    uint32_t leaf_count = 0;
+    uint32_t max_depth = 0;
+    uint32_t triangle_count = 0;
+    float average_leaf_size = 0.0f;
+    /// Surface-area heuristic cost of the finished tree. Comparable between
+    /// builds of the same geometry: lower is a better tree.
+    float sah_cost = 0.0f;
+};
+
+struct BvhBuildOptions {
+    /// Stop splitting at or below this many triangles. 4 is the usual sweet
+    /// spot for software traversal: fewer means more nodes to walk, more means
+    /// wasted intersection tests.
+    uint32_t max_leaf_triangles = 4;
+    /// SAH bins per axis. 16 gets within ~1% of a full sweep at a fraction of
+    /// the cost; the build runs at load time and should not dominate it.
+    uint32_t sah_bins = 16;
+    uint32_t max_depth = 64;
+};
+
+/**
+ * Build a BLAS from an indexed triangle mesh.
+ *
+ * Binned SAH: for each axis the triangles are bucketed by centroid, the bins
+ * are swept to find the cheapest split, and the best axis wins. Median splits
+ * are simpler and produce trees that are roughly 1.5-2x slower to traverse —
+ * and traversal cost is paid every frame by every ray, while build cost is
+ * paid once, so the trade is not close.
+ *
+ * Deterministic: the same mesh always produces the same tree, so a traced
+ * frame is reproducible and can sit inside the regression gate.
+ */
+[[nodiscard]] Blas build_blas(std::span<const glm::vec3> positions,
+                              std::span<const uint32_t> indices,
+                              const BvhBuildOptions& options = {},
+                              BvhBuildStats* out_stats = nullptr);
+
+/**
+ * One instance in the top-level structure: which BLAS, and where.
+ *
+ * The inverse transform is stored rather than derived because traversal needs
+ * it per ray per instance — transforming the RAY into model space is far
+ * cheaper than transforming the model's geometry into world space, which is
+ * the entire reason a two-level structure exists.
+ */
+struct TlasInstance {
+    glm::mat4 world_to_model{1.0f};
+    glm::vec3 bounds_min{0.0f}; ///< world-space AABB of this instance
+    uint32_t blas_node_offset = 0;
+    glm::vec3 bounds_max{0.0f};
+    uint32_t blas_triangle_offset = 0;
+};
+
+/** A TLAS is itself a BVH, over instance AABBs rather than triangles. */
+struct Tlas {
+    std::vector<BvhNode> nodes;
+    std::vector<TlasInstance> instances;
+
+    [[nodiscard]] bool empty() const noexcept { return nodes.empty(); }
+};
+
+/**
+ * Build a TLAS over world-space instance bounds.
+ *
+ * Rebuilt only when instances move. A static scene builds it once; the
+ * playground's village never moves, so this is not per-frame work there.
+ */
+[[nodiscard]] Tlas build_tlas(std::span<const TlasInstance> instances,
+                              const BvhBuildOptions& options = {},
+                              BvhBuildStats* out_stats = nullptr);
+
+/** SAH cost of a finished tree, for comparing builds. Traversal-cost 1.0,
+ *  intersection-cost 1.0, which is the usual normalization. */
+[[nodiscard]] float sah_cost(std::span<const BvhNode> nodes);
+
+} // namespace bracken::render::rt
