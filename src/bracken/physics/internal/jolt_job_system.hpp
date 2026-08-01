@@ -1,8 +1,12 @@
 #pragma once
 
-// INTERNAL header — includes Jolt. Only src/bracken/physics/*.cpp may
-// include it; the public bracken::physics surface (physics_world.hpp) stays
-// Jolt-free by contract (Jolt is linked PRIVATE into the engine).
+// INTERNAL header — includes Jolt. It lives under `physics/internal/`, which
+// is the engine-wide convention for headers that are NOT part of the public
+// include tree: nothing outside `src/bracken/physics/` may include it, and
+// `public_headers.test.cpp` enforces that no header outside an `internal/`
+// directory transitively reaches Jolt (or ImGui, tinygltf, stb_). The public
+// bracken::physics surface (physics_world.hpp) stays Jolt-free by contract;
+// Jolt is linked PRIVATE into the engine.
 
 // Jolt v5.2.0's Core.h names std traits (is_trivial et al.) without
 // including <type_traits> itself, relying on transitive std-header leakage

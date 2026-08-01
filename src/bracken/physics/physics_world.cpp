@@ -4,7 +4,7 @@
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
-#include "bracken/physics/jolt_job_system.hpp"
+#include "bracken/physics/internal/jolt_job_system.hpp"
 
 #include <Jolt/Jolt.h>
 

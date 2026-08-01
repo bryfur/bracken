@@ -1,4 +1,4 @@
-#include "bracken/physics/jolt_job_system.hpp"
+#include "bracken/physics/internal/jolt_job_system.hpp"
 
 #include "bracken/core/assert.hpp"
 #include "bracken/core/jobs/job_system.hpp"
