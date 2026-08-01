@@ -1,4 +1,6 @@
 #include "gpu_pipeline.hpp"
+
+#include <array>
 #include "bracken/core/assert.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_device.hpp"
@@ -168,13 +170,22 @@ std::unique_ptr<GPUPipeline> GPUPipeline::create(GPUDevice& device, const Pipeli
     depth_stencil.enable_stencil_test = config.stencil_test_enable;
     pipeline_info.depth_stencil_state = depth_stencil;
 
-    // Color target (single target for most pipelines, 0 for depth-only)
-    SDL_GPUColorTargetDescription color_target = {};
+    // Colour targets: one for most pipelines, two for the prepass G-buffer
+    // variants, none for depth-only.
+    std::array<SDL_GPUColorTargetDescription, 2> color_targets{};
     if (config.color_format != SDL_GPU_TEXTUREFORMAT_INVALID) {
-        color_target.format = config.color_format;
-        color_target.blend_state = get_blend_state(config.blend_mode);
-        pipeline_info.target_info.color_target_descriptions = &color_target;
-        pipeline_info.target_info.num_color_targets = 1;
+        color_targets[0].format = config.color_format;
+        color_targets[0].blend_state = get_blend_state(config.blend_mode);
+        Uint32 count = 1;
+        if (config.color_format2 != SDL_GPU_TEXTUREFORMAT_INVALID) {
+            // The second target never blends: a G-buffer is a write of the
+            // surface's own values, not a composite over what was there.
+            color_targets[1].format = config.color_format2;
+            color_targets[1].blend_state = get_blend_state(BlendMode::None);
+            count = 2;
+        }
+        pipeline_info.target_info.color_target_descriptions = color_targets.data();
+        pipeline_info.target_info.num_color_targets = count;
     } else {
         // Depth-only pipeline
         pipeline_info.target_info.color_target_descriptions = nullptr;

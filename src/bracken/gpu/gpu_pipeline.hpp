@@ -50,6 +50,13 @@ struct PipelineConfig {
     // Color targets
     BlendMode blend_mode = BlendMode::None;
     SDL_GPUTextureFormat color_format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    /// Second colour attachment (MRT), INVALID for the single-target common
+    /// case. Only the depth prepass uses it, to lay down a normal+roughness
+    /// G-buffer alongside velocity when ray-traced reflections are on. A
+    /// render pass and the pipelines used inside it must agree on the
+    /// attachment count, which is why this exists as a pipeline VARIANT
+    /// rather than a runtime toggle.
+    SDL_GPUTextureFormat color_format2 = SDL_GPU_TEXTUREFORMAT_INVALID;
 
     // Depth format (set to invalid to disable depth)
     bool has_depth_target = true;

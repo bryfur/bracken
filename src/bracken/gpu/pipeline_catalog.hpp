@@ -191,6 +191,10 @@ enum class TargetFormat : uint8_t {
     R8,         ///< Single-channel unorm (ambient occlusion)
     RG16F,      ///< Two-channel half float (AO history, BRDF LUT)
     RGBA16F,    ///< Four-channel half float (bloom chain, fog, IBL cubes)
+    /// RGBA8: world normal encoded to [0,1] in RGB, linear roughness in A.
+    /// The optional second prepass attachment that feeds ray-traced
+    /// reflections; see render/rt_renderer.hpp.
+    NormalRoughness,
 };
 
 /// Rasterizer depth bias. `enabled == false` is "no bias" regardless of the
@@ -229,6 +233,9 @@ struct PipelineDesc {
     DepthBias depth_bias{};
 
     TargetFormat color = TargetFormat::SceneColor;
+    /// Second colour attachment, or DepthOnly for "none" (the usual case).
+    /// See PipelineConfig::color_format2 for why this is a variant.
+    TargetFormat color2 = TargetFormat::DepthOnly;
     /// false ⇒ no depth attachment at all; depth test and write are forced off
     /// whatever the two fields above say (this is PipelineConfig::no_depth()).
     bool depth_target = true;

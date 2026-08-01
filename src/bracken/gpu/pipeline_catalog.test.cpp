@@ -172,6 +172,10 @@ std::string describe(const PipelineConfig& config) {
     out += std::format("  targets   blend={} color={} has_depth={} depth={} samples={}\n", blend_name(config.blend_mode),
                        texture_format_name(config.color_format), config.has_depth_target,
                        texture_format_name(config.depth_format), sample_count_name(config.sample_count));
+    // Emitted only when present, so adding MRT did not churn every golden row.
+    if (config.color_format2 != SDL_GPU_TEXTUREFORMAT_INVALID) {
+        out += std::format("  targets2  color2={}\n", texture_format_name(config.color_format2));
+    }
     for (const auto& vb : config.vertex_buffers) {
         out += std::format("  vbuffer   slot={} pitch={} rate={} step={}\n", vb.slot, vb.pitch,
                            input_rate_name(vb.input_rate), vb.instance_step_rate);

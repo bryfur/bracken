@@ -763,6 +763,8 @@ SDL_GPUTextureFormat resolve_target_format(TargetFormat target, const PipelineFo
             return SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
         case TargetFormat::RGBA16F:
             return SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        case TargetFormat::NormalRoughness:
+            return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
     }
     return SDL_GPU_TEXTUREFORMAT_INVALID;
 }
@@ -815,6 +817,7 @@ PipelineConfig build_pipeline_config(const PipelineDesc& desc, const PipelineFor
     config.depth_bias_clamp = 0.0f;
 
     config.color_format = resolve_target_format(desc.color, formats);
+    config.color_format2 = resolve_target_format(desc.color2, formats);
     config.depth_format = formats.depth;
     config.has_depth_target = desc.depth_target;
     if (!desc.depth_target) {
