@@ -328,6 +328,26 @@ std::unique_ptr<Model> build_shard_model() {
     return model;
 }
 
+std::unique_ptr<Model> build_lantern_model() {
+    auto model = std::make_unique<Model>();
+    Mesh mesh;
+    // Hand-sized: about 5 units across, against a 150-unit character. The
+    // first version of this demo reused the orb shard at 18x scale, which is a
+    // glowing sphere of radius 45 — a third of the character's height, welded
+    // to their arm. A carried prop has to be sized like one.
+    add_sphere(mesh, 4.0f, 6, 8, {1.0f, 0.82f, 0.45f, 1.0f});
+    mesh.material.roughness_factor = 0.4f;
+    // Warm and clearly lit, but well under the orbs' 2.4 — this is a carried
+    // light, not a second sun, and it should not dominate the bloom pass.
+    mesh.material.emissive_factor = {0.9f, 0.6f, 0.25f};
+    // Emissive geometry carried right next to the character would otherwise
+    // shadow-stipple across their own arm.
+    mesh.cast_shadows = false;
+    model->meshes.push_back(std::move(mesh));
+    model->bounds = {glm::vec3(-4.0f), glm::vec3(4.0f)};
+    return model;
+}
+
 std::unique_ptr<Model> build_rain_streak_model() {
     auto model = std::make_unique<Model>();
     Mesh mesh;

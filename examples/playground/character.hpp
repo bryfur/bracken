@@ -22,6 +22,10 @@ std::unique_ptr<bracken::Model> build_chrome_sphere_model();
 // Small emissive octahedron used as the particle mesh for effects.
 std::unique_ptr<bracken::Model> build_shard_model();
 
+/** A small carried lantern — the bone-attachment demo's prop. Sized and lit
+ *  like something a person holds, not like the pickup orbs. */
+std::unique_ptr<bracken::Model> build_lantern_model();
+
 // Soft grey blob used as the chimney-smoke particle mesh.
 std::unique_ptr<bracken::Model> build_smoke_puff_model();
 

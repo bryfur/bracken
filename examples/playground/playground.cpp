@@ -340,7 +340,11 @@ bool PlaygroundGame::on_init() {
         for (const char* candidate : {"RightArm", "mixamorig:RightHand", "hand.R", "Hand_R"}) {
             lantern_attach_ = bracken::animation::make_attachment(
                 pm->skeleton, candidate,
-                glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -14.0f, 0.0f)));
+                // The joint is the SHOULDER; the arm box runs from y=153 down to
+                // y=103 (character.cpp), so the hand is ~52 units along the
+                // bone. Offsetting by a token amount buried the lantern inside
+                // the upper arm.
+                glm::translate(glm::mat4(1.0f), glm::vec3(5.0f, -56.0f, 0.0f)));
             if (lantern_attach_.valid()) {
                 BRACKEN_LOG_INFO("playground", "lantern attached to bone '{}'", candidate);
                 break;
@@ -350,7 +354,7 @@ bool PlaygroundGame::on_init() {
 
     // Reuse an existing small mesh as the carried lantern rather than adding
     // an asset the repo does not have.
-    lantern_model_ = models().get_handle("orb_shard");
+    lantern_model_ = models().get_handle("lantern");
 
     // --- Tier 3: nav grid ---------------------------------------------
     {
@@ -556,6 +560,8 @@ void PlaygroundGame::register_models() {
         return handle.value();
     };
     player_model_ = register_or_log("player", build_character_model());
+    // The bone-attachment demo's carried prop.
+    register_or_log("lantern", build_lantern_model());
     orb_model_ = register_or_log("orb", build_orb_model());
     chrome_model_ = register_or_log("chrome_sphere", build_chrome_sphere_model());
     register_or_log("orb_shard", build_shard_model()); // referenced by name from effects
@@ -2317,8 +2323,7 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
             // animation with no per-frame math on this side. One call.
             if (lantern_model_ != INVALID_MODEL_HANDLE && lantern_attach_.valid()) {
                 const glm::mat4 held = lantern_attach_.world(player_transform_, anim_player_);
-                fb.draw_model(lantern_model_, glm::scale(held, glm::vec3(18.0f)),
-                              {1.0f, 0.85f, 0.5f, 1.0f});
+                fb.draw_model(lantern_model_, held, {1.0f, 0.9f, 0.65f, 1.0f});
             }
         }
     }
