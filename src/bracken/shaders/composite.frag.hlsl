@@ -46,7 +46,7 @@ cbuffer CompositeUniforms : register(b0, space3) {
     float3 cdlOffset;
     float _pad1;
     float3 cdlPower;
-    float _pad2;
+    float rtReflectionEnabled;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
@@ -150,11 +150,15 @@ float4 PSMain(PSInput input) : SV_Target {
     float3 color = colorTexture.Sample(colorSampler, input.texCoord).rgb;
 
     // Traced specular, added before tonemapping so it goes through exposure
-    // and grading like every other light. alpha gates it: 0 where the surface
-    // kept the IBL probe or there is no surface, so this is a no-op when ray
-    // tracing is off (the dummy texture is transparent).
-    float4 rtSpec = rtReflectionTexture.Sample(rtReflectionSampler, input.texCoord);
-    color += rtSpec.rgb * rtSpec.a;
+    // and grading like every other light. The flag gates the whole read: with
+    // ray tracing off this slot holds the scene colour (something must be
+    // bound), so sampling it and trusting its alpha would DOUBLE the image.
+    // Within the traced texture, alpha still gates per pixel: 0 where the
+    // surface kept the IBL probe or no surface was hit.
+    if (rtReflectionEnabled > 0.5) {
+        float4 rtSpec = rtReflectionTexture.Sample(rtReflectionSampler, input.texCoord);
+        color += rtSpec.rgb * rtSpec.a;
+    }
 
     // Premultiplied fog blend (scene * transmittance + inscattered) stays linear.
     if (volumetricFogEnabled > 0.5) {

@@ -358,8 +358,17 @@ struct alignas(16) InstancedLightingUniforms {
     float iblEnabled = 0.0f;
     // Screen-AO gate — see ModelLightingUniforms::screenAOEnabled.
     float screenAOEnabled = 1.0f;
+    // Ray-traced sun shadows — see ModelLightingUniforms::rtShadowEnabled.
+    // The instanced path carries this for the same reason the non-instanced
+    // one does: without it the village (every building, crate, tree and rock
+    // is an instanced draw) keeps its cascade shadows while the character
+    // alone gets traced ones, which reads as "ray tracing does nothing".
+    float rtShadowEnabled = 0.0f;
+    float _rtPad0 = 0.0f;
+    float _rtPad1 = 0.0f;
+    float _rtPad2 = 0.0f;
 };
-BRACKEN_HLSL_CBUFFER(InstancedLightingUniforms, 208);
+BRACKEN_HLSL_CBUFFER(InstancedLightingUniforms, 224);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, lightDir, 0);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _padding0, 12);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, lightColor, 16);
@@ -393,6 +402,8 @@ BRACKEN_HLSL_FIELD(InstancedLightingUniforms, screenAOTexelX, 192);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, screenAOTexelY, 196);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, iblEnabled, 200);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, screenAOEnabled, 204);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtShadowEnabled, 208);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _rtPad0, 212);
 
 /**
  * Per-instance data for instanced model rendering (storage buffer).
@@ -778,7 +789,11 @@ struct alignas(16) CompositeUniforms {
     glm::vec3 cdlOffset{0.0f, 0.0f, 0.0f};
     float _pad1 = 0.0f;
     glm::vec3 cdlPower{1.0f, 1.0f, 1.0f};
-    float _pad2 = 0.0f;
+    /// 1 = add the traced specular from the RT reflection texture. Gated by a
+    /// flag rather than by the texture's alpha because the slot is bound to
+    /// the scene colour when ray tracing is off (SDL3 GPU requires every
+    /// declared sampler bound), and that texture's alpha is NOT zero.
+    float rtReflectionEnabled = 0.0f;
 };
 BRACKEN_HLSL_CBUFFER(CompositeUniforms, 112);
 BRACKEN_HLSL_FIELD(CompositeUniforms, bloomStrength, 0);
@@ -799,7 +814,7 @@ BRACKEN_HLSL_FIELD(CompositeUniforms, _pad0, 76);
 BRACKEN_HLSL_FIELD(CompositeUniforms, cdlOffset, 80);
 BRACKEN_HLSL_FIELD(CompositeUniforms, _pad1, 92);
 BRACKEN_HLSL_FIELD(CompositeUniforms, cdlPower, 96);
-BRACKEN_HLSL_FIELD(CompositeUniforms, _pad2, 108);
+BRACKEN_HLSL_FIELD(CompositeUniforms, rtReflectionEnabled, 108);
 
 /**
  * FXAA pass fragment uniforms (set 3, b0)

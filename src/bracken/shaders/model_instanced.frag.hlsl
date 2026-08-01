@@ -49,6 +49,12 @@ cbuffer LightingUniforms {
     float iblEnabled;       // 1 = sky IBL ambient (samplers 7-9), 0 = hemisphere fallback
     float screenAOEnabled;  // 0 for MASK/BLEND: not in the depth prepass, so the AO
                             // texel under them belongs to the geometry behind them
+    // Ray-traced sun shadow mask — see model.frag.hlsl for the full note on
+    // why it shares screenAOTexture and screenAOTexel*.
+    float rtShadowEnabled;
+    float _rtPad0;
+    float _rtPad1;
+    float _rtPad2;
 };
 
 [[vk::binding(1, 3)]]
@@ -97,10 +103,13 @@ Texture2D emissiveTexture;
 [[vk::combinedImageSampler]][[vk::binding(5, 2)]]
 SamplerState emissiveSampler;
 
-// Full-res screen-space GTAO (R8, 1 = unoccluded), computed before this pass
-// from the prepass depth. Bound to a 1x1 white dummy when AO is off.
+// Screen-space lighting terms, ONE binding for two of them (this stage is at
+// its sampler ceiling, exactly as in model.frag.hlsl):
+//   R = ambient occlusion (GTAO)
+//   G = sun visibility from ray-traced shadows, read only when rtShadowEnabled
+// With RT shadows off this is GTAO's R8 texture unchanged and G is never read.
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
-Texture2D<float> screenAOTexture;
+Texture2D<float4> screenAOTexture;
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
 SamplerState screenAOSampler;
 
@@ -179,6 +188,12 @@ float4 PSMain(PSInput input) : SV_Target {
     roughness = specularAARoughness(N, roughness);
 
     float shadow = calcShadow(input.fragPos, N_geo, L, input.viewDepth, input.position.xy);
+
+    // Traced sun shadows REPLACE the cascade result (see model.frag.hlsl).
+    if (rtShadowEnabled > 0.5) {
+        float2 rtUV = input.position.xy * float2(screenAOTexelX, screenAOTexelY);
+        shadow = screenAOTexture.SampleLevel(screenAOSampler, rtUV, 0).g;
+    }
     float3 directLight = lightColor * sunIntensity * shadow;
 
     float3 direct = evaluatePBR(N, V, L, directLight, baseColor.rgb, metallic, roughness, 1.0);
@@ -188,7 +203,7 @@ float4 PSMain(PSInput input) : SV_Target {
     float screenAO = 1.0;
     if (screenAOEnabled > 0.5) {
         screenAO = screenAOTexture.Sample(
-            screenAOSampler, input.position.xy * float2(screenAOTexelX, screenAOTexelY));
+            screenAOSampler, input.position.xy * float2(screenAOTexelX, screenAOTexelY)).r;
     }
     float aoCombined = min(matAO, screenAO);
 

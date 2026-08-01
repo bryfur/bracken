@@ -50,8 +50,12 @@ constexpr ShaderResources k_vs_grass{
 
 /// `composite.frag`: color + bloom + volumetric fog + depth, plus the
 /// auto-exposure state buffer.
+// 5 samplers: scene colour, bloom, fog, depth, and the ray-traced reflection
+// (bound to a dummy when RT is off). This count MUST match the shader — a
+// stale value here does not fail loudly, it misbinds the storage buffer that
+// follows the samplers and quietly breaks tonemapping.
 constexpr ShaderResources k_fs_composite{
-    .num_samplers = 4, .num_storage_buffers = 1, .num_uniform_buffers = 1};
+    .num_samplers = 5, .num_storage_buffers = 1, .num_uniform_buffers = 1};
 
 // =============================================================================
 // Shared fixed-function constants

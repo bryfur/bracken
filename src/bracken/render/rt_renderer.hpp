@@ -139,6 +139,7 @@ private:
     RtResolution reflection_res_ = RtResolution::Quarter;
     bool built_with_attributes_ = false;
     bool warned_missing_attributes_ = false;
+    bool warned_no_normal_buffer_ = false;
     RtStats stats_{};
 };
 

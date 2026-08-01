@@ -492,6 +492,7 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
     lighting_uniforms.screenAOTexelX = 1.0f / static_cast<float>(std::max(context_->width(), 1));
     lighting_uniforms.screenAOTexelY = 1.0f / static_cast<float>(std::max(context_->height(), 1));
     lighting_uniforms.iblEnabled = frame_ibl_active_ ? 1.0f : 0.0f;
+    lighting_uniforms.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
 
     SDL_GPUBuffer* storage_buf = instance_storage_buffer_->handle();
 

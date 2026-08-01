@@ -142,6 +142,21 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_G
     // ---- reflections -----------------------------------------------------
     if (reflections.enabled) {
         BRACKEN_PROFILE_ZONE("RtRenderer::reflections");
+        // KNOWN NON-FUNCTIONAL: rt_reflection.comp.hlsl needs a per-pixel
+        // normal + roughness input to decide which surfaces are smooth enough
+        // to trace. The engine has no such target (and no MRT support to write
+        // one), so `ao_input` currently occupies that slot; an R8 read yields
+        // .w == 1.0, which fails the roughness gate on every pixel and writes
+        // alpha 0 everywhere. The pass is left wired and correct so it works
+        // the moment a real input exists — but say so rather than burning rays
+        // and attribute memory in silence.
+        if (!warned_no_normal_buffer_) {
+            BRACKEN_LOG_WARN("rt",
+                             "RT reflections are enabled but produce nothing: the pass needs a "
+                             "normal+roughness target the renderer does not yet write. Shadows "
+                             "are unaffected.");
+            warned_no_normal_buffer_ = true;
+        }
         if (!scene_.has_attributes()) {
             // Attributes are gathered at build time; enabling reflections
             // afterwards cannot conjure them. Say so once rather than

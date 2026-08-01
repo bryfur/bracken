@@ -209,6 +209,7 @@ void PostProcessStack::render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::Pip
     uniforms.cdlSlope = params.cdl_slope;
     uniforms.cdlOffset = params.cdl_offset;
     uniforms.cdlPower = params.cdl_power;
+    uniforms.rtReflectionEnabled = rt_reflection_texture ? 1.0f : 0.0f;
 
     SDL_GPUColorTargetInfo color_target = {};
     color_target.texture = target;
@@ -239,8 +240,9 @@ void PostProcessStack::render_composite_pass(SDL_GPUCommandBuffer* cmd, gpu::Pip
     // Full-res depth drives the joint bilateral upsample of the fog.
     bindings[3].texture = offscreen_depth_->handle();
     bindings[3].sampler = nearest_clamp_sampler_;
-    // Traced reflections, or the transparent dummy when ray tracing is off —
-    // the composite adds rgb*a, so a zero alpha makes it a no-op.
+    // Traced reflections. With ray tracing off there is nothing to bind but
+    // the slot is declared, so the scene colour stands in and
+    // rtReflectionEnabled keeps the shader from reading it.
     bindings[4].texture = rt_reflection_texture ? rt_reflection_texture
                                                 : offscreen_color_->handle();
     bindings[4].sampler = linear_clamp_sampler_;
