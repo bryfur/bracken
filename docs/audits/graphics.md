@@ -35,7 +35,7 @@ On the gap side, the highest value-for-effort items for this engine (outdoor, fo
 | Particles | Additive unlit HDR mesh particles; `"sprite"` type declared but **not implemented** (documented stub) | `particle.frag.hlsl`, `docs/architecture.md:288` |
 | Culling | CPU frustum culling (main + per-cascade), distance culling, per-model instanced batching | `scene_renderer.cpp:1173-1298` |
 
-Known documented stubs not re-flagged as findings: GPU timestamp pool returns zeros; `Mesh::near_only` unenforced; cluster SSBOs keep stale contents when light count is zero (guarded by zeroed params); `render_graph/` deliberately unwired.
+Known documented stubs not re-flagged as findings: GPU timestamp pool returns zeros; cluster SSBOs keep stale contents when light count is zero (guarded by zeroed params); `render_graph/` deliberately unwired.
 
 ---
 

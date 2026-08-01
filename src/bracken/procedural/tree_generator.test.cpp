@@ -91,10 +91,10 @@ TEST(TreeGenerator, DifferentSeedsProduceDifferentTrees) {
 TEST(TreeGenerator, AABBIsComputed) {
     auto model = TreeGenerator::generate_oak(1);
     // Tree should extend upward from origin
-    EXPECT_GT(model->max_y, 0.0f);
-    EXPECT_NEAR(model->min_y, 0.0f, 1.0f);
+    EXPECT_GT(model->bounds.max.y, 0.0f);
+    EXPECT_NEAR(model->bounds.min.y, 0.0f, 1.0f);
     // Should have some width
-    EXPECT_GT(model->max_x - model->min_x, 0.1f);
+    EXPECT_GT(model->bounds.max.x - model->bounds.min.x, 0.1f);
 }
 
 TEST(TreeGenerator, BoundingSphereIsComputed) {

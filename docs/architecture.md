@@ -45,7 +45,7 @@ points from a layer to one below it:
 core                                          sink: fan-out 0, includes nothing in-tree
   core/jobs, core/asset, memory, contracts    contracts: core + glm + <std> only
     gpu, animation
-      model_loader.hpp, heightmap.hpp         asset-layer leaves, filed at the root
+      model_loader.{hpp,cpp}, heightmap.{hpp,cpp}   asset-layer leaves, at the root
         render, render/lighting, procedural, physics
           scene                               FramePacket / FrameBuilder / PacketRing
             effects, systems
@@ -789,9 +789,10 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
 - **`ModelManager`**: name → `ModelHandle` (`uint32_t`, `0` =
   `INVALID_MODEL_HANDLE`) registry. `load_model(name, path)`,
   `get_model(handle|name)`, `register_model(name, unique_ptr<Model>)` for
-  procedural meshes, `reload_model(handle)`, `enable_hot_reload(watcher)`.
+  procedural meshes — returns `core::Result<ModelHandle, ModelRegisterError>`
+  and finishes the model (bounds from mesh vertices when unset, bounding
+  sphere, `loaded`) — `reload_model(handle)`, `enable_hot_reload(watcher)`.
 - **Mesh flags** (`model_loader.hpp`): `cast_shadows`, `shadow_only`,
-  `near_only` (declared but **not yet enforced** by the renderer),
   `has_packed_occlusion` (ORM-packed occlusion in the metallic-roughness
   texture). Standalone (non-ORM) occlusion textures are unsupported: the
   loader warns and drops them at load.
@@ -1240,8 +1241,6 @@ debugging "why is this value zero / where did my draw go":
 - **Animation channels targeting non-skin nodes are dropped** (counted and
   logged once per model as a `ModelLoadReport` summary) at glb
   load.
-- **`Mesh::near_only` is not enforced** — the flag exists, the renderer
-  ignores it.
 - **`BRACKEN_ASSERT` conditions are never evaluated in release builds** —
   under `NDEBUG` the condition is type-checked via `sizeof` but not executed
   (`core/assert.hpp`), so asserted expressions must be side-effect-free. Use

@@ -85,17 +85,6 @@ void add_sphere(Mesh& mesh, float radius, int stacks, int sectors, const glm::ve
     }
 }
 
-void finalize_bounds(Model& model, const glm::vec3& min, const glm::vec3& max) {
-    model.min_x = min.x;
-    model.min_y = min.y;
-    model.min_z = min.z;
-    model.max_x = max.x;
-    model.max_y = max.y;
-    model.max_z = max.z;
-    model.compute_bounding_sphere();
-    model.loaded = true;
-}
-
 // ---------------------------------------------------------------------------
 // Skeleton helpers
 // ---------------------------------------------------------------------------
@@ -292,7 +281,10 @@ std::unique_ptr<Model> build_character_model() {
     model->animations.push_back(make_locomotion_clip("Run", 0.55f, 0.85f, 0.9f, 0.7f, 8.0f, 0.14f));
     model->animations.push_back(make_attack_clip());
 
-    finalize_bounds(*model, {-31, 0, -18}, {31, 182, 18});
+    // Set by hand, not left for register_model to scan: this is a SKINNED
+    // model, so the vertex AABB is the bind pose and an animation that reaches
+    // outside it would be frustum-culled. These carry the headroom.
+    model->bounds = {{-31, 0, -18}, {31, 182, 18}};
     return model;
 }
 
@@ -309,7 +301,7 @@ std::unique_ptr<Model> build_orb_model() {
     // must opt out of shadow casting.
     mesh.cast_shadows = false;
     model->meshes.push_back(std::move(mesh));
-    finalize_bounds(*model, glm::vec3(-8.0f), glm::vec3(8.0f));
+    model->bounds = {glm::vec3(-8.0f), glm::vec3(8.0f)};
     return model;
 }
 
@@ -322,7 +314,7 @@ std::unique_ptr<Model> build_chrome_sphere_model() {
     mesh.material.metallic_factor = 1.0f;
     mesh.material.roughness_factor = 0.06f;
     model->meshes.push_back(std::move(mesh));
-    finalize_bounds(*model, glm::vec3(-45.0f), glm::vec3(45.0f));
+    model->bounds = {glm::vec3(-45.0f), glm::vec3(45.0f)};
     return model;
 }
 
@@ -332,7 +324,7 @@ std::unique_ptr<Model> build_shard_model() {
     add_sphere(mesh, 2.5f, 4, 6, {1.0f, 0.75f, 0.35f, 1.0f});
     mesh.material.emissive_factor = {2.0f, 1.2f, 0.4f};
     model->meshes.push_back(std::move(mesh));
-    finalize_bounds(*model, glm::vec3(-2.5f), glm::vec3(2.5f));
+    model->bounds = {glm::vec3(-2.5f), glm::vec3(2.5f)};
     return model;
 }
 
@@ -367,7 +359,7 @@ std::unique_ptr<Model> build_rain_streak_model() {
     }
     mesh.cast_shadows = false;
     model->meshes.push_back(std::move(mesh));
-    finalize_bounds(*model, {-HALF_W, -HALF_H, -HALF_W}, {HALF_W, HALF_H, HALF_W});
+    model->bounds = {{-HALF_W, -HALF_H, -HALF_W}, {HALF_W, HALF_H, HALF_W}};
     return model;
 }
 
@@ -377,7 +369,7 @@ std::unique_ptr<Model> build_splash_drop_model() {
     add_sphere(mesh, 1.6f, 3, 5, {0.55f, 0.65f, 0.85f, 1.0f});
     mesh.cast_shadows = false;
     model->meshes.push_back(std::move(mesh));
-    finalize_bounds(*model, glm::vec3(-1.6f), glm::vec3(1.6f));
+    model->bounds = {glm::vec3(-1.6f), glm::vec3(1.6f)};
     return model;
 }
 
@@ -391,7 +383,7 @@ std::unique_ptr<Model> build_smoke_puff_model() {
     // Smoke should never write into the shadow atlas or the sun cascades.
     mesh.cast_shadows = false;
     model->meshes.push_back(std::move(mesh));
-    finalize_bounds(*model, glm::vec3(-9.0f), glm::vec3(9.0f));
+    model->bounds = {glm::vec3(-9.0f), glm::vec3(9.0f)};
     return model;
 }
 

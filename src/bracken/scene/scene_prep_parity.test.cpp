@@ -100,14 +100,25 @@ struct PrepWorld {
     }
 };
 
+// register_model refuses a model with no geometry, so the synthetic models
+// below carry one throwaway triangle. Prep works from bounds and handles, not
+// mesh contents, so it changes nothing these tests measure.
+void add_token_mesh(Model& m) {
+    Mesh mesh;
+    mesh.vertices.resize(3);
+    mesh.indices = {0, 1, 2};
+    m.meshes.push_back(std::move(mesh));
+}
+
 std::unique_ptr<Model> make_static_model(Lcg& rng) {
     auto m = std::make_unique<Model>();
-    m->min_x = -rng.next_float(0.5f, 8.0f);
-    m->min_y = 0.0f;
-    m->min_z = -rng.next_float(0.5f, 8.0f);
-    m->max_x = rng.next_float(0.5f, 8.0f);
-    m->max_y = rng.next_float(1.0f, 12.0f);
-    m->max_z = rng.next_float(0.5f, 8.0f);
+    add_token_mesh(*m);
+    m->bounds.min.x = -rng.next_float(0.5f, 8.0f);
+    m->bounds.min.y = 0.0f;
+    m->bounds.min.z = -rng.next_float(0.5f, 8.0f);
+    m->bounds.max.x = rng.next_float(0.5f, 8.0f);
+    m->bounds.max.y = rng.next_float(1.0f, 12.0f);
+    m->bounds.max.z = rng.next_float(0.5f, 8.0f);
     m->compute_bounding_sphere();
     return m;
 }
@@ -139,11 +150,13 @@ void build_world(PrepWorld& w, size_t model_count, size_t skinned_count) {
     Lcg rng{0xC0FFEEu};
 
     for (int i = 0; i < 6; ++i) {
-        w.static_handles.push_back(w.models.register_model("static_" + std::to_string(i), make_static_model(rng)));
+        w.static_handles.push_back(
+            w.models.register_model("static_" + std::to_string(i), make_static_model(rng)).value_or(0));
     }
     for (int i = 0; i < 3; ++i) {
         w.skinned_handles.push_back(
-            w.models.register_model("skinned_" + std::to_string(i), make_skinned_model(rng, 8u + 8u * i)));
+            w.models.register_model("skinned_" + std::to_string(i), make_skinned_model(rng, 8u + 8u * i))
+                .value_or(0));
     }
 
     // Camera + frustums (main perspective; cascades = shifted ortho volumes).

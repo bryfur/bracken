@@ -40,10 +40,21 @@ namespace jobs = bracken::core::jobs;
 
 namespace {
 
+// register_model refuses a model with no geometry, so the synthetic models
+// below carry one throwaway triangle. Prep works from bounds and handles, not
+// mesh contents, so it changes nothing these tests measure.
+void add_token_mesh(Model& m) {
+    Mesh mesh;
+    mesh.vertices.resize(3);
+    mesh.indices = {0, 1, 2};
+    m.meshes.push_back(std::move(mesh));
+}
+
 std::unique_ptr<Model> make_model(bool with_skeleton, uint32_t joints = 0) {
     auto m = std::make_unique<Model>();
-    m->min_x = m->min_y = m->min_z = -1.0f;
-    m->max_x = m->max_y = m->max_z = 1.0f;
+    add_token_mesh(*m);
+    m->bounds.min.x = m->bounds.min.y = m->bounds.min.z = -1.0f;
+    m->bounds.max.x = m->bounds.max.y = m->bounds.max.z = 1.0f;
     m->compute_bounding_sphere();
     if (with_skeleton) {
         m->has_skeleton = true;
@@ -107,7 +118,7 @@ FrameStatsPartial run_skinned_prep(DiagWorld& w) {
 
 TEST(FrameDiagnosticsTest, UnknownModelHandleIsCountedOncePerDraw) {
     DiagWorld w;
-    const ModelHandle good = w.models.register_model("good", make_model(false));
+    const ModelHandle good = w.models.register_model("good", make_model(false)).value_or(0);
     const ModelHandle bogus = static_cast<ModelHandle>(9999); // never registered
 
     FrameBuilder fb(w.packet);
@@ -142,7 +153,7 @@ TEST(FrameDiagnosticsTest, InvalidHandleIsRefusedAtEmitTime) {
 
 TEST(FrameDiagnosticsTest, CleanFrameCountsNothing) {
     DiagWorld w;
-    const ModelHandle good = w.models.register_model("good", make_model(false));
+    const ModelHandle good = w.models.register_model("good", make_model(false)).value_or(0);
     FrameBuilder fb(w.packet);
     for (int i = 0; i < 8; ++i) {
         fb.draw_model(good, glm::mat4(1.0f));
@@ -159,8 +170,8 @@ TEST(FrameDiagnosticsTest, CleanFrameCountsNothing) {
 
 TEST(FrameDiagnosticsTest, SkinnedDrawWithNoSkeletonIsCounted) {
     DiagWorld w;
-    const ModelHandle rigged = w.models.register_model("rigged", make_model(true, 8));
-    const ModelHandle rigid = w.models.register_model("rigid", make_model(false));
+    const ModelHandle rigged = w.models.register_model("rigged", make_model(true, 8)).value_or(0);
+    const ModelHandle rigid = w.models.register_model("rigid", make_model(false)).value_or(0);
 
     FrameBuilder fb(w.packet);
     for (const ModelHandle h : {rigged, rigid, rigid}) {
@@ -179,7 +190,7 @@ TEST(FrameDiagnosticsTest, SkinnedDrawWithNoSkeletonIsCounted) {
 
 TEST(FrameDiagnosticsTest, PaletteBudgetOverrunIsCountedAndSummarized) {
     DiagWorld w;
-    const ModelHandle rigged = w.models.register_model("rigged", make_model(true, 4));
+    const ModelHandle rigged = w.models.register_model("rigged", make_model(true, 4)).value_or(0);
 
     FrameBuilder fb(w.packet);
     constexpr uint32_t k_over = 5;
@@ -208,7 +219,7 @@ TEST(FrameDiagnosticsTest, PaletteBudgetOverrunIsCountedAndSummarized) {
 
 TEST(FrameDiagnosticsTest, ThreeDContentWithoutACameraIsDetected) {
     DiagWorld w;
-    const ModelHandle good = w.models.register_model("good", make_model(false));
+    const ModelHandle good = w.models.register_model("good", make_model(false)).value_or(0);
     FrameBuilder fb(w.packet);
     fb.draw_model(good, glm::mat4(1.0f));
     FrameAccess::seal(fb);
@@ -291,7 +302,7 @@ TEST(FrameDiagnosticsTest, DroppedLightCountResetsEachFrame) {
 
 TEST(FrameDiagnosticsTest, CountsAreIdenticalAtAnyWorkerCount) {
     DiagWorld w;
-    const ModelHandle good = w.models.register_model("good", make_model(false));
+    const ModelHandle good = w.models.register_model("good", make_model(false)).value_or(0);
     FrameBuilder fb(w.packet);
     for (uint32_t i = 0; i < 4000; ++i) {
         // Every third draw names a handle nothing ever registered.

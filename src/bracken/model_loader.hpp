@@ -14,6 +14,7 @@
 // the GPU resource headers below in behind it; re-exported here so every
 // existing `#include "bracken/model_loader.hpp"` still sees both names.
 #include "bracken/contracts/model_handle.hpp"
+#include "bracken/core/result.hpp"
 
 // Include GPU abstraction headers for proper type definitions
 #include "bracken/gpu/gpu_buffer.hpp"
@@ -102,11 +103,8 @@ struct Mesh {
     // shadow_only=true   : main pass skips this mesh; only shadow passes render it.
     //   Used for canopy shadow proxies — a low-poly ellipsoid that approximates the
     //   leaf silhouette for shadows, replacing thousands of individual leaf quads.
-    // near_only=true     : hint that this mesh should only render near the camera
-    //   (high-frequency detail). Not yet enforced.
     bool cast_shadows = true;
     bool shadow_only = false;
-    bool near_only = false;
 
     // Texture data for deferred upload (before GPU upload)
     std::vector<uint8_t> texture_pixels;
@@ -128,10 +126,25 @@ struct Mesh {
     void bind_buffers(struct SDL_GPURenderPass* pass) const;
 };
 
+/** Axis-aligned bounding box in model-local space. */
+struct AABB {
+    glm::vec3 min{0.0f};
+    glm::vec3 max{0.0f};
+
+    [[nodiscard]] glm::vec3 size() const { return max - min; }
+    [[nodiscard]] glm::vec3 center() const { return (min + max) * 0.5f; }
+    /** No extent in any axis — which is also the default-constructed "nobody
+     *  filled this in" state ModelManager::register_model derives from. */
+    [[nodiscard]] bool empty() const { return !(max.x > min.x || max.y > min.y || max.z > min.z); }
+};
+
 struct Model {
     std::vector<Mesh> meshes;
-    float min_x = 0, min_y = 0, min_z = 0;
-    float max_x = 0, max_y = 0, max_z = 0;
+    /** Model-local bounds. Set by the loader/generator, or derived from mesh
+     *  vertices by register_model when left empty. Skinned models usually want
+     *  them set by hand with animation headroom: the vertex AABB is the BIND
+     *  pose, and a pose that reaches outside it would be culled. */
+    AABB bounds;
     bool loaded = false;
 
     // Skeletal animation data
@@ -144,14 +157,14 @@ struct Model {
     glm::vec3 bounding_center = {0, 0, 0};
     float bounding_half_diag = 0.0f;
 
-    float width() const { return max_x - min_x; }
-    float height() const { return max_y - min_y; }
-    float depth() const { return max_z - min_z; }
+    float width() const { return bounds.size().x; }
+    float height() const { return bounds.size().y; }
+    float depth() const { return bounds.size().z; }
     float max_dimension() const { return std::max({width(), height(), depth()}); }
 
     void compute_bounding_sphere() {
-        bounding_center = glm::vec3((min_x + max_x) * 0.5f, (min_y + max_y) * 0.5f, (min_z + max_z) * 0.5f);
-        bounding_half_diag = glm::length(glm::vec3(width(), height(), depth())) * 0.5f;
+        bounding_center = bounds.center();
+        bounding_half_diag = glm::length(bounds.size()) * 0.5f;
     }
 
     // Animation helpers
@@ -187,6 +200,19 @@ struct ModelLoadReport {
     }
     [[nodiscard]] bool any() const { return total() != 0; }
 };
+
+/** Why ModelManager::register_model refused a model. */
+enum class ModelRegisterError : uint8_t {
+    /// No meshes, or no mesh with any geometry to draw or upload.
+    EmptyModel,
+    /// Another model already owns that name. Registering anyway would orphan
+    /// the previous handle: it would stay valid but unreachable by name.
+    NameAlreadyRegistered,
+    /// A device is set but at least one mesh failed to reach the GPU.
+    UploadFailed,
+};
+
+[[nodiscard]] const char* to_string(ModelRegisterError error);
 
 class ModelLoader {
 public:
@@ -242,9 +268,21 @@ public:
     /// Const-safe after load.
     ModelHandle get_handle(const std::string& name) const;
 
-    /// Register a pre-built model (e.g. procedurally generated). Takes ownership.
-    /// Uploads to GPU if device is set. Returns handle. Main-thread (asserted).
-    ModelHandle register_model(const std::string& name, std::unique_ptr<Model> model);
+    /**
+     * Register a pre-built model (e.g. procedurally generated). Takes
+     * ownership, uploads to the GPU when a device is set, and finishes the
+     * model the host used to finish by hand: `bounds` are derived from the
+     * mesh vertices when left empty, the bounding sphere is computed from
+     * them, and `loaded` is set. Forgetting compute_bounding_sphere() used to
+     * leave `bounding_half_diag == 0`, which frustum-culls the model into
+     * invisibility with no message anywhere.
+     *
+     * Main-thread (asserted). See ModelRegisterError for the refusals — the
+     * previous signature validated nothing and answered a name collision by
+     * silently orphaning the older handle.
+     */
+    [[nodiscard]] core::Result<ModelHandle, ModelRegisterError> register_model(const std::string& name,
+                                                                              std::unique_ptr<Model> model);
 
     /// Re-parse the source file and replace the model's contents in place:
     /// the ModelHandle and any raw Model* previously returned by get_model

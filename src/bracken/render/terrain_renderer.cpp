@@ -301,11 +301,7 @@ float TerrainRenderer::get_height(float x, float z) const {
 
 glm::vec3 TerrainRenderer::get_normal(float x, float z) const {
     if (heightmap_) {
-        float nx = 0.0f;
-        float ny = 1.0f;
-        float nz = 0.0f;
-        heightmap_->get_normal_world(x, z, nx, ny, nz);
-        return {nx, ny, nz};
+        return heightmap_->get_normal_world(x, z);
     }
     // Fallback: return up vector
     return {0.0f, 1.0f, 0.0f};

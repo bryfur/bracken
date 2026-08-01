@@ -12,12 +12,12 @@ using namespace bracken;
 // Does not need meshes/skeleton -- only the bounding fields are used.
 static Model make_test_model(float min_x, float max_x, float min_y, float max_y, float min_z, float max_z) {
     Model m;
-    m.min_x = min_x;
-    m.max_x = max_x;
-    m.min_y = min_y;
-    m.max_y = max_y;
-    m.min_z = min_z;
-    m.max_z = max_z;
+    m.bounds.min.x = min_x;
+    m.bounds.max.x = max_x;
+    m.bounds.min.y = min_y;
+    m.bounds.max.y = max_y;
+    m.bounds.min.z = min_z;
+    m.bounds.max.z = max_z;
     return m;
 }
 

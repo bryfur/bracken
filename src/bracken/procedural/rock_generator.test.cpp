@@ -98,7 +98,7 @@ TEST(RockGenerator, AdjacentLargeSeedsBeyondFloatPrecisionDiffer) {
 TEST(RockGenerator, FlatBaseSitsAtYZero) {
     auto model = RockGenerator::generate(test_params());
     ASSERT_NE(model, nullptr);
-    EXPECT_EQ(model->min_y, 0.0f);
+    EXPECT_EQ(model->bounds.min.y, 0.0f);
     float lowest = 1e9f;
     for (const auto& v : model->meshes[0].vertices) {
         EXPECT_GE(v.position.y, 0.0f);
@@ -111,11 +111,11 @@ TEST(RockGenerator, FlatBaseSitsAtYZero) {
 TEST(RockGenerator, AABBIsSymmetricInXZ) {
     auto model = RockGenerator::generate(test_params());
     ASSERT_NE(model, nullptr);
-    EXPECT_FLOAT_EQ(model->min_x, -model->max_x);
-    EXPECT_FLOAT_EQ(model->min_z, -model->max_z);
-    EXPECT_GT(model->max_x, 0.0f);
-    EXPECT_GT(model->max_z, 0.0f);
-    EXPECT_GT(model->max_y, 0.0f);
+    EXPECT_FLOAT_EQ(model->bounds.min.x, -model->bounds.max.x);
+    EXPECT_FLOAT_EQ(model->bounds.min.z, -model->bounds.max.z);
+    EXPECT_GT(model->bounds.max.x, 0.0f);
+    EXPECT_GT(model->bounds.max.z, 0.0f);
+    EXPECT_GT(model->bounds.max.y, 0.0f);
 }
 
 TEST(RockGenerator, VerticesStayWithinGridBounds) {

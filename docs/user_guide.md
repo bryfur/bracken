@@ -2954,8 +2954,13 @@ Declared in `src/bracken/model_loader.hpp`. Key facts:
   on a bad handle (verified by `src/bracken/model_loader.test.cpp`).
 - `get_handle(name)` — name → handle, `INVALID_MODEL_HANDLE` if not found.
 - `register_model(name, std::unique_ptr<Model>)` — hand the manager a model
-  you built in code (procedural geometry). Takes ownership, uploads to GPU if
-  a device is set, returns a handle.
+  you built in code (procedural geometry). Takes ownership, uploads to the GPU
+  if a device is set, and **finishes the model for you**: `bounds` derived
+  from the mesh vertices when you left them empty, the bounding sphere
+  computed from them, `loaded` set. Returns
+  `core::Result<ModelHandle, ModelRegisterError>` — `EmptyModel` (no
+  geometry), `NameAlreadyRegistered`, or `UploadFailed`; `to_string(error)`
+  gives a message.
 - `reload_model(handle)` — re-parse the source file and swap the model in
   place; the handle stays valid. Returns `false` (and leaves the old model
   untouched) if the file fails to parse.
@@ -2966,9 +2971,10 @@ Declared in `src/bracken/model_loader.hpp`. Key facts:
   `init_renderer`; you only call this yourself when using a `ModelManager`
   standalone.
 
-Registering the same name twice is not an error: the name map is simply
-re-pointed at the new handle. The old model stays alive and reachable through
-its old handle, but is no longer reachable by name.
+Registering the same name twice through `register_model` **is** an error
+(`NameAlreadyRegistered`): re-pointing the map would leave the previous model
+alive but reachable only by a handle nobody kept. `load_model` still allows
+it — that path is unchanged.
 
 #### Registering procedural models
 
@@ -2979,21 +2985,29 @@ of its assets in code:
 ```cpp
 void PlaygroundGame::register_models() {
     auto& mm = models();
-    player_model_ = mm.register_model("player", build_character_model());
-    orb_model_ = mm.register_model("orb", build_orb_model());
-    mm.register_model("orb_shard", build_shard_model()); // referenced by name from effects
+    auto register_or_log = [&mm](const char* name, std::unique_ptr<Model> model) {
+        auto handle = mm.register_model(name, std::move(model));
+        if (!handle) {
+            BRACKEN_LOG_ERROR("game", "register_model('{}'): {}", name, to_string(handle.error()));
+            return INVALID_MODEL_HANDLE;
+        }
+        return handle.value();
+    };
+    player_model_ = register_or_log("player", build_character_model());
+    orb_model_ = register_or_log("orb", build_orb_model());
+    register_or_log("orb_shard", build_shard_model()); // referenced by name from effects
 
-    mm.register_model("tree_oak", procedural::TreeGenerator::generate_oak(7));
-    mm.register_model("tree_pine", procedural::TreeGenerator::generate_pine(21));
-    mm.register_model("rock_boulder", procedural::RockGenerator::generate_boulder(11));
+    register_or_log("tree_oak", procedural::TreeGenerator::generate_oak(7));
+    register_or_log("rock_boulder", procedural::RockGenerator::generate_boulder(11));
 }
 ```
 
-A hand-built `Model` just needs `meshes` filled with vertices/indices, the
-`min_*`/`max_*` bounds set, and `compute_bounding_sphere()` called (the
-procedural generators in `src/bracken/procedural/` do all this). Procedural
-models have no source path, so `reload_model` returns `false` for them and hot
-reload skips them.
+A hand-built `Model` just needs `meshes` filled with vertices/indices —
+`register_model` derives `bounds`, the bounding sphere and `loaded`. Set
+`bounds` yourself when the vertex AABB is the wrong answer, which is the
+normal case for a **skinned** model: the vertex AABB is the bind pose, and a
+pose reaching outside it gets frustum-culled. Procedural models have no source
+path, so `reload_model` returns `false` for them and hot reload skips them.
 
 #### Hot reload
 
@@ -3048,9 +3062,9 @@ data** to save memory. Consequences you must know:
 
 - `std::vector<Mesh> meshes` — one `Mesh` per glTF **primitive** (a glTF mesh
   with 3 primitives yields 3 engine meshes).
-- Axis-aligned bounds `min_x/min_y/min_z` / `max_x/max_y/max_z` accumulated
-  from every vertex position, plus helpers `width()`, `height()`, `depth()`,
-  `max_dimension()`.
+- `AABB bounds` (`glm::vec3 min, max`, plus `size()`, `center()`, `empty()`)
+  accumulated from every vertex position, with helpers `width()`, `height()`,
+  `depth()`, `max_dimension()` on the model.
 - A precomputed bounding sphere (`bounding_center`, `bounding_half_diag`) for
   frustum culling — `compute_bounding_sphere()` is called at the end of
   `load_glb`; call it yourself for hand-built models.
@@ -3083,9 +3097,6 @@ them from glTF):
 - `shadow_only` (default `false`) — `true` makes the *main* pass skip the mesh;
   only shadow passes render it. Used for low-poly canopy shadow proxies
   (`src/bracken/procedural/tree_generator.cpp`).
-- `near_only` (default `false`) — declared as a "render only near the camera"
-  hint but **not enforced by the renderer**. Setting it currently does
-  nothing.
 
 #### Materials
 
@@ -3217,9 +3228,9 @@ perpendicular fallback. Mirrored UVs correctly produce `tangent.w == -1`
 ### Heightmaps
 
 `bracken::Heightmap` (`src/bracken/heightmap.hpp`) is a plain struct — there
-is **no file format and no loader**; the host fills the fields itself
-("game code converts from its own heightmap format to this", per the header).
-It stores a square grid of 16-bit normalized heights:
+is **no file format and no loader**; the host produces heights and
+`Heightmap::from_floats` does the packing. It stores a square grid of 16-bit
+normalized heights:
 
 - `resolution` — grid points per side (`height_data.size()` must be
   `resolution * resolution`, row-major, indexed `z * resolution + x`).
@@ -3228,26 +3239,35 @@ It stores a square grid of 16-bit normalized heights:
 - `min_height`, `max_height` (defaults −500/+500) — the range the `uint16_t`
   values decode into: `height = raw / 65535.0 * (max - min) + min`.
 
-The playground builds one procedurally
+You author world-unit floats; the engine scans and packs them
 (`PlaygroundGame::build_heightmap`, `examples/playground/playground.cpp`):
 
 ```cpp
 constexpr uint32_t RES = 257;
-heightmap_.resolution = RES;
-heightmap_.world_origin_x = 0.0f;
-heightmap_.world_origin_z = 0.0f;
-heightmap_.world_size = WORLD;
-heightmap_.min_height = -100.0f;
-heightmap_.max_height = 150.0f;
-heightmap_.height_data.resize(RES * RES);
+std::vector<float> heights(static_cast<size_t>(RES) * RES);
 for (uint32_t z = 0; z < RES; ++z) {
     for (uint32_t x = 0; x < RES; ++x) {
-        float h = /* any height function, in world units */;
-        float normalized = (h - heightmap_.min_height) / (heightmap_.max_height - heightmap_.min_height);
-        heightmap_.height_data[z * RES + x] = static_cast<uint16_t>(normalized * 65535.0f);
+        heights[z * RES + x] = /* any height function, in world units */;
     }
 }
+heightmap_ = bracken::Heightmap::from_floats(heights, RES, {0.0f, 0.0f, WORLD});
 ```
+
+`from_floats` scans for the min/max, quantizes, and fills every field. The
+scanned range is the most precise one the data allows — but it also means the
+encoding of *every* sample depends on the extremes, so editing one height
+re-quantizes the whole map. Pass your own range when you need the encoding to
+be stable (a reproducible integration test, streamed tiles that must agree),
+which is what the playground does:
+
+```cpp
+constexpr bracken::HeightRange RANGE{-160.0f, 150.0f};
+heightmap_ = bracken::Heightmap::from_floats(heights, RES, {0.0f, 0.0f, WORLD}, RANGE);
+```
+
+Heights outside an explicit range are clamped. A `resolution` below 2, or a
+sample count that does not match it, is refused with a logged error and yields
+an invalid heightmap (`valid()` is false).
 
 #### Feeding the renderer
 
@@ -3255,8 +3275,11 @@ for (uint32_t z = 0; z < RES; ++z) {
 set_heightmap(heightmap_);   // Application::set_heightmap(const Heightmap&)
 ```
 
-`Application::set_heightmap` forwards to the `SceneRenderer`, which **deep
-copies** the heightmap into the terrain renderer, uploads it as an `R16`
+`Application::set_heightmap` **rejects an invalid map** (`valid()`: at least
+2×2 and fully populated) with a logged error rather than installing it —
+below 2×2, `resolution - 1` underflows an unsigned and every query silently
+returns 0, which reads as "my terrain is flat" with no diagnostic anywhere.
+Otherwise it forwards to the `SceneRenderer`, which **deep copies** the heightmap into the terrain renderer, uploads it as an `R16`
 (16-bit UNORM) GPU texture, regenerates the terrain meshes (main + shadow
 LOD), and hands the heightmap parameters to the grass renderer
 (`src/bracken/scene/scene_renderer.cpp`, `SceneRenderer::set_heightmap`). You
@@ -3279,9 +3302,10 @@ All sampling is on your CPU-side struct, header-only:
 player_pos_.y = heightmap_.get_height_world(player_pos_.x, player_pos_.z);
 ```
 
-- `get_normal_world(x, z, nx, ny, nz)` — unit surface normal from
+- `get_normal_world(x, z)` — returns a `glm::vec3` unit surface normal from
   central-difference height taps one grid-cell apart; degenerate cases return
   straight up `(0,1,0)`.
+- `valid()` — at least 2×2 and `height_data.size() == resolution * resolution`.
 
 There is also `Application::get_terrain_height(x, z)`, which queries the
 renderer's own copy — the playground uses its local `Heightmap` for gameplay
@@ -3300,7 +3324,6 @@ wider than the terrain actually needs.
 - Checking a bool return: both `ModelLoader::load_glb` and
   `ModelManager::reload_model` are `[[nodiscard]]` for a reason.
 - Reading `mesh.vertices` after `upload_to_gpu` — the CPU copy is freed.
-- Relying on `Mesh::near_only` — declared but not enforced.
 - Shipping a separate AO texture — warned about and dropped at load; use ORM
   packing.
 - Exporting non-u8 joints / non-float weights — mesh silently ships unskinned
@@ -3769,8 +3792,7 @@ CPU-side queries (useful for placement, character grounding, camera collision):
 
 ```cpp
 float y = hm.get_height_world(x, z);      // bilinear; clamps outside bounds
-float nx, ny, nz;
-hm.get_normal_world(x, z, nx, ny, nz);    // central-difference, unit length
+glm::vec3 n = hm.get_normal_world(x, z);  // central-difference, unit length
 ```
 
 After the heightmap is installed, the same queries are available through the renderer without keeping your own copy:

@@ -336,13 +336,13 @@ void PlaygroundGame::on_shutdown() {
 
 void PlaygroundGame::build_heightmap() {
     constexpr uint32_t RES = 257;
-    heightmap_.resolution = RES;
-    heightmap_.world_origin_x = 0.0f;
-    heightmap_.world_origin_z = 0.0f;
-    heightmap_.world_size = WORLD;
-    heightmap_.min_height = -160.0f; // riverbed carves to ~-135
-    heightmap_.max_height = 150.0f;
-    heightmap_.height_data.resize(RES * RES);
+    // Author in world units; Heightmap::from_floats owns the packing. The
+    // range is given explicitly rather than scanned because this demo is also
+    // the regression gate: a scanned range would re-quantize the whole map
+    // whenever a single sample moved, so the terrain would shift under an
+    // unrelated edit.
+    constexpr bracken::HeightRange RANGE{-160.0f, 150.0f}; // riverbed carves to ~-135
+    std::vector<float> heights(static_cast<size_t>(RES) * RES);
     for (uint32_t z = 0; z < RES; ++z) {
         for (uint32_t x = 0; x < RES; ++x) {
             float wx = WORLD * static_cast<float>(x) / (RES - 1);
@@ -398,10 +398,10 @@ void PlaygroundGame::build_heightmap() {
                     h = std::max(h, dry);
                 }
             }
-            float normalized = (h - heightmap_.min_height) / (heightmap_.max_height - heightmap_.min_height);
-            heightmap_.height_data[z * RES + x] = static_cast<uint16_t>(normalized * 65535.0f);
+            heights[z * RES + x] = h;
         }
     }
+    heightmap_ = bracken::Heightmap::from_floats(heights, RES, {0.0f, 0.0f, WORLD}, RANGE);
 }
 
 glm::vec3 PlaygroundGame::village_pos(float vx, float vz, float vy) {
@@ -417,13 +417,24 @@ glm::vec3 PlaygroundGame::village_pos(float vx, float vz, float vy) {
 
 void PlaygroundGame::register_models() {
     auto& mm = models();
-    player_model_ = mm.register_model("player", build_character_model());
-    orb_model_ = mm.register_model("orb", build_orb_model());
-    chrome_model_ = mm.register_model("chrome_sphere", build_chrome_sphere_model());
-    mm.register_model("orb_shard", build_shard_model()); // referenced by name from effects
-    mm.register_model("smoke_puff", build_smoke_puff_model());
-    mm.register_model("rain_streak", build_rain_streak_model());
-    mm.register_model("splash_drop", build_splash_drop_model());
+    // register_model finishes the model (bounds where unset, bounding sphere,
+    // `loaded`) and reports why it refused one; a demo that ignored that would
+    // fail later as an invisible model.
+    auto register_or_log = [&mm](const char* name, std::unique_ptr<Model> model) {
+        auto handle = mm.register_model(name, std::move(model));
+        if (!handle) {
+            BRACKEN_LOG_ERROR("playground", "register_model('{}'): {}", name, to_string(handle.error()));
+            return INVALID_MODEL_HANDLE;
+        }
+        return handle.value();
+    };
+    player_model_ = register_or_log("player", build_character_model());
+    orb_model_ = register_or_log("orb", build_orb_model());
+    chrome_model_ = register_or_log("chrome_sphere", build_chrome_sphere_model());
+    register_or_log("orb_shard", build_shard_model()); // referenced by name from effects
+    register_or_log("smoke_puff", build_smoke_puff_model());
+    register_or_log("rain_streak", build_rain_streak_model());
+    register_or_log("splash_drop", build_splash_drop_model());
 
     // The medieval kit + stylized nature pack (both converted by
     // tools/build_medieval_assets.py). Absence is not an error: the
@@ -453,12 +464,12 @@ void PlaygroundGame::register_models() {
                          "falling back to the procedural-only scene",
                          asset_path("assets/models/village.glb"));
         // Procedural stand-ins for the fallback world only.
-        mm.register_model("rock_boulder", procedural::RockGenerator::generate_boulder(11));
-        mm.register_model("rock_slate", procedural::RockGenerator::generate_slate(29));
-        mm.register_model("rock_cluster", procedural::RockGenerator::generate_cluster(43));
-        mm.register_model("tree_oak", procedural::TreeGenerator::generate_oak(7));
-        mm.register_model("tree_pine", procedural::TreeGenerator::generate_pine(21));
-        mm.register_model("tree_birch", procedural::TreeGenerator::generate_birch(33));
+        register_or_log("rock_boulder", procedural::RockGenerator::generate_boulder(11));
+        register_or_log("rock_slate", procedural::RockGenerator::generate_slate(29));
+        register_or_log("rock_cluster", procedural::RockGenerator::generate_cluster(43));
+        register_or_log("tree_oak", procedural::TreeGenerator::generate_oak(7));
+        register_or_log("tree_pine", procedural::TreeGenerator::generate_pine(21));
+        register_or_log("tree_birch", procedural::TreeGenerator::generate_birch(33));
     }
 }
 
@@ -998,10 +1009,8 @@ void PlaygroundGame::setup_physics() {
         if (model == nullptr || !model->loaded) {
             continue;
         }
-        const glm::vec3 lmin{model->min_x, model->min_y, model->min_z};
-        const glm::vec3 lmax{model->max_x, model->max_y, model->max_z};
-        const glm::vec3 lcenter = (lmin + lmax) * 0.5f;
-        const glm::vec3 lhalf = (lmax - lmin) * 0.5f;
+        const glm::vec3 lcenter = model->bounds.center();
+        const glm::vec3 lhalf = model->bounds.size() * 0.5f;
         const glm::vec3 wcenter = glm::vec3(pc.transform * glm::vec4(lcenter, 1.0f));
         glm::mat3 absm{pc.transform};
         for (int c = 0; c < 3; ++c) {

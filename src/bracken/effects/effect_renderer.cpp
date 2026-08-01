@@ -191,8 +191,7 @@ void EffectRenderer::upload_particle_instances(SDL_GPUCopyPass* copy_pass,
 
         // Model-center recentering offset is constant per model; hoisted
         // out of the per-particle loop.
-        const glm::vec3 center((model->min_x + model->max_x) * 0.5f, (model->min_y + model->max_y) * 0.5f,
-                               (model->min_z + model->max_z) * 0.5f);
+        const glm::vec3 center = model->bounds.center();
 
         const uint32_t first_instance = static_cast<uint32_t>(instance_scratch_.size());
         for (const auto& particle : particles.subspan(emitter.first_particle, emitter.particle_count)) {

@@ -284,7 +284,7 @@ Loads the PNG via `IMG_Load`, converts to `SDL_PIXELFORMAT_RGB24`, computes per-
 
 Constants: `WORLD=8000`, `WORLD_MARGIN=250`, `ORB_COUNT=15`, `ORB_PICKUP_RADIUS=60`, `ORB_HOVER=26`, `WALK_SPEED=140`, `RUN_SPEED=300`, `ATTACK_DURATION=0.45`.
 
-`on_init`: `init_renderer(1600, 900, "bracken playground", WORLD, WORLD)`; `init_dev_ui()` + `dev_ui().set_toggle_key(SDL_SCANCODE_F10)` + one host panel guarded by `#ifdef BRACKEN_DEV_UI`; builds a 257×257 `Heightmap` (world_size 8000, heights −100..150, `uint16_t` normalized samples from layered sines) and `set_heightmap`; registers models by name through `models().register_model(...)` — `"player"`, `"orb"`, `"orb_shard"` (referenced *by name* from effect definitions), three `procedural::TreeGenerator` species and three `procedural::RockGenerator` shapes with fixed seeds (fallback scene only; with village assets the pack `.glb`s load instead); builds the animation state machine; defines two member `EffectDefinition`s (`pickup_burst_`: BURST of 26 radial shards with gravity/drag and fade curves; `attack_arc_`: BURST of 12 ARC-path particles with `face_velocity`) — members because **definitions must outlive all spawned instances**; applies the hand-authored scene layout (`scene_layout.cpp`: per-area placements for props, flora, rock outcrops, and the grove-stamp forest ring) plus the procedural grass-tuft ground cover — or, in the fallback scene, scatters 70 procedural trees + 25 rocks outside the plateau clearing; places 15 orbs; configures the camera (terrain-height callback, screen size, `distance=380`, `height_offset=120`, target above the player); enables render-stats collection when in smoke mode.
+`on_init`: `init_renderer(1600, 900, "bracken playground", WORLD, WORLD)`; `init_dev_ui()` + `dev_ui().set_toggle_key(SDL_SCANCODE_F10)` + one host panel guarded by `#ifdef BRACKEN_DEV_UI`; builds a 257×257 `Heightmap` via `Heightmap::from_floats(heights, 257, {0, 0, 8000}, {-160, 150})` (world-unit samples from layered sines; the range is explicit so the encoding is stable under edits) and `set_heightmap`; registers models by name through `models().register_model(...)`, logging `to_string(error)` on a refusal — `"player"`, `"orb"`, `"orb_shard"` (referenced *by name* from effect definitions), three `procedural::TreeGenerator` species and three `procedural::RockGenerator` shapes with fixed seeds (fallback scene only; with village assets the pack `.glb`s load instead); builds the animation state machine; defines two member `EffectDefinition`s (`pickup_burst_`: BURST of 26 radial shards with gravity/drag and fade curves; `attack_arc_`: BURST of 12 ARC-path particles with `face_velocity`) — members because **definitions must outlive all spawned instances**; applies the hand-authored scene layout (`scene_layout.cpp`: per-area placements for props, flora, rock outcrops, and the grove-stamp forest ring) plus the procedural grass-tuft ground cover — or, in the fallback scene, scatters 70 procedural trees + 25 rocks outside the plateau clearing; places 15 orbs; configures the camera (terrain-height callback, screen size, `distance=380`, `height_offset=120`, target above the player); enables render-stats collection when in smoke mode.
 
 State machine (`setup_state_machine`): states Idle/Walk/Run/Attack bound to same-named clips; transitions on parameters `speed` (float) and `attacking` (bool) — Idle→Walk at `speed GT 20`, Walk→Run at `GT 240`, Run→Walk at `LT 220`, Walk→Idle at `LT 20`, any→Attack on `attacking IS_TRUE` with crossfade 0.08 and priority 10; Attack is non-looping and exits to Idle on `IS_FALSE`. `bind_clips(model->animations)` resolves clip names to indices once (warns on unbound states); `param_index("speed"/"attacking")` resolves parameter names to indices once so per-frame updates (`set_float`/`set_bool` index overloads) hash nothing.
 
@@ -317,7 +317,7 @@ Summary format (exact): `[smoke] OK frames={} fps={:.0f} draw_calls={} triangles
 
 #### Code-built assets (`character.cpp`)
 
-Demonstrates the minimum viable in-code asset pipeline: `build_character_model()` constructs an 11-joint skeleton (parents strictly before children — an `AnimationPlayer` requirement; joint names `Hips/Spine/Head/LeftUpperLeg/.../RightArm` match the engine's default `FootIK` bone names so `model->foot_ik.init(model->skeleton)` binds), skinned box geometry (`gpu::SkinnedVertex` with single-joint weights, per-face normals), inverse bind matrices as negative translations of the pure-translation bind pose, and four clips — `Idle` (3.0 s), `Walk` (0.9 s), `Run` (0.55 s) via a parameterized locomotion-cycle sampler (16 keys, closures over phase 0..1, last key repeating phase 0 for clean loops), and a non-looping `Attack` (0.45 s) with explicit keys. `build_orb_model()`/`build_shard_model()` are UV spheres (`gpu::Vertex3D`) with HDR emissive factors (orb `{2.4,1.7,0.55}` — above the default `bloom_threshold` of 1.1 so orbs feed the bloom pass); `build_chrome_sphere_model()` is a polished-metal UV sphere (metallic 1.0, roughness 0.06) placed in the spawn clearing — the specular-IBL proof piece (it mirrors the prefiltered sky, sun disc included). Every model finalizes AABB bounds + `compute_bounding_sphere()` and sets `loaded = true`.
+Demonstrates the minimum viable in-code asset pipeline: `build_character_model()` constructs an 11-joint skeleton (parents strictly before children — an `AnimationPlayer` requirement; joint names `Hips/Spine/Head/LeftUpperLeg/.../RightArm` match the engine's default `FootIK` bone names so `model->foot_ik.init(model->skeleton)` binds), skinned box geometry (`gpu::SkinnedVertex` with single-joint weights, per-face normals), inverse bind matrices as negative translations of the pure-translation bind pose, and four clips — `Idle` (3.0 s), `Walk` (0.9 s), `Run` (0.55 s) via a parameterized locomotion-cycle sampler (16 keys, closures over phase 0..1, last key repeating phase 0 for clean loops), and a non-looping `Attack` (0.45 s) with explicit keys. `build_orb_model()`/`build_shard_model()` are UV spheres (`gpu::Vertex3D`) with HDR emissive factors (orb `{2.4,1.7,0.55}` — above the default `bloom_threshold` of 1.1 so orbs feed the bloom pass); `build_chrome_sphere_model()` is a polished-metal UV sphere (metallic 1.0, roughness 0.06) placed in the spawn clearing — the specular-IBL proof piece (it mirrors the prefiltered sky, sun disc included). Every model sets its AABB `bounds` explicitly (the sphere models to their construction radius, the skinned character to hand-authored bounds with animation headroom); `register_model` computes the bounding sphere and sets `loaded`.
 
 ### Known limitations and silent behaviors in this area
 
@@ -2857,7 +2857,7 @@ Per-frame CPU cost is linear in command count: one cull + bin pass over static c
 - `BonePaletteId`s held by the host across `seal()` are stale (fill-time encoding → dense index remap); only ids re-read from sealed commands are meaningful.
 - Skinned commands whose model/skeleton can't be resolved are silently excluded.
 - Distance culling is XZ-only; frustum culling is skipped for commands whose model can't be resolved.
-- `pass_times_ms` is zeroed (timestamp stub); `Mesh::near_only` is declared but not enforced.
+- `pass_times_ms` is zeroed (timestamp stub).
 - Cluster light SSBOs retain stale contents on zero-light frames; correctness relies on zeroed `ClusterParams` (`gridDim.w == 0`), not on clearing.
 - No OIT; transparent sort granularity is per queued mesh keyed on the model bounding-sphere center; `BLEND` meshes in instanced batches degrade to one draw per instance.
 - Single `PostUICallback` slot; `Application::init_dev_ui()` claims it.
@@ -2929,9 +2929,7 @@ One `Mesh` per glTF *primitive*. CPU-side data + GPU resources + flags:
 - `bool has_texture` — base-color texture present.
 - Perf flags: `cast_shadows = true` (false ⇒ shadow passes skip the mesh),
   `shadow_only = false` (true ⇒ main pass skips it; shadow passes render it —
-  canopy shadow proxies), `near_only = false` (**declared, not enforced
-  anywhere in the renderer** — confirmed: `scene_renderer.cpp` checks only
-  `shadow_only`/`cast_shadows`). Consumers set these on procedural meshes
+  canopy shadow proxies). Consumers set these on procedural meshes
   (`src/bracken/procedural/tree_generator.cpp:426-474`); `load_glb` never sets
   them.
 - `texture_pixels`/`texture_width`/`texture_height` — deferred base-color
@@ -2968,13 +2966,15 @@ struct SkinnedVertex {               // Vertex3D fields + skinning
 #### Model (`src/bracken/model_loader.hpp`)
 
 - `std::vector<Mesh> meshes`; `bool loaded`.
-- AABB: `float min_x, min_y, min_z, max_x, max_y, max_z` (all 0 by default;
-  `load_glb` seeds them ±1e10 and accumulates every parsed vertex — bounds
-  come from actual vertex data, not accessor `min`/`max` metadata).
+- `AABB bounds` — `struct AABB { glm::vec3 min, max; }` with `size()`,
+  `center()` and `empty()` (no extent in any axis, which is also the
+  default-constructed state). `load_glb` seeds it ±1e10 and accumulates every
+  parsed vertex — bounds come from actual vertex data, not accessor
+  `min`/`max` metadata.
 - Derived: `width()/height()/depth()/max_dimension()`;
   `compute_bounding_sphere()` fills `bounding_center` (AABB center) and
   `bounding_half_diag` (half the AABB diagonal length) — called at the end of
-  `load_glb`; hand-built models must call it themselves.
+  `load_glb`, and by `register_model` for hand-built models.
 - Animation payload: `animation::Skeleton skeleton`,
   `std::vector<animation::AnimationClip> animations`, `bool has_skeleton`,
   `animation::FootIKData foot_ik` (types in
@@ -3025,12 +3025,19 @@ Behavior details (`model_loader.cpp:827-942`):
   push slot, record path, map name → if `watcher_` is set, register a
   `watch_file(path, ...)` that calls `reload_model(handle)`. Returns
   `INVALID_MODEL_HANDLE` on parse failure (nothing is registered).
-- Duplicate names: `name_to_handle_[name] = handle` overwrites — the old model
-  stays alive at its old handle but is unreachable by name.
+- Duplicate names: `load_model` overwrites `name_to_handle_[name]` — the old
+  model stays alive at its old handle but is unreachable by name.
+  `register_model` refuses instead (`NameAlreadyRegistered`).
 - `get_model(handle)`: null for `INVALID_MODEL_HANDLE` or out-of-range
   (tested).
-- `register_model`: uploads (if device), stores with empty path. No validity
-  checks on the model.
+- `register_model`: returns `core::Result<ModelHandle, ModelRegisterError>`.
+  Refuses a model with no geometry (`EmptyModel` — checked BEFORE the upload,
+  which frees the CPU-side vertex arrays), a name already registered
+  (`NameAlreadyRegistered`), or a mesh that did not reach the GPU
+  (`UploadFailed`, only when a device is set). On the way through it derives
+  `bounds` from the mesh vertices when they are empty, calls
+  `compute_bounding_sphere()` and sets `loaded`. Stores with an empty path.
+  `to_string(ModelRegisterError)` gives the message.
 - `reload_model`: rejects invalid handles and empty (procedural) paths; parses
   into a *fresh* `Model`; on parse failure logs a
   `hot_reload` warning and returns `false` leaving the old model untouched; on
@@ -3057,26 +3064,44 @@ void compute_tangents_from_uvs(std::vector<gpu::Vertex3D>& vertices,
                                const std::vector<uint32_t>& indices);
 ```
 
-#### Heightmap (`src/bracken/heightmap.hpp`, header-only)
+#### Heightmap (`src/bracken/heightmap.hpp` + `.cpp`)
 
 ```cpp
+struct WorldBounds { float origin_x = 0.0f, origin_z = 0.0f, size = 0.0f; };
+struct HeightRange { float min = 0.0f, max = 0.0f; };
+
 struct Heightmap {
     uint32_t resolution = 0;
     float world_origin_x = 0.0f, world_origin_z = 0.0f, world_size = 0.0f;
     float min_height = -500.0f, max_height = 500.0f;
     std::vector<uint16_t> height_data;   // row-major, z * resolution + x
 
+    static Heightmap from_floats(std::span<const float>, uint32_t resolution, WorldBounds);
+    static Heightmap from_floats(std::span<const float>, uint32_t resolution, WorldBounds, HeightRange);
+    bool  valid() const;
     float get_height_local(uint32_t local_x, uint32_t local_z) const;
     float get_height_world(float world_x, float world_z) const;
-    void  get_normal_world(float world_x, float world_z,
-                           float& nx, float& ny, float& nz) const;
+    glm::vec3 get_normal_world(float world_x, float world_z) const;
 };
 ```
 
-There is deliberately no engine-side heightmap *file* loader: "Game code
-converts from its own heightmap format to this" (header comment). The
-playground synthesizes one (`examples/playground/playground.cpp`,
-`build_heightmap`, 257×257).
+- `from_floats` (the only non-inline members, in `heightmap.cpp`): validates
+  `resolution >= 2` and `heights.size() == resolution * resolution` — either
+  failure logs `BRACKEN_LOG_ERROR("heightmap", ...)` and returns a default
+  (invalid) map. The three-argument form scans the data for the range; the
+  four-argument form takes one and CLAMPS out-of-range heights. The packing is
+  deliberately the arithmetic hosts hand-rolled — `(h - min) / (max - min)`
+  (a division, not a reciprocal multiply, which is not bit-identical) and a
+  truncating `static_cast<uint16_t>(normalized * 65535.0f)` — so moving a host
+  onto it reproduces its terrain sample for sample
+  (`heightmap.test.cpp::ExplicitRangeMatchesTheHandRolledQuantizationBitForBit`).
+- `valid()`: `resolution >= 2 && height_data.size() == resolution^2`.
+  `Application::set_heightmap` refuses anything else with a logged error.
+
+There is deliberately no engine-side heightmap *file* loader: game code
+produces world-unit floats and `from_floats` owns the packing. The playground
+synthesizes one (`examples/playground/playground.cpp`, `build_heightmap`,
+257×257, explicit range `{-160, 150}`).
 
 ### load_glb: parsing pipeline
 
@@ -3257,7 +3282,7 @@ a freed model can only be revived by re-parsing the file.
 ```cpp
 scale = (target_size * 1.5f) / model.max_dimension();   // div-by-zero if bounds unset
 M = T(position) · R_y(yaw) · [R_x(attack_tilt) if != 0] · S(scale) · T(-pivot)
-pivot = ((min_x+max_x)/2, min_y, (min_z+max_z)/2)
+pivot = (bounds.center().x, bounds.min.y, bounds.center().z)
 ```
 
 Guarantees (verified in `model_utils.test.cpp`): the model's bottom-center
@@ -3311,14 +3336,15 @@ to `min_height`; tested).
   **bilinearly interpolates** the four surrounding samples. `resolution` must
   be ≥ 1 and `world_size > 0` (u,v become inf/NaN at `world_size == 0`; no
   guard).
-- `get_normal_world`: central differences with `eps = world_size /
-  (resolution − 1)` (one grid cell): `n = normalize(hL−hR, 2·eps, hD−hU)`;
-  if `‖n‖ ≤ 1e-4` returns `(0,1,0)`. Always unit length otherwise (tested,
+- `get_normal_world`: returns `glm::vec3`; central differences with
+  `eps = world_size / (resolution − 1)` (one grid cell):
+  `n = normalize(hL−hR, 2·eps, hD−hU)`; if `‖n‖ ≤ 1e-4` returns `(0,1,0)`. Always unit length otherwise (tested,
   including at map corners where clamping degrades the difference to
   one-sided).
 
-All methods are `const`, header-inline, allocation-free, and safe to call
-from any thread that isn't concurrently mutating the struct.
+The sampling methods are `const`, header-inline, allocation-free, and safe to
+call from any thread that isn't concurrently mutating the struct;
+`from_floats` is a static factory that allocates once.
 
 #### Renderer integration
 
@@ -3406,28 +3432,30 @@ bool+log APIs stay as they are"):
 3. **Animation channels targeting non-skin nodes silently dropped**; clips
    with zero surviving channels vanish from `Model::animations` without a
    log.
-4. **`Mesh::near_only` declared but not enforced** anywhere in the renderer.
-5. **Only `skins[0]`** becomes the skeleton; other skins ignored.
-6. **Skinning downgrade**: non-u8 joints or non-float weights ⇒ mesh ships
+4. **Only `skins[0]`** becomes the skeleton; other skins ignored.
+5. **Skinning downgrade**: non-u8 joints or non-float weights ⇒ mesh ships
    unskinned (warn).
-7. **Interleaved accessors unsupported**: non-tight `byteStride` ⇒ attribute
+6. **Interleaved accessors unsupported**: non-tight `byteStride` ⇒ attribute
    skipped (warn); on `POSITION`, the primitive is skipped. Inverse-bind and
    animation sampler accessors go through their own validation (sparse,
    non-FLOAT, wrong element type ⇒ warned and dropped).
-8. **Separate occlusion textures are warned about and dropped at load**
+7. **Separate occlusion textures are warned about and dropped at load**
    (only ORM-packed AO works).
-9. **glTF sampler state ignored** (wrap/filter); engine samplers rule.
-10. **>2048×2048 embedded images** warn but still load (budget guard).
-11. **Index component types** other than u16/u32 are read as u8 (glTF's u8
+8. **glTF sampler state ignored** (wrap/filter); engine samplers rule.
+9. **>2048×2048 embedded images** warn but still load (budget guard).
+10. **Index component types** other than u16/u32 are read as u8 (glTF's u8
     indices work; malformed types decode garbage rather than failing).
-12. **Handle slots are never recycled**; duplicate names orphan the old
-    name mapping; `unload_all` is the only teardown.
-13. **`build_model_transform` divides by `max_dimension()`** — zero for a
+11. **Handle slots are never recycled**; `unload_all` is the only teardown.
+    `load_model` still orphans the old name mapping on a duplicate name;
+    `register_model` refuses one (`ModelRegisterError::NameAlreadyRegistered`).
+12. **`build_model_transform` divides by `max_dimension()`** — zero for a
     bounds-less model (no guard).
-14. **`Heightmap` has no world_size/resolution validation**; `world_size == 0`
-    yields NaN/inf UVs, `get_height_local` OOB returns `0.0f` rather than
-    clamping.
-15. Engine material defaults for *material-less* primitives
+13. **`Heightmap` has no world_size validation**; `world_size == 0` yields
+    NaN/inf UVs, `get_height_local` OOB returns `0.0f` rather than clamping.
+    Resolution IS validated at the two entry points that matter:
+    `Heightmap::from_floats` refuses to build below 2x2 and
+    `Application::set_heightmap` refuses to install an invalid map (`valid()`).
+14. Engine material defaults for *material-less* primitives
     (`metallic 0.0`, `roughness 0.85`) deviate from glTF spec defaults
     (1.0/1.0); with a material present, spec defaults flow through tinygltf.
 
@@ -3744,7 +3772,7 @@ Both renderers are owned by `scene::SceneRenderer` (`src/bracken/scene/scene_ren
 
 ### Heightmap data structure — `bracken::Heightmap`
 
-The shared heightmap aggregate (`src/bracken/heightmap.hpp`, header-only, unit-tested in `src/bracken/heightmap.test.cpp`) is specified in full — fields, decode formula, `get_height_local`/`get_height_world`/`get_normal_world` semantics, and edge behaviors — in [Model Loading, Heightmaps & the glTF Contract](#model-loading-heightmaps--the-gltf-contract) §"Heightmap specification". Terrain-relevant summary: `uint16_t` samples, row-major `z*resolution + x`, decoded as `raw/65535 * (max_height - min_height) + min_height`; world-space queries clamp and bilinearly interpolate; normals are central differences over one grid cell with a `(0,1,0)` degenerate fallback. Precision: 16 bits over the default 1000-unit range ≈ 0.015 units per step (round-trip test tolerance 0.02).
+The shared heightmap aggregate (`src/bracken/heightmap.{hpp,cpp}`, unit-tested in `src/bracken/heightmap.test.cpp`) is specified in full — fields, decode formula, `get_height_local`/`get_height_world`/`get_normal_world` semantics, and edge behaviors — in [Model Loading, Heightmaps & the glTF Contract](#model-loading-heightmaps--the-gltf-contract) §"Heightmap specification". Terrain-relevant summary: `uint16_t` samples, row-major `z*resolution + x`, decoded as `raw/65535 * (max_height - min_height) + min_height`; world-space queries clamp and bilinearly interpolate; normals are central differences over one grid cell with a `(0,1,0)` degenerate fallback. Precision: 16 bits over the default 1000-unit range ≈ 0.015 units per step (round-trip test tolerance 0.02).
 
 ### TerrainRenderer
 
@@ -5126,7 +5154,7 @@ Model-family pipeline types (`src/bracken/gpu/pipeline_registry.hpp`): `Model`, 
 - Skinned draws: `bind_skinned_pipeline(double_sided)` additionally binds the bone-palette SSBO to vertex set 0 binding 0; returns false (draw skipped) when `bone_palette_buffer_` doesn't exist.
 - Instanced draws (`render_instanced_models`): one pipeline bind, camera uniforms + instance SSBO + shadow + cluster binds once; per-mesh double-sided switches re-establish all pass state. One `SDL_DrawGPUIndexedPrimitives(pass, index_count, instance_count, 0, 0, base_instance)` per (model, mesh); `base_instance` follows ascending-`ModelHandle` packing order, which must match `upload_instance_buffers`' packing.
 - **Blend re-routing**: any mesh with `alpha_mode == AlphaMode::Blend` encountered in the static, skinned, or instanced walk is queued via `queue_transparent_mesh` (instanced: one queue entry per instance, losing instancing) and drawn by `render_transparent_models` after the skybox — sorted back-to-front on squared distance from camera to the *model's* world bounding-sphere center, depth-test on / depth-write off, using the (Skinned)ModelBlend(DoubleSided) variants. Skinned transparent draws carry their `palette_offset` (sentinel `INVALID_PALETTE_OFFSET = 0xFFFFFFFFu` marks static) and are skipped if the palette buffer is missing. No OIT, no intra-mesh sorting (documented limitation).
-- Meshes with `shadow_only = true` are skipped by all main-pass walks (shadow-pass-only proxies); `Mesh::near_only` is declared but not enforced anywhere.
+- Meshes with `shadow_only = true` are skipped by all main-pass walks (shadow-pass-only proxies).
 
 #### Bone palettes (skinned vertex-stage input)
 
@@ -5200,7 +5228,6 @@ Identical to `ModelLightingUniforms` minus the `tintColor` vec4 (tint is per-ins
 - Material AO: ambient-only, ORM-packed-only; standalone occlusion textures silently dropped at upload.
 - BLEND: back-to-front per-draw sort on model bounding-sphere centers; no OIT, no per-triangle sorting; instanced BLEND devolves to per-instance draws.
 - Skinned normals/tangents use the linear-blended skin matrix (no per-bone inverse-transpose).
-- `Mesh::near_only` unenforced.
 - README/`scene_renderer.cpp` comment discrepancies noted above (ACES attributed to `pbr.hlsli`; "branch-free" normal-map path that actually branches).
 
 ---
@@ -6324,7 +6351,7 @@ Creates: an `SDL_GPUSampler` (linear min/mag/mip, REPEAT on u/v/w, anisotropy en
 Clears `batches_`/`instance_scratch_` (capacity retained across frames), then for each snapshot emitter with a non-null definition and non-empty particle range:
 
 - Resolve model; skip null. If `meshes[0]` is not uploaded, log `BRACKEN_LOG_WARN("effect", "Effect model '{}' not GPU-uploaded; skipping particles this frame", ...)` and skip — the mid-frame path **never uploads**, only drops for one frame.
-- Compute the model-center recentering offset once per emitter: `((min_x+max_x)/2, (min_y+max_y)/2, (min_z+max_z)/2)` from the `Model` bounds.
+- Compute the model-center recentering offset once per emitter: `model->bounds.center()`.
 - Append one `gpu::ParticleInstanceData { build_particle_transform(particle, center), vec4(color.rgb, opacity) }` per particle (note: `particle.color.a` is discarded; `opacity` takes its place).
 - Record a `ParticleBatch { const Model* model; uint32_t first_instance; uint32_t instance_count; }` — all particles of one emitter share the emitter's model, so each emitter is one contiguous range = one draw batch.
 
@@ -6939,7 +6966,7 @@ struct Vertex3D {
 - Generators write `position`, `normal`, `texcoord`, `color`; **`tangent` is left at its default** `(1,0,0,1)` — `compute_tangents_from_uvs` (`src/bracken/model_utils.hpp`) is *not* invoked. This is inert because generated meshes carry no normal map (`hasNormalMap = 0` in the shaders).
 - Indices are `uint32_t` triangle lists.
 - Colors are linear-space (engine-wide convention).
-- On the returned `Model`: `min_/max_{x,y,z}` populated, `compute_bounding_sphere()` called, `loaded = true`, no skeleton/animations.
+- On the returned `Model`: `bounds` populated, `compute_bounding_sphere()` called, `loaded = true`, no skeleton/animations.
 
 ### TreeGenerator
 
@@ -7097,7 +7124,7 @@ Per output triangle, three **unshared** vertices are appended (no dedup/welding;
 
 - All vertices shifted up by `-min_y` so the flat base sits at `Y = 0`.
 - Single `Mesh` (`has_texture = false`; appearance comes from per-vertex `params.color`).
-- AABB computed, then **forced symmetric in X/Z** (`min_x = -max(|min_x|, |max_x|)` etc.) and `min_y = 0`, "so `build_model_transform` centering is zero (procedural rocks are already centered at XZ origin)". Bounding sphere computed; `loaded = true`.
+- AABB computed, then **forced symmetric in X/Z** (`bounds.min.x = -max(|min.x|, |max.x|)` etc.) and `bounds.min.y = 0`, "so `build_model_transform` centering is zero (procedural rocks are already centered at XZ origin)". Bounding sphere computed; `loaded = true`.
 
 #### Presets (exact values, `rock_generator.cpp`)
 

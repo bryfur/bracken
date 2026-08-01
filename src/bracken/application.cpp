@@ -10,6 +10,7 @@
 #include "bracken/dev/dev_ui.hpp"
 #include "bracken/effects/effect_system.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
+#include "bracken/heightmap.hpp"
 #include "bracken/render/render_context.hpp"
 #include "bracken/scene/frame_packet_ring.hpp"
 #include "bracken/scene/packet_digest.hpp"
@@ -521,6 +522,17 @@ scene::PacketRing& Application::frame_packets() {
 
 void Application::set_heightmap(const Heightmap& heightmap) {
     BRACKEN_CONTRACT(scene_renderer_ != nullptr, "set_heightmap() requires init_renderer() first");
+    // Reject rather than install: below 2x2 the world queries compute
+    // `resolution - 1` on an unsigned, which underflows to 4 billion, and
+    // every height/normal sample silently returns 0 — flat terrain with no
+    // message anywhere. Loud here is the whole point.
+    if (!heightmap.valid()) {
+        BRACKEN_LOG_ERROR("app",
+                          "set_heightmap: ignoring an invalid heightmap (resolution {}, {} samples — needs "
+                          "resolution >= 2 and resolution^2 samples)",
+                          heightmap.resolution, heightmap.height_data.size());
+        return;
+    }
     scene_renderer_->set_heightmap(heightmap);
 }
 

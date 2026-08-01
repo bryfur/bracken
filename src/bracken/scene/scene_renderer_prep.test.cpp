@@ -91,14 +91,25 @@ constexpr ModelHandle H_SKINNED = 3; // "skinned": cube bounds, 4 joints
 // handle — which is exactly the shape of a host that unloaded a model.
 constexpr ModelHandle H_UNKNOWN = 7;
 
+// register_model refuses a model with no geometry, so the synthetic models
+// below carry one throwaway triangle. Prep works from bounds and handles, not
+// mesh contents, so it changes nothing these tests measure.
+void add_token_mesh(Model& m) {
+    Mesh mesh;
+    mesh.vertices.resize(3);
+    mesh.indices = {0, 1, 2};
+    m.meshes.push_back(std::move(mesh));
+}
+
 std::unique_ptr<Model> make_box_model(float hx, float min_y, float max_y, float hz, bool skeleton, uint32_t joints) {
     auto m = std::make_unique<Model>();
-    m->min_x = -hx;
-    m->max_x = hx;
-    m->min_y = min_y;
-    m->max_y = max_y;
-    m->min_z = -hz;
-    m->max_z = hz;
+    add_token_mesh(*m);
+    m->bounds.min.x = -hx;
+    m->bounds.max.x = hx;
+    m->bounds.min.y = min_y;
+    m->bounds.max.y = max_y;
+    m->bounds.min.z = -hz;
+    m->bounds.max.z = hz;
     m->compute_bounding_sphere();
     if (skeleton) {
         m->has_skeleton = true;
@@ -187,11 +198,13 @@ struct GoldenWorld {
     }
 
 private:
-    static void require_handle(ModelHandle got, ModelHandle want) {
+    static void require_handle(const core::Result<ModelHandle, ModelRegisterError>& got, ModelHandle want) {
         // Not a gtest assertion (runs in a constructor): the handles are a
         // precondition of every expectation below, so a mismatch must be
         // impossible rather than merely reported.
-        BRACKEN_ASSERT(got == want, "registration order changed: got handle {} expected {}", got, want);
+        BRACKEN_ASSERT(got.is_ok(), "register_model failed: {}", to_string(got.error()));
+        BRACKEN_ASSERT(got.value_or(0) == want, "registration order changed: got handle {} expected {}",
+                       got.value_or(0), want);
         (void)got;
         (void)want;
     }

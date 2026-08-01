@@ -18,9 +18,9 @@ glm::mat4 build_model_transform(const Model& model, const glm::vec3& position, f
     }
     mat = glm::scale(mat, glm::vec3(scale));
 
-    float cx = (model.min_x + model.max_x) / 2.0f;
-    float cy = model.min_y;
-    float cz = (model.min_z + model.max_z) / 2.0f;
+    float cx = (model.bounds.min.x + model.bounds.max.x) / 2.0f;
+    float cy = model.bounds.min.y;
+    float cz = (model.bounds.min.z + model.bounds.max.z) / 2.0f;
     mat = mat * glm::translate(glm::mat4(1.0f), glm::vec3(-cx, -cy, -cz));
 
     return mat;

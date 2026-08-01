@@ -152,7 +152,14 @@ TEST(EffectRendererModelCache, FailedLookupIsNotCachedAndResolvesAfterRegistrati
 
     // ...but the failure is not cached, so registering the model afterwards
     // makes the same definition resolve.
-    bracken::ModelHandle handle = manager.register_model("late_model", std::make_unique<bracken::Model>());
+    auto model = std::make_unique<bracken::Model>();
+    bracken::Mesh mesh; // register_model refuses a model with no geometry
+    mesh.vertices.resize(3);
+    mesh.indices = {0, 1, 2};
+    model->meshes.push_back(std::move(mesh));
+    const auto registered = manager.register_model("late_model", std::move(model));
+    ASSERT_TRUE(registered) << bracken::to_string(registered.error());
+    const bracken::ModelHandle handle = registered.value();
     ASSERT_NE(handle, bracken::INVALID_MODEL_HANDLE);
     EXPECT_EQ(EffectRendererTestAccess::resolve(renderer, def), handle);
 

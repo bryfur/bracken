@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <SDL3/SDL_gpu.h>
 #include <string>
 #include <unordered_map>
@@ -151,8 +152,8 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
     }
 
     model.meshes.clear();
-    model.min_x = model.min_y = model.min_z = 1e10f;
-    model.max_x = model.max_y = model.max_z = -1e10f;
+    model.bounds.min = glm::vec3(1e10f);
+    model.bounds.max = glm::vec3(-1e10f);
 
     // Texture budget guard (see CLAUDE.md): assets shipping >2048² embedded
     // images should be resized in the optimization pass, not at runtime.
@@ -366,12 +367,8 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
                 v.position.y = positions[i * 3 + 1];
                 v.position.z = positions[i * 3 + 2];
 
-                model.min_x = std::min(model.min_x, v.position.x);
-                model.min_y = std::min(model.min_y, v.position.y);
-                model.min_z = std::min(model.min_z, v.position.z);
-                model.max_x = std::max(model.max_x, v.position.x);
-                model.max_y = std::max(model.max_y, v.position.y);
-                model.max_z = std::max(model.max_z, v.position.z);
+                model.bounds.min = glm::min(model.bounds.min, v.position);
+                model.bounds.max = glm::max(model.bounds.max, v.position);
 
                 if (normals) {
                     v.normal.x = normals[i * 3 + 0];
@@ -857,7 +854,7 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
     model.loaded = true;
     model.compute_bounding_sphere();
     BRACKEN_LOG_INFO("model", "Loaded GLB model: {} ({} meshes) bounds: Y=[{}, {}]", path, model.meshes.size(),
-                    model.min_y, model.max_y);
+                    model.bounds.min.y, model.bounds.max.y);
     if (report.any()) {
         BRACKEN_LOG_WARN("model",
                         "{}: dropped {} animation channel(s) - {} targeting nodes outside the skin, {} on "
@@ -1042,13 +1039,83 @@ Model* ModelManager::get_model(const std::string& name) const {
     return models_[it->second].get();
 }
 
-ModelHandle ModelManager::register_model(const std::string& name, std::unique_ptr<Model> model) {
+const char* to_string(ModelRegisterError error) {
+    switch (error) {
+    case ModelRegisterError::EmptyModel:
+        return "model has no geometry";
+    case ModelRegisterError::NameAlreadyRegistered:
+        return "a model is already registered under that name";
+    case ModelRegisterError::UploadFailed:
+        return "one or more meshes failed to upload to the GPU";
+    }
+    return "unknown error";
+}
+
+core::Result<ModelHandle, ModelRegisterError> ModelManager::register_model(const std::string& name,
+                                                                          std::unique_ptr<Model> model) {
     // Mutates the model table (and creates GPU resources): main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
     BRACKEN_ASSERT_NOT_SIM_STAGE();
+    BRACKEN_CONTRACT(model != nullptr, "register_model() with a null model");
+
+    // A name collision used to overwrite the map entry and leave the previous
+    // model in the table, reachable by handle but by nothing else — a leak
+    // that presents as "my model didn't update".
+    if (name_to_handle_.contains(name)) {
+        BRACKEN_LOG_ERROR("model", "register_model('{}'): {}", name,
+                          to_string(ModelRegisterError::NameAlreadyRegistered));
+        return core::Err{ModelRegisterError::NameAlreadyRegistered};
+    }
+
+    // Which meshes carry geometry has to be answered BEFORE the upload: it
+    // frees the CPU-side vertex arrays it consumed.
+    bool any_geometry = false;
+    for (const auto& mesh : model->meshes) {
+        if (mesh.uploaded || !mesh.vertices.empty() || !mesh.skinned_vertices.empty()) {
+            any_geometry = true;
+            break;
+        }
+    }
+    if (!any_geometry) {
+        BRACKEN_LOG_ERROR("model", "register_model('{}'): {}", name, to_string(ModelRegisterError::EmptyModel));
+        return core::Err{ModelRegisterError::EmptyModel};
+    }
+
+    // Derived state the host used to be responsible for remembering. Bounds
+    // left empty are scanned off the mesh vertices (before the upload frees
+    // them); a model that set its own — a skinned one with animation headroom
+    // — keeps them.
+    if (model->bounds.empty()) {
+        glm::vec3 lo(std::numeric_limits<float>::max());
+        glm::vec3 hi(std::numeric_limits<float>::lowest());
+        for (const auto& mesh : model->meshes) {
+            for (const auto& v : mesh.vertices) {
+                lo = glm::min(lo, v.position);
+                hi = glm::max(hi, v.position);
+            }
+            for (const auto& v : mesh.skinned_vertices) {
+                lo = glm::min(lo, v.position);
+                hi = glm::max(hi, v.position);
+            }
+        }
+        if (lo.x <= hi.x) {
+            model->bounds = {lo, hi};
+        }
+    }
+    model->compute_bounding_sphere();
+    model->loaded = true;
+
     if (device_) {
         ModelLoader::upload_to_gpu(*device_, *model);
+        for (const auto& mesh : model->meshes) {
+            if (!mesh.uploaded) {
+                BRACKEN_LOG_ERROR("model", "register_model('{}'): {}", name,
+                                  to_string(ModelRegisterError::UploadFailed));
+                return core::Err{ModelRegisterError::UploadFailed};
+            }
+        }
     }
+
     ModelHandle handle = static_cast<ModelHandle>(models_.size());
     models_.push_back(std::move(model));
     model_paths_.emplace_back(); // procedural -- no source path

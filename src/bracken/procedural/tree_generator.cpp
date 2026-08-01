@@ -581,21 +581,17 @@ std::unique_ptr<Model> TreeGenerator::generate(const TreeParams& raw_params) {
     }
 
     // Compute AABB from all vertices
-    model->min_x = model->min_y = model->min_z = 1e9f;
-    model->max_x = model->max_y = model->max_z = -1e9f;
+    model->bounds.min = glm::vec3(1e9f);
+    model->bounds.max = glm::vec3(-1e9f);
     for (const auto& mesh : model->meshes) {
         for (const auto& v : mesh.vertices) {
-            model->min_x = std::min(model->min_x, v.position.x);
-            model->min_y = std::min(model->min_y, v.position.y);
-            model->min_z = std::min(model->min_z, v.position.z);
-            model->max_x = std::max(model->max_x, v.position.x);
-            model->max_y = std::max(model->max_y, v.position.y);
-            model->max_z = std::max(model->max_z, v.position.z);
+            model->bounds.min = glm::min(model->bounds.min, v.position);
+            model->bounds.max = glm::max(model->bounds.max, v.position);
         }
     }
     // Trunk base is always at Y=0; clamp min_y so the centering transform
     // doesn't lift the tree off the ground when branches droop below origin
-    model->min_y = 0.0f;
+    model->bounds.min.y = 0.0f;
 
     model->compute_bounding_sphere();
     model->loaded = true;

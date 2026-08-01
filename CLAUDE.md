@@ -127,9 +127,10 @@ draws it.
   shadow-cascade passes deliberately stay standard-Z — see architecture.md).
 - Frame data flows one way, by value: in `on_simulate` the host fills a
   `scene::FramePacket` through `sim.frame()`'s **`scene::FrameSink`** (3D
-  draws, lights, UI, effect spawns, camera/environment), the engine's
-  sim-stage tail appends the effect-instance snapshot + scene/sky clocks and
-  `seal()`s, and the renderer consumes `const FramePacket&`. `FrameSink` is
+  draws, lights, UI, effect spawns, environment), the engine's
+  sim-stage tail drives the camera into the packet (unless the host took the
+  rig back with `set_camera_driven_by_engine(false)`), appends the
+  effect-instance snapshot + scene/sky clocks and `seal()`s, and the renderer consumes `const FramePacket&`. `FrameSink` is
   the host half of `FrameBuilder`; the sim-stage tail (`seal`,
   `set_frame_timing`, `alloc_effect_snapshot`, `set_engine_frame`, the
   staged-environment reads, `packet()`) and `FramePacket`'s lifecycle
@@ -227,8 +228,9 @@ draws it.
   40 us and cost 4 ms on the device — for GPU-side cost use RenderDoc/Nsight.
   `Application::present_wait_ms()` is the CPU-bound-vs-GPU-bound signal.
 - glTF animation channels targeting non-skin nodes are dropped (counted and
-  summarized in one `ModelLoadReport` line per model since phase 4)
-  at load; `Mesh::near_only` exists but is **not enforced**.
+  summarized in one `ModelLoadReport` line per model since phase 4) at load.
+  (`Mesh::near_only` was deleted in phase 9 — it was a hint the draw walk
+  never read.)
 - `render_graph/` is not in the frame path — don't route the renderer through
   it without a measured reason (design notes explain why).
 

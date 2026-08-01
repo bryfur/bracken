@@ -1,6 +1,10 @@
 #include "bracken/heightmap.hpp"
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <gtest/gtest.h>
+#include <vector>
 
 using namespace bracken;
 
@@ -166,14 +170,11 @@ TEST(Heightmap, WorldToGridConversion) {
 
 TEST(Heightmap, NormalOnFlatSurfacePointsUp) {
     auto h = make_flat(8, 10.0f, 0.0f);
-    float nx = NAN;
-    float ny = NAN;
-    float nz = NAN;
-    h.get_normal_world(5.0f, 5.0f, nx, ny, nz);
+    const glm::vec3 n = h.get_normal_world(5.0f, 5.0f);
     // Flat surface normal should be (0, 1, 0)
-    EXPECT_NEAR(nx, 0.0f, 0.01f);
-    EXPECT_NEAR(ny, 1.0f, 0.01f);
-    EXPECT_NEAR(nz, 0.0f, 0.01f);
+    EXPECT_NEAR(n.x, 0.0f, 0.01f);
+    EXPECT_NEAR(n.y, 1.0f, 0.01f);
+    EXPECT_NEAR(n.z, 0.0f, 0.01f);
 }
 
 TEST(Heightmap, NormalIsUnitLength) {
@@ -193,12 +194,8 @@ TEST(Heightmap, NormalIsUnitLength) {
         }
     }
 
-    float nx = NAN;
-    float ny = NAN;
-    float nz = NAN;
-    h.get_normal_world(1.5f, 1.5f, nx, ny, nz);
-    float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-    EXPECT_NEAR(len, 1.0f, 0.001f);
+    const glm::vec3 n = h.get_normal_world(1.5f, 1.5f);
+    EXPECT_NEAR(glm::length(n), 1.0f, 0.001f);
 }
 
 TEST(Heightmap, NegativeHeights) {
@@ -396,43 +393,155 @@ TEST(Heightmap, NormalOnSlope) {
         }
     }
 
-    float nx = NAN;
-    float ny = NAN;
-    float nz = NAN;
-    h.get_normal_world(1.5f, 1.5f, nx, ny, nz);
+    const glm::vec3 n = h.get_normal_world(1.5f, 1.5f);
 
     // Normal should point away from the slope: negative x component (tilts away from rising slope)
-    EXPECT_LT(nx, 0.0f) << "Normal x should be negative on a +x upward slope";
+    EXPECT_LT(n.x, 0.0f) << "Normal x should be negative on a +x upward slope";
     // Normal should still point generally upward
-    EXPECT_GT(ny, 0.0f) << "Normal y should be positive (pointing up)";
-    // No slope in z direction, so nz should be near zero
-    EXPECT_NEAR(nz, 0.0f, 0.01f);
+    EXPECT_GT(n.y, 0.0f) << "Normal y should be positive (pointing up)";
+    // No slope in z direction, so n.z should be near zero
+    EXPECT_NEAR(n.z, 0.0f, 0.01f);
     // Should be unit length
-    float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-    EXPECT_NEAR(len, 1.0f, 0.001f);
+    EXPECT_NEAR(glm::length(n), 1.0f, 0.001f);
 }
 
 TEST(Heightmap, NormalAtEdgeOfHeightmap) {
     // Normal at the very edge should still work (clamping prevents out-of-bounds)
     auto h = make_flat(8, 10.0f, 25.0f);
 
-    float nx = NAN;
-    float ny = NAN;
-    float nz = NAN;
     // Bottom-left corner
-    h.get_normal_world(0.0f, 0.0f, nx, ny, nz);
-    float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+    const glm::vec3 n = h.get_normal_world(0.0f, 0.0f);
+    float len = glm::length(n);
     EXPECT_NEAR(len, 1.0f, 0.001f);
     // Flat terrain: normal should be roughly (0,1,0) even at edge
-    EXPECT_NEAR(nx, 0.0f, 0.05f);
-    EXPECT_NEAR(ny, 1.0f, 0.05f);
-    EXPECT_NEAR(nz, 0.0f, 0.05f);
+    EXPECT_NEAR(n.x, 0.0f, 0.05f);
+    EXPECT_NEAR(n.y, 1.0f, 0.05f);
+    EXPECT_NEAR(n.z, 0.0f, 0.05f);
 
     // Top-right corner
-    h.get_normal_world(10.0f, 10.0f, nx, ny, nz);
-    len = std::sqrt(nx * nx + ny * ny + nz * nz);
+    const glm::vec3 n2 = h.get_normal_world(10.0f, 10.0f);
+    len = glm::length(n2);
     EXPECT_NEAR(len, 1.0f, 0.001f);
-    EXPECT_NEAR(nx, 0.0f, 0.05f);
-    EXPECT_NEAR(ny, 1.0f, 0.05f);
-    EXPECT_NEAR(nz, 0.0f, 0.05f);
+    EXPECT_NEAR(n2.x, 0.0f, 0.05f);
+    EXPECT_NEAR(n2.y, 1.0f, 0.05f);
+    EXPECT_NEAR(n2.z, 0.0f, 0.05f);
+}
+
+// ===== from_floats: the engine owns the scan and the 16-bit packing (P9) =====
+
+namespace {
+
+// The exact arithmetic every host hand-rolled before from_floats existed
+// (examples/playground/playground.cpp::build_heightmap). from_floats must
+// reproduce it bit for bit, or moving a host onto it silently reshapes its
+// terrain.
+uint16_t hand_rolled_quantize(float h, float min_height, float max_height) {
+    float normalized = (h - min_height) / (max_height - min_height);
+    return static_cast<uint16_t>(normalized * 65535.0f);
+}
+
+std::vector<float> ramp_heights(uint32_t res) {
+    std::vector<float> heights(static_cast<size_t>(res) * res);
+    for (uint32_t z = 0; z < res; ++z) {
+        for (uint32_t x = 0; x < res; ++x) {
+            // Something with structure in both axes and awkward fractions.
+            heights[z * res + x] = -160.0f + static_cast<float>(x) * 1.37f - static_cast<float>(z) * 0.91f +
+                                   std::sin(static_cast<float>(x + z) * 0.3f) * 17.0f;
+        }
+    }
+    return heights;
+}
+
+} // namespace
+
+TEST(HeightmapFromFloats, ExplicitRangeMatchesTheHandRolledQuantizationBitForBit) {
+    constexpr uint32_t RES = 33;
+    const std::vector<float> heights = ramp_heights(RES);
+    // The range must CONTAIN the data: the hand-rolled cast is only defined
+    // in range (outside it the float->uint16 conversion is undefined, and an
+    // optimizing build happily wraps). Clamping out-of-range heights is
+    // from_floats' one deliberate behavioral addition, covered separately.
+    const HeightRange range{-240.0f, 160.0f};
+
+    const Heightmap h = Heightmap::from_floats(heights, RES, {0.0f, 0.0f, 8000.0f}, range);
+    ASSERT_TRUE(h.valid());
+    EXPECT_EQ(h.resolution, RES);
+    EXPECT_FLOAT_EQ(h.world_size, 8000.0f);
+    EXPECT_FLOAT_EQ(h.min_height, range.min);
+    EXPECT_FLOAT_EQ(h.max_height, range.max);
+
+    for (size_t i = 0; i < heights.size(); ++i) {
+        ASSERT_GE(heights[i], range.min) << "test data left the range at sample " << i;
+        ASSERT_LE(heights[i], range.max) << "test data left the range at sample " << i;
+        EXPECT_EQ(h.height_data[i], hand_rolled_quantize(heights[i], range.min, range.max)) << "sample " << i;
+    }
+}
+
+TEST(HeightmapFromFloats, ScannedRangeIsTheDataExtremesAndRoundTrips) {
+    constexpr uint32_t RES = 17;
+    const std::vector<float> heights = ramp_heights(RES);
+    const float lo = *std::min_element(heights.begin(), heights.end());
+    const float hi = *std::max_element(heights.begin(), heights.end());
+
+    const Heightmap h = Heightmap::from_floats(heights, RES, {100.0f, 200.0f, 1000.0f});
+    ASSERT_TRUE(h.valid());
+    EXPECT_FLOAT_EQ(h.min_height, lo);
+    EXPECT_FLOAT_EQ(h.max_height, hi);
+    EXPECT_FLOAT_EQ(h.world_origin_x, 100.0f);
+    EXPECT_FLOAT_EQ(h.world_origin_z, 200.0f);
+
+    // 16 bits over the data range: every sample decodes back to within one step.
+    const float step = (hi - lo) / 65535.0f;
+    for (uint32_t z = 0; z < RES; ++z) {
+        for (uint32_t x = 0; x < RES; ++x) {
+            EXPECT_NEAR(h.get_height_local(x, z), heights[z * RES + x], step * 1.5f);
+        }
+    }
+    // The extremes land exactly on the ends of the encoding.
+    EXPECT_EQ(*std::min_element(h.height_data.begin(), h.height_data.end()), 0);
+    EXPECT_EQ(*std::max_element(h.height_data.begin(), h.height_data.end()), 65535);
+}
+
+TEST(HeightmapFromFloats, OutOfRangeHeightsClampInsteadOfWrapping) {
+    const std::vector<float> heights{-500.0f, 0.0f, 5.0f, 900.0f};
+    const Heightmap h = Heightmap::from_floats(heights, 2, {0.0f, 0.0f, 10.0f}, {0.0f, 10.0f});
+    ASSERT_TRUE(h.valid());
+    EXPECT_EQ(h.height_data[0], 0);     // far below the range
+    EXPECT_EQ(h.height_data[3], 65535); // far above it
+    EXPECT_EQ(h.height_data[1], 0);
+}
+
+TEST(HeightmapFromFloats, DegenerateInputsProduceAnInvalidMap) {
+    const std::vector<float> four{1.0f, 2.0f, 3.0f, 4.0f};
+    // Below the 2x2 minimum: resolution - 1 would underflow in every query.
+    EXPECT_FALSE(Heightmap::from_floats(four, 1, {0.0f, 0.0f, 10.0f}).valid());
+    EXPECT_FALSE(Heightmap::from_floats(four, 0, {0.0f, 0.0f, 10.0f}).valid());
+    // Sample count that does not match the resolution.
+    EXPECT_FALSE(Heightmap::from_floats(four, 3, {0.0f, 0.0f, 10.0f}).valid());
+    EXPECT_FALSE(Heightmap::from_floats({}, 2, {0.0f, 0.0f, 10.0f}).valid());
+}
+
+TEST(HeightmapFromFloats, FlatDataPacksToZeroAndDecodesToItself) {
+    const std::vector<float> heights(16, 42.0f);
+    const Heightmap h = Heightmap::from_floats(heights, 4, {0.0f, 0.0f, 3.0f});
+    ASSERT_TRUE(h.valid());
+    // A zero-width range: everything packs to 0 and decodes back to min_height.
+    EXPECT_FLOAT_EQ(h.min_height, 42.0f);
+    EXPECT_FLOAT_EQ(h.max_height, 42.0f);
+    EXPECT_EQ(h.height_data[7], 0);
+    EXPECT_FLOAT_EQ(h.get_height_local(1, 1), 42.0f);
+}
+
+TEST(Heightmap, ValidRejectsUnderPopulatedAndTooSmallMaps) {
+    Heightmap h;
+    EXPECT_FALSE(h.valid()); // default: resolution 0
+    h.resolution = 4;
+    EXPECT_FALSE(h.valid()); // no samples
+    h.height_data.resize(15);
+    EXPECT_FALSE(h.valid()); // one short
+    h.height_data.resize(16);
+    EXPECT_TRUE(h.valid());
+    h.resolution = 1;
+    h.height_data.resize(1);
+    EXPECT_FALSE(h.valid()); // 1x1 underflows resolution - 1
 }

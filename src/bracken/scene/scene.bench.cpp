@@ -201,13 +201,8 @@ static void BM_HeightmapNormal(benchmark::State& state) {
     size_t i = 0;
     for (auto _ : state) {
         const glm::vec2& c = coords[i++ & (kCoordCount - 1)];
-        float nx = 0.0f;
-        float ny = 0.0f;
-        float nz = 0.0f;
-        map.get_normal_world(c.x, c.y, nx, ny, nz);
-        benchmark::DoNotOptimize(nx);
-        benchmark::DoNotOptimize(ny);
-        benchmark::DoNotOptimize(nz);
+        glm::vec3 n = map.get_normal_world(c.x, c.y);
+        benchmark::DoNotOptimize(n);
     }
     state.SetItemsProcessed(state.iterations());
 }

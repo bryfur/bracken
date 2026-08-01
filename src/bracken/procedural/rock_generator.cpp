@@ -611,27 +611,23 @@ std::unique_ptr<Model> RockGenerator::generate(const RockParams& params) {
     mesh.has_texture = false;
     model->meshes.push_back(std::move(mesh));
 
-    model->min_x = model->min_y = model->min_z = 1e9f;
-    model->max_x = model->max_y = model->max_z = -1e9f;
+    model->bounds.min = glm::vec3(1e9f);
+    model->bounds.max = glm::vec3(-1e9f);
     for (const auto& m : model->meshes) {
         for (const auto& v : m.vertices) {
-            model->min_x = std::min(model->min_x, v.position.x);
-            model->min_y = std::min(model->min_y, v.position.y);
-            model->min_z = std::min(model->min_z, v.position.z);
-            model->max_x = std::max(model->max_x, v.position.x);
-            model->max_y = std::max(model->max_y, v.position.y);
-            model->max_z = std::max(model->max_z, v.position.z);
+            model->bounds.min = glm::min(model->bounds.min, v.position);
+            model->bounds.max = glm::max(model->bounds.max, v.position);
         }
     }
     // Force symmetric AABB so build_model_transform centering is zero
     // (procedural rocks are already centered at XZ origin)
-    float x_extent = std::max(std::abs(model->min_x), std::abs(model->max_x));
-    float z_extent = std::max(std::abs(model->min_z), std::abs(model->max_z));
-    model->min_x = -x_extent;
-    model->max_x = x_extent;
-    model->min_z = -z_extent;
-    model->max_z = z_extent;
-    model->min_y = 0.0f;
+    float x_extent = std::max(std::abs(model->bounds.min.x), std::abs(model->bounds.max.x));
+    float z_extent = std::max(std::abs(model->bounds.min.z), std::abs(model->bounds.max.z));
+    model->bounds.min.x = -x_extent;
+    model->bounds.max.x = x_extent;
+    model->bounds.min.z = -z_extent;
+    model->bounds.max.z = z_extent;
+    model->bounds.min.y = 0.0f;
     model->compute_bounding_sphere();
     model->loaded = true;
 
