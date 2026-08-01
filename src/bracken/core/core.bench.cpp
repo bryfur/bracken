@@ -7,10 +7,12 @@
 #include "bracken/memory/frame_allocator.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace bracken::core;
@@ -169,3 +171,68 @@ static void BM_ParallelForSum(benchmark::State& state) {
     state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(k_sum_count));
 }
 BENCHMARK(BM_ParallelForSum)->Arg(1024)->Arg(16384);
+
+// ---------------------------------------------------------------------------
+// parallel_for DISPATCH cost — the thing Phase 10a is about. The chunk body
+// is deliberately near-empty (one dependent load per chunk) so what is timed
+// is submit + wake + steal + join, not the work. Reported per CHUNK
+// (SetItemsProcessed counts chunks, so items/s inverts to s/chunk): the
+// per-node epoch bump + notify is a per-chunk cost, so a fixed total with a
+// varying chunk count is the wrong axis. Run at BRACKEN_WORKERS=4 and 8.
+// ---------------------------------------------------------------------------
+
+static void BM_ParallelForDispatch(benchmark::State& state) {
+    ensure_job_system();
+    const std::size_t chunks = static_cast<std::size_t>(state.range(0));
+    // Explicit grain: bypasses the small-total guard so chunk count is
+    // exactly `chunks` regardless of the pool size.
+    constexpr std::size_t grain = 64;
+    const std::size_t total = chunks * grain;
+    std::vector<std::uint32_t> data(total, 1u);
+
+    for (auto _ : state) {
+        parallel_for(
+            0, total,
+            [&](std::size_t b, std::size_t e) {
+                std::uint32_t v = data[b] + data[e - 1];
+                benchmark::DoNotOptimize(v);
+            },
+            grain);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(chunks));
+    state.counters["chunks"] = static_cast<double>(chunks);
+}
+BENCHMARK(BM_ParallelForDispatch)->Arg(32)->Arg(64)->Arg(256)->Arg(1024);
+
+// The same dispatch against a PARKED pool. The loop above is back-to-back, so
+// workers never get past their spin window and the epoch notify is nearly
+// free; between engine frames (~9 ms) they are parked on the futex, and a
+// wake there costs a syscall. Both regimes are real — the frame's FIRST
+// fan-out hits a parked pool, the rest of the frame hits a hot one — so both
+// are measured. The idle gap is excluded from the timing (PauseTiming), and
+// the iteration count is fixed to keep the wall time sane.
+static void BM_ParallelForDispatchParked(benchmark::State& state) {
+    ensure_job_system();
+    const std::size_t chunks = static_cast<std::size_t>(state.range(0));
+    constexpr std::size_t grain = 64;
+    const std::size_t total = chunks * grain;
+    std::vector<std::uint32_t> data(total, 1u);
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        // Comfortably past k_spin_rounds (64 steal sweeps): every worker is
+        // on the futex when the dispatch below starts.
+        std::this_thread::sleep_for(std::chrono::microseconds(400));
+        state.ResumeTiming();
+        parallel_for(
+            0, total,
+            [&](std::size_t b, std::size_t e) {
+                std::uint32_t v = data[b] + data[e - 1];
+                benchmark::DoNotOptimize(v);
+            },
+            grain);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(chunks));
+    state.counters["chunks"] = static_cast<double>(chunks);
+}
+BENCHMARK(BM_ParallelForDispatchParked)->Arg(32)->Arg(64)->Arg(256)->Iterations(300);
