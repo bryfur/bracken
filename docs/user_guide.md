@@ -262,7 +262,7 @@ Boot sequence: `init_engine()` → `init_renderer(width, height, title, world_wi
 
 Side effects worth knowing (all in `src/bracken/application.cpp`):
 
-- `init_renderer` **auto-loads** `GraphicsSettings` from `settings_file_path()` (SDL pref path + `settings.cfg`; missing file is fine — defaults apply) and applies them; `shutdown_renderer` **auto-saves** them.
+- `init_renderer` **auto-loads** `GraphicsSettings` from `settings_file_path()` (SDL pref path + `settings.cfg`; missing file is fine — defaults apply) and applies them; `shutdown_renderer` **auto-saves** them. Call **`set_settings_persistence(false)` before `init_renderer()`** to opt out of both — see "Persistence, and when to turn it off".
 - Nothing you hand the builder carries a lifetime obligation: everything is copied or packet-allocated (skinned bone matrices go into packet memory via `fb.alloc_bone_palette`; UI strings are copied at emit time). The one exception is asset data — `EffectDefinition*` passed to `spawn_effect` must outlive the spawned instances.
 - Change settings at runtime through **`edit_graphics_settings()`** — a scoped handle that requests its edited copy when it dies (and requests nothing if you changed nothing). The actual GPU/SDL work (sampler rebuilds, swapchain reconfigure, fullscreen transitions) happens at the next frame fence, diffed so expensive setters only run when their inputs changed. (`request_graphics_settings` / `apply_all_graphics_settings` remain for hosts that want to drive it by hand.)
 - `request_screenshot(path)` is deferred to the frame fence: a request from sim frame i captures frame i's final swapchain image (UI included) to a PNG. The capturing frame blocks on the GPU — integration tests and debugging only, not a gameplay feature.
@@ -512,6 +512,20 @@ gs->shadow_mode = bracken::ShadowMode::PCF;
 `apply_all_graphics_settings()` copies the struct into `graphics_settings()`, always pushes the cheap renderer settings, and only invokes the expensive setters (sampler rebuild for anisotropy, swapchain reconfigure for vsync, fullscreen transition for window mode/resolution) when those specific fields actually changed since the last apply. It does GPU/SDL work, so it is **main-thread tier with no sim in flight**. From `on_simulate` (where the playground's F1–F8 hotkeys live, `examples/playground/playground.cpp::handle_input`) the request goes through `edit_graphics_settings()` / `request_graphics_settings(gs)`: the request is stored and applied through the same diffing path at the next frame fence (last request before a fence wins; the DevUI Graphics tab's main-thread request wins over a simultaneous sim request). Keep edits to one phase at a time — edit in `on_simulate` or in `on_main_frame`, not both concurrently, and do not hold an edit handle across a frame boundary.
 
 Settings are auto-loaded by `init_renderer()` and auto-saved by `shutdown_renderer()`. The file lives at `settings_file_path()` — the SDL pref path for org/app `"bracken"/"bracken"` plus `settings.cfg` (e.g. `~/.local/share/bracken/bracken/settings.cfg` on Linux). A missing file on first run is normal and logged at INFO level; defaults apply.
+
+#### Persistence, and when to turn it off
+
+`set_settings_persistence(false)` — called **before `init_renderer()`** — makes the engine neither read nor write that file. The run starts from `GraphicsSettings{}` plus whatever the host sets, and nothing is written at shutdown.
+
+Turn it off for **any run whose output is a measurement**: a headless regression run, CI, a screenshot A/B, a benchmark harness. `settings.cfg` is a single process-global mutable input, so with persistence on:
+
+- the run's result depends on what ran *last* on that machine — including a session where a developer ticked a Graphics-panel checkbox;
+- two runs in parallel race on the same path;
+- the run's own end-of-run state is written back, so it perturbs the *next* run and the developer's interactive preferences.
+
+This is not hypothetical. `rt_shadows` / `rt_reflections` round-trip like every other field, so a single opt-in ray-tracing run armed every later run on the machine — a plain smoke run built a 27 MB acceleration structure and traced with both defaults `false` and no env var set. The playground now calls `set_settings_persistence(false)` as soon as `--smoke` is parsed, which is what makes its reported numbers reproducible; the interactive playground keeps persistence, because a player's preference *should* survive a restart.
+
+The one behaviour you give up: a Graphics-panel edit made during a persistence-off run does not survive the process.
 
 #### Fields and defaults
 

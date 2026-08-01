@@ -215,6 +215,8 @@ bool init_dev_ui();
 dev::DevUI& dev_ui();
 GraphicsSettings& graphics_settings();                // host-owned; single writer per phase (on_simulate OR on_main_frame, not both)
 std::string settings_file_path() const;                    // SDL_GetPrefPath("bracken","bracken") + "settings.cfg"
+void set_settings_persistence(bool enabled);               // default true; false = never read or write that file (call BEFORE init_renderer)
+bool settings_persistence() const;
 std::vector<DisplayMode> available_resolutions() const;    // DisplayMode { int w, h; }
 ModelManager& models();                               // mutation main-thread; const lookups worker-safe
 float get_terrain_height(float x, float z);           // worker-safe (immutable heightmap reads)
@@ -408,6 +410,7 @@ dev::DevUI& dev_ui();
 
 GraphicsSettings& graphics_settings();  const GraphicsSettings& graphics_settings() const;
 std::string settings_file_path() const;
+void set_settings_persistence(bool enabled);  bool settings_persistence() const;
 
 struct DisplayMode { int w, h; };
 std::vector<DisplayMode> available_resolutions() const;
@@ -499,7 +502,7 @@ Mouse-button edge flags are consumed by `InputHandler::snapshot()` — the snaps
 3. Construct `scene::SceneRenderer`; `scene_renderer_->init(*context_, world_width, world_height)`; on failure return `false`.
 4. Hot-reload wiring: `scene_renderer_->pipeline_registry()->enable_hot_reload(FileWatcher::instance())` (if the registry exists) and `scene_renderer_->models().enable_hot_reload(...)`. These are wired unconditionally; they only do anything if the watcher was initialized.
 5. Construct `systems::CameraSystem`.
-6. Auto-load settings: `graphics_settings_.load(settings_file_path())`; a missing file is logged at INFO ("using defaults") — not an error.
+6. Auto-load settings: `graphics_settings_.load(settings_file_path())`; a missing file is logged at INFO ("using defaults") — not an error. **Skipped entirely when `settings_persistence()` is false** (logged once at INFO), so the struct's defaults stand.
 7. `apply_all_graphics_settings(graphics_settings_)`.
 
 Default world extents 32000×32000 are a documented load-bearing constant (`docs/architecture.md` constants table).
@@ -507,7 +510,7 @@ Default world extents 32000×32000 are a documented load-bearing constant (`docs
 #### shutdown_renderer() — teardown order
 
 1. `core::jobs::JobSystem::instance().shutdown()` — **join the worker pool before any GPU teardown**: no in-flight or queued job can touch a subsystem (renderer, device, model manager) about to be destroyed (source comment).
-2. Auto-save: `graphics_settings_.save(settings_file_path())`; failure logged `BRACKEN_LOG_ERROR("settings", ...)`, not fatal.
+2. Auto-save: `graphics_settings_.save(settings_file_path())`; failure logged `BRACKEN_LOG_ERROR("settings", ...)`, not fatal. **Skipped entirely when `settings_persistence()` is false** — a run that did not read the file must not write it either.
 3. `dev_ui_->shutdown(); dev_ui_.reset()` — **the dev overlay owns GPU resources and must die before the device** (source comment).
 4. `camera_.reset()`; `scene_renderer_->shutdown()`; `context_->shutdown()`; then reset both pointers.
 
@@ -523,6 +526,12 @@ Default world extents 32000×32000 are a documented load-bearing constant (`docs
 #### settings_file_path()
 
 `SDL_GetPrefPath("bracken", "bracken")` + `"settings.cfg"`; returns `""` if SDL cannot produce a pref path (both auto-load and auto-save skip an empty path). The `char*` from SDL is freed with `SDL_free`.
+
+#### set_settings_persistence(bool) / settings_persistence()
+
+Plain bool member, default `true`, main-thread tier; read at `init_renderer()` (step 6) and `shutdown_renderer()` (step 2), so it must be set **before** `init_renderer()` to suppress the load. `false` makes the engine neither read nor write `settings_file_path()`.
+
+The file is a single process-global mutable input: with persistence on, a run's starting state is whatever the last run (or a concurrent one) left behind, and every field round-trips — including `rt_shadows` / `rt_reflections`, so one opt-in ray-tracing run arms every later run on that machine. Any run whose output is a *measurement* (regression/CI/benchmark/screenshot A/B) should turn persistence off; `examples/playground` does so as soon as `--smoke` is parsed.
 
 #### Window / presentation facade semantics (implemented in `render/render_context.cpp`)
 

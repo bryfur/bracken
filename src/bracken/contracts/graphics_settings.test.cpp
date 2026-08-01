@@ -45,6 +45,43 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
     EXPECT_FLOAT_EQ(s.auto_exposure_max_ev, 4.0f);
     EXPECT_FLOAT_EQ(s.auto_exposure_speed_up, 1.5f);
     EXPECT_FLOAT_EQ(s.auto_exposure_speed_down, 2.5f);
+    // Ray tracing is OFF by default, and the docs promise it. Pinned here
+    // because a defaulted-on software BVH silently costs tens of MB and a
+    // multiple of the frame time; the bug that motivated this test was these
+    // two arriving as `1` from a persisted file, so also see
+    // RayTracingFlagsRoundTrip below.
+    EXPECT_FALSE(s.rt_shadows);
+    EXPECT_FALSE(s.rt_reflections);
+}
+
+// The rt_* flags are persisted like every other field, which means any run
+// that turned them on arms every later run on that machine. That behaviour is
+// intentional for a game (a player's preference should survive a restart), so
+// what is pinned here is the round trip, not the absence of it — a host that
+// needs a hermetic run uses Application::set_settings_persistence(false).
+TEST_F(GraphicsSettingsTest, RayTracingFlagsRoundTrip) {
+    GraphicsSettings written;
+    written.rt_shadows = true;
+    written.rt_reflections = true;
+    ASSERT_TRUE(written.save(TEST_FILE));
+
+    GraphicsSettings read;
+    ASSERT_FALSE(read.rt_shadows);
+    ASSERT_FALSE(read.rt_reflections);
+    ASSERT_TRUE(read.load(TEST_FILE));
+    EXPECT_TRUE(read.rt_shadows);
+    EXPECT_TRUE(read.rt_reflections);
+
+    // ...and back off again, so a file holding `0` really does clear them
+    // rather than leaving the previous value standing.
+    GraphicsSettings off;
+    ASSERT_TRUE(off.save(TEST_FILE));
+    GraphicsSettings reread;
+    reread.rt_shadows = true;
+    reread.rt_reflections = true;
+    ASSERT_TRUE(reread.load(TEST_FILE));
+    EXPECT_FALSE(reread.rt_shadows);
+    EXPECT_FALSE(reread.rt_reflections);
 }
 
 TEST_F(GraphicsSettingsTest, GetDrawDistanceMapping) {

@@ -216,6 +216,21 @@ bool PlaygroundGame::on_init() {
         async_load_disabled_ = true;
     }
 
+    // A smoke run is a regression gate, so it must not read or write the
+    // developer's persisted GraphicsSettings. This has to happen BEFORE
+    // init_renderer(), which is where the engine auto-loads that file.
+    //
+    // It was not hermetic, and that cost two full investigations: any earlier
+    // run that turned ray tracing on (PLAYGROUND_RT, or a tick in the dev
+    // overlay) wrote rt_shadows=1 at exit, so every later plain `--smoke`
+    // silently traced; and a full 240-frame run persists its end-of-run
+    // sweep state (shadow_mode, ao_mode), which moved the reported mean_luma
+    // by more than a point with no code change at all. The file is also a
+    // single process-global path, so two concurrent runs raced on it.
+    if (smoke_frames_ > 0) {
+        set_settings_persistence(false);
+    }
+
     if (!init_renderer(1600, 900, "bracken playground", WORLD, WORLD)) {
         return false;
     }
@@ -379,13 +394,19 @@ bool PlaygroundGame::on_init() {
     // flags, and the engine builds/refreshes the acceleration structure from
     // the frame packet itself. Off unless asked for: this is software ray
     // tracing over a BVH, and it is not free.
-    if (!rt_mode_.empty()) {
-        const std::string& mode = rt_mode_;
+    // PINS both flags rather than only setting them when the var is present:
+    // an unset PLAYGROUND_RT means "no ray tracing", and used to mean "keep
+    // whatever the last run persisted". That is how a plain `--smoke` ended up
+    // building a 27 MB acceleration structure and tracing, with no env var set
+    // and both GraphicsSettings defaults false. The playground is a demo and
+    // an integration harness, so an explicit pin is the right trade: an
+    // interactive session that wants ray tracing ticks the Graphics panel.
+    {
         auto edit = edit_graphics_settings();
-        auto& gs = *edit;
-        gs.rt_shadows = mode == "shadows" || mode == "both";
-        gs.rt_reflections = mode == "reflections" || mode == "both";
-        request_graphics_settings(gs);
+        apply_rt_mode(*edit);
+        // No request_graphics_settings() here: the edit handle commits on
+        // scope exit if anything changed (the old code requested the same
+        // value twice into the same slot).
     }
 
     // --- Tier 3: nav grid ---------------------------------------------
@@ -1483,6 +1504,11 @@ void PlaygroundGame::update_smoke_driver(float dt) {
     }
 }
 
+void PlaygroundGame::apply_rt_mode(bracken::GraphicsSettings& gs) const {
+    gs.rt_shadows = rt_mode_ == "shadows" || rt_mode_ == "both";
+    gs.rt_reflections = rt_mode_ == "reflections" || rt_mode_ == "both";
+}
+
 // One-time smoke-run configuration — the retired driver's frame-1 block, now
 // run from the end of on_init (main thread, renderer up, no sim in flight, so
 // the render-side touches are legal; the env-var parsing happens once instead
@@ -1502,11 +1528,24 @@ void PlaygroundGame::setup_smoke_run() {
     // in the same request, applied at the first frame fence — before frame 0
     // renders.
     auto gs = edit_graphics_settings();
-    // Persisted settings may have stored another AA mode: force TAA so the
-    // smoke always exercises the temporal path (and the final screenshot
-    // captures it). Local shadows likewise forced to the default-ON state
-    // (PLAYGROUND_LOCAL_SHADOWS=0 is the A/B test hook to force them off
-    // for the whole run).
+
+    // START FROM THE ENGINE DEFAULTS. set_settings_persistence(false) in
+    // on_init already stops the file being read, so this is belt and braces —
+    // but it is also the thing that scales. There used to be an ad-hoc list of
+    // fields reset here ("a previous run may have persisted its end-of-run
+    // state"), and it had silently fallen behind by ten fields: rt_shadows,
+    // rt_reflections, shadow_mode, ao_mode, ao_strength, ao_radius,
+    // draw_distance, shadow_distance, local_shadow_spot_budget, vsync_mode.
+    // Two of those (rt_*) made plain `--smoke` trace without being asked; two
+    // more (shadow_mode=Off, draw_distance) moved mean_luma by 4.4 points with
+    // no code change. Enumerating fields does not scale; resetting does.
+    // Every override below — and every env hook — runs after this and wins.
+    *gs = bracken::GraphicsSettings{};
+    // Ray tracing: pinned from PLAYGROUND_RT, off when it is unset.
+    apply_rt_mode(*gs);
+    // TAA so the smoke always exercises the temporal path (and the final
+    // screenshot captures it). This is also the struct default; kept explicit
+    // because PLAYGROUND_AA below overrides it and the intent should read.
     gs->aa_mode = AAMode::TAA;
     // PLAYGROUND_AA=0/1/2 pins Off/FXAA/TAA for the whole run (A/B hook;
     // the mid-run AA flips at 110/160 are skipped while pinned).
@@ -1534,13 +1573,9 @@ void PlaygroundGame::setup_smoke_run() {
             smoke_cam_dist_ = dist * 100.0f;
         }
     }
-    // A previous run may have persisted its end-of-run state (frame-205
-    // "cloud passes over" dim, frame-80 volumetric fog): reset both so
-    // every run starts at the scene's canonical look. NOTE: the engine's
-    // canonical sun_intensity is 3.0 (HDR headroom), not 1.0.
-    gs->sun_intensity = 3.0f;
-    gs->volumetric_fog = false;
-    gs->god_rays = false;
+    // (sun_intensity / volumetric_fog / god_rays used to be reset here against
+    // a run's persisted end state — the whole-struct reset above covers them,
+    // and every other field the list had missed.)
     // PLAYGROUND_SUN_SHADOWS=0 forces the CSM off for the whole run (A/B
     // debug hook, like PLAYGROUND_LOCAL_SHADOWS). Remembered so the frame-200
     // PCF flip stays skipped without re-reading the env var at the fence.
@@ -1826,6 +1861,19 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
         // The hard regression gate. Unlike everything on the line above, this
         // is computed entirely CPU-side, so it is exact and driver-independent.
         std::cout << std::format("[smoke] packet_digest=0x{:016x}\n", packet_digest());
+        {   // The settings the run ACTUALLY rendered with. mean_luma is not a
+            // reproducible measurement without this: these knobs used to be
+            // inherited from a persisted file, and a drifted shadow_mode alone
+            // moved the reported baseline by 3 luma points with no code change.
+            // `persist=0` says the run neither read nor wrote settings.cfg.
+            const auto& g = graphics_settings();
+            std::cout << std::format(
+                "[smoke] settings persist={} shadow_mode={} ao_mode={} aa_mode={} draw_distance={} "
+                "rt_shadows={} rt_reflections={} sun={:.2f} local_shadows={}\n",
+                settings_persistence() ? 1 : 0, static_cast<int>(g.shadow_mode), static_cast<int>(g.ao_mode),
+                static_cast<int>(g.aa_mode), static_cast<int>(g.draw_distance), g.rt_shadows ? 1 : 0,
+                g.rt_reflections ? 1 : 0, g.sun_intensity, g.local_shadows ? 1 : 0);
+        }
         {   // Ray-tracing evidence: whether the passes actually ran, not just
             // whether the frame survived them.
             const auto& rt = scene_renderer().raytracing_stats();

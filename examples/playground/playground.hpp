@@ -151,6 +151,10 @@ private:
                           // after the heightmap/village/props exist
     void setup_smoke_run(); // one-time smoke config (env-var hooks, forced
                             // settings, camera framing) — main thread, at init
+    /// Pin rt_shadows/rt_reflections from PLAYGROUND_RT. An UNSET var means
+    /// both OFF: the flags are persisted in settings.cfg, so "leave them
+    /// alone" silently inherited ray tracing from whatever ran last.
+    void apply_rt_mode(bracken::GraphicsSettings& gs) const;
 
     // Sim-side (on_simulate; pool job — no GPU/SDL/main-thread-tier calls):
     void update_smoke_driver(float dt); // movement synthesis: orbit/chase/attack

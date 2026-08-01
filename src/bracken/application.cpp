@@ -469,11 +469,16 @@ bool Application::init_renderer(int width, int height, const std::string& title,
 
     camera_ = std::make_unique<CameraSystem>();
 
-    // Auto-load settings from disk
-    auto path = settings_file_path();
-    if (!path.empty() && !graphics_settings_.load(path)) {
-        // Normal on first run: no settings file yet, defaults apply.
-        BRACKEN_LOG_INFO("app", "No graphics settings at '{}'; using defaults", path);
+    // Auto-load settings from disk, unless the host opted out
+    // (set_settings_persistence(false) — regression runs, headless tools).
+    if (settings_persistence_) {
+        auto path = settings_file_path();
+        if (!path.empty() && !graphics_settings_.load(path)) {
+            // Normal on first run: no settings file yet, defaults apply.
+            BRACKEN_LOG_INFO("app", "No graphics settings at '{}'; using defaults", path);
+        }
+    } else {
+        BRACKEN_LOG_INFO("app", "Graphics settings persistence disabled; using in-memory settings only");
     }
     apply_all_graphics_settings(graphics_settings_);
 
@@ -486,11 +491,15 @@ void Application::shutdown_renderer() {
     // device, model manager) that is about to be destroyed.
     core::jobs::JobSystem::instance().shutdown();
 
-    // Auto-save settings on shutdown
-    auto path = settings_file_path();
-    if (!path.empty()) {
-        if (!graphics_settings_.save(path)) {
-            BRACKEN_LOG_ERROR("settings", "Failed to save settings to {}", path);
+    // Auto-save settings on shutdown, unless the host opted out. A run that
+    // did not read the file must not write it either — otherwise a regression
+    // run keeps corrupting the developer's interactive preferences.
+    if (settings_persistence_) {
+        auto path = settings_file_path();
+        if (!path.empty()) {
+            if (!graphics_settings_.save(path)) {
+                BRACKEN_LOG_ERROR("settings", "Failed to save settings to {}", path);
+            }
         }
     }
 

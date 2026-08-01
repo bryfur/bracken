@@ -333,6 +333,22 @@ protected:
     /** Get the platform-appropriate settings file path. */
     std::string settings_file_path() const;
 
+    /** Opt out of the graphics-settings file entirely (default: on).
+     *
+     *  With persistence ON, init_renderer() loads settings_file_path() over
+     *  the struct's defaults and shutdown_renderer() writes the live settings
+     *  back. That is what a game wants — and exactly what a deterministic
+     *  regression run must not have: the file is a single process-global
+     *  mutable input, so a headless run's result would depend on what ran
+     *  last on that machine (and two concurrent runs would race on it).
+     *
+     *  Turn it OFF before init_renderer() for smoke/regression/CI runs: the
+     *  engine then neither reads nor writes the file, and the run starts from
+     *  GraphicsSettings{} plus whatever the host sets. Tier: main-thread; must
+     *  be called before init_renderer() to affect the load. */
+    void set_settings_persistence(bool enabled) { settings_persistence_ = enabled; }
+    bool settings_persistence() const { return settings_persistence_; }
+
     struct DisplayMode {
         int w, h;
     };
@@ -607,6 +623,10 @@ private:
     GraphicsSettings pending_graphics_settings_main_; // main-thread writer
     bool has_pending_graphics_settings_main_ = false; // main-thread writer
     std::string pending_screenshot_path_;             // sim-phase or fence writer
+
+    // See set_settings_persistence(). Main-thread only; read at init_renderer
+    // and shutdown_renderer.
+    bool settings_persistence_ = true;
 
     // Owned engine subsystems (opaque to subclasses)
     std::unique_ptr<render::RenderContext> context_;

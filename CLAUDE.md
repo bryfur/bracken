@@ -433,13 +433,40 @@ worker counts:
 
 | Invocation | Digest |
 |---|---|
-| `--smoke` | `0x88a341b9217a591b` |
-| `--smoke --engine-camera=off` | `0x2a88efac36b3fccc` |
+| `--smoke` | `0x0ad9664ddaea3468` |
+| `--smoke --engine-camera=off` | `0x23832a2116250517` |
+| `--smoke 30` | `0x97558825216ed65e` |
 
-The second is the pre-phase-9 value: with the engine's camera drive disabled
-the host describes the identical frame it did before the engine took the
-camera over, which is the evidence that the move was the *only* change. If you
-move either number, say why in the commit message.
+If you move any of them, say why in the commit message.
+
+**The smoke run is hermetic w.r.t. `settings.cfg`, and only became so on
+2026-08-01.** `Application::init_renderer()` auto-loads `GraphicsSettings` from
+`settings_file_path()` and `shutdown_renderer()` auto-saves them, so every
+`--smoke` run used to *start* from whatever the previous run (or a concurrent
+one, or a developer's Graphics-panel tick) had left in that one global file —
+and then wrote its own end state back. That is why plain `--smoke` was observed
+building a 27 MB acceleration structure and tracing with `rt_shadows` /
+`rt_reflections` both defaulting to `false` and no env var set, and why the
+recorded `mean_luma` figures drifted by several points with no code change at
+all. The playground now calls `Application::set_settings_persistence(false)`
+as soon as `--smoke` is parsed, resets `GraphicsSettings{}` wholesale in
+`setup_smoke_run()`, and pins `rt_shadows`/`rt_reflections` from
+`PLAYGROUND_RT` (unset = both off). `[smoke] settings persist=0 shadow_mode=…`
+prints what the run actually rendered with — check it before believing any
+luma number, yours or a commit message's.
+
+**Screenshot baselines** (`mean_luma` / `stddev`, 1600×900, Metal). These were
+re-measured hermetically after that fix; the previously circulated
+`87.6 / 45.4` is *not* reproducible and was itself taken against a drifted
+settings file. `--smoke 30` at commit `8f21a3d` — which predates the entire
+G-buffer/reflection series — produces the identical figure below, which is the
+evidence that no RT-series commit moved the RT-off path.
+
+| Invocation | mean_luma / stddev |
+|---|---|
+| `--smoke 30` (RT off) | `86.6 / 44.9` |
+| `--smoke 30 PLAYGROUND_AO=0` | `87.0 / 44.5` |
+| `--smoke 30 PLAYGROUND_AO=2` | `86.4 / 45.0` |
 
 Benchmarks: `build-bench/src/bracken/bracken_benchmarks` (add
 `--benchmark_filter=<regex>` for a subset). The binary also exists in `build/`,
