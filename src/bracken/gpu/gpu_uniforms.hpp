@@ -484,8 +484,13 @@ struct alignas(16) PrepassModelUniforms {
     uint32_t paletteOffset = 0;                     // skinned only
     uint32_t prevPaletteOffset = NO_PREV_PALETTE;   // skinned only
     float _padding0[2] = {0.0f, 0.0f};
+    /// Inverse-transpose of `model`, read only by the depth-prepass G-buffer
+    /// variants (ray-traced reflections). It lives in this shared block rather
+    /// than a second binding so every prepass model pipeline — plain, masked
+    /// and G-buffer — pushes one identical uniform layout.
+    glm::mat4 normalMatrix{1.0f};
 };
-BRACKEN_HLSL_CBUFFER(PrepassModelUniforms, 400);
+BRACKEN_HLSL_CBUFFER(PrepassModelUniforms, 464);
 BRACKEN_HLSL_FIELD(PrepassModelUniforms, model, 0);
 BRACKEN_HLSL_FIELD(PrepassModelUniforms, view, 64);
 BRACKEN_HLSL_FIELD(PrepassModelUniforms, projection, 128);
@@ -495,6 +500,25 @@ BRACKEN_HLSL_FIELD(PrepassModelUniforms, prevViewProjectionNoJitter, 320);
 BRACKEN_HLSL_FIELD(PrepassModelUniforms, paletteOffset, 384);
 BRACKEN_HLSL_FIELD(PrepassModelUniforms, prevPaletteOffset, 388);
 BRACKEN_HLSL_FIELD(PrepassModelUniforms, _padding0, 392);
+BRACKEN_HLSL_FIELD(PrepassModelUniforms, normalMatrix, 400);
+
+/**
+ * @brief Depth-prepass G-buffer fragment uniforms (roughness).
+ *
+ * Matches the PrepassGBufferUniforms cbuffer in prepass_gbuffer.frag.hlsl.
+ * Only the roughness FACTOR is sent: the reflection pass uses it as a
+ * threshold test ("is this smooth enough to mirror?"), which does not justify
+ * a metallic-roughness texture fetch per pixel in the prepass to refine.
+ */
+struct alignas(16) PrepassGBufferUniforms {
+    float roughness = 1.0f;
+    float _pad0 = 0.0f;
+    float _pad1 = 0.0f;
+    float _pad2 = 0.0f;
+};
+BRACKEN_HLSL_CBUFFER(PrepassGBufferUniforms, 16);
+BRACKEN_HLSL_FIELD(PrepassGBufferUniforms, roughness, 0);
+BRACKEN_HLSL_FIELD(PrepassGBufferUniforms, _pad0, 4);
 
 /**
  * Depth-prepass vertex uniforms shared by the instanced-model and terrain

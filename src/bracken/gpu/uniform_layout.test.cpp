@@ -418,6 +418,15 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("prepass_instanced.vert.spv", 1, 0, gpu::PrepassCameraUniforms),
     ROW("prepass_instanced_masked.vert.spv", 1, 0, gpu::PrepassCameraUniforms),
     ROW("prepass_terrain.vert.spv", 1, 0, gpu::PrepassCameraUniforms),
+    // Depth-prepass G-buffer variants (ray-traced reflections). Same bodies as
+    // the rows above, compiled with BRACKEN_PREPASS_GBUFFER, so they must back
+    // onto the same CPU structs — that is exactly what this table pins.
+    ROW("prepass_model_gbuffer.vert.spv", 1, 0, gpu::PrepassModelUniforms),
+    ROW("prepass_skinned_gbuffer.vert.spv", 1, 0, gpu::PrepassModelUniforms),
+    ROW("prepass_instanced_gbuffer.vert.spv", 1, 0, gpu::PrepassCameraUniforms),
+    ROW("prepass_terrain_gbuffer.vert.spv", 1, 0, gpu::PrepassCameraUniforms),
+    ROW("prepass_gbuffer.frag.spv", 3, 0, gpu::PrepassGBufferUniforms),
+    ROW("prepass_gbuffer_masked.frag.spv", 3, 0, gpu::PrepassMaskedUniforms),
     ROW("shadow_depth.vert.spv", 1, 0, gpu::ShadowTransformUniforms),
     ROW("shadow_skinned.vert.spv", 1, 0, gpu::ShadowSkinnedTransformUniforms),
     ROW("shadow_terrain.vert.spv", 1, 0, gpu::ShadowTerrainUniforms),

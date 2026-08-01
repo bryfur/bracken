@@ -602,6 +602,101 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::Velocity},
 
+    // --- Depth-prepass G-buffer variants --------------------------------------
+    // Same geometry, same depth, plus a normal+roughness second attachment for
+    // ray-traced reflections (render/rt_renderer.hpp). Only created when a game
+    // turns reflections on. Grass and MASK foliage write a constant roughness
+    // of 1 -- they are never mirror surfaces, so the reflection pass skips them
+    // without tracing, and they need no normal plumbed through their vertex
+    // stage. `.fs` gains one uniform buffer on the rows that send a real
+    // roughness factor.
+    {.name = "DepthPrepassModelGBuffer",
+     .vertex_shader = "prepass_model_gbuffer.vert.spv",
+     .fragment_shader = "prepass_gbuffer.frag.spv",
+     .vs = k_ubo1,
+     .fs = k_ubo1,
+     .vertex_layout = VertexLayout::Vertex3DPositionNormal,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+    {.name = "DepthPrepassModelDoubleSidedGBuffer",
+     .vertex_shader = "prepass_model_gbuffer.vert.spv",
+     .fragment_shader = "prepass_gbuffer.frag.spv",
+     .vs = k_ubo1,
+     .fs = k_ubo1,
+     .vertex_layout = VertexLayout::Vertex3DPositionNormal,
+     .cull_mode = SDL_GPU_CULLMODE_NONE,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+    {.name = "DepthPrepassSkinnedModelGBuffer",
+     .vertex_shader = "prepass_skinned_gbuffer.vert.spv",
+     .fragment_shader = "prepass_gbuffer.frag.spv",
+     .vs = k_ubo1_sb2,
+     .fs = k_ubo1,
+     .vertex_layout = VertexLayout::SkinnedVertexPositionSkinNormal,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+    {.name = "DepthPrepassSkinnedModelDoubleSidedGBuffer",
+     .vertex_shader = "prepass_skinned_gbuffer.vert.spv",
+     .fragment_shader = "prepass_gbuffer.frag.spv",
+     .vs = k_ubo1_sb2,
+     .fs = k_ubo1,
+     .vertex_layout = VertexLayout::SkinnedVertexPositionSkinNormal,
+     .cull_mode = SDL_GPU_CULLMODE_NONE,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+    {.name = "DepthPrepassInstancedModelGBuffer",
+     .vertex_shader = "prepass_instanced_gbuffer.vert.spv",
+     .fragment_shader = "prepass_gbuffer.frag.spv",
+     .vs = k_ubo1_sb1,
+     .fs = k_ubo1,
+     .vertex_layout = VertexLayout::Vertex3DPositionNormal,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+    {.name = "DepthPrepassInstancedModelDoubleSidedGBuffer",
+     .vertex_shader = "prepass_instanced_gbuffer.vert.spv",
+     .fragment_shader = "prepass_gbuffer.frag.spv",
+     .vs = k_ubo1_sb1,
+     .fs = k_ubo1,
+     .vertex_layout = VertexLayout::Vertex3DPositionNormal,
+     .cull_mode = SDL_GPU_CULLMODE_NONE,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+    {.name = "DepthPrepassTerrainGBuffer",
+     .vertex_shader = "prepass_terrain_gbuffer.vert.spv",
+     .fragment_shader = "prepass_gbuffer.frag.spv",
+     .vs = k_ubo1,
+     .fs = k_ubo1,
+     .vertex_layout = VertexLayout::TerrainPositionNormal,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+    {.name = "DepthPrepassGrassGBuffer",
+     .vertex_shader = "prepass_grass.vert.spv",
+     .fragment_shader = "prepass_gbuffer_rough.frag.spv",
+     .vs = k_vs_grass,
+     .fs = k_none,
+     .vertex_layout = VertexLayout::Vertex3DPositionOnly,
+     .cull_mode = SDL_GPU_CULLMODE_NONE,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+    {.name = "DepthPrepassModelMaskedGBuffer",
+     .vertex_shader = "prepass_model_masked.vert.spv",
+     .fragment_shader = "prepass_gbuffer_masked.frag.spv",
+     .vs = k_ubo1,
+     .fs = k_ubo1_samp1,
+     .vertex_layout = VertexLayout::Vertex3DPositionTexcoord,
+     .cull_mode = SDL_GPU_CULLMODE_NONE,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+    {.name = "DepthPrepassInstancedModelMaskedGBuffer",
+     .vertex_shader = "prepass_instanced_masked.vert.spv",
+     .fragment_shader = "prepass_gbuffer_masked.frag.spv",
+     .vs = k_ubo1_sb1,
+     .fs = k_ubo1_samp1,
+     .vertex_layout = VertexLayout::Vertex3DPositionTexcoord,
+     .cull_mode = SDL_GPU_CULLMODE_NONE,
+     .color = TargetFormat::Velocity,
+     .color2 = TargetFormat::NormalRoughness},
+
     // --- Water ----------------------------------------------------------------
     // Refraction/reflection blending is composited in-shader from the scene
     // copies, so the pipeline itself is opaque; depth test + write stay on so
@@ -688,6 +783,13 @@ void apply_vertex_layout(PipelineConfig& config, VertexLayout layout) {
                 {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(Vertex3D, texcoord)},
             };
             return;
+        case VertexLayout::Vertex3DPositionNormal:
+            config.vertex_buffers = {get_vertex3d_buffer_desc()};
+            config.vertex_attributes = {
+                {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, position)},
+                {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, normal)},
+            };
+            return;
         case VertexLayout::SkinnedVertex:
             config.with_skinned_vertex();
             return;
@@ -697,6 +799,15 @@ void apply_vertex_layout(PipelineConfig& config, VertexLayout layout) {
                 {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(SkinnedVertex, position)},
                 {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4, offsetof(SkinnedVertex, joints)},
                 {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, offsetof(SkinnedVertex, weights)},
+            };
+            return;
+        case VertexLayout::SkinnedVertexPositionSkinNormal:
+            config.vertex_buffers = {get_skinned_vertex_buffer_desc()};
+            config.vertex_attributes = {
+                {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(SkinnedVertex, position)},
+                {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4, offsetof(SkinnedVertex, joints)},
+                {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, offsetof(SkinnedVertex, weights)},
+                {3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(SkinnedVertex, normal)},
             };
             return;
         case VertexLayout::Vertex2D:
@@ -715,6 +826,13 @@ void apply_vertex_layout(PipelineConfig& config, VertexLayout layout) {
             config.vertex_buffers = {buffer_desc(k_terrain_vertex_stride)};
             config.vertex_attributes = {
                 {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0},
+            };
+            return;
+        case VertexLayout::TerrainPositionNormal:
+            config.vertex_buffers = {buffer_desc(k_terrain_vertex_stride)};
+            config.vertex_attributes = {
+                {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0},                 // position
+                {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, sizeof(float) * 9}, // normal
             };
             return;
         case VertexLayout::Grid:

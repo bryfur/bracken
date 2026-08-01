@@ -128,6 +128,24 @@ enum class PipelineType {
     DepthPrepassModelMasked,           ///< Static MASK meshes (alpha-tested prepass, no cull)
     DepthPrepassInstancedModelMasked,  ///< Instanced MASK meshes (alpha-tested prepass, no cull)
 
+    // --- Depth-prepass G-buffer variants -------------------------------------
+    // Identical to the rows above but writing a SECOND attachment (world
+    // normal + roughness) for ray-traced reflections. They exist as separate
+    // pipelines rather than a flag because a render pass and every pipeline
+    // used inside it must agree on the colour-attachment count — so enabling
+    // reflections swaps the whole prepass over to this set, and a game that
+    // leaves them off never creates these at all.
+    DepthPrepassModelGBuffer,
+    DepthPrepassModelDoubleSidedGBuffer,
+    DepthPrepassSkinnedModelGBuffer,
+    DepthPrepassSkinnedModelDoubleSidedGBuffer,
+    DepthPrepassInstancedModelGBuffer,
+    DepthPrepassInstancedModelDoubleSidedGBuffer,
+    DepthPrepassTerrainGBuffer,
+    DepthPrepassGrassGBuffer,
+    DepthPrepassModelMaskedGBuffer,
+    DepthPrepassInstancedModelMaskedGBuffer,
+
     Water,                             ///< Water surface (own pass after opaques + skybox)
 
     // Count for iteration
@@ -163,11 +181,14 @@ enum class VertexLayout : uint8_t {
     Vertex3D,                  ///< gpu::Vertex3D: position, normal, texcoord, color, tangent
     Vertex3DPositionOnly,      ///< Vertex3D stride, position attribute only (depth prepass)
     Vertex3DPositionTexcoord,  ///< Vertex3D stride, position + texcoord (alpha-MASK prepass)
+    Vertex3DPositionNormal,    ///< Vertex3D stride, position + normal (prepass G-buffer)
     SkinnedVertex,             ///< gpu::SkinnedVertex: Vertex3D fields + joints + weights
     SkinnedVertexPositionSkin, ///< SkinnedVertex stride, position + joints + weights
+    SkinnedVertexPositionSkinNormal, ///< …plus normal (prepass G-buffer)
     Vertex2D,                  ///< gpu::Vertex2D: position, texcoord, color (UI)
     Terrain,                   ///< 12 floats: position(3), texcoord(2), color(4), normal(3)
     TerrainPositionOnly,       ///< Terrain stride, position attribute only
+    TerrainPositionNormal,     ///< Terrain stride, position + normal (prepass G-buffer)
     Grid,                      ///< 7 floats: position(3), color(4)
     Text,                      ///< 4 floats: position(2), texcoord(2); color is a uniform
     Position3,                 ///< 3 floats, tightly packed (skybox cube)

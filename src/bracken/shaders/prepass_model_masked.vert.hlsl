@@ -30,6 +30,10 @@ cbuffer PrepassTransformUniforms {
     uint paletteOffset;
     uint prevPaletteOffset;
     float2 _padding0;
+    // Inverse-transpose of `model`, read only by the G-buffer variant. Kept in
+    // this shared cbuffer (rather than a second binding) so all prepass model
+    // pipelines push one identical uniform block.
+    float4x4 normalMatrix;
 };
 
 VSOutput VSMain(VSInput input) {
