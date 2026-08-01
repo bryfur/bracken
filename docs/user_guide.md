@@ -102,20 +102,28 @@ cmake -S . -B build -G Ninja \
 
 Note: `BRACKEN_PLAYGROUND_SMOKE_TEST` is a root-level option, and the root `CMakeLists.txt` calls `enable_testing()` when *either* `BRACKEN_BUILD_TESTS` or `BRACKEN_PLAYGROUND_SMOKE_TEST` is `ON` — so the smoke ctest works even in a tests-off configure (turning it on without `BRACKEN_BUILD_EXAMPLES` gets a configure-time warning instead of a silently missing test).
 
-#### CMake presets and the TSan lane
+#### CMake presets: the five build lanes
 
-A `CMakePresets.json` (version 6) at the repo root defines two configure presets:
+A `CMakePresets.json` (version 6) at the repo root defines five configure presets, one per long-lived build tree. They **coexist**; none is ever deleted or reconfigured to "switch" to another, and the no-clean-rebuild rule applies to each.
 
-- **`default`** — the primary tree: Ninja, `build/`, project-default options. It exists to reproduce the standard configuration; it is *not* an invitation to reconfigure an existing `build/` from scratch.
-- **`tsan`** — the ThreadSanitizer lane: a **separate** build directory `build-tsan/` with `-fsanitize=thread` on compile and link, `RelWithDebInfo`, examples and benchmarks OFF (the lane runs `bracken_tests`). Run it whenever you touch concurrency code (the job system, atomics, anything from `docs/multithreading_plan.md`).
+| Preset | Tree | What it is for |
+|---|---|---|
+| `default` | `build/` | The primary incremental tree: Ninja, project-default options, **no `CMAKE_BUILD_TYPE`** → `-O0` with `NDEBUG` undefined, so every `BRACKEN_ASSERT` and thread-tier check is live. It exists to reproduce the standard configuration; it is *not* an invitation to reconfigure an existing `build/` from scratch. |
+| `rel` | `build-rel/` | `RelWithDebInfo` — the **only** lane that compiles the `NDEBUG` path, where `BRACKEN_ASSERT` and the debug-only tier assertions vanish (`BRACKEN_CONTRACT` stays, by design). Run it before relying on an assert for correctness; it also surfaces UB that `-O0` papers over. |
+| `bench` | `build-bench/` | Optimized, benchmarks ON, examples OFF. **Benchmark here.** A timing taken in `build/` is measuring `-O0` with arena poisoning and live tier assertions and says nothing about the shipped engine. |
+| `tsan` | `build-tsan/` | ThreadSanitizer (`-fsanitize=thread` on compile and link), `RelWithDebInfo`, tests only. Run it whenever you touch concurrency code — the job system, an atomic, anything from `docs/multithreading_plan.md`. |
+| `asan` | `build-asan/` | Address + UndefinedBehavior sanitizer, tests only. Finds the class TSan cannot: use-after-free and out-of-bounds across the arena/frame allocators, the packet ring's retire-and-reuse cycle, and the job-system node pools. Built with **`-fno-sanitize=enum`**, deliberately: the engine bounds-checks enum parameters at the host boundary (`InputSnapshot::key_held` rejects a scancode outside `[0, SDL_SCANCODE_COUNT)`), and the only way to *test* such a guard is to hand it an out-of-range enumerator — which the `enum` check reports as UB in the test, not in the engine. Declining that one sub-check keeps the guards testable and costs nothing this lane exists for. |
 
 ```bash
 cmake --preset tsan                          # first configure only — slow: refetches/builds deps into build-tsan/
 cmake --build build-tsan                     # incremental thereafter
 ctest --test-dir build-tsan --output-on-failure
+
+cmake --preset asan                          # same shape
+cmake --build build-asan && ctest --test-dir build-asan --output-on-failure
 ```
 
-The TSan tree's first configure refetches SDL_shadercross/DXC just like any cold configure — expected, one-time. Keep `build-tsan/` alive afterwards; the no-clean-rebuild rule applies to it too. Never delete or reconfigure the primary `build/` to "switch" sanitizers — the two trees coexist.
+Every non-`default` tree's first configure refetches SDL_shadercross/DXC just like any cold configure — expected, one-time. Keep the tree alive afterwards. Never delete or reconfigure the primary `build/` to "switch" lanes.
 
 ### Environment variables
 
@@ -152,11 +160,12 @@ ctest --test-dir build -L integration --output-on-failure
 ### Running the benchmarks
 
 ```bash
-./build/src/bracken/bracken_benchmarks                          # all
-./build/src/bracken/bracken_benchmarks --benchmark_filter=Anim  # subset (regex)
+cmake --preset bench && cmake --build build-bench                     # first time
+./build-bench/src/bracken/bracken_benchmarks                          # all
+./build-bench/src/bracken/bracken_benchmarks --benchmark_filter=Anim  # subset (regex)
 ```
 
-Micro-benchmarks live next to their unit as `*.bench.cpp` (auto-globbed, linked against `benchmark::benchmark_main`) and cover the CPU hot paths: animation sampling/crossfade, IK, state machines, frustum culling, clustered light binning, particle updates, allocators, hashing, and procedural mesh generation. Audit reports referencing benchmark results live in `docs/audits/`.
+**Use the `bench` tree.** The binary also builds in `build/`, and its numbers there are meaningless: that tree has no `CMAKE_BUILD_TYPE`, so it is `-O0` with arena poisoning and every thread-tier assertion live. Micro-benchmarks live next to their unit as `*.bench.cpp` (auto-globbed, linked against `benchmark::benchmark_main`) and cover the CPU hot paths: animation sampling/crossfade, IK, state machines, frustum culling, clustered light binning, particle updates, allocators, hashing, and procedural mesh generation. Audit reports referencing benchmark results live in `docs/audits/`.
 
 ### Profiling (Tracy)
 
@@ -164,21 +173,32 @@ Configure with `-DBRACKEN_ENABLE_TRACY=ON`, run any engine app, and connect the 
 
 ### Consuming the engine from a game project
 
-The intended integration (from `README.md`) is `add_subdirectory` + linking the `bracken` target + staging shaders:
+The intended integration (from `README.md`) is `add_subdirectory` + linking the `bracken::bracken` target + staging shaders:
 
 ```cmake
 add_subdirectory(path/to/engine)   # or use it as a submodule
-target_link_libraries(my_game PRIVATE bracken)
+target_link_libraries(my_game PRIVATE bracken::bracken)
 bracken_copy_shaders(my_game)      # stages compiled SPIR-V next to the exe
+```
+
+```cpp
+#include "bracken/bracken.hpp"     // the supported surface, in one header
 ```
 
 What each line does:
 
 - `add_subdirectory(path/to/engine)` runs the engine's root `CMakeLists.txt`: it fetches dependencies, builds the `bracken` static library, and compiles all shaders. All engine CMake options above can be set from your project before the `add_subdirectory` call.
+- `bracken::bracken` is an `ALIAS` for `bracken`. Prefer the namespaced spelling: CMake fails at configure time on a misspelled namespaced target, while a misspelled plain name silently degrades into a `-lbracken` link flag against nothing.
 - Linking `bracken` is `PUBLIC`-transitive: you automatically get SDL3/SDL3_ttf/SDL3_image, SDL3_shadercross, glm, the engine include root, and the `GLM_FORCE_DEPTH_ZERO_TO_ONE` compile definition (all projection math in the engine is reversed-Z zero-to-one; this definition **propagates to your code**, which is required for your glm math to agree with the engine's).
 - `bracken_copy_shaders(my_game)` (function defined in `src/bracken/CMakeLists.txt` lines 141–152) adds a custom target that removes and recopies the compiled SPIR-V directory to `$<TARGET_FILE_DIR:my_game>/shaders` after every build (deleted shaders don't linger). The engine loads shaders at runtime from `SDL_GetBasePath() + "shaders/"` — i.e. a `shaders/` directory **next to your executable** (`src/bracken/gpu/pipeline_registry.cpp` lines 36–41), so this step is mandatory; without it every pipeline fails to build at startup.
 
 Conventions your project inherits: **Y-up** coordinates (x,z ground plane), **reversed-Z zero-to-one depth**, linear-space lighting, `.glb` models only (Y-up, `+Y up`/`-Z forward`, no Draco — the vendored tinygltf can't decode it).
+
+**The public surface, and what "public" means.** `src/bracken/bracken.hpp` is an umbrella over the headers this guide covers — the exact set `examples/playground` includes, grouped by section with one comment per header. Include it to get going; include the two or three headers a translation unit actually uses once you care about compile time (there is deliberately no precompiled header behind the umbrella). It is a statement of *what to reach for*, **not** a stability promise: the engine is pre-1.0 and this release changed six of those signatures. Every break is compiler-caught.
+
+Headers under `src/bracken/<module>/internal/` are engine-private and may include vendored dependencies. That is where Jolt lives (`physics/internal/jolt_job_system.hpp`), and it is the mechanism — not merely the intention — behind `bracken::physics` being Jolt-free: `public_headers.test.cpp` fails the suite if any header outside an `internal/` directory transitively reaches Jolt, ImGui, tinygltf or stb_, or if `application.hpp` starts dragging the `gpu/` layer into every host TU. Each of the umbrella's headers is also compiled standalone by a generated target, so `#include "bracken/render/water_renderer.hpp"` as the first line of a fresh file always works.
+
+**Testing your frame code.** `#include "bracken/testing/frame_test.hpp"` gives you `bracken::testing::TestFrame`: build a frame through a `FrameSink`, `seal()`, and read back typed views plus the packet digest — no GPU, no window, no SDL. It is not part of the umbrella on purpose; it belongs to your test TUs, not your game.
 
 The engine's public include directory is declared as `${PROJECT_SOURCE_DIR}/src` (`src/bracken/CMakeLists.txt`), which resolves to the engine's own root regardless of who the top-level project is — the three-line snippet above works verbatim from a consuming super-project, with no extra `target_include_directories` needed.
 
@@ -191,7 +211,7 @@ The engine's root `CMakeLists.txt` sets `BUILD_SHARED_LIBS OFF` as a plain (non-
 - Pure virtual: `on_init()`, `on_simulate(bracken::SimFrame&)`.
 - Optional: `on_shutdown()`, `on_main_frame(bracken::MainFrame&)`, and `on_event(const SDL_Event&) -> bool` (return `true` to consume an event before `InputHandler` sees it).
 
-There is **no `on_update`/`on_render`**: you don't render — you *describe* a frame through `sim.frame()`'s `FrameBuilder` and the engine draws it. `on_simulate` **runs as a job on the engine's worker pool, overlapped with the previous frame's rendering** — write it as straight-line single-threaded code; the engine handles the packet ring, timing, sealing, and rendering around it.
+There is **no `on_update`/`on_render`**: you don't render — you *describe* a frame through the `scene::FrameSink` that `sim.frame()` returns, and the engine draws it. `on_simulate` **runs as a job on the engine's worker pool, overlapped with the previous frame's rendering** — write it as straight-line single-threaded code; the engine handles the packet ring, timing, sealing, and rendering around it.
 
 **Important:** `run()` drives only `on_simulate`/`on_main_frame`/`on_event`. Your `main()` drives the boot sequence, through `Application`'s public `start()`/`stop()` — they call the protected `on_init`/`on_shutdown` hooks for you (`stop()` is a no-op when `start()` failed, so the bail-out path below is safe). Minimal skeleton, adapted from `examples/playground/`:
 
@@ -297,7 +317,7 @@ What `on_init` does, in order (`examples/playground/playground.cpp`): `init_rend
 
 What `on_simulate` does — first the simulation: reads `sim.input()` (or the smoke self-driver), moves the player with terrain clamping, feeds `speed`/`attacking` into the state machine, runs `anim_sm_.update(anim_player_)` then `anim_player_.update(skeleton, animations, sim.dt())`, and then — as the engine intends — applies the procedural layers on top: `anim::apply_foot_ik(...)` pinning feet to terrain height and `anim::apply_body_lean(...)` from speed/turn rate. The camera is only *aimed* (`set_target`/`set_target_velocity`, or yaw/pitch from the snapshot); the engine updates it, stages it into the packet and records the movement basis in its sim-stage tail.
 
-Then the frame description, into `auto& fb = sim.frame()`: `set_camera`, `set_draw_skybox/ground/grass`, the player as `alloc_bone_palette` + copy of `anim_player_.bone_matrices()` into packet memory + `draw_skinned(..., pal.id)`, `draw_model` per prop and orb, an `add_point_light` per orb, `add_billboard_3d` proximity bars, optional `add_spot_light` flashlight, `spawn_effect` for queued bursts, optional `add_debug_sphere`/`add_debug_line` overlays (including a post-IK skeleton overlay), UI text via `fb.ui().add_text`/`add_filled_rect`/`add_text_wrapped`. No timing, sealing, rendering, or ring management — the engine wraps all of that around the hook.
+Then the frame description, into `auto& fb = sim.frame()` (a `scene::FrameSink`): `set_draw_skybox/ground/grass` — no `set_camera`, the engine stages it, and the one `fb.set_camera(...)` in the file runs only under `--engine-camera=off` — the player as `alloc_bone_palette` + copy of `anim_player_.bone_matrices()` into packet memory + `draw_skinned(..., pal.id)`, `draw_model` per prop and orb, an `add_point_light` per orb, `add_billboard_3d` proximity bars, optional `add_spot_light` flashlight, `spawn_effect` for queued bursts, optional `add_debug_sphere`/`add_debug_line` overlays (including a post-IK skeleton overlay), UI text via `fb.ui().add_text`/`add_filled_rect`/`add_text_wrapped`. No timing, sealing, rendering, or ring management — the engine wraps all of that around the hook.
 
 #### Smoke mode and screenshot self-verification
 
@@ -318,7 +338,7 @@ Run it after any change that could affect rendering. You can also open `playgrou
 
 - **Never clean-rebuild** — the SDL_shadercross/DXC build is the expensive part and lives in `build/`.
 - **Missing `bracken_copy_shaders(<target>)`** — your app will fail to create every pipeline because there is no `shaders/` directory next to the executable.
-- **`on_init`/`on_shutdown` are not called by `run()`** — your `main()` must drive them (see the playground's `start()`/`stop()` wrappers).
+- **`on_init`/`on_shutdown` are not called by `run()`** — your `main()` drives them through `Application`'s public `start()`/`stop()`: `init_engine() → start() → run() → stop() → shutdown_engine()`. `stop()` is a no-op when `start()` failed, so the bail-out path needs no guard.
 - `EffectDefinition`s referenced by `spawn_effect` must **outlive all spawned instances** — make them long-lived members, not locals.
 - `BonePaletteId`s from `alloc_bone_palette` are only valid within the frame they were allocated in — allocate, write the matrices, and `draw_skinned` within the same `on_simulate`; never cache an id across frames.
 - You **cannot** call `fb.seal()` or `fb.set_frame_timing(...)` from `on_simulate`: `sim.frame()` returns a `scene::FrameSink`, which carries the host surface and nothing else. The engine stamps timing at kick and seals after its own sim-stage tail. (This used to be a rule in prose backed by a debug assert; a release build that sealed early republished a packet the renderer was already consuming, silently.)
@@ -713,12 +733,23 @@ dev_ui().set_toggle_key(SDL_SCANCODE_F10); // safe even when dev_ui_ok == false
 
 ### Common mistakes checklist
 
+What is *not* on this list matters as much as what is. Passing the wrong
+positional `bool` to `draw_model`, handing a magic `int` to a graphics setting,
+sealing the frame yourself, hand-rolling a heightmap's float→`uint16`
+quantization: those were all live mistakes in earlier releases and none of them
+is expressible any more. `DrawFlags`, the `GraphicsSettings` enums, `FrameSink`
+and `Heightmap::from_floats` did not document them away — they deleted the
+shape that permitted them. What remains is what the type system still cannot
+catch:
+
 - Ignoring the `[[nodiscard]]` results of `init_engine()`, `start()`, `init_renderer()`, `GraphicsSettings::save()/load()`.
-- Calling `set_keyboard_captured()` yourself — the main loop overwrites it every frame.
-- Touching GPU/SDL/main-thread-tier APIs from `on_simulate` — it runs on a pool thread; debug builds assert.
+- Calling `set_keyboard_captured()` yourself — the engine sets it every frame from the dev overlay's keyboard capture.
+- Touching GPU/SDL/main-thread-tier APIs from `on_simulate` — it runs on a pool thread; debug builds assert (the stage rides the job node, so it is still correct when a job is stolen).
 - Setting `god_rays = true` without `volumetric_fog = true` — god rays require volumetric fog.
-- Reading `PassTiming::cpu_ms` as GPU cost — it is the CPU's cost of recording the pass. `gpu_ms` is `nullopt`; SDL3 has no timestamp queries.
+- Reading `PassTiming::cpu_ms` as GPU cost — it is the CPU's cost of recording the pass. `gpu_ms` is `nullopt`; SDL3 has no timestamp queries. Read `present_wait_ms()` first to find out whether you are GPU-bound at all.
+- Ignoring `RenderStats::diagnostics` when things don't draw — an unknown `ModelHandle`, an exhausted bone-palette budget or a dropped light is counted there, not silently swallowed.
 - Calling `request_screenshot` every frame — each capture stalls the GPU pipeline.
+- Reaching for a header the umbrella does not include. It compiles, but it means you are using engine plumbing rather than an API; say so instead, so the API can exist.
 
 ---
 
@@ -2163,7 +2194,7 @@ Label your passes so RenderDoc/Nsight captures are navigable:
 }
 ```
 
-`GPUTimestampPool` + `BRACKEN_GPU_TIMER(pool, cmd, "PassName")` are wired through `SceneRenderer` (64 pairs) and report a **real CPU record time** per scope through `core::PassTimeline` (`PassTiming::cpu_ms`, exponentially smoothed). The GPU half remains unavailable: SDL3 GPU (as of SDL 3.2) exposes no per-pass timestamp queries, so `is_supported()` is always `false` and `PassTiming::gpu_ms` is `std::nullopt` — deliberately not `0.0f`, which would read as a free pass. For GPU-side numbers use RenderDoc/Nsight. The API is kept so call sites stay identical when SDL adds support.
+`GPUTimestampPool` + `BRACKEN_GPU_TIMER(pool, cmd, "PassName")` are wired through `SceneRenderer` (64 pairs) and report a **real CPU record time** per scope through `core::PassTimeline` (`PassTiming::cpu_ms`, exponentially smoothed). The GPU half remains unavailable: SDL3 GPU (as of SDL 3.4) exposes no per-pass timestamp queries, so `is_supported()` is always `false` and `PassTiming::gpu_ms` is `std::nullopt` — deliberately not `0.0f`, which would read as a free pass. For GPU-side numbers use RenderDoc/Nsight. The API is kept so call sites stay identical when SDL adds support.
 
 One contract if you use the pool directly: the `pass_name` passed to `reserve_pair`/`BRACKEN_GPU_TIMER` is stored as a raw `const char*` — it must be a string literal (or otherwise outlive the frame).
 
@@ -4464,7 +4495,7 @@ How each field behaves in the shader:
 #### Alpha modes (`alpha_mode`, `alpha_cutoff`)
 
 - `AlphaMode::Opaque` (default): alpha is ignored; the CPU forces the shader's `alphaCutoff` uniform to 0 so no fragment is ever discarded.
-- `AlphaMode::Mask`: fragments with `baseColor.a < alpha_cutoff` are discarded. Only MASK materials get a non-zero cutoff — this is decided per-mesh on the CPU in `apply_mesh_material` (`src/bracken/scene/scene_renderer.cpp`), so an OPAQUE texture with a garbage alpha channel cannot accidentally alpha-test.
+- `AlphaMode::Mask`: fragments with `baseColor.a < alpha_cutoff` are discarded. Only MASK materials get a non-zero cutoff — this is decided per-mesh on the CPU in `apply_mesh_material` (`src/bracken/scene/scene_renderer_draw.cpp`), so an OPAQUE texture with a garbage alpha channel cannot accidentally alpha-test.
 - `AlphaMode::Blend`: the mesh is silently **re-routed out of the opaque pass** into a sorted back-to-front transparent pass drawn after the skybox, with depth writes off. Sorting is per queued draw using the *model's* bounding-sphere center — there is no OIT and no intra-mesh sorting, so large or interpenetrating transparent meshes can sort wrong. Instanced BLEND meshes lose their instancing: each instance becomes an individual sorted draw.
 
 #### Double-sided
@@ -5515,7 +5546,7 @@ system.clear(); // drop everything
 
 The terrain-sampler overload is a **template** — any callable `float(float x, float z)` works with zero `std::function` overhead in the inner particle loop. The engine's sim-job tail passes a lambda over `SceneRenderer::get_terrain_height` (worker-safe const reads).
 
-Iteration structure for custom rendering: `EffectInstance` → `emitters` (`EmitterInstance`) → `particles` (`Particle` with `position`, `rotation` (radians), `scale`, `opacity`, `color`, `age`, `lifetime`). `bracken::render::build_particle_transform_of(particle, center_offset)` (`bracken/render/particle_transform.hpp`) is a free function template over anything with `.position`/`.rotation`/`.scale` if you want the exact world matrix the engine renderer uses — it works on a live `Particle` and on the packet's `EffectParticleSnapshot` alike.
+Iteration structure for custom rendering: `EffectInstance` → `emitters` (`EmitterInstance`) → `particles` (`Particle` with `position`, `rotation` (radians), `scale`, `opacity`, `color`, `age`, `lifetime`). `bracken::render::build_particle_transform_of(particle, center_offset)` (`bracken/effects/particle_transform.hpp`) is a free function template over anything with `.position`/`.rotation`/`.scale` if you want the exact world matrix the engine renderer uses — it works on a live `Particle` and on the packet's `EffectParticleSnapshot` alike.
 
 `EffectSystem` is **owned** — drive one instance from one thread (the RNG used at spawn is `thread_local`, so separate systems on separate threads are fine). `update()` internally parallelizes particle integration and compaction on the job pool and joins before returning — this is invisible and deterministic (spawning stays serial, so results are bit-identical at any worker count), with one contract to know: the terrain-sampler callable is invoked **from job workers**, so it must be safe to call concurrently — a pure function of `(x, z)` (the engine's `TerrainRenderer::get_height` lambda qualifies). There are also explicit-pool forms `update(JobSystem&, dt[, fn])` if you own a pool (tests use this); the plain forms service `JobSystem::instance()`.
 

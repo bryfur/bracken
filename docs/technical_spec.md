@@ -68,21 +68,27 @@ This chapter specifies the build system, all build-time configuration, the consu
 
 ### Build-system layout and targets
 
-CMake ≥ 3.20, project `bracken` VERSION 0.1.0, languages C and CXX, `CMAKE_CXX_STANDARD 23` + `CMAKE_CXX_STANDARD_REQUIRED ON`, `CMAKE_EXPORT_COMPILE_COMMANDS ON` (root `CMakeLists.txt` lines 1–6). `BUILD_SHARED_LIBS` is set `OFF` as a plain (non-cache) variable (line 15) so every vendored dependency links statically; being directory-scoped, it does not leak into a super-project that consumes the engine via `add_subdirectory` or override the consumer's own `BUILD_SHARED_LIBS` choice.
+CMake ≥ 3.20, project `bracken` VERSION 0.1.0, languages C and CXX, `CMAKE_CXX_STANDARD 23` + `CMAKE_CXX_STANDARD_REQUIRED ON`, `CMAKE_EXPORT_COMPILE_COMMANDS ON` (root `CMakeLists.txt`, its opening block). `BUILD_SHARED_LIBS` is set `OFF` as a plain (non-cache) variable so every vendored dependency links statically; being directory-scoped, it does not leak into a super-project that consumes the engine via `add_subdirectory` or override the consumer's own `BUILD_SHARED_LIBS` choice.
 
 Targets produced:
 
+Line numbers are deliberately omitted from this table: cite the file and the
+target name, which survive an edit. `docs_coherence.test.cpp` checks the paths
+and identifiers; nothing checks the lines, on purpose.
+
 | Target | Kind | Defined in | Condition |
 |---|---|---|---|
-| `bracken` | STATIC library | `src/bracken/CMakeLists.txt:81` | always |
-| `bracken_imgui` | STATIC library (ImGui core + `imgui_impl_sdl3` + `imgui_impl_sdlgpu3` backends) | `src/bracken/CMakeLists.txt:111` | `BRACKEN_ENABLE_DEV_UI=ON` |
-| `compile_shaders` | custom target (ALL) | `src/bracken/shaders/CMakeLists.txt:111` | always |
-| `bracken_tests` | executable (GoogleTest) | `src/bracken/CMakeLists.txt:169` | `BRACKEN_BUILD_TESTS=ON` and at least one `*.test.cpp` exists |
-| `bracken_benchmarks` | executable (Google Benchmark) | `src/bracken/CMakeLists.txt:159` | `BRACKEN_BUILD_BENCHMARKS=ON` and at least one `*.bench.cpp` exists |
-| `playground` | executable | `examples/playground/CMakeLists.txt:3` | `BRACKEN_BUILD_EXAMPLES=ON` |
-| `<target>_copy_shaders` | custom target (ALL), one per `bracken_copy_shaders()` call | `src/bracken/CMakeLists.txt:141–152` | per consumer |
+| `bracken` | STATIC library | `src/bracken/CMakeLists.txt` | always |
+| `bracken::bracken` | ALIAS for `bracken` | `src/bracken/CMakeLists.txt` | always — the spelling consumers should use |
+| `bracken_imgui` | STATIC library (ImGui core + `imgui_impl_sdl3` + `imgui_impl_sdlgpu3` backends) | `src/bracken/CMakeLists.txt` | `BRACKEN_ENABLE_DEV_UI=ON` |
+| `bracken_public_headers` | OBJECT library — one generated TU per header listed in `src/bracken/bracken.hpp`, each including it twice as the first thing in the file | `src/bracken/CMakeLists.txt` | always; proves every public header compiles standalone |
+| `compile_shaders` | custom target (ALL) | `src/bracken/shaders/CMakeLists.txt` | always |
+| `bracken_tests` | executable (GoogleTest) | `src/bracken/CMakeLists.txt` | `BRACKEN_BUILD_TESTS=ON` and at least one `*.test.cpp` exists |
+| `bracken_benchmarks` | executable (Google Benchmark) | `src/bracken/CMakeLists.txt` | `BRACKEN_BUILD_BENCHMARKS=ON` and at least one `*.bench.cpp` exists |
+| `playground` | executable | `examples/playground/CMakeLists.txt` | `BRACKEN_BUILD_EXAMPLES=ON` |
+| `<target>_copy_shaders` | custom target (ALL), one per `bracken_copy_shaders()` call | `src/bracken/CMakeLists.txt` | per consumer |
 
-Source discovery is glob-based and reconfigure-free: `file(GLOB_RECURSE BRACKEN_SOURCES CONFIGURE_DEPENDS "*.cpp")` with `list(FILTER ... EXCLUDE REGEX ".*\\.(test|bench)\\.cpp$")` (`src/bracken/CMakeLists.txt:78–80`). `CONFIGURE_DEPENDS` makes Ninja re-run CMake when the file set changes, so adding a source file requires only an incremental build. The same pattern collects `*.test.cpp` (line 167) and `*.bench.cpp` (line 157).
+Source discovery is glob-based and reconfigure-free: `file(GLOB_RECURSE BRACKEN_SOURCES CONFIGURE_DEPENDS "*.cpp")` with `list(FILTER ... EXCLUDE REGEX ".*\\.(test|bench)\\.cpp$")`. `CONFIGURE_DEPENDS` makes Ninja re-run CMake when the file set changes, so adding a source file requires only an incremental build. The same pattern collects `*.test.cpp` for `bracken_tests` and `*.bench.cpp` for `bracken_benchmarks`. `bracken.hpp` is additionally listed in the directory's `CMAKE_CONFIGURE_DEPENDS`, so editing the umbrella regenerates the `bracken_public_headers` TUs.
 
 House rule (`.claude/RULES.md`): **incremental builds only** — `cmake --build build` or `ninja -C build`. Full clean rebuilds (`rm -rf build`, `--clean-first`, reconfiguring over an existing `build/`) are prohibited because the first configure fetches and compiles SDL_shadercross with its vendored DXC + SPIRV-Tools, the dominant cost of a cold build.
 
@@ -90,12 +96,15 @@ House rule (`.claude/RULES.md`): **incremental builds only** — `cmake --build 
 
 From `src/bracken/CMakeLists.txt`:
 
-- `target_include_directories(bracken PUBLIC ${PROJECT_SOURCE_DIR}/src ${tinygltf_SOURCE_DIR} ${SDL_shadercross_SOURCE_DIR}/include)` (lines 86–90). Headers are included `bracken/`-rooted, e.g. `#include "bracken/render/world_renderer.hpp"`. `${PROJECT_SOURCE_DIR}` resolves to the engine root (where `project(bracken)` is declared) regardless of the top-level project, so `add_subdirectory` consumption works verbatim with no extra include dirs. The same `${PROJECT_SOURCE_DIR}/src` is used for `bracken_tests` and `bracken_benchmarks` include dirs (lines 161, 171).
-- `target_compile_definitions(bracken PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)` (line 92) — propagates reversed-Z zero-to-one clip-space to all consumers; host glm math must agree with engine projection math, so this being PUBLIC is load-bearing.
-- `target_link_libraries(bracken PUBLIC ...)` (lines 94–100): SDL3, SDL3_ttf, SDL3_image (each via generator expression `$<IF:$<BOOL:${VENDORED_SDL}>,SDL3::SDL3-static,SDL3::SDL3>` etc.), `SDL3_shadercross::SDL3_shadercross-static` (runtime cross-compile library used by shader hot-reload), `glm::glm`.
-- `BRACKEN_ENABLE_TRACY=ON` additionally links `TracyClient` and defines `BRACKEN_ENABLE_TRACY=1` PUBLIC (lines 102–105).
-- `BRACKEN_ENABLE_DEV_UI=ON` links `bracken_imgui` PUBLIC and defines `BRACKEN_DEV_UI=1` PUBLIC (lines 127–128). `bracken_imgui` compiles exactly: `imgui.cpp`, `imgui_demo.cpp`, `imgui_draw.cpp`, `imgui_tables.cpp`, `imgui_widgets.cpp`, `backends/imgui_impl_sdl3.cpp`, `backends/imgui_impl_sdlgpu3.cpp` (lines 111–119), with `${imgui_SOURCE_DIR}` and `${imgui_SOURCE_DIR}/backends` as PUBLIC include dirs.
-- `add_dependencies(bracken compile_shaders)` (line 132) — shaders always compile before the engine library.
+- `target_include_directories(bracken PUBLIC ${PROJECT_SOURCE_DIR}/src)` plus `target_include_directories(bracken SYSTEM PUBLIC ${tinygltf_SOURCE_DIR})` (SYSTEM: tinygltf's bundled `json.hpp` trips `-Wdeprecated-literal-operator`, and a vendored header must never be able to fail our `-Werror` build). There is deliberately **no** SDL_shadercross include directory here — `FetchContent` populates `SDL3_shadercross_SOURCE_DIR` (note the "3"), so the old entry expanded to a literal `/include` and put a bogus `-I` on every TU; the real headers arrive through the `SDL3_shadercross::SDL3_shadercross-static` interface include dirs. Headers are included `bracken/`-rooted, e.g. `#include "bracken/render/world_renderer.hpp"`. `${PROJECT_SOURCE_DIR}` resolves to the engine root (where `project(bracken)` is declared) regardless of the top-level project, so `add_subdirectory` consumption works verbatim with no extra include dirs. The same `${PROJECT_SOURCE_DIR}/src` is used for the `bracken_tests` and `bracken_benchmarks` include dirs.
+- `add_library(bracken::bracken ALIAS bracken)` — the namespaced spelling consumers should link. A misspelled namespaced target is a configure-time error; a misspelled plain one silently becomes a `-lbracken` link flag.
+- `target_compile_definitions(bracken PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)` — propagates reversed-Z zero-to-one clip-space to all consumers; host glm math must agree with engine projection math, so this being PUBLIC is load-bearing.
+- `target_compile_definitions(bracken PUBLIC BRACKEN_CONTRACTS_ENABLED=<0|1>)` — PUBLIC because `BRACKEN_CONTRACT` lives in headers a host includes (`frame_packet.hpp`, `frame_builder.hpp`), so engine and host must agree on whether it is compiled.
+- `target_link_libraries(bracken PUBLIC ...)`: SDL3, SDL3_ttf, SDL3_image (each via generator expression `$<IF:$<BOOL:${VENDORED_SDL}>,SDL3::SDL3-static,SDL3::SDL3>` etc.), `SDL3_shadercross::SDL3_shadercross-static` (runtime cross-compile library used by shader hot-reload), `glm::glm`.
+- `target_link_libraries(bracken PRIVATE Jolt)` — **PRIVATE by design**. Jolt's headers and its `JPH_*` definitions are an implementation detail of `src/bracken/physics/`; static archives still propagate the link requirement (`$<LINK_ONLY>`), so an executable linking `bracken` gets Jolt's symbols without its include paths. The include-side half of that invariant is enforced by `public_headers.test.cpp`, not by this line.
+- `BRACKEN_ENABLE_TRACY=ON` additionally links `TracyClient` and defines `BRACKEN_ENABLE_TRACY=1` PUBLIC.
+- `BRACKEN_ENABLE_DEV_UI=ON` links `bracken_imgui` PUBLIC and defines `BRACKEN_DEV_UI=1` PUBLIC. `bracken_imgui` compiles exactly: `imgui.cpp`, `imgui_demo.cpp`, `imgui_draw.cpp`, `imgui_tables.cpp`, `imgui_widgets.cpp`, `backends/imgui_impl_sdl3.cpp`, `backends/imgui_impl_sdlgpu3.cpp`, with `${imgui_SOURCE_DIR}` and `${imgui_SOURCE_DIR}/backends` as PUBLIC include dirs.
+- `add_dependencies(bracken compile_shaders)` — shaders always compile before the engine library.
 
 ### CMake options — exact definitions and defaults
 
@@ -128,11 +137,11 @@ From `src/bracken/CMakeLists.txt`:
 
 Build-time HLSL→SPIR-V via the `shadercross` CLI:
 
-- Compiler resolution: always the freshly built, pinned CLI — `SHADERCROSS_COMMAND = "$<TARGET_FILE:shadercross>"`, with `shadercross` in every custom command's `DEPENDS`. A `shadercross` binary on `PATH` is deliberately ignored, so the build-time compiler and the runtime SDL3_shadercross library can never version-skew (lines 33–37).
+- Compiler resolution: always the freshly built, pinned CLI — `SHADERCROSS_COMMAND = "$<TARGET_FILE:shadercross>"`, with `shadercross` in every custom command's `DEPENDS`. A `shadercross` binary on `PATH` is deliberately ignored, so the build-time compiler and the runtime SDL3_shadercross library can never version-skew.
 - Output directory: `SHADER_OUTPUT_DIR = "${CMAKE_CURRENT_BINARY_DIR}/spv"` — a dedicated `.spv`-only directory (`build/src/bracken/shaders/spv/` in this repo). Exported to parent scope and cached as `BRACKEN_SHADER_OUTPUT_DIR` (INTERNAL) in `src/bracken/CMakeLists.txt:135`.
-- Sources: `file(GLOB_RECURSE ... CONFIGURE_DEPENDS "*.hlsl")`. Stage and entry point come purely from filename convention: `name.vert.hlsl` → `-t vertex -e VSMain` → `name.vert.spv`; `name.frag.hlsl` → `-t fragment -e PSMain` → `name.frag.spv`; anything else emits a CMake warning and is skipped (lines 64–75).
-- Per-shader `add_custom_command`: `shadercross <src> -s HLSL -d SPIRV -t <stage> -e <entry> -I <shaders src dir> -o <out>`, `DEPENDS` on the source, **all** `.hlsli` includes (`GLOB_RECURSE` of `*.hlsli`, matching the source glob), and the `shadercross` CLI target (lines 79–94). Editing any `.hlsli` recompiles every shader.
-- Stale-output pruning: at configure time, any `.spv` in `SHADER_OUTPUT_DIR` that no longer corresponds to a globbed `.hlsl` is deleted (lines 98–108) — deleted/renamed shaders can't keep shipping via `bracken_copy_shaders`.
+- Sources: `file(GLOB_RECURSE ... CONFIGURE_DEPENDS "*.hlsl")`. Stage and entry point come purely from filename convention: `<name>.vert.hlsl` → `-t vertex -e VSMain` → `<name>.vert.spv`; `<name>.frag.hlsl` → `-t fragment -e PSMain` → `<name>.frag.spv`; anything else emits a CMake warning and is skipped.
+- Per-shader `add_custom_command`: `shadercross <src> -s HLSL -d SPIRV -t <stage> -e <entry> -I <shaders src dir> -o <out>`, `DEPENDS` on the source, **all** `.hlsli` includes (`GLOB_RECURSE` of `*.hlsli`, matching the source glob), and the `shadercross` CLI target. Editing any `.hlsli` recompiles every shader.
+- Stale-output pruning: at configure time, any `.spv` in `SHADER_OUTPUT_DIR` that no longer corresponds to a globbed `.hlsl` is deleted — deleted/renamed shaders can't keep shipping via `bracken_copy_shaders`.
 - `compile_shaders` is an `ALL` custom target depending on every compiled `.spv`.
 
 #### `bracken_copy_shaders(target)` — the consumer staging function
@@ -184,7 +193,7 @@ public:
     float fps() const;
 ```
 
-Protected hooks (the subclass contract): pure virtual `on_init()` and `on_simulate(SimFrame&)`; optional `on_shutdown()`, `on_main_frame(MainFrame&)`, and `on_event(const SDL_Event&) -> bool` (return `true` to consume before `InputHandler::process_event`). There is **no `on_update`/`on_render`** — `on_simulate` runs as a pool job overlapped with the previous frame's rendering and describes the frame through `SimFrame::frame()`'s `FrameBuilder`; `on_main_frame` runs at the frame fence. **`run()` does not call `on_init`/`on_shutdown`** — the public `start()`/`stop()` do, and the host `main()` drives the sequence `init_engine() → start() → run() → stop() → shutdown_engine()`. `stop()` is a no-op unless `start()` returned `true`, and runs `on_shutdown()` at most once.
+Protected hooks (the subclass contract): pure virtual `on_init()` and `on_simulate(SimFrame&)`; optional `on_shutdown()`, `on_main_frame(MainFrame&)`, and `on_event(const SDL_Event&) -> bool` (return `true` to consume before `InputHandler::process_event`). There is **no `on_update`/`on_render`** — `on_simulate` runs as a pool job overlapped with the previous frame's rendering and describes the frame through the `scene::FrameSink` that `SimFrame::frame()` returns; `on_main_frame` runs at the frame fence. **`run()` does not call `on_init`/`on_shutdown`** — the public `start()`/`stop()` do, and the host `main()` drives the sequence `init_engine() → start() → run() → stop() → shutdown_engine()`. `stop()` is a no-op unless `start()` returned `true`, and runs `on_shutdown()` at most once.
 
 Protected rendering facade (all forwarding to owned subsystems, `src/bracken/application.cpp`):
 
@@ -245,9 +254,9 @@ Threading contract: `init_engine()` calls `core::bind_main_thread()`; `BRACKEN_A
 
 `shutdown_renderer`: **joins the job-system pool first** (`JobSystem::instance().shutdown()` at the top — no in-flight or queued job may touch a subsystem about to be destroyed), then **auto-saves settings** (logs an error on failure), destroys the DevUI *before* the device (it owns GPU resources), then camera → `SceneRenderer::shutdown` → `RenderContext::shutdown` → resets pointers. Destruction order is load-bearing.
 
-`apply_all_graphics_settings` (lines 255–272): stores the settings, always calls `set_graphics_settings` (cheap), but gates the expensive setters on diffs against `last_applied_settings_`: `set_anisotropic_filter` (sampler rebuild) only when `anisotropic_filter` changed, `set_vsync_mode` (swapchain reconfigure) only when `vsync_mode` changed, `set_window_mode` (fullscreen transition) only when `window_mode`/`resolution_index` changed. First call applies everything.
+`apply_all_graphics_settings` (`src/bracken/application.cpp`): stores the settings, always calls `set_graphics_settings` (cheap), but gates the expensive setters on diffs against `last_applied_settings_`: `set_anisotropic_filter` (sampler rebuild) only when `anisotropic_filter` changed, `set_vsync_mode` (swapchain reconfigure) only when `vsync_mode` changed, `set_window_mode` (fullscreen transition) only when `window_mode`/`resolution_index` changed. First call applies everything.
 
-`GraphicsSettings` (`src/bracken/contracts/graphics_settings.hpp`): plain struct with `[[nodiscard]] bool save(path)/load(path)`, `clamp_to_valid_ranges()` applied by `load()` at the trust boundary, `CURRENT_SETTINGS_VERSION = 2` with lighting-value migration for older files. Enums with stable serialized integer values: `ShadowMode {Off=0, PCF=1, PCSS=2}`, `AOMode {Off=0, GTAO_Half=1, GTAO_Full=2}`, `AAMode {Off=0, FXAA=1, TAA=2}`, `TonemapMode {ACESFitted=0, ACESNarkowicz=1, Reinhard=2, None=3}`. Notable defaults: `shadow_mode=PCSS`, `ao_mode=GTAO_Half`, `aa_mode=TAA` (fresh settings only — persisted files keep their stored mode), `bloom_enabled=true` (`bloom_threshold=1.1`, post-exposure HDR luminance), `volumetric_fog=false`, `god_rays=false`, `vsync_mode=2` (mailbox; clamped to `max_vsync_mode()` at apply), `anisotropic_filter=4` (16×), `draw_distance=3` (=4000 via `get_draw_distance()`'s clamped table {500,1000,2000,4000,8000,16000,32000}), `window_mode=0` (windowed).
+`GraphicsSettings` (`src/bracken/contracts/graphics_settings.hpp`): plain struct with `[[nodiscard]] bool save(path)/load(path)`, `clamp_to_valid_ranges()` applied by `load()` at the trust boundary, `CURRENT_SETTINGS_VERSION = 2` with lighting-value migration for older files. Enums with stable serialized integer values: `ShadowMode {Off=0, PCF=1, PCSS=2}`, `AOMode {Off=0, GTAO_Half=1, GTAO_Full=2}`, `AAMode {Off=0, FXAA=1, TAA=2}`, `TonemapMode {ACESFitted=0, ACESNarkowicz=1, Reinhard=2, None=3}`. Notable defaults: `shadow_mode=PCSS`, `ao_mode=GTAO_Half`, `aa_mode=TAA` (fresh settings only — persisted files keep their stored mode), `bloom_enabled=true` (`bloom_threshold=1.1`, post-exposure HDR luminance), `volumetric_fog=false`, `god_rays=false`, `vsync_mode=VSyncMode::Mailbox` (clamped to `max_vsync_mode()` at apply), `anisotropic_filter=AnisotropicFilter::X16`, `draw_distance=DrawDistance::D4000` (`get_draw_distance()` maps the enum through the saturating table {500,1000,2000,4000,8000,16000,32000}), `window_mode=WindowMode::Windowed`. Every mode field is a scoped `enum class` with stable serialized integer values — `DrawDistance`, `AnisotropicFilter`, `VSyncMode`, `ShadowCascades`, `ShadowResolution`, `LocalShadowResolution` and `WindowMode` joined the four listed above in phase 7; none of them is a bare `int` any more, and the lookup helpers (`cascade_count`, `shadow_map_texels`, …) saturate rather than defaulting, because a corrupt file or a `static_cast` can still present an out-of-range value.
 
 #### Dev UI wiring (`init_dev_ui`, `application.cpp:276–305`)
 
@@ -2218,7 +2227,7 @@ Legacy: the `CameraUniforms`, `ModelUniforms`, `LightUniforms`, `TimeUniforms` s
 
 `GPUDebugGroup(cb, name)` — RAII `SDL_PushGPUDebugGroup`/`SDL_PopGPUDebugGroup`; null `cb`/`name` degrades to a no-op. Non-copyable/non-movable. Macro `BRACKEN_GPU_SCOPE(cb, name)` instantiates one with a line-unique identifier. `insert_debug_label(cb, name)` / `BRACKEN_GPU_LABEL` wraps `SDL_InsertGPUDebugLabel`.
 
-`GPUTimestampPool` — CPU-record timings are real (`core::PassTimeline` behind `write_begin`/`write_end`); the GPU half is **absent by necessity**: SDL3 GPU (as of SDL 3.2) exposes no per-pass timestamp queries, so `is_supported()` is false and `PassTiming::gpu_ms` is `nullopt`. The API shape is preserved so call sites remain identical when support lands.
+`GPUTimestampPool` — CPU-record timings are real (`core::PassTimeline` behind `write_begin`/`write_end`); the GPU half is **absent by necessity**: SDL3 GPU (as of SDL 3.4) exposes no per-pass timestamp queries, so `is_supported()` is false and `PassTiming::gpu_ms` is `nullopt`. The API shape is preserved so call sites remain identical when support lands.
 
 ```cpp
 [[nodiscard]] bool init(GPUDevice&, size_t pair_count);   // stores capacity, supported_ = false, returns true
@@ -5148,7 +5157,7 @@ void SceneRenderer::bind_mesh_material_textures(const Mesh& mesh);
 void SceneRenderer::bind_material_texture(uint32_t slot, SDL_GPUTexture* texture); // dedupes via last_frag_tex_[slot]
 ```
 
-Slot 0 is *always* bound (the shader declares `baseColorTexture` regardless of the `hasTexture` branch; an unbound or stale-incompatible descriptor is undefined behavior): mesh texture, else `dummy_white_texture_` (1×1 white `0xFFFFFFFF`, `RGBA8`). Slot 3: `mat.normal_texture` else `default_normal_texture_` (1×1 `(128,128,255,255)` flat tangent-space normal). Slot 4: `mat.metallic_roughness_texture` else `dummy_white_texture_` (white is safe *and* neutral: sampling is gated by `hasMRMap`, and white would multiply factors by 1 anyway). Slot 5: `mat.emissive_texture` else `dummy_black_texture_` (1×1 `0xFF000000`). All three fallbacks are created in `create_fallback_assets` (`scene_renderer.cpp`); slots 1–2 (shadow atlas ×2) are bound separately by `bind_shadow_data`. `bind_material_texture` skips rebinds when `last_frag_tex_[slot]` already holds the texture and silently no-ops when the texture or `default_sampler_` is null. All material slots share `default_sampler_` (linear min/mag/mip, repeat addressing, anisotropy up to 16, `max_lod = 1000`).
+Slot 0 is *always* bound (the shader declares `baseColorTexture` regardless of the `hasTexture` branch; an unbound or stale-incompatible descriptor is undefined behavior): mesh texture, else `dummy_white_texture_` (1×1 white `0xFFFFFFFF`, `RGBA8`). Slot 3: `mat.normal_texture` else `default_normal_texture_` (1×1 `(128,128,255,255)` flat tangent-space normal). Slot 4: `mat.metallic_roughness_texture` else `dummy_white_texture_` (white is safe *and* neutral: sampling is gated by `hasMRMap`, and white would multiply factors by 1 anyway). Slot 5: `mat.emissive_texture` else `dummy_black_texture_` (1×1 `0xFF000000`). All three fallbacks are created once at boot in `SceneRenderer::init_pipelines` (`scene/scene_renderer.cpp`); slots 1–2 (shadow atlas ×2) are bound separately by `bind_shadow_data` (`scene/scene_renderer_draw.cpp`). `bind_material_texture` skips rebinds when `last_frag_tex_[slot]` already holds the texture and silently no-ops when the texture or `default_sampler_` is null. All material slots share `default_sampler_` (linear min/mag/mip, repeat addressing, anisotropy up to 16, `max_lod = 1000`).
 
 #### Pipeline-variant selection and draw routing
 
@@ -5274,7 +5283,7 @@ at 0.25 s. Per substep: semi-Lagrangian back-trace along `flow`
 frame only), and a 24-texel absorbing border band. Uniforms:
 `WaterRenderer::SimUniforms` (160 B, pinned by `water_renderer.test.cpp`).
 
-**Surface pass** (`water.vert/.frag.hlsl`, `PipelineType::Water`): grid of
+**Surface pass** (`water.vert.hlsl` / `water.frag.hlsl`, `PipelineType::Water`): grid of
 float2 world-XZ vertices (`grid_cells_for`: ≤160 cells on the longer axis,
 aspect-scaled short axis), lifted to `height` and displaced by the sim field
 in the VS (displacement and sim normals fade at the window edge, 0.06 uv
@@ -8265,8 +8274,11 @@ Build`, linked **PRIVATE** into `bracken`; sample/test/viewer targets, LTO,
 and `-Werror` are disabled on the Jolt build). Public surface:
 `physics_world.hpp` only — glm + POD types over a pimpl; Jolt types and
 `JPH_*` compile definitions never cross into consumer code.
-`jolt_job_system.hpp` is an internal header (includes Jolt; only
-`physics/*.cpp` may include it).
+`physics/internal/jolt_job_system.hpp` is an internal header (it includes Jolt;
+only `physics/*.cpp` may include it). `<module>/internal/` is the engine-wide
+convention for headers outside the public surface, and
+`public_headers.test.cpp` enforces it: no header outside such a directory may
+transitively reach Jolt.
 
 ### Configuration (`PhysicsConfig`)
 

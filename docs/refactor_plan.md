@@ -1400,6 +1400,58 @@ use-after-free — which TSan does not.
 **Rollback:** three commits — umbrella + alias; `internal/` move + header test; docs. The
 effects move that used to live here is now Phase 6b's, with its own rollback.
 
+**Outcome (landed 2026-07-31).** All three commits landed. Digest unchanged
+(`0x88a341b9217a591b` default, `0x2a88efac36b3fccc` under `--engine-camera=off`); ctest
+1130/1130 in `build/` and 1116/1116 in `build-rel/`. Four places where this section was
+wrong about the code, corrected in the implementation rather than followed:
+
+- **The `gpu/` assertion above is false.** "No header reachable from `bracken.hpp` pulls
+  `gpu_buffer.hpp` or `gpu_texture.hpp` unless it is itself a `gpu/` header" cannot hold:
+  `TerrainRenderer`, `GrassRenderer`, `WaterRenderer`, `AutoExposure`, `IBL` and
+  `SceneRenderer` hold GPU resources **by value** and must name their types, and all six are
+  in the public subset because a host configures them. `public_headers.test.cpp` asserts the
+  property that is both true and worth guarding: **`application.hpp`'s transitive closure
+  contains no `gpu/` header** — exactly the 6b win this section was reaching for, stated
+  about the one header every host TU includes.
+- **The `.cpp` moved with its header.** The section moves only `jolt_job_system.hpp` and
+  updates `jolt_job_system.cpp` in place. Both moved. `internal/` is a statement about the
+  *include tree*, but splitting a translation unit across two directories to express that
+  would cost more than the convention buys the moment a second internal unit appears.
+- **"Every header in `bracken.hpp` compiles standalone" is not a runtime check.** A source
+  scan cannot answer it. `src/bracken/CMakeLists.txt` reads the header list back out of
+  `bracken.hpp` and generates one TU per header into `bracken_public_headers` — each
+  including its header twice as the first thing in the file, which proves self-sufficiency
+  and the include guard together. The scan-based test checks the include *graph*; the
+  generated target checks compilability. Both parsers anchor `#include` at start of line,
+  because the umbrella's preamble quotes a `#include` inside a comment and a loose
+  `find('#')` reports the umbrella as including itself.
+- **The 20 cited stale `technical_spec.md` line numbers had all shifted**, as had every
+  `path:NNN` in this plan. Rather than re-derive them, the build chapter's line-keying was
+  **deleted**: the targets table, the usage-requirement bullets and the shader-pipeline
+  bullets now cite files and identifiers only — which is what `docs_coherence.test.cpp`
+  checks and what this section argues for. That test found five genuine stale citations no
+  reader had caught: `bracken/render/particle_transform.hpp` (moved to `effects/` in 6b),
+  `apply_mesh_material` and `create_fallback_assets` still attributed to `scene_renderer.cpp`
+  after the phase-6 split — the latter naming a function that does not exist at all
+  (`SceneRenderer::init_pipelines` creates those fallback textures inline) — plus two
+  malformed paths. It also caught the two missing module-map rows, `dev/` and `testing/`.
+
+The ASan/UBSan lane's first run found exactly one thing, and it is worth recording because
+it is a decision rather than a bug: `InputHandlerHeldKeys.SnapshotKeyHeldIsScancodeBoundsChecked`
+hands `key_held()` a `static_cast<SDL_Scancode>(-1)` to prove the guard rejects it, and
+UBSan's `enum` check calls *loading* that value undefined. The engine code is correct — the
+guard is exactly the defensive bounds check a host boundary should have — and the only way
+to test such a guard is to construct an out-of-range enumerator. The lane runs with
+`-fno-sanitize=enum`; the trade is written into the preset description and the three build-lane
+tables. It costs nothing this lane exists for (use-after-free, out-of-bounds), and the
+alternative — deleting the test, or widening `key_held` to take an `int` — would be paying
+for a sanitizer sub-check with engine API.
+
+Added beyond the section: the `asan` preset and lane (specified in the gate but not in the
+Changes list), and `bracken.test.cpp` — a TU that includes `bracken/bracken.hpp` and nothing
+else from the engine, subclasses `Application` and runs it headless. That is the compile-only
+TU the gate asks for, kept as a real test so it has a failure mode.
+
 ---
 
 ## 5. Before / after — real host code

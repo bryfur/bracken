@@ -11,7 +11,8 @@ loading, skeletal animation, and a clustered-forward renderer.
 This repository contains *only* the engine — no game, server, or networking
 code (rigid-body physics, however, ships in-engine: `bracken::physics`, a
 glm-typed API over vendored Jolt Physics). It builds as a static library
-(`bracken`) plus its unit-test suite (`bracken_tests`, GoogleTest).
+(`bracken`, aliased `bracken::bracken`) plus its unit-test suite
+(`bracken_tests`, GoogleTest).
 
 ## Features
 
@@ -111,15 +112,31 @@ ctest --test-dir build --output-on-failure
 
 Tests live next to their unit as `*.test.cpp` and are auto-discovered.
 
+### Build lanes
+
+`CMakePresets.json` defines five long-lived, coexisting trees. None is ever
+deleted or reconfigured to "switch" to another.
+
+| Preset | Tree | Purpose |
+|---|---|---|
+| `default` | `build/` | Primary incremental tree. No build type → `-O0`, all asserts live. |
+| `rel` | `build-rel/` | RelWithDebInfo — the only lane that compiles the `NDEBUG` path. |
+| `bench` | `build-bench/` | Optimized. **Benchmark here**: numbers from `build/` are meaningless. |
+| `tsan` | `build-tsan/` | ThreadSanitizer — data races. Tests only. |
+| `asan` | `build-asan/` | Address + UB sanitizer — use-after-free, out-of-bounds. Tests only (`-fno-sanitize=enum`, see the user guide). |
+
 ### Benchmarks
 
 ```bash
-./build/src/bracken/bracken_benchmarks                          # all
-./build/src/bracken/bracken_benchmarks --benchmark_filter=Anim  # subset
+cmake --preset bench && cmake --build build-bench
+./build-bench/src/bracken/bracken_benchmarks                          # all
+./build-bench/src/bracken/bracken_benchmarks --benchmark_filter=Anim  # subset
 ```
 
-Micro-benchmarks live next to their unit as `*.bench.cpp` (Google Benchmark,
-auto-discovered) and cover the CPU hot paths: animation sampling/crossfade,
+`build/` has no `CMAKE_BUILD_TYPE`, so it compiles at `-O0` with arena
+poisoning and live thread-tier assertions — any timing measured there says
+nothing about the shipped engine. Micro-benchmarks live next to their unit as
+`*.bench.cpp` (Google Benchmark, auto-discovered) and cover the CPU hot paths: animation sampling/crossfade,
 IK, state machines, frustum culling, clustered light binning, particle
 updates, allocators, hashing, and procedural mesh generation.
 
@@ -207,16 +224,42 @@ src/bracken/
 
 ## Consuming the engine
 
-Subclass `bracken::Application` (override `on_init` / `on_update` /
-`on_render`), link against the `bracken` target, and call
+Subclass `bracken::Application` and override `on_init` / `on_simulate` /
+`on_shutdown`, link against the `bracken::bracken` target, and call
 `bracken_copy_shaders(<your_target>)` to stage the compiled SPIR-V next to
 your executable:
 
 ```cmake
 add_subdirectory(path/to/engine)   # or use it as a submodule
-target_link_libraries(my_game PRIVATE bracken)
+target_link_libraries(my_game PRIVATE bracken::bracken)
 bracken_copy_shaders(my_game)
 ```
+
+```cpp
+#include "bracken/bracken.hpp"   // the supported surface, in one header
+
+class MyGame final : public bracken::Application {
+protected:
+    bool on_init() override { /* load models, configure renderers */ return true; }
+    void on_simulate(bracken::SimFrame& sim) override {
+        // Runs as a pool job, overlapped with the previous frame's render.
+        // Describe the frame; the engine draws it.
+        sim.frame().draw_model(hero_, transform);
+    }
+};
+```
+
+There is no `on_update`/`on_render`: the host *describes* a frame through the
+`FrameSink` that `SimFrame::frame()` returns, and the engine renders it.
+`bracken.hpp` is an umbrella over the supported surface — the headers the
+example app actually uses. It says what to reach for; it is **not** a stability
+promise (the engine is pre-1.0 and breaks are compiler-caught). Headers under
+`<module>/internal/` are engine-private and may include vendored dependencies:
+that is where Jolt lives, and it is why `bracken::physics` stays Jolt-free.
+
+For your own tests, `#include "bracken/testing/frame_test.hpp"` — build a
+frame, seal it, and assert on exactly what your game described, with no GPU
+and no window.
 
 Conventions consumers inherit: **Y-up** coordinates, **reversed-Z zero-to-one
 depth** (`GLM_FORCE_DEPTH_ZERO_TO_ONE` propagates from the engine target;

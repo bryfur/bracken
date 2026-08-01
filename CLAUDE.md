@@ -9,7 +9,9 @@ clustered-forward renderer.
 This repo contains **only the engine** — no game, server, networking, or ECS.
 Rigid-body physics *is* engine infrastructure here: `src/bracken/physics/`
 wraps Jolt Physics behind a glm-only pimpl API (owner decision 2026-07-21 —
-see engine_design_notes.md). It builds as a static library (`bracken`) plus a GoogleTest suite
+see engine_design_notes.md). It builds as a static library (`bracken`, aliased
+`bracken::bracken`; `src/bracken/bracken.hpp` is the umbrella over its public
+surface) plus a GoogleTest suite
 (`bracken_tests`), and one example app: `examples/playground`, a medieval
 village orb-collector demo that doubles as the integration test (`--smoke N`
 self-drives for N frames and exits — run it after changes that could affect
@@ -46,7 +48,9 @@ In short: **no full clean rebuilds.** Always `cmake --build build` (or
 part of the tree) — SDL_shadercross is the slow part of a cold build; never
 throw it away with a clean rebuild. New `.cpp`/`.hpp`/`.test.cpp` files under
 `src/bracken/` are picked up automatically by the CMake `GLOB_RECURSE`, so an
-incremental build is all that's needed after adding a file.
+incremental build is all that's needed after adding a file. Editing
+`src/bracken/bracken.hpp` also triggers a reconfigure — the umbrella's header
+list is read back out of it to generate the standalone-compile TUs.
 
 ---
 
@@ -61,8 +65,9 @@ Read the doc that matches the task before diving into code:
   API surfaces, data structures, algorithms, contracts, constants, known
   limitations/stubs.
 - [docs/architecture.md](docs/architecture.md) — **the deep reference**:
-  module map, `Application` lifecycle, exact frame/pass order, GPU layer,
-  threading & lifetime contracts, constants, known stubs/silent behaviors.
+  module map, module layering + the public/`internal/` surface,
+  `Application` lifecycle, exact frame/pass order, GPU layer, threading &
+  lifetime contracts, constants, known stubs/silent behaviors.
 - [docs/engine_design_notes.md](docs/engine_design_notes.md) — rationale +
   decision principles. **Required reading before adding any cross-cutting
   infrastructure** (allocators, watchers, render-graph wiring). Note the
@@ -92,7 +97,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 
 | Module | Namespace | What's there |
 |---|---|---|
-| `contracts/` | *(each type keeps its own)* | the **leaf layer** — pure-data types two layers must agree on: `ModelHandle`, `EnvironmentState`, `CameraState`, `Frustum`, `velocity_math`, `PointLight`/`SpotLight`, `GraphicsSettings`, `RenderStats`. May include `core/`, glm and `<std>` and nothing else; a header's directory and its namespace are independent here. This is what makes the header graph a DAG — see `contracts/README.md` and architecture.md "Module layering" |
+| `contracts/` | *(each type keeps its own)* | the **leaf layer** — pure-data types two layers must agree on: `ModelHandle`, `EnvironmentState`, `CameraState`, `Frustum`, `velocity_math`, the host light descriptors `PointLightDesc`/`SpotLightDesc` **and** the GPU PODs `PointLight`/`SpotLight`/`LightHeader` they pack into, `GraphicsSettings` (every mode field is a scoped `enum class` — `ShadowMode`, `AOMode`, `AAMode`, `TonemapMode`, `DrawDistance`, `AnisotropicFilter`, `VSyncMode`, `ShadowCascades`, `ShadowResolution`, `LocalShadowResolution`, `WindowMode` — never a magic int), `RenderStats`. May include `core/`, glm and `<std>` and nothing else; a header's directory and its namespace are independent here. This is what makes the header graph a DAG — see `contracts/README.md` and architecture.md "Module layering" |
 | `core/` | `bracken::core` | logger (**the engine's only log channel**), asserts, `Result`, `Handle`, `hash`/`StringId`, Tracy profiler hooks |
 | `core/jobs/` | `core::jobs` | `JobSystem` (**always-on** lock-free work-stealing pool — Chase–Lev deques, `atomic::wait` parking), `TaskGroup`, `parallel_for`, task handles. Worker count via `BRACKEN_WORKERS` (=1 is single-worker debug mode, same code path) |
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload; opt-in via `BRACKEN_HOT_RELOAD=1`) + `AssetRegistry` (host-facing utility — engine systems register on the watcher directly) |
@@ -105,9 +110,24 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `systems/` | `bracken::systems` | camera controller/system |
 | `effects/` | *(namespaces unchanged)* | the particle-effect triad in one place: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage owned: spawned/updated/snapshotted inside the sim job), `EffectRenderer` (draws the packet snapshot) |
 | `procedural/` | `bracken::procedural` | tree + rock generators |
-| `physics/` | `bracken::physics` | `PhysicsWorld` — rigid-body physics over vendored **Jolt** (pimpl; Jolt never appears in public headers). Fixed-step accumulator `update()` (tier owned/sim-stage), sphere/box/capsule/heightfield bodies, ray casts; Jolt's step jobs run on the engine `JobSystem` via an internal `JoltJobSystem` bridge — one pool owns the cores |
-| `dev/` | `bracken::dev` | `DevUI` Dear ImGui developer overlay (F10 in the playground; no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`) |
+| `physics/` | `bracken::physics` | `PhysicsWorld` — rigid-body physics over vendored **Jolt** (pimpl; Jolt never appears in a public header). Fixed-step accumulator `update()` (tier owned/sim-stage), sphere/box/capsule/heightfield bodies, ray casts; Jolt's step jobs run on the engine `JobSystem` via the `JoltJobSystem` bridge in **`physics/internal/`** — one pool owns the cores |
+| `dev/` | `bracken::dev` | `DevUI` Dear ImGui developer overlay (F10 in the playground; no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`) + `dev_panels` (built-in Stats/Environment/Graphics/Camera panels). ImGui appears only in `dev/*.cpp` |
+| `testing/` | `bracken::testing` | `frame_test.hpp` — `TestFrame` + `FrameAccess`, published **for host games** to unit-test their frame code with no GPU/window/SDL. Header-only; nothing in the engine's production path includes it |
 | `shaders/` | — | HLSL sources, compiled to SPIR-V at build time |
+
+**Public vs internal.** `src/bracken/bracken.hpp` is the umbrella over the
+supported surface — the 24 headers the playground actually includes, grouped
+and annotated. It is a statement of *what to reach for*, explicitly **not** a
+stability promise (pre-1.0; this refactor broke six of those signatures). A
+header under `<module>/internal/` is outside that surface and may include a
+vendored dependency freely — `physics/internal/jolt_job_system.hpp` is the one
+header in the tree that includes Jolt. `public_headers.test.cpp` enforces both
+halves: nothing outside an `internal/` directory may transitively reach Jolt,
+ImGui, tinygltf or stb_, and `application.hpp` must not drag the `gpu/` layer
+into every host TU. The umbrella's 24 headers are also each compiled
+**standalone** by the generated `bracken_public_headers` target. Adopt
+`<module>/internal/` for any future header that has to include a vendored
+dependency.
 
 `Application` (`src/bracken/application.hpp`) is the base class that owns the
 SDL lifecycle, the **pipelined** main loop (depth 2 — Simulate(i+1) overlaps
@@ -145,6 +165,17 @@ draws it.
   consume). A packet is consumed exactly once, then retired to its
   `PacketRing`. `BonePaletteId`s held by the host across `seal()` are stale;
   only re-read them from sealed commands.
+- **Diagnostics: the engine does not drop work silently.** Every budget or
+  lookup failure that used to be a `continue` is counted in
+  `RenderStats::diagnostics` (`contracts/render_stats.hpp`) —
+  `draws_dropped_unknown_model`, `skinned_dropped_no_skeleton`,
+  `palettes_over_budget`, `effect_models_unresolved`, `lights_dropped`,
+  `cluster_lights_dropped`, `camera_missing`. The per-chunk accumulators fold
+  in chunk-index order, so the counts are bit-identical at any worker count.
+  Per-pass CPU record time is real (`core::PassTimeline` →
+  `RenderStats::pass_times_ms`), the GPU half is honestly `nullopt`, and
+  `ModelLoadReport` summarizes what a `.glb` load quietly discarded. Check
+  these before believing "nothing is drawing" is a shader bug.
 - Hosts can unit-test their own frame code headlessly:
   `bracken/testing/frame_test.hpp` ships `testing::TestFrame` (build a frame
   through a `FrameSink`, `seal()`, read back typed views + `digest()`) and
@@ -217,8 +248,11 @@ draws it.
   `LightHeader` are `contracts/light.hpp` (host-facing data contract — the
   frame packet carries them, so they must not drag the renderer in).
   `render/lighting/light.hpp` includes it, so both spellings keep working.
-- Formats (`gpu/pipeline_registry.hpp`): swapchain `RGBA8_UNORM`, HDR scene
-  `RGBA16F`, depth `D32_FLOAT`.
+- Formats: swapchain `RGBA8_UNORM`, HDR scene `RGBA16F`, depth `D32_FLOAT` —
+  the live values are `PipelineRegistry`'s members (`gpu/pipeline_registry.hpp`,
+  the swapchain one updated at runtime by `set_swapchain_format`), and the
+  catalogue's `TargetFormats` defaults (`gpu/pipeline_catalog.hpp`) must agree
+  with them.
 
 ### Gotchas (full list in [docs/architecture.md](docs/architecture.md))
 - **Per-pass timings are CPU-record only** — `RenderStats::pass_times_ms` is
@@ -233,6 +267,13 @@ draws it.
   never read.)
 - `render_graph/` is not in the frame path — don't route the renderer through
   it without a measured reason (design notes explain why).
+- A number measured in `build/` is not a performance number. That tree has no
+  `CMAKE_BUILD_TYPE`: `-O0`, arena poisoning, live tier assertions. Use
+  `cmake --preset bench`.
+- `bracken.hpp` is not a stability contract, and `<module>/internal/` is not a
+  suggestion — `public_headers.test.cpp` fails the suite if a public header
+  reaches Jolt/ImGui/tinygltf/stb_, or if `application.hpp` starts exporting
+  the `gpu/` layer again.
 
 ---
 
@@ -293,15 +334,26 @@ Env: `BRACKEN_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.
 `hardware_concurrency()-1`, min 1; `=1` is the single-worker debug mode —
 same code path, one worker).
 
-A `CMakePresets.json` (version 6) exists at the repo root. Four trees, all
-long-lived and coexisting — the no-clean-rebuild rule applies to each:
+A `CMakePresets.json` (version 6) exists at the repo root. **Five** trees, all
+long-lived and coexisting — the no-clean-rebuild rule applies to each, and no
+tree is ever deleted or reconfigured to "switch" to another:
 
 | Preset | Tree | What it is for |
 |---|---|---|
-| `default` | `build/` | The primary incremental tree. No `CMAKE_BUILD_TYPE` → `-O0`. |
-| `tsan` | `build-tsan/` | ThreadSanitizer lane (below). Tests only. |
-| `rel` | `build-rel/` | RelWithDebInfo — the **only** lane that compiles the `NDEBUG` path, where `BRACKEN_ASSERT` and the debug-only thread-tier assertions vanish. Run it before relying on an assert for correctness. |
-| `bench` | `build-bench/` | Optimized benchmark lane. `build/` is `-O0` with arena poisoning and live tier asserts, so **numbers measured there are meaningless** — configure warns about this. |
+| `default` | `build/` | The primary incremental tree. No `CMAKE_BUILD_TYPE` → `-O0`, every `BRACKEN_ASSERT` and thread-tier check live. |
+| `rel` | `build-rel/` | RelWithDebInfo — the **only** lane that compiles the `NDEBUG` path, where `BRACKEN_ASSERT` and the debug-only thread-tier assertions vanish (`BRACKEN_CONTRACT` stays). Run it before relying on an assert for correctness; it also catches UB that `-O0` hides. |
+| `bench` | `build-bench/` | Optimized benchmark lane. `build/` is `-O0` with arena poisoning and live tier asserts, so **any number measured there is meaningless.** Benchmark here or do not quote the figure. |
+| `tsan` | `build-tsan/` | ThreadSanitizer (below). Data races: run it after touching the job system, an atomic, or anything in the multithreading plan. Tests only. |
+| `asan` | `build-asan/` | Address + UB sanitizer. Finds what TSan cannot — use-after-free and out-of-bounds across the arena/frame allocators, the packet ring's retire-and-reuse cycle, the job-system node pools. Tests only. `-fno-sanitize=enum` on purpose: the engine bounds-checks enum parameters at the host boundary, and the only way to test such a guard is to hand it an out-of-range enumerator. |
+
+The first configure of `tsan`/`asan`/`rel`/`bench` refetches and rebuilds the
+deps (SDL_shadercross/DXC) from scratch — slow, expected, one-time. After that
+each is incremental like any other tree.
+
+```bash
+cmake --preset asan     # first time only
+cmake --build build-asan && ctest --test-dir build-asan --output-on-failure
+```
 
 ### TSan lane
 
@@ -330,17 +382,36 @@ API is `Application::request_screenshot(path)` (deferred to the frame fence —
 a request from sim frame i captures frame i's final swapchain image, UI
 included; the capturing frame blocks on the GPU).
 
-Benchmarks: `build/src/bracken/bracken_benchmarks` (add
-`--benchmark_filter=<regex>` for a subset). Audit reports live in
+Benchmarks: `build-bench/src/bracken/bracken_benchmarks` (add
+`--benchmark_filter=<regex>` for a subset). The binary also exists in `build/`,
+and its numbers there are **meaningless** — that tree has no
+`CMAKE_BUILD_TYPE`, so it is `-O0` with arena poisoning and live asserts. Use
+the `bench` preset for anything you intend to quote. Audit reports live in
 `docs/audits/`.
 
 ## Consuming the engine
 
 ```cmake
 add_subdirectory(path/to/engine)
-target_link_libraries(my_game PRIVATE bracken)
+target_link_libraries(my_game PRIVATE bracken::bracken)
 bracken_copy_shaders(my_game)   # stages compiled SPIR-V next to the exe
 ```
+
+```cpp
+#include "bracken/bracken.hpp"   // the supported surface, in one header
+```
+
+`bracken::bracken` is an alias for `bracken`; prefer the namespaced spelling —
+a typo in it fails at configure time, whereas a bare `bracken` silently
+degrades into a `-lbracken` link flag. Linking is `PUBLIC`-transitive: you get
+SDL3/SDL3_ttf/SDL3_image, glm, the `src/` include root and
+`GLM_FORCE_DEPTH_ZERO_TO_ONE` (load-bearing — your glm math must agree with the
+engine's reversed-Z). Jolt is linked **PRIVATE**: you get its symbols, never
+its headers.
+
+For a game's own tests, `#include "bracken/testing/frame_test.hpp"` — build a
+frame through a `FrameSink`, `seal()`, assert on the typed views and the
+packet digest, with no GPU and no window.
 
 ## What you must not do
 - No full clean rebuild — see [.claude/RULES.md](.claude/RULES.md).

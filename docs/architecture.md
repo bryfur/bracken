@@ -17,8 +17,8 @@ Root namespace `bracken`, one sub-namespace per module.
 
 | Path | Namespace | Contents |
 |---|---|---|
-| `src/bracken/` (root) | `bracken` | `Application`, `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `Heightmap` |
-| `contracts/` | *(unchanged per type)* | the **leaf layer**: pure-data types two or more layers must agree on — `ModelHandle`, `EnvironmentState`, `CameraState`, `Frustum`, `velocity_math`, `PointLight`/`SpotLight`, `GraphicsSettings`, `RenderStats`. May include `core/`, glm and `<std>` and nothing else; namespaces are those of the owning module, not the directory. See [`contracts/README.md`](../src/bracken/contracts/README.md) |
+| `src/bracken/` (root) | `bracken` | `Application` + `SimFrame`/`MainFrame` (the two per-frame host views it hands the hooks), `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `Heightmap`, and `bracken.hpp` — the umbrella over the public surface |
+| `contracts/` | *(unchanged per type)* | the **leaf layer**: pure-data types two or more layers must agree on — `ModelHandle`, `EnvironmentState`, `CameraState`, `Frustum`, `velocity_math`, the host descriptors `PointLightDesc`/`SpotLightDesc` and the GPU PODs `PointLight`/`SpotLight`/`LightHeader`, `GraphicsSettings` (every mode field a scoped `enum class`), `RenderStats` (+ `FrameDiagnostics`, `PassTiming`). May include `core/`, glm and `<std>` and nothing else; namespaces are those of the owning module, not the directory. See [`contracts/README.md`](../src/bracken/contracts/README.md) |
 | `core/` | `core` | `Logger` (+`BRACKEN_LOG_*`), `assert.hpp`, `Result<T,E>`, `Handle` pools, `hash.hpp` (`StringId`, FNV-1a), `profiler.hpp` (Tracy macros) |
 | `core/jobs/` | `core::jobs` | `JobSystem` (always-on lock-free work-stealing pool — Chase–Lev deques, MPSC injection, pooled job nodes), `TaskGroup`, `parallel_for`, `TaskHandle` |
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload poller); `AssetRegistry` (typed, stable handles — a host-facing utility: no engine system instantiates it) |
@@ -32,7 +32,9 @@ Root namespace `bracken`, one sub-namespace per module.
 | `systems/` | `systems` | `CameraController` / `CameraSystem` |
 | `effects/` | `bracken` + `systems` + `render` | the particle-effect triad, together at last: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage simulation), `EffectRenderer` + `particle_transform.hpp` (drawing). Namespaces are unchanged — the directory groups the feature, not the namespace |
 | `procedural/` | `procedural` | `tree_generator` (ez-tree algorithm), `rock_generator` (SDF + marching cubes) |
-| `physics/` | `physics` | `PhysicsWorld` (glm-only pimpl over vendored **Jolt Physics** — linked PRIVATE, Jolt never in public headers), internal `JoltJobSystem` bridge onto `core::jobs::JobSystem` (see "Physics" below) |
+| `physics/` | `physics` | `PhysicsWorld` (glm-only pimpl over vendored **Jolt Physics** — linked PRIVATE, Jolt never in public headers). `physics/internal/` holds the `JoltJobSystem` bridge onto `core::jobs::JobSystem` — the one header in the tree that includes Jolt (see "Physics" below) |
+| `dev/` | `dev` | `DevUI` — the Dear ImGui developer overlay (F10 in the playground) — and `dev_panels` (the built-in Stats / Environment / Graphics / Camera panels). Compiles to a no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`; ImGui appears only in `dev/*.cpp`, never in a header |
+| `testing/` | `testing` | `frame_test.hpp` — `TestFrame` + `FrameAccess`, the headless frame fixture published **for host games**: build a frame, seal it, read back typed views and the packet digest with no GPU, window or SDL. Header-only; nothing in the engine's production path includes it |
 | `shaders/` | — | HLSL sources → SPIR-V at build time; see [shaders/README.md](../src/bracken/shaders/README.md) |
 
 ### Module layering
@@ -88,6 +90,45 @@ under `contracts/` includes anything but `bracken/core/*`, `bracken/contracts/*`
 glm and `<std>`; and `core/`, `memory/` and `gpu/` never include upward (tests
 and benchmarks exempt — cross-layer contract tests like
 `gpu/uniform_layout.test.cpp` exist precisely to check that the layers agree).
+
+### Public surface and `<module>/internal/`
+
+Layering says which header may include which. A second, independent axis says
+which headers a **host** is meant to include at all, and it is written down in
+two places:
+
+- **`src/bracken/bracken.hpp`** — the umbrella. It includes exactly the set
+  `examples/playground` uses, grouped by section with one comment per header.
+  Read it as a table of contents for the engine. It is explicitly **not** a
+  stability promise: the engine is pre-1.0, and the refactor that introduced
+  the umbrella changed six of those signatures in the same release. Publishing
+  an API contract on top of that would be signalling.
+- **`src/bracken/<module>/internal/`** — the convention for a header that is
+  *not* part of that surface. An `internal/` header may include a vendored
+  dependency freely; a public one may not. Today there is exactly one:
+  `physics/internal/jolt_job_system.hpp`, which includes `Jolt/Jolt.h` and
+  derives from `JPH::JobSystemWithBarrier`.
+
+The Jolt invariant is the reason the convention exists. "Jolt types never
+appear in a public bracken header" was asserted in four documents and enforced
+by nothing: it held only because Jolt is linked `PRIVATE`, which is a *link*-time
+property standing in for an *include*-time rule. A consumer with Jolt already on
+its include path would have compiled that header straight out of the public tree.
+`public_headers.test.cpp` now checks the include graph directly — no header
+outside an `internal/` directory may transitively reach Jolt, ImGui, tinygltf or
+stb_ — plus two more facts worth keeping true: the umbrella covers every bracken
+header the reference consumer includes, and **`application.hpp` pulls in no
+`gpu/` header** (before the `ModelHandle` hoist into `contracts/`, the chain
+`application.hpp → sim_frame.hpp → frame_builder.hpp → frame_packet.hpp →
+model_loader.hpp` exported `gpu_buffer.hpp`, `gpu_texture.hpp` and
+`gpu_types.hpp` into every host translation unit, purely so the packet could
+name one handle type).
+
+Compilability is a separate question a source scan cannot answer, so
+`src/bracken/CMakeLists.txt` reads the header list back out of `bracken.hpp` and
+generates one translation unit per header into the `bracken_public_headers`
+object library. Each includes its header twice — first line of the file, nothing
+before it — which proves both self-sufficiency and the include guard.
 
 ---
 
@@ -146,7 +187,7 @@ it:
   `on_event(const SDL_Event&) -> bool` (return `true` to consume an event
   before `InputHandler` sees it).
 - There is **no `on_update`/`on_render`**: the host does not "render" — it
-  *describes* a frame through `SimFrame::frame()`'s `FrameBuilder`, and the
+  *describes* a frame through the `FrameSink` that `SimFrame::frame()` returns, and the
   engine draws it. `on_simulate` **runs as a job on the worker pool**,
   overlapped with the previous frame's rendering (tier `sim-stage` — see
   Threading & lifetime contracts); `on_main_frame` runs at the frame fence
@@ -887,7 +928,7 @@ internally synchronized against concurrent host calls. Jolt's own global
 registration (allocator, factory, type registry) is `std::call_once`-guarded
 and process-wide.
 
-**The job-system bridge** (`jolt_job_system.hpp/.cpp`, internal header):
+**The job-system bridge** (`physics/internal/jolt_job_system.hpp` + `.cpp` — the one header in the tree that includes Jolt, which is why it lives under `internal/`; see "Public surface and `<module>/internal/`"):
 `JoltJobSystem` subclasses `JPH::JobSystemWithBarrier` and mirrors
 `JPH::JobSystemThreadPool`'s structure — pooled `Job` storage in a
 `FixedSizeFreeList`, `QueueJob(s)` submitting a

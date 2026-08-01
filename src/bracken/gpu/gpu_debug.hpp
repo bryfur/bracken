@@ -35,7 +35,7 @@ inline void insert_debug_label(SDL_GPUCommandBuffer* cb, const char* name) noexc
 // TWO clocks, one API. The CPU clock is real: every scope is wall-clock timed
 // through core::PassTimeline, so all BRACKEN_GPU_TIMER sites report the cost
 // of RECORDING their pass with no call-site change. The GPU clock does not
-// exist — SDL3 exposes no timestamp query API (as of SDL 3.2), so
+// exist — SDL3 exposes no timestamp query API (as of SDL 3.4), so
 // is_supported() is false, write_begin/write_end are no-ops, and read_results
 // reports PassTiming::gpu_ms as nullopt. That nullopt is the point: the old
 // API returned 0.0 ms, which reads as "this pass is free" rather than "this

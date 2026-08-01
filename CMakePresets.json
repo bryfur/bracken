@@ -30,6 +30,22 @@
             }
         },
         {
+            "name": "asan",
+            "displayName": "Address/UB Sanitizer (build-asan/)",
+            "description": "AddressSanitizer + UndefinedBehaviorSanitizer tree. Finds what TSan cannot: use-after-free and out-of-bounds across the arena/frame allocators, the packet ring's retire-and-reuse cycle, and the job system's node pools. Like tsan/, its first configure refetches and rebuilds the deps (slow, one-time) — keep build-asan/ alive afterwards. Tests only; RelWithDebInfo with frame pointers so reports are readable. -fno-sanitize=enum is deliberate: the engine bounds-checks enum parameters at the host boundary (InputSnapshot::key_held / was_key_just_pressed reject a scancode outside [0, SDL_SCANCODE_COUNT)), and the only way to TEST such a guard is to hand it an out-of-range enumerator — which the enum check calls UB. Declining that one sub-check keeps the guards testable; it costs nothing this lane exists for.",
+            "inherits": "default",
+            "binaryDir": "${sourceDir}/build-asan",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-sanitize=enum -fno-omit-frame-pointer -fno-sanitize-recover=undefined",
+                "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-sanitize=enum -fno-omit-frame-pointer -fno-sanitize-recover=undefined",
+                "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+                "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address,undefined",
+                "BRACKEN_BUILD_EXAMPLES": "OFF",
+                "BRACKEN_BUILD_BENCHMARKS": "OFF"
+            }
+        },
+        {
             "name": "rel",
             "displayName": "Release-ish (build-rel/)",
             "description": "RelWithDebInfo tree — the only lane that exercises the NDEBUG path, where BRACKEN_ASSERT and the debug-only thread-tier assertions compile out. Run it before shipping any change that relies on an assert for correctness. Coexists with build/ and build-tsan/.",
@@ -55,6 +71,7 @@
     "buildPresets": [
         { "name": "default", "configurePreset": "default" },
         { "name": "tsan", "configurePreset": "tsan" },
+        { "name": "asan", "configurePreset": "asan" },
         { "name": "rel", "configurePreset": "rel" },
         { "name": "bench", "configurePreset": "bench" }
     ],
@@ -76,6 +93,15 @@
             "name": "rel",
             "configurePreset": "rel",
             "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "asan",
+            "configurePreset": "asan",
+            "output": { "outputOnFailure": true },
+            "environment": {
+                "ASAN_OPTIONS": "detect_leaks=0 abort_on_error=1",
+                "UBSAN_OPTIONS": "print_stacktrace=1"
+            }
         }
     ]
 }

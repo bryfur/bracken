@@ -76,7 +76,7 @@ implementation detail.
 `JobSystemThreadPool`, which would spawn its own N workers — exactly the
 oversubscription the multithreading plan forbids (§7: **one pool owns the
 cores**; the risk table lists "pool + FileWatcher + driver threads" as the
-trap). So `physics/jolt_job_system.{hpp,cpp}` implements
+trap). So `physics/internal/jolt_job_system.hpp` + `.cpp` implement
 `JPH::JobSystemWithBarrier` over `core::jobs::JobSystem`: Jolt's step jobs
 become bracken jobs (pooled `FixedSizeFreeList` records,
 `Execute()`/`Release()` thunks matching the thread pool's reference
