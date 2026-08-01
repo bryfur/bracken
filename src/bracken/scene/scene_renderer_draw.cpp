@@ -312,8 +312,8 @@ void SceneRenderer::bind_mesh_material_textures(const Mesh& mesh) {
     // Always bind slot 0: the shader declares baseColorTexture regardless of
     // the hasTexture branch, and leaving the slot unbound (or carrying a
     // previous pipeline's incompatible descriptor) is undefined behavior.
-    bind_material_texture(0, (mesh.has_texture && mesh.texture)
-                                 ? mesh.texture->handle()
+    bind_material_texture(0, mesh.has_albedo()
+                                 ? mesh.albedo_handle()
                                  : (dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr));
     bind_material_texture(3, mat.normal_texture
                                  ? mat.normal_texture->handle()

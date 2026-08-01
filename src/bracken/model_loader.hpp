@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <span>
 #include <vector>
 
 // The model identity contract: ModelHandle / INVALID_MODEL_HANDLE. Kept in the
@@ -96,6 +97,31 @@ struct Mesh {
     bool has_texture = false;
     bool is_skinned = false; // True if using skinned vertices
 
+    /**
+     * Non-owning albedo, used when `texture` is null.
+     *
+     * A generated LOD level is the same surface at fewer triangles, so it
+     * needs the same images. Owning its own copy would multiply texture
+     * memory by the number of levels for zero visual gain — and textures, not
+     * vertices, are what fills VRAM. The base model outlives its LOD levels
+     * (they are registered after it and released together in unload_all), so
+     * borrowing is safe.
+     */
+    gpu::GPUTexture* shared_texture = nullptr;
+
+    /** The albedo to bind, owned or borrowed; null when there is none. */
+    [[nodiscard]] SDL_GPUTexture* albedo_handle() const {
+        if (texture) {
+            return texture->handle();
+        }
+        return shared_texture != nullptr ? shared_texture->handle() : nullptr;
+    }
+
+    /** Should this mesh sample an albedo texture at all? Collapses the
+     *  `has_texture && texture` pair that used to be repeated at every bind
+     *  site — and which silently meant "no texture" if either half was wrong. */
+    [[nodiscard]] bool has_albedo() const { return has_texture && albedo_handle() != nullptr; }
+
     // Perf flags.
     //
     // cast_shadows=false : shadow passes skip this mesh (e.g. transparent leaves
@@ -156,6 +182,25 @@ struct Model {
     // Pre-computed bounding sphere for fast frustum culling (avoids per-entity recomputation)
     glm::vec3 bounding_center = {0, 0, 0};
     float bounding_half_diag = 0.0f;
+
+    /**
+     * Level-of-detail chain. `lod_handles[k]` is the handle of level k+1 —
+     * coarser than this model, which is always level 0.
+     *
+     * Levels are separate MODELS rather than extra mesh sets inside this one,
+     * which is what keeps LOD out of the renderer's hot path entirely: the
+     * Prepare stage swaps the handle before binning and every stage after it
+     * (binning, upload, draw) is unchanged and unaware. It also means a
+     * project that authors its own LOD meshes registers them like any other
+     * model and links them here, with no special asset path.
+     *
+     * `lod_thresholds[k]` is the projected screen radius below which level
+     * k+1 takes over — bounding radius divided by distance, so it is
+     * resolution-independent and a small distant prop and a huge far one
+     * switch at the same apparent size. Descending.
+     */
+    std::vector<ModelHandle> lod_handles;
+    std::vector<float> lod_thresholds;
 
     float width() const { return bounds.size().x; }
     float height() const { return bounds.size().y; }
@@ -238,6 +283,38 @@ public:
  *   a hot-reload apply, which rewrites model contents in place) is in flight.
  *   The hot-reload fence guarantees that quiescence in the pipelined frame.
  */
+/**
+ * Choose which level of `model`'s LOD chain to draw.
+ *
+ * `projected_radius` is the model's world bounding radius divided by its
+ * distance to the camera — an apparent-size measure, so the same threshold
+ * behaves identically for a pebble up close and a tower far away, and does not
+ * change meaning when the window is resized.
+ *
+ * Returns `base` when the model has no chain, so callers need no branch.
+ *
+ * Pure: the result depends only on its arguments, which is what lets the
+ * Prepare stage call it inside the parallel binning fan-out and stay
+ * bit-identical at any worker count.
+ *
+ * NOTE: there is deliberately no hysteresis. A stable switch band needs
+ * per-instance state that persists across frames, and the FramePacket carries
+ * no such identity for static instances (motion_id is opt-in and only set for
+ * movers). Thresholds are therefore spaced far enough apart that a switch is
+ * a small change in a small object; if a project needs guaranteed
+ * pop-free transitions it wants dithered cross-fade, which is a renderer
+ * feature rather than a selection one.
+ */
+[[nodiscard]] inline ModelHandle select_lod(const Model& model, ModelHandle base,
+                                            float projected_radius) noexcept {
+    for (std::size_t k = 0; k < model.lod_thresholds.size(); ++k) {
+        if (projected_radius >= model.lod_thresholds[k]) {
+            return k == 0 ? base : model.lod_handles[k - 1];
+        }
+    }
+    return model.lod_handles.empty() ? base : model.lod_handles.back();
+}
+
 class ModelManager {
 public:
     ModelManager();
@@ -256,6 +333,21 @@ public:
     /// Main-thread (asserted).
     ModelHandle load_model(const std::string& name, const std::string& path);
 
+    /**
+     * Load a model and generate its LOD chain in one step.
+     *
+     * This has to be one call rather than load_model() followed by
+     * build_lods(): uploading frees the model's CPU-side vertices and indices,
+     * and simplification needs them. Doing it in the wrong order is a silent
+     * no-op, so build_lods() logs an error in that case rather than quietly
+     * producing nothing.
+     *
+     * See build_lods() for the meaning of `ratios` and `thresholds`.
+     */
+    ModelHandle load_model_with_lods(const std::string& name, const std::string& path,
+                                     std::span<const float> ratios,
+                                     std::span<const float> thresholds);
+
     /// O(1) lookup by handle. Const-safe after load (worker-safe when no
     /// mutation is in flight).
     Model* get_model(ModelHandle handle) const;
@@ -263,6 +355,28 @@ public:
     /// Name-based lookup (backward compat, uses hash map). Const-safe after
     /// load.
     Model* get_model(const std::string& name) const;
+
+    /**
+     * Generate a LOD chain for `handle` by simplifying its meshes, register
+     * each level as its own model, and link them.
+     *
+     * `ratios` are triangle-count fractions of the ORIGINAL, descending
+     * (e.g. {0.4f, 0.12f}); `thresholds` are the projected screen radii at
+     * which each level takes over, also descending and one shorter — see
+     * Model::lod_thresholds.
+     *
+     * Generated rather than authored because most projects have no LOD assets
+     * and never will: an engine whose LOD support requires an art pipeline is
+     * an engine whose LOD support goes unused. A project that DOES author
+     * levels can skip this and populate Model::lod_handles directly.
+     *
+     * Returns the number of levels created. Main-thread, at load time — it
+     * simplifies and uploads geometry. Skinned meshes are skipped: clustering
+     * would collapse vertices carrying different bone weights and tear the
+     * mesh apart under animation.
+     */
+    std::size_t build_lods(ModelHandle handle, std::span<const float> ratios,
+                           std::span<const float> thresholds);
 
     /// Resolve a name to a handle (INVALID_MODEL_HANDLE if not found).
     /// Const-safe after load.

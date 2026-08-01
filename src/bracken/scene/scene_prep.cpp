@@ -89,6 +89,21 @@ static void bin_main_chunk(std::span<const ModelDrawCommand> cmds, size_t begin,
             continue;
         }
 
+        // LOD: pick a coarser copy of this model when it is small on screen.
+        // Levels are separate models, so the swap happens HERE and every stage
+        // after this line — binning, upload, draw — is unchanged and unaware.
+        // select_lod is pure, so this stays bit-identical at any worker count.
+        ModelHandle bin_handle = handle;
+        if (model != nullptr && !model->lod_handles.empty()) {
+            const glm::vec3 to_camera = glm::vec3(t[3]) - p.camera_pos;
+            const float distance = glm::length(to_camera);
+            const float world_radius = model->bounding_half_diag * max_scale_factor(t);
+            // Apparent size, not distance: the same threshold then behaves
+            // identically for a pebble up close and a tower far away.
+            const float projected = distance > 1e-3f ? world_radius / distance : 1e6f;
+            bin_handle = select_lod(*model, handle, projected);
+        }
+
         gpu::InstanceData instance{};
         instance.model = cmd.transform;
         instance.normalMatrix = compute_normal_matrix(cmd.transform);
@@ -103,12 +118,12 @@ static void bin_main_chunk(std::span<const ModelDrawCommand> cmds, size_t begin,
         // Dense-bin push: grow the bin array to cover the handle (handles are
         // dense indices into ModelManager's slot array, so this stays small)
         // and record first touch for O(touched) clearing/merging.
-        if (handle >= bins.size()) {
-            bins.resize(handle + 1);
+        if (bin_handle >= bins.size()) {
+            bins.resize(bin_handle + 1);
         }
-        auto& bin = bins[handle];
+        auto& bin = bins[bin_handle];
         if (bin.empty()) {
-            touched.push_back(handle);
+            touched.push_back(bin_handle);
         }
         bin.push_back(instance);
     }

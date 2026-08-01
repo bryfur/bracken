@@ -269,6 +269,16 @@ private:
     float step_distance_ = 0.0f;
     bool was_in_water_ = false;         // rising edge = entry splash
 #endif
+    // Generated LODs are OFF here by default, and that is a measured decision,
+    // not an oversight. A/B on this scene (PLAYGROUND_LOD=1 turns them on):
+    //   off: 538 draw calls, 6,243,298 triangles, 86-87 fps
+    //   on : 604 draw calls, 5,646,904 triangles, 86-88 fps
+    // -9.6% triangles for +12% draw calls and no frame-time change, because
+    // this scene's flora are already 40-1700 triangles each and the frame is
+    // fill/pass-bound (render 7.9ms of which present_wait 3.4ms), not
+    // vertex-bound. The engine feature is real and tested; this particular
+    // scene is simply not one that benefits.
+    bool lod_disabled_ = true;
     float ambient_ripple_timer_ = 0.0f; // occasional ambient rings on the river
 
     // Game state

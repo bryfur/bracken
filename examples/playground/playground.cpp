@@ -195,6 +195,13 @@ std::string asset_path(const std::string& rel) {
 // ---------------------------------------------------------------------------
 
 bool PlaygroundGame::on_init() {
+    // A/B hook: PLAYGROUND_LOD=1 builds LOD chains for the flora, 0 (the
+    // default, see playground.hpp) skips them, so the two runs differ in
+    // exactly one thing.
+    if (const char* env = SDL_getenv("PLAYGROUND_LOD"); env != nullptr) {
+        lod_disabled_ = env[0] == '0';
+    }
+
     if (!init_renderer(1600, 900, "bracken playground", WORLD, WORLD)) {
         return false;
     }
@@ -495,7 +502,20 @@ void PlaygroundGame::register_models() {
               "nature_flower_4_group", "nature_flower_6", "nature_flower_7_group", "nature_mushroom_common",
               "nature_mushroom_redcap", "nature_pebble_round_1", "nature_pebble_round_2", "nature_pebble_round_3",
               "nature_pebble_square_1", "nature_pebble_square_2"}) {
-            mm.load_model(name, asset_path(std::string("assets/models/") + name + ".glb"));
+            constexpr float k_lod_ratios[] = {0.35f, 0.10f};
+            constexpr float k_lod_thresholds[] = {0.040f, 0.014f};
+            const std::string path = asset_path(std::string("assets/models/") + name + ".glb");
+            const bracken::ModelHandle h =
+                lod_disabled_ ? mm.load_model(name, path)
+                              : mm.load_model_with_lods(name, path, k_lod_ratios, k_lod_thresholds);
+            // Two generated LOD levels for the scattered flora. These are the
+            // instanced props that fill the middle distance, so they are where
+            // the triangle budget actually goes; the village itself is a single
+            // large model the player is usually inside, where LOD would switch
+            // on the whole building at once.
+            // Thresholds are apparent size (radius/distance): ~1/25th of the
+            // distance drops to level 1, ~1/70th to level 2.
+            (void)h;
         }
     } else {
         BRACKEN_LOG_WARN("playground",

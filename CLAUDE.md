@@ -141,6 +141,15 @@ Render(i)), frame timing, and input. Consumers subclass it and override
 draws it.
 
 ### Key patterns
+- **Level of detail** is opt-in per model and lives entirely outside the hot
+  path: `ModelManager::load_model_with_lods` generates simplified levels
+  (`mesh_simplify.hpp`, vertex clustering) and registers each as its own
+  MODEL, so the Prepare stage only swaps a handle before binning and every
+  stage after it is unchanged. Selection (`select_lod`) is a pure function of
+  apparent size (bounding radius / distance), so it stays bit-identical at any
+  worker count. It must be `load_model_with_lods`, not `load_model` then
+  `build_lods`: uploading frees the CPU geometry simplification needs, and
+  build_lods logs an error rather than silently doing nothing in that case.
 - **Y-up** coordinate system (x,z = ground plane, y = height) and
   **reversed-Z zero-to-one depth** (`GLM_FORCE_DEPTH_ZERO_TO_ONE` is PUBLIC on
   the engine target — all projection math is glm `RH_ZO`, with near/far

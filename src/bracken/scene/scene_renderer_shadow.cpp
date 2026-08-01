@@ -87,7 +87,7 @@ void SceneRenderer::render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_
                     continue;
                 }
 
-                int has_tex = (mesh.has_texture && mesh.texture) ? 1 : 0;
+                int has_tex = mesh.has_albedo() ? 1 : 0;
                 if (has_tex != last_has_tex) {
                     gpu::ShadowFragUniforms shadow_frag = {};
                     shadow_frag.hasTexture = has_tex;
@@ -96,7 +96,7 @@ void SceneRenderer::render_instanced_shadow_models(SDL_GPURenderPass* pass, SDL_
                 }
 
                 if (has_tex && default_sampler_) {
-                    SDL_GPUTexture* th = mesh.texture->handle();
+                    SDL_GPUTexture* th = mesh.albedo_handle();
                     if (th != last_tex) {
                         SDL_GPUTextureSamplerBinding tb = {th, default_sampler_};
                         SDL_BindGPUFragmentSamplers(pass, 0, &tb, 1);
@@ -231,7 +231,7 @@ void SceneRenderer::render_shadow_passes() {
                             continue;
                         }
 
-                        int has_tex = (mesh.has_texture && mesh.texture) ? 1 : 0;
+                        int has_tex = mesh.has_albedo() ? 1 : 0;
                         if (has_tex != last_has_tex) {
                             SDL_PushGPUFragmentUniformData(cmd, 0, has_tex ? &frag_tex : &frag_notex,
                                                            sizeof(gpu::ShadowFragUniforms));
@@ -239,7 +239,7 @@ void SceneRenderer::render_shadow_passes() {
                         }
 
                         if (has_tex && default_sampler_) {
-                            SDL_GPUTexture* th = mesh.texture->handle();
+                            SDL_GPUTexture* th = mesh.albedo_handle();
                             if (th != last_tex) {
                                 SDL_GPUTextureSamplerBinding tb = {th, default_sampler_};
                                 SDL_BindGPUFragmentSamplers(shadow_pass, 0, &tb, 1);
@@ -447,14 +447,14 @@ void SceneRenderer::render_local_shadow_passes(const FramePacket& frame, const C
                         mesh.index_count() == 0) {
                         continue;
                     }
-                    const int has_tex = (mesh.has_texture && mesh.texture) ? 1 : 0;
+                    const int has_tex = mesh.has_albedo() ? 1 : 0;
                     if (has_tex != last_has_tex) {
                         SDL_PushGPUFragmentUniformData(cmd, 0, has_tex ? &frag_tex : &frag_notex,
                                                        sizeof(gpu::ShadowFragUniforms));
                         last_has_tex = has_tex;
                     }
                     if (has_tex && default_sampler_) {
-                        SDL_GPUTexture* th = mesh.texture->handle();
+                        SDL_GPUTexture* th = mesh.albedo_handle();
                         if (th != last_tex) {
                             SDL_GPUTextureSamplerBinding tb = {th, default_sampler_};
                             SDL_BindGPUFragmentSamplers(pass, 0, &tb, 1);

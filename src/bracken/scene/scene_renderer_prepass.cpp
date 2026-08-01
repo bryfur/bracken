@@ -150,7 +150,7 @@ void SceneRenderer::prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUComma
                         continue;
                     }
                     SDL_GPUTextureSamplerBinding tex_binding = {
-                        (mesh.has_texture && mesh.texture) ? mesh.texture->handle()
+                        mesh.has_albedo() ? mesh.albedo_handle()
                                                            : dummy_white_texture_->handle(),
                         default_sampler_};
                     SDL_BindGPUFragmentSamplers(pass, 0, &tex_binding, 1);
@@ -229,7 +229,7 @@ void SceneRenderer::prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUC
                     continue;
                 }
                 SDL_GPUTextureSamplerBinding tex_binding = {
-                    (mesh.has_texture && mesh.texture) ? mesh.texture->handle()
+                    mesh.has_albedo() ? mesh.albedo_handle()
                                                        : dummy_white_texture_->handle(),
                     default_sampler_};
                 SDL_BindGPUFragmentSamplers(pass, 0, &tex_binding, 1);

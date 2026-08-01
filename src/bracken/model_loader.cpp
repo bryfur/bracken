@@ -1,4 +1,6 @@
 #include "bracken/model_loader.hpp"
+
+#include "bracken/mesh_simplify.hpp"
 #include "bracken/gpu/gpu_types.hpp"
 #include "bracken/model_utils.hpp"
 #include "glm/ext/matrix_float4x4.hpp"
@@ -998,6 +1000,48 @@ ModelManager::~ModelManager() {
     unload_all();
 }
 
+ModelHandle ModelManager::load_model_with_lods(const std::string& name, const std::string& path,
+                                               std::span<const float> ratios,
+                                               std::span<const float> thresholds) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+
+    auto model = std::make_unique<Model>();
+    if (!ModelLoader::load_glb(path, *model)) {
+        return INVALID_MODEL_HANDLE;
+    }
+
+    // Register FIRST but upload LAST: simplification reads the CPU-side
+    // vertices and indices that upload_to_gpu() frees, so the LOD levels have
+    // to be generated from the model while it is still only in system memory.
+    const auto handle = static_cast<ModelHandle>(models_.size());
+    models_.push_back(std::move(model));
+    model_paths_.push_back(path);
+    name_to_handle_[name] = handle;
+
+    (void)build_lods(handle, ratios, thresholds);
+
+    if (device_) {
+        ModelLoader::upload_to_gpu(*device_, *get_model(handle));
+        // Levels were appended after the base, so uploading them here keeps
+        // the "CPU geometry is freed at upload" rule uniform across all of them.
+        for (ModelHandle lod : get_model(handle)->lod_handles) {
+            if (Model* m = get_model(lod)) {
+                ModelLoader::upload_to_gpu(*device_, *m);
+            }
+        }
+        // Share the base's albedo with every level, now that it exists.
+        Model* b = get_model(handle);
+        for (ModelHandle lod : b->lod_handles) {
+            Model* m = get_model(lod);
+            for (std::size_t i = 0; i < m->meshes.size() && i < b->meshes.size(); ++i) {
+                m->meshes[i].shared_texture = b->meshes[i].texture.get();
+            }
+        }
+    }
+    return handle;
+}
+
 ModelHandle ModelManager::load_model(const std::string& name, const std::string& path) {
     // Mutates the model table (and creates GPU resources): main-thread tier.
     BRACKEN_ASSERT_MAIN_THREAD();
@@ -1022,6 +1066,120 @@ ModelHandle ModelManager::load_model(const std::string& name, const std::string&
         return handle;
     }
     return INVALID_MODEL_HANDLE;
+}
+
+std::size_t ModelManager::build_lods(ModelHandle handle, std::span<const float> ratios,
+                                     std::span<const float> thresholds) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+
+    Model* base = get_model(handle);
+    if (base == nullptr || base->meshes.empty()) {
+        return 0;
+    }
+
+    // upload_to_gpu() frees CPU-side vertices and indices once the geometry is
+    // on the device, so a model that has already been uploaded has nothing
+    // left to simplify. Say so instead of returning 0 and leaving the caller
+    // to wonder why LOD "did nothing" — use load_model_with_lods(), which
+    // generates the levels before the upload.
+    bool has_cpu_geometry = false;
+    for (const Mesh& m : base->meshes) {
+        if (!m.indices.empty()) {
+            has_cpu_geometry = true;
+            break;
+        }
+    }
+    if (!has_cpu_geometry) {
+        BRACKEN_LOG_ERROR("model",
+                          "build_lods(handle {}): the model's CPU geometry was released at "
+                          "upload; call load_model_with_lods() instead of build_lods() after "
+                          "load_model()",
+                          handle);
+        return 0;
+    }
+    if (thresholds.size() != ratios.size()) {
+        BRACKEN_LOG_ERROR("model",
+                          "build_lods: {} ratios but {} thresholds; they must match",
+                          ratios.size(), thresholds.size());
+        return 0;
+    }
+    if (base->has_skeleton) {
+        // Clustering merges vertices by position alone, so two vertices bound
+        // to different bones would collapse into one and the mesh would tear
+        // apart the moment it animates. Authored skinned LODs are fine; a
+        // generated one is not.
+        BRACKEN_LOG_INFO("model", "build_lods: skipping skinned model (handle {})", handle);
+        return 0;
+    }
+
+    std::size_t created = 0;
+    std::size_t source_tris = 0;
+    std::size_t lod_tris = 0;
+    for (const Mesh& m : base->meshes) {
+        source_tris += m.indices.size() / 3;
+    }
+
+    for (std::size_t level = 0; level < ratios.size(); ++level) {
+        auto lod = std::make_unique<Model>();
+        lod->bounds = base->bounds;
+        lod->bounding_center = base->bounding_center;
+        lod->bounding_half_diag = base->bounding_half_diag;
+        lod->loaded = true;
+
+        for (const Mesh& src : base->meshes) {
+            SimplifiedMesh simplified =
+                simplify_to_ratio(src.vertices, src.indices, ratios[level]);
+            if (simplified.indices.size() < 3) {
+                continue; // this mesh vanished at this ratio; drop it
+            }
+            Mesh dst;
+            dst.vertices = std::move(simplified.vertices);
+            dst.indices = std::move(simplified.indices);
+            // Shading parameters carry over field by field: an LOD is the same
+            // surface, so it must shade identically or the switch reads as a
+            // lighting pop rather than a detail change. PBRMaterial owns its
+            // texture objects and so cannot be copied wholesale — the images
+            // are shared below instead.
+            dst.material.base_color_factor = src.material.base_color_factor;
+            dst.material.metallic_factor = src.material.metallic_factor;
+            dst.material.roughness_factor = src.material.roughness_factor;
+            dst.material.normal_scale = src.material.normal_scale;
+            dst.material.occlusion_strength = src.material.occlusion_strength;
+            dst.material.emissive_factor = src.material.emissive_factor;
+            dst.material.alpha_cutoff = src.material.alpha_cutoff;
+            dst.has_texture = src.has_texture;
+            dst.cast_shadows = src.cast_shadows;
+            lod->meshes.push_back(std::move(dst));
+        }
+
+        if (lod->meshes.empty()) {
+            break; // nothing survived; coarser levels would be emptier still
+        }
+        if (level + 1 == ratios.size()) {
+            for (const Mesh& m : lod->meshes) {
+                lod_tris += m.indices.size() / 3;
+            }
+        }
+
+        // Upload and texture sharing are the CALLER's job: at this point the
+        // base may not be uploaded yet, so its GPUTexture does not exist to
+        // share. load_model_with_lods() does both once the base is on the GPU.
+
+        const auto lod_handle = static_cast<ModelHandle>(models_.size());
+        models_.push_back(std::move(lod));
+        model_paths_.emplace_back();
+        base = get_model(handle); // models_ may have reallocated
+        base->lod_handles.push_back(lod_handle);
+        base->lod_thresholds.push_back(thresholds[level]);
+        ++created;
+    }
+
+    if (created > 0) {
+        BRACKEN_LOG_INFO("model", "build_lods(handle {}): {} levels, {} -> {} triangles at the coarsest",
+                         handle, created, source_tris, lod_tris);
+    }
+    return created;
 }
 
 Model* ModelManager::get_model(ModelHandle handle) const {
