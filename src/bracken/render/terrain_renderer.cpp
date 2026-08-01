@@ -770,13 +770,14 @@ void TerrainRenderer::set_cluster_lighting(SDL_GPUBuffer* light_data, SDL_GPUBuf
 }
 
 void TerrainRenderer::render_prepass(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
-                                     const gpu::PrepassCameraUniforms& uniforms, const scene::Frustum* frustum) {
+                                     const gpu::PrepassCameraUniforms& uniforms, gpu::PipelineType pipeline_type,
+                                     const scene::Frustum* frustum) {
     BRACKEN_PROFILE_ZONE_COLOR("TerrainRenderer::render_prepass", 0xC0392B);
     if (!pipeline_registry_ || !vertex_buffer_ || !index_buffer_ || index_count_ == 0 || !pass || !cmd) {
         return;
     }
 
-    auto* pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::DepthPrepassTerrain);
+    auto* pipeline = pipeline_registry_->get_pipeline(pipeline_type);
     if (!pipeline) {
         return;
     }

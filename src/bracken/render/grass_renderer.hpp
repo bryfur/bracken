@@ -202,7 +202,8 @@ public:
     /// jittered) draw projection, the *_no_jitter matrices feed velocity.
     void render_prepass(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view,
                         const glm::mat4& projection, const glm::vec3& camera_pos,
-                        const glm::mat4& curr_vp_no_jitter, const glm::mat4& prev_vp_no_jitter);
+                        const glm::mat4& curr_vp_no_jitter, const glm::mat4& prev_vp_no_jitter,
+                        gpu::PipelineType pipeline_type);
 
     void shutdown();
 

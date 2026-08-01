@@ -353,6 +353,7 @@ gpu::ModelLightingUniforms SceneRenderer::make_model_lighting(const CameraState&
     // GTAO's output and passed AO through in R). One texture, because this
     // stage is at its 10-sampler ceiling.
     u.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
+    u.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
 
     return u;
 }
@@ -493,6 +494,7 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
     lighting_uniforms.screenAOTexelY = 1.0f / static_cast<float>(std::max(context_->height(), 1));
     lighting_uniforms.iblEnabled = frame_ibl_active_ ? 1.0f : 0.0f;
     lighting_uniforms.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
+    lighting_uniforms.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
 
     SDL_GPUBuffer* storage_buf = instance_storage_buffer_->handle();
 

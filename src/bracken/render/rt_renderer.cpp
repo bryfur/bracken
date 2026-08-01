@@ -74,8 +74,8 @@ void RtRenderer::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>
 }
 
 void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_GPUTexture* ao_input,
-                        const FrameParams& params, const RtShadowSettings& shadows,
-                        const RtReflectionSettings& reflections) {
+                        SDL_GPUTexture* normal_rough, const FrameParams& params,
+                        const RtShadowSettings& shadows, const RtReflectionSettings& reflections) {
     stats_.shadows_traced = false;
     stats_.reflections_traced = false;
     stats_.shadow_rays = 0;
@@ -142,20 +142,8 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_G
     // ---- reflections -----------------------------------------------------
     if (reflections.enabled) {
         BRACKEN_PROFILE_ZONE("RtRenderer::reflections");
-        // KNOWN NON-FUNCTIONAL: rt_reflection.comp.hlsl needs a per-pixel
-        // normal + roughness input to decide which surfaces are smooth enough
-        // to trace. The engine has no such target (and no MRT support to write
-        // one), so `ao_input` currently occupies that slot; an R8 read yields
-        // .w == 1.0, which fails the roughness gate on every pixel and writes
-        // alpha 0 everywhere. The pass is left wired and correct so it works
-        // the moment a real input exists — but say so rather than burning rays
-        // and attribute memory in silence.
-        if (!warned_no_normal_buffer_) {
-            BRACKEN_LOG_WARN("rt",
-                             "RT reflections are enabled but produce nothing: the pass needs a "
-                             "normal+roughness target the renderer does not yet write. Shadows "
-                             "are unaffected.");
-            warned_no_normal_buffer_ = true;
+        if (normal_rough == nullptr) {
+            return; // no G-buffer this frame; the caller already gated on this
         }
         if (!scene_.has_attributes()) {
             // Attributes are gathered at build time; enabling reflections
@@ -208,7 +196,7 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_G
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
         if (pass) {
             pass.bind_pipeline(*pipeline);
-            const std::array<SDL_GPUTexture*, 2> textures{depth.handle(), ao_input};
+            const std::array<SDL_GPUTexture*, 2> textures{depth.handle(), normal_rough};
             pass.bind_storage_textures(0, textures);
             const std::array<SDL_GPUBuffer*, 5> buffers{
                 scene_.tlas_nodes(), scene_.tlas_instances(), scene_.blas_nodes(),

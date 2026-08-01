@@ -88,7 +88,10 @@ struct alignas(16) ModelLightingUniforms {
     // 1 = take the sun shadow from the ray-traced mask instead of the cascades
     // (render/rt_renderer.hpp). Off by default; the CSM path is unchanged.
     float rtShadowEnabled = 0.0f;
-    float _rtPad0 = 0.0f;
+    /// Roughness at or below which a ray-traced reflection will be composited
+    /// for this pixel, so the IBL probe must not also contribute a specular
+    /// lobe. 0 = reflections off. See render/rt_renderer.hpp.
+    float rtReflectionMaxRoughness = 0.0f;
     float _rtPad1 = 0.0f;
     float _rtPad2 = 0.0f;
 };
@@ -128,7 +131,7 @@ BRACKEN_HLSL_FIELD(ModelLightingUniforms, screenAOTexelY, 212);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, iblEnabled, 216);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, screenAOEnabled, 220);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtShadowEnabled, 224);
-BRACKEN_HLSL_FIELD(ModelLightingUniforms, _rtPad0, 228);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionMaxRoughness, 228);
 
 /**
  * Skybox fragment shader uniforms - matches skybox.frag.hlsl SkyUniforms (set 3, b0)
@@ -364,7 +367,10 @@ struct alignas(16) InstancedLightingUniforms {
     // is an instanced draw) keeps its cascade shadows while the character
     // alone gets traced ones, which reads as "ray tracing does nothing".
     float rtShadowEnabled = 0.0f;
-    float _rtPad0 = 0.0f;
+    /// Roughness at or below which a ray-traced reflection will be composited
+    /// for this pixel, so the IBL probe must not also contribute a specular
+    /// lobe. 0 = reflections off. See render/rt_renderer.hpp.
+    float rtReflectionMaxRoughness = 0.0f;
     float _rtPad1 = 0.0f;
     float _rtPad2 = 0.0f;
 };
@@ -403,7 +409,7 @@ BRACKEN_HLSL_FIELD(InstancedLightingUniforms, screenAOTexelY, 196);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, iblEnabled, 200);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, screenAOEnabled, 204);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtShadowEnabled, 208);
-BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _rtPad0, 212);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionMaxRoughness, 212);
 
 /**
  * Per-instance data for instanced model rendering (storage buffer).

@@ -357,6 +357,9 @@ private:
     // `draw_camera` carries the jittered projection; velocity uses the
     // frame's unjittered matrices.
     [[nodiscard]] bool render_depth_prepass(const FramePacket& frame, const CameraState& draw_camera);
+    /// `base` when this frame's prepass writes velocity only, its G-buffer
+    /// twin when the normal+roughness attachment is live.
+    [[nodiscard]] gpu::PipelineType prepass_pipeline(gpu::PipelineType base) const;
     void prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
                                 const gpu::PrepassCameraUniforms& camera_uniforms);
     void prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
@@ -479,6 +482,18 @@ private:
     std::unique_ptr<render::RtRenderer> rt_renderer_; // created in init()
     bool frame_rt_shadows_active_ = false;
     SDL_GPUTexture* frame_rt_reflection_texture_ = nullptr;
+    /// Normal+roughness G-buffer for ray-traced reflections. Allocated only
+    /// while reflections are on, and released the moment they go off — a game
+    /// that never enables them never pays for a screen-sized target.
+    std::unique_ptr<gpu::GPUTexture> normal_rough_texture_;
+    /// Whether THIS frame's prepass attached the G-buffer, and therefore
+    /// whether the prepass draws must use the *GBuffer pipeline variants: a
+    /// pass and its pipelines must agree on the attachment count.
+    bool frame_prepass_gbuffer_ = false;
+    /// The roughness cutoff this frame's reflection pass used, or 0 when it
+    /// did not run. The forward shaders read it to drop their IBL specular
+    /// exactly where a traced reflection will replace it.
+    float frame_rt_reflection_max_roughness_ = 0.0f;
     std::unique_ptr<gpu::GPUTexture> default_normal_texture_; // 1x1 (128,128,255) flat tangent-space normal
     std::unique_ptr<gpu::GPUTexture> dummy_black_texture_;    // 1x1 black emissive fallback
     std::unique_ptr<gpu::GPUTexture> dummy_black_cube_;       // 1x1x6 black cube for the IBL slots when

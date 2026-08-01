@@ -667,6 +667,14 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     // always bind the slot, and GTAO's textures may have been recreated
     // since last frame (resize / quality change).
     frame_ao_texture_ = dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr;
+    // Ray-tracing state is per-frame and must be cleared here, not merely set
+    // when the passes run: these are read by every forward draw, and a stale
+    // "shadows active" would make the lighting sample G out of a plain R8 AO
+    // texture (i.e. zero — everything shadowed) the frame after ray tracing is
+    // switched off.
+    frame_rt_shadows_active_ = false;
+    frame_rt_reflection_texture_ = nullptr;
+    frame_rt_reflection_max_roughness_ = 0.0f;
     // Sky IBL drives every scene shader's iblEnabled flag (the IBL sampler
     // slots are bound either way — dummies when inactive).
     frame_ibl_active_ = plan.ibl_active;
@@ -950,6 +958,29 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 }
             }
 
+            // Normal+roughness G-buffer: allocated only while ray-traced
+            // reflections are on and released the moment they go off, so a game
+            // that never enables them never holds a screen-sized target. It
+            // shares the prepass with velocity, hence the identical size.
+            if (gfx.rt_reflections) {
+                const int gw = context_->width();
+                const int gh = context_->height();
+                if (!normal_rough_texture_ || normal_rough_texture_->width() != gw ||
+                    normal_rough_texture_->height() != gh) {
+                    normal_rough_texture_ = gpu::GPUTexture::create_2d(
+                        context_->device(), gw, gh, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                        SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER |
+                            SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ);
+                    if (!normal_rough_texture_) {
+                        BRACKEN_LOG_WARN(LOG_TAG,
+                                         "render_frame: could not create the reflection G-buffer; "
+                                         "ray-traced reflections will not run");
+                    }
+                }
+            } else if (normal_rough_texture_) {
+                normal_rough_texture_.reset();
+            }
+
             // Offscreen clear tracks the environment's horizon fog color so
             // unrendered sky pixels melt into the atmosphere (linear HDR).
             post_->set_clear_color(env_.fog_color_horizon);
@@ -1010,8 +1041,15 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     frame_ao_texture_ != nullptr
                         ? frame_ao_texture_
                         : (dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr);
+                // Reflections need the prepass G-buffer; without it (allocation
+                // failed, or the prepass did not run this frame) the pass has
+                // no way to tell a mirror from a wall, so it is skipped rather
+                // than run against a texture that means something else.
+                SDL_GPUTexture* normal_rough =
+                    (frame_prepass_active_ && normal_rough_texture_) ? normal_rough_texture_->handle() : nullptr;
+                rr.enabled = rr.enabled && normal_rough != nullptr;
                 if (ao_for_rt != nullptr) {
-                    rt_renderer_->render(cmd, *post_->offscreen_depth(), ao_for_rt, rp, rs, rr);
+                    rt_renderer_->render(cmd, *post_->offscreen_depth(), ao_for_rt, normal_rough, rp, rs, rr);
                     if (rt_renderer_->stats().shadows_traced &&
                         rt_renderer_->shadow_mask() != nullptr) {
                         frame_ao_texture_ = rt_renderer_->shadow_mask()->handle();
@@ -1020,6 +1058,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     if (rt_renderer_->stats().reflections_traced &&
                         rt_renderer_->reflection_target() != nullptr) {
                         frame_rt_reflection_texture_ = rt_renderer_->reflection_target()->handle();
+                        frame_rt_reflection_max_roughness_ = rr.max_roughness;
                     }
                 }
             }

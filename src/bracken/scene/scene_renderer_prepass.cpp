@@ -37,6 +37,45 @@ namespace bracken::scene {
 namespace gpu = bracken::gpu;
 namespace render = bracken::render;
 
+namespace {
+
+/// The G-buffer twin of a prepass pipeline row. Every prepass pipeline needs
+/// one, because a render pass and the pipelines used inside it must agree on
+/// how many colour attachments there are — a plain row inside a two-attachment
+/// pass is invalid, not merely wasteful.
+gpu::PipelineType gbuffer_variant(gpu::PipelineType base) {
+    switch (base) {
+        case gpu::PipelineType::DepthPrepassModel:
+            return gpu::PipelineType::DepthPrepassModelGBuffer;
+        case gpu::PipelineType::DepthPrepassModelDoubleSided:
+            return gpu::PipelineType::DepthPrepassModelDoubleSidedGBuffer;
+        case gpu::PipelineType::DepthPrepassSkinnedModel:
+            return gpu::PipelineType::DepthPrepassSkinnedModelGBuffer;
+        case gpu::PipelineType::DepthPrepassSkinnedModelDoubleSided:
+            return gpu::PipelineType::DepthPrepassSkinnedModelDoubleSidedGBuffer;
+        case gpu::PipelineType::DepthPrepassInstancedModel:
+            return gpu::PipelineType::DepthPrepassInstancedModelGBuffer;
+        case gpu::PipelineType::DepthPrepassInstancedModelDoubleSided:
+            return gpu::PipelineType::DepthPrepassInstancedModelDoubleSidedGBuffer;
+        case gpu::PipelineType::DepthPrepassTerrain:
+            return gpu::PipelineType::DepthPrepassTerrainGBuffer;
+        case gpu::PipelineType::DepthPrepassGrass:
+            return gpu::PipelineType::DepthPrepassGrassGBuffer;
+        case gpu::PipelineType::DepthPrepassModelMasked:
+            return gpu::PipelineType::DepthPrepassModelMaskedGBuffer;
+        case gpu::PipelineType::DepthPrepassInstancedModelMasked:
+            return gpu::PipelineType::DepthPrepassInstancedModelMaskedGBuffer;
+        default:
+            return base;
+    }
+}
+
+} // namespace
+
+gpu::PipelineType SceneRenderer::prepass_pipeline(gpu::PipelineType base) const {
+    return frame_prepass_gbuffer_ ? gbuffer_variant(base) : base;
+}
+
 bool SceneRenderer::render_depth_prepass(const FramePacket& frame, const CameraState& draw_camera) {
     SDL_GPUCommandBuffer* cmd = context_->current_command_buffer();
     if (!cmd || !velocity_texture_ || !post_->offscreen_depth()) {
@@ -57,6 +96,21 @@ bool SceneRenderer::render_depth_prepass(const FramePacket& frame, const CameraS
     color_target.store_op = SDL_GPU_STOREOP_STORE;
     color_target.clear_color = {0.0f, 0.0f, 0.0f, 0.0f}; // zero velocity (sky pixels reproject via depth in TAA)
 
+    // Second attachment: the normal+roughness G-buffer, only when ray-traced
+    // reflections asked for it. Cleared to a fully-rough +Y normal so pixels no
+    // draw covers (sky) read as "not worth tracing" rather than as garbage.
+    SDL_GPUColorTargetInfo gbuffer_target = {};
+    frame_prepass_gbuffer_ = normal_rough_texture_ != nullptr &&
+                             normal_rough_texture_->width() == velocity_texture_->width() &&
+                             normal_rough_texture_->height() == velocity_texture_->height();
+    if (frame_prepass_gbuffer_) {
+        gbuffer_target.texture = normal_rough_texture_->handle();
+        gbuffer_target.load_op = SDL_GPU_LOADOP_CLEAR;
+        gbuffer_target.store_op = SDL_GPU_STOREOP_STORE;
+        gbuffer_target.clear_color = {0.5f, 1.0f, 0.5f, 1.0f};
+    }
+    const SDL_GPUColorTargetInfo color_targets[2] = {color_target, gbuffer_target};
+
     SDL_GPUDepthStencilTargetInfo depth_target = {};
     depth_target.texture = post_->offscreen_depth()->handle();
     depth_target.load_op = SDL_GPU_LOADOP_CLEAR;
@@ -65,7 +119,8 @@ bool SceneRenderer::render_depth_prepass(const FramePacket& frame, const CameraS
     depth_target.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
     depth_target.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
 
-    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, &depth_target);
+    SDL_GPURenderPass* pass =
+        SDL_BeginGPURenderPass(cmd, color_targets, frame_prepass_gbuffer_ ? 2 : 1, &depth_target);
     if (!pass) {
         BRACKEN_LOG_ERROR(LOG_TAG, "render_depth_prepass: failed to begin render pass");
         return false;
@@ -81,7 +136,9 @@ bool SceneRenderer::render_depth_prepass(const FramePacket& frame, const CameraS
     camera_uniforms.prevViewProjectionNoJitter = prev_view_proj_unjittered_;
 
     if (frame.should_draw_ground()) {
-        terrain_->render_prepass(pass, cmd, camera_uniforms, &frame_frustum_);
+        terrain_->render_prepass(pass, cmd, camera_uniforms,
+                                 prepass_pipeline(gpu::PipelineType::DepthPrepassTerrain),
+                                 &frame_frustum_);
     }
 
     prepass_draw_instanced(pass, cmd, camera_uniforms);
@@ -90,7 +147,8 @@ bool SceneRenderer::render_depth_prepass(const FramePacket& frame, const CameraS
 
     if (frame.should_draw_grass() && gfx.grass_enabled && grass_renderer_) {
         grass_renderer_->render_prepass(pass, cmd, draw_camera.view, draw_camera.projection, draw_camera.position,
-                                        frame_cam_.view_proj_unjittered, prev_view_proj_unjittered_);
+                                        frame_cam_.view_proj_unjittered, prev_view_proj_unjittered_,
+                                        prepass_pipeline(gpu::PipelineType::DepthPrepassGrass));
     }
 
     SDL_EndGPURenderPass(pass);
@@ -121,8 +179,9 @@ void SceneRenderer::prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUComma
         return true;
     };
     auto ensure_pipeline = [&](bool double_sided) -> bool {
-        return ensure_pipeline_type(double_sided ? gpu::PipelineType::DepthPrepassInstancedModelDoubleSided
-                                                 : gpu::PipelineType::DepthPrepassInstancedModel);
+        return ensure_pipeline_type(
+            prepass_pipeline(double_sided ? gpu::PipelineType::DepthPrepassInstancedModelDoubleSided
+                                          : gpu::PipelineType::DepthPrepassInstancedModel));
     };
 
     // Same packing order as upload_instance_buffers / the forward walk
@@ -146,7 +205,8 @@ void SceneRenderer::prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUComma
                     continue;
                 }
                 if (mesh.material.alpha_mode == AlphaMode::Mask) {
-                    if (!ensure_pipeline_type(gpu::PipelineType::DepthPrepassInstancedModelMasked)) {
+                    if (!ensure_pipeline_type(
+                            prepass_pipeline(gpu::PipelineType::DepthPrepassInstancedModelMasked))) {
                         continue;
                     }
                     SDL_GPUTextureSamplerBinding tex_binding = {
@@ -159,6 +219,10 @@ void SceneRenderer::prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUComma
                     SDL_PushGPUFragmentUniformData(cmd, 0, &masked, sizeof(masked));
                 } else if (!ensure_pipeline(mesh.material.double_sided)) {
                     continue;
+                } else if (frame_prepass_gbuffer_) {
+                    gpu::PrepassGBufferUniforms gb = {};
+                    gb.roughness = mesh.material.roughness_factor;
+                    SDL_PushGPUFragmentUniformData(cmd, 0, &gb, sizeof(gb));
                 }
 
                 mesh.bind_buffers(pass);
@@ -192,8 +256,9 @@ void SceneRenderer::prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUC
         return true;
     };
     auto ensure_pipeline = [&](bool double_sided) -> bool {
-        return ensure_pipeline_type(double_sided ? gpu::PipelineType::DepthPrepassModelDoubleSided
-                                                 : gpu::PipelineType::DepthPrepassModel);
+        return ensure_pipeline_type(
+            prepass_pipeline(double_sided ? gpu::PipelineType::DepthPrepassModelDoubleSided
+                                          : gpu::PipelineType::DepthPrepassModel));
     };
 
     // Draw stats accumulate into a section-local partial, merged once after
@@ -213,6 +278,7 @@ void SceneRenderer::prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUC
         u.prevModel = hist ? hist->model : mc->transform;
         u.currViewProjectionNoJitter = frame_cam_.view_proj_unjittered;
         u.prevViewProjectionNoJitter = prev_view_proj_unjittered_;
+        u.normalMatrix = glm::transpose(glm::inverse(mc->transform));
 
         bool uniforms_pushed = false;
         for (auto& mesh : model->meshes) {
@@ -225,7 +291,7 @@ void SceneRenderer::prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUC
             }
             if (mesh.material.alpha_mode == AlphaMode::Mask) {
                 // Alpha-tested masked variant: foliage joins GTAO + velocity.
-                if (!ensure_pipeline_type(gpu::PipelineType::DepthPrepassModelMasked)) {
+                if (!ensure_pipeline_type(prepass_pipeline(gpu::PipelineType::DepthPrepassModelMasked))) {
                     continue;
                 }
                 SDL_GPUTextureSamplerBinding tex_binding = {
@@ -238,6 +304,10 @@ void SceneRenderer::prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUC
                 SDL_PushGPUFragmentUniformData(cmd, 0, &masked, sizeof(masked));
             } else if (!ensure_pipeline(mesh.material.double_sided)) {
                 continue;
+            } else if (frame_prepass_gbuffer_) {
+                gpu::PrepassGBufferUniforms gb = {};
+                gb.roughness = mesh.material.roughness_factor;
+                SDL_PushGPUFragmentUniformData(cmd, 0, &gb, sizeof(gb));
             }
             if (!uniforms_pushed) {
                 // Pushed uniform data survives pipeline binds within the pass.
@@ -272,8 +342,9 @@ void SceneRenderer::prepass_draw_skinned_models(SDL_GPURenderPass* pass, SDL_GPU
 
     gpu::PipelineType bound_type = gpu::PipelineType::Count;
     auto ensure_pipeline = [&](bool double_sided) -> bool {
-        const gpu::PipelineType want = double_sided ? gpu::PipelineType::DepthPrepassSkinnedModelDoubleSided
-                                                    : gpu::PipelineType::DepthPrepassSkinnedModel;
+        const gpu::PipelineType want =
+            prepass_pipeline(double_sided ? gpu::PipelineType::DepthPrepassSkinnedModelDoubleSided
+                                          : gpu::PipelineType::DepthPrepassSkinnedModel);
         if (want == bound_type) {
             return true;
         }
@@ -304,6 +375,7 @@ void SceneRenderer::prepass_draw_skinned_models(SDL_GPURenderPass* pass, SDL_GPU
         u.prevViewProjectionNoJitter = prev_view_proj_unjittered_;
         u.paletteOffset = rs.palette_offset;
         u.prevPaletteOffset = rs.prev_palette_offset;
+        u.normalMatrix = glm::transpose(glm::inverse(rs.cmd->transform));
 
         bool uniforms_pushed = false;
         for (auto& mesh : rs.model->meshes) {
@@ -318,6 +390,11 @@ void SceneRenderer::prepass_draw_skinned_models(SDL_GPURenderPass* pass, SDL_GPU
             }
             if (!ensure_pipeline(mesh.material.double_sided)) {
                 continue;
+            }
+            if (frame_prepass_gbuffer_) {
+                gpu::PrepassGBufferUniforms gb = {};
+                gb.roughness = mesh.material.roughness_factor;
+                SDL_PushGPUFragmentUniformData(cmd, 0, &gb, sizeof(gb));
             }
             if (!uniforms_pushed) {
                 SDL_PushGPUVertexUniformData(cmd, 0, &u, sizeof(u));

@@ -174,8 +174,11 @@ public:
      * the (possibly jittered) draw projection; the no-jitter matrices feed
      * the velocity output.
      */
+    /// `pipeline_type` selects the plain prepass row or its G-buffer variant;
+    /// every pipeline in a pass must match the pass's attachment count.
     void render_prepass(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
-                        const gpu::PrepassCameraUniforms& uniforms, const scene::Frustum* frustum = nullptr);
+                        const gpu::PrepassCameraUniforms& uniforms, gpu::PipelineType pipeline_type,
+                        const scene::Frustum* frustum = nullptr);
 
     // Per-frame cluster lighting plumbing. Buffers and uniform are owned by
     // the SceneRenderer's ClusterGrid; nullptr disables clustered lighting.

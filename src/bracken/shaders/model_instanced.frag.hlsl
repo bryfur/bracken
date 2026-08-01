@@ -52,7 +52,10 @@ cbuffer LightingUniforms {
     // Ray-traced sun shadow mask — see model.frag.hlsl for the full note on
     // why it shares screenAOTexture and screenAOTexel*.
     float rtShadowEnabled;
-    float _rtPad0;
+    // Roughness at or below this means a ray-traced reflection will be added
+    // for this pixel in the composite, so the IBL probe must NOT also supply a
+    // specular lobe here. 0 = reflections off, probe used as normal.
+    float rtReflectionMaxRoughness;
     float _rtPad1;
     float _rtPad2;
 };
@@ -207,12 +210,17 @@ float4 PSMain(PSInput input) : SV_Target {
     }
     float aoCombined = min(matAO, screenAO);
 
+    // See rtReflectionMaxRoughness: hand the specular lobe over to the traced
+    // reflection rather than adding both.
+    float iblSpecularScale =
+        (rtReflectionMaxRoughness > 0.0 && roughness <= rtReflectionMaxRoughness) ? 0.0 : 1.0;
+
     float ambientLift = lerp(ambientStrength, 1.0, shadow);
     float3 ambient;
     if (iblEnabled > 0.5) {
         ambient = ambientIBL(N, N_geo, V, baseColor.rgb, metallic, roughness, aoCombined, ambientLift,
                              iblIrradianceMap, iblIrradianceSampler, iblSpecularMap, iblSpecularSampler,
-                             iblBrdfLut, iblBrdfLutSampler);
+                             iblBrdfLut, iblBrdfLutSampler, iblSpecularScale);
     } else {
         ambient = ambientPBR(N, V, baseColor.rgb, metallic, roughness, aoCombined,
                              ambientSky * ambientLift, ambientGround * ambientLift);

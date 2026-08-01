@@ -7530,6 +7530,19 @@ is on. Take either, both, or neither.
 - **Roughness gate.** Rough surfaces keep the prefiltered IBL probe, which is
   indistinguishable there and far cheaper.
 
+### What reflections additionally cost
+
+Reflections need to know each pixel's normal and roughness, which the engine
+does not otherwise store. Turning them on therefore adds a second attachment to
+the depth prepass (an RGBA8 normal+roughness G-buffer) and switches it to a
+parallel set of pipelines. Shadows do not need it and do not pay for it. With
+reflections off, the target is not allocated and those pipelines are never
+created.
+
+Where a traced reflection lands, the forward pass drops its IBL specular lobe
+for that pixel rather than adding both — otherwise the same specular energy is
+counted twice and metal blows out.
+
 ### The one ordering constraint
 
 Reflections need per-triangle attributes (normals, colours) to shade a hit, and

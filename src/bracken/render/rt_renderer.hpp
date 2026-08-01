@@ -110,8 +110,11 @@ public:
     /// `ao_input` is the screen-space AO the shadow pass passes through in R
     /// (see rt_shadow.comp.hlsl); raw SDL handle because that is how the
     /// renderer already carries this texture between passes.
+    /// `normal_rough` is the depth-prepass G-buffer (RGB = world normal
+    /// encoded to [0,1], A = roughness). Reflections REQUIRE it and are
+    /// skipped when it is null; shadows ignore it entirely.
     void render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_GPUTexture* ao_input,
-                const FrameParams& params, const RtShadowSettings& shadows,
+                SDL_GPUTexture* normal_rough, const FrameParams& params, const RtShadowSettings& shadows,
                 const RtReflectionSettings& reflections);
 
     /** Half/quarter-res visibility mask (1 = lit). Null when shadows are off. */
@@ -139,7 +142,6 @@ private:
     RtResolution reflection_res_ = RtResolution::Quarter;
     bool built_with_attributes_ = false;
     bool warned_missing_attributes_ = false;
-    bool warned_no_normal_buffer_ = false;
     RtStats stats_{};
 };
 

@@ -132,7 +132,12 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
                   float roughness, float ao, float lift,
                   TextureCube<float4> irradianceMap, SamplerState irradianceSampler,
                   TextureCube<float4> specularMap, SamplerState specularSampler,
-                  Texture2D<float4> brdfLut, SamplerState brdfLutSampler) {
+                  Texture2D<float4> brdfLut, SamplerState brdfLutSampler,
+                  // 0 drops the probe's specular lobe entirely, for pixels a
+                  // ray-traced reflection is about to supply instead. Adding
+                  // both would count the same specular energy twice, which
+                  // reads as blown-out metal.
+                  float specularScale = 1.0) {
     float NdotV = max(dot(N, V), 1e-4);
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metallic);
 
@@ -155,7 +160,7 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
     horizon *= horizon;
     float3 specular = prefiltered * (F0 * envBRDF.x + envBRDF.y) * horizon;
 
-    return (diffuse + specular) * (ao * lift);
+    return (diffuse + specular * specularScale) * (ao * lift);
 }
 
 // Kaplanyan-style specular anti-aliasing: widen perceptual roughness by the

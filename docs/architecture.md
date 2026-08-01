@@ -491,6 +491,23 @@ one linear script in `render_frame`:
 | `scene/scene_renderer.cpp` | init/shutdown/lifecycle/setters + the `render_frame` orchestration script |
 | `scene/scene_renderer_upload.cpp` | the per-frame GPU uploads (instances, bone palettes) — the **main-thread side** of the Prepare tier boundary; everything here takes an `SDL_GPUCopyPass*` |
 | `scene/scene_renderer_prepass.cpp` | the depth prepass + its instanced/static/skinned draw walks |
+
+The depth prepass writes **one** colour attachment (RG16F velocity) normally,
+and **two** when ray-traced reflections are on: the second is an RGBA8
+normal+roughness G-buffer (RGB = world normal encoded to [0,1], A = linear
+roughness) that `render/rt_renderer.hpp` needs to decide which pixels are
+smooth enough to trace. Because a render pass and every pipeline used inside it
+must agree on the attachment count, this is not a runtime flag — enabling
+reflections swaps the whole prepass onto the `DepthPrepass*GBuffer` rows, and a
+game that leaves reflections off never creates them or allocates the target.
+Grass and alpha-MASK foliage write a constant roughness of 1 into it and no
+normal at all: they are never mirror surfaces, so the reflection pass skips
+those pixels without tracing.
+
+The four G-buffer vertex shaders share one `.hlsli` body with their plain
+counterparts, compiled twice (`BRACKEN_PREPASS_GBUFFER`). Their `SV_Position`
+math is what the forward pass depth-tests EQUAL against, so it has to stay
+bit-identical between the variants.
 | `scene/scene_renderer_draw.cpp` | the main pass: `render_3d_scene`, model/skinned/instanced/transparent draws, the model-family pipeline binds, UI, billboards, debug lines |
 | `scene/scene_renderer_shadow.cpp` | CSM cascade passes, the instanced shadow walk, local (point/spot) tile passes, `bind_shadow_data` / `bind_cluster_lights` |
 | `scene/scene_renderer_capture.cpp` | the screenshot download + PNG encode (the only GPU download + fence block in the renderer) |
@@ -768,8 +785,9 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
 - **`PipelineRegistry`** (`gpu/pipeline_registry.hpp`) is the cache and
   lifecycle around that catalogue, and names no pipeline itself. It lazily
   creates and caches one `GPUPipeline` per `PipelineType` (including the
-  model-family `DoubleSided`/`Blend` material variants, the 8 `DepthPrepass*`
-  pipelines that write the RG16F velocity target, the 8 `*DepthEqual`
+  model-family `DoubleSided`/`Blend` material variants, the 10 `DepthPrepass*`
+  pipelines that write the RG16F velocity target and their 10
+  `DepthPrepass*GBuffer` twins (below), the 8 `*DepthEqual`
   forward variants used after the prepass, the
   `GTAO`/`GTAOTemporal`/`GTAOUpsample`/`BlurAO` AO pipelines, the
   `TaaResolve`/`TaaSharpen` post pipelines, the 4 IBL prefilter

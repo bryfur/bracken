@@ -443,7 +443,8 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
 
 void GrassRenderer::render_prepass(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view,
                                    const glm::mat4& projection, const glm::vec3& camera_pos,
-                                   const glm::mat4& curr_vp_no_jitter, const glm::mat4& prev_vp_no_jitter) {
+                                   const glm::mat4& curr_vp_no_jitter, const glm::mat4& prev_vp_no_jitter,
+                                   gpu::PipelineType pipeline_type) {
     BRACKEN_PROFILE_ZONE_COLOR("GrassRenderer::render_prepass", 0xC0392B);
     if (!initialized_ || !pipeline_registry_ || !pass || !cmd) {
         return;
@@ -458,7 +459,7 @@ void GrassRenderer::render_prepass(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer
         return;
     }
 
-    auto* pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::DepthPrepassGrass);
+    auto* pipeline = pipeline_registry_->get_pipeline(pipeline_type);
     if (!pipeline) {
         BRACKEN_LOG_ERROR(LOG_TAG, "GrassRenderer::render_prepass: Failed to get grass prepass pipeline");
         return;
