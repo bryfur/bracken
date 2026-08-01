@@ -111,15 +111,18 @@ Texture2D emissiveTexture;
 SamplerState emissiveSampler;
 
 // Full-res screen-space GTAO (R8, 1 = unoccluded), computed before this pass
-// from the prepass depth. Bound to a 1x1 white dummy when AO is off.
+// from the prepass depth. Bound to a 1x1 white dummy when AO is off, which is
+// why the white dummy has to be white: this is sampled unconditionally
+// wherever screenAOEnabled is set.
+//
+// This slot USED to carry the traced sun shadow in G as well, because the
+// stage was believed to be at an 11-sampler DXC ceiling. It is not (12
+// compiles; 17 compiles), and the packing was actively harmful: it forced the
+// RT pass to copy AO through with a texel coordinate derived from a different
+// texture's dimensions, which read out of bounds -- returning 0 -- and zeroed
+// the ambient term scene-wide whenever AO was off. See rtShadowTexture below.
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
-// Screen-space lighting terms, ONE binding for two of them because the
-// fragment stage is at its 10-sampler ceiling (an 11th fails to legalize):
-//   R = ambient occlusion (GTAO)
-//   G = sun visibility from ray-traced shadows, read only when rtShadowEnabled
-// With RT shadows off this is GTAO's R8 texture unchanged and G is never read;
-// with them on it is the RT pass's RG8 output, which passes AO through in R.
-Texture2D<float4> screenAOTexture;
+Texture2D<float> screenAOTexture;
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
 SamplerState screenAOSampler;
 
@@ -141,16 +144,27 @@ Texture2D<float4> iblBrdfLut;
 SamplerState iblBrdfLutSampler;
 
 
+// Ray-traced sun visibility (R8, 1 = lit), at the traced pass's own
+// resolution -- half res by default, so ALWAYS sample it with a normalized UV
+// and never with a texel coordinate borrowed from another texture. Bound to
+// the 1x1 white dummy when ray tracing is off, and read only when
+// rtShadowEnabled: a white dummy then reads 1.0 = "fully lit" from any UV,
+// which is the correct no-op.
+[[vk::combinedImageSampler]][[vk::binding(10, 2)]]
+Texture2D<float> rtShadowTexture;
+[[vk::combinedImageSampler]][[vk::binding(10, 2)]]
+SamplerState rtShadowSampler;
+
 // Local (point/spot) shadow atlas + comparison sampler: declared by
-// cluster_lighting.hlsli at this shader's LAST sampler slot (10).
+// cluster_lighting.hlsli at this shader's LAST sampler slot (11).
 
 #include "shadow_common.hlsli"
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
-// Cluster SSBOs follow this shader's 11 fragment samplers in set 2 (slots
-// 0-9 above + the local-shadow atlas at 10, declared by the include).
-#define CLUSTER_SSBO_BINDING_BASE 11
+// Cluster SSBOs follow this shader's 12 fragment samplers in set 2 (slots
+// 0-10 above + the local-shadow atlas at 11, declared by the include).
+#define CLUSTER_SSBO_BINDING_BASE 12
 #include "cluster_lighting.hlsli"
 
 float4 PSMain(PSInput input) : SV_Target {
@@ -213,8 +227,11 @@ float4 PSMain(PSInput input) : SV_Target {
     // tracing exists because it is the more accurate answer. The cascades stay
     // as the fallback when it is off.
     if (rtShadowEnabled > 0.5) {
+        // Normalized UV into the mask's OWN resolution: screenAOTexel* is
+        // 1/screen size, and the mask's sampler does the rest. This is what
+        // makes half- or quarter-res masks a free parameter.
         float2 rtUV = input.position.xy * float2(screenAOTexelX, screenAOTexelY);
-        shadow = screenAOTexture.SampleLevel(screenAOSampler, rtUV, 0).g;
+        shadow = rtShadowTexture.SampleLevel(rtShadowSampler, rtUV, 0).r;
     }
 
 

@@ -121,7 +121,14 @@ valid and the shaders branch to the hemisphere `ambientPBR` fallback.
 The very LAST sampler slot of every scene fragment shader is the LOCAL
 (point/spot) shadow atlas + `LESS_OR_EQUAL` comparison sampler, declared by
 `cluster_lighting.hlsli` at `CLUSTER_SSBO_BINDING_BASE - 1` (fragment sampler
-counts: model/instanced 11, terrain 9, grass 7). Cluster lights whose
+counts: model/instanced 12, terrain 9, grass 7). In `model.frag` /
+`model_instanced.frag` the slot below it (10) is `rtShadowTexture`, the R8
+ray-traced sun-visibility mask — sampled with a NORMALIZED UV because it lives
+at the traced pass's own resolution, and bound to the 1x1 white dummy (= fully
+lit) when ray tracing is off. It used to be multiplexed into `screenAOTexture`'s
+G channel on the belief that a 12th sampler failed DXC legalization; it does
+not (12 compiles, verified to 17), and the packing zeroed the ambient term
+scene-wide whenever AO was off. Cluster lights whose
 `shadow_slot >= 0` sample it inside `accumulateClusterLights` — point lights
 pick one of their 6 face tiles by the dominant axis of light→fragment
 (`localShadowCubeFace`; CPU mirror `lighting::local_shadow_cube_face`), then

@@ -425,6 +425,14 @@ private:
     // this — the shaders always declare the slot.
     void bind_screen_ao(uint32_t slot, bool enabled = true);
 
+    // Bind the frame's ray-traced sun-visibility mask (or the 1x1 white dummy
+    // when ray tracing is off) at the given fragment sampler slot. Every
+    // model-family pipeline bind must include this — model.frag /
+    // model_instanced.frag always DECLARE the slot, and an undeclared-but-
+    // unbound sampler descriptor is undefined behaviour in SDL3 GPU. The white
+    // dummy reads 1.0 = fully lit from any UV, which is the correct no-op.
+    void bind_rt_shadow_mask(uint32_t slot);
+
     // Fill the 3-entry sky IBL binding array (irradiance cube, prefiltered
     // specular cube, BRDF LUT — real chain when the IBL renderer is ready,
     // cube-typed dummies otherwise). Returns false if no valid binding can be
@@ -717,7 +725,18 @@ private:
     // The AO texture forward draws sample this frame: gtao_'s full-res R8
     // output when AO ran, otherwise the 1x1 white dummy. Reset at the top of
     // every render_frame (never dangles across resizes/mode switches).
+    //
+    // This means EXACTLY "GTAO or white" again. The RT shadow pass used to
+    // overwrite it with an RG8 mask that carried a copy of AO in R, which made
+    // "the AO texture" mean two different things depending on a setting; see
+    // frame_rt_shadow_texture_.
     SDL_GPUTexture* frame_ao_texture_ = nullptr;
+
+    // The traced sun-visibility mask forward draws sample this frame (R8, at
+    // the RT pass's own resolution), or null when ray tracing is off — in
+    // which case the model shaders get the white dummy and never read it
+    // (rtShadowEnabled == 0). Reset at the top of every render_frame.
+    SDL_GPUTexture* frame_rt_shadow_texture_ = nullptr;
 
     // Sky IBL is active this frame: settings flag on AND the prefilter chain
     // is alive. Drives the iblEnabled uniform flag of every scene shader.

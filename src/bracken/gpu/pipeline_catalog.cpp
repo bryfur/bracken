@@ -27,11 +27,18 @@ constexpr ShaderResources k_ubo1_samp4{.num_samplers = 4, .num_uniform_buffers =
 
 /// `model.frag` / `model_instanced.frag`: baseColor + shadow atlas (cmp + raw)
 /// + normal + metallic-roughness + emissive + screen AO + IBL (irradiance /
-/// prefiltered / BRDF LUT) + local-shadow atlas = 11 samplers; light data +
-/// cluster offsets + light indices + local-shadow slots = 4 storage buffers;
-/// lighting + shadow data + cluster params = 3 uniform buffers.
+/// prefiltered / BRDF LUT) + traced sun-shadow mask + local-shadow atlas = 12
+/// samplers; light data + cluster offsets + light indices + local-shadow slots
+/// = 4 storage buffers; lighting + shadow data + cluster params = 3 uniform
+/// buffers.
+///
+/// The RT shadow mask is slot 10 and the local-shadow atlas moved to 11
+/// (`CLUSTER_SSBO_BINDING_BASE` = 12). It was previously multiplexed into the
+/// screen-AO texture's G channel on the belief that a 12th sampler failed DXC
+/// legalization; that does not reproduce — model.frag compiles clean at 12,
+/// and was verified up to 17.
 constexpr ShaderResources k_fs_lit_model{
-    .num_samplers = 11, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 12, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `terrain.frag`: material array + splatmap + shadow atlas (cmp + raw) +
 /// screen AO + IBL (irradiance / prefiltered / BRDF LUT) + local-shadow atlas.
@@ -734,11 +741,12 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
     {.name = "RtShadow",
      .shader = "rt_shadow.comp.spv",
      .entry_point = "CSMain",
-     // depth + normal, then the four acceleration-structure buffers. No
-     // attribute buffer: a shadow ray asks a yes/no question and never shades
-     // what it hits, which is why it costs 48 bytes per triangle and
-     // reflections cost 112.
-     .resources = {.num_readonly_storage_textures = 2,
+     // Depth only, then the four acceleration-structure buffers. No attribute
+     // buffer: a shadow ray asks a yes/no question and never shades what it
+     // hits, which is why it costs 48 bytes per triangle and reflections cost
+     // 112. (It also took the AO texture, to copy through into the mask's
+     // second channel — see rt_shadow.comp.hlsl for why that is gone.)
+     .resources = {.num_readonly_storage_textures = 1,
                    .num_readonly_storage_buffers = 4,
                    .num_readwrite_storage_textures = 1,
                    .num_uniform_buffers = 1}},

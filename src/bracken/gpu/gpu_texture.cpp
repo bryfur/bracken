@@ -340,6 +340,21 @@ std::unique_ptr<GPUTexture> GPUTexture::create_depth(GPUDevice& device, int widt
     SDL_GPUTextureCreateInfo tex_info = {};
     tex_info.type = SDL_GPU_TEXTURETYPE_2D;
     tex_info.format = texture->format_;
+    // KNOWN PORTABILITY GAP, recorded here because it is not fixable at this
+    // line. The ray-tracing compute passes bind this texture with
+    // SDL_BindGPUComputeStorageTextures, and SDL_gpu.h says such a texture
+    // "must have been created with SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ".
+    // Adding that flag here is REJECTED by SDL itself: SDL_gpu.c asserts
+    // "For depth textures: usage cannot contain any flags except for
+    // DEPTH_STENCIL_TARGET and SAMPLER", and create_texture then fails, so the
+    // renderer comes up with no depth buffer at all (measured). The two
+    // requirements are mutually exclusive for a depth format. Metal tolerates
+    // the binding; a Vulkan run with validation will flag it, and D3D12 may
+    // reject it. The real fix is for the RT passes to take depth as a SAMPLED
+    // texture (which this usage already permits) rather than a storage
+    // texture — that is a shader-binding change in rt_shadow.comp.hlsl /
+    // rt_reflection.comp.hlsl plus a point-clamp sampler, deliberately left
+    // out of the defect fix that found it.
     tex_info.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
     tex_info.width = static_cast<Uint32>(width);
     tex_info.height = static_cast<Uint32>(height);

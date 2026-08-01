@@ -2458,7 +2458,7 @@ Within a set, storage-buffer slots begin immediately after the shader's sampled 
 
 CPU-side slot mapping: `SDL_PushGPUVertexUniformData(cmd, i, ...)` → `(i, 1)`; `SDL_PushGPUFragmentUniformData(cmd, i, ...)` → `(i, 3)`; `SDL_BindGPUVertexStorageBuffers` / `SDL_BindGPUFragmentStorageBuffers(pass, first, ...)` → set-0/set-2 storage slots relative to the sampler count; `SDL_BindGPUFragmentSamplers(pass, first, ...)` → `(first.., 2)`.
 
-`cluster_lighting.hlsli` codifies this for clustered lighting: the including fragment shader must `#define CLUSTER_SSBO_BINDING_BASE <its sampler count>` first (compile-time `#error` otherwise); the include then declares `ClusterParamsCB` at `(2, 3)`, the local-shadow atlas + comparison sampler at the shader's LAST sampler slot (`BASE-1`, set 2), and four SSBOs (`lightDataBuf` ByteAddressBuffer, `clusterOffsetsBuf StructuredBuffer<uint2>`, `lightIndicesBuf StructuredBuffer<uint>`, `localShadowSlots StructuredBuffer<LocalShadowSlot>`) at set-2 slots `BASE+0..3`, matched by `SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4)` on the CPU. Slot `(2,3)`, the last sampler, and those four set-2 bindings are reserved in every cluster-lit shader (`model.frag` base 11, `model_instanced.frag` 11, `terrain.frag` 9, `grass.frag` 7).
+`cluster_lighting.hlsli` codifies this for clustered lighting: the including fragment shader must `#define CLUSTER_SSBO_BINDING_BASE <its sampler count>` first (compile-time `#error` otherwise); the include then declares `ClusterParamsCB` at `(2, 3)`, the local-shadow atlas + comparison sampler at the shader's LAST sampler slot (`BASE-1`, set 2), and four SSBOs (`lightDataBuf` ByteAddressBuffer, `clusterOffsetsBuf StructuredBuffer<uint2>`, `lightIndicesBuf StructuredBuffer<uint>`, `localShadowSlots StructuredBuffer<LocalShadowSlot>`) at set-2 slots `BASE+0..3`, matched by `SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4)` on the CPU. Slot `(2,3)`, the last sampler, and those four set-2 bindings are reserved in every cluster-lit shader (`model.frag` base 12, `model_instanced.frag` 12, `terrain.frag` 9, `grass.frag` 7).
 
 ### CPU↔GPU uniform contract — `src/bracken/gpu/gpu_uniforms.hpp`
 
@@ -4946,7 +4946,7 @@ This chapter specifies the shading algorithm applied to every model draw in the 
 
 Include chains (relevant to symbol availability):
 
-- `model.frag.hlsl` and `model_instanced.frag.hlsl` include, in order: `shadow_common.hlsli` (which itself includes `lighting.hlsli` for `interleavedGradientNoise`), `fog.hlsli`, `lighting.hlsli`, `pbr.hlsli`, then — after `#define CLUSTER_SSBO_BINDING_BASE 11` (= the fragment sampler count; the include itself declares the 11th sampler, the local-shadow atlas, at slot 10) — `cluster_lighting.hlsli`.
+- `model.frag.hlsl` and `model_instanced.frag.hlsl` include, in order: `shadow_common.hlsli` (which itself includes `lighting.hlsli` for `interleavedGradientNoise`), `fog.hlsli`, `lighting.hlsli`, `pbr.hlsli`, then — after `#define CLUSTER_SSBO_BINDING_BASE 12` (= the fragment sampler count; the include itself declares the 12th sampler, the local-shadow atlas, at slot 11) — `cluster_lighting.hlsli`.
 - Direct `#include "lighting.hlsli"` consumers: `model.frag.hlsl`, `model_instanced.frag.hlsl`, `terrain.frag.hlsl`, `grass.frag.hlsl`, `skybox.frag.hlsl`, `composite.frag.hlsl`, and `shadow_common.hlsli` (which propagates it to every shadow-receiving shader). Both `.hlsli` libraries are include-guarded (`PBR_HLSLI`, `LIGHTING_HLSLI`), so the double inclusion via `shadow_common.hlsli` is harmless.
 - Direct `pbr.hlsli` consumer besides `clusters.hlsli`: none in the model family; `terrain.frag.hlsl` and `grass.frag.hlsl` also reach it via `cluster_lighting.hlsli`.
 
@@ -5130,8 +5130,9 @@ Position, normal (`w = 0`), and tangent (`w = 0`) are all transformed by the sam
 | set 2, sampler 5 | `emissiveTexture` (`RGBA8_SRGB`) |
 | set 2, sampler 6 | `screenAOTexture` (full-res R8 GTAO; 1×1 white dummy when AO off / BLEND draws) |
 | set 2, samplers 7–9 | `iblIrradianceMap` / `iblSpecularMap` (cubes) + `iblBrdfLut` (typed dummies when IBL off) |
-| set 2, sampler 10 | `localShadowAtlas` + `SamplerComparisonState` (declared by `cluster_lighting.hlsli` at `CLUSTER_SSBO_BINDING_BASE − 1`; CSM atlas as filler when local shadows are unavailable) |
-| set 2, storage buffers 0–3 | cluster light data / offsets / indices / local-shadow slots (`CLUSTER_SSBO_BINDING_BASE = 11`, i.e. immediately after the 11 samplers per SDL GPU's set-2 layout: sampled textures, then storage textures, then storage buffers) |
+| set 2, sampler 10 | `rtShadowTexture` (R8 ray-traced sun visibility, 1 = lit, at the traced pass's OWN resolution — sample with a normalized UV; 1×1 white dummy when ray tracing is off, and read only when `rtShadowEnabled`) |
+| set 2, sampler 11 | `localShadowAtlas` + `SamplerComparisonState` (declared by `cluster_lighting.hlsli` at `CLUSTER_SSBO_BINDING_BASE − 1`; CSM atlas as filler when local shadows are unavailable) |
+| set 2, storage buffers 0–3 | cluster light data / offsets / indices / local-shadow slots (`CLUSTER_SSBO_BINDING_BASE = 12` for `model.frag` / `model_instanced.frag`, i.e. immediately after their 12 samplers per SDL GPU's set-2 layout: sampled textures, then storage textures, then storage buffers. Slot 10 is the ray-traced sun-visibility mask, slot 11 the local-shadow atlas) |
 
 Per-fragment algorithm, in order (`PSMain`):
 

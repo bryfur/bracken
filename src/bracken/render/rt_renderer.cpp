@@ -73,7 +73,7 @@ void RtRenderer::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>
     }
 }
 
-void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_GPUTexture* ao_input,
+void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                         SDL_GPUTexture* normal_rough, const FrameParams& params,
                         const RtShadowSettings& shadows, const RtReflectionSettings& reflections) {
     stats_.shadows_traced = false;
@@ -100,7 +100,11 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_G
             shadow_res_ = shadows.resolution;
         }
 
-        if (ensure_target(*device_, shadow_mask_, w, h, SDL_GPU_TEXTUREFORMAT_R8G8_UNORM,
+        // R8, not RG8: the mask carries sun visibility and nothing else. The
+        // second channel used to hold a copy of the GTAO result so the
+        // lighting stage could get both from one sampler slot; that is what
+        // made an AO-off frame render fully occluded (rt_shadow.comp.hlsl).
+        if (ensure_target(*device_, shadow_mask_, w, h, SDL_GPU_TEXTUREFORMAT_R8_UNORM,
                           "shadow mask")) {
             const gpu::GPUComputePipeline* pipeline =
                 pipelines_->get_compute_pipeline(gpu::ComputePipelineType::RtShadow);
@@ -123,7 +127,7 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_G
                 gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
                 if (pass) {
                     pass.bind_pipeline(*pipeline);
-                    const std::array<SDL_GPUTexture*, 2> textures{depth.handle(), ao_input};
+                    const std::array<SDL_GPUTexture*, 1> textures{depth.handle()};
                     pass.bind_storage_textures(0, textures);
                     const std::array<SDL_GPUBuffer*, 4> buffers{
                         scene_.tlas_nodes(), scene_.tlas_instances(), scene_.blas_nodes(),

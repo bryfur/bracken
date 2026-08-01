@@ -107,17 +107,21 @@ public:
 
     /** Record the traced passes. Each is skipped entirely when its feature is
      *  off or the acceleration structure is not ready. */
-    /// `ao_input` is the screen-space AO the shadow pass passes through in R
-    /// (see rt_shadow.comp.hlsl); raw SDL handle because that is how the
-    /// renderer already carries this texture between passes.
-    /// `normal_rough` is the depth-prepass G-buffer (RGB = world normal
-    /// encoded to [0,1], A = roughness). Reflections REQUIRE it and are
+    /// `normal_rough` is the depth-prepass G-buffer (RG = octahedral world
+    /// normal, B = roughness, A = metallic). Reflections REQUIRE it and are
     /// skipped when it is null; shadows ignore it entirely.
-    void render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth, SDL_GPUTexture* ao_input,
+    ///
+    /// The shadow pass used to also take the screen-space AO texture and copy
+    /// it through into R of an RG8 mask, so the lighting stage could read AO
+    /// and sun visibility from one sampler. It no longer does: the mask is R8
+    /// visibility only. See rt_shadow.comp.hlsl for what that packing cost.
+    void render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                 SDL_GPUTexture* normal_rough, const FrameParams& params, const RtShadowSettings& shadows,
                 const RtReflectionSettings& reflections);
 
-    /** Half/quarter-res visibility mask (1 = lit). Null when shadows are off. */
+    /** Half/quarter-res R8 visibility mask (1 = lit). Null when shadows are
+     *  off. Sample it with a NORMALIZED UV — its resolution is independent of
+     *  both the screen and the depth buffer. */
     [[nodiscard]] gpu::GPUTexture* shadow_mask() const;
     /** Traced reflection colour; alpha 0 means "use the IBL probe here". */
     [[nodiscard]] gpu::GPUTexture* reflection_target() const;

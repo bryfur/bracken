@@ -669,10 +669,10 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     frame_ao_texture_ = dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr;
     // Ray-tracing state is per-frame and must be cleared here, not merely set
     // when the passes run: these are read by every forward draw, and a stale
-    // "shadows active" would make the lighting sample G out of a plain R8 AO
-    // texture (i.e. zero — everything shadowed) the frame after ray tracing is
-    // switched off.
+    // "shadows active" plus a stale mask handle would keep applying last
+    // frame's traced shadows after ray tracing is switched off.
     frame_rt_shadows_active_ = false;
+    frame_rt_shadow_texture_ = nullptr;
     frame_rt_reflection_texture_ = nullptr;
     frame_rt_reflection_max_roughness_ = 0.0f;
     // Sky IBL drives every scene shader's iblEnabled flag (the IBL sampler
@@ -1015,12 +1015,15 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 gtao_->invalidate_history();
             }
 
-            // Ray-traced sun shadows. Dispatched after GTAO because it reads
-            // the AO result and passes it through in R, writing sun visibility
-            // in G — the lighting pass samples ONE texture for both, since its
-            // fragment stage is at the 10-sampler ceiling. Substituting
-            // frame_ao_texture_ is the entire integration: every draw that
-            // already binds AO now gets the traced shadow with it.
+            // Ray-traced sun shadows. The mask is its own R8 texture on its
+            // own fragment sampler slot; it does NOT touch frame_ao_texture_.
+            // It used to: the pass copied GTAO through into R of an RG8 mask
+            // so the lighting stage could read both from one slot. That copy
+            // indexed the AO texture with a coordinate scaled from the DEPTH
+            // texture's dimensions, so with AO off (a 1x1 white dummy) every
+            // thread read out of bounds, got 0, and the frame rendered fully
+            // ambient-occluded. Un-multiplexing also stops full-res GTAO being
+            // point-downsampled to the mask's resolution on every traced frame.
             if ((gfx.rt_shadows || gfx.rt_reflections) && rt_renderer_ &&
                 post_->offscreen_depth() && cmd) {
                 // Own the acceleration structure here rather than asking the
@@ -1043,10 +1046,6 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 render::RtReflectionSettings rr;
                 rr.enabled = gfx.rt_reflections;
 
-                SDL_GPUTexture* ao_for_rt =
-                    frame_ao_texture_ != nullptr
-                        ? frame_ao_texture_
-                        : (dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr);
                 // Reflections need the prepass G-buffer; without it (allocation
                 // failed, or the prepass did not run this frame) the pass has
                 // no way to tell a mirror from a wall, so it is skipped rather
@@ -1054,18 +1053,15 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 SDL_GPUTexture* normal_rough =
                     (frame_prepass_active_ && normal_rough_texture_) ? normal_rough_texture_->handle() : nullptr;
                 rr.enabled = rr.enabled && normal_rough != nullptr;
-                if (ao_for_rt != nullptr) {
-                    rt_renderer_->render(cmd, *post_->offscreen_depth(), ao_for_rt, normal_rough, rp, rs, rr);
-                    if (rt_renderer_->stats().shadows_traced &&
-                        rt_renderer_->shadow_mask() != nullptr) {
-                        frame_ao_texture_ = rt_renderer_->shadow_mask()->handle();
-                        frame_rt_shadows_active_ = true;
-                    }
-                    if (rt_renderer_->stats().reflections_traced &&
-                        rt_renderer_->reflection_target() != nullptr) {
-                        frame_rt_reflection_texture_ = rt_renderer_->reflection_target()->handle();
-                        frame_rt_reflection_max_roughness_ = rr.max_roughness;
-                    }
+                rt_renderer_->render(cmd, *post_->offscreen_depth(), normal_rough, rp, rs, rr);
+                if (rt_renderer_->stats().shadows_traced && rt_renderer_->shadow_mask() != nullptr) {
+                    frame_rt_shadow_texture_ = rt_renderer_->shadow_mask()->handle();
+                    frame_rt_shadows_active_ = true;
+                }
+                if (rt_renderer_->stats().reflections_traced &&
+                    rt_renderer_->reflection_target() != nullptr) {
+                    frame_rt_reflection_texture_ = rt_renderer_->reflection_target()->handle();
+                    frame_rt_reflection_max_roughness_ = rr.max_roughness;
                 }
             }
 

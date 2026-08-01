@@ -23,8 +23,21 @@
 //    hiding, which is the whole game in a memory-bound traversal.
 //
 // Output is a single-channel visibility mask (1 = lit, 0 = shadowed), which
-// the lighting pass multiplies in. Half-resolution by default; the composite
-// upsamples with a depth-aware filter.
+// the lighting pass multiplies in. Half-resolution by default, sampled with a
+// normalized UV so its resolution is a free parameter.
+//
+// THIS PASS DELIBERATELY OWNS NOTHING BUT VISIBILITY. It used to also read the
+// GTAO texture and copy it into R of an RG8 mask, so the lighting pass could
+// get both terms from one sampler slot. That coupling was a bug factory: the
+// AO fetch used a texel coordinate derived from the DEPTH texture's dimensions
+// while indexing the AO texture, so the two only agreed by luck. With AO off
+// the engine binds a 1x1 white dummy there, every thread but (0,0) read out of
+// bounds, an out-of-bounds Load returns 0.0, and the whole screen came back
+// "fully occluded" — the entire ambient/IBL term zeroed scene-wide. It also
+// point-downsampled full-res GTAO to the mask's resolution on every frame ray
+// tracing was on. The mask now has its own R8 texture and its own fragment
+// sampler slot (the "11-sampler DXC ceiling" that motivated the packing does
+// not reproduce: model.frag compiles clean at 12).
 
 static const uint TLAS_STACK = 32;
 static const uint BLAS_STACK = 32;
@@ -69,16 +82,14 @@ cbuffer RtShadowUniforms : register(b0, space2) {
 };
 
 [[vk::binding(0, 0)]] Texture2D<float> sceneDepth : register(t0, space0);
-[[vk::binding(1, 0)]] Texture2D<float> aoInput : register(t1, space0);
-[[vk::binding(2, 0)]] StructuredBuffer<BvhNode> tlasNodes : register(t2, space0);
-[[vk::binding(3, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t3, space0);
-[[vk::binding(4, 0)]] StructuredBuffer<BvhNode> blasNodes : register(t4, space0);
-[[vk::binding(5, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t5, space0);
+[[vk::binding(1, 0)]] StructuredBuffer<BvhNode> tlasNodes : register(t1, space0);
+[[vk::binding(2, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t2, space0);
+[[vk::binding(3, 0)]] StructuredBuffer<BvhNode> blasNodes : register(t3, space0);
+[[vk::binding(4, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t4, space0);
 
-// RG8: R = the ambient occlusion read straight through from GTAO, G = sun
-// visibility. Two terms in one texture because the lighting pass's fragment
-// stage is at its 10-sampler ceiling and cannot take another binding.
-[[vk::binding(0, 1)]] RWTexture2D<float2> shadowMask : register(u0, space1);
+// R8: sun visibility only, 1 = lit, 0 = shadowed. See the header comment for
+// why this is no longer RG8 with ambient occlusion multiplexed into R.
+[[vk::binding(0, 1)]] RWTexture2D<float> shadowMask : register(u0, space1);
 
 // Slab test. Returns the near hit distance, or a miss as tNear > tFar.
 // Branchless min/max: a per-lane branch here would serialize the warp on the
@@ -255,7 +266,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // and casting a ray from the far plane is the single most expensive way to
     // learn that.
     if (depth <= 0.0) {
-        shadowMask[coord] = float2(aoInput.Load(int3(depthCoord, 0)), 1.0);
+        shadowMask[coord] = 1.0;
         return;
     }
 
@@ -270,7 +281,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // the dot product already said.
     float ndotl = dot(normal, toLight);
     if (ndotl <= 0.0) {
-        shadowMask[coord] = float2(aoInput.Load(int3(depthCoord, 0)), 0.0);
+        shadowMask[coord] = 0.0;
         return;
     }
 
@@ -288,6 +299,5 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float3 rayOrigin = worldPos + normal * (normalBias * (1.0 + slope * 4.0)) +
                        toLight * depthBias;
 
-    float visibility = sceneOccluded(rayOrigin, toLight, rayMaxDistance) ? 0.0 : 1.0;
-    shadowMask[coord] = float2(aoInput.Load(int3(depthCoord, 0)), visibility);
+    shadowMask[coord] = sceneOccluded(rayOrigin, toLight, rayMaxDistance) ? 0.0 : 1.0;
 }

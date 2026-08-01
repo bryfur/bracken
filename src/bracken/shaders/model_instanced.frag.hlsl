@@ -49,8 +49,8 @@ cbuffer LightingUniforms {
     float iblEnabled;       // 1 = sky IBL ambient (samplers 7-9), 0 = hemisphere fallback
     float screenAOEnabled;  // 0 for MASK/BLEND: not in the depth prepass, so the AO
                             // texel under them belongs to the geometry behind them
-    // Ray-traced sun shadow mask — see model.frag.hlsl for the full note on
-    // why it shares screenAOTexture and screenAOTexel*.
+    // Ray-traced sun shadow mask (rtShadowTexture, its own sampler slot) —
+    // see model.frag.hlsl. screenAOTexel* doubles as its UV scale.
     float rtShadowEnabled;
     // Roughness at or below this means a ray-traced reflection will be added
     // for this pixel in the composite, so the IBL probe must NOT also supply a
@@ -106,13 +106,11 @@ Texture2D emissiveTexture;
 [[vk::combinedImageSampler]][[vk::binding(5, 2)]]
 SamplerState emissiveSampler;
 
-// Screen-space lighting terms, ONE binding for two of them (this stage is at
-// its sampler ceiling, exactly as in model.frag.hlsl):
-//   R = ambient occlusion (GTAO)
-//   G = sun visibility from ray-traced shadows, read only when rtShadowEnabled
-// With RT shadows off this is GTAO's R8 texture unchanged and G is never read.
+// Full-res screen-space GTAO (R8, 1 = unoccluded); 1x1 white dummy when off.
+// It used to carry the traced sun shadow in G too — see model.frag.hlsl for
+// why that packing is gone.
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
-Texture2D<float4> screenAOTexture;
+Texture2D<float> screenAOTexture;
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
 SamplerState screenAOSampler;
 
@@ -133,13 +131,21 @@ Texture2D<float4> iblBrdfLut;
 [[vk::combinedImageSampler]][[vk::binding(9, 2)]]
 SamplerState iblBrdfLutSampler;
 
+// Ray-traced sun visibility (R8, 1 = lit) at the traced pass's own resolution
+// — sample with a normalized UV, never a borrowed texel coordinate. White
+// dummy when ray tracing is off; read only when rtShadowEnabled.
+[[vk::combinedImageSampler]][[vk::binding(10, 2)]]
+Texture2D<float> rtShadowTexture;
+[[vk::combinedImageSampler]][[vk::binding(10, 2)]]
+SamplerState rtShadowSampler;
+
 #include "shadow_common.hlsli"
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
-// Cluster SSBOs follow this shader's 11 fragment samplers in set 2 (slots
-// 0-9 above + the local-shadow atlas at 10, declared by the include).
-#define CLUSTER_SSBO_BINDING_BASE 11
+// Cluster SSBOs follow this shader's 12 fragment samplers in set 2 (slots
+// 0-10 above + the local-shadow atlas at 11, declared by the include).
+#define CLUSTER_SSBO_BINDING_BASE 12
 #include "cluster_lighting.hlsli"
 
 float4 PSMain(PSInput input) : SV_Target {
@@ -195,7 +201,7 @@ float4 PSMain(PSInput input) : SV_Target {
     // Traced sun shadows REPLACE the cascade result (see model.frag.hlsl).
     if (rtShadowEnabled > 0.5) {
         float2 rtUV = input.position.xy * float2(screenAOTexelX, screenAOTexelY);
-        shadow = screenAOTexture.SampleLevel(screenAOSampler, rtUV, 0).g;
+        shadow = rtShadowTexture.SampleLevel(rtShadowSampler, rtUV, 0).r;
     }
     float3 directLight = lightColor * sunIntensity * shadow;
 

@@ -473,9 +473,11 @@ nothing.
 `RenderPlan` is the **immutable half only**. Three frame-scoped renderer
 members are written mid-frame, after the camera/frustum state is final —
 `frame_prepass_active_` (the prepass reports whether it recorded),
-`frame_ao_texture_` (GTAO publishes its output) and
+`frame_ao_texture_` (GTAO publishes its output — **only** GTAO's, or the 1×1
+white dummy) and
 `frame_shadow_uniforms_` — and therefore cannot live in a const struct built
-before those passes run.
+before those passes run. The ray-tracing passes publish their own
+`frame_rt_shadow_texture_` / `frame_rt_reflection_texture_` alongside them.
 
 ### Pass order inside `SceneRenderer::render_frame`
 
@@ -630,6 +632,32 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    nor occludes (enforced by `screenAOEnabled = 0` in its per-mesh uniforms —
    without the gate the forward pass would sample the AO of whatever is
    BEHIND the surface).
+7b. **`RT shadows` / `RT reflections`** (only when `rt_shadows` or
+   `rt_reflections` is on) — `render::RtRenderer`, two compute dispatches over
+   the engine's own software BVH (SDL3 GPU exposes no hardware ray tracing).
+   Both read the prepass depth; reflections additionally require the prepass
+   G-buffer and are skipped without it. Recorded after GTAO and before the
+   forward pass, outside any render pass (a compute pass requires that).
+   * The shadow pass writes an **R8 visibility mask** (1 = lit) at its own
+     resolution — half res by default — published as
+     `frame_rt_shadow_texture_` and bound at **fragment sampler slot 10** of
+     `model.frag` / `model_instanced.frag`, which sample it with a NORMALIZED
+     UV. Traced visibility *replaces* the cascade result rather than
+     multiplying with it. Terrain and grass do not read it (they have no such
+     slot), so they keep CSM shadows while models take the traced answer.
+   * That mask was formerly **RG8 with GTAO copied through in R**, so the
+     forward stage could read both from one sampler. It is not, and must not
+     be again: the copy indexed the AO texture with a texel coordinate scaled
+     from the *depth* texture's dimensions, so with AO off (a 1×1 white dummy
+     bound there) every thread read out of bounds, an out-of-bounds
+     `Load` returns 0, and the entire ambient/IBL term was zeroed scene-wide.
+     It also point-downsampled full-res GTAO to the mask's resolution on every
+     traced frame. The packing existed because the model fragment stage was
+     believed to be at an 11-sampler DXC legalization ceiling; that does not
+     reproduce (12 compiles, verified to 17). `frame_ao_texture_` therefore
+     means exactly "GTAO's output, or the 1×1 white dummy" — nothing else.
+   * `CLUSTER_SSBO_BINDING_BASE` is **12** for the two model fragment shaders
+     (0–9 material/AO/IBL, 10 the traced mask, 11 the local-shadow atlas).
 8. **`HDROffscreen`** (the normal path whenever the post stack initialized) —
    the whole 3D scene renders into the linear-HDR offscreen target: terrain,
    grass, static/instanced/skinned models, skybox, sorted transparent
@@ -1307,6 +1335,20 @@ is a review defect, as is a mutex anywhere in the frame hot path (plan §7).
 Things that look functional but aren't, or fail quietly — check here before
 debugging "why is this value zero / where did my draw go":
 
+- **The ray-tracing passes bind the scene depth as a compute STORAGE texture
+  it was not created for.** `SDL_gpu.h` says a texture bound with
+  `SDL_BindGPUComputeStorageTextures` must carry
+  `SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ`; `SDL_gpu.c` separately asserts
+  that a **depth** texture's usage "cannot contain any flags except for
+  `DEPTH_STENCIL_TARGET` and `SAMPLER`" and fails creation outright if it
+  does (measured — the renderer comes up with no depth buffer). The two rules
+  are mutually exclusive for `D32_FLOAT`, so `GPUTexture::create_depth` omits
+  the flag and the binding works only because the Metal backend tolerates it.
+  A Vulkan run with validation will flag it; D3D12 may reject it. The fix is
+  to take depth as a SAMPLED texture in `rt_shadow.comp.hlsl` /
+  `rt_reflection.comp.hlsl` (which the existing `SAMPLER` usage already
+  permits) with a point-clamp sampler, as `exposure_histogram.comp.hlsl`
+  already does for the scene colour.
 - **GPU-side per-pass timings do not exist** — SDL3 has no timestamp query
   API, so `PassTiming::gpu_ms` is `nullopt` (not zero). `PassTiming::cpu_ms`
   IS real: the CPU cost of recording that pass. Do not read it as GPU cost.

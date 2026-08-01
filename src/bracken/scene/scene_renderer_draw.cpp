@@ -217,7 +217,8 @@ bool SceneRenderer::bind_model_pipeline(bool double_sided, bool depth_equal) {
     bind_cluster_lights(main_render_pass_, context_->current_command_buffer(), 2);
     bind_screen_ao(6);
     bind_ibl(7);
-    bind_local_shadow_atlas(10);
+    bind_rt_shadow_mask(10);
+    bind_local_shadow_atlas(11);
     model_pipeline_double_sided_ = double_sided;
     model_pipeline_depth_equal_ = depth_equal;
     model_pipeline_bound_ = true;
@@ -245,7 +246,8 @@ bool SceneRenderer::bind_skinned_pipeline(bool double_sided, bool depth_equal) {
     bind_cluster_lights(main_render_pass_, context_->current_command_buffer(), 2);
     bind_screen_ao(6);
     bind_ibl(7);
-    bind_local_shadow_atlas(10);
+    bind_rt_shadow_mask(10);
+    bind_local_shadow_atlas(11);
     SDL_GPUBuffer* palette_buf = current_bone_palette_buffer()->handle();
     SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);
     skinned_pipeline_double_sided_ = double_sided;
@@ -257,6 +259,21 @@ bool SceneRenderer::bind_skinned_pipeline(bool double_sided, bool depth_equal) {
 void SceneRenderer::reset_model_bind_state() {
     last_frag_tex_.fill(nullptr);
     model_lighting_valid_ = false;
+}
+
+void SceneRenderer::bind_rt_shadow_mask(uint32_t slot) {
+    // Always bound, even with ray tracing off: model.frag / model_instanced
+    // .frag declare the slot unconditionally, and SDL3 GPU leaves an unbound
+    // fragment sampler descriptor undefined. The white dummy reads 1.0 from
+    // any UV, which is "fully lit" — and rtShadowEnabled is 0 anyway, so it is
+    // never actually sampled.
+    SDL_GPUTexture* white = dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr;
+    SDL_GPUTexture* tex = frame_rt_shadow_texture_ ? frame_rt_shadow_texture_ : white;
+    if (!tex || !default_sampler_ || !main_render_pass_) {
+        return;
+    }
+    SDL_GPUTextureSamplerBinding binding = {tex, default_sampler_};
+    SDL_BindGPUFragmentSamplers(main_render_pass_, slot, &binding, 1);
 }
 
 void SceneRenderer::bind_screen_ao(uint32_t slot, bool enabled) {
@@ -348,10 +365,10 @@ gpu::ModelLightingUniforms SceneRenderer::make_model_lighting(const CameraState&
     u.screenAOTexelX = 1.0f / static_cast<float>(std::max(context_->width(), 1));
     u.screenAOTexelY = 1.0f / static_cast<float>(std::max(context_->height(), 1));
     u.iblEnabled = frame_ibl_active_ ? 1.0f : 0.0f;
-    // Ray-traced sun shadows: the mask rides in G of the screen-space term
-    // texture that frame_ao_texture_ points at (the RT pass substituted it for
-    // GTAO's output and passed AO through in R). One texture, because this
-    // stage is at its 10-sampler ceiling.
+    // Ray-traced sun shadows: sampled from rtShadowTexture (fragment slot 10,
+    // bound by bind_rt_shadow_mask) with the same screenAOTexel* UV scale. The
+    // mask is at the traced pass's own resolution, so the sampler does the
+    // magnification; screenAOTexel* only converts SV_Position to [0,1].
     u.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
     u.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
 
@@ -530,7 +547,8 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
         bind_cluster_lights(main_render_pass_, gpu_cmd, 2);
         bind_screen_ao(6);
         bind_ibl(7);
-        bind_local_shadow_atlas(10);
+        bind_rt_shadow_mask(10);
+        bind_local_shadow_atlas(11);
         lighting_pushed = false;
         bound_type = want;
         return true;
@@ -745,7 +763,8 @@ void SceneRenderer::render_transparent_models(const CameraState& camera) {
             // local light shadows are world-space too and stay on as well.
             bind_screen_ao(6, /*enabled=*/false);
             bind_ibl(7);
-            bind_local_shadow_atlas(10);
+            bind_rt_shadow_mask(10);
+            bind_local_shadow_atlas(11);
             if (skinned) {
                 SDL_GPUBuffer* palette_buf = current_bone_palette_buffer()->handle();
                 SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);
