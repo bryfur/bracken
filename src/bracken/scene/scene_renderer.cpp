@@ -1023,6 +1023,12 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // already binds AO now gets the traced shadow with it.
             if ((gfx.rt_shadows || gfx.rt_reflections) && rt_renderer_ &&
                 post_->offscreen_depth() && cmd) {
+                // Own the acceleration structure here rather than asking the
+                // host to. A toggle flipped at runtime otherwise leaves the
+                // structure unbuilt, RtRenderer::render() returns immediately,
+                // and the setting silently does nothing.
+                ensure_raytracing_scene(gfx.rt_reflections);
+                refresh_raytracing_instances(frame);
                 BRACKEN_PROFILE_ZONE_COLOR("RT shadows", 0x8E44AD);
                 BRACKEN_GPU_SCOPE(cmd, "RT shadows");
                 render::RtRenderer::FrameParams rp;
@@ -1460,6 +1466,43 @@ void SceneRenderer::build_raytracing_scene(const ModelManager& models, bool want
         return;
     }
     rt_renderer_->build_scene(context_->device(), models, want_attributes);
+    rt_scene_built_ = true;
+    rt_scene_has_attributes_ = want_attributes;
+}
+
+void SceneRenderer::ensure_raytracing_scene(bool want_attributes) {
+    if (!rt_renderer_ || context_ == nullptr || model_manager_ == nullptr) {
+        return;
+    }
+    // Reflections need per-triangle attributes; a structure built for shadows
+    // alone does not have them, so enabling reflections later has to rebuild.
+    const bool need_rebuild = !rt_scene_built_ || (want_attributes && !rt_scene_has_attributes_);
+    if (!need_rebuild) {
+        return;
+    }
+    // Building every model's BLAS is on the order of a second for a scene this
+    // size. That is a visible hitch when it happens because someone ticked a
+    // checkbox, so say what is going on rather than looking like a hang.
+    BRACKEN_LOG_INFO(LOG_TAG, "ray tracing enabled: building the acceleration structure{}",
+                     want_attributes ? " with triangle attributes (reflections)" : "");
+    build_raytracing_scene(*model_manager_, want_attributes);
+}
+
+void SceneRenderer::refresh_raytracing_instances(const FramePacket& frame) {
+    if (!rt_renderer_) {
+        return;
+    }
+    // Straight off the packet: whatever the host described this frame is what
+    // the rays see. There is no second list for a host to forget to update.
+    rt_instances_scratch_.clear();
+    const auto models = frame.model_commands();
+    rt_instances_scratch_.reserve(models.size());
+    for (const ModelDrawCommand& cmd : models) {
+        if (cmd.model_handle != INVALID_MODEL_HANDLE) {
+            rt_instances_scratch_.emplace_back(cmd.model_handle, cmd.transform);
+        }
+    }
+    rt_renderer_->set_instances(rt_instances_scratch_);
 }
 
 void SceneRenderer::set_raytracing_instances(

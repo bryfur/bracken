@@ -222,10 +222,13 @@ bool PlaygroundGame::on_init() {
 
     // Before ANY model loads: ray tracing builds its BVH from CPU-side
     // geometry, and upload releases it. The decision cannot wait until the
-    // structure is built, because by then the data is gone.
-    if (!rt_mode_.empty()) {
-        models().set_retain_cpu_geometry(true);
-    }
+    // structure is built, because by then the data is gone -- which is exactly
+    // why this is NOT gated on PLAYGROUND_RT. The dev overlay can turn ray
+    // tracing on at any moment (Graphics panel), and a toggle that silently
+    // does nothing because the geometry was freed an hour ago is worse than
+    // the memory this costs. A shipping game that knows it will never trace
+    // should leave this off and pay nothing.
+    models().set_retain_cpu_geometry(true);
 
     // Dear ImGui developer overlay (F10). In stub builds
     // (BRACKEN_ENABLE_DEV_UI=OFF) init_dev_ui() returns false and every DevUI
@@ -371,30 +374,18 @@ bool PlaygroundGame::on_init() {
     lantern_model_ = models().get_handle("lantern");
 
     // --- Ray tracing (opt-in) -----------------------------------------
-    // PLAYGROUND_RT=shadows | reflections | both. Off unless asked for: this
-    // is software ray tracing over a BVH, and it is not free.
+    // PLAYGROUND_RT=shadows | reflections | both, or the dev overlay's
+    // Graphics panel at runtime — both go through the same GraphicsSettings
+    // flags, and the engine builds/refreshes the acceleration structure from
+    // the frame packet itself. Off unless asked for: this is software ray
+    // tracing over a BVH, and it is not free.
     if (!rt_mode_.empty()) {
         const std::string& mode = rt_mode_;
         auto edit = edit_graphics_settings();
         auto& gs = *edit;
         gs.rt_shadows = mode == "shadows" || mode == "both";
         gs.rt_reflections = mode == "reflections" || mode == "both";
-        if (gs.rt_shadows || gs.rt_reflections) {
-            scene_renderer().build_raytracing_scene(models(), gs.rt_reflections);
-            std::vector<std::pair<bracken::ModelHandle, glm::mat4>> rt_instances;
-            if (has_village_) {
-                rt_instances.emplace_back(village_model_, village_transform_);
-            }
-            for (const Prop& prop : props_) {
-                rt_instances.emplace_back(prop.model, prop.transform);
-            }
-            scene_renderer().set_raytracing_instances(rt_instances);
-            const auto& st = scene_renderer().raytracing_stats();
-            BRACKEN_LOG_INFO("playground", "RT: shadows={} reflections={} accel={:.1f} MB",
-                             gs.rt_shadows, gs.rt_reflections,
-                             static_cast<double>(st.acceleration_bytes) / (1024.0 * 1024.0));
-            request_graphics_settings(gs);
-        }
+        request_graphics_settings(gs);
     }
 
     // --- Tier 3: nav grid ---------------------------------------------
@@ -1777,6 +1768,21 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
     }
 
     // Late enough that all the settings flips above are visible in the image.
+    // PLAYGROUND_RT_LATE=<mode> flips ray tracing on mid-run, which is what
+    // the dev overlay's Graphics checkboxes do. It exists because that path
+    // was broken while PLAYGROUND_RT (set before any model loads) worked
+    // perfectly: the toggle had no acceleration structure, and no CPU geometry
+    // left to build one from. Anything that regresses it must fail here.
+    if (std::getenv("PLAYGROUND_RT_LATE") != nullptr && frame_ == 5) {
+        auto late_edit = edit_graphics_settings();
+        auto& late_gs = *late_edit;
+        const std::string late_mode = std::getenv("PLAYGROUND_RT_LATE");
+        late_gs.rt_shadows = (late_mode == "shadows" || late_mode == "both");
+        late_gs.rt_reflections = (late_mode == "reflections" || late_mode == "both");
+        request_graphics_settings(late_gs);
+        BRACKEN_LOG_INFO("playground", "LATE RT toggle -> shadows={} reflections={}",
+                         late_gs.rt_shadows, late_gs.rt_reflections);
+    }
     if (frame_ == std::max(1, smoke_frames_ - 20)) {
         request_screenshot(SMOKE_SCREENSHOT_PATH);
     }

@@ -494,6 +494,23 @@ private:
     /// did not run. The forward shaders read it to drop their IBL specular
     /// exactly where a traced reflection will replace it.
     float frame_rt_reflection_max_roughness_ = 0.0f;
+    /// Whether the BLAS set has been built, and whether it was built with the
+    /// per-triangle attributes reflections need. Both drive the lazy (re)build
+    /// in ensure_raytracing_scene.
+    bool rt_scene_built_ = false;
+    bool rt_scene_has_attributes_ = false;
+    /// Reused across frames so rebuilding the TLAS from the packet does not
+    /// allocate every frame.
+    std::vector<std::pair<ModelHandle, glm::mat4>> rt_instances_scratch_;
+
+    /// Build (or rebuild) the acceleration structure if ray tracing needs one
+    /// and the current one will not do. Called from the frame, so turning a
+    /// toggle on mid-session works without the host doing anything.
+    void ensure_raytracing_scene(bool want_attributes);
+    /// Refresh the TLAS from THIS frame's draws — the packet is the source of
+    /// truth for what is on screen, so the traced scene cannot desync from the
+    /// rasterized one.
+    void refresh_raytracing_instances(const FramePacket& frame);
     std::unique_ptr<gpu::GPUTexture> default_normal_texture_; // 1x1 (128,128,255) flat tangent-space normal
     std::unique_ptr<gpu::GPUTexture> dummy_black_texture_;    // 1x1 black emissive fallback
     std::unique_ptr<gpu::GPUTexture> dummy_black_cube_;       // 1x1x6 black cube for the IBL slots when
