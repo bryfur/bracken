@@ -96,3 +96,64 @@ TEST(MotionHistory, ClearDropsEverything) {
     h.end_frame();
     EXPECT_EQ(h.find_prev(1), nullptr);
 }
+
+// ============================================================================
+// Open-addressed storage (phase 10d). The public contract above is the real
+// specification; these pin the behaviours the table implementation could get
+// wrong and the maps could not: growth, probe-run collisions, and the stamp
+// bump that replaced the per-frame clear.
+// ============================================================================
+
+TEST(MotionHistory, GrowsPastInitialCapacityAndKeepsEveryEntry) {
+    MotionHistory h;
+    // Well past the initial 64 slots, so the table rehashes several times.
+    constexpr uint32_t COUNT = 5000;
+    for (uint32_t i = 1; i <= COUNT; ++i) {
+        h.record(i, translation(static_cast<float>(i)), i);
+    }
+    h.end_frame();
+
+    EXPECT_EQ(h.size(), COUNT);
+    for (uint32_t i = 1; i <= COUNT; ++i) {
+        const MotionHistory::Entry* e = h.find_prev(i);
+        ASSERT_NE(e, nullptr) << "id " << i;
+        EXPECT_EQ(e->model, translation(static_cast<float>(i))) << "id " << i;
+        EXPECT_EQ(e->palette_offset, i) << "id " << i;
+    }
+    EXPECT_EQ(h.find_prev(COUNT + 1), nullptr); // absent id, after a full table
+}
+
+TEST(MotionHistory, IdsCollidingInTheSameProbeRunStayDistinct) {
+    MotionHistory h;
+    // Fibonacci hashing takes the high bits of key * 2654435769, so ids one
+    // apart land in adjacent slots — consecutive ids ARE the collision case.
+    for (uint32_t i = 100; i < 140; ++i) {
+        h.record(i, translation(static_cast<float>(i)));
+    }
+    h.end_frame();
+    for (uint32_t i = 100; i < 140; ++i) {
+        const MotionHistory::Entry* e = h.find_prev(i);
+        ASSERT_NE(e, nullptr) << "id " << i;
+        EXPECT_EQ(e->model, translation(static_cast<float>(i))) << "id " << i;
+    }
+    // A miss whose probe run starts inside that cluster must still terminate.
+    EXPECT_EQ(h.find_prev(139u + 4096u), nullptr);
+}
+
+TEST(MotionHistory, SurvivesManyFramesOfChurnWithoutLeakingStaleEntries) {
+    MotionHistory h;
+    // Each frame records a disjoint id window; the previous window must be
+    // pruned by end_frame() alone (the stamp bump), never resurface, and the
+    // table must not grow without bound.
+    for (uint32_t frame = 0; frame < 200; ++frame) {
+        for (uint32_t k = 0; k < 32; ++k) {
+            h.record(frame * 1000 + k + 1, translation(static_cast<float>(k)));
+        }
+        h.end_frame();
+        EXPECT_EQ(h.size(), 32u) << "frame " << frame;
+        if (frame > 0) {
+            EXPECT_EQ(h.find_prev((frame - 1) * 1000 + 1), nullptr) << "frame " << frame;
+        }
+        EXPECT_NE(h.find_prev(frame * 1000 + 1), nullptr) << "frame " << frame;
+    }
+}

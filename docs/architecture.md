@@ -335,7 +335,10 @@ see a lane.
 Model and skinned commands carry an optional `motion_id` (default 0): a
 host-unique nonzero id lets the velocity prepass pair this frame's transform
 (and skinned palette) with last frame's via `scene::MotionHistory`; id 0 is
-treated as static (camera-only velocity).
+treated as static (camera-only velocity). `MotionHistory` is two open-addressed
+tables (linear probing, Fibonacci hash, per-slot frame stamp) swapped at
+`end_frame()`, so the per-frame prune is a stamp bump rather than a node-by-node
+clear and steady-state frames allocate nothing.
 
 Lights are submitted as **host descriptors**, not as the GPU-layout PODs:
 `add_point_light` takes `render::lighting::PointLightDesc`, `add_spot_light`

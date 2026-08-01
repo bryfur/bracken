@@ -1295,6 +1295,31 @@ cmake --build build-tsan && ctest --test-dir build-tsan --output-on-failure   # 
 **Rollback:** one commit per item, each independently revertible. Items are ordered
 10a→10d and none depends on another.
 
+**Measured outcome (landed 2026-07-31).** The gates above were run in `build-bench/`
+(RelWithDebInfo) at `BRACKEN_WORKERS=4` and `8`, 7 repetitions, medians. Two items passed
+and landed; two were measured and **rejected**. The benchmarks themselves landed either way —
+they are the evidence, and the rejections are only trustworthy because they are reproducible.
+
+- **10a — landed.** `BM_ParallelForDispatchParked` (a dispatch against a pool that has been
+  idle past its spin window — the state the frame's FIRST fan-out actually finds):
+  −37 %/−44 %/−58 % at 32/64/256 chunks (w4) and −23 %/−32 %/−66 % (w8). Against a *hot*
+  pool (`BM_ParallelForDispatch`, back-to-back dispatches, where the notify is nearly free)
+  it is −8 % to −16 % — both numbers are reported because both regimes are real. The
+  end-to-end number that decided it: `BM_PrepInstanceBatches` −9 % to −25 %.
+- **10b — REJECTED, measured.** SoA model bounds moved `BM_PrepInstanceBatches` by
+  **−4.5 % to −9.5 %** against a ≥ 15 % gate (64 registered models, matching the
+  playground's ~60; at 6 models it was **0 %**). The premise — a cache miss per command on
+  the `Model*` chase — does not hold here: ~60 models is ~4 KB of touched cache lines and
+  stays resident in L1. Reverted rather than landed at a third of its gate for a permanent
+  second source of truth for bounds.
+- **10c — REJECTED, measured.** `BM_TerrainCullTileRuns` puts ONE cull of the playground's
+  terrain (52×52 tiles) at **3.5 µs**. The double-cull elimination removes exactly one of the
+  six culls a frame does (forward + prepass + 4 cascades), so its entire ceiling is 3.5 µs on
+  a ~9.5 ms frame — 0.04 % — bought with a cached run list whose validity depends on a
+  frustum-pointer match and on pass ordering (cascades record before the prepass). Not worth
+  the hazard at that size. The benchmark stays as the number that says so.
+- **10d — landed.** `BM_MotionHistoryRecordFind` −87 % (256 ids) and −80 % (4096 ids).
+
 ---
 
 ### Phase 11 — Public surface and documentation
