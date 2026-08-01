@@ -79,6 +79,9 @@
 // Particle effects
 // ---------------------------------------------------------------------------
 #include "bracken/action_map.hpp"                // named game actions bound to keys/mouse/pad, with rebinding
+#include "bracken/async_model_loader.hpp"      // decode models on the pool, upload at the fence
+#include "bracken/core/asset/asset_pack.hpp"   // ship assets as one file instead of thousands
+#include "bracken/core/random.hpp"             // deterministic RNG: seed it, do not derive from game state
 #include "bracken/audio/audio_engine.hpp"      // playback device, mixer, 3D voices — Application::audio()
 #if BRACKEN_SYNTH
 #include "bracken/audio/music/song.hpp"         // Song/Track/Pattern — the data play_music() takes

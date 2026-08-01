@@ -667,3 +667,47 @@ std::vector<Placement> build_layout() {
 }
 
 } // namespace playground::layout
+
+// ---------------------------------------------------------------------------
+// Asset packing (playground --build-pack out.pack)
+// ---------------------------------------------------------------------------
+
+#include "bracken/core/asset/asset_pack.hpp"
+
+#include <algorithm>
+
+#include <filesystem>
+#include <iostream>
+
+namespace playground {
+
+bool build_asset_pack(const std::string& out_path) {
+    namespace fs = std::filesystem;
+    const fs::path models = fs::path("assets") / "models";
+    if (!fs::exists(models)) {
+        std::cerr << "--build-pack: no " << models.string()
+                  << " directory here; run from the staged playground output dir\n";
+        return false;
+    }
+
+    std::vector<std::pair<std::string, std::string>> sources;
+    for (const auto& entry : fs::directory_iterator(models)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".glb") {
+            // Logical name is the path a game would ask for, not where the
+            // file happens to sit on this machine.
+            sources.emplace_back("models/" + entry.path().filename().string(),
+                                 entry.path().string());
+        }
+    }
+    std::sort(sources.begin(), sources.end());
+
+    auto r = bracken::core::asset::AssetPack::build(out_path, sources);
+    if (!r) {
+        std::cerr << "--build-pack failed: " << bracken::core::asset::to_string(r.error()) << "\n";
+        return false;
+    }
+    std::cout << "packed " << sources.size() << " models into " << out_path << "\n";
+    return true;
+}
+
+} // namespace playground

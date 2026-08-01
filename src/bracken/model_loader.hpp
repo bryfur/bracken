@@ -264,6 +264,26 @@ public:
     /// Parse a .glb into `model`. Pure CPU work on caller-owned data — no
     /// shared state, thread-agnostic (Phase 6 streaming will run it on jobs).
     [[nodiscard]] static bool load_glb(const std::string& path, Model& model);
+
+    /**
+     * Parse a .glb from bytes already in memory — from an AssetPack entry, a
+     * downloaded buffer, or anything else.
+     *
+     * Worker-safe: every piece of parser state is per-call, so any number of
+     * threads may decode different models concurrently. It produces a Model
+     * with CPU-side geometry only; ModelLoader::upload_to_gpu still has to run
+     * on the main thread, which is exactly the split AsyncModelLoader uses.
+     *
+     * `name` is used only for diagnostics.
+     */
+    [[nodiscard]] static bool load_glb_from_memory(std::span<const std::byte> bytes,
+                                                   const std::string& name, Model& model);
+
+private:
+    [[nodiscard]] static bool load_glb_impl(const std::string& path,
+                                            std::span<const std::byte> bytes, Model& model);
+
+public:
     /// Create GPU buffers/textures for every un-uploaded mesh and free the
     /// CPU-side copies. Main-thread tier (asserted): GPU resource creation.
     static void upload_to_gpu(gpu::GPUDevice& device, Model& model);

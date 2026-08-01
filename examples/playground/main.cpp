@@ -67,6 +67,13 @@ int main(int argc, char** argv) {
     int smoke_frames = -1;
     bool engine_camera = true;
     for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--build-pack") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "--build-pack needs an output path\n";
+                return 2;
+            }
+            return playground::build_asset_pack(argv[++i]) ? 0 : 1;
+        }
 #if BRACKEN_SYNTH
         if (std::strcmp(argv[i], "--render-music") == 0) {
             if (i + 1 >= argc) {

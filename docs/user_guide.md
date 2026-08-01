@@ -7369,3 +7369,56 @@ is its own bin. On the playground's scene it is a wash — −9.6% triangles for
 already 40–1700 triangles each and the frame is fill-bound rather than
 vertex-bound. It pays on scenes with many *distant, dense* meshes. Run your own
 A/B; the playground's is `PLAYGROUND_LOD=1`.
+
+## Asset packs and async loading
+
+### Packs
+
+`playground --build-pack village.pack` bundles a directory of assets into one
+file: one artifact to ship, one file handle, and a sorted TOC so lookups are a
+binary search. Entry bytes are read on demand, so a pack may be larger than
+RAM, and `read()` is worker-safe.
+
+On a warm cache with 52 models the pack is not measurably faster to load than
+loose files — its value is shipping, patching and integrity, not startup time.
+Measure your own case rather than assuming.
+
+### Async loading
+
+Decoding a `.glb` is pure CPU work over per-call state, so it belongs on the
+job pool; creating GPU resources is main-thread tier, so it belongs at the
+frame fence. `AsyncModelLoader` splits exactly there.
+
+```cpp
+AsyncModelLoader loader(models(), pack_or_nullptr);
+loader.request_all(requests);
+
+// During a loading screen — helps the pool while it waits:
+const auto done = loader.drain();
+
+// Or while the game runs, capped so a frame does not spike:
+const auto done = loader.pump(/*max_uploads=*/2);
+```
+
+Measured on the playground: **3.5 s → 2.2 s startup (~36%)** for 52 models,
+one variable (`PLAYGROUND_ASYNC=0` restores the serial path).
+
+Models are registered in **request order**, never completion order. Handles are
+handed out sequentially and end up inside draw commands, so registering
+whatever finished first would make the frame's content differ between runs and
+between worker counts.
+
+## Randomness
+
+`core::Rng` is deterministic **by seed**. Seed it from a constant and a run
+repeats exactly while still varying from draw to draw.
+
+Do not fake randomness by deriving a value from game state you happen to have.
+It is reproducible and usually wrong: the playground's footstep pitch was once
+derived from the player's X coordinate, which is constant while running along
+Z — so every step came out at the same pitch, the exact artifact the scatter
+existed to prevent.
+
+If you want run-to-run variation, seed it yourself, deliberately. Nothing in
+the engine seeds an RNG from a clock, because a stream that differs per run
+puts whatever it drives outside every regression gate.

@@ -2,6 +2,8 @@
 #include "music.hpp"
 
 #include "bracken/audio/audio_engine.hpp"
+#include "bracken/async_model_loader.hpp"
+#include "bracken/core/asset/asset_pack.hpp"
 #include "bracken/save/save_document.hpp"
 
 #include "character.hpp"
@@ -200,6 +202,11 @@ bool PlaygroundGame::on_init() {
     // exactly one thing.
     if (const char* env = SDL_getenv("PLAYGROUND_LOD"); env != nullptr) {
         lod_disabled_ = env[0] == '0';
+    }
+    // PLAYGROUND_ASYNC=0 forces the old one-at-a-time load, so the async win is
+    // a measurement rather than a claim.
+    if (const char* env = SDL_getenv("PLAYGROUND_ASYNC"); env != nullptr && env[0] == '0') {
+        async_load_disabled_ = true;
     }
 
     if (!init_renderer(1600, 900, "bracken playground", WORLD, WORLD)) {
@@ -487,6 +494,9 @@ void PlaygroundGame::register_models() {
     // playground degrades to the procedural-only scene.
     village_model_ = mm.load_model("village", asset_path("assets/models/village.glb"));
     has_village_ = village_model_ != INVALID_MODEL_HANDLE;
+
+    // Decoded on the worker pool rather than one at a time on this thread.
+    std::vector<bracken::AsyncModelLoader::Request> nature_requests;
     if (has_village_) {
         for (const char* name :
              {"prop_crate", "prop_wagon", "prop_fence", "prop_fence_ext", "prop_bricks",
@@ -502,20 +512,48 @@ void PlaygroundGame::register_models() {
               "nature_flower_4_group", "nature_flower_6", "nature_flower_7_group", "nature_mushroom_common",
               "nature_mushroom_redcap", "nature_pebble_round_1", "nature_pebble_round_2", "nature_pebble_round_3",
               "nature_pebble_square_1", "nature_pebble_square_2"}) {
-            constexpr float k_lod_ratios[] = {0.35f, 0.10f};
-            constexpr float k_lod_thresholds[] = {0.040f, 0.014f};
+            // Queue rather than load: decoding is worker-safe, so the whole
+            // pack is decoded in parallel and only the GPU upload comes back
+            // to this thread. (The LOD path stays synchronous — build_lods
+            // has to run between decode and upload, and PLAYGROUND_LOD=1 is
+            // a measurement hook, not the default.)
             const std::string path = asset_path(std::string("assets/models/") + name + ".glb");
-            const bracken::ModelHandle h =
-                lod_disabled_ ? mm.load_model(name, path)
-                              : mm.load_model_with_lods(name, path, k_lod_ratios, k_lod_thresholds);
-            // Two generated LOD levels for the scattered flora. These are the
-            // instanced props that fill the middle distance, so they are where
-            // the triangle budget actually goes; the village itself is a single
-            // large model the player is usually inside, where LOD would switch
-            // on the whole building at once.
-            // Thresholds are apparent size (radius/distance): ~1/25th of the
-            // distance drops to level 1, ~1/70th to level 2.
-            (void)h;
+            if (lod_disabled_ && !async_load_disabled_) {
+                nature_requests.push_back({name, path});
+            } else if (lod_disabled_) {
+                (void)mm.load_model(name, path); // PLAYGROUND_ASYNC=0: the old serial path
+            } else {
+                constexpr float k_lod_ratios[] = {0.35f, 0.10f};
+                constexpr float k_lod_thresholds[] = {0.040f, 0.014f};
+                (void)mm.load_model_with_lods(name, path, k_lod_ratios, k_lod_thresholds);
+            }
+        }
+
+        if (!nature_requests.empty()) {
+            // PLAYGROUND_PACK=<file> loads through an asset pack instead of
+            // loose files — build one with `playground --build-pack out.pack`.
+            std::optional<bracken::core::asset::AssetPack> pack;
+            if (const char* pack_path = SDL_getenv("PLAYGROUND_PACK")) {
+                auto opened = bracken::core::asset::AssetPack::open(pack_path);
+                if (opened) {
+                    pack = std::move(opened).value();
+                    // Sources become logical pack names rather than paths.
+                    for (auto& r : nature_requests) {
+                        r.source = "models/" + r.name + ".glb";
+                    }
+                } else {
+                    BRACKEN_LOG_WARN("playground", "PLAYGROUND_PACK='{}': {}; using loose files",
+                                     pack_path, bracken::core::asset::to_string(opened.error()));
+                }
+            }
+
+            bracken::AsyncModelLoader loader(mm, pack ? &*pack : nullptr);
+            loader.request_all(nature_requests);
+            // Nothing to overlap with during boot, so drain — which helps the
+            // pool while it waits rather than idling.
+            const auto completed = loader.drain();
+            BRACKEN_LOG_INFO("playground", "Decoded {} nature models on the pool ({} failed)",
+                             completed.size(), loader.failed_count());
         }
     } else {
         BRACKEN_LOG_WARN("playground",
@@ -1752,11 +1790,15 @@ void PlaygroundGame::update_player(float dt) {
                                    // Quieter when walking than running: velocity
                                    // is the cheapest cue that a step has weight.
                                    .gain = 0.35f + 0.45f * std::min(player_speed_ / RUN_SPEED, 1.0f),
-                                   // Slight pitch scatter, derived from position
-                                   // rather than random so the smoke run stays
-                                   // reproducible. Identical repeats are the
-                                   // thing that makes footsteps sound fake.
-                                   .pitch = 0.92f + 0.16f * std::fabs(std::fmod(player_pos_.x * 0.013f, 1.0f)),
+                                   // Real per-step scatter from a stream seeded
+                                   // to a constant: varied every step, and
+                                   // still identical run to run. Deriving it
+                                   // from player_pos_.x instead was
+                                   // reproducible and WRONG — x is constant
+                                   // while running along Z, so every footstep
+                                   // came out at the same pitch, which is the
+                                   // artifact the scatter exists to prevent.
+                                   .pitch = step_rng_.next_range(0.92f, 1.08f),
                                    .space = bracken::audio::SoundSpace::World,
                                    .position = player_pos_,
                                    .min_distance = 250.0f,

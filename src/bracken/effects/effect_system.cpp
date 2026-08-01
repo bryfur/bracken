@@ -1,6 +1,7 @@
 #include "effect_system.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/core/logger.hpp"
+#include "bracken/core/random.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/scene/frame_builder.hpp"
 #include <algorithm>
@@ -15,26 +16,18 @@ using bracken::VelocityType;
 
 namespace {
 
-// SplitMix64. The particle streams must be reproducible run-to-run AND
-// independent of which worker happens to run the sim job, so the generator
-// state lives on the emitter that draws from it rather than in a thread_local:
-// a thread_local mt19937 seeded from std::random_device gave a different
-// stream on every run and interleaved differently at different worker counts,
-// which put particle positions — and therefore the sealed packet — outside any
-// regression gate. Advancing a per-emitter counter makes each draw a pure
-// function of (emitter seed, draw index).
-uint64_t splitmix64(uint64_t& state) {
-    uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
-}
-
+// Particle streams live on the emitter that draws from them (see
+// EmitterInstance::rng) rather than in a shared or thread_local generator: a
+// thread_local mt19937 seeded from std::random_device gave a different stream
+// on every run and interleaved differently at different worker counts, which
+// put particle positions — and therefore the sealed packet — outside any
+// regression gate. core::Rng is the same SplitMix64 this used to spell out
+// inline; the packet digest is what proves the extraction changed nothing.
 float random_float(uint64_t& rng, float min, float max) {
-    // Top 24 bits → [0,1): exactly representable in a float mantissa, so the
-    // mapping carries no rounding surprise across platforms.
-    const float unit = static_cast<float>(splitmix64(rng) >> 40) / 16777216.0f;
-    return min + unit * (max - min);
+    core::Rng r(rng);
+    const float v = r.next_range(min, max);
+    rng = r.state();
+    return v;
 }
 
 } // anonymous namespace

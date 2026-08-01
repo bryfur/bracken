@@ -129,6 +129,20 @@ bool write_image_data(const std::string* basepath, const std::string* filename, 
 namespace bracken {
 
 bool ModelLoader::load_glb(const std::string& path, Model& model) {
+    return load_glb_impl(path, {}, model);
+}
+
+bool ModelLoader::load_glb_from_memory(std::span<const std::byte> bytes, const std::string& name,
+                                       Model& model) {
+    if (bytes.empty()) {
+        BRACKEN_LOG_ERROR("model", "load_glb_from_memory('{}'): no data", name);
+        return false;
+    }
+    return load_glb_impl(name, bytes, model);
+}
+
+bool ModelLoader::load_glb_impl(const std::string& path, std::span<const std::byte> bytes,
+                                Model& model) {
     BRACKEN_PROFILE_ZONE_TAG(path.c_str());
     tinygltf::Model gltf;
     tinygltf::TinyGLTF loader;
@@ -139,7 +153,14 @@ bool ModelLoader::load_glb(const std::string& path, Model& model) {
     loader.SetImageLoader(load_image_data, nullptr);
     loader.SetImageWriter(write_image_data, nullptr);
 
-    bool ret = loader.LoadBinaryFromFile(&gltf, &err, &warn, path);
+    // Everything below is per-call local state, which is what makes parsing
+    // worker-safe and lets the async loader decode many models at once.
+    const bool ret =
+        bytes.empty()
+            ? loader.LoadBinaryFromFile(&gltf, &err, &warn, path)
+            : loader.LoadBinaryFromMemory(&gltf, &err, &warn,
+                                          reinterpret_cast<const unsigned char*>(bytes.data()),
+                                          static_cast<unsigned int>(bytes.size()));
 
     if (!warn.empty()) {
         BRACKEN_LOG_WARN("model", "Warning loading {}: {}", path, warn);

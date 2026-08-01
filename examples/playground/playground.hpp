@@ -14,11 +14,18 @@
 #include "sfx.hpp"
 
 #include "bracken/action_map.hpp"
+#include "bracken/core/random.hpp"
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
 
 namespace playground {
+
+/** Bundle every .glb under assets/models into one pack file and exit. The
+ *  shippable form of the asset directory: one artifact, one file handle, and a
+ *  sorted TOC so lookups are a binary search rather than a scan. */
+[[nodiscard]] bool build_asset_pack(const std::string& out_path);
+
 
 /**
  * Medieval-village demo: walk a villager around a hamlet assembled from the
@@ -268,6 +275,10 @@ private:
     // accelerates. Only the synth build has footsteps to schedule.
     float step_distance_ = 0.0f;
     bool was_in_water_ = false;         // rising edge = entry splash
+    // Footstep pitch scatter. Seeded to a constant, so steps vary from each
+    // other but a run is reproducible — determinism belongs in the seed, not
+    // in deriving the value from game state that may not be varying.
+    bracken::core::Rng step_rng_{0x5EED'F007ULL};
 #endif
     // Generated LODs are OFF here by default, and that is a measured decision,
     // not an oversight. A/B on this scene (PLAYGROUND_LOD=1 turns them on):
@@ -279,6 +290,8 @@ private:
     // vertex-bound. The engine feature is real and tested; this particular
     // scene is simply not one that benefits.
     bool lod_disabled_ = true;
+    // PLAYGROUND_ASYNC=0 restores serial model loading (the A/B baseline).
+    bool async_load_disabled_ = false;
     float ambient_ripple_timer_ = 0.0f; // occasional ambient rings on the river
 
     // Game state
