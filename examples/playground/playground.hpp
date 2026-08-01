@@ -14,7 +14,10 @@
 #include "sfx.hpp"
 
 #include "bracken/action_map.hpp"
+#include "bracken/animation/attachment.hpp"
 #include "bracken/core/random.hpp"
+#include "bracken/navigation/nav_grid.hpp"
+#include "bracken/physics/character_controller.hpp"
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
@@ -157,6 +160,7 @@ private:
     void update_player(float dt);
     void update_camera(bracken::SimFrame& sim); // non-const: records camera-forward feedback
     void update_orbs(float dt);
+    void update_wanderer(float dt); // nav-grid pathing demo
     void update_chimneys(float dt);
     void update_day_weather(float dt); // sun clock + weather -> env staging,
                                        // rain layer/splash/ripple emission
@@ -268,6 +272,33 @@ private:
     bracken::ActionId act_forward_{}, act_back_{}, act_left_{}, act_right_{};
     bracken::ActionId act_run_{}, act_attack_{}, act_flashlight_{};
     bracken::ActionId act_quicksave_{}, act_quickload_{};
+    bracken::ActionId act_jump_{}, act_crouch_{};
+
+    // --- Tier 3 demos ---------------------------------------------------
+    /// Replaces the old `player_pos_.y = terrain_height(...)` snap: real
+    /// slopes, step-up, air time and jump.
+    bracken::physics::CharacterController character_;
+    /// A lantern carried in the character's hand, placed by the bone rather
+    /// than by hand-written matrix math.
+    bracken::animation::Attachment lantern_attach_{};
+    bracken::ModelHandle lantern_model_ = bracken::INVALID_MODEL_HANDLE;
+    /// Walkability + A* over the terrain, for the wandering villager.
+    bracken::nav::NavGrid nav_;
+    /// A villager that paths around the village on the nav grid.
+    struct Wanderer {
+        glm::vec3 position{0.0f};
+        float facing = 0.0f;
+        std::vector<glm::vec3> path;
+        std::size_t waypoint = 0;
+        float repath_timer = 0.0f;
+    } wanderer_;
+    bool nav_debug_draw_ = false;
+    bool jump_requested_ = false; // edge, consumed by the controller
+    bool crouch_held_ = false;
+    int smoke_grounded_frames_ = 0;
+    int smoke_air_frames_ = 0;
+    float smoke_max_height_ = 0.0f;
+    glm::vec3 wanderer_start_{0.0f};
 
 #if BRACKEN_SYNTH
     // Footfalls are driven by distance travelled, not by a timer, so the step

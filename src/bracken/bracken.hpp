@@ -78,6 +78,9 @@
 // ---------------------------------------------------------------------------
 // Particle effects
 // ---------------------------------------------------------------------------
+#include "bracken/animation/attachment.hpp"     // put a sword in a hand: bone-space attachments
+#include "bracken/navigation/nav_grid.hpp"      // walkability + A* pathfinding
+#include "bracken/physics/character_controller.hpp" // capsule controller: slopes, steps, jump
 #include "bracken/action_map.hpp"                // named game actions bound to keys/mouse/pad, with rebinding
 #include "bracken/async_model_loader.hpp"      // decode models on the pool, upload at the fence
 #include "bracken/core/asset/asset_pack.hpp"   // ship assets as one file instead of thousands

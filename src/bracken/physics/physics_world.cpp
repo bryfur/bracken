@@ -498,14 +498,19 @@ bool PhysicsWorld::is_active(BodyId id) const {
 }
 
 PhysicsWorld::RayHit PhysicsWorld::cast_ray(const glm::vec3& origin,
-                                            const glm::vec3& direction_and_length) const {
+                                            const glm::vec3& direction_and_length,
+                                            BodyId ignore_body) const {
     RayHit out;
     if (!impl_) {
         return out;
     }
     const JPH::RRayCast ray{to_jolt(origin), to_jolt(direction_and_length)};
     JPH::RayCastResult hit;
-    if (!impl_->physics.GetNarrowPhaseQuery().CastRay(ray, hit)) {
+    const JPH::BroadPhaseLayerFilter bp_filter;
+    const JPH::ObjectLayerFilter obj_filter;
+    const JPH::IgnoreSingleBodyFilter body_filter{jolt_id(ignore_body)};
+    if (!impl_->physics.GetNarrowPhaseQuery().CastRay(ray, hit, bp_filter, obj_filter,
+                                                      body_filter)) {
         return out;
     }
     out.hit = true;

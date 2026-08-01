@@ -153,7 +153,14 @@ public:
 
     // Casts a ray of length |direction_and_length| from origin; returns the
     // closest hit against any body.
-    RayHit cast_ray(const glm::vec3& origin, const glm::vec3& direction_and_length) const;
+    //
+    // `ignore_body` skips one body. A character controller needs this for its
+    // own ground probe: a character usually has a kinematic body tracking it,
+    // and without the filter the downward ray hits that body's own capsule
+    // instead of the floor — which reads as the character standing on itself
+    // and levitating a little further every frame.
+    RayHit cast_ray(const glm::vec3& origin, const glm::vec3& direction_and_length,
+                    BodyId ignore_body = INVALID_BODY_ID) const;
 
     struct ShapeContact {
         glm::vec3 normal{0};   // unit push direction for the queried shape (world space)

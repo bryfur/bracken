@@ -7422,3 +7422,80 @@ existed to prevent.
 If you want run-to-run variation, seed it yourself, deliberately. Nothing in
 the engine seeds an RNG from a clock, because a stream that differs per run
 puts whatever it drives outside every regression gate.
+
+## Character controller
+
+A capsule controller with slopes, step-up, ground snapping, crouch and jump.
+It is kinematic, not a rigid body: a dynamic-body character is shoved by every
+crate and slides down every ramp — physically honest and uniformly hated.
+
+```cpp
+physics::CharacterConfig cfg;
+cfg.step_height = 45.0f;        // curbs and doorway sills
+cfg.max_slope_degrees = 50.0f;  // steeper than this you slide
+character_.configure(cfg);
+
+physics::CharacterInput in;
+in.desired_velocity = move_dir * speed;   // horizontal, world space
+in.jump = jump_pressed;                   // an edge, not held
+in.crouch = crouch_held;
+
+character_.update(physics_, in, dt, /*self=*/my_body, /*ground=*/terrain_body);
+pos = character_.state().position;        // FEET, not centre
+```
+
+The two body filters matter, and both were learned the hard way:
+
+- **`self`** is the character's own kinematic body. Excluded from everything —
+  otherwise the ground probe hits the character's own capsule and it stands on
+  itself, climbing a little further every frame.
+- **`ground`** is the terrain collider. Excluded from *depenetration only*, and
+  deliberately still visible to the ground ray. A capsule resting on a
+  heightfield always overlaps it slightly, and pushing out of that every frame
+  walks the character into the sky. **Walls are depenetration's job; floors are
+  the ray's**, and depenetration is horizontal-only for the same reason: inside
+  a large volume the shortest way out is up.
+
+`coyote_time` and `jump_buffer` default to non-zero on purpose. Players press
+jump a frame early or late constantly, and without them the game feels
+unresponsive in a way nobody can articulate.
+
+## Bone attachment
+
+```cpp
+sword_ = animation::make_attachment(model->skeleton, "RightArm", grip_offset);
+...
+frame.draw_model(sword_model, sword_.world(character_transform, anim_player_));
+```
+
+It reads the joint's **world transform**, not its skinning matrix. The two are
+constantly confused; the difference is the inverse bind matrix, and attaching
+with a skinning matrix puts the object near the origin at a strange angle.
+
+An unknown bone name yields an invalid attachment that follows the model
+origin, plus a warning — a renamed bone in an updated asset drops the sword
+rather than corrupting the frame.
+
+## Navigation
+
+```cpp
+nav::NavGridConfig cfg;
+cfg.cell_size = 120.0f;
+cfg.width = cfg.depth = 66;
+cfg.max_slope_degrees = 45.0f;   // keep it UNDER the controller's max_slope
+nav_.build(cfg, height_fn, blocked_fn);
+
+std::vector<glm::vec3> path;
+if (nav_.find_path(from, to, path)) { /* walk the waypoints */ }
+```
+
+Paths are string-pulled before they are returned; raw A* follows the grid and
+an agent walking it reads as drunk.
+
+Keep the nav slope limit slightly under the controller's: a path over ground
+the controller refuses to climb is worse than no path, because the agent walks
+into it and sticks.
+
+Exclude the ground itself from `blocked_fn`. Testing a capsule that rests on
+the terrain marks every cell blocked — the playground's first grid came out 0%
+walkable for exactly that reason.

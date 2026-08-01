@@ -315,6 +315,74 @@ bool PlaygroundGame::on_init() {
     // spot and the player spawn.
     setup_physics();
 
+    // --- Tier 3: character controller ---------------------------------
+    {
+        bracken::physics::CharacterConfig cc;
+        cc.radius = 26.0f;
+        cc.stand_height = 150.0f;
+        cc.crouch_height = 85.0f;
+        cc.step_height = 45.0f;      // village doorsills and the tavern porch
+        cc.max_slope_degrees = 50.0f;
+        cc.gravity = -2400.0f;       // snappier than earth: game feel, not physics
+        cc.jump_speed = 850.0f;
+        cc.ground_snap = 50.0f;
+        character_.configure(cc);
+        character_.set_position(player_pos_);
+    }
+
+    // --- Tier 3: bone attachment --------------------------------------
+    // A lantern in the character's hand, placed BY THE BONE. The engine finds
+    // the joint; the host supplies only a grip offset.
+    if (Model* pm = models().get_model(player_model_); pm != nullptr) {
+        // The playground's rig (character.cpp) names its arm bones
+        // "RightArm"/"LeftArm"; the alternatives cover common exported rigs so
+        // the demo keeps working if the character is swapped for real art.
+        for (const char* candidate : {"RightArm", "mixamorig:RightHand", "hand.R", "Hand_R"}) {
+            lantern_attach_ = bracken::animation::make_attachment(
+                pm->skeleton, candidate,
+                glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -14.0f, 0.0f)));
+            if (lantern_attach_.valid()) {
+                BRACKEN_LOG_INFO("playground", "lantern attached to bone '{}'", candidate);
+                break;
+            }
+        }
+    }
+
+    // Reuse an existing small mesh as the carried lantern rather than adding
+    // an asset the repo does not have.
+    lantern_model_ = models().get_handle("orb_shard");
+
+    // --- Tier 3: nav grid ---------------------------------------------
+    {
+        bracken::nav::NavGridConfig ng;
+        ng.cell_size = 120.0f;
+        ng.origin = glm::vec3(0.0f);
+        ng.width = static_cast<int>(WORLD / ng.cell_size);
+        ng.depth = ng.width;
+        ng.max_slope_degrees = 45.0f; // slightly under the controller's 50
+        ng.max_step = 45.0f;
+        nav_.build(
+            ng, [this](float x, float z) { return get_terrain_height(x, z); },
+            [this](const glm::vec3& p) {
+                // Anything the character cannot stand in is off the mesh. One
+                // capsule overlap test per cell, reusing the same physics the
+                // controller collides against — so the path and the walking
+                // agree by construction.
+                //
+                // The terrain heightfield is EXCLUDED: it is the thing being
+                // walked on, and a capsule resting on the ground always
+                // overlaps it. Including it marked every cell blocked and the
+                // grid came out 0% walkable.
+                std::array<bracken::physics::PhysicsWorld::ShapeContact, 4> hits{};
+                const glm::vec3 center = p + glm::vec3(0.0f, 80.0f, 0.0f);
+                return physics_.collide_capsule(center, 45.0f, 26.0f, hits, /*include_moving=*/false,
+                                                terrain_body_) > 0;
+            });
+        wanderer_.position = player_pos_ + glm::vec3(300.0f, 0.0f, 300.0f);
+        wanderer_.position.y = get_terrain_height(wanderer_.position.x, wanderer_.position.z);
+        wanderer_start_ = wanderer_.position;
+    }
+
     set_camera_driven_by_engine(engine_camera_);
     auto& cam = camera();
     cam.set_terrain_height_func([this](float x, float z) { return get_terrain_height(x, z); });
@@ -352,6 +420,12 @@ bool PlaygroundGame::on_init() {
     act_quickload_ = actions_.add("quickload");
     actions_.bind(act_quicksave_, bracken::Binding::key(SDL_SCANCODE_F9));
     actions_.bind(act_quickload_, bracken::Binding::key(SDL_SCANCODE_F11));
+    act_jump_ = actions_.add("jump");
+    act_crouch_ = actions_.add("crouch");
+    actions_.bind(act_jump_, bracken::Binding::key(SDL_SCANCODE_SPACE));
+    actions_.bind(act_jump_, bracken::Binding::controller(bracken::ControllerButton::Secondary));
+    actions_.bind(act_crouch_, bracken::Binding::key(SDL_SCANCODE_LCTRL));
+    actions_.bind(actions_.add("nav_debug"), bracken::Binding::key(SDL_SCANCODE_N));
     (void)actions_.load("playground_bindings.cfg"); // absent = defaults stand
 
     audio().set_music_gain(0.55f);
@@ -1204,6 +1278,7 @@ void PlaygroundGame::on_simulate(SimFrame& sim) {
     update_player(dt);
     update_camera(sim);
     update_orbs(dt);
+    update_wanderer(dt);
     update_chimneys(dt);
     update_day_weather(dt);
     // Physics is sim-stage: step it after the character/orb update so the
@@ -1291,6 +1366,13 @@ void PlaygroundGame::handle_input(const SimFrame& sim) {
     move_dir_ = glm::length(dir) > 0.001f ? glm::normalize(dir) : glm::vec3(0.0f);
 
     running_input_ = actions_.held(act_run_);
+    // Latched, not sampled: the controller consumes the edge, so a press
+    // between sim frames cannot be missed.
+    jump_requested_ = jump_requested_ || actions_.pressed(act_jump_);
+    crouch_held_ = actions_.held(act_crouch_);
+    if (actions_.pressed(actions_.find("nav_debug"))) {
+        nav_debug_draw_ = !nav_debug_draw_; // N: show the villager's route
+    }
 
     if (actions_.pressed(act_attack_) && attack_timer_ <= 0.0f) {
         attack_timer_ = ATTACK_DURATION;
@@ -1300,6 +1382,18 @@ void PlaygroundGame::handle_input(const SimFrame& sim) {
 }
 
 void PlaygroundGame::update_smoke_driver(float dt) {
+    // Jump on a fixed cadence so the smoke run actually exercises the
+    // character controller's air path (and the counters below prove it did).
+    if (frame_ % 47 == 0) {
+        jump_requested_ = true;
+    }
+    if (character_.state().grounded) {
+        ++smoke_grounded_frames_;
+    } else {
+        ++smoke_air_frames_;
+    }
+    smoke_max_height_ = std::max(smoke_max_height_, player_pos_.y);
+
     // Self-drive, sim side: orbit the camera, run toward the nearest orb
     // (real pickups), attack periodically. The mid-run settings flips that
     // exercise the post-processing matrix are fence work — see
@@ -1679,6 +1773,13 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
         // The hard regression gate. Unlike everything on the line above, this
         // is computed entirely CPU-side, so it is exact and driver-independent.
         std::cout << std::format("[smoke] packet_digest=0x{:016x}\n", packet_digest());
+        // Tier-3 evidence: that the controller left the ground, that the nav
+        // grid built, and that the villager actually pathed somewhere.
+        std::cout << std::format(
+            "[smoke] character grounded={} air={} max_y={:.0f} | nav walkable={} | "
+            "wanderer waypoints={} moved={:.0f}\n",
+            smoke_grounded_frames_, smoke_air_frames_, smoke_max_height_, nav_.walkable_count(),
+            wanderer_.path.size(), glm::distance(wanderer_.position, wanderer_start_));
         // Phase timings: CPU-record only (SDL3 has no GPU timestamp API).
         // present_wait is the CPU/GPU-bound signal and is a subset of render.
         std::cout << std::format("[smoke] timing sim={:.2f}ms render={:.2f}ms fence={:.2f}ms present_wait={:.2f}ms\n",
@@ -1821,67 +1922,38 @@ void PlaygroundGame::update_player(float dt) {
     }
     was_in_water_ = in_water;
 #endif
-    player_pos_ += player_vel_ * dt;
+    // Movement, world collision and ground placement are all the character
+    // controller's job now (below). What used to live here — a manual
+    // `player_pos_ += vel*dt`, an XZ-only depenetration loop, a village
+    // rect push-out fallback and a terrain-height snap — is exactly the
+    // hand-rolled controller every game rewrites, and it could not express
+    // slopes, steps or air time.
+
+    // Character controller instead of snapping to the terrain height. This is
+    // what gives the demo slopes, step-up, air time and a real jump — the old
+    // one-liner pinned the character to the ground and could not express any
+    // of it.
+    bracken::physics::CharacterInput cin;
+    cin.desired_velocity = player_vel_;
+    cin.jump = jump_requested_;
+    cin.crouch = crouch_held_;
+    jump_requested_ = false;
+
+    // The TERRAIN body is excluded from the controller's depenetration: a
+    // capsule resting on a heightfield always overlaps it slightly, and
+    // pushing out of that every frame walks the character up into the sky.
+    // Ground is resolved by the downward ray instead, which is the same split
+    // the old hand-rolled code used.
+    character_.update(physics_, cin, dt, /*self=*/character_body_,
+                      /*ground=*/terrain_body_);
+    player_pos_ = character_.state().position;
+    // World bounds are a game rule, not a collision one.
     player_pos_.x = std::clamp(player_pos_.x, WORLD_MARGIN, WORLD - WORLD_MARGIN);
     player_pos_.z = std::clamp(player_pos_.z, WORLD_MARGIN, WORLD - WORLD_MARGIN);
-    if (physics_ready_) {
-        // Static-world collision through bracken::physics: depenetrate the
-        // character capsule against the same bodies the chrome ball bounces
-        // off — buildings, tree trunks, rocks, crates, wagons, fences. XZ
-        // only: terrain height stays heightmap-snapped below, and the
-        // heightfield body is excluded so slope contacts can't shove the
-        // capsule sideways. Up to 3 rounds — pushing out of one body can push
-        // into a neighbour (fence corner against a crate).
-        physics::PhysicsWorld::ShapeContact contacts[8];
-        for (int round = 0; round < 3; ++round) {
-            const glm::vec3 center = player_pos_ + glm::vec3(0.0f, CHAR_CAPSULE_CENTER_Y, 0.0f);
-            const std::size_t n =
-                physics_.collide_capsule(center, CHAR_CAPSULE_HALF_CYL, CHAR_CAPSULE_RADIUS,
-                                         contacts, /*include_moving=*/false, terrain_body_);
-            bool pushed = false;
-            for (std::size_t i = 0; i < n; ++i) {
-                if (contacts[i].normal.y > 0.7f) {
-                    continue; // resting on top of a low collider — not a wall
-                }
-                glm::vec3 push = contacts[i].normal * contacts[i].penetration;
-                push.y = 0.0f;
-                player_pos_ += push;
-                pushed = true;
-            }
-            if (!pushed) {
-                break;
-            }
-        }
-        player_pos_.x = std::clamp(player_pos_.x, WORLD_MARGIN, WORLD - WORLD_MARGIN);
-        player_pos_.z = std::clamp(player_pos_.z, WORLD_MARGIN, WORLD - WORLD_MARGIN);
-    }
-#if PLAYGROUND_HAS_VILLAGE
-    // Fallback when physics failed to init: rect push-out against the
-    // building footprints so walls still block (trees/props go uncollidable —
-    // same as before physics landed).
-    else if (has_village_) {
-        const float S = village::VILLAGE_SCALE;
-        constexpr float PAD = 0.3f; // keep the capsule's edge off the plinth
-        for (const auto& b : village::BUILDINGS) {
-            const float x0 = VILLAGE_CX + (b.min_x - PAD) * S;
-            const float z0 = VILLAGE_CZ + (b.min_z - PAD) * S;
-            const float x1 = VILLAGE_CX + (b.max_x + PAD) * S;
-            const float z1 = VILLAGE_CZ + (b.max_z + PAD) * S;
-            if (player_pos_.x > x0 && player_pos_.x < x1 && player_pos_.z > z0 && player_pos_.z < z1) {
-                const float push_left = player_pos_.x - x0;
-                const float push_right = x1 - player_pos_.x;
-                const float push_front = player_pos_.z - z0;
-                const float push_back = z1 - player_pos_.z;
-                const float m = std::min({push_left, push_right, push_front, push_back});
-                if (m == push_left) player_pos_.x = x0;
-                else if (m == push_right) player_pos_.x = x1;
-                else if (m == push_front) player_pos_.z = z0;
-                else player_pos_.z = z1;
-            }
-        }
-    }
-#endif
-    player_pos_.y = get_terrain_height(player_pos_.x, player_pos_.z);
+    character_.set_position_preserving_velocity(player_pos_);
+    // Animation reacts to what actually happened, not what was asked for.
+    player_speed_ = glm::length(
+        glm::vec2(character_.state().velocity.x, character_.state().velocity.z));
 
     player_transform_ = glm::rotate(glm::translate(glm::mat4(1.0f), player_pos_), facing_.current, glm::vec3(0, 1, 0));
 
@@ -2012,6 +2084,51 @@ void PlaygroundGame::update_orbs(float dt) {
             orb.bob_phase = rand01() * 6.28f;
         }
     }
+}
+
+void PlaygroundGame::update_wanderer(float dt) {
+    if (!nav_.built()) {
+        return;
+    }
+
+    wanderer_.repath_timer -= dt;
+
+    const bool needs_path = wanderer_.path.empty() ||
+                            wanderer_.waypoint >= wanderer_.path.size() ||
+                            wanderer_.repath_timer <= 0.0f;
+    if (needs_path) {
+        // Head for the player. Re-pathing on a timer rather than every frame:
+        // A* over a 100x100 grid is cheap but not free, and a path that is one
+        // second stale is invisible at walking speed.
+        wanderer_.repath_timer = 1.5f;
+        if (nav_.find_path(wanderer_.position, player_pos_, wanderer_.path)) {
+            wanderer_.waypoint = 1; // [0] is where we already are
+        } else {
+            wanderer_.path.clear();
+        }
+    }
+
+    if (wanderer_.waypoint >= wanderer_.path.size()) {
+        return;
+    }
+
+    constexpr float k_speed = 190.0f;
+    const glm::vec3 target = wanderer_.path[wanderer_.waypoint];
+    glm::vec3 to_target = target - wanderer_.position;
+    to_target.y = 0.0f;
+    const float distance = glm::length(to_target);
+
+    // Advance the waypoint on arrival. The tolerance is generous because the
+    // string-pulled path's waypoints are corners, not precise targets.
+    if (distance < 60.0f) {
+        ++wanderer_.waypoint;
+        return;
+    }
+
+    const glm::vec3 step = (to_target / distance) * k_speed * dt;
+    wanderer_.position += step;
+    wanderer_.position.y = get_terrain_height(wanderer_.position.x, wanderer_.position.z);
+    wanderer_.facing = std::atan2(-step.x, -step.z);
 }
 
 void PlaygroundGame::update_chimneys(float dt) {
@@ -2195,6 +2312,33 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
             anim_player_.write_palette(palette.matrices);
             fb.draw_skinned(player_model_, player_transform_, palette.id, {1.0f, 1.0f, 1.0f, 1.0f},
                             scene::DrawFlags::None, MOTION_ID_PLAYER);
+
+            // Bone attachment: the lantern follows the hand through every
+            // animation with no per-frame math on this side. One call.
+            if (lantern_model_ != INVALID_MODEL_HANDLE && lantern_attach_.valid()) {
+                const glm::mat4 held = lantern_attach_.world(player_transform_, anim_player_);
+                fb.draw_model(lantern_model_, glm::scale(held, glm::vec3(18.0f)),
+                              {1.0f, 0.85f, 0.5f, 1.0f});
+            }
+        }
+    }
+
+    // The pathfinding villager, and its route when debug draw is on.
+    if (nav_.built() && orb_model_ != INVALID_MODEL_HANDLE) {
+        const glm::mat4 t =
+            glm::rotate(glm::translate(glm::mat4(1.0f),
+                                       wanderer_.position + glm::vec3(0.0f, 60.0f, 0.0f)),
+                        wanderer_.facing, glm::vec3(0, 1, 0));
+        fb.draw_model(orb_model_, glm::scale(t, glm::vec3(1.4f)), {0.4f, 0.9f, 1.0f, 1.0f});
+
+        if (nav_debug_draw_) {
+            // The actual string-pulled path, so the smoothing is visible
+            // rather than taken on trust.
+            for (std::size_t i = 1; i < wanderer_.path.size(); ++i) {
+                fb.add_debug_line(wanderer_.path[i - 1] + glm::vec3(0, 40, 0),
+                                  wanderer_.path[i] + glm::vec3(0, 40, 0),
+                                  bracken::core::Color{0xFF40E0FFu});
+            }
         }
     }
 

@@ -1,27 +1,14 @@
-# The raw medieval asset pack is unpacked here but not tracked (hundreds of
-# MB, multiple engine formats). Only the pipeline outputs in generated/ are
-# candidates for version control.
-/FBX/
-/FBX (Unity)/
-/FBX (Unreal Engine)/
-/OBJ/
-/glTF/
-/glTF (Godot)/
-/Textures/
-# Pipeline outputs: ~50 MB of .glb + textures regenerated from the raw packs by
-# tools/build_medieval_assets.py. The playground falls back to a procedural-only
-# scene when they are absent, so they stay out of history.
-/generated/
-
-# Stray files shipped in the raw pack root.
-/Preview.jpg
-/License_Pro.txt
-/Format Differences.txt
-/nature/FBX/
-/nature/FBX (Unity)/
-/nature/OBJ/
-/nature/glTF/
-/nature/Textures/
-/nature/*.jpg
-/nature/*.txt
-/nature/desktop.ini
+# Nothing under assets/ belongs in git. Track by EXCEPTION only.
+#
+# This used to list the raw pack's directories by name (/FBX/, /glTF/,
+# /Textures/, ...), which worked exactly until someone unpacked a differently
+# named pack next to them: "Modular Character Outfits - Fantasy[Source]" and
+# "Universal Base Characters[Source]" matched none of those rules and 1.6 GB of
+# raw art was staged for commit. An allowlist cannot fail that way.
+#
+# What lives here: raw art packs (hundreds of MB, several export formats each)
+# and the pipeline outputs in generated/ that tools/build_medieval_assets.py
+# rebuilds from them. The playground falls back to a procedural-only scene when
+# generated/ is absent, so a fresh clone still builds and still passes smoke.
+*
+!.gitignore

@@ -112,6 +112,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `procedural/` | `bracken::procedural` | tree + rock generators |
 | `audio/` | `bracken::audio` (+ `::dsp`, `::synth`, `::music`) | SDL3 playback device, lock-free mixer, 3D positional voices, WAV clips — **plus a software synthesizer**: band-limited oscillators / ADSR / SVF (`dsp/`), patches + polyphonic voices (`synth/`), and a sample-accurate song sequencer (`music/`). `BRACKEN_ENABLE_SYNTH=OFF` compiles the synth half out. The one subsystem with a thread the engine does not own |
 | `save/` | `bracken::save` | `SaveDocument` — path-addressed typed records, so schema changes never invalidate old saves; unknown keys round-trip; **atomic** write (temp + rename) + checksum, so an interrupted save cannot corrupt the previous one |
+| `navigation/` | `bracken::nav` | `NavGrid` — walkability from a height function + A* with string-pulled paths. A grid, not a polygon navmesh: built from the height function the engine already has, and honest about its limit (one height per cell, so no bridges over roads) |
 | `physics/` | `bracken::physics` | `PhysicsWorld` — rigid-body physics over vendored **Jolt** (pimpl; Jolt never appears in a public header). Fixed-step accumulator `update()` (tier owned/sim-stage), sphere/box/capsule/heightfield bodies, ray casts; Jolt's step jobs run on the engine `JobSystem` via the `JoltJobSystem` bridge in **`physics/internal/`** — one pool owns the cores |
 | `dev/` | `bracken::dev` | `DevUI` Dear ImGui developer overlay (F10 in the playground; no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`) + `dev_panels` (built-in Stats/Environment/Graphics/Camera panels). ImGui appears only in `dev/*.cpp` |
 | `testing/` | `bracken::testing` | `frame_test.hpp` — `TestFrame` + `FrameAccess`, published **for host games** to unit-test their frame code with no GPU/window/SDL. Header-only; nothing in the engine's production path includes it |
@@ -474,7 +475,7 @@ packet digest, with no GPU and no window.
 - No full clean rebuild — see [.claude/RULES.md](.claude/RULES.md).
 - Don't reintroduce gameplay concepts (combat, inventory, skills, ECS) or
   server/networking code into engine headers — this repo is deliberately
-  engine-only. Physics is the exception: it lives in `physics/` as engine
+  engine-only. `physics/character_controller.hpp` (capsule controller: slopes, step-up, crouch, jump — kinematic, never a rigid body) and `animation/attachment.hpp` (bone-space attachment: reads the joint WORLD transform, not the skinning matrix) are engine infrastructure too. Physics is the exception: it lives in `physics/` as engine
   infrastructure (Jolt-backed), added by owner decision 2026-07-21. Jolt
   types must stay out of public bracken headers (pimpl — link stays PRIVATE).
 - Don't change `MAX_BONES` casually — it sizes CPU-side palette arrays; audit
