@@ -1161,6 +1161,8 @@ void parallel_for(JobSystem& js, std::size_t begin, std::size_t end, Fn&& fn, st
 
 Chunk form (not per-index) is deliberate: tight loops avoid per-element indirect-call overhead. `PARALLEL_MIN_TOTAL` is tuned so "animation/cull loops with a few dozen entities" never pay the dispatch tax (header comment).
 
+Dispatch is a single **batch**: the `ceil(total / grain)` chunk nodes are queued and then announced with one epoch bump + wake (`JobSystem::submit_batch`), instead of a bump + notify per chunk. Chunk boundaries are unchanged — chunk `c` is `[begin + c*grain, min(end, begin + (c+1)*grain))` — so every caller's chunk-index arithmetic and determinism contract is untouched.
+
 ### Internals (Phase-1 lock-free design, plan §7)
 
 The Phase-1 rewrite replaces the original mutex-deque scheduler. Load-bearing structures:
@@ -1168,7 +1170,7 @@ The Phase-1 rewrite replaces the original mutex-deque scheduler. Load-bearing st
 - **Per-worker Chase–Lev work-stealing deques** — the bounded lock-free deque in the C++11-memory-model formulation (Lê/Pop/Cohen/Nardelli 2013). The owning worker pushes and pops the **bottom** with relaxed/acquire-release operations; thieves CAS the **top**. The only contended operation is a steal — by design the rare path of a well-grained workload. LIFO owner pop / FIFO steal keeps the standard locality/contention split.
 - **MPSC injection queue** — external (non-worker) submits go through a multi-producer/single-consumer queue instead of a mutexed global queue; workers drain it alongside their own deques.
 - **Pooled job nodes** — fixed-size nodes in per-worker pools, recycled via freelist, with a generation counter per node backing `TaskHandle`'s done/error queries. No per-job heap allocation, no `shared_ptr` refcount traffic on the submit path (large `std::function` captures may still allocate inside the callable itself).
-- **Two-phase parking** — an idle worker spins briefly, then parks on C++20 `std::atomic::wait`/`notify_one` (futex/ulock under the hood). No condition-variable + mutex pairing, no periodic idle poll: a parked pool costs ~zero. Submits `notify_one` a parked worker; `notify_all` happens only at shutdown (no thundering herd). The pre-rewrite lost-wakeup regression tests (gated-job discard, external waiter) carry over as the safety net for the wake protocol.
+- **Two-phase parking** — an idle worker spins briefly, then parks on C++20 `std::atomic::wait`/`notify_one` (futex/ulock under the hood). No condition-variable + mutex pairing, no periodic idle poll: a parked pool costs ~zero. Submits `notify_one` a parked worker; `notify_all` happens at shutdown and once per `submit_batch` dispatch (which made N jobs runnable at once, so there is no herd to avoid). The pre-rewrite lost-wakeup regression tests (gated-job discard, external waiter) carry over as the safety net for the wake protocol.
 - **Ordering discipline** — every atomic in the module documents its protocol at its declaration: what it publishes, its memory ordering, and its release/acquire pairing partner. Bare `seq_cst` in a hot path requires a justifying comment. Genuinely contended atomics are padded to the destructive interference size (128 B on Apple Silicon; guarded fallback constant where the standard trait is unavailable/warns).
 
 `job_system.cpp` keeps a `thread_local` worker index (`-1` on non-worker threads) for submit routing and helping waits.
@@ -1186,6 +1188,8 @@ The Phase-1 rewrite replaces the original mutex-deque scheduler. Load-bearing st
 #### Submission
 
 `pending` is incremented **before** enqueue (so `pending_count()` never undercounts). A job node is taken from the submitting worker's pool (or the injection path's pool for external threads); worker submits push onto the caller's own deque bottom, external submits go through the MPSC injection queue. One `notify_one` wakes a parked worker. The group-counted overload additionally increments the `TaskGroup` counter before enqueue.
+
+`submit_batch(TaskGroup&, n, make_body)` is the n-jobs-one-wake form `parallel_for` dispatches through: it queues all `n` nodes (identical per-node work — same pool, same queue, same order) and then bumps the work epoch **once, by n**, followed by a single `notify_all`. The publish-before-bump protocol holds trivially because every push precedes the single bump. Nothing else observable changes; the win is the `n - 1` epoch RMWs and futex wakes that no longer happen (measured: 40–60 % off a parked-pool dispatch of ≥ 64 chunks, 10–15 % off the whole Prepare stage — `BM_ParallelForDispatch`, `BM_ParallelForDispatchParked`, `BM_PrepInstanceBatches`). If `make_body` throws mid-batch, the already-queued jobs are published before the exception propagates, so the group still joins.
 
 #### Worker loop
 

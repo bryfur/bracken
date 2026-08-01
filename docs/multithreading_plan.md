@@ -452,7 +452,8 @@ Concretely, per component:
 - **Parking — futex-style, two-phase.** Idle workers spin briefly then park
   on C++20 `std::atomic::wait`/`notify_one` (futex/ulock under the hood) —
   no condition-variable + mutex pairing, no 50 ms poll, no thundering herd
-  (targeted `notify_one` per submitted job, `notify_all` only at shutdown).
+  (targeted `notify_one` per submitted job, `notify_all` at shutdown and
+  once per `submit_batch` dispatch).
   The existing lost-wakeup regression tests (gated-job discard, external
   waiter) carry over as the safety net for the wake protocol.
 - **`TaskGroup` — one padded atomic.** A cache-line-aligned

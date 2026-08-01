@@ -386,7 +386,7 @@ JobNode* JobSystem::acquire_node_(std::function<void()>&& fn, TaskGroup* group) 
     return n;
 }
 
-void JobSystem::enqueue_(JobNode* n) {
+void JobSystem::push_(JobNode* n) {
     if (t_owner_ == this && t_worker_index_ >= 0) {
         // Owner push; the deque's release fence publishes the node payload.
         worker_state_[static_cast<std::size_t>(t_worker_index_)]->deque.push(n);
@@ -394,13 +394,30 @@ void JobSystem::enqueue_(JobNode* n) {
         // MPSC push; its release store publishes the node payload.
         injection_.push(n);
     }
+}
+
+void JobSystem::publish_work_(std::size_t count) {
+    if (count == 0) {
+        return;
+    }
     // Work-epoch protocol (see epoch_ declaration): the bump comes AFTER the
     // queue publish completes, so a parker that read the pre-bump epoch and
     // found nothing will have its wait(e) return, and a parker that read the
-    // post-bump epoch synchronized with the push and finds the job in its
-    // re-check. Release pairs with the workers' acquire epoch loads.
-    epoch_.fetch_add(1, std::memory_order_release);
-    epoch_.notify_one(); // one targeted wake per job; notify_all only at shutdown
+    // post-bump epoch synchronized with the push(es) and finds the job in its
+    // re-check. Release pairs with the workers' acquire epoch loads. A batch
+    // bumps by `count` in one RMW — every one of its pushes precedes it, so
+    // the protocol holds for all of them at once.
+    epoch_.fetch_add(count, std::memory_order_release);
+    if (count == 1) {
+        epoch_.notify_one(); // one targeted wake per job; notify_all only at shutdown…
+    } else {
+        epoch_.notify_all(); // …and per BATCH, which made `count` jobs runnable at once
+    }
+}
+
+void JobSystem::enqueue_(JobNode* n) {
+    push_(n);
+    publish_work_(1);
 }
 
 TaskHandle JobSystem::submit(std::function<void()> fn) {
@@ -422,7 +439,7 @@ TaskHandle JobSystem::submit(std::function<void()> fn) {
     return h;
 }
 
-void JobSystem::submit(TaskGroup& group, std::function<void()> fn) {
+void JobSystem::submit_deferred_(TaskGroup& group, std::function<void()> fn) {
     JobNode* n = acquire_node_(std::move(fn), &group);
     // Execution reference only — no handle, so completion recycles the node
     // immediately (the parallel_for hot path). Blind store safe as above.
@@ -430,7 +447,16 @@ void JobSystem::submit(TaskGroup& group, std::function<void()> fn) {
     n->state.store(JobNode::make_state(gen, 1), std::memory_order_relaxed);
     group.on_job_submitted();
     pending_.fetch_add(1, std::memory_order_relaxed); // see pending_ declaration
-    enqueue_(n);
+    // Queued, but NOT announced: the caller publishes (submit below for one
+    // job, submit_batch once for the whole batch). Until then the node is
+    // still REACHABLE — a spinning worker, or a helping waiter inside
+    // wait(group), can steal it; the epoch bump only wakes PARKED workers.
+    push_(n);
+}
+
+void JobSystem::submit(TaskGroup& group, std::function<void()> fn) {
+    submit_deferred_(group, std::move(fn));
+    publish_work_(1);
 }
 
 JobSystem::InjectionResult JobSystem::try_consume_injection_(JobNode*& out) {

@@ -171,6 +171,50 @@ public:
     // the group join.
     void submit(TaskGroup& group, std::function<void()> fn);
 
+    // Submits `n` group jobs with ONE wake. This is submit(group, fn) called
+    // n times in every respect that is observable — same queue (the caller's
+    // own deque on a worker, the injection queue otherwise), same insertion
+    // order, same node lifetime, same error capture — except that the
+    // work-epoch bump is done once, by n, after every node is published,
+    // instead of once per node.
+    //
+    // Why: the per-node `epoch_.fetch_add(1, release); notify_one()` pair is
+    // ~175 ns of futex traffic with the pool parked, and a parallel_for
+    // submits one node per chunk, so a 32-chunk dispatch paid it 32 times to
+    // wake at most worker_count() threads. Batching satisfies the documented
+    // publish-before-bump protocol (see enqueue_) trivially: EVERY queue
+    // publish precedes the single bump, so a parker that read the pre-bump
+    // epoch has its wait return, and a parker that read the post-bump epoch
+    // synchronized with all n pushes and finds work in its re-check.
+    //
+    // The wake is notify_all rather than n targeted notify_one calls: the
+    // batch made up to n jobs runnable at once, so waking the parked pool
+    // once is both cheaper and closer to the truth. (n == 1 keeps the
+    // targeted single wake.)
+    //
+    // `make_body(i)` is invoked for i in [0, n) ON THE CALLING THREAD, in
+    // order, and must return something convertible to std::function<void()>.
+    // Chunk boundaries — and therefore any determinism contract built on
+    // them — are entirely the caller's business, unchanged by batching.
+    //
+    // Exception contract, matching parallel_for's: if make_body or a submit
+    // throws, the nodes already enqueued are PUBLISHED before the exception
+    // propagates (they reference the caller's stack and must remain
+    // joinable), then the exception is rethrown. Join the group either way.
+    template<typename MakeBody>
+    void submit_batch(TaskGroup& group, std::size_t n, MakeBody&& make_body) {
+        std::size_t enqueued = 0;
+        try {
+            for (; enqueued < n; ++enqueued) {
+                submit_deferred_(group, std::function<void()>(make_body(enqueued)));
+            }
+        } catch (...) {
+            publish_work_(enqueued);
+            throw;
+        }
+        publish_work_(enqueued);
+    }
+
     // Blocks until the task completes, helping in the meantime: the caller
     // drains its own deque (if it is a worker of this pool), consumes the
     // injection queue, and steals from other workers — so nested submit+wait
@@ -194,7 +238,14 @@ private:
 
     void worker_main_(unsigned index);
     JobNode* acquire_node_(std::function<void()>&& fn, TaskGroup* group);
+    // enqueue_ = push_ + publish_work_(1); the two halves are separate so a
+    // batch can push every node before publishing the whole batch once.
     void enqueue_(JobNode* n);
+    void push_(JobNode* n);
+    void publish_work_(std::size_t count);
+    // One group job, armed and queued but NOT yet announced on the epoch —
+    // the caller must publish_work_() for it (submit_batch does, per batch).
+    void submit_deferred_(TaskGroup& group, std::function<void()> fn);
     // Tries to execute one job: own deque (workers), injection queue, then
     // stealing. Returns true if a job ran. injection_busy reports that the
     // injection consumer token was held elsewhere — callers on the epoch

@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
 #include "bracken/core/jobs/job_system.hpp"
+#include "bracken/core/jobs/task_group.hpp"
 
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -495,4 +497,85 @@ TEST(JobSystemStaleChurnTest, StaleHandleChurnCannotResurrectNodes) {
             << " times — node lifecycle corruption";
     }
     js.shutdown();
+}
+
+// ============================================================================
+// submit_batch — n group jobs, one work-epoch bump + wake (the parallel_for
+// dispatch path). The observable contract must be indistinguishable from n
+// calls to submit(group, fn): every body runs exactly once, the join drains
+// them all, and the first error is captured and rethrown by the join.
+// ============================================================================
+
+TEST_F(JobSystemTest, SubmitBatchRunsEveryBodyExactlyOnce) {
+    auto& js = JobSystem::instance();
+    constexpr std::size_t N = 512;
+    std::vector<std::atomic<int>> runs(N);
+    for (auto& r : runs) {
+        r.store(0);
+    }
+
+    TaskGroup group;
+    js.submit_batch(group, N, [&](std::size_t i) {
+        return [&runs, i] { runs[i].fetch_add(1, std::memory_order_relaxed); };
+    });
+    js.wait(group);
+
+    EXPECT_EQ(group.pending(), 0u);
+    for (std::size_t i = 0; i < N; ++i) {
+        EXPECT_EQ(runs[i].load(), 1) << "body " << i;
+    }
+}
+
+TEST_F(JobSystemTest, SubmitBatchOfZeroIsANoOp) {
+    auto& js = JobSystem::instance();
+    TaskGroup group;
+    bool called = false;
+    js.submit_batch(group, 0, [&](std::size_t) {
+        called = true;
+        return [] {};
+    });
+    js.wait(group); // must return immediately, nothing to join
+    EXPECT_FALSE(called);
+    EXPECT_EQ(group.pending(), 0u);
+}
+
+TEST_F(JobSystemTest, SubmitBatchCapturesMemberErrorAtTheJoin) {
+    auto& js = JobSystem::instance();
+    constexpr std::size_t N = 64;
+    std::atomic<int> ran{0};
+
+    TaskGroup group;
+    js.submit_batch(group, N, [&](std::size_t i) {
+        return [&ran, i] {
+            ran.fetch_add(1, std::memory_order_relaxed);
+            if (i == N / 2) {
+                throw std::runtime_error("batch member boom");
+            }
+        };
+    });
+    EXPECT_THROW(js.wait(group), std::runtime_error);
+    // The join is unconditional: every member finished before the rethrow.
+    EXPECT_EQ(ran.load(), static_cast<int>(N));
+    EXPECT_EQ(group.pending(), 0u);
+}
+
+TEST_F(JobSystemTest, SubmitBatchPublishesAlreadyQueuedJobsWhenMakeBodyThrows) {
+    auto& js = JobSystem::instance();
+    constexpr std::size_t GOOD = 32;
+    std::atomic<int> ran{0};
+
+    TaskGroup group;
+    EXPECT_THROW(js.submit_batch(group, GOOD + 8,
+                                 [&](std::size_t i) -> std::function<void()> {
+                                     if (i == GOOD) {
+                                         throw std::logic_error("make_body boom");
+                                     }
+                                     return [&ran] { ran.fetch_add(1, std::memory_order_relaxed); };
+                                 }),
+                 std::logic_error);
+    // The jobs enqueued before the throw were published, so this join
+    // terminates (a batch that swallowed them would hang or livelock).
+    js.wait(group);
+    EXPECT_EQ(ran.load(), static_cast<int>(GOOD));
+    EXPECT_EQ(group.pending(), 0u);
 }

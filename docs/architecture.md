@@ -1124,7 +1124,8 @@ lock-free design of plan §7:
 - **Two-phase parking**: idle workers spin briefly, then park on C++20
   `std::atomic::wait`/`notify_one` (futex/ulock). No CV+mutex pairing, no
   periodic idle poll — a parked pool costs ~zero. `notify_one` per submitted
-  job; `notify_all` only at shutdown.
+  job; `notify_all` at shutdown **and once per batch dispatch**
+  (`JobSystem::submit_batch` — see below).
 - **`TaskGroup`**: one cache-line-padded atomic counter (padded to the
   destructive interference size — 128 B on Apple Silicon). Release
   `fetch_sub` on job completion; the zero-observer acquires and notifies;

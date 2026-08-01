@@ -22,8 +22,10 @@ inline constexpr std::size_t PARALLEL_MIN_TOTAL = 256;
 // direct call on the caller — granularity control, not a second code path.
 //
 // Chunks are submitted against a stack TaskGroup (no per-chunk handles, no
-// allocation) and joined with JobSystem::wait(group), which helps execute
-// chunks — fork-join safe even from inside a job on a 1-worker pool.
+// allocation) as ONE batch — every chunk node is queued, then the pool is
+// woken once (JobSystem::submit_batch) — and joined with
+// JobSystem::wait(group), which helps execute chunks — fork-join safe even
+// from inside a job on a 1-worker pool.
 //
 // Exception contract: ALL chunks are joined before anything propagates. fn
 // typically captures caller stack state by reference, so unwinding while
@@ -58,14 +60,22 @@ void parallel_for(JobSystem& js, std::size_t begin, std::size_t end, Fn&& fn, st
         return;
     }
 
+    // One node per chunk, but ONE work-epoch bump + wake for the whole
+    // dispatch (JobSystem::submit_batch): the per-node bump+notify dominated
+    // small-chunk dispatch. Chunk boundaries are unchanged — chunk c covers
+    // [begin + c * grain, min(end, ...)), exactly the loop this replaced —
+    // so every caller's chunk-index arithmetic and determinism contract
+    // still holds.
+    const std::size_t chunk_count = (total + grain - 1) / grain;
     TaskGroup group;
     try {
-        for (std::size_t i = begin; i < end; i += grain) {
-            const std::size_t chunk_end = std::min(end, i + grain);
+        js.submit_batch(group, chunk_count, [&](std::size_t c) {
+            const std::size_t chunk_begin = begin + c * grain;
+            const std::size_t chunk_end = std::min(end, chunk_begin + grain);
             // fn captured by reference: it lives in this frame, which the
             // unconditional join below keeps alive past every chunk.
-            js.submit(group, [i, chunk_end, &fn]() { fn(i, chunk_end); });
-        }
+            return [chunk_begin, chunk_end, &fn]() { fn(chunk_begin, chunk_end); };
+        });
     } catch (...) {
         // A submit failed: join the chunks already queued before unwinding
         // (they reference `fn`/the caller's stack), then propagate the
