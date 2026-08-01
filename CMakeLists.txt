@@ -93,6 +93,13 @@ if(BRACKEN_BUILD_BENCHMARKS)
     endif()
 endif()
 
+# The software synthesizer + music sequencer (bracken::audio::synth / ::music).
+# ON by default: it is header-only DSP with no third-party dependency and no
+# cost until a song is played. Turn it OFF for a game that ships only recorded
+# audio — AudioEngine::play_music becomes a no-op and the oscillator, envelope,
+# filter, voice, synth and sequencer headers are not compiled at all.
+option(BRACKEN_ENABLE_SYNTH "Build the software synthesizer and music sequencer" ON)
+
 # Dear ImGui developer overlay (bracken::dev::DevUI). ON by default for
 # development; turn OFF for shipping builds — the DevUI class compiles to a
 # no-op stub and ImGui is neither fetched nor linked.

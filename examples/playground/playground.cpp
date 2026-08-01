@@ -1,4 +1,7 @@
 #include "playground.hpp"
+#include "music.hpp"
+
+#include "bracken/audio/audio_engine.hpp"
 
 #include "character.hpp"
 #include "scene_layout.hpp"
@@ -306,6 +309,14 @@ bool PlaygroundGame::on_init() {
     cfg.height_offset = 130.0f;
     cam.set_config(cfg);
     cam.set_target(player_pos_ + glm::vec3(0, 110, 0));
+
+    // The village theme, played by the engine's synthesizer. There is no
+    // audio file: the whole score is generated from oscillators at runtime.
+    // Quieter than the default so it sits under the scene rather than on it.
+    audio().set_music_gain(0.55f);
+#if BRACKEN_SYNTH
+    audio().play_music(build_village_theme());
+#endif
 
     if (smoke_frames_ > 0) {
         set_collect_render_stats(true);
@@ -1113,6 +1124,11 @@ void PlaygroundGame::on_simulate(SimFrame& sim) {
     // pusher capsule chases this frame's player position, and before
     // build_frame so the ball renders where it landed this frame.
     update_physics(dt);
+
+    // Put the listener on the camera. play_sound/set_listener are worker-safe,
+    // so this is a plain call from the sim job — no locking, no deferral.
+    audio().set_listener(camera().get_position(), camera().get_forward(),
+                         glm::vec3(0.0f, 1.0f, 0.0f));
 
     build_frame(sim);
 }

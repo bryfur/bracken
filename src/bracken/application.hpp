@@ -30,6 +30,9 @@ class FramePacket;
 class FrameBuilder;
 class PacketRing;
 } // namespace scene
+namespace audio {
+class AudioEngine;
+}
 namespace systems {
 class CameraController;
 class CameraSystem;
@@ -359,6 +362,22 @@ protected:
      *  from the sim-job tail (spawns from the builder, update, packet
      *  snapshot); hosts normally only spawn via SimFrame::frame()'s
      *  spawn_effect. Touch it only from on_simulate / the fence / init. */
+    /** The audio system. Brought up by init_engine(); if no playback device
+     *  exists the object is still here and every call is a silent no-op, so
+     *  hosts never need to branch on whether the machine has sound.
+     *
+     *  Tier: play_sound / play_music / set_listener are worker-safe — call
+     *  them straight from on_simulate. Registration (load_sound,
+     *  register_clip) is main-thread, before playback. */
+    audio::AudioEngine& audio() {
+        BRACKEN_CONTRACT(audio_ != nullptr, "audio() requires init_engine() first");
+        return *audio_;
+    }
+    const audio::AudioEngine& audio() const {
+        BRACKEN_CONTRACT(audio_ != nullptr, "audio() requires init_engine() first");
+        return *audio_;
+    }
+
     systems::EffectSystem& effect_system() {
         BRACKEN_CONTRACT(effect_system_ != nullptr, "effect_system() requires init_engine() first");
         return *effect_system_;
@@ -597,6 +616,7 @@ private:
     std::unique_ptr<scene::SceneRenderer> scene_renderer_;
     std::unique_ptr<systems::CameraSystem> camera_;
     std::unique_ptr<systems::EffectSystem> effect_system_; // sim-stage owned (see effect_system())
+    std::unique_ptr<audio::AudioEngine> audio_;            // owns the SDL audio device + mixer
     std::unique_ptr<dev::DevUI> dev_ui_; // created by init_dev_ui(); destroyed before the renderer
 
     // See set_camera_driven_by_engine().

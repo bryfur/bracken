@@ -78,6 +78,12 @@
 // ---------------------------------------------------------------------------
 // Particle effects
 // ---------------------------------------------------------------------------
+#include "bracken/audio/audio_engine.hpp"      // playback device, mixer, 3D voices — Application::audio()
+#if BRACKEN_SYNTH
+#include "bracken/audio/music/song.hpp"         // Song/Track/Pattern — the data play_music() takes
+#include "bracken/audio/synth/instrument.hpp"   // patches: the synthesizer's authoring surface
+#include "bracken/audio/wav_writer.hpp"         // dump a rendered mix for inspection
+#endif
 #include "bracken/effects/effect_definition.hpp" // EffectDefinition and its curves/emitters — spawned through the FrameSink
 
 // ---------------------------------------------------------------------------

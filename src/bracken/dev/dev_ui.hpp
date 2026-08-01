@@ -19,6 +19,9 @@ class SceneRenderer;
 namespace bracken::systems {
 class CameraController;
 }
+namespace bracken::audio {
+class AudioEngine;
+}
 namespace bracken {
 struct GraphicsSettings;
 }
@@ -78,6 +81,7 @@ public:
         GraphicsSettings* settings = nullptr;           ///< edited in place...
         std::function<void(const GraphicsSettings&)> apply_settings; ///< ...then pushed through this
         const float* fps = nullptr;                     ///< Application's fps counter
+        audio::AudioEngine* audio = nullptr;            ///< mixer state + gains (Audio tab)
         /// Application's EMA-smoothed phase timings (nullable; the Stats tab
         /// omits the breakdown when any is null). `present_wait_ms` is a
         /// SUBSET of `render_ms` — the part the CPU spent blocked on the GPU,

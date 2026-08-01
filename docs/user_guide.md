@@ -87,6 +87,7 @@ All options with their defaults (defined in the root `CMakeLists.txt` except the
 | `BRACKEN_PLAYGROUND_SMOKE_TEST` | `OFF` | Register `playground --smoke 240` as a ctest named `playground_smoke` (label `integration`, 180 s timeout). Needs a GPU + display, so off by default. |
 | `BRACKEN_ENABLE_DEV_UI` | `ON` | Build the Dear ImGui developer overlay (`bracken::dev::DevUI`). `OFF` compiles `DevUI` to a no-op stub and skips fetching/linking ImGui entirely. When `ON`, the engine defines `BRACKEN_DEV_UI=1` publicly (use it to guard panel bodies that call `ImGui::` directly). |
 | `BRACKEN_ENABLE_TRACY` | `OFF` | Fetch Tracy v0.11.1, link `TracyClient`, and define `BRACKEN_ENABLE_TRACY=1` publicly. OFF means zero overhead. |
+| `BRACKEN_ENABLE_SYNTH` | `ON` | Build the software synthesizer and music sequencer (`audio/dsp`, `audio/synth`, `audio/music`). `OFF` makes `AudioEngine::play_music` a no-op and compiles those headers out entirely — for a game shipping only recorded audio. Recorded-audio playback, the mixer and 3D positioning are unaffected. |
 | `BRACKEN_WERROR` | top-level: `ON`<br>as subproject: `OFF` | Treat warnings as errors on the four first-party targets (`bracken`, `bracken_tests`, `bracken_benchmarks`, `playground`). Warning flags are applied **PRIVATE**, so consuming a game via `add_subdirectory` never inherits them — and the default flips to `OFF` off-top-level so a new compiler release can't break your build. |
 
 Example — a lean "shipping-style" configure:
@@ -7161,3 +7162,87 @@ implementation.
   `set_position(..., activate=true)` wake them.
 - One `PhysicsWorld` per independent simulation; worlds share Jolt's global
   type registry (initialized once, thread-safe) but nothing else.
+
+## Audio
+
+`Application::audio()` returns the `bracken::audio::AudioEngine`. It is brought
+up by `init_engine()`; if the machine has no output device every call becomes a
+silent no-op, so you never need to branch on whether sound exists.
+
+`play_sound`, `play_music` and `set_listener` are **worker-safe** — call them
+directly from `on_simulate`, with no locking and no ordering rules. They post to
+a bounded lock-free ring that the device callback drains.
+
+### Sound effects
+
+```cpp
+// on_init (main thread)
+splash_ = audio().load_sound("assets/splash.wav");
+
+// on_simulate (sim stage) — a world-positioned one-shot
+audio().play_sound(splash_, {
+    .gain = 0.8f,
+    .space = bracken::audio::SoundSpace::World,
+    .position = impact_point,
+    .min_distance = 200.0f,   // full volume inside this radius
+    .max_distance = 4000.0f,  // silent beyond it
+});
+
+// once a frame, so world sounds pan correctly
+audio().set_listener(camera().get_position(), camera().get_forward(), {0, 1, 0});
+```
+
+`SoundSpace::UI` skips attenuation and panning — use it for interface clicks
+and music stings.
+
+### Music, from the built-in synthesizer
+
+There is no audio file involved: a `Song` is data, and the engine synthesizes
+it. A track is monophonic (chords are several tracks), and patterns are
+referenced by index so a repeated section is stored once.
+
+```cpp
+using namespace bracken::audio;
+
+music::Track lead;
+lead.instrument = synth::patches::plucked_string(); // or build an Instrument
+music::Pattern p;
+p.steps = {
+    {.note = A4, .gate_steps = 3},
+    {},                              // rest
+    {.note = C5, .gate_steps = 3},
+    {},
+};
+lead.patterns.push_back(p);
+
+music::Song song;
+song.bpm = 76.0f;
+song.steps_per_beat = 4;   // sixteenth-note grid
+song.loop = true;
+song.tracks = {lead};
+
+audio().play_music(std::move(song));   // copied; the audio thread reads it
+```
+
+An `Instrument` is plain data — two oscillators, an ADSR, a filter, pan — so
+patches can be built in code, generated, or loaded from your own format.
+`synth::patches::` ships `soft_pad`, `plucked_string`, `sine_bass`, `reed` and
+`hat` to start from.
+
+Playback is **sample-accurate**: the sequencer splits a buffer at a step
+boundary rather than rounding to it, so a song sounds identical regardless of
+the device's buffer size, and renders bit-identically every run.
+
+### Hearing it without a device
+
+`AudioEngine::render_offline()` runs the real mixer with no device, and
+`audio::write_wav()` dumps the result. This is the audio equivalent of the
+smoke run's screenshot — when generated music stops sounding right there is no
+source asset to diff against, so you dump the output and look at it:
+
+```bash
+build/examples/playground/playground --render-music theme.wav 26
+```
+
+The playground's own theme ("Hearthsmoke", `examples/playground/music.cpp`) is
+built entirely this way.

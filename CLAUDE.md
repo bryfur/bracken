@@ -110,6 +110,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `systems/` | `bracken::systems` | camera controller/system |
 | `effects/` | *(namespaces unchanged)* | the particle-effect triad in one place: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage owned: spawned/updated/snapshotted inside the sim job), `EffectRenderer` (draws the packet snapshot) |
 | `procedural/` | `bracken::procedural` | tree + rock generators |
+| `audio/` | `bracken::audio` (+ `::dsp`, `::synth`, `::music`) | SDL3 playback device, lock-free mixer, 3D positional voices, WAV clips — **plus a software synthesizer**: band-limited oscillators / ADSR / SVF (`dsp/`), patches + polyphonic voices (`synth/`), and a sample-accurate song sequencer (`music/`). `BRACKEN_ENABLE_SYNTH=OFF` compiles the synth half out. The one subsystem with a thread the engine does not own |
 | `physics/` | `bracken::physics` | `PhysicsWorld` — rigid-body physics over vendored **Jolt** (pimpl; Jolt never appears in a public header). Fixed-step accumulator `update()` (tier owned/sim-stage), sphere/box/capsule/heightfield bodies, ray casts; Jolt's step jobs run on the engine `JobSystem` via the `JoltJobSystem` bridge in **`physics/internal/`** — one pool owns the cores |
 | `dev/` | `bracken::dev` | `DevUI` Dear ImGui developer overlay (F10 in the playground; no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`) + `dev_panels` (built-in Stats/Environment/Graphics/Camera panels). ImGui appears only in `dev/*.cpp` |
 | `testing/` | `bracken::testing` | `frame_test.hpp` — `TestFrame` + `FrameAccess`, published **for host games** to unit-test their frame code with no GPU/window/SDL. Header-only; nothing in the engine's production path includes it |
@@ -229,6 +230,16 @@ draws it.
   pairing partner) at its declaration; bare `seq_cst` in a hot path needs a
   justifying comment. Run the TSan lane after touching concurrency code.
 
+- **Audio threading**: SDL calls back on *its* thread whenever the device
+  wants samples. That thread never blocks, allocates or logs, so everything
+  crossing into it goes through a bounded lock-free ring
+  (`audio/command_ring.hpp`) and pre-sized buffers; a new song is adopted
+  under a `try_lock` and the *outgoing* song is handed back for the game
+  thread to free (`Sequencer::swap_song`). The payoff for hosts is that
+  `play_sound` / `play_music` / `set_listener` are **worker-safe** — call them
+  straight from `on_simulate`. Audio does not touch the `FramePacket`, so it
+  cannot move the packet digest.
+
 ### Load-bearing constants
 - `MAX_BONES = 128` — defined **only** in `animation/animation_types.hpp`. It
   caps the CPU-side per-instance bone-matrix arrays; the skinned shaders read
@@ -326,7 +337,9 @@ to a no-op stub and skips fetching ImGui), `BRACKEN_ENABLE_CONTRACTS`
 (default ON — compiles the host-boundary `BRACKEN_CONTRACT` checks into
 release builds; each is one compare and a branch off any per-item loop, so
 turn it OFF only with a measurement), `BRACKEN_ENABLE_TRACY`
-(default OFF), `BRACKEN_WERROR` (default ON at top level, OFF when consumed via
+(default OFF), `BRACKEN_ENABLE_SYNTH` (default ON — the software synth +
+sequencer; OFF makes `play_music` a no-op and drops `audio/dsp|synth|music`),
+`BRACKEN_WERROR` (default ON at top level, OFF when consumed via
 `add_subdirectory` — warnings are applied PRIVATE so a consuming game never
 inherits them; see `cmake/BrackenWarnings.cmake`).
 Env: `BRACKEN_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.

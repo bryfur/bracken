@@ -1,5 +1,7 @@
 #include "bracken/dev/dev_panels.hpp"
 
+#include "bracken/audio/audio_engine.hpp"
+
 #if defined(BRACKEN_DEV_UI) && BRACKEN_DEV_UI
 
 #include "bracken/contracts/environment.hpp"
@@ -406,6 +408,58 @@ void draw_camera_tab(systems::CameraController& camera, DevUI::PanelState& state
     }
 }
 
+void draw_audio_tab(const DevUI::Bindings& bindings) {
+    audio::AudioEngine& engine = *bindings.audio;
+    const audio::AudioDiagnostics d = engine.diagnostics();
+
+    ImGui::SeparatorText("Device");
+    ImGui::Text("%s", d.device_open ? "open (48 kHz stereo float)"
+                                    : "NO DEVICE - running silent");
+
+    ImGui::SeparatorText("Mixer");
+    ImGui::Text("sound voices: %d", d.active_sound_voices);
+    ImGui::Text("music voices: %d", d.active_music_voices);
+    // A running total, not a rate: a single burst of drops is the interesting
+    // event and a per-second figure would average it away to nothing.
+    ImGui::Text("commands dropped: %llu",
+                static_cast<unsigned long long>(d.commands_dropped));
+    if (d.commands_dropped > 0) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "(ring full)");
+    }
+
+    // Peak is post-master and post-limiter, so this is what actually left the
+    // mixer. Sustained 1.0 means the soft clipper is working the whole time.
+    ImGui::Text("peak");
+    ImGui::SameLine();
+    ImGui::ProgressBar(d.peak_level, ImVec2(-1.0f, 0.0f));
+
+    ImGui::SeparatorText("Levels");
+    static float master = 1.0f;
+    static float music = 0.55f;
+    static float sfx = 1.0f;
+    if (ImGui::SliderFloat("Master", &master, 0.0f, 1.5f, "%.2f")) {
+        engine.set_master_gain(master);
+    }
+    if (ImGui::SliderFloat("Music", &music, 0.0f, 1.5f, "%.2f")) {
+        engine.set_music_gain(music);
+    }
+    if (ImGui::SliderFloat("Sound", &sfx, 0.0f, 1.5f, "%.2f")) {
+        engine.set_sound_gain(sfx);
+    }
+
+#if BRACKEN_SYNTH
+    ImGui::SeparatorText("Music");
+    bool playing = engine.music_playing();
+    if (ImGui::Checkbox("Playing", &playing)) {
+        engine.set_music_playing(playing);
+    }
+#else
+    ImGui::SeparatorText("Music");
+    ImGui::TextDisabled("synthesizer compiled out (BRACKEN_ENABLE_SYNTH=OFF)");
+#endif
+}
+
 } // namespace
 
 void draw_builtin_panels(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
@@ -418,6 +472,12 @@ void draw_builtin_panels(const DevUI::Bindings& bindings, DevUI::PanelState& sta
         if ((bindings.fps != nullptr || bindings.scene_renderer != nullptr) && ImGui::BeginTabItem("Stats")) {
             ImGui::PushID("stats");
             draw_stats_tab(bindings, state);
+            ImGui::PopID();
+            ImGui::EndTabItem();
+        }
+        if (bindings.audio != nullptr && ImGui::BeginTabItem("Audio")) {
+            ImGui::PushID("audio");
+            draw_audio_tab(bindings);
             ImGui::PopID();
             ImGui::EndTabItem();
         }

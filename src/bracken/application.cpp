@@ -13,6 +13,7 @@
 #include "bracken/heightmap.hpp"
 #include "bracken/render/render_context.hpp"
 #include "bracken/scene/frame_packet_ring.hpp"
+#include "bracken/audio/audio_engine.hpp"
 #include "bracken/scene/packet_digest.hpp"
 #include "bracken/scene/scene_renderer.hpp"
 #include "bracken/sim_frame.hpp"
@@ -34,7 +35,9 @@ using namespace bracken::render;
 using namespace bracken::scene;
 using namespace bracken::systems;
 
-Application::Application() : effect_system_(std::make_unique<systems::EffectSystem>()) {}
+Application::Application()
+    : effect_system_(std::make_unique<systems::EffectSystem>()),
+      audio_(std::make_unique<audio::AudioEngine>()) {}
 
 Application::~Application() = default;
 
@@ -81,6 +84,11 @@ bool Application::init_engine() {
             BRACKEN_LOG_INFO("app", "Hot-reload enabled (BRACKEN_HOT_RELOAD=1)");
         }
     }
+
+    // A machine with no output device is not an error: init() logs and every
+    // subsequent audio call becomes a no-op, so hosts and CI need no branch.
+    (void)audio_->init();
+
     return true;
 }
 
@@ -428,6 +436,9 @@ void Application::run() {
 }
 
 void Application::shutdown_engine() {
+    // Before SDL_Quit: destroying the stream joins the audio callback, so no
+    // mix can be in flight while the rest of the engine tears down.
+    audio_->shutdown();
     core::asset::FileWatcher::instance().shutdown();
     // Safety net for hosts that never brought up the renderer: normally the
     // pool is already down (top of shutdown_renderer(), before GPU teardown);
@@ -691,6 +702,7 @@ bool Application::init_dev_ui() {
         // lands at the frame fence (see dev_ui.hpp's panel-data-safety note).
         [this](const GraphicsSettings& s) { request_graphics_settings(s); },
         &fps_,
+        audio_.get(),
         &sim_ms_,
         &render_ms_,
         &fence_ms_,
