@@ -7,6 +7,7 @@ add_executable(playground
     character.cpp
     day_weather.cpp
     music.cpp
+    sfx.cpp
 )
 bracken_target_warnings(playground)
 # The namespaced alias, deliberately: this is the reference consumer, so it

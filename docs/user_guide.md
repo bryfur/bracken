@@ -7246,3 +7246,37 @@ build/examples/playground/playground --render-music theme.wav 26
 
 The playground's own theme ("Hearthsmoke", `examples/playground/music.cpp`) is
 built entirely this way.
+
+## Input actions
+
+`InputHandler` is raw input by design. `bracken::ActionMap` is the layer above
+it: named actions bound to physical inputs, with edge detection, normalized
+axes and rebinding persistence. The engine never learns what an action *means* —
+the names stay with you.
+
+```cpp
+// on_init
+ActionId fire = actions_.add("attack");
+actions_.bind(fire, Binding::mouse(MouseButton::Left));
+actions_.bind(fire, Binding::controller(ControllerButton::Primary));
+(void)actions_.load("bindings.cfg");   // absent file = your defaults stand
+
+// on_simulate — once, before any query (edges compare against the last call)
+actions_.update(sim.input());
+
+if (actions_.pressed(fire)) { swing(); }
+glm::vec2 move = actions_.vector(left_, right_, back_, forward_);  // never >1
+```
+
+An action can have several bindings and any of them triggers it, so hosts stop
+writing `||` between a key and a pad button at each call site.
+
+For a rebinding screen use `rebind_exclusive()`, which also takes the input
+away from whatever else had it — two actions sharing one key is the defect that
+screen otherwise ships.
+
+`save()`/`load()` write `action=source:code,...` keyed by **name**, so the file
+survives reordering your `add()` calls. Unknown actions in the file are skipped
+with a warning (an old file must not discard the rest of a player's setup), a
+malformed line keeps that action's current bindings, and an action absent from
+the file keeps its default.

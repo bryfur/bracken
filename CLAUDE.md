@@ -198,7 +198,7 @@ draws it.
   disagree. Adding a cbuffer to a shader without a row in that test's table
   also fails.
 - Engine code is **game-agnostic**: no gameplay concepts (combat, inventory,
-  skills) belong in engine headers. `InputHandler` is raw input only;
+  skills) belong in engine headers. `InputHandler` is raw input only (`ActionMap` in `action_map.hpp` is the host-facing layer above it: named actions bound to keys/mouse/pad, with edges, normalized axes and rebinding persistence — the engine never learns what an action *means*);
   `CameraController` exposes generic shake/focus/fov primitives.
 - **Threading** (Phase 4 of [docs/multithreading_plan.md](docs/multithreading_plan.md)):
   the frame **is pipelined** — `Application::run()` kicks `on_simulate(i+1)`

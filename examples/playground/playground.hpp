@@ -11,6 +11,9 @@
 #include "bracken/physics/physics_world.hpp"
 #include "bracken/scene/frame_sink.hpp"
 #include "day_weather.hpp"
+#include "sfx.hpp"
+
+#include "bracken/action_map.hpp"
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
@@ -242,6 +245,27 @@ private:
     bool river_active_ = false; // cached at init; immutable afterwards
     std::vector<PendingRipple> pending_ripples_;
     float wade_ripple_timer_ = 0.0f;    // rate-limits wading ripple impulses
+
+#if BRACKEN_SYNTH
+    SfxBank sfx_{};                     // synthesized at boot; no audio assets
+#endif
+    // Footfalls are driven by distance travelled, not by a timer: that way the
+    // step rate follows the animation instead of drifting against it when the
+    // player accelerates.
+    // Named actions rather than scancodes at the call site. Bindings load
+    // from playground_bindings.cfg when present, so they are rebindable
+    // without a rebuild.
+    bracken::ActionMap actions_;
+    bracken::ActionId act_forward_{}, act_back_{}, act_left_{}, act_right_{};
+    bracken::ActionId act_run_{}, act_attack_{}, act_flashlight_{};
+
+#if BRACKEN_SYNTH
+    // Footfalls are driven by distance travelled, not by a timer, so the step
+    // rate follows the animation instead of drifting against it as the player
+    // accelerates. Only the synth build has footsteps to schedule.
+    float step_distance_ = 0.0f;
+    bool was_in_water_ = false;         // rising edge = entry splash
+#endif
     float ambient_ripple_timer_ = 0.0f; // occasional ambient rings on the river
 
     // Game state

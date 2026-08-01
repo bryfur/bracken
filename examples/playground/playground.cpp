@@ -313,8 +313,31 @@ bool PlaygroundGame::on_init() {
     // The village theme, played by the engine's synthesizer. There is no
     // audio file: the whole score is generated from oscillators at runtime.
     // Quieter than the default so it sits under the scene rather than on it.
+    // Actions, bound to defaults then overridden by a bindings file if the
+    // player has one. The engine never learns what "attack" means — it only
+    // reports that the thing this host named "attack" went down.
+    act_forward_ = actions_.add("move_forward");
+    act_back_ = actions_.add("move_backward");
+    act_left_ = actions_.add("move_left");
+    act_right_ = actions_.add("move_right");
+    act_run_ = actions_.add("run");
+    act_attack_ = actions_.add("attack");
+    act_flashlight_ = actions_.add("flashlight");
+
+    actions_.bind(act_forward_, bracken::Binding::key(SDL_SCANCODE_W));
+    actions_.bind(act_back_, bracken::Binding::key(SDL_SCANCODE_S));
+    actions_.bind(act_left_, bracken::Binding::key(SDL_SCANCODE_A));
+    actions_.bind(act_right_, bracken::Binding::key(SDL_SCANCODE_D));
+    actions_.bind(act_run_, bracken::Binding::key(SDL_SCANCODE_LSHIFT));
+    actions_.bind(act_run_, bracken::Binding::key(SDL_SCANCODE_RSHIFT));
+    actions_.bind(act_attack_, bracken::Binding::mouse(bracken::MouseButton::Left));
+    actions_.bind(act_attack_, bracken::Binding::controller(bracken::ControllerButton::Primary));
+    actions_.bind(act_flashlight_, bracken::Binding::key(SDL_SCANCODE_F));
+    (void)actions_.load("playground_bindings.cfg"); // absent = defaults stand
+
     audio().set_music_gain(0.55f);
 #if BRACKEN_SYNTH
+    sfx_.build(audio());
     audio().play_music(build_village_theme());
 #endif
 
@@ -1136,10 +1159,15 @@ void PlaygroundGame::on_simulate(SimFrame& sim) {
 void PlaygroundGame::handle_input(const SimFrame& sim) {
     const auto& in = sim.input();
 
+    // Evaluate every action once, up front: edges are computed against the
+    // previous update(), so it must happen exactly once per sim frame and
+    // before any query.
+    actions_.update(in);
+
     if (in.was_key_just_pressed(SDL_SCANCODE_ESCAPE)) {
         quit();
     }
-    if (in.was_key_just_pressed(SDL_SCANCODE_F)) {
+    if (actions_.pressed(act_flashlight_)) {
         flashlight_ = !flashlight_;
     }
     if (in.was_key_just_pressed(SDL_SCANCODE_F3)) {
@@ -1185,16 +1213,16 @@ void PlaygroundGame::handle_input(const SimFrame& sim) {
     fwd.y = 0.0f;
     fwd = glm::length(fwd) > 0.001f ? glm::normalize(fwd) : glm::vec3(0, 0, -1);
     glm::vec3 right = glm::normalize(glm::cross(fwd, glm::vec3(0, 1, 0)));
-    glm::vec3 dir{0.0f};
-    if (in.move_forward) dir += fwd;
-    if (in.move_backward) dir -= fwd;
-    if (in.move_right) dir += right;
-    if (in.move_left) dir -= right;
+    // One normalized 2D read instead of four ifs — and the diagonal is not
+    // 1.41x faster, which the hand-rolled version only avoided because it
+    // normalized afterwards.
+    const glm::vec2 move = actions_.vector(act_left_, act_right_, act_back_, act_forward_);
+    const glm::vec3 dir = fwd * move.y + right * move.x;
     move_dir_ = glm::length(dir) > 0.001f ? glm::normalize(dir) : glm::vec3(0.0f);
 
-    running_input_ = in.key_held(SDL_SCANCODE_LSHIFT) || in.key_held(SDL_SCANCODE_RSHIFT);
+    running_input_ = actions_.held(act_run_);
 
-    if (in.mouse_left_pressed && attack_timer_ <= 0.0f) {
+    if (actions_.pressed(act_attack_) && attack_timer_ <= 0.0f) {
         attack_timer_ = ATTACK_DURATION;
         pending_attack_arc_ = true;
         camera().add_directional_shake(forward_from_yaw(facing_.current), 6.0f, 0.15f);
@@ -1602,6 +1630,48 @@ void PlaygroundGame::update_player(float dt) {
     }
 
     player_vel_ = move_dir_ * player_speed_;
+
+#if BRACKEN_SYNTH
+    // Footfalls by distance travelled, so the rate tracks the animation
+    // instead of drifting against it as the player accelerates.
+    const bool in_water = river_active_ && player_pos_.y < RIVER_WATER_LEVEL;
+    if (player_speed_ > 5.0f) {
+        step_distance_ += player_speed_ * dt;
+        constexpr float k_stride = 95.0f; // world units between footfalls
+        if (step_distance_ >= k_stride) {
+            step_distance_ -= k_stride;
+            audio().play_sound(in_water ? sfx_.footstep_water : sfx_.footstep_grass,
+                               {
+                                   // Quieter when walking than running: velocity
+                                   // is the cheapest cue that a step has weight.
+                                   .gain = 0.35f + 0.45f * std::min(player_speed_ / RUN_SPEED, 1.0f),
+                                   // Slight pitch scatter, derived from position
+                                   // rather than random so the smoke run stays
+                                   // reproducible. Identical repeats are the
+                                   // thing that makes footsteps sound fake.
+                                   .pitch = 0.92f + 0.16f * std::fabs(std::fmod(player_pos_.x * 0.013f, 1.0f)),
+                                   .space = bracken::audio::SoundSpace::World,
+                                   .position = player_pos_,
+                                   .min_distance = 250.0f,
+                                   .max_distance = 3000.0f,
+                               });
+        }
+    } else {
+        // Reset so the first step after standing still lands immediately.
+        step_distance_ = 90.0f; // just under a stride: next step fires soon
+    }
+
+    if (in_water && !was_in_water_) {
+        audio().play_sound(sfx_.splash, {
+                                            .gain = 0.9f,
+                                            .space = bracken::audio::SoundSpace::World,
+                                            .position = player_pos_,
+                                            .min_distance = 300.0f,
+                                            .max_distance = 5000.0f,
+                                        });
+    }
+    was_in_water_ = in_water;
+#endif
     player_pos_ += player_vel_ * dt;
     player_pos_.x = std::clamp(player_pos_.x, WORLD_MARGIN, WORLD - WORLD_MARGIN);
     player_pos_.z = std::clamp(player_pos_.z, WORLD_MARGIN, WORLD - WORLD_MARGIN);
@@ -1773,6 +1843,15 @@ void PlaygroundGame::update_orbs(float dt) {
         float d = glm::distance(glm::vec2(orb.pos.x, orb.pos.z), glm::vec2(player_pos_.x, player_pos_.z));
         if (d < ORB_PICKUP_RADIUS) {
             ++orbs_collected_;
+#if BRACKEN_SYNTH
+            audio().play_sound(sfx_.orb_pickup, {
+                                                    .gain = 0.7f,
+                                                    .space = bracken::audio::SoundSpace::World,
+                                                    .position = orb.pos,
+                                                    .min_distance = 400.0f,
+                                                    .max_distance = 4000.0f,
+                                                });
+#endif
             pending_pickup_bursts_.push_back(orb.pos);
             camera().add_shake(systems::ShakeType::Impact, 4.0f, 0.25f);
             // Respawn at another spot (not the one it was just taken from).
