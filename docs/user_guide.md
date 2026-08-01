@@ -7499,3 +7499,48 @@ into it and sticks.
 Exclude the ground itself from `blocked_fn`. Testing a capsule that rests on
 the terrain marks every cell blocked — the playground's first grid came out 0%
 walkable for exactly that reason.
+
+## Ray tracing (optional)
+
+Compute-shader ray tracing for **shadows** and **reflections**. They are
+independent toggles and **both default off**:
+
+```cpp
+gs.rt_shadows = true;      // traced sun shadows
+gs.rt_reflections = true;  // traced specular on smooth surfaces
+```
+
+There is no hardware ray tracing in SDL3 GPU, so these traverse a BVH the
+engine builds itself. That is a real cost for a taste-dependent gain, which is
+why nothing — not even the acceleration structure — is built unless one of them
+is on. Take either, both, or neither.
+
+### What makes it affordable
+
+- **No primary rays.** World position comes from the depth prepass, so the only
+  ray cast is the shadow or reflection ray itself.
+- **Two-level.** One BLAS per model, shared by every instance. The playground
+  draws 6.2M triangles but stores ~600k: a flat structure would be ~300 MB, this
+  is ~40 MB.
+- **Rays that cannot matter are never cast.** Sky pixels, and surfaces with
+  `N·L ≤ 0` (already unlit), are rejected before traversal.
+- **Shadows use any-hit** and stop at the first occluder. **Reflections need
+  closest-hit** and cannot, which is most of why they cost several times more.
+- **Reduced resolution** — shadows half, reflections quarter by default.
+- **Roughness gate.** Rough surfaces keep the prefiltered IBL probe, which is
+  indistinguishable there and far cheaper.
+
+### The one ordering constraint
+
+Reflections need per-triangle attributes (normals, colours) to shade a hit, and
+those are gathered when the acceleration structure is built. Enabling
+reflections after building without them logs an error rather than rendering
+black — build with `want_attributes = true` if reflections may be turned on
+during the session. Shadows never need them, so a shadows-only game stores 48
+bytes per triangle instead of 112.
+
+### Tuning
+
+`max_distance` is the strongest dial: traversal cost scales with how much of
+the tree a ray can reach, so a shorter ray is cheaper *and* misses distant
+occluders. Trade it against `resolution` before reaching for anything else.

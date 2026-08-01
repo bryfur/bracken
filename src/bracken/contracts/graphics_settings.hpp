@@ -181,6 +181,17 @@ struct GraphicsSettings {
                                               // procedural sky; OFF falls back to hemisphere ambient
     bool bloom_enabled = true;                // Bloom post-processing
     float bloom_strength = 0.25f;             // Bloom intensity (0.0 - 1.0)
+    // --- Compute-shader ray tracing -------------------------------------
+    // BOTH OFF BY DEFAULT and independently switchable. There is no hardware
+    // ray tracing in SDL3 GPU, so these traverse a software BVH the engine
+    // builds; that is a large cost for a taste-dependent gain, and neither
+    // even builds an acceleration structure unless it is on.
+    //
+    // rt_reflections additionally needs per-triangle attributes, which more
+    // than doubles the structure's memory — so enabling it after the scene was
+    // built without them logs an error rather than rendering black.
+    bool rt_shadows = false;     ///< traced sun shadows instead of / alongside CSM
+    bool rt_reflections = false; ///< traced specular for smooth surfaces
     bool volumetric_fog = false;              // Atmospheric fog haze (expensive, off by default)
     bool god_rays = false;                    // Light shafts through shadows (requires volumetric_fog)
     WindowMode window_mode = WindowMode::Windowed;

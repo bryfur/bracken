@@ -297,6 +297,16 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
 
     ImGui::SeparatorText("Features");
     changed |= ImGui::Checkbox("Image-based lighting", &settings.ibl_enabled);
+    changed |= ImGui::Checkbox("RT shadows", &settings.rt_shadows);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Compute-shader ray-traced sun shadows over a software BVH.\n"
+                          "Independent of RT reflections; both are off by default.");
+    }
+    changed |= ImGui::Checkbox("RT reflections", &settings.rt_reflections);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Traced specular for smooth surfaces; rough ones keep the IBL probe.\n"
+                          "Costs more than RT shadows: closest-hit cannot stop early.");
+    }
     changed |= ImGui::Checkbox("Bloom", &settings.bloom_enabled);
     changed |= ImGui::Checkbox("Volumetric fog", &settings.volumetric_fog);
     changed |= ImGui::Checkbox("God rays", &settings.god_rays);

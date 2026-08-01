@@ -1203,6 +1203,10 @@ std::size_t ModelManager::build_lods(ModelHandle handle, std::span<const float> 
     return created;
 }
 
+std::size_t ModelManager::model_count() const noexcept {
+    return models_.size();
+}
+
 Model* ModelManager::get_model(ModelHandle handle) const {
     if (handle == INVALID_MODEL_HANDLE || handle >= models_.size()) {
         return nullptr;

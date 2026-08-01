@@ -601,4 +601,8 @@ ExposureAdapt
   cs        exposure_adapt.comp.spv entry=CSMain samplers=0 ro_textures=0 ro_buffers=0 rw_textures=0 rw_buffers=2 uniform_buffers=1
 WaterSim
   cs        water_sim.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
+RtShadow
+  cs        rt_shadow.comp.spv entry=CSMain samplers=0 ro_textures=2 ro_buffers=4 rw_textures=1 rw_buffers=0 uniform_buffers=1
+RtReflection
+  cs        rt_reflection.comp.spv entry=CSMain samplers=0 ro_textures=2 ro_buffers=5 rw_textures=1 rw_buffers=0 uniform_buffers=1
 )GOLDEN"

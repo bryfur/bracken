@@ -1075,4 +1075,37 @@ BRACKEN_HLSL_FIELD(RtShadowUniforms, outputSize, 96);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, tlasNodeCount, 104);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, depthBias, 108);
 
+/**
+ * Ray-traced reflection compute uniforms — matches rt_reflection.comp.hlsl
+ * RtReflectionUniforms (set 2, b0). Used by: render::RtRenderer.
+ */
+struct alignas(16) RtReflectionUniforms {
+    glm::mat4 invViewProj;
+    glm::vec3 cameraPosition;
+    float rayMaxDistance;
+    glm::vec3 sunDirection;
+    float maxRoughness;   // above this the IBL probe is used instead of a ray
+    glm::vec3 sunColor;
+    float normalBias;
+    glm::vec3 skyColor;
+    float intensity;
+    glm::uvec2 outputSize;
+    uint32_t tlasNodeCount;
+    float pad;
+};
+
+BRACKEN_HLSL_CBUFFER(RtReflectionUniforms, 144);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, invViewProj, 0);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, cameraPosition, 64);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, rayMaxDistance, 76);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, sunDirection, 80);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, maxRoughness, 92);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, sunColor, 96);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, normalBias, 108);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, skyColor, 112);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, intensity, 124);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, outputSize, 128);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, tlasNodeCount, 136);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, pad, 140);
+
 } // namespace bracken::gpu

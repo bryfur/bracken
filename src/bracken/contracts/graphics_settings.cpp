@@ -78,6 +78,8 @@ bool GraphicsSettings::save(const std::string& path) const {
     out << "ibl_enabled=" << ibl_enabled << "\n";
     out << "bloom_enabled=" << bloom_enabled << "\n";
     out << "bloom_strength=" << bloom_strength << "\n";
+    out << "rt_shadows=" << rt_shadows << "\n";
+    out << "rt_reflections=" << rt_reflections << "\n";
     out << "volumetric_fog=" << volumetric_fog << "\n";
     out << "god_rays=" << god_rays << "\n";
     out << "window_mode=" << static_cast<int>(window_mode) << "\n";
@@ -175,6 +177,8 @@ bool GraphicsSettings::load(const std::string& path) {
     read_bool("ibl_enabled", ibl_enabled);
     read_bool("bloom_enabled", bloom_enabled);
     read_float("bloom_strength", bloom_strength);
+    read_bool("rt_shadows", rt_shadows);
+    read_bool("rt_reflections", rt_reflections);
     read_bool("volumetric_fog", volumetric_fog);
     read_bool("god_rays", god_rays);
     read_enum("window_mode", window_mode);

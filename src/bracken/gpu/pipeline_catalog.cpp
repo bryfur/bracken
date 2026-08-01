@@ -632,6 +632,25 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      .resources = {.num_readonly_storage_textures = 1,  // previous wave state
                    .num_readwrite_storage_textures = 1, // next wave state
                    .num_uniform_buffers = 1}},
+    {.name = "RtShadow",
+     .shader = "rt_shadow.comp.spv",
+     .entry_point = "CSMain",
+     // depth + normal, then the four acceleration-structure buffers. No
+     // attribute buffer: a shadow ray asks a yes/no question and never shades
+     // what it hits, which is why it costs 48 bytes per triangle and
+     // reflections cost 112.
+     .resources = {.num_readonly_storage_textures = 2,
+                   .num_readonly_storage_buffers = 4,
+                   .num_readwrite_storage_textures = 1,
+                   .num_uniform_buffers = 1}},
+    {.name = "RtReflection",
+     .shader = "rt_reflection.comp.spv",
+     .entry_point = "CSMain",
+     // Same, plus per-triangle attributes to shade the hit.
+     .resources = {.num_readonly_storage_textures = 2,
+                   .num_readonly_storage_buffers = 5,
+                   .num_readwrite_storage_textures = 1,
+                   .num_uniform_buffers = 1}},
 }};
 
 static_assert(k_compute_descs.size() == static_cast<size_t>(ComputePipelineType::Count),

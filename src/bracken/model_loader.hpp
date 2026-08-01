@@ -402,6 +402,11 @@ public:
     /// Const-safe after load.
     ModelHandle get_handle(const std::string& name) const;
 
+    /// Number of registered models. Handles are dense indices below this, so
+    /// this is also the bound for iterating every model — which is what
+    /// building an acceleration structure over the whole scene needs.
+    [[nodiscard]] std::size_t model_count() const noexcept;
+
     /**
      * Register a pre-built model (e.g. procedurally generated). Takes
      * ownership, uploads to the GPU when a device is set, and finishes the

@@ -144,6 +144,8 @@ enum class ComputePipelineType {
     ExposureHistogram, ///< 256-bin log2-luminance histogram of the HDR scene (16x16 tiles, LDS-merged)
     ExposureAdapt,     ///< Histogram reduce -> target EV -> temporal adaptation (single workgroup)
     WaterSim,          ///< Wave-equation water simulation substep (ping-pong RG16F state)
+    RtShadow,          ///< Ray-traced sun shadows over the software BVH (any-hit, half-res mask)
+    RtReflection,      ///< Ray-traced specular reflections over the same BVH (closest-hit)
 
     // Count for iteration
     Count
