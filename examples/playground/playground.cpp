@@ -2,6 +2,7 @@
 #include "music.hpp"
 
 #include "bracken/audio/audio_engine.hpp"
+#include "bracken/save/save_document.hpp"
 
 #include "character.hpp"
 #include "scene_layout.hpp"
@@ -333,6 +334,10 @@ bool PlaygroundGame::on_init() {
     actions_.bind(act_attack_, bracken::Binding::mouse(bracken::MouseButton::Left));
     actions_.bind(act_attack_, bracken::Binding::controller(bracken::ControllerButton::Primary));
     actions_.bind(act_flashlight_, bracken::Binding::key(SDL_SCANCODE_F));
+    act_quicksave_ = actions_.add("quicksave");
+    act_quickload_ = actions_.add("quickload");
+    actions_.bind(act_quicksave_, bracken::Binding::key(SDL_SCANCODE_F9));
+    actions_.bind(act_quickload_, bracken::Binding::key(SDL_SCANCODE_F11));
     (void)actions_.load("playground_bindings.cfg"); // absent = defaults stand
 
     audio().set_music_gain(0.55f);
@@ -1167,6 +1172,13 @@ void PlaygroundGame::handle_input(const SimFrame& sim) {
     if (in.was_key_just_pressed(SDL_SCANCODE_ESCAPE)) {
         quit();
     }
+    if (actions_.pressed(act_quicksave_)) {
+        quicksave();
+    }
+    if (actions_.pressed(act_quickload_)) {
+        quickload();
+    }
+
     if (actions_.pressed(act_flashlight_)) {
         flashlight_ = !flashlight_;
     }
@@ -1478,6 +1490,17 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
         smoke_start_ns_ = SDL_GetTicksNS();
     }
 
+    // Save/load coverage for the smoke run, at the fence because save() does
+    // blocking file IO and no sim is in flight here. Saving and immediately
+    // reloading must be LOSSLESS: if it is, game state is unchanged and the
+    // packet digest stays put, so the digest doubles as an end-to-end
+    // round-trip check. A quicksave that quietly degrades a float or drops an
+    // orb position would move it.
+    if (frame_ == 150) {
+        quicksave();
+        quickload();
+    }
+
     // One scoped edit per fence: whatever the scripted flips below touch is
     // requested once on scope exit and applied at the NEXT fence (one frame
     // later than the old immediate apply — invisible in a 240-frame run, and
@@ -1617,6 +1640,70 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
                                  diag.cluster_lights_dropped, diag.camera_missing ? 1 : 0);
         quit();
     }
+}
+
+namespace {
+constexpr const char* k_quicksave_path = "playground_quicksave.sav";
+/** Bump when the meaning of a saved field changes. Fields that are merely
+ *  ADDED need no bump — a reader takes its default when they are absent. */
+constexpr uint32_t k_playground_save_version = 1;
+} // namespace
+
+void PlaygroundGame::quicksave() {
+    bracken::save::SaveDocument doc;
+    doc.set_game_version(k_playground_save_version);
+
+    doc.write("player/position", player_pos_);
+    doc.write("player/facing", facing_.current);
+    doc.write("progress/orbs_collected", orbs_collected_);
+    doc.write("world/hour", day_weather_.hour);
+    doc.write("world/weather_mode", static_cast<int32_t>(day_weather_.mode));
+    doc.write("world/animate_sun", day_weather_.animate);
+
+    // Orb positions: they respawn to random spots, so a reload that put them
+    // back at the defaults would visibly differ from what the player saw.
+    doc.write_count("orbs", orbs_.size());
+    for (std::size_t i = 0; i < orbs_.size(); ++i) {
+        doc.write(bracken::save::index_path("orbs", i, "position"), orbs_[i].pos);
+    }
+
+    if (auto r = doc.save(k_quicksave_path); !r) {
+        BRACKEN_LOG_WARN("playground", "quicksave failed: {}",
+                         bracken::save::to_string(r.error()));
+    }
+}
+
+void PlaygroundGame::quickload() {
+    auto loaded = bracken::save::SaveDocument::load(k_quicksave_path);
+    if (!loaded) {
+        // A missing quicksave is the normal case on a fresh run, not an error.
+        if (loaded.error() != bracken::save::SaveError::FileNotFound) {
+            BRACKEN_LOG_WARN("playground", "quickload failed: {}",
+                             bracken::save::to_string(loaded.error()));
+        }
+        return;
+    }
+    const bracken::save::SaveDocument& doc = loaded.value();
+
+    player_pos_ = doc.read_or("player/position", player_pos_);
+    facing_.current = doc.read_or("player/facing", facing_.current);
+    orbs_collected_ = doc.read_or<int32_t>("progress/orbs_collected", orbs_collected_);
+    day_weather_.hour = doc.read_or("world/hour", day_weather_.hour);
+    day_weather_.mode =
+        static_cast<WeatherMode>(doc.read_or<int32_t>("world/weather_mode",
+                                                      static_cast<int32_t>(day_weather_.mode)));
+    day_weather_.animate = doc.read_or("world/animate_sun", day_weather_.animate);
+
+    const std::size_t n = std::min(doc.read_count("orbs"), orbs_.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        orbs_[i].pos = doc.read_or(bracken::save::index_path("orbs", i, "position"), orbs_[i].pos);
+    }
+
+    // Snap the weather to its restored targets rather than sliding there from
+    // whatever the live state happened to be.
+    day_weather_.snap();
+    BRACKEN_LOG_INFO("playground", "Quickload: {} orbs, hour {:.1f}", orbs_collected_,
+                     day_weather_.hour);
 }
 
 void PlaygroundGame::update_player(float dt) {

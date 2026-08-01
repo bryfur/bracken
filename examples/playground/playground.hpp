@@ -145,6 +145,8 @@ private:
     // Sim-side (on_simulate; pool job — no GPU/SDL/main-thread-tier calls):
     void update_smoke_driver(float dt); // movement synthesis: orbit/chase/attack
     void handle_input(const bracken::SimFrame& sim);
+    void quicksave();  // writes playground_quicksave.sav (atomic)
+    void quickload();  // restores it if present
     void update_player(float dt);
     void update_camera(bracken::SimFrame& sim); // non-const: records camera-forward feedback
     void update_orbs(float dt);
@@ -258,6 +260,7 @@ private:
     bracken::ActionMap actions_;
     bracken::ActionId act_forward_{}, act_back_{}, act_left_{}, act_right_{};
     bracken::ActionId act_run_{}, act_attack_{}, act_flashlight_{};
+    bracken::ActionId act_quicksave_{}, act_quickload_{};
 
 #if BRACKEN_SYNTH
     // Footfalls are driven by distance travelled, not by a timer, so the step

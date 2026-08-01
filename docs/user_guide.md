@@ -7280,3 +7280,56 @@ survives reordering your `add()` calls. Unknown actions in the file are skipped
 with a warning (an old file must not discard the rest of a player's setup), a
 malformed line keeps that action's current bindings, and an action absent from
 the file keeps its default.
+
+## Saved games
+
+`bracken::save::SaveDocument` stores typed values addressed by path. Values
+carry their own key, so adding a field, removing one, or reordering your code
+never invalidates an existing save — a reader asks for what it wants and takes
+a default when it is absent. That is the difference between a save system you
+can ship a patch against and one you cannot.
+
+```cpp
+using namespace bracken::save;
+
+SaveDocument doc;
+doc.set_game_version(2);                       // your content version
+doc.write("player/position", player_pos);
+doc.write("player/health", health);
+doc.write_count("orbs", orbs.size());
+for (std::size_t i = 0; i < orbs.size(); ++i)
+    doc.write(index_path("orbs", i, "position"), orbs[i].pos);
+
+if (auto r = doc.save("slot1.sav"); !r)
+    log_error(to_string(r.error()));
+```
+
+```cpp
+auto loaded = SaveDocument::load("slot1.sav");
+if (!loaded) { /* FileNotFound is the normal first-run case */ }
+const SaveDocument& d = loaded.value();
+
+pos    = d.read_or("player/position", spawn_point);
+health = d.read_or<int32_t>("player/health", 100);   // added later? default
+for (std::size_t i = 0; i < d.read_count("orbs"); ++i)
+    orbs[i].pos = d.read_or(index_path("orbs", i, "position"), orbs[i].pos);
+```
+
+What it guarantees, so you do not have to:
+
+- **Durability.** `save()` writes a temp file and renames it over the target.
+  An interrupted save leaves the *previous* one intact. Writing straight to the
+  target is how games ship "my save is gone".
+- **Corruption is reported, not loaded.** Every payload is checksummed;
+  truncated and bit-rotted files come back as `SaveError::Corrupt`.
+- **Old builds do not eat new data.** Records this build does not understand
+  survive a load and re-save.
+- **Type mismatches fail cleanly.** A save from another build is data, not a
+  contract; asking for the wrong type returns false and leaves your value alone.
+- **A newer format is refused,** rather than half-read — an unknown record
+  cannot be skipped, because its length is unknown.
+
+`game_version()` is yours: the engine round-trips it without interpreting it,
+so your own migrations have something to branch on.
+
+Try it in the playground: **F9** quicksaves, **F11** reloads.

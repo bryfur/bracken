@@ -86,6 +86,7 @@
 #include "bracken/audio/synth/render.hpp"       // bake a patch into a clip: SFX without audio assets
 #include "bracken/audio/wav_writer.hpp"         // dump a rendered mix for inspection
 #endif
+#include "bracken/save/save_document.hpp"      // saved games: typed, versioned, atomic, checksummed
 #include "bracken/effects/effect_definition.hpp" // EffectDefinition and its curves/emitters — spawned through the FrameSink
 
 // ---------------------------------------------------------------------------
