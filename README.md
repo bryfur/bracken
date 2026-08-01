@@ -192,6 +192,15 @@ verifies it isn't black or solid-color — a broken renderer that still hits
 underlying API is `Application::request_screenshot(path)` (final swapchain
 image, UI included, saved as PNG).
 
+It also prints `[smoke] packet_digest=0x...`, a 64-bit hash of every sealed
+`FramePacket` the run produced (`scene::packet_digest`). Because it is taken
+on the CPU side of the GPU boundary it is exact and driver-independent, and
+it is bit-identical at any `BRACKEN_WORKERS` — unlike the stat counters and
+the screenshot, which legitimately vary. It is the engine's regression gate:
+a change that should not alter what is drawn must leave it unchanged. The
+same function is public as `TestFrame::digest()` so your own game can pin the
+frames it describes in a unit test, with no GPU and no image comparison.
+
 ### Developer overlay
 
 The engine ships an immediate-mode developer overlay (`bracken::dev::DevUI`,

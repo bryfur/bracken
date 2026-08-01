@@ -228,14 +228,22 @@ then kick sim 0 (no overlap for frame 0). Each steady-state iteration i:
 4. **Kick sim i+1**: dt computed at kick (`SDL_GetTicksNS()`, clamped
    0.1 s) and stamped into the packet; by-value `InputSnapshot` taken
    (`InputHandler::snapshot()` — drains the text buffer); packet acquired
-   from the ring (`FrameBuilder` with 16 fixed lanes); sim job submitted.
+   from the ring (`FrameBuilder` with 16 fixed lanes); the viewport
+   snapshotted onto `SimFrame::screen_width()/height()`; sim job submitted.
    The job body: `SimFrame` → `on_simulate` → the engine's **sim-stage
-   tail** — apply the builder's effect spawns to the sim-owned
-   `EffectSystem` in deterministic (lane, emission) order,
-   `EffectSystem::update` on the pool, `snapshot_into(fb)` (the
-   effect-instance snapshot), advance the scene/sky clocks (sky = dt ×
-   the staged environment's `cloud_speed`), `set_engine_frame(...)` — →
-   `seal()`.
+   tail**, in this order —
+   (a) **camera** (unless `set_camera_driven_by_engine(false)`):
+   `set_screen_size` from the kick-time viewport, `update(dt)`,
+   `fb.set_camera(...)`, and the camera-forward feedback unless the host
+   set it itself. This runs *after* `on_simulate` so the frame's target
+   move and its shakes are both already in;
+   (b) apply the builder's effect spawns to the sim-owned
+   `EffectSystem` in deterministic (lane, emission) order, then
+   `EffectSystem::update` on the pool, then `snapshot_into(fb)` (the
+   effect-instance snapshot);
+   (c) advance the scene/sky clocks (sky = dt ×
+   the staged environment's `cloud_speed`) and `set_engine_frame(...)`
+   — → `seal()`. (`Application::run_sim_job`, `application.cpp`.)
 5. **Render frame i** on the main thread (`render_frame(packet)` — Prepare
    fan-out + Record + present, unchanged from Phase 3) while sim i+1 runs.
 6. **Retire** packet i.

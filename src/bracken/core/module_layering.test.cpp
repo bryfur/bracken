@@ -92,10 +92,27 @@ bool is_test_or_bench(const std::string& rel) {
     return ends_with(rel, ".test.cpp") || ends_with(rel, ".bench.cpp");
 }
 
+// The `#` of a preprocessor directive on `line`, or npos.
+//
+// Anchored at the first non-blank character on purpose. A loose `find('#')`
+// also matches a `#include` quoted inside a comment, and three production
+// headers do exactly that to document what they re-export
+// (`model_loader.hpp`, `bracken.hpp`, `render/lighting/light.hpp`). Today all
+// three name their own file, so the resulting phantom edge is a self-edge the
+// cycle check drops — but the next one that quotes a *different* header would
+// manufacture an edge that does not exist and fail a layering test that is
+// actually satisfied. `public_headers.test.cpp` and the CMake side that
+// generates the standalone-compile TUs anchor the same way; all three parsers
+// must agree or they are silently checking different graphs.
+std::size_t directive_hash(const std::string& line) {
+    const std::size_t first = line.find_first_not_of(" \t");
+    return (first == std::string::npos || line[first] != '#') ? std::string::npos : first;
+}
+
 // The quoted-include target of `line`, or empty. Only quoted includes can name
 // an in-tree header; angle includes are always external.
 std::string quoted_include(const std::string& line) {
-    const std::size_t hash = line.find('#');
+    const std::size_t hash = directive_hash(line);
     if (hash == std::string::npos) {
         return {};
     }
@@ -119,7 +136,7 @@ std::string quoted_include(const std::string& line) {
 
 // The angle-include target of `line`, or empty.
 std::string angle_include(const std::string& line) {
-    const std::size_t hash = line.find('#');
+    const std::size_t hash = directive_hash(line);
     if (hash == std::string::npos) {
         return {};
     }
@@ -438,4 +455,31 @@ TEST(ModuleLayering, ScanActuallySeesTheTree) {
     EXPECT_EQ(module_of("render/lighting/light.hpp"), "render/lighting");
     EXPECT_EQ(module_of("render/bloom.hpp"), "render");
     EXPECT_EQ(module_of("model_loader.hpp"), "model_loader.hpp");
+}
+
+// The include parser is what every assertion above is computed from, so its
+// one interesting edge case gets pinned rather than assumed. Three production
+// headers quote an `#include` inside a comment to document what they
+// re-export; a parser that counted those would invent edges that do not exist
+// and fail layering tests that are actually satisfied.
+TEST(ModuleLayering, IncludeParserIgnoresCommentedAndQuotedIncludes) {
+    // Real directives, in the forms the tree actually uses.
+    EXPECT_EQ(quoted_include("#include \"bracken/core/logger.hpp\""), "bracken/core/logger.hpp");
+    EXPECT_EQ(quoted_include("  #  include   \"bracken/contracts/light.hpp\""), "bracken/contracts/light.hpp");
+    EXPECT_EQ(angle_include("#include <vector>"), "vector");
+
+    // Prose that merely mentions one. These are the live cases: the comments
+    // at model_loader.hpp, bracken.hpp and render/lighting/light.hpp.
+    EXPECT_EQ(quoted_include("// existing `#include \"bracken/model_loader.hpp\"` still sees both names."), "");
+    EXPECT_EQ(quoted_include(" * `#include \"bracken/render/lighting/light.hpp\"` still sees them."), "");
+    EXPECT_EQ(angle_include("// a doc comment mentioning #include <memory>"), "");
+
+    // A string literal that happens to contain one (public_headers.test.cpp
+    // builds diagnostics like this).
+    EXPECT_EQ(quoted_include("    msg += \"#include \\\"bracken/x.hpp\\\"\";"), "");
+
+    // Not directives at all.
+    EXPECT_EQ(quoted_include(""), "");
+    EXPECT_EQ(quoted_include("int x = 1; // includes nothing"), "");
+    EXPECT_EQ(quoted_include("#pragma once"), "");
 }

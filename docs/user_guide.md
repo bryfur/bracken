@@ -1888,7 +1888,7 @@ Silent-drop behaviors to know:
 
 #### Zero-copy writes: `GPUBuffer::Mapping`
 
-For large per-frame data, skip the intermediate CPU staging vector and write straight into the mapped transfer memory. This is how `SceneRenderer` packs instance data (`src/bracken/scene/scene_renderer.cpp`):
+For large per-frame data, skip the intermediate CPU staging vector and write straight into the mapped transfer memory. This is how `SceneRenderer` packs instance data (`src/bracken/scene/scene_renderer_upload.cpp`):
 
 ```cpp
 if (bracken::gpu::GPUBuffer::Mapping mapping = instance_storage_buffer_->map()) {
@@ -4164,14 +4164,14 @@ Shadow reach is a quality setting: the cascades cover
 (`GraphicsSettings::shadow_distance`, default 4000, clamped [200, 20000] —
 also on the dev overlay's Graphics tab) and the shader fades shadows out over
 the last 15% of that range instead of popping
-(`src/bracken/scene/scene_renderer.cpp`, `shadow_common.hlsli`). Raising it
+(`src/bracken/scene/scene_renderer_shadow.cpp`, `shadow_common.hlsli`). Raising it
 trades texel density for reach at a given `shadow_resolution`, and more
 casters land in the cascades, so it costs GPU time.
 
 #### Per-mesh opt-out
 
 Meshes carry a `cast_shadows` flag; the shadow passes skip meshes with it
-cleared (see the caster loops in `src/bracken/scene/scene_renderer.cpp`).
+cleared (see the caster loops in `src/bracken/scene/scene_renderer_shadow.cpp`).
 Alpha-`BLEND` materials are alpha-tested at 0.5 in the shadow pass rather
 than casting translucent shadows.
 
@@ -4536,7 +4536,7 @@ void draw_skinned(bracken::ModelHandle handle, const glm::mat4& transform,
 
 ### Scene-wide lighting knobs
 
-Two objects feed every model draw's `LightingUniforms` (built per draw in `SceneRenderer::make_model_lighting`, `src/bracken/scene/scene_renderer.cpp`):
+Two objects feed every model draw's `LightingUniforms` (built per draw in `SceneRenderer::make_model_lighting`, `src/bracken/scene/scene_renderer_draw.cpp`):
 
 #### EnvironmentState — sun, sky, fog colors
 

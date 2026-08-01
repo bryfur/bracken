@@ -19,8 +19,8 @@ Consolidated from the chapters below. Changing any of these requires auditing ev
 | Swapchain / scene / depth formats | `RGBA8_UNORM` / `RGBA16F` / `D32_FLOAT` | `gpu/pipeline_registry.hpp` | Swapchain, HDR scene color, and depth target formats |
 | Default world extents | 32000 × 32000 | `application.hpp` (`init_renderer` default arguments) | Terrain/grass world size when the host omits it |
 | Near / far planes | `CameraModeConfig::near_plane`/`far_plane` (defaults 5 / 15000), arguments swapped (reversed-Z) | `systems/camera_controller.hpp` (config), `systems/camera_system.cpp` (`compute_matrices`) | The engine's only scene projection; configurable via `CameraModeConfig` |
-| Shadow resolution table | {512, 1024, 2048, 4096} | `scene/scene_renderer.cpp` | Per-cascade quadrant resolution, indexed by `GraphicsSettings::shadow_resolution` (0–3) |
-| Local-shadow atlas table | {1024, 2048, 4096} | `scene/scene_renderer.cpp` | 8×8-tile point/spot shadow atlas, indexed by `GraphicsSettings::local_shadow_resolution` (0–2) |
+| Shadow resolution table | {512, 1024, 2048, 4096} | `contracts/graphics_settings.hpp` (`shadow_map_texels`) | Per-cascade quadrant resolution. A `constexpr` mapping off `GraphicsSettings::shadow_resolution`, which is a `ShadowResolution` enum — not an int index |
+| Local-shadow atlas table | {1024, 2048, 4096} | `contracts/graphics_settings.hpp` (`local_shadow_atlas_texels`) | 8×8-tile point/spot shadow atlas, off the `LocalShadowResolution` enum |
 | `LOCAL_SHADOW_TILES_PER_ROW` (→ `LOCAL_SHADOW_MAX_SLOTS`) | 8 (→ 64 tiles) | `render/lighting/light.hpp` (mirrored in `cluster_lighting.hlsli`) | Local-shadow atlas grid; caps `local_shadow_point_budget` ≤ 8 (6 face tiles each) and `local_shadow_spot_budget` ≤ 16 |
 | `LocalShadowConfig::max_tile_updates_per_frame` | 6 | `render/lighting/local_shadows.hpp` | Local-shadow tiles re-rendered per frame; excess degrades to stale tiles (round-robin), never a hitch |
 | `EXPOSURE_HISTOGRAM_BINS` | 256 | `render/auto_exposure.hpp` (fixed by the compute shaders' LDS/`[numthreads]`) | Auto-exposure histogram bins; `EXPOSURE_MIN/MAX_LOG2_LUMA` = −10/+16 bounds the metered EV range |
@@ -743,7 +743,7 @@ struct RenderStats {
 };
 ```
 
-- Owned by `SceneRenderer` (`scene/scene_renderer.hpp`: `bracken::RenderStats render_stats_`); exposed via `Application::render_stats()` (`std::optional<RenderStats>`, `nullopt` while collection is off) and gated by `Application::set_collect_render_stats(bool)` → `SceneRenderer::set_collect_stats`. **Default off**; when off, none of the counters are incremented (every increment site in `scene/scene_renderer.cpp` checks `collect_stats_`).
+- Owned by `SceneRenderer` (`scene/scene_renderer.hpp`: `bracken::RenderStats render_stats_`); exposed via `Application::render_stats()` (`std::optional<RenderStats>`, `nullopt` while collection is off) and gated by `Application::set_collect_render_stats(bool)` → `SceneRenderer::set_collect_stats`. **Default off**; when off, none of the counters are incremented (every increment site across the `scene_renderer*.cpp` family checks `collect_stats_`).
 - `FrameDiagnostics` is the exception to that gate: `SceneRenderer::frame_diagnostics()` is reset and accumulated every frame regardless, because a dropped draw is not opt-in instrumentation. It rides the same chunk-index-ordered `FrameStatsPartial` merge, so it needs no atomics and is bit-identical at any worker count.
 - `pass_times_ms` is filled from `gpu_timer_pool_.read_results(...)`. `cpu_ms` is a real wall-clock measurement of the pass's command recording (`core::PassTimeline`, EMA alpha 0.2, 64 slots, slot averages discarded when a slot's pass name changes). `gpu_ms` stays `nullopt`: SDL3 GPU exposes no timestamp queries. Use RenderDoc/Nsight for GPU-side cost.
 - When collecting, draw calls/triangles/entities are also emitted as Tracy plots (`render.draw_calls`, `render.triangles`, `render.entities`).
@@ -1923,7 +1923,7 @@ Semantics:
 - `create_dynamic`: allocates the GPU buffer and a **persistent** `UPLOAD` transfer buffer of the same size (`is_dynamic()` ⇔ `transfer_buffer_ != nullptr`). No initial contents.
 - `update(SDL_GPUCommandBuffer*, ...)`: begins/ends its own copy pass and delegates to the copy-pass overload. Prefer the copy-pass overload to batch several updates into one pass.
 - `update(SDL_GPUCopyPass*, ...)`: no-op with log if not dynamic, args invalid, or `offset + size > size_` (**silent drop**, buffer unchanged). Otherwise map transfer buffer with `cycle=true` (double-buffering; safe to rewrite while previous frame's copy is in flight), memcpy at `offset`, unmap, `SDL_UploadToGPUBuffer` with `cycle=true`. The same `offset` applies to both the transfer buffer and the GPU buffer region.
-- `Mapping map()`: dynamic-only; maps the persistent transfer buffer with `cycle=true` and returns an RAII handle. Empty `Mapping` (falsy) on failure/non-dynamic. `Mapping::data()` is the write pointer; `Mapping::upload(copy_pass, size, offset = 0)` unmaps **before** recording the copy, bounds-checks (`offset + size > buffer->size_` drops with log), records `SDL_UploadToGPUBuffer` with `cycle=true`. If `upload` is never called, the destructor unmaps without recording. Move-only; must not outlive its `GPUBuffer`. Canonical consumer: `scene::SceneRenderer` instance/bone-palette packing (`src/bracken/scene/scene_renderer.cpp`).
+- `Mapping map()`: dynamic-only; maps the persistent transfer buffer with `cycle=true` and returns an RAII handle. Empty `Mapping` (falsy) on failure/non-dynamic. `Mapping::data()` is the write pointer; `Mapping::upload(copy_pass, size, offset = 0)` unmaps **before** recording the copy, bounds-checks (`offset + size > buffer->size_` drops with log), records `SDL_UploadToGPUBuffer` with `cycle=true`. If `upload` is never called, the destructor unmaps without recording. Move-only; must not outlive its `GPUBuffer`. Canonical consumer: `scene::SceneRenderer` instance/bone-palette packing (`src/bracken/scene/scene_renderer_upload.cpp`).
 - Destructor releases transfer buffer then GPU buffer through the device.
 
 Performance: dynamic `update`/`map` do zero heap allocation per call; `create_static` allocates and submits a private command buffer per call (do not call per frame). Growing a buffer = create a new `GPUBuffer` (legal inside an open copy pass — see `src/bracken/render/grass_renderer.cpp`); engine callers over-allocate ×2 on growth.
@@ -2715,7 +2715,20 @@ A sealed `FramePacket` carries **no host-lifetime contracts**: every command is 
 
 ### SceneRenderer
 
-`src/bracken/scene/scene_renderer.hpp` / `scene_renderer.cpp` (~2350 lines). Non-copyable, non-movable. Owns (as `unique_ptr` members): `gpu::PipelineRegistry`, `render::TerrainRenderer`, `render::WorldRenderer` (skybox), `render::UIRenderer`, `render::EffectRenderer`, `ModelManager`, `render::GrassRenderer`, `render::ShadowMap`, `render::PostProcessStack`, `render::GTAO`, `render::TAA`, `render::AutoExposure`, `render::Bloom`, `render::VolumetricFog`, plus `render::lighting::ClusterGrid` by value. (The `systems::EffectSystem` is **not** owned here anymore — it is sim-stage owned by `Application`; the renderer consumes the packet's effect-instance snapshot.)
+`src/bracken/scene/scene_renderer.hpp` plus **six** implementation files. `SceneRenderer` was a single `.cpp` of ~3.3k lines until Phase 6 split it by frame stage. The class, its header and its API are unchanged — this table is purely where to look:
+
+| File | What is in it |
+|---|---|
+| `scene_renderer.cpp` | the frame's spine: construction, `init`/`shutdown`, settings application, and `render_frame`, which calls into the rest |
+| `scene_renderer_upload.cpp` | the single consolidated `FrameUploads` copy pass |
+| `scene_renderer_shadow.cpp` | CSM cascades + the local (point/spot) shadow atlas |
+| `scene_renderer_prepass.cpp` | depth prepass and motion vectors |
+| `scene_renderer_draw.cpp` | the forward/transparent draw walk, billboards, debug lines |
+| `scene_renderer_capture.cpp` | screenshot readback |
+
+The Prepare stage is *not* one of these: it was extracted in Phase 6 as its own type, `ScenePrep` (`scene/scene_prep.hpp` / `.cpp`), so that the renderer's one thread-tier boundary is expressed by a device-free, stateless type that structurally cannot reach a main-thread API. Pass selection likewise became `RenderPlan` (`scene/render_plan.hpp` / `.cpp`), which is pure and tested headless.
+
+Non-copyable, non-movable. Owns (as `unique_ptr` members): `gpu::PipelineRegistry`, `render::TerrainRenderer`, `render::WorldRenderer` (skybox), `render::UIRenderer`, `render::EffectRenderer`, `ModelManager`, `render::GrassRenderer`, `render::ShadowMap`, `render::PostProcessStack`, `render::GTAO`, `render::TAA`, `render::AutoExposure`, `render::Bloom`, `render::VolumetricFog`, plus `render::lighting::ClusterGrid` by value. (The `systems::EffectSystem` is **not** owned here anymore — it is sim-stage owned by `Application`; the renderer consumes the packet's effect-instance snapshot.)
 
 #### Public API
 
@@ -2853,14 +2866,14 @@ Per-frame CPU cost is linear in command count: one cull + bin pass over static c
 | `PacketRing` default depth | 2 | `scene/frame_packet_ring.hpp` — fill + consume slots; deeper pipelining is a constructor argument |
 | `INVALID_PALETTE_OFFSET` | `0xFFFFFFFF` | `scene/scene_renderer.hpp` — transparent-queue marker for static draws |
 | `MAX_SHADOW_CASCADES` | 4 | `scene/scene_renderer.hpp` — static-asserted == `render::CSM_MAX_CASCADES` |
-| bone-palette buffer floor | 64 KB | `scene_renderer.cpp` palette upload |
-| debug-line buffer floor | 256 lines | `scene_renderer.cpp` `upload_debug_lines` |
+| bone-palette buffer floor | 64 KB | `scene_renderer_upload.cpp` palette upload |
+| debug-line buffer floor | 256 lines | `scene_renderer_draw.cpp` `upload_debug_lines` |
 | non-AO clear color | `{0.35, 0.45, 0.6, 1.0}` | `scene_renderer.cpp` `begin_main_pass` |
 | depth clear | 0.0 (reversed-Z far) | `scene_renderer.cpp` `begin_main_pass` |
-| shadow resolution table | `{512, 1024, 2048, 4096}` | `scene_renderer.cpp` (indexed by `shadow_resolution` 0–3) |
-| local-shadow atlas table | `{1024, 2048, 4096}` | `scene_renderer.cpp` (indexed by `local_shadow_resolution` 0–2; reinit drops all cached tiles) |
+| shadow resolution table | `{512, 1024, 2048, 4096}` | `contracts/graphics_settings.hpp` `shadow_map_texels(ShadowResolution)` — a `constexpr` mapping off the enum, not an index into a table at the call site |
+| local-shadow atlas table | `{1024, 2048, 4096}` | `contracts/graphics_settings.hpp` `local_shadow_atlas_texels(LocalShadowResolution)` (reinit drops all cached tiles) |
 | shadow far | `min(draw_distance, shadow_distance)` — `GraphicsSettings::shadow_distance`, default 4000, clamped [200, 20000] | `scene_renderer.cpp` `render_frame` |
-| billboard scale clamp | `100/clip.w`, clamped 0.3–1.5 | `scene_renderer.cpp` `draw_billboard_3d` |
+| billboard scale clamp | `100/clip.w`, clamped 0.3–1.5 | `scene_renderer_draw.cpp` `draw_billboard_3d` |
 | `MAX_BONES` (referenced) | 128 | `animation/animation_types.hpp` — upper bound of `alloc_bone_palette`'s `joint_count` |
 | `MAX_LIGHTS` (referenced) | 256 | `render/lighting/light.hpp` — cluster-grid capacity |
 
@@ -4545,8 +4558,8 @@ last `update()`; member default 1200.0f).
   shadows-disabled. `reinit` recreates only the atlas (samplers survive);
   returns true immediately if the resolution is unchanged, false if there is
   no device yet (settings applied before `init` are picked up at `init`
-  time via `set_active_cascades` + the resolution table `{512, 1024, 2048,
-  4096}` in `scene_renderer.cpp`).
+  time via `set_active_cascades` + `shadow_map_texels(ShadowResolution)`,
+  `contracts/graphics_settings.hpp`).
 - `begin_shadow_pass` returns nullptr on failure; `set_cascade_viewport`
   no-ops without a live pass or with an out-of-range index. The class holds
   the current pass pointer (`current_shadow_pass_`) — do not interleave two

@@ -382,6 +382,40 @@ API is `Application::request_screenshot(path)` (deferred to the frame fence —
 a request from sim frame i captures frame i's final swapchain image, UI
 included; the capturing frame blocks on the GPU).
 
+Known limitation of that shot, so you do not misread it as a rendering bug:
+the capture frame (`smoke_frames - 20`, i.e. 220 of 240) currently lands with
+the player at a building doorway, and the camera boom has no collision, so it
+sits **inside the wall** and the frame is mostly one flat facade. Materials,
+normal maps, AO, shadows, UI and the dev overlay are all visible and correct
+in it, and the self-verify (not black, not solid) still does its job — but it
+is not the village establishing shot it was set up to be
+(`playground.cpp`, the `cam_cfg`/`set_pitch`/`set_yaw` block in the smoke
+init). Pre-existing and unrelated to the refactor: `mean_luma=80.5
+stddev=38.8` is unchanged all the way back to the Phase 8 baseline. Judge
+rendering health from the digest and the diagnostics line; treat the PNG as a
+"did anything draw at all" check until the framing is fixed.
+
+**`[smoke] packet_digest=0x...` is the line to diff, not `draw_calls`.** It is
+`scene::packet_digest` over every sealed `FramePacket` of the run — a CPU-side
+hash of exactly what the host described and what the sim tail appended, so it
+is exact, driver-independent, and bit-identical at any `BRACKEN_WORKERS`. The
+other numbers are downstream of the GPU and legitimately wobble run to run
+(`auto_ev` rides a histogram readback; `draw_calls`/`triangles` ride culling
+against a driver-dependent frame). After any change that should not alter what
+is drawn, the digest must come back byte-identical — that is what makes a
+"pure refactor" claim checkable. Current values, both stable across runs and
+worker counts:
+
+| Invocation | Digest |
+|---|---|
+| `--smoke` | `0x88a341b9217a591b` |
+| `--smoke --engine-camera=off` | `0x2a88efac36b3fccc` |
+
+The second is the pre-phase-9 value: with the engine's camera drive disabled
+the host describes the identical frame it did before the engine took the
+camera over, which is the evidence that the move was the *only* change. If you
+move either number, say why in the commit message.
+
 Benchmarks: `build-bench/src/bracken/bracken_benchmarks` (add
 `--benchmark_filter=<regex>` for a subset). The binary also exists in `build/`,
 and its numbers there are **meaningless** — that tree has no

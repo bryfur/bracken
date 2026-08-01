@@ -10,11 +10,12 @@ otherwise) is the host's job** — the engine never does file I/O for effects.
 | Runtime simulation | `src/bracken/effects/effect_system.hpp/.cpp` | `bracken::systems` |
 | Rendering | `src/bracken/effects/effect_renderer.hpp/.cpp` | `bracken::render` |
 
-When using `Application`/`SceneRenderer`, the host only touches the first
-layer: build `EffectDefinition`s, then emit spawns through the frame builder
-(`scene::FrameBuilder::spawn_effect`). The `SceneRenderer` owns the
-`EffectSystem` and `EffectRenderer` internally — it updates, terrain-clamps,
-and draws particles as part of `render_frame`.
+When using `Application`, the host only touches the first layer: build
+`EffectDefinition`s, then emit spawns through the frame sink
+(`scene::FrameSink::spawn_effect`). **`Application` owns the `EffectSystem`**
+— it is sim-stage state, spawned/updated/snapshotted inside the sim job — and
+`SceneRenderer` owns only the `EffectRenderer`, which draws the packet's
+snapshot. The host never calls into either.
 
 ## Spawning effects (host side)
 
@@ -25,20 +26,28 @@ and draws particles as part of `render_frame`.
 // stores raw pointers into them. Keep them in a long-lived registry.
 bracken::EffectDefinition fireball = make_fireball_definition();
 
-// When the event happens, while building the frame in on_render():
-fb.spawn_effect(&fireball, position, direction);
+// When the event happens, while describing the frame in on_simulate():
+sim.frame().spawn_effect(&fireball, position, direction);
 ```
 
-`SceneRenderer::render_frame` consumes the sealed packet's spawns exactly
-once (there is no persistent spawn queue — emit once per event),
-pre-uploads any models the
-effect references, and simulates + renders from then on. Particle models are
+The spawn is a *command in the packet*, not an immediate call. The engine's
+**sim-stage tail** — after `on_simulate` returns, before `seal()` — drains the
+frame's spawns into the `EffectSystem` in deterministic (lane, emission)
+order, runs `EffectSystem::update` on the job pool with the terrain sampler,
+and writes the resulting effect-instance snapshot into the packet
+(`Application::run_sim_frame`, `application.cpp`). Each packet's spawns are
+consumed exactly once — there is no persistent spawn queue, so emit once per
+event.
+
+The renderer then draws **that snapshot** and never the live `EffectSystem`,
+which the next sim frame is already mutating. `SceneRenderer::render_frame`
+pre-uploads any models the snapshot's emitters reference. Particle models are
 looked up by name in the `ModelManager` — load or `register_model` them
 before the first spawn so the first frame can render. A model registered
 late is picked up automatically: unresolved lookups are retried every frame
 (they are never cached; the miss is warned once per emitter definition).
 
-Driving `EffectSystem` directly (without `SceneRenderer`) is also supported:
+Driving `EffectSystem` directly (without `Application`) is also supported:
 `spawn_effect(definition, position, direction)`, then
 `update(dt)` or `update(dt, terrain_height_fn)` per frame, then render from
 `get_effects()`. The update overload taking a terrain sampler is templated —
