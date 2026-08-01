@@ -224,6 +224,11 @@ struct GraphicsSettings {
     // Volumetric fog
     float fog_density = 0.05f; // density multiplier
 
+    /** Field-by-field equality. Exact (floats compared with ==) on purpose:
+     *  the question it answers is "did anything change", and a tolerance
+     *  would swallow a deliberate hairline edit. */
+    friend bool operator==(const GraphicsSettings&, const GraphicsSettings&) = default;
+
     float get_draw_distance() const { return draw_distance_units(draw_distance); }
 
     /**

@@ -150,8 +150,11 @@ void Application::kick_sim() {
     sim_frame_current_ = sim_frame_index_++;
 
     // Take the input snapshot for this sim frame (main thread; the sim job
-    // reads it via the submit publish edge).
+    // reads it via the submit publish edge), plus the viewport it may not
+    // read for itself (see sim_screen_width_).
     sim_input_ = input_.snapshot();
+    sim_screen_width_ = screen_width();
+    sim_screen_height_ = screen_height();
     sim_feedback_.has_camera_forward = false;
 
     // Acquire the fill slot + builder (Retired → Filling) and stamp timing.
@@ -176,11 +179,32 @@ void Application::run_sim_job() {
 
     {
         BRACKEN_PROFILE_ZONE("App::on_simulate");
-        SimFrame sim(fb, sim_input_, sim_dt_, sim_time_, sim_frame_current_, &sim_feedback_);
+        SimFrame sim(fb, sim_input_, sim_dt_, sim_time_, sim_frame_current_, &sim_feedback_, sim_screen_width_,
+                     sim_screen_height_);
         on_simulate(sim);
     }
 
     // ---- Engine sim-stage tail (docs/multithreading_plan.md §4.2/§4.3) ----
+    // Camera. Application owns the rig, so it drives it: the host aims the
+    // camera during on_simulate and the engine does the rest, HERE — after
+    // the frame is fully staged, so this frame's target move and this frame's
+    // shakes are both in. The viewport comes from the kick-time snapshot, not
+    // screen_width(): RenderContext is main-thread tier and may be
+    // reconfiguring the swapchain while this job runs. A host with its own rig
+    // opts out via set_camera_driven_by_engine(false) and owes the frame all
+    // four calls itself.
+    if (camera_driven_by_engine_ && camera_) {
+        camera_->set_screen_size(sim_screen_width_, sim_screen_height_);
+        camera_->update(sim_dt_);
+        fb.set_camera(camera_->get_camera_state());
+        if (!sim_feedback_.has_camera_forward) {
+            // Only when the host did not override it (SimFrame::set_camera_forward).
+            const glm::vec3 forward = camera_->get_forward();
+            sim_feedback_.has_camera_forward = true;
+            sim_feedback_.camera_forward = {forward.x, forward.z};
+        }
+    }
+
     // Apply the frame's queued effect spawns to the sim-owned EffectSystem in
     // deterministic (lane, emission) order — the drain the renderer used to
     // do, moved to the sim side.
@@ -283,7 +307,7 @@ void Application::frame_fence(uint64_t joined_frame_index) {
     // basis of the NEXT input snapshot (same one-frame latency as the old
     // sequential loop).
     if (sim_feedback_.has_camera_forward) {
-        input_.set_camera_forward(sim_feedback_.camera_forward_x, sim_feedback_.camera_forward_z);
+        input_.set_camera_forward(sim_feedback_.camera_forward.x, sim_feedback_.camera_forward.y);
         sim_feedback_.has_camera_forward = false;
     }
 
@@ -603,6 +627,17 @@ void Application::request_graphics_settings(const GraphicsSettings& settings) {
     } else {
         pending_graphics_settings_ = settings;
         has_pending_graphics_settings_ = true;
+    }
+}
+
+GraphicsSettingsEdit::GraphicsSettingsEdit(GraphicsSettingsEdit&& other) noexcept
+    : app_(other.app_), original_(other.original_), edited_(other.edited_) {
+    other.app_ = nullptr; // disarmed: exactly one handle may commit
+}
+
+GraphicsSettingsEdit::~GraphicsSettingsEdit() {
+    if (app_ != nullptr && !(edited_ == original_)) {
+        app_->request_graphics_settings(edited_);
     }
 }
 

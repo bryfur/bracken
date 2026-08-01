@@ -297,6 +297,7 @@ bool PlaygroundGame::on_init() {
     // spot and the player spawn.
     setup_physics();
 
+    set_camera_driven_by_engine(engine_camera_);
     auto& cam = camera();
     cam.set_terrain_height_func([this](float x, float z) { return get_terrain_height(x, z); });
     cam.set_screen_size(screen_width(), screen_height());
@@ -1123,43 +1124,35 @@ void PlaygroundGame::handle_input(const SimFrame& sim) {
         request_screenshot(std::format("screenshot_{:03d}.png", screenshot_counter_++));
     }
 
-    // Graphics-settings toggles. The struct is host frame code's to mutate
-    // (application.hpp: graphics_settings() tier); the APPLICATION of the
-    // settings is GPU/SDL work, so from sim it goes through the deferred
-    // request_graphics_settings — the engine applies at the next frame fence.
-    auto& gs = graphics_settings();
-    bool gs_dirty = false;
-    if (in.was_key_just_pressed(SDL_SCANCODE_F1)) {
-        gs.ao_mode = static_cast<AOMode>((static_cast<int>(gs.ao_mode) + 1) % 3); // Off -> GTAO Half -> GTAO Full
-        gs_dirty = true;
-    }
-    if (in.was_key_just_pressed(SDL_SCANCODE_F2)) {
-        gs.bloom_enabled = !gs.bloom_enabled;
-        gs_dirty = true;
-    }
-    if (in.was_key_just_pressed(SDL_SCANCODE_F4)) {
-        gs.volumetric_fog = !gs.volumetric_fog;
-        gs.god_rays = gs.volumetric_fog;
-        gs_dirty = true;
-    }
-    if (in.was_key_just_pressed(SDL_SCANCODE_F5)) {
-        gs.shadow_mode = static_cast<ShadowMode>((static_cast<int>(gs.shadow_mode) + 1) % 3);
-        gs_dirty = true;
-    }
-    if (in.was_key_just_pressed(SDL_SCANCODE_F6)) {
-        gs.aa_mode = static_cast<AAMode>((static_cast<int>(gs.aa_mode) + 1) % 3); // Off -> FXAA -> TAA
-        gs_dirty = true;
-    }
-    if (in.was_key_just_pressed(SDL_SCANCODE_F7)) {
-        gs.ibl_enabled = !gs.ibl_enabled; // sky IBL ambient vs hemisphere fallback
-        gs_dirty = true;
-    }
-    if (in.was_key_just_pressed(SDL_SCANCODE_F8)) {
-        gs.local_shadows = !gs.local_shadows; // point/spot light shadows
-        gs_dirty = true;
-    }
-    if (gs_dirty) {
-        request_graphics_settings(gs);
+    // Graphics-settings toggles. edit_graphics_settings() hands back a scoped
+    // copy and requests it on scope exit — untouched frames cost nothing, and
+    // there is no "forgot to hand it back" to forget. Applying the settings is
+    // GPU/SDL work, so the request is deferred to the next frame fence.
+    {
+        auto gs = edit_graphics_settings();
+        if (in.was_key_just_pressed(SDL_SCANCODE_F1)) {
+            // Off -> GTAO Half -> GTAO Full
+            gs->ao_mode = static_cast<AOMode>((static_cast<int>(gs->ao_mode) + 1) % 3);
+        }
+        if (in.was_key_just_pressed(SDL_SCANCODE_F2)) {
+            gs->bloom_enabled = !gs->bloom_enabled;
+        }
+        if (in.was_key_just_pressed(SDL_SCANCODE_F4)) {
+            gs->volumetric_fog = !gs->volumetric_fog;
+            gs->god_rays = gs->volumetric_fog;
+        }
+        if (in.was_key_just_pressed(SDL_SCANCODE_F5)) {
+            gs->shadow_mode = static_cast<ShadowMode>((static_cast<int>(gs->shadow_mode) + 1) % 3);
+        }
+        if (in.was_key_just_pressed(SDL_SCANCODE_F6)) {
+            gs->aa_mode = static_cast<AAMode>((static_cast<int>(gs->aa_mode) + 1) % 3); // Off -> FXAA -> TAA
+        }
+        if (in.was_key_just_pressed(SDL_SCANCODE_F7)) {
+            gs->ibl_enabled = !gs->ibl_enabled; // sky IBL ambient vs hemisphere fallback
+        }
+        if (in.was_key_just_pressed(SDL_SCANCODE_F8)) {
+            gs->local_shadows = !gs->local_shadows; // point/spot light shadows
+        }
     }
 
     // Camera-relative movement.
@@ -1237,8 +1230,8 @@ void PlaygroundGame::update_smoke_driver(float dt) {
 
 // One-time smoke-run configuration — the retired driver's frame-1 block, now
 // run from the end of on_init (main thread, renderer up, no sim in flight, so
-// apply_all_graphics_settings and the render-side touches are legal; the
-// env-var parsing happens once instead of from a pool job).
+// the render-side touches are legal; the env-var parsing happens once instead
+// of from a pool job).
 void PlaygroundGame::setup_smoke_run() {
     // Pin the timestep: the smoke run is a fixed FRAME count, so with
     // wall-clock timing the amount of simulated time it covers depends on how
@@ -1250,25 +1243,28 @@ void PlaygroundGame::setup_smoke_run() {
     set_fixed_timestep(1.0f / 60.0f);
     set_packet_digest_enabled(true);
 
-    auto& gs = graphics_settings();
+    // One scoped edit for the whole one-time config: every field below lands
+    // in the same request, applied at the first frame fence — before frame 0
+    // renders.
+    auto gs = edit_graphics_settings();
     // Persisted settings may have stored another AA mode: force TAA so the
     // smoke always exercises the temporal path (and the final screenshot
     // captures it). Local shadows likewise forced to the default-ON state
     // (PLAYGROUND_LOCAL_SHADOWS=0 is the A/B test hook to force them off
     // for the whole run).
-    gs.aa_mode = AAMode::TAA;
+    gs->aa_mode = AAMode::TAA;
     // PLAYGROUND_AA=0/1/2 pins Off/FXAA/TAA for the whole run (A/B hook;
     // the mid-run AA flips at 110/160 are skipped while pinned).
     const char* aa_env = SDL_getenv("PLAYGROUND_AA");
     if (aa_env && aa_env[0] >= '0' && aa_env[0] <= '2') {
-        gs.aa_mode = static_cast<AAMode>(aa_env[0] - '0');
+        gs->aa_mode = static_cast<AAMode>(aa_env[0] - '0');
         smoke_aa_forced_ = true;
     }
     // PLAYGROUND_AO=0/1/2 pins the AO mode (Off/Half/Full) for the whole
     // run (A/B hook; the frame-140 GTAO_Full flip is skipped while pinned).
     const char* ao_env = SDL_getenv("PLAYGROUND_AO");
     if (ao_env && ao_env[0] >= '0' && ao_env[0] <= '2') {
-        gs.ao_mode = static_cast<AOMode>(ao_env[0] - '0');
+        gs->ao_mode = static_cast<AOMode>(ao_env[0] - '0');
         smoke_ao_forced_ = true;
     }
     // PLAYGROUND_CAMERA="vx,vz,yaw,pitch,dist_m" pins the camera at a
@@ -1287,25 +1283,24 @@ void PlaygroundGame::setup_smoke_run() {
     // "cloud passes over" dim, frame-80 volumetric fog): reset both so
     // every run starts at the scene's canonical look. NOTE: the engine's
     // canonical sun_intensity is 3.0 (HDR headroom), not 1.0.
-    gs.sun_intensity = 3.0f;
-    gs.volumetric_fog = false;
-    gs.god_rays = false;
+    gs->sun_intensity = 3.0f;
+    gs->volumetric_fog = false;
+    gs->god_rays = false;
     // PLAYGROUND_SUN_SHADOWS=0 forces the CSM off for the whole run (A/B
     // debug hook, like PLAYGROUND_LOCAL_SHADOWS). Remembered so the frame-200
     // PCF flip stays skipped without re-reading the env var at the fence.
     const char* ss_env = SDL_getenv("PLAYGROUND_SUN_SHADOWS");
     if (ss_env && ss_env[0] == '0') {
         smoke_sun_shadows_off_ = true;
-        gs.shadow_mode = ShadowMode::Off;
+        gs->shadow_mode = ShadowMode::Off;
     }
     const char* ls_env = SDL_getenv("PLAYGROUND_LOCAL_SHADOWS");
     smoke_local_shadows_ = !(ls_env && ls_env[0] == '0');
-    gs.local_shadows = smoke_local_shadows_;
+    gs->local_shadows = smoke_local_shadows_;
     // PLAYGROUND_AUTO_EXPOSURE=0 forces histogram auto exposure off for
     // the whole run (the A/B test hook, like PLAYGROUND_LOCAL_SHADOWS).
     const char* ae_env = SDL_getenv("PLAYGROUND_AUTO_EXPOSURE");
-    gs.auto_exposure = !(ae_env && ae_env[0] == '0');
-    apply_all_graphics_settings(gs);
+    gs->auto_exposure = !(ae_env && ae_env[0] == '0');
     // Flashlight on for the whole run: the shadow-casting spot follows
     // the player + camera, so its tile re-renders nearly every frame and
     // the character's local shadow is visible in the final screenshot.
@@ -1365,11 +1360,10 @@ void PlaygroundGame::setup_smoke_run() {
                                   low_sun * 0.8f);
         // Reset the persisted knobs a previous (default) smoke run may
         // have saved, so art shots are reproducible from any state.
-        gs.sun_intensity = 1.0f * day;
-        gs.volumetric_fog = false;
-        gs.god_rays = false;
-        apply_all_graphics_settings(gs);
-        // Art-shot framing: look toward the horizon, facing the sun, so
+        gs->sun_intensity = 1.0f * day;
+        gs->volumetric_fog = false;
+        gs->god_rays = false;
+            // Art-shot framing: look toward the horizon, facing the sun, so
         // the screenshot frames the sky (silver lining / forward scatter
         // are sun-side effects). Camera forward is -(sin yaw, cos yaw).
         camera().set_pitch(-12.0f);
@@ -1419,9 +1413,9 @@ void PlaygroundGame::setup_smoke_run() {
 }
 
 // Fence-side smoke logic, called from on_main_frame: main thread, no sim in
-// flight, BEFORE the joined frame renders — so apply_all_graphics_settings
-// here is visible in that frame, exactly like the retired sequential
-// update-then-render loop. frame_ was written by the sim frame just joined
+// flight, BEFORE the joined frame renders — the render-side reads here (the
+// exposure probe, the end-of-run stats) see that frame's state.
+// frame_ was written by the sim frame just joined
 // (== mf.frame_index() + 1), so the frame numbering below is unchanged from
 // the old driver.
 void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
@@ -1431,7 +1425,11 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
         smoke_start_ns_ = SDL_GetTicksNS();
     }
 
-    auto& gs = graphics_settings();
+    // One scoped edit per fence: whatever the scripted flips below touch is
+    // requested once on scope exit and applied at the NEXT fence (one frame
+    // later than the old immediate apply — invisible in a 240-frame run, and
+    // every flip is well clear of the frame-220 screenshot).
+    auto gs = edit_graphics_settings();
     if (smoke_exposure_probe_) {
         if (const auto* auto_exposure = scene_renderer().auto_exposure()) {
             if (const auto& state = auto_exposure->latest_state()) {
@@ -1443,29 +1441,23 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
     if (frame_ == 80 && !smoke_sun_forced_) {
         // Skipped in sun-pinned art runs: the half-res volumetric wash would
         // sit over the sky being photographed (it defaults off in free play).
-        gs.volumetric_fog = true;
-        gs.god_rays = true;
-        apply_all_graphics_settings(gs);
+        gs->volumetric_fog = true;
+        gs->god_rays = true;
     }
     if (smoke_local_shadows_ && frame_ == 100) {
-        gs.local_shadows = false; // exercise the local-shadow toggle path...
-        apply_all_graphics_settings(gs);
+        gs->local_shadows = false; // exercise the local-shadow toggle path...
     }
     if (smoke_local_shadows_ && frame_ == 115) {
-        gs.local_shadows = true; // ...and the cached-tile revival after it
-        apply_all_graphics_settings(gs);
+        gs->local_shadows = true; // ...and the cached-tile revival after it
     }
     if (frame_ == 110 && !smoke_sun_forced_ && !smoke_aa_forced_) {
-        gs.aa_mode = AAMode::FXAA; // exercise the FXAA resolve mid-run...
-        apply_all_graphics_settings(gs);
+        gs->aa_mode = AAMode::FXAA; // exercise the FXAA resolve mid-run...
     }
     if (frame_ == 140 && !smoke_ao_forced_) {
-        gs.ao_mode = AOMode::GTAO_Full; // exercise the full-res AO path (default is GTAO_Half)
-        apply_all_graphics_settings(gs);
+        gs->ao_mode = AOMode::GTAO_Full; // exercise the full-res AO path (default is GTAO_Half)
     }
     if (frame_ == 160 && !smoke_sun_forced_ && !smoke_aa_forced_) {
-        gs.aa_mode = AAMode::TAA; // ...then back to TAA (history restarts cleanly)
-        apply_all_graphics_settings(gs);
+        gs->aa_mode = AAMode::TAA; // ...then back to TAA (history restarts cleanly)
     }
     if (frame_ == 170 && !smoke_sun_forced_) {
         // Show the dev overlay so the end-of-run screenshot proves it renders.
@@ -1491,25 +1483,22 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
     if (frame_ == 185 && !smoke_sun_forced_) {
         // ...and back OFF: exercises the volumetric teardown path too, and
         // the end-of-run screenshot stays free of the half-res dusk wash.
-        gs.volumetric_fog = false;
-        gs.god_rays = false;
-        apply_all_graphics_settings(gs);
+        gs->volumetric_fog = false;
+        gs->god_rays = false;
     }
     if (frame_ == 195 && !smoke_sun_forced_ && !day_weather_enabled_) {
         env_.sun_dir = scene_sun_dir_;
         env_dirty_ = true;
     }
     if (frame_ == 200 && !smoke_sun_shadows_off_) {
-        gs.shadow_mode = ShadowMode::PCF;
-        apply_all_graphics_settings(gs);
+        gs->shadow_mode = ShadowMode::PCF;
     }
     if (frame_ == 205 && !smoke_sun_forced_ && !day_weather_enabled_) {
         // "Cloud passes over": dim the direct sun so the local lights (orb
         // pools + flashlight beam) visibly dominate in the screenshot and
         // their shadows are unmistakable. sun_intensity is a shading
         // multiplier only — the IBL sky snapshot is untouched (no refresh).
-        gs.sun_intensity = 2.4f; // 80% of the canonical 3.0
-        apply_all_graphics_settings(gs);
+        gs->sun_intensity = 2.4f; // 80% of the canonical 3.0
     }
 
     // Late enough that all the settings flips above are visible in the image.
@@ -1706,10 +1695,13 @@ void PlaygroundGame::update_player(float dt) {
                           model->skeleton, ik.spine, forward_lean, lateral_lean);
 }
 
+// AIM the camera. The engine owns the rig and drives it in its sim-stage
+// tail (Application::set_camera_driven_by_engine): no set_screen_size, no
+// update(dt), no set_camera into the packet, no set_camera_forward here.
+// --engine-camera=off flips that off and does all four by hand, which is
+// what keeps the escape hatch honest.
 void PlaygroundGame::update_camera(SimFrame& sim) {
-    const float dt = sim.dt();
     auto& cam = camera(); // sim-stage tier under run()
-    cam.set_screen_size(screen_width(), screen_height());
     if (smoke_frames_ <= 0) {
         const auto& in = sim.input();
         cam.set_yaw(in.camera_yaw);
@@ -1739,17 +1731,15 @@ void PlaygroundGame::update_camera(SimFrame& sim) {
             }
             smoke_cam_settled_ = true;
         }
-        cam.update(dt);
-        // Deferred: applied to the InputHandler at the next frame fence, so
-        // it shapes the NEXT snapshot's movement basis (same one-frame
-        // latency the old sequential loop had).
-        sim.set_camera_forward(cam.get_forward().x, cam.get_forward().z);
-        return;
+    } else {
+        cam.set_target(player_pos_ + glm::vec3(0, 110, 0));
+        cam.set_target_velocity(player_vel_);
     }
-    cam.set_target(player_pos_ + glm::vec3(0, 110, 0));
-    cam.set_target_velocity(player_vel_);
-    cam.update(dt);
-    sim.set_camera_forward(cam.get_forward().x, cam.get_forward().z);
+    if (!engine_camera_) {
+        cam.set_screen_size(sim.screen_width(), sim.screen_height());
+        cam.update(sim.dt());
+        sim.set_camera_forward({cam.get_forward().x, cam.get_forward().z});
+    }
 }
 
 void PlaygroundGame::update_orbs(float dt) {
@@ -1915,7 +1905,9 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
     scene::FrameSink& fb = sim.frame();
     const auto& gs = graphics_settings();
 
-    fb.set_camera(camera().get_camera_state());
+    if (!engine_camera_) {
+        fb.set_camera(camera().get_camera_state()); // --engine-camera=off only
+    }
     // Stage the environment only when the game changed it (init, smoke-run
     // sun swings): a staged environment is adopted over the renderer's live
     // EnvironmentState, so staging on change — not every frame — keeps the
@@ -2057,10 +2049,10 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
         }
     }
 
-    build_ui(fb);
+    build_ui(sim, fb);
 }
 
-void PlaygroundGame::build_ui(scene::FrameSink& fb) {
+void PlaygroundGame::build_ui(const SimFrame& sim, scene::FrameSink& fb) {
     auto ui = fb.ui();
     ui.add_filled_rect(10, 10, 280, 122, 0xB0101418);
     ui.add_text("bracken playground", 22, 20, 1.0f, 0xFFFFD080);
@@ -2083,8 +2075,8 @@ void PlaygroundGame::build_ui(scene::FrameSink& fb) {
     ui.add_text_wrapped("WASD move | Shift run | mouse-drag orbit | wheel zoom | LMB attack | F flashlight | "
                         "F1 AO | F2 bloom | F4 fog | F5 shadows | F6 AA | F7 IBL | F8 local shadows | F3 debug | "
                         "F12 screenshot | Esc quit | F10 dev overlay",
-                        10, static_cast<float>(screen_height()) - 56.0f, static_cast<float>(screen_width()) - 20.0f,
-                        0.9f, 0xFFC8D0DC);
+                        10, static_cast<float>(sim.screen_height()) - 56.0f,
+                        static_cast<float>(sim.screen_width()) - 20.0f, 0.9f, 0xFFC8D0DC);
 }
 
 // ---------------------------------------------------------------------------

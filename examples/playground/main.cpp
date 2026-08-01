@@ -49,15 +49,23 @@ bool verify_smoke_screenshot(const char* path) {
 
 } // namespace
 
-// Usage: playground [--smoke [frames]]
+// Usage: playground [--smoke [frames]] [--engine-camera=on|off]
 //   --smoke: self-drive for N frames (default 240) and exit — the integration-
 //            test mode. Prints "[smoke] OK ..." and "[smoke] screenshot OK ..."
 //            on success; exit code 1 if the run or the screenshot check fails,
 //            2 on bad arguments.
+//   --engine-camera=off: drive the camera rig from the demo instead of letting
+//            the engine drive it (Application::set_camera_driven_by_engine) —
+//            coverage for the escape hatch a game with a custom rig uses.
 int main(int argc, char** argv) {
     int smoke_frames = -1;
+    bool engine_camera = true;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--smoke") == 0) {
+        if (std::strcmp(argv[i], "--engine-camera=off") == 0) {
+            engine_camera = false;
+        } else if (std::strcmp(argv[i], "--engine-camera=on") == 0) {
+            engine_camera = true;
+        } else if (std::strcmp(argv[i], "--smoke") == 0) {
             smoke_frames = 240;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 const char* arg = argv[++i];
@@ -77,7 +85,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    playground::PlaygroundGame game(smoke_frames);
+    playground::PlaygroundGame game(smoke_frames, engine_camera);
     if (!game.init_engine()) {
         return 1;
     }

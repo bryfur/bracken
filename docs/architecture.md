@@ -247,8 +247,10 @@ sim job i+1 (pool):   SimFrame sim(builder, input snapshot, dt, ...)
                           AnimationStateMachine::update → AnimationPlayer::update
                           → (optional) apply_foot_ik / apply_body_lean
                           → fb = sim.frame(): draw_model/draw_skinned/lights/UI/
-                            spawn_effect/set_camera/set_environment
-                      → engine sim-stage tail: effect spawns → EffectSystem::update
+                            spawn_effect/set_environment (camera: AIM only)
+                      → engine sim-stage tail: camera set_screen_size/update(dt)
+                        → fb.set_camera + camera-forward feedback
+                        → effect spawns → EffectSystem::update
                         → effect snapshot + scene/sky clocks into the packet
                       → fb.seal()          (the packet's one release-publish edge)
 main thread, frame i: → scene::SceneRenderer::render_frame(const FramePacket&)
@@ -261,6 +263,19 @@ emission out across `fb.lane(i)` with its own `sim.run_async` jobs, one lane
 per job. `sim.parallel_for` bodies must **not** emit into the builder (no
 automatic lane assignment). The host never calls `seal()` or
 `set_frame_timing` — the engine does both.
+
+The camera is engine-driven by default
+(`Application::set_camera_driven_by_engine`): the host aims `camera()` during
+`on_simulate` and the tail does the viewport (from the kick-time snapshot —
+`RenderContext` is main-thread tier, so neither host nor engine may read
+`screen_width()` from the sim stage; `SimFrame::screen_width()` carries it),
+the `update(dt)`, the packet's `set_camera`, and the camera-forward feedback
+for the next input snapshot's movement basis. Because that runs at the END of
+the frame, camera *output* read during `on_simulate` is the previous frame's,
+while shakes and target moves staged anywhere in the frame land in this
+frame's camera. A host with its own rig turns the drive off and owes the
+frame all four calls (`SimFrame::set_camera_forward` overrides the feedback
+either way).
 
 Inside `render_frame`, the CPU **Prepare** work (culling, batching, binning
 — see "Prepare-stage fan-out" under Threading & lifetime contracts) fans out
@@ -964,7 +979,7 @@ so here is the mechanism for each claim:
 | Tier | Meaning | Members today |
 |---|---|---|
 | `main-thread` | asserted via `BRACKEN_ASSERT_MAIN_THREAD()`; `on_main_frame`/`on_event` and the fence run here with no sim in flight | swapchain acquire, `render_frame`, command submission, ImGui/DevUI, GPU resource creation/destruction (pipeline/shader/model *mutation* paths), `FileWatcher` entry points, the live `InputHandler`, graphics-settings *application* (`apply_all_graphics_settings`/`set_*`) |
-| `sim-stage` | any job within the Simulate stage — `on_simulate` and everything it fans out to; **live**: this tier now runs concurrently with frame i's rendering | `SimFrame` (its `parallel_for`/`run_async`/`set_camera_forward`), `FrameBuilder` emission (multi-lane: `FramePacket::reserve_block` / `take_palette_slot` are safe from any fill-stage thread; singular setters like `set_camera` are single-writer), `AnimationPlayer`/IK as host sim work, `EffectSystem` (sim-stage **owned**: engine-driven from the sim-job tail), `Application::camera()` under `run()`, `request_graphics_settings`, `request_screenshot`, `graphics_settings()` mutation (single writer per phase) |
+| `sim-stage` | any job within the Simulate stage — `on_simulate` and everything it fans out to; **live**: this tier now runs concurrently with frame i's rendering | `SimFrame` (its `parallel_for`/`run_async`/`set_camera_forward`), `FrameBuilder` emission (multi-lane: `FramePacket::reserve_block` / `take_palette_slot` are safe from any fill-stage thread; singular setters like `set_camera` are single-writer), `AnimationPlayer`/IK as host sim work, `EffectSystem` (sim-stage **owned**: engine-driven from the sim-job tail), `Application::camera()` under `run()`, `request_graphics_settings` / `edit_graphics_settings` (single writer per phase; do not hold an edit handle across a frame boundary), `request_screenshot` |
 | `worker-safe` | callable from any thread, any time | `Logger`, `JobSystem` submit/wait, `TaskGroup`, `parallel_for`, `Application::quit()`, pipeline/shader/model **lookups** (read-only after init-time pre-creation), `get_terrain_height` (const reads of the immutable heightmap), **`FramePacket` reads after seal** (plain loads, no atomics on the read path) |
 | `owned` | single owner at a time; debug-asserted (owner binding for arenas, overlap detection for lanes — see above) | `Arena`, `FrameAllocator`, per-worker scratch arenas, a `FrameBuilder::Lane` (one thread at a time), a `FramePacket` during fill (per-lane) |
 

@@ -213,7 +213,7 @@ protected:
         // ... game logic with sim.dt(), in.move_forward, in.was_key_just_pressed(...) ...
 
         auto& fb = sim.frame();                          // the ONLY way render state leaves the game
-        fb.set_camera(camera().get_camera_state());
+        // (no set_camera: the engine drives camera() and stages it — see Camera)
         // ... fb.draw_model / draw_skinned / add_point_light / spawn_effect ...
         // ... fb.ui().add_text / add_filled_rect ...
         // NO set_frame_timing, NO seal(), NO render_frame — the engine does all three.
@@ -243,7 +243,7 @@ Side effects worth knowing (all in `src/bracken/application.cpp`):
 
 - `init_renderer` **auto-loads** `GraphicsSettings` from `settings_file_path()` (SDL pref path + `settings.cfg`; missing file is fine — defaults apply) and applies them; `shutdown_renderer` **auto-saves** them.
 - Nothing you hand the builder carries a lifetime obligation: everything is copied or packet-allocated (skinned bone matrices go into packet memory via `fb.alloc_bone_palette`; UI strings are copied at emit time). The one exception is asset data — `EffectDefinition*` passed to `spawn_effect` must outlive the spawned instances.
-- Change settings at runtime by mutating `graphics_settings()` and calling **`request_graphics_settings(gs)`** — the sim-safe deferred apply; the actual GPU/SDL work (sampler rebuilds, swapchain reconfigure, fullscreen transitions) happens at the next frame fence, diffed so expensive setters only run when their inputs changed. (`apply_all_graphics_settings` still exists for main-thread-only paths: init and `on_main_frame`.)
+- Change settings at runtime through **`edit_graphics_settings()`** — a scoped handle that requests its edited copy when it dies (and requests nothing if you changed nothing). The actual GPU/SDL work (sampler rebuilds, swapchain reconfigure, fullscreen transitions) happens at the next frame fence, diffed so expensive setters only run when their inputs changed. (`request_graphics_settings` / `apply_all_graphics_settings` remain for hosts that want to drive it by hand.)
 - `request_screenshot(path)` is deferred to the frame fence: a request from sim frame i captures frame i's final swapchain image (UI included) to a PNG. The capturing frame blocks on the GPU — integration tests and debugging only, not a gameplay feature.
 
 #### The developer overlay (DevUI)
@@ -295,7 +295,7 @@ File-by-file map:
 
 What `on_init` does, in order (`examples/playground/playground.cpp`): `init_renderer(1600, 900, "bracken playground", WORLD, WORLD)` with an 8000×8000 world → `init_dev_ui()` + F10 toggle + a game panel → build a 257×257 procedural `Heightmap` and `set_heightmap(...)` → register models — code-built ones via `models().register_model(name, build_...())` (player, orb, shard, smoke puff) and the pack `.glb`s via `load_model` (village + props + `nature_*`; `TreeGenerator`/`RockGenerator` stand-ins register only in the fallback) → build the animation state machine (Idle/Walk/Run/Attack with `speed`/`attacking` parameters, clip indices bound once via `anim_sm_.bind_clips(...)`, parameter names resolved to indices once via `anim_sm_.param_index(...)` so nothing hashes per frame) → define two `EffectDefinition`s in code (a radial pickup burst and an arc attack slash — note the definitions are *members* because they **must outlive all spawned instances**) → apply the hand-authored scene layout + ground-cover carpet (`scatter_wilds`, backed by `scene_layout.cpp`) → configure the third-person `camera()` (terrain-height callback, distance, target).
 
-What `on_simulate` does — first the simulation: reads `sim.input()` (or the smoke self-driver), moves the player with terrain clamping, feeds `speed`/`attacking` into the state machine, runs `anim_sm_.update(anim_player_)` then `anim_player_.update(skeleton, animations, sim.dt())`, and then — as the engine intends — applies the procedural layers on top: `anim::apply_foot_ik(...)` pinning feet to terrain height and `anim::apply_body_lean(...)` from speed/turn rate. Camera follows via `set_target`/`set_target_velocity`/`update(dt)`, and `sim.set_camera_forward(...)` keeps WASD camera-relative.
+What `on_simulate` does — first the simulation: reads `sim.input()` (or the smoke self-driver), moves the player with terrain clamping, feeds `speed`/`attacking` into the state machine, runs `anim_sm_.update(anim_player_)` then `anim_player_.update(skeleton, animations, sim.dt())`, and then — as the engine intends — applies the procedural layers on top: `anim::apply_foot_ik(...)` pinning feet to terrain height and `anim::apply_body_lean(...)` from speed/turn rate. The camera is only *aimed* (`set_target`/`set_target_velocity`, or yaw/pitch from the snapshot); the engine updates it, stages it into the packet and records the movement basis in its sim-stage tail.
 
 Then the frame description, into `auto& fb = sim.frame()`: `set_camera`, `set_draw_skybox/ground/grass`, the player as `alloc_bone_palette` + copy of `anim_player_.bone_matrices()` into packet memory + `draw_skinned(..., pal.id)`, `draw_model` per prop and orb, an `add_point_light` per orb, `add_billboard_3d` proximity bars, optional `add_spot_light` flashlight, `spawn_effect` for queued bursts, optional `add_debug_sphere`/`add_debug_line` overlays (including a post-IK skeleton overlay), UI text via `fb.ui().add_text`/`add_filled_rect`/`add_text_wrapped`. No timing, sealing, rendering, or ring management — the engine wraps all of that around the hook.
 
@@ -457,7 +457,6 @@ void MyGame::on_simulate(bracken::SimFrame& sim) {
     // ... simulation (movement, animation, IK) using sim.dt()/sim.input() ...
 
     auto& fb = sim.frame();
-    fb.set_camera(camera().get_camera_state());
 
     auto pal = fb.alloc_bone_palette(joint_count);           // packet-owned palette memory
     std::ranges::copy(anim_player_.bone_matrices().first(joint_count), pal.matrices.begin());
@@ -481,14 +480,15 @@ Other facade pass-throughs on `Application` you will use from these hooks: `mode
 `bracken::GraphicsSettings` (`src/bracken/contracts/graphics_settings.hpp`) is a plain struct of user-facing quality knobs, persisted as a `key=value` text file. `Application` owns one instance:
 
 ```cpp
-auto& gs = graphics_settings();     // the persisted instance (loaded at init_renderer)
-gs.bloom_enabled = !gs.bloom_enabled;
-gs.shadow_mode = bracken::ShadowMode::PCF;
-request_graphics_settings(gs);      // from on_simulate: applied at the next frame fence
-// apply_all_graphics_settings(gs); // main-thread only (init / on_main_frame): applies immediately
+auto gs = edit_graphics_settings();   // scoped copy of the persisted instance
+gs->bloom_enabled = !gs->bloom_enabled;
+gs->shadow_mode = bracken::ShadowMode::PCF;
+// ...requested when `gs` goes out of scope; skipped entirely if nothing changed.
 ```
 
-`apply_all_graphics_settings()` copies the struct into `graphics_settings()`, always pushes the cheap renderer settings, and only invokes the expensive setters (sampler rebuild for anisotropy, swapchain reconfigure for vsync, fullscreen transition for window mode/resolution) when those specific fields actually changed since the last apply. It does GPU/SDL work, so it is **main-thread tier with no sim in flight** — from `on_simulate` (where the playground's F1–F8 hotkeys live, `examples/playground/playground.cpp::handle_input`) use **`request_graphics_settings(gs)`** instead: the request is stored and applied through the same diffing path at the next frame fence (last request before a fence wins; the DevUI Graphics tab's main-thread request wins over a simultaneous sim request). Own the struct from one phase at a time — mutate it in `on_simulate` or in `on_main_frame`, not both concurrently.
+`edit_graphics_settings()` returns a move-only `GraphicsSettingsEdit`: mutate through `operator->`, and its destructor calls `request_graphics_settings` with the edited copy. There is no "forgot to hand it back", because there is nothing to hand back. Read-only access is `graphics_settings()`, which is const. The lower-level pair is still there for hosts that want it: `request_graphics_settings(gs)` (sim-safe, deferred to the frame fence) and `apply_all_graphics_settings(gs)` (main-thread only — init or `on_main_frame` — applies immediately).
+
+`apply_all_graphics_settings()` copies the struct into `graphics_settings()`, always pushes the cheap renderer settings, and only invokes the expensive setters (sampler rebuild for anisotropy, swapchain reconfigure for vsync, fullscreen transition for window mode/resolution) when those specific fields actually changed since the last apply. It does GPU/SDL work, so it is **main-thread tier with no sim in flight**. From `on_simulate` (where the playground's F1–F8 hotkeys live, `examples/playground/playground.cpp::handle_input`) the request goes through `edit_graphics_settings()` / `request_graphics_settings(gs)`: the request is stored and applied through the same diffing path at the next frame fence (last request before a fence wins; the DevUI Graphics tab's main-thread request wins over a simultaneous sim request). Keep edits to one phase at a time — edit in `on_simulate` or in `on_main_frame`, not both concurrently, and do not hold an edit handle across a frame boundary.
 
 Settings are auto-loaded by `init_renderer()` and auto-saved by `shutdown_renderer()`. The file lives at `settings_file_path()` — the SDL pref path for org/app `"bracken"/"bracken"` plus `settings.cfg` (e.g. `~/.local/share/bracken/bracken/settings.cfg` on Linux). A missing file on first run is normal and logged at INFO level; defaults apply.
 
@@ -602,18 +602,15 @@ auto& cam = camera();
 cam.set_yaw(in.camera_yaw);              // degrees, wrapped to [0, 360)
 cam.set_pitch(in.camera_pitch);          // degrees, clamped to [-70, 70]
 cam.adjust_zoom(in.camera_zoom_delta);   // wheel: -y * 50 per notch
-cam.update(sim.dt());
-// REQUIRED feedback: tell the input layer which way the camera actually faces
-// so WASD is camera-relative (accounts for shoulder offset). Deferred:
-// applied to the InputHandler at the next frame fence.
-sim.set_camera_forward(cam.get_forward().x, cam.get_forward().z);
+// No update(), no set_camera_forward: the engine drives the rig in its
+// sim-stage tail and records the movement basis (see "Camera" below).
 ```
 
 - The zoom delta is reset by the main loop each frame (`reset_camera_deltas()`); yaw/pitch persist and accumulate.
 - `set_camera_yaw(yaw)` on the live handler lets you force the stored yaw (e.g. after a scripted camera cut) — main-thread hooks only.
 - Sensitivity and inversion are runtime-configurable on the live handler (main-thread hooks): `set_mouse_sensitivity()` (default `0.35f`), `set_controller_sensitivity()` (default `2.5f`), `set_camera_x_inverted()` / `set_camera_y_inverted()` / the `toggle_*` variants (default: not inverted). The snapshot's `camera_yaw/camera_pitch/camera_zoom_delta` already have sensitivity/inversion applied.
 
-**Gotcha:** if you never call `sim.set_camera_forward`, movement directions are derived from the default forward `(0, -1)` (-Z), not your camera.
+`sim.set_camera_forward(glm::vec2)` **overrides** the basis the engine recorded — for a host-owned rig (`set_camera_driven_by_engine(false)`), or to aim movement somewhere other than where the camera looks. Without an engine-driven camera and without that call, movement is derived from the default forward `(0, -1)` (-Z).
 
 #### Movement
 
@@ -718,8 +715,6 @@ dev_ui().set_toggle_key(SDL_SCANCODE_F10); // safe even when dev_ui_ok == false
 
 - Ignoring the `[[nodiscard]]` results of `init_engine()`, `start()`, `init_renderer()`, `GraphicsSettings::save()/load()`.
 - Calling `set_keyboard_captured()` yourself — the main loop overwrites it every frame.
-- Never calling `sim.set_camera_forward(...)` — WASD moves relative to -Z instead of the camera.
-- Mutating `graphics_settings()` fields without calling `request_graphics_settings()` (or `apply_all_graphics_settings()` from a main-thread hook) — the renderer never sees the change (until something else applies).
 - Touching GPU/SDL/main-thread-tier APIs from `on_simulate` — it runs on a pool thread; debug builds assert.
 - Setting `god_rays = true` without `volumetric_fog = true` — god rays require volumetric fog.
 - Reading `PassTiming::cpu_ms` as GPU cost — it is the CPU's cost of recording the pass. `gpu_ms` is `nullopt`; SDL3 has no timestamp queries.
@@ -2565,7 +2560,6 @@ void PlaygroundGame::on_simulate(bracken::SimFrame& sim) {
 
     scene::FrameSink& fb = sim.frame();             // engine-acquired, engine-sealed
 
-    fb.set_camera(camera().get_camera_state());
     fb.set_draw_skybox(graphics_settings().skybox_enabled);
     fb.set_draw_ground(true);
     fb.set_draw_grass(graphics_settings().grass_enabled);
@@ -2608,11 +2602,7 @@ struct CameraState {
 };
 ```
 
-If you use the built-in camera (`systems::CameraController`, accessed via `Application::camera()`), you never build one by hand:
-
-```cpp
-fb.set_camera(camera().get_camera_state());  // camera_controller.hpp; snapshotted by value
-```
+If you use the built-in camera (`systems::CameraController`, accessed via `Application::camera()`), you never build one by hand — or set one: the engine stages `camera().get_camera_state()` into every packet from its sim-stage tail. `set_camera` is for hosts that took the rig back (`set_camera_driven_by_engine(false)`) or that drive `CameraState` directly (a replay, a cutscene track). The state is snapshotted by value.
 
 (If you never call `set_camera` in a frame, `packet.has_camera()` stays false and the renderer skips the 3D pass rather than draw with a stale view.)
 
@@ -4019,7 +4009,6 @@ glow on each collectible orb, and a flashlight cone while toggled on:
 ```cpp
 void MyGame::on_simulate(bracken::SimFrame& sim) {
     auto& fb = sim.frame();
-    fb.set_camera(camera().get_camera_state());
 
     // PointLightDesc: {position, radius, color, intensity, casts_shadows}
     fb.add_point_light({orb_pos, 320.0f, {1.0f, 0.72f, 0.30f}, 12000.0f, true});
@@ -4101,11 +4090,10 @@ Everything a game usually needs is in `GraphicsSettings`
 ```cpp
 #include "bracken/contracts/graphics_settings.hpp"
 
-auto& gs = graphics_settings();
-gs.shadow_mode       = bracken::ShadowMode::PCSS; // Off / PCF / PCSS (default PCSS)
-gs.shadow_cascades   = 3;                         // 0=1, 1=2, 2=3, 3=4 cascades (default 3)
-gs.shadow_resolution = ShadowResolution::R2048;   // default
-request_graphics_settings(gs);   // sim-safe; applied at the next frame fence
+auto gs = edit_graphics_settings();   // requested on scope exit
+gs->shadow_mode       = bracken::ShadowMode::PCSS; // Off / PCF / PCSS (default PCSS)
+gs->shadow_cascades   = 3;                         // 0=1, 1=2, 2=3, 3=4 cascades (default 3)
+gs->shadow_resolution = ShadowResolution::R2048;   // default
 ```
 
 The playground cycles `shadow_mode` on F5 exactly this way. Changing
@@ -4213,11 +4201,10 @@ reversed-Z would fix nothing; and all the receiver bias / PCF / PCSS math in
 #### Settings-level control
 
 ```cpp
-auto& gs = graphics_settings();
-gs.ao_mode     = bracken::AOMode::GTAO_Half; // Off / GTAO_Half / GTAO_Full (default GTAO_Half)
-gs.ao_strength = 1.0f;                       // darkening power (0 = off, 1 = stock, >1 darker)
-gs.ao_radius   = 1.0f;                       // multiplier on the world-space sample radius
-request_graphics_settings(gs);   // sim-safe; applied at the next frame fence
+auto gs = edit_graphics_settings();   // requested on scope exit
+gs->ao_mode     = bracken::AOMode::GTAO_Half; // Off / GTAO_Half / GTAO_Full (default GTAO_Half)
+gs->ao_strength = 1.0f;                       // darkening power (0 = off, 1 = stock, >1 darker)
+gs->ao_radius   = 1.0f;                       // multiplier on the world-space sample radius
 ```
 
 The playground cycles `ao_mode` on F1. `GTAO_Half` computes AO at half
@@ -4970,8 +4957,7 @@ practice this means:
 You normally interact with exactly one knob:
 
 ```cpp
-graphics_settings().ibl_enabled = true;   // default; false = legacy hemisphere ambient
-request_graphics_settings(graphics_settings());   // sim-safe deferred apply
+edit_graphics_settings()->ibl_enabled = true;   // default; false = legacy hemisphere ambient
 ```
 
 With `ibl_enabled = false` (or if IBL failed to initialize) the shaders fall
@@ -4999,10 +4985,9 @@ alpha.
 It is **off by default** (it's the most expensive post pass):
 
 ```cpp
-auto& gs = graphics_settings();
-gs.volumetric_fog = true;   // enable the fog volume
-gs.god_rays = true;         // light shafts; needs shadow_mode != ShadowMode::Off
-request_graphics_settings(gs);   // sim-safe; applied at the next frame fence
+auto gs = edit_graphics_settings();   // requested on scope exit
+gs->volumetric_fog = true;   // enable the fog volume
+gs->god_rays = true;         // light shafts; needs shadow_mode != ShadowMode::Off
 ```
 
 (the playground binds this to **F4**, `examples/playground/playground.cpp`).
@@ -5072,9 +5057,8 @@ All through `GraphicsSettings`:
 | `bloom_threshold` | `1.1f` | **post-exposure** HDR luminance above which pixels bloom |
 
 ```cpp
-auto& gs = graphics_settings();
-gs.bloom_enabled = !gs.bloom_enabled;   // playground F2 toggle
-request_graphics_settings(gs);   // sim-safe; applied at the next frame fence
+auto gs = edit_graphics_settings();   // requested on scope exit
+gs->bloom_enabled = !gs->bloom_enabled;   // playground F2 toggle
 ```
 
 The threshold is compared against `scene_luminance * exposure`, so **what
@@ -5150,12 +5134,11 @@ Your knobs — display trims on `GraphicsSettings`, look grading on
 | `EnvironmentState::grade_*` | neutral | white balance + ASC-CDL (see the EnvironmentState field table) |
 
 ```cpp
-auto& gs = graphics_settings();
-gs.exposure = 1.2f;
-gs.tonemap_mode = bracken::TonemapMode::ACESFitted;
-gs.contrast = 1.05f;
-gs.saturation = 1.1f;
-request_graphics_settings(gs);   // sim-safe; applied at the next frame fence
+auto gs = edit_graphics_settings();   // requested on scope exit
+gs->exposure = 1.2f;
+gs->tonemap_mode = bracken::TonemapMode::ACESFitted;
+gs->contrast = 1.05f;
+gs->saturation = 1.1f;
 ```
 
 With `aa_mode == AAMode::FXAA`, composite writes an intermediate LDR target
@@ -5717,33 +5700,33 @@ Bracken ships one camera: a smooth third-person follow/orbit camera. It comes in
 If you subclass `Application`, the camera already exists after `init_renderer()`. You are responsible for three things every frame, in `on_simulate` (the camera is tier sim-stage under `run()` — update it from sim code, nowhere else):
 
 1. feed it the follow target and target velocity,
-2. call `update(dt)` — **the engine does not call it for you**,
-3. hand its output to the frame via `get_camera_state()`.
+2. that's it — **the engine drives it**: after `on_simulate` returns, the sim-stage tail sets the camera's viewport from the frame's kick-time screen size, calls `update(dt)`, writes `get_camera_state()` into the packet, and records the ground forward for the next input snapshot's movement basis.
 
-This is exactly what the playground does (`examples/playground/playground.cpp`, `PlaygroundGame::update_camera`):
+This is what the playground does (`examples/playground/playground.cpp`, `PlaygroundGame::update_camera`):
 
 ```cpp
 void PlaygroundGame::update_camera(bracken::SimFrame& sim) {
     const bracken::InputSnapshot& in = sim.input();
     auto& cam = camera();                       // systems::CameraController&
-    cam.set_screen_size(screen_width(), screen_height());
     cam.set_yaw(in.camera_yaw);                 // mouse-driven orbit (snapshot fields)
     cam.set_pitch(in.camera_pitch);
     cam.adjust_zoom(in.camera_zoom_delta);
     cam.set_target(player_pos_ + glm::vec3(0, 110, 0));
     cam.set_target_velocity(player_vel_);
-    cam.update(sim.dt());
-    // Camera-relative movement axes for the input system (deferred —
-    // applied to the InputHandler at the next frame fence):
-    sim.set_camera_forward(cam.get_forward().x, cam.get_forward().z);
 }
 ```
 
-And while building the frame:
+**Ordering consequence.** The update runs at the END of the frame, so a shake or a target move staged anywhere in `on_simulate` lands in *this* frame's camera — but camera OUTPUT read during `on_simulate` (`get_forward()`, `get_position()`) is the PREVIOUS frame's. For a sub-degree-per-frame rig that is invisible; if your game needs this frame's forward mid-frame, take the rig back:
 
 ```cpp
-sim.frame().set_camera(camera().get_camera_state());
+set_camera_driven_by_engine(false);   // in on_init; then you owe the frame:
+cam.set_screen_size(sim.screen_width(), sim.screen_height());
+cam.update(sim.dt());
+sim.frame().set_camera(cam.get_camera_state());
+sim.set_camera_forward({cam.get_forward().x, cam.get_forward().z});
 ```
+
+`playground --engine-camera=off` runs the demo that way, which is how the escape hatch stays tested. Note `sim.screen_width()/screen_height()` rather than `Application::screen_width()`: the viewport is snapshotted at kick because `RenderContext` is main-thread tier and may be reconfiguring the swapchain while your frame simulates.
 
 `get_camera_state()` builds a `scene::CameraState` (`src/bracken/contracts/camera_state.hpp`) — `view`, `projection`, `view_projection = projection * view`, and `position` — which is the entire contract between the camera and `SceneRenderer`. Nothing forces you to use `CameraSystem`; any code that can fill a `CameraState` can drive the renderer.
 
@@ -5932,7 +5915,7 @@ camera_system.set_collision_func(
 ### Screen size and projection
 
 ```cpp
-cam.set_screen_size(screen_width(), screen_height());   // call on resize (or every frame)
+cam.set_screen_size(sim.screen_width(), sim.screen_height());   // engine-driven cameras: done for you
 ```
 
 Defaults to 1280×720; degenerate sizes are clamped to 1×1 so the projection never NaNs. The projection is right-handed, **reversed-Z zero-to-one depth** with `config.near_plane` (default 5) and `config.far_plane` (default 15000) *swapped* in the `glm::perspective` call (`src/bracken/systems/camera_system.cpp`, `compute_matrices`). Near maps to depth 1, far to depth 0 — this matches the engine-wide convention (`GLM_FORCE_DEPTH_ZERO_TO_ONE`, `GREATER_OR_EQUAL` depth tests, clear-to-0). Don't hand-build a standard-Z projection into `CameraState` unless you also understand what breaks (skybox, AO, fog all assume depth 0 = far).
@@ -5955,7 +5938,7 @@ glm::vec3 dir = camera().get_forward();   // where the camera looks
 
 ### Quick gotcha checklist
 
-- Call `cam.update(dt)` yourself every frame; nothing else will.
+- The engine calls `cam.update(dt)` once per frame in its sim-stage tail — unless you called `set_camera_driven_by_engine(false)`, in which case nothing else will.
 - `dt` is clamped to 0.1 s internally — long hitches slow the camera instead of exploding it.
 - Look-at height ignores the target's Y; it's `terrain_y + height_offset`.
 - `set_config` resets player zoom to `config.distance` (clamped to `config.zoom_min`/`zoom_max`).

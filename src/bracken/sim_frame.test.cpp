@@ -97,11 +97,40 @@ TEST(SimFrame, SetCameraForwardRecordsFeedback) {
     SimFrame sim(fb, input, 0.016f, 0.0, 0, &feedback);
 
     EXPECT_FALSE(feedback.has_camera_forward);
-    sim.set_camera_forward(0.6f, -0.8f);
+    sim.set_camera_forward({0.6f, -0.8f});
     EXPECT_TRUE(feedback.has_camera_forward);
-    EXPECT_FLOAT_EQ(feedback.camera_forward_x, 0.6f);
-    EXPECT_FLOAT_EQ(feedback.camera_forward_z, -0.8f);
+    EXPECT_FLOAT_EQ(feedback.camera_forward.x, 0.6f);
+    EXPECT_FLOAT_EQ(feedback.camera_forward.y, -0.8f);
 
+    FrameAccess::seal(fb);
+    FrameAccess::reset(packet);
+}
+
+// --- Viewport (P9: sim code must not read RenderContext) ---
+
+TEST(SimFrame, CarriesTheKickTimeViewport) {
+    FramePacket packet;
+    FrameBuilder fb(packet);
+    InputSnapshot input;
+    SimFrame sim(fb, input, 0.016f, 0.0, 0, nullptr, 1600, 900);
+
+    // Snapshotted on the main thread at kick: the swapchain may be
+    // reconfiguring under the next frame's sim, so Application::screen_width()
+    // is not readable from here.
+    EXPECT_EQ(sim.screen_width(), 1600);
+    EXPECT_EQ(sim.screen_height(), 900);
+
+    FrameAccess::seal(fb);
+    FrameAccess::reset(packet);
+}
+
+TEST(SimFrame, ViewportIsZeroWithoutARenderer) {
+    FramePacket packet;
+    FrameBuilder fb(packet);
+    InputSnapshot input;
+    SimFrame sim(fb, input, 0.016f, 0.0, 0);
+    EXPECT_EQ(sim.screen_width(), 0);
+    EXPECT_EQ(sim.screen_height(), 0);
     FrameAccess::seal(fb);
     FrameAccess::reset(packet);
 }
@@ -111,7 +140,7 @@ TEST(SimFrame, SetCameraForwardWithoutFeedbackIsNoop) {
     FrameBuilder fb(packet);
     InputSnapshot input;
     SimFrame sim(fb, input, 0.016f, 0.0, 0, nullptr);
-    sim.set_camera_forward(1.0f, 0.0f); // must not crash
+    sim.set_camera_forward({1.0f, 0.0f}); // must not crash
     FrameAccess::seal(fb);
     FrameAccess::reset(packet);
 }

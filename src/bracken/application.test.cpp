@@ -5,8 +5,10 @@
 
 #include <gtest/gtest.h>
 #include <stdexcept>
+#include <utility>
 
 using bracken::Application;
+using bracken::GraphicsSettings;
 using bracken::SimFrame;
 using bracken::core::jobs::JobSystem;
 
@@ -37,6 +39,16 @@ protected:
     }
 
     void on_shutdown() override { ++shutdowns; }
+
+public:
+    // set_camera_driven_by_engine / camera_driven_by_engine are protected
+    // facade; expose them for the test below.
+    void take_the_camera() { set_camera_driven_by_engine(false); }
+    using Application::camera_driven_by_engine;
+    using Application::edit_graphics_settings;
+    using Application::graphics_settings;
+
+protected:
 
     void on_simulate(SimFrame& sim) override {
         ++sim_frames;
@@ -114,4 +126,64 @@ TEST_F(ApplicationPipelineTest, StopIsANoOpWhenStartFailed) {
     // stop() anyway must not unwind a game that never came up.
     app.stop();
     EXPECT_EQ(app.shutdowns, 0);
+}
+
+// ===== Camera: the engine drives the rig unless the host takes it back =====
+
+TEST_F(ApplicationPipelineTest, CameraIsEngineDrivenByDefaultAndTheHatchToggles) {
+    HeadlessApp app;
+    // The default matters: a host that never thinks about the camera gets one
+    // that updates, lands in the packet, and feeds the movement basis.
+    EXPECT_TRUE(app.camera_driven_by_engine());
+    app.take_the_camera();
+    EXPECT_FALSE(app.camera_driven_by_engine());
+    // Without a renderer there is no rig at all, so the drive is a no-op —
+    // run() must still complete every frame.
+    app.quit_at_frame = 2;
+    app.run();
+    EXPECT_GE(app.sim_frames, 2);
+}
+
+
+// ===== Settings: the scoped edit commits itself, or does nothing =====
+
+TEST_F(ApplicationPipelineTest, GraphicsEditIsDeferredNotImmediate) {
+    HeadlessApp app;
+    const bool before = app.graphics_settings().bloom_enabled;
+    {
+        auto gs = app.edit_graphics_settings();
+        gs->bloom_enabled = !before;
+        EXPECT_EQ(gs->bloom_enabled, !before);
+    }
+    // The edit is a REQUEST: applying it is GPU/SDL work that happens at the
+    // frame fence, so the persisted copy does not change under the caller.
+    EXPECT_EQ(app.graphics_settings().bloom_enabled, before);
+}
+
+TEST_F(ApplicationPipelineTest, UnchangedGraphicsEditRequestsNothing) {
+    HeadlessApp app;
+    {
+        auto gs = app.edit_graphics_settings();
+        (void)gs->bloom_enabled; // read-only: nothing to commit
+    }
+    // Proof by consequence: applying settings needs a renderer (the facade
+    // setters are BRACKEN_CONTRACT-guarded), so a spurious request from an
+    // untouched edit would abort this renderer-less run at the first fence.
+    app.quit_at_frame = 2;
+    app.run();
+    EXPECT_GE(app.sim_frames, 2);
+}
+
+TEST_F(ApplicationPipelineTest, MovedFromGraphicsEditDoesNotAlsoCommit) {
+    HeadlessApp app;
+    auto gs = app.edit_graphics_settings();
+    gs->bloom_enabled = !gs->bloom_enabled;
+    {
+        // Exactly one handle may commit; the moved-from one is disarmed. A
+        // double commit here would be two requests, the second of which is
+        // the stale copy.
+        bracken::GraphicsSettingsEdit moved = std::move(gs);
+        (void)moved;
+    }
+    EXPECT_EQ(app.graphics_settings().bloom_enabled, GraphicsSettings{}.bloom_enabled);
 }

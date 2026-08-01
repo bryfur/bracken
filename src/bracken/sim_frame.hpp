@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <glm/glm.hpp>
 #include <string>
 #include <utility>
 
@@ -26,8 +27,8 @@ class Application;
  */
 struct SimFeedback {
     bool has_camera_forward = false;
-    float camera_forward_x = 0.0f;
-    float camera_forward_z = -1.0f;
+    /// Ground-plane (x, z) camera forward for the movement basis.
+    glm::vec2 camera_forward{0.0f, -1.0f};
 };
 
 /**
@@ -52,8 +53,9 @@ public:
     /** Engine-internal constructor (Application's sim job + tests): binds
      *  the frame contexts. Host code never constructs SimFrames. */
     SimFrame(scene::FrameBuilder& builder, const InputSnapshot& input, float dt, double time, uint64_t frame_index,
-             SimFeedback* feedback = nullptr)
-        : sink_(builder), input_(&input), feedback_(feedback), dt_(dt), time_(time), frame_index_(frame_index) {}
+             SimFeedback* feedback = nullptr, int screen_width = 0, int screen_height = 0)
+        : sink_(builder), input_(&input), feedback_(feedback), dt_(dt), time_(time), frame_index_(frame_index),
+          screen_width_(screen_width), screen_height_(screen_height) {}
 
     SimFrame(const SimFrame&) = delete;
     SimFrame& operator=(const SimFrame&) = delete;
@@ -136,19 +138,36 @@ public:
     }
 
     /**
-     * Record the camera's ground-plane forward direction for the input
-     * system's camera-relative movement basis (mirror of the retired
-     * InputHandler::set_camera_forward call from host update code). Deferred:
-     * applied to the InputHandler at the next frame fence, so it shapes the
-     * NEXT snapshot's InputState::move_dir — the same one-frame latency the
-     * pre-pipelined loop had. No-op when the engine did not attach feedback
-     * (hand-built test frames).
+     * The frame's window client size in pixels, snapshotted on the main
+     * thread at this frame's kick.
+     *
+     * Read THIS from sim code, never Application::screen_width() — that goes
+     * through the RenderContext, which is main-thread-tier state and may be
+     * reconfiguring the swapchain while this frame simulates (pipeline depth
+     * 2). 0 when there is no renderer.
      */
-    void set_camera_forward(float x, float z) {
+    [[nodiscard]] int screen_width() const { return screen_width_; }
+    [[nodiscard]] int screen_height() const { return screen_height_; }
+
+    /**
+     * OVERRIDE the camera's ground-plane (x, z) forward direction for the
+     * input system's camera-relative movement basis.
+     *
+     * Normally the engine records this itself, from the camera it drives in
+     * the sim-stage tail — call this only for a host-owned rig (see
+     * Application::set_camera_driven_by_engine) or to bias the movement basis
+     * away from where the camera actually looks. A call from on_simulate
+     * wins: the engine fills the feedback only when the host did not.
+     *
+     * Deferred either way: applied to the InputHandler at the next frame
+     * fence, so it shapes the NEXT snapshot's InputState::move_dir — the same
+     * one-frame latency the pre-pipelined loop had. No-op when the engine did
+     * not attach feedback (hand-built test frames).
+     */
+    void set_camera_forward(glm::vec2 ground_forward) {
         if (feedback_ != nullptr) {
             feedback_->has_camera_forward = true;
-            feedback_->camera_forward_x = x;
-            feedback_->camera_forward_z = z;
+            feedback_->camera_forward = ground_forward;
         }
     }
 
@@ -159,6 +178,8 @@ private:
     float dt_;
     double time_;
     uint64_t frame_index_;
+    int screen_width_;
+    int screen_height_;
 };
 
 /**

@@ -42,7 +42,12 @@ namespace playground {
  */
 class PlaygroundGame : public bracken::Application {
 public:
-    explicit PlaygroundGame(int smoke_frames = -1) : smoke_frames_(smoke_frames) {}
+    /** @param smoke_frames  >0: self-drive for N frames and exit.
+     *  @param engine_camera false (--engine-camera=off) makes the demo drive
+     *         the camera rig by hand instead of letting the engine do it —
+     *         the coverage that keeps Application's escape hatch honest. */
+    explicit PlaygroundGame(int smoke_frames = -1, bool engine_camera = true)
+        : engine_camera_(engine_camera), smoke_frames_(smoke_frames) {}
 
     /** Where the smoke run saves its screenshot (main() verifies it after). */
     static constexpr const char* SMOKE_SCREENSHOT_PATH = "playground_smoke.png";
@@ -145,7 +150,7 @@ private:
                                        // rain layer/splash/ripple emission
     void update_physics(float dt); // kinematic pusher, kick, step, readback
     void build_frame(bracken::SimFrame& sim); // describe the frame via sim.frame()
-    void build_ui(bracken::scene::FrameSink& fb);
+    void build_ui(const bracken::SimFrame& sim, bracken::scene::FrameSink& fb);
 
     // Fence-side (on_main_frame; main thread, no sim in flight):
     void sync_dev_panel(); // apply panel edits + refresh the panel snapshot
@@ -282,6 +287,10 @@ private:
     bracken::EffectDefinition chimney_smoke_;
     bracken::EffectDefinition rain_layer_;
     bracken::EffectDefinition rain_splash_;
+
+    // Let the engine drive the camera rig (the default; see
+    // Application::set_camera_driven_by_engine). Immutable after construction.
+    bool engine_camera_ = true;
 
     float time_ = 0.0f; // mirror of sim.time() (accumulated dt)
     int frame_ = 0;     // 1-based sim frame counter (sim.frame_index() + 1)

@@ -37,7 +37,50 @@ class EffectSystem;
 } // namespace systems
 
 class ModelManager;
+class Application;
 struct Heightmap;
+
+/**
+ * A scoped edit of the persisted graphics settings, committed on destruction.
+ *
+ * Mutate through `operator->`; when the handle dies it hands the edited copy
+ * to Application::request_graphics_settings — and does nothing at all if
+ * nothing changed, so an untaken branch costs no swapchain reconfigure.
+ *
+ * It exists because the old shape ("take a reference to the engine's struct,
+ * mutate it, then remember to hand it back") made forgetting the hand-back
+ * representable, and forgetting it is silent: the field is set, the renderer
+ * never hears about it, and the setting appears to work until something else
+ * applies. Here, forgetting is not expressible.
+ *
+ * Move-only, and moving from a handle disarms it. Tier: sim-stage or main
+ * thread — same as request_graphics_settings, which does the deferring.
+ * Do not hold one across a frame boundary: it captures the settings as they
+ * were when it was opened.
+ */
+class [[nodiscard]] GraphicsSettingsEdit {
+public:
+    ~GraphicsSettingsEdit();
+
+    GraphicsSettingsEdit(const GraphicsSettingsEdit&) = delete;
+    GraphicsSettingsEdit& operator=(const GraphicsSettingsEdit&) = delete;
+    GraphicsSettingsEdit(GraphicsSettingsEdit&& other) noexcept;
+    GraphicsSettingsEdit& operator=(GraphicsSettingsEdit&&) = delete;
+
+    GraphicsSettings* operator->() { return &edited_; }
+    const GraphicsSettings* operator->() const { return &edited_; }
+    GraphicsSettings& operator*() { return edited_; }
+    const GraphicsSettings& operator*() const { return edited_; }
+
+private:
+    friend class Application;
+    GraphicsSettingsEdit(Application& app, const GraphicsSettings& current)
+        : app_(&app), original_(current), edited_(current) {}
+
+    Application* app_;
+    GraphicsSettings original_;
+    GraphicsSettings edited_;
+};
 
 /**
  * Base application class that owns the SDL lifecycle, the pipelined main
@@ -70,11 +113,12 @@ struct Heightmap;
  *      the frame's by-value InputSnapshot.
  *   4. Acquire packet i+1's FrameBuilder from the ring and KICK sim job i+1
  *      on the pool: SimFrame construction → on_simulate(sim) → the engine's
- *      sim-stage tail (apply the builder's effect spawns to the EffectSystem,
- *      EffectSystem::update on the pool, write the effect-instance snapshot
- *      + sim-advanced scene/sky clocks into the packet's engine section) →
- *      seal. Frame timing (dt) is computed at kick time and carried in the
- *      packet.
+ *      sim-stage tail (drive the camera and write its state into the packet
+ *      unless the host opted out; apply the builder's effect spawns to the
+ *      EffectSystem, EffectSystem::update on the pool, write the
+ *      effect-instance snapshot + sim-advanced scene/sky clocks into the
+ *      packet's engine section) → seal. Frame timing (dt) and the viewport
+ *      are computed at kick time and carried into the frame.
  *   5. render_frame(packet i) on the main thread (Prepare fan-out + Record +
  *      present).
  *   6. Retire packet i.
@@ -273,13 +317,15 @@ protected:
      *  Valid after init_dev_ui() — including when it returned false. */
     dev::DevUI& dev_ui();
 
-    /** The persisted graphics settings. Tier: owned by the host's frame code
-     *  — under run(), mutate it from on_simulate (and apply via
-     *  request_graphics_settings) or from on_main_frame, but not both
-     *  concurrently. The engine itself only touches it at init/shutdown and
-     *  the frame fence. */
-    GraphicsSettings& graphics_settings() { return graphics_settings_; }
+    /** The persisted graphics settings, read-only. Change them through
+     *  edit_graphics_settings(). Safe to read from on_simulate or the fence;
+     *  the engine writes this only at init/shutdown and the frame fence. */
     const GraphicsSettings& graphics_settings() const { return graphics_settings_; }
+
+    /** Open a scoped edit of the graphics settings; the change is requested
+     *  when the handle goes out of scope, and skipped entirely if nothing was
+     *  edited. See GraphicsSettingsEdit. Tier: sim-stage or main thread. */
+    [[nodiscard]] GraphicsSettingsEdit edit_graphics_settings() { return {*this, graphics_settings_}; }
 
     /** Get the platform-appropriate settings file path. */
     std::string settings_file_path() const;
@@ -394,14 +440,45 @@ protected:
 
     // ========== Camera facade ==========
 
-    /** The host camera rig. Tier: sim-stage under run() (update it in
+    /** The host camera rig. Tier: sim-stage under run() (aim it from
      *  on_simulate); main-thread reads (DevUI Camera tab) tear at worst —
-     *  see dev::DevUI's panel-data-safety note. */
+     *  see dev::DevUI's panel-data-safety note.
+     *
+     *  The engine DRIVES it (see set_camera_driven_by_engine): the host sets
+     *  target/yaw/pitch/zoom and the engine does the per-frame update, the
+     *  viewport, the packet's camera state and the input movement basis. */
     systems::CameraController& camera();
     const systems::CameraController& camera() const;
 
+    /**
+     * Who drives the camera each frame. Default: the engine.
+     *
+     * ON (default): the sim-stage tail — after on_simulate returns, so it
+     * sees everything the frame staged — sets the camera's viewport from the
+     * frame's kick-time screen size, calls update(dt), writes the resulting
+     * CameraState into the packet, and records the ground forward for the
+     * next input snapshot's movement basis. The host only aims the rig
+     * (set_target/set_yaw/...); it never calls update() or fb.set_camera().
+     *
+     * OFF: nothing touches the camera but the host, which then owes the frame
+     * all four itself — camera().set_screen_size(sim.screen_width(), ...),
+     * camera().update(sim.dt()), sim.frame().set_camera(...) and
+     * sim.set_camera_forward(...). For custom rigs (a fixed cinematic camera,
+     * a replay driving CameraState directly, a game that runs the rig at a
+     * different rate than the frame).
+     *
+     * Note the ordering consequence of ON: the camera updates at the END of
+     * the frame, so camera OUTPUT read during on_simulate (get_forward(),
+     * get_position()) is the previous frame's, while shakes and target moves
+     * staged during the frame land in this frame's camera. Tier: main-thread
+     * (set it in on_init).
+     */
+    void set_camera_driven_by_engine(bool enabled) { camera_driven_by_engine_ = enabled; }
+    [[nodiscard]] bool camera_driven_by_engine() const { return camera_driven_by_engine_; }
+
 private:
-    friend class MainFrame; // fence-scoped passthroughs (fps/window/screenshot)
+    friend class MainFrame;            // fence-scoped passthroughs (fps/window/screenshot)
+    friend class GraphicsSettingsEdit; // commits through request_graphics_settings
 
     // ---- Pipeline steps (see the class comment's schedule) ----
 
@@ -482,6 +559,12 @@ private:
 
     // Written at kick (main thread, no sim in flight), read by the job.
     InputSnapshot sim_input_;
+    // Viewport for the frame, snapshotted at kick: RenderContext is
+    // main-thread tier and may be reconfiguring the swapchain while this
+    // frame's sim runs, so neither the host nor the engine's camera drive may
+    // read screen_width()/height() from the sim stage.
+    int sim_screen_width_ = 0;
+    int sim_screen_height_ = 0;
     float sim_dt_ = 0.0f;
     double sim_time_ = 0.0;          // accumulated dt
     uint64_t sim_frame_index_ = 0;   // next frame index to kick
@@ -515,6 +598,9 @@ private:
     std::unique_ptr<systems::CameraSystem> camera_;
     std::unique_ptr<systems::EffectSystem> effect_system_; // sim-stage owned (see effect_system())
     std::unique_ptr<dev::DevUI> dev_ui_; // created by init_dev_ui(); destroyed before the renderer
+
+    // See set_camera_driven_by_engine().
+    bool camera_driven_by_engine_ = true;
 
     GraphicsSettings graphics_settings_;
 
