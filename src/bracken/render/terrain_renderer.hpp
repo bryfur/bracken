@@ -22,6 +22,11 @@ class JobSystem;
 
 namespace bracken::render {
 
+namespace gi {
+struct GiBindings;
+} // namespace gi
+
+
 namespace gpu = bracken::gpu;
 
 /**
@@ -77,10 +82,17 @@ struct alignas(16) TerrainLightingUniforms {
     float iblEnabled = 0.0f;   // offset 128 — 1 = sky IBL ambient (samplers 5-7), 0 = hemisphere
     float rtShadowEnabled = 0.0f; // offset 132 — 1 = traced sun visibility replaces CSM
     float _padIbl[2] = {0.0f, 0.0f};
+    /// Probe-field GI (render/gi/), R1c — see
+    /// gpu::ModelLightingUniforms::giCascadeBase for the full contract.
+    glm::ivec4 giCascadeBase[3] = {}; // offset 144
+    float giEnabled = 0.0f;           // offset 192
+    float _giPad0 = 0.0f;
+    float _giPad1 = 0.0f;
+    float _giPad2 = 0.0f;
 };
 
 // Layout pins against terrain.frag.hlsl LightingUniforms.
-static_assert(sizeof(TerrainLightingUniforms) == 144, "must match terrain.frag.hlsl LightingUniforms (144 B)");
+static_assert(sizeof(TerrainLightingUniforms) == 208, "must match terrain.frag.hlsl LightingUniforms (208 B)");
 static_assert(offsetof(TerrainLightingUniforms, fogColorHorizon) == 0);
 static_assert(offsetof(TerrainLightingUniforms, fogColorSun) == 16);
 static_assert(offsetof(TerrainLightingUniforms, lightDir) == 32);
@@ -91,6 +103,8 @@ static_assert(offsetof(TerrainLightingUniforms, sunColor) == 96);
 static_assert(offsetof(TerrainLightingUniforms, splat_params) == 112);
 static_assert(offsetof(TerrainLightingUniforms, iblEnabled) == 128);
 static_assert(offsetof(TerrainLightingUniforms, rtShadowEnabled) == 132);
+static_assert(offsetof(TerrainLightingUniforms, giCascadeBase) == 144);
+static_assert(offsetof(TerrainLightingUniforms, giEnabled) == 192);
 
 /**
  * TerrainRenderer handles terrain rendering using server-provided heightmaps.
@@ -159,9 +173,15 @@ public:
      * @param rt_shadow_binding Ray-traced sun visibility mask (slot 8; a
      *        white dummy keeps the descriptor valid while disabled).
      * @param local_shadow_binding Local (point/spot) shadow atlas +
-     *        comparison sampler (slot 9 — the shader's last sampler; sampled
+     *        comparison sampler (slot 12 — the shader's last sampler; sampled
      *        only for lights with shadow_slot >= 0, so any D32 depth texture
      *        keeps the slot valid when local shadows are off).
+     * @param gi Probe-field GI: the three atlas bindings (slots 9-11) plus
+     *        each cascade's window corner and the enable flag
+     *        (render/gi/gi_bindings.hpp). The slots are declared
+     *        unconditionally by the fragment shader, so null leaves them
+     *        unbound — which SDL3 GPU leaves undefined. Pass the dummy-filled
+     *        snapshot `SceneRenderer::refresh_gi_bindings()` always produces.
      */
     void render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view, const glm::mat4& projection,
                 const glm::vec3& camera_pos, const glm::vec3& light_dir,
@@ -170,7 +190,8 @@ public:
                 const scene::Frustum* frustum = nullptr, bool depth_equal = false,
                 const SDL_GPUTextureSamplerBinding* ibl_bindings = nullptr, bool ibl_enabled = false,
                 const SDL_GPUTextureSamplerBinding* rt_shadow_binding = nullptr, bool rt_shadows_enabled = false,
-                const SDL_GPUTextureSamplerBinding* local_shadow_binding = nullptr);
+                const SDL_GPUTextureSamplerBinding* local_shadow_binding = nullptr,
+                const gi::GiBindings* gi = nullptr);
 
     /**
      * Depth-prepass draw (velocity + depth, DepthPrepassTerrain pipeline).

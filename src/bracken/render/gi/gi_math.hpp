@@ -4,25 +4,34 @@
  * Probe-field addressing math — the CPU source of truth for phase R1 of
  * `docs/rt_lighting_plan.md` (§5.2).
  *
- * Header-only, glm + `<std>` only, NO GPU headers: every function here is a
- * pure mapping that R1b's compute shaders will mirror in HLSL, and the only way
- * to keep the two honest is to be able to test this half with no device, no
- * window and no SDL. Each function names its future shader counterpart in its
- * comment; when that counterpart is written it must be a transliteration of the
- * body below, not a re-derivation.
+ * Header-only, glm + `<std>` only, NO GPU headers: every function here is
+ * mirrored in HLSL by the GI shaders, and the only way to keep the two honest
+ * is to be able to test this half with no device, no window and no SDL. Each
+ * function names its shader counterpart in its comment, and that counterpart is
+ * a transliteration of the body below, not a re-derivation.
  *
- * WHAT EXISTS AFTER R1a: the addressing, the scroll, and the invalidation
- * bookkeeping. Nothing traces a ray, nothing shades a probe, and every probe
- * therefore stays `PROBE_UNINITIALIZED` forever. `render/gi/probe_volume.hpp`
- * hangs GPU atlases off this and `scene::SceneRenderer` scrolls it; consumers
- * arrive in R1b/R1c.
+ * THREE LAYERS, all of them here:
+ *   - ADDRESSING (R1a) — the torus wrap, the banded atlas tiling, octahedral
+ *     encode/decode and the border wrap, world <-> probe mapping, the scroll
+ *     and its invalidation bookkeeping. Mirrored by `shaders/gi_probe.hlsli`.
+ *   - UPDATE (R1b) — spherical-Fibonacci ray directions with their per-frame
+ *     rotation, the change-adaptive blend curve, the relocation and
+ *     classification thresholds. Mirrored by the `gi_probe_*.comp.hlsl` passes.
+ *   - SAMPLING (R1c) — the bias, cascade selection, the eight-probe weights,
+ *     the Chebyshev test and the cascade blend, in the `SAMPLE_*` block and
+ *     `sample_field()` below. Mirrored by `shaders/gi_sample.hlsli`, and the
+ *     one layer whose failure modes (seams at cascade and cell boundaries) are
+ *     continuity properties, so they are asserted numerically in the tests
+ *     rather than eyeballed in a frame.
  */
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>
+#include <limits>
 #include <vector>
 
 namespace bracken::render::gi {
@@ -96,11 +105,30 @@ inline constexpr std::uint8_t PROBE_ACTIVE = 1;
  * the erasure would look like "classification is flaky" rather than like a
  * lost-update bug. One texture, one writer.
  *
- * R1c's sampler reads BOTH: `probe_state` for "has this probe ever been
- * filled", and this channel for "is it inside geometry" (skip it) plus xyz for
- * where the probe actually sampled from, which is where its irradiance is
- * valid. Anything sampling the field must apply the offset — a probe nudged
- * 0.45 spacings out of a wall is not at its lattice position any more.
+ * R1c'S SAMPLER READS ONLY THIS TEXTURE, and that is a deliberate narrowing of
+ * what R1a anticipated. The forward shaders have three sampler slots to spend
+ * on the field (see ATLAS_ROWS_ALL_CASCADES below for why three and not four),
+ * so the "has this probe ever been filled" question has to be answerable from
+ * the same texel as "is it inside geometry". It is, because
+ * `ProbeVolume::init()` seeds the WHOLE offset plane with
+ * PROBE_CLASS_INSIDE_GEOMETRY: a probe reads as "skip me" from allocation until
+ * the classify pass — which runs only on probes the blend passes have just
+ * filled — overwrites it with PROBE_CLASS_OK. That seed is a one-time CPU
+ * upload before any GPU write, so it is not a second writer; it is the initial
+ * value. It also removes the last path that could read undefined texture
+ * memory, which the atlases' never-cleared policy otherwise leaves open once
+ * something outside the update passes starts sampling them.
+ *
+ * The residual, stated rather than hidden: a probe whose slot was taken over by
+ * a scrolled-in probe that the frame's ray budget could not reach still reads
+ * PROBE_CLASS_OK while holding its predecessor's radiance. `select_updates`
+ * gives entering probes the whole budget first and a single-plane scroll enters
+ * 288-576 probes against a budget of 864-1728, so this needs a jump of several
+ * probe spacings in one frame to happen at all, and it is corrected on the
+ * cascade's next turn.
+ *
+ * Anything sampling the field must also apply the offset — a probe nudged 0.45
+ * spacings out of a wall is not at its lattice position any more.
  */
 inline constexpr float PROBE_CLASS_OK = 0.0f;
 inline constexpr float PROBE_CLASS_INSIDE_GEOMETRY = 2.0f;
@@ -128,6 +156,30 @@ inline constexpr float PROBE_CLASS_INSIDE_GEOMETRY = 2.0f;
 
 inline constexpr int PROBES_PER_ATLAS_ROW = GRID_X * GRID_Y; // 288
 inline constexpr int ATLAS_ROWS = GRID_Z;                    // 24
+
+// ---------------------------------------------------------------------------
+// THE CASCADE BANDS — one texture for the whole field, not one per cascade
+// ---------------------------------------------------------------------------
+//
+// Every atlas holds ALL THREE cascades, stacked vertically: cascade c occupies
+// rows [c * ATLAS_ROWS, (c+1) * ATLAS_ROWS), i.e. its tiles start at
+// texel row c * ATLAS_ROWS * probe_texels. Nothing else changes — within a band
+// the tiling is exactly the (column = x + GRID_X*y, row = z) mapping above.
+//
+// WHY, and this is a consumption decision rather than a storage one (R1c): the
+// forward shaders sample the field, and a per-cascade texture would cost them
+// THREE sampler slots per atlas — nine for irradiance + visibility + offsets,
+// against three for the banded form. Scene fragment stages are already at 12
+// (model) / 10 (terrain) / 8 (grass) samplers and DXC's practical ceiling for
+// this stage was measured at 17, so nine new slots does not fit and three does.
+// The volumetric fog pass and R4's screen probes reuse the same three.
+//
+// The cost is that a compute pass writing one cascade now writes into a shared
+// texture. That is harmless here because the GPU passes serialise on one queue
+// and each dispatch touches only its own band's texels — but it is why the
+// read-write bindings use `cycle = false` (see probe_volume.cpp): cycling would
+// hand the pass a fresh allocation and discard the other two cascades.
+inline constexpr int ATLAS_ROWS_ALL_CASCADES = ATLAS_ROWS * CASCADE_COUNT; // 72
 
 // ---------------------------------------------------------------------------
 // Probe indexing
@@ -178,26 +230,39 @@ inline constexpr int ATLAS_ROWS = GRID_Z;                    // 24
 // Atlas mapping
 // ---------------------------------------------------------------------------
 
-/// Atlas width/height in texels for a given per-probe tile size.
+/// Atlas width in texels for a given per-probe tile size.
 [[nodiscard]] inline int atlas_width(int probe_texels) { return PROBES_PER_ATLAS_ROW * probe_texels; }
-[[nodiscard]] inline int atlas_height(int probe_texels) { return ATLAS_ROWS * probe_texels; }
+/// Height of ONE cascade's band.
+[[nodiscard]] inline int atlas_band_height(int probe_texels) { return ATLAS_ROWS * probe_texels; }
+/// Height of the whole texture: every cascade's band, stacked.
+[[nodiscard]] inline int atlas_height(int probe_texels) {
+    return ATLAS_ROWS_ALL_CASCADES * probe_texels;
+}
 
 /**
- * Top-left texel of a probe's tile, BORDER INCLUDED. Add PROBE_BORDER_TEXELS to
- * reach the payload's first texel.
+ * Top-left texel of a probe's tile, BORDER INCLUDED, in the banded atlas. Add
+ * PROBE_BORDER_TEXELS to reach the payload's first texel.
  *
- * Shader counterpart-to-be: `giProbeAtlasOrigin(int slot, int probeTexels)`.
+ * Shader counterpart: `giProbeAtlasOrigin(int slot, int probeTexels, int cascade)`.
  */
-[[nodiscard]] inline glm::ivec2 probe_atlas_origin(int slot_index, int probe_texels) {
+[[nodiscard]] inline glm::ivec2 probe_atlas_origin(int slot_index, int probe_texels, int cascade) {
     const int col = slot_index % PROBES_PER_ATLAS_ROW;
-    const int row = slot_index / PROBES_PER_ATLAS_ROW;
+    const int row = slot_index / PROBES_PER_ATLAS_ROW + cascade * ATLAS_ROWS;
     return {col * probe_texels, row * probe_texels};
 }
 
 /// Absolute atlas texel of a payload texel `local` in [0, payload)^2.
-[[nodiscard]] inline glm::ivec2 probe_payload_texel(int slot_index, int probe_texels,
+[[nodiscard]] inline glm::ivec2 probe_payload_texel(int slot_index, int probe_texels, int cascade,
                                                     const glm::ivec2& local) {
-    return probe_atlas_origin(slot_index, probe_texels) + glm::ivec2(PROBE_BORDER_TEXELS) + local;
+    return probe_atlas_origin(slot_index, probe_texels, cascade) + glm::ivec2(PROBE_BORDER_TEXELS) +
+           local;
+}
+
+/// The one-texel-per-probe planes (probe state, probe offset) use the same
+/// banding with a tile size of 1. Shader counterpart:
+/// `giProbeStateTexel(int slot, int cascade)`.
+[[nodiscard]] inline glm::ivec2 probe_state_texel(int slot_index, int cascade) {
+    return probe_atlas_origin(slot_index, 1, cascade);
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +588,244 @@ inline constexpr float PROBE_VISIBILITY_DISTANCE_SCALE = 1.5f;
 /// take a much narrower cone of rays than the irradiance texels do — the
 /// DDGI-standard trade.
 inline constexpr float PROBE_VISIBILITY_SHARPNESS = 50.0f;
+
+// ---------------------------------------------------------------------------
+// SAMPLING — the CPU mirror of shaders/gi_sample.hlsli
+// ---------------------------------------------------------------------------
+//
+// R1c's consumption path. Everything below is a transliteration partner of
+// `giSampleDiffuse()` and its helpers; the shader does the texture taps, this
+// half does the identical arithmetic over readings a caller supplies, so the
+// cascade selection, the weights, the renormalisation and the cascade blend can
+// all be tested with no device (`gi_math.test.cpp`).
+//
+// The quantity sampled is COSINE-WEIGHTED MEAN INCOMING RADIANCE (irradiance/pi)
+// — the same convention as the IBL irradiance cube, so it substitutes for
+// `ambientIBL`'s cube tap with no scale factor anywhere.
+
+/// Sample-point bias, in fractions of the cascade's probe spacing.
+///
+/// DDGI's two-part bias, and both halves earn their keep. Along the NORMAL,
+/// because a shading point sits exactly on a surface and the probes that see
+/// that surface are all on one side of it — without the push, half the cage
+/// answers for the wrong side and self-shadowing artefacts crawl along every
+/// wall. Toward the CAMERA, because the error that survives the normal bias is
+/// worst at grazing angles, where a surface fills many pixels and the probe
+/// cage barely changes; pushing along the view ray decorrelates the two.
+///
+/// Both scale with the SPACING rather than being absolute: a coarse cascade's
+/// probes are farther apart, so its acceptable bias is proportionally larger.
+/// 0.2/0.3 are the RTXGI defaults, which is where they come from and why they
+/// are not tuned here.
+inline constexpr float SAMPLE_NORMAL_BIAS_FRACTION = 0.20f;
+inline constexpr float SAMPLE_VIEW_BIAS_FRACTION = 0.30f;
+
+/// How far inside a cascade's window the biased sample point must lie, in
+/// probes, for that cascade to answer at all. Half a spacing: at exactly 0.5 the
+/// floor of the local coordinate is 0 and the 8-tap cage is [0,1] on every
+/// axis — wholly inside the window, which is the requirement. Any less and a
+/// tap wraps around the torus and reads the opposite side of the world.
+inline constexpr float SAMPLE_CASCADE_MARGIN_PROBES = 0.5f;
+/// Width of the fade band at that boundary, in probes. THIS IS THE CONTINUITY
+/// MECHANISM: a cascade's confidence ramps to zero over the last probe of its
+/// window, so at the exact point where it stops answering it was already
+/// contributing nothing and the next-coarser cascade already had all the
+/// weight. Without it a cascade boundary is a visible step in the ambient term.
+inline constexpr float SAMPLE_CASCADE_FADE_PROBES = 1.0f;
+
+/// Live-weight fraction at which a cascade is trusted completely. The eight
+/// trilinear weights sum to 1 when every probe is usable, so this is "at least
+/// 30% of the cage answered"; below it the confidence ramps down and the
+/// next-coarser cascade fills the rest in. It is what stops a cage that is
+/// mostly buried probes from stretching one survivor's radiance over a room.
+inline constexpr float SAMPLE_WEIGHT_SUM_FLOOR = 0.30f;
+
+/// Floor added to the squared backface term so a cage that faces entirely away
+/// from the shading normal ends up dim rather than black. Same value and same
+/// reason as the bounce sampler in `gi_probe_trace.comp.hlsl`.
+inline constexpr float SAMPLE_BACKFACE_WEIGHT_FLOOR = 0.02f;
+
+/// Chebyshev variance floor, as a fraction of spacing^2. The moments are
+/// accumulated from a handful of rays per update, so a texel that has seen one
+/// consistent distance reports a variance of ~0 and the bound collapses to a
+/// hard binary test that flickers as the ray set rotates. Flooring it keeps the
+/// test soft. Scaled by spacing^2 because the moments are distances in world
+/// units and a coarse cascade's are four times larger.
+inline constexpr float SAMPLE_CHEBYSHEV_MIN_VARIANCE = 1e-4f;
+/// Slack, in spacings, before the Chebyshev test starts attenuating at all. The
+/// stored mean is itself a filtered estimate; without slack, a shading point at
+/// the same distance as the surface the probe measured (i.e. its own surface)
+/// tests as occluded and every wall self-darkens.
+inline constexpr float SAMPLE_CHEBYSHEV_BIAS_FRACTION = 0.02f;
+
+/**
+ * Chebyshev's inequality as a soft visibility test between a probe and a
+ * shading point `dist` away, given that probe's mean and mean-squared ray
+ * distance in that direction. 1 = the probe can see the point.
+ *
+ * This is what makes a sparse grid usable indoors: without it, a probe on the
+ * far side of a wall is trilinearly nearby and leaks its radiance through.
+ *
+ * Mirrors `giChebyshev()` in `shaders/gi_sample.hlsli`.
+ */
+[[nodiscard]] inline float chebyshev_visibility(float dist, float mean, float mean_squared,
+                                                float spacing) {
+    const float bias = SAMPLE_CHEBYSHEV_BIAS_FRACTION * spacing;
+    if (dist <= mean + bias) {
+        return 1.0f;
+    }
+    const float floor_variance = SAMPLE_CHEBYSHEV_MIN_VARIANCE * spacing * spacing;
+    const float variance = std::max(mean_squared - mean * mean, floor_variance);
+    const float d = dist - (mean + bias);
+    const float v = variance / (variance + d * d);
+    // Cubed, per DDGI: the raw bound is far too permissive at the one-sample-
+    // per-texel-per-update rates a probe field actually runs at, and light that
+    // leaks 30% through a wall reads as a rendering bug rather than as softness.
+    return std::max(v * v * v, 0.0f);
+}
+
+/// What one probe answers when the sampler asks. The shader reads these out of
+/// the three atlases; the CPU mirror takes them from a caller-supplied functor
+/// so the weight math can be exercised with no device.
+struct ProbeReading {
+    /// Relocation offset in world units (`probe_offset.xyz`). The probe's
+    /// irradiance describes the world at lattice position + this.
+    glm::vec3 offset{0.0f};
+    /// `probe_offset.w` — PROBE_CLASS_INSIDE_GEOMETRY means "do not use me",
+    /// and covers "never filled" as well (see PROBE_CLASS_* above).
+    float classification = PROBE_CLASS_OK;
+    /// The octahedral irradiance tap along the shading normal.
+    glm::vec3 irradiance{0.0f};
+    /// Visibility moments (mean, mean^2) toward the shading point.
+    glm::vec2 moments{0.0f, 0.0f};
+};
+
+/// One cascade's answer: the renormalised irradiance and how much of the final
+/// result it is entitled to, in [0, 1].
+struct CascadeSample {
+    glm::vec3 irradiance{0.0f};
+    float confidence = 0.0f;
+};
+
+/// The biased sample position for a cascade. Cascade-dependent on purpose — the
+/// bias scales with that cascade's spacing — which is why the containment test
+/// below uses this and not the raw shading point.
+[[nodiscard]] inline glm::vec3 sample_bias_position(const glm::vec3& world, const glm::vec3& normal,
+                                                    const glm::vec3& to_camera, int cascade) {
+    const float sp = cascade_spacing(cascade);
+    return world + normal * (SAMPLE_NORMAL_BIAS_FRACTION * sp) +
+           to_camera * (SAMPLE_VIEW_BIAS_FRACTION * sp);
+}
+
+/**
+ * Trilinear-plus-weights gather over the eight probes surrounding `world` in
+ * cascade `cascade`, whose window corner is at `base`.
+ *
+ * `read(cascade, absolute_coord, slot, irradiance_dir)` supplies the probe's
+ * reading; the caller resolves the visibility direction itself from the offset
+ * it returns, so the functor is called once per probe exactly as the shader
+ * taps once per probe.
+ *
+ * Mirrors `giSampleCascade()` in `shaders/gi_sample.hlsli`.
+ */
+template <typename ReadFn>
+[[nodiscard]] CascadeSample sample_cascade(int cascade, const glm::ivec3& base, const glm::vec3& world,
+                                           const glm::vec3& normal, const glm::vec3& to_camera,
+                                           ReadFn&& read) {
+    const float sp = cascade_spacing(cascade);
+    const glm::vec3 biased = sample_bias_position(world, normal, to_camera, cascade);
+    const glm::vec3 local = biased / sp - glm::vec3(base);
+
+    const glm::vec3 lo(SAMPLE_CASCADE_MARGIN_PROBES);
+    const glm::vec3 hi(static_cast<float>(GRID_X) - 1.0f - SAMPLE_CASCADE_MARGIN_PROBES,
+                       static_cast<float>(GRID_Y) - 1.0f - SAMPLE_CASCADE_MARGIN_PROBES,
+                       static_cast<float>(GRID_Z) - 1.0f - SAMPLE_CASCADE_MARGIN_PROBES);
+    float inset = std::numeric_limits<float>::max();
+    for (int a = 0; a < 3; ++a) {
+        inset = std::min(inset, std::min(local[a] - lo[a], hi[a] - local[a]));
+    }
+    if (inset <= 0.0f) {
+        return {};
+    }
+    const float edge_fade = std::clamp(inset / SAMPLE_CASCADE_FADE_PROBES, 0.0f, 1.0f);
+
+    const glm::vec3 base_f{std::floor(local.x), std::floor(local.y), std::floor(local.z)};
+    const glm::vec3 frac = local - base_f;
+    const glm::ivec3 b{static_cast<int>(base_f.x), static_cast<int>(base_f.y),
+                       static_cast<int>(base_f.z)};
+
+    glm::vec3 sum(0.0f);
+    float weight_sum = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        const glm::ivec3 o{i & 1, (i >> 1) & 1, (i >> 2) & 1};
+        const glm::ivec3 absolute = base + b + o;
+        const int slot = wrapped_probe_index(absolute);
+        const ProbeReading r = read(cascade, absolute, slot, normal);
+        if (r.classification == PROBE_CLASS_INSIDE_GEOMETRY) {
+            continue; // buried, or never filled — both leak if used
+        }
+        const glm::vec3 probe_pos = glm::vec3(absolute) * sp + r.offset;
+        const glm::vec3 to_probe = probe_pos - biased;
+        const float dist = glm::length(to_probe);
+        const glm::vec3 dir = dist > 1e-4f ? to_probe / dist : normal;
+
+        const glm::vec3 tri{o.x != 0 ? frac.x : 1.0f - frac.x, o.y != 0 ? frac.y : 1.0f - frac.y,
+                            o.z != 0 ? frac.z : 1.0f - frac.z};
+        const float wrapped = (glm::dot(dir, normal) + 1.0f) * 0.5f;
+        const float w = tri.x * tri.y * tri.z * (wrapped * wrapped + SAMPLE_BACKFACE_WEIGHT_FLOOR) *
+                        chebyshev_visibility(dist, r.moments.x, r.moments.y, sp);
+        if (w <= 0.0f) {
+            continue;
+        }
+        sum += w * r.irradiance;
+        weight_sum += w;
+    }
+    if (weight_sum <= 1e-6f) {
+        return {};
+    }
+    // RENORMALISE over the probes that actually answered. Dividing by the live
+    // weight rather than by 8 (or by the full trilinear total) is what makes a
+    // cage with two buried probes report the six survivors' average instead of
+    // three quarters of it — the alternative reads as a dark halo around every
+    // wall the relocation pass gave up on.
+    CascadeSample out;
+    out.irradiance = sum / weight_sum;
+    out.confidence = edge_fade * std::clamp(weight_sum / SAMPLE_WEIGHT_SUM_FLOOR, 0.0f, 1.0f);
+    return out;
+}
+
+/**
+ * The whole sampler: finest cascade first, each taking as much of the remaining
+ * weight as its confidence allows, with the hemisphere ambient absorbing
+ * whatever is left over.
+ *
+ * The fallback is deliberately `EnvironmentState`'s hemisphere and not the IBL
+ * irradiance cube even when IBL is on: it is the engine's GI-off tier, so a
+ * pixel the field cannot answer for looks exactly as it did before this phase.
+ *
+ * Mirrors `giSampleDiffuse()` in `shaders/gi_sample.hlsli`.
+ */
+template <typename ReadFn>
+[[nodiscard]] glm::vec3 sample_field(const std::array<glm::ivec3, CASCADE_COUNT>& bases,
+                                     const glm::vec3& world, const glm::vec3& normal,
+                                     const glm::vec3& to_camera, const glm::vec3& ambient_sky,
+                                     const glm::vec3& ambient_ground, ReadFn&& read) {
+    glm::vec3 accum(0.0f);
+    float remaining = 1.0f;
+    for (int c = 0; c < CASCADE_COUNT && remaining > 0.0f; ++c) {
+        const CascadeSample s =
+            sample_cascade(c, bases[static_cast<std::size_t>(c)], world, normal, to_camera, read);
+        if (s.confidence <= 0.0f) {
+            continue;
+        }
+        const float take = std::min(s.confidence, remaining);
+        accum += s.irradiance * take;
+        remaining -= take;
+    }
+    const glm::vec3 hemisphere =
+        glm::mix(ambient_ground, ambient_sky, std::clamp(normal.y * 0.5f + 0.5f, 0.0f, 1.0f));
+    return accum + hemisphere * remaining;
+}
 
 // ---------------------------------------------------------------------------
 // One cascade's CPU-side state

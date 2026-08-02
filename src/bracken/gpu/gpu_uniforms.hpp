@@ -97,8 +97,19 @@ struct alignas(16) ModelLightingUniforms {
     float rtReflectionMaxRoughness = 0.0f;
     float rtReflectionFadeStart = 0.0f;
     float _rtPad2 = 0.0f;
+    /// Probe-field GI (render/gi/), R1c. `giCascadeBase[c].xyz` is
+    /// `render::gi::cascade_base()` of the position ProbeVolume was scrolled
+    /// with — sent rather than re-derived from cameraPos in the shader, so the
+    /// two can never disagree about which probe answers for which point in the
+    /// world (`.w` is unused; an array cannot carry a named pad). `giEnabled`
+    /// gates every tap: 0 restores the pre-R1c ambient term exactly.
+    glm::ivec4 giCascadeBase[3] = {};
+    float giEnabled = 0.0f;
+    float _giPad0 = 0.0f;
+    float _giPad1 = 0.0f;
+    float _giPad2 = 0.0f;
 };
-BRACKEN_HLSL_CBUFFER(ModelLightingUniforms, 240);
+BRACKEN_HLSL_CBUFFER(ModelLightingUniforms, 304);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, lightDir, 0);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, _padding0, 12);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, lightColor, 16);
@@ -136,6 +147,11 @@ BRACKEN_HLSL_FIELD(ModelLightingUniforms, screenAOEnabled, 220);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtShadowEnabled, 224);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionMaxRoughness, 228);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionFadeStart, 232);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, giCascadeBase, 240);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, giEnabled, 288);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, _giPad0, 292);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, _giPad1, 296);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, _giPad2, 300);
 
 /**
  * Skybox fragment shader uniforms - matches skybox.frag.hlsl SkyUniforms (set 3, b0)
@@ -376,8 +392,14 @@ struct alignas(16) InstancedLightingUniforms {
     float rtReflectionMaxRoughness = 0.0f;
     float rtReflectionFadeStart = 0.0f;
     float _rtPad2 = 0.0f;
+    /// Probe-field GI (render/gi/), R1c — see ModelLightingUniforms::giCascadeBase.
+    glm::ivec4 giCascadeBase[3] = {};
+    float giEnabled = 0.0f;
+    float _giPad0 = 0.0f;
+    float _giPad1 = 0.0f;
+    float _giPad2 = 0.0f;
 };
-BRACKEN_HLSL_CBUFFER(InstancedLightingUniforms, 224);
+BRACKEN_HLSL_CBUFFER(InstancedLightingUniforms, 288);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, lightDir, 0);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _padding0, 12);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, lightColor, 16);
@@ -414,6 +436,11 @@ BRACKEN_HLSL_FIELD(InstancedLightingUniforms, screenAOEnabled, 204);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtShadowEnabled, 208);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionMaxRoughness, 212);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionFadeStart, 216);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giCascadeBase, 224);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giEnabled, 272);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _giPad0, 276);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _giPad1, 280);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _giPad2, 284);
 
 /**
  * Per-instance data for instanced model rendering (storage buffer).
@@ -1039,8 +1066,21 @@ struct alignas(16) VolumetricFogUniforms {
     float lastActiveSplit = 0.0f;  // far distance of the last active cascade (lit beyond it)
     float _padding0 = 0.0f;
     float _padding1 = 0.0f;
+    /// The hemisphere ambient (EnvironmentState). Needed by this pass only
+    /// since R1c: it is both the probe field's fallback and the reference the
+    /// GI gain is measured against, so the two must be the same numbers.
+    glm::vec3 ambientSky{};
+    float _ambientPad0 = 0.0f;
+    glm::vec3 ambientGround{};
+    float _ambientPad1 = 0.0f;
+    /// Probe-field GI (render/gi/), R1c — see ModelLightingUniforms::giCascadeBase.
+    glm::ivec4 giCascadeBase[3] = {};
+    float giEnabled = 0.0f;
+    float _giPad0 = 0.0f;
+    float _giPad1 = 0.0f;
+    float _giPad2 = 0.0f;
 };
-BRACKEN_HLSL_CBUFFER(VolumetricFogUniforms, 448);
+BRACKEN_HLSL_CBUFFER(VolumetricFogUniforms, 544);
 BRACKEN_HLSL_FIELD(VolumetricFogUniforms, invViewProjection, 0);
 BRACKEN_HLSL_FIELD(VolumetricFogUniforms, shadowLightViewProjection, 64);
 BRACKEN_HLSL_FIELD(VolumetricFogUniforms, cascadeSplits, 320);
@@ -1061,6 +1101,15 @@ BRACKEN_HLSL_FIELD(VolumetricFogUniforms, shadowAtlasTexel, 432);
 BRACKEN_HLSL_FIELD(VolumetricFogUniforms, lastActiveSplit, 436);
 BRACKEN_HLSL_FIELD(VolumetricFogUniforms, _padding0, 440);
 BRACKEN_HLSL_FIELD(VolumetricFogUniforms, _padding1, 444);
+BRACKEN_HLSL_FIELD(VolumetricFogUniforms, ambientSky, 448);
+BRACKEN_HLSL_FIELD(VolumetricFogUniforms, _ambientPad0, 460);
+BRACKEN_HLSL_FIELD(VolumetricFogUniforms, ambientGround, 464);
+BRACKEN_HLSL_FIELD(VolumetricFogUniforms, _ambientPad1, 476);
+BRACKEN_HLSL_FIELD(VolumetricFogUniforms, giCascadeBase, 480);
+BRACKEN_HLSL_FIELD(VolumetricFogUniforms, giEnabled, 528);
+BRACKEN_HLSL_FIELD(VolumetricFogUniforms, _giPad0, 532);
+BRACKEN_HLSL_FIELD(VolumetricFogUniforms, _giPad1, 536);
+BRACKEN_HLSL_FIELD(VolumetricFogUniforms, _giPad2, 540);
 
 /**
  * Auto-exposure histogram COMPUTE uniforms - matches
@@ -1462,9 +1511,12 @@ struct alignas(16) GiProbeBlendUniforms {
     /// direction from it to weight that ray's radiance — so this must be the
     /// value the trace ran with, or every texel weights the wrong ray.
     uint32_t frameIndex = 0;
+    /// Which cascade's BAND of the shared atlas this dispatch writes. Since
+    /// R1c every cascade lives in one texture (gi_math.hpp,
+    /// ATLAS_ROWS_ALL_CASCADES), so the tile origin needs it.
+    uint32_t cascadeIndex = 0;
     uint32_t _pad0 = 0;
     uint32_t _pad1 = 0;
-    uint32_t _pad2 = 0;
 };
 BRACKEN_HLSL_CBUFFER(GiProbeBlendUniforms, 32);
 BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, probeCount, 0);
@@ -1472,9 +1524,9 @@ BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, rayCount, 4);
 BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, distanceClamp, 8);
 BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, rayMaxDistance, 12);
 BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, frameIndex, 16);
-BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad0, 20);
-BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad1, 24);
-BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad2, 28);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, cascadeIndex, 20);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad0, 24);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad1, 28);
 
 /** GiProbeClassifyUniforms (set 2, b0) — gi_probe_classify.comp.hlsl. */
 struct alignas(16) GiProbeClassifyUniforms {

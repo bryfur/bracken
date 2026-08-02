@@ -1,4 +1,5 @@
 #include "volumetric_fog.hpp"
+#include "bracken/render/gi/gi_bindings.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_pipeline.hpp"
@@ -98,7 +99,8 @@ SDL_GPUTexture* VolumetricFog::fog_texture() const {
 gpu::VolumetricFogUniforms VolumetricFog::build_uniforms(const ShadowMap& shadow_map,
                                                          const scene::CameraState& camera,
                                                          const EnvironmentState& env, bool god_rays_enabled,
-                                                         bool fog_enabled, float density_multiplier) {
+                                                         bool fog_enabled, float density_multiplier,
+                                                         const gi::GiBindings* gi) {
     gpu::VolumetricFogUniforms uniforms = {};
     if (camera.view_projection != cached_view_projection_) {
         cached_view_projection_ = camera.view_projection;
@@ -133,12 +135,24 @@ gpu::VolumetricFogUniforms VolumetricFog::build_uniforms(const ShadowMap& shadow
     uniforms.maxDist = env.fog_volumetric_end;
     uniforms.godRaysEnabled = god_rays_enabled ? 1.0f : 0.0f;
     uniforms.densityMultiplier = density_multiplier;
+    // R1c: both the probe field's fallback and the reference its per-channel
+    // gain is measured against, so the fog's ambient term is bit-identical to
+    // the pre-R1c one wherever the field has no answer.
+    uniforms.ambientSky = env.ambient_sky;
+    uniforms.ambientGround = env.ambient_ground;
+    if (gi != nullptr && gi->textures[0].texture != nullptr) {
+        uniforms.giCascadeBase[0] = gi->cascade_base[0];
+        uniforms.giCascadeBase[1] = gi->cascade_base[1];
+        uniforms.giCascadeBase[2] = gi->cascade_base[2];
+        uniforms.giEnabled = gi->enabled;
+    }
     return uniforms;
 }
 
 void VolumetricFog::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, SDL_GPUTexture* depth_texture,
                            const ShadowMap& shadow_map, const scene::CameraState& camera, const EnvironmentState& env,
-                           bool god_rays_enabled, bool fog_enabled, float density_multiplier) {
+                           bool god_rays_enabled, bool fog_enabled, float density_multiplier,
+                           const gi::GiBindings* gi) {
     BRACKEN_PROFILE_ZONE_COLOR("VolumetricFog::render", 0x16A085);
     if (!is_ready() || !cmd || !depth_texture) {
         return;
@@ -150,7 +164,7 @@ void VolumetricFog::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& reg
     }
 
     gpu::VolumetricFogUniforms uniforms =
-        build_uniforms(shadow_map, camera, env, god_rays_enabled, fog_enabled, density_multiplier);
+        build_uniforms(shadow_map, camera, env, god_rays_enabled, fog_enabled, density_multiplier, gi);
 
     // Begin render pass to fog texture
     SDL_GPUColorTargetInfo color_target = {};
@@ -166,13 +180,23 @@ void VolumetricFog::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& reg
     pipeline->bind(pass);
     SDL_PushGPUFragmentUniformData(cmd, 0, &uniforms, sizeof(uniforms));
 
-    // Bind depth texture (slot 0) and shadow atlas with raw sampler (slot 1)
-    SDL_GPUTextureSamplerBinding bindings[2] = {};
+    // Depth (slot 0), shadow atlas with the raw sampler (slot 1), and the
+    // probe field's three atlases (slots 2-4). The GI slots are declared
+    // unconditionally by the shader, so they are bound even with GI off —
+    // giEnabled is what decides whether they are read.
+    SDL_GPUTextureSamplerBinding bindings[5] = {};
     bindings[0].texture = depth_texture;
     bindings[0].sampler = linear_sampler_;
     bindings[1].texture = shadow_map.atlas_texture();
     bindings[1].sampler = shadow_map.shadow_sampler();
-    SDL_BindGPUFragmentSamplers(pass, 0, bindings, 2);
+    int binding_count = 2;
+    if (gi != nullptr && gi->textures[0].texture != nullptr) {
+        bindings[2] = gi->textures[0];
+        bindings[3] = gi->textures[1];
+        bindings[4] = gi->textures[2];
+        binding_count = 5;
+    }
+    SDL_BindGPUFragmentSamplers(pass, 0, bindings, static_cast<Uint32>(binding_count));
 
     SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
     SDL_EndGPURenderPass(pass);

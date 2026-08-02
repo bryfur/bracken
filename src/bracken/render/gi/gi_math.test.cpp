@@ -40,9 +40,44 @@ TEST(GiMath, GridAndAtlasDimensions) {
 
     EXPECT_EQ(PROBES_PER_ATLAS_ROW * ATLAS_ROWS, PROBES_PER_CASCADE);
     EXPECT_EQ(atlas_width(IRRADIANCE_PROBE_TEXELS), 2304);
-    EXPECT_EQ(atlas_height(IRRADIANCE_PROBE_TEXELS), 192);
+    EXPECT_EQ(atlas_band_height(IRRADIANCE_PROBE_TEXELS), 192);
     EXPECT_EQ(atlas_width(VISIBILITY_PROBE_TEXELS), 4608);
-    EXPECT_EQ(atlas_height(VISIBILITY_PROBE_TEXELS), 384);
+    EXPECT_EQ(atlas_band_height(VISIBILITY_PROBE_TEXELS), 384);
+
+    // R1c: one texture per quantity, every cascade banded into it.
+    EXPECT_EQ(ATLAS_ROWS_ALL_CASCADES, ATLAS_ROWS * CASCADE_COUNT);
+    EXPECT_EQ(atlas_height(IRRADIANCE_PROBE_TEXELS), 576);
+    EXPECT_EQ(atlas_height(VISIBILITY_PROBE_TEXELS), 1152);
+}
+
+TEST(GiMath, CascadeBandsTileTheAtlasWithoutOverlap) {
+    // The banding is what buys the forward shaders three sampler slots instead
+    // of nine, so "cascade c's tiles are disjoint from cascade c''s" is a
+    // correctness property of the whole consumption path, not a detail.
+    std::set<std::pair<int, int>> tiles;
+    for (int c = 0; c < CASCADE_COUNT; ++c) {
+        for (int slot = 0; slot < PROBES_PER_CASCADE; ++slot) {
+            const glm::ivec2 origin = probe_atlas_origin(slot, IRRADIANCE_PROBE_TEXELS, c);
+            EXPECT_GE(origin.y, c * atlas_band_height(IRRADIANCE_PROBE_TEXELS));
+            EXPECT_LT(origin.y, (c + 1) * atlas_band_height(IRRADIANCE_PROBE_TEXELS));
+            EXPECT_LT(origin.y, atlas_height(IRRADIANCE_PROBE_TEXELS));
+            EXPECT_TRUE(tiles.emplace(origin.x, origin.y).second)
+                << "cascade " << c << " slot " << slot << " collides with another band";
+        }
+    }
+    EXPECT_EQ(tiles.size(), static_cast<std::size_t>(PROBES_PER_CASCADE * CASCADE_COUNT));
+
+    // The one-texel planes use the same banding at a tile size of 1, which is
+    // what lets the CPU upload all three states as one contiguous plane.
+    for (int c = 0; c < CASCADE_COUNT; ++c) {
+        for (int slot : {0, 1, PROBES_PER_ATLAS_ROW, PROBES_PER_CASCADE - 1}) {
+            const glm::ivec2 t = probe_state_texel(slot, c);
+            EXPECT_EQ(t.x, slot % PROBES_PER_ATLAS_ROW);
+            EXPECT_EQ(t.y, slot / PROBES_PER_ATLAS_ROW + c * ATLAS_ROWS);
+            // Row-major linear index into the CPU mirror ProbeVolume uploads.
+            EXPECT_EQ(t.y * PROBES_PER_ATLAS_ROW + t.x, c * PROBES_PER_CASCADE + slot);
+        }
+    }
 }
 
 TEST(GiMath, CascadeSpacingDoubles) {
@@ -73,11 +108,11 @@ TEST(GiMath, ProbeIndexIsABijectionOntoTheAtlas) {
         EXPECT_GE(c.z, 0);
         EXPECT_LT(c.z, GRID_Z);
 
-        const glm::ivec2 origin = probe_atlas_origin(i, IRRADIANCE_PROBE_TEXELS);
+        const glm::ivec2 origin = probe_atlas_origin(i, IRRADIANCE_PROBE_TEXELS, 0);
         EXPECT_GE(origin.x, 0);
         EXPECT_LT(origin.x, atlas_width(IRRADIANCE_PROBE_TEXELS));
         EXPECT_GE(origin.y, 0);
-        EXPECT_LT(origin.y, atlas_height(IRRADIANCE_PROBE_TEXELS));
+        EXPECT_LT(origin.y, atlas_band_height(IRRADIANCE_PROBE_TEXELS));
         EXPECT_TRUE(tiles.emplace(origin.x, origin.y).second) << "two probes share atlas tile at " << i;
     }
     EXPECT_EQ(tiles.size(), static_cast<std::size_t>(PROBES_PER_CASCADE));
@@ -87,10 +122,10 @@ TEST(GiMath, PayloadTexelsStayInsideTheirTile) {
     // The border ring exists so a bilinear tap at the payload edge does not
     // reach the next probe. That only holds if the payload really is inset.
     for (int slot : {0, 1, PROBES_PER_ATLAS_ROW, PROBES_PER_CASCADE - 1}) {
-        const glm::ivec2 origin = probe_atlas_origin(slot, VISIBILITY_PROBE_TEXELS);
+        const glm::ivec2 origin = probe_atlas_origin(slot, VISIBILITY_PROBE_TEXELS, 1);
         for (int y = 0; y < VISIBILITY_PAYLOAD_TEXELS; ++y) {
             for (int x = 0; x < VISIBILITY_PAYLOAD_TEXELS; ++x) {
-                const glm::ivec2 t = probe_payload_texel(slot, VISIBILITY_PROBE_TEXELS, {x, y});
+                const glm::ivec2 t = probe_payload_texel(slot, VISIBILITY_PROBE_TEXELS, 1, {x, y});
                 EXPECT_GT(t.x, origin.x);
                 EXPECT_GT(t.y, origin.y);
                 EXPECT_LT(t.x, origin.x + VISIBILITY_PROBE_TEXELS - 1);
@@ -816,4 +851,311 @@ TEST(GiMath, UpdateSelectionIsDeterministicAndDuplicateFree) {
         return order;
     };
     EXPECT_EQ(run(), run());
+}
+
+// ---------------------------------------------------------------------------
+// R1c — the SAMPLER. The CPU mirror of shaders/gi_sample.hlsli.
+// ---------------------------------------------------------------------------
+//
+// These are the tests the shader cannot have. The consumption path's failure
+// modes are all continuity failures — a seam at a cascade boundary, a halo
+// where a probe was written off, a step where a cage crosses a cell — and every
+// one of them is invisible in a still frame and obvious in motion. Asserting
+// them numerically here is the only way to catch them before a player does.
+
+namespace {
+
+/// A field where every probe is usable, has no relocation offset, reports the
+/// same irradiance, and sees nothing (moments at the distance clamp, so
+/// Chebyshev never attenuates). The arithmetic baseline.
+struct UniformField {
+    glm::vec3 value{1.0f, 2.0f, 3.0f};
+    ProbeReading operator()(int cascade, const glm::ivec3&, int, const glm::vec3&) const {
+        ProbeReading r;
+        const float far = PROBE_VISIBILITY_DISTANCE_SCALE * cascade_spacing(cascade);
+        r.moments = {far, far * far};
+        r.irradiance = value;
+        return r;
+    }
+};
+
+/// Same, but a caller-chosen set of absolute coordinates is written off as
+/// sitting inside geometry, and each cascade answers with its own colour so the
+/// blend can be read off the result.
+struct BandedField {
+    /// Keyed by (cascade, x, y, z): the coarse lattices are SUBSETS of the fine
+    /// one, so a cage killed by absolute coordinate alone would take the
+    /// next-coarser cascade's cage with it and the handover under test would
+    /// never happen.
+    std::set<std::tuple<int, int, int, int>> dead;
+    std::array<glm::vec3, CASCADE_COUNT> per_cascade{glm::vec3(1.0f, 0.0f, 0.0f),
+                                                     glm::vec3(0.0f, 1.0f, 0.0f),
+                                                     glm::vec3(0.0f, 0.0f, 1.0f)};
+    ProbeReading operator()(int cascade, const glm::ivec3& a, int, const glm::vec3&) const {
+        ProbeReading r;
+        const float far = PROBE_VISIBILITY_DISTANCE_SCALE * cascade_spacing(cascade);
+        r.moments = {far, far * far};
+        r.irradiance = per_cascade[static_cast<std::size_t>(cascade)];
+        if (dead.count({cascade, a.x, a.y, a.z}) != 0) {
+            r.classification = PROBE_CLASS_INSIDE_GEOMETRY;
+        }
+        return r;
+    }
+};
+
+/// Cascade bases for a camera at the world origin — what ProbeVolume would
+/// report after one update() there.
+std::array<glm::ivec3, CASCADE_COUNT> bases_at(const glm::vec3& camera) {
+    std::array<glm::ivec3, CASCADE_COUNT> b{};
+    for (int c = 0; c < CASCADE_COUNT; ++c) {
+        b[static_cast<std::size_t>(c)] = cascade_base(camera, c);
+    }
+    return b;
+}
+
+constexpr glm::vec3 UP{0.0f, 1.0f, 0.0f};
+constexpr glm::vec3 SKY{0.2f, 0.4f, 0.9f};
+constexpr glm::vec3 GROUND{0.1f, 0.08f, 0.06f};
+
+} // namespace
+
+TEST(GiSample, AUniformFieldReproducesItsOwnValue) {
+    // Trilinear over eight identical probes, renormalised, must be exactly the
+    // probe value at ANY position inside the window — including positions that
+    // are not on the lattice. If it is not, the weights are not a partition.
+    const auto bases = bases_at(glm::vec3(0.0f));
+    const UniformField field;
+    for (const glm::vec3& p : {glm::vec3(0.0f), glm::vec3(37.0f, 12.0f, -91.0f),
+                               glm::vec3(-450.0f, 300.0f, 620.0f)}) {
+        const glm::vec3 got = sample_field(bases, p, UP, UP, SKY, GROUND, field);
+        EXPECT_NEAR(got.x, field.value.x, 1e-4f) << "at " << p.x << "," << p.y << "," << p.z;
+        EXPECT_NEAR(got.y, field.value.y, 1e-4f);
+        EXPECT_NEAR(got.z, field.value.z, 1e-4f);
+    }
+}
+
+TEST(GiSample, CascadeSelectionTakesTheFinestCascadeThatContainsThePoint) {
+    const auto bases = bases_at(glm::vec3(0.0f));
+    BandedField field;
+    // Near the camera every cascade contains the point, so cascade 0 answers
+    // alone and the coarser ones never get any weight.
+    const glm::vec3 near_result = sample_field(bases, glm::vec3(0.0f), UP, UP, SKY, GROUND, field);
+    EXPECT_NEAR(near_result.x, 1.0f, 1e-4f);
+    EXPECT_NEAR(near_result.y, 0.0f, 1e-4f);
+
+    // Cascade 0 reaches 24 * 150 = 3600 units across, centred, so ~+1600 on X
+    // is outside it but well inside cascade 1 (7200) — which must answer alone.
+    const glm::vec3 mid_result =
+        sample_field(bases, glm::vec3(1600.0f, 0.0f, 0.0f), UP, UP, SKY, GROUND, field);
+    EXPECT_NEAR(mid_result.x, 0.0f, 1e-4f);
+    EXPECT_NEAR(mid_result.y, 1.0f, 1e-4f);
+
+    // Past cascade 2's reach nothing answers and the hemisphere fallback — the
+    // engine's GI-off tier — takes the whole weight, so a pixel the field
+    // cannot cover looks exactly as it did before this phase.
+    const glm::vec3 far_result =
+        sample_field(bases, glm::vec3(50000.0f, 0.0f, 0.0f), UP, UP, SKY, GROUND, field);
+    const glm::vec3 hemisphere = glm::mix(GROUND, SKY, UP.y * 0.5f + 0.5f);
+    EXPECT_NEAR(far_result.x, hemisphere.x, 1e-5f);
+    EXPECT_NEAR(far_result.y, hemisphere.y, 1e-5f);
+    EXPECT_NEAR(far_result.z, hemisphere.z, 1e-5f);
+}
+
+TEST(GiSample, ACascadeStopsAnsweringExactlyWhereItsCageWouldLeaveTheWindow) {
+    // The margin is what keeps a trilinear tap from wrapping around the torus
+    // and reading the opposite side of the world. Walk out along +X until
+    // cascade 0 gives up, and check the last position it answered for still has
+    // its whole 8-tap cage inside the window.
+    const auto bases = bases_at(glm::vec3(0.0f));
+    const UniformField field;
+    const float sp = cascade_spacing(0);
+    float last_answering = 0.0f;
+    for (float x = 0.0f; x < 4000.0f; x += 1.0f) {
+        const CascadeSample s = sample_cascade(0, bases[0], glm::vec3(x, 0.0f, 0.0f), UP, UP, field);
+        if (s.confidence > 0.0f) {
+            last_answering = x;
+        } else {
+            break;
+        }
+    }
+    const glm::vec3 biased = sample_bias_position(glm::vec3(last_answering, 0.0f, 0.0f), UP, UP, 0);
+    const glm::vec3 local = biased / sp - glm::vec3(bases[0]);
+    EXPECT_GE(local.x, SAMPLE_CASCADE_MARGIN_PROBES);
+    EXPECT_LE(std::floor(local.x) + 1.0f, static_cast<float>(GRID_X - 1));
+}
+
+TEST(GiSample, DeadProbesAreExcludedAndTheSurvivorsRenormalise) {
+    // Half the cage written off must NOT halve the answer: the live weights are
+    // renormalised, so four survivors reporting the same value still report
+    // that value. Dividing by the full trilinear total instead would produce a
+    // dark halo around every wall the relocation pass gave up on.
+    const auto bases = bases_at(glm::vec3(0.0f));
+    const glm::vec3 P(37.0f, 12.0f, -91.0f);
+    BandedField field;
+    const CascadeSample all_live = sample_cascade(0, bases[0], P, UP, UP, field);
+    ASSERT_GT(all_live.confidence, 0.0f);
+
+    const glm::vec3 local = sample_bias_position(P, UP, UP, 0) / cascade_spacing(0) - glm::vec3(bases[0]);
+    const glm::ivec3 corner = bases[0] + glm::ivec3(static_cast<int>(std::floor(local.x)),
+                                                    static_cast<int>(std::floor(local.y)),
+                                                    static_cast<int>(std::floor(local.z)));
+    for (int i = 0; i < 8; i += 2) { // kill four of the eight
+        const glm::ivec3 a = corner + glm::ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        field.dead.insert({0, a.x, a.y, a.z});
+    }
+    const CascadeSample half_dead = sample_cascade(0, bases[0], P, UP, UP, field);
+    EXPECT_NEAR(half_dead.irradiance.x, all_live.irradiance.x, 1e-5f);
+    // What it DOES cost is confidence: less of the cage answered, so more of
+    // the result comes from the next-coarser cascade.
+    EXPECT_LT(half_dead.confidence, all_live.confidence + 1e-6f);
+
+    // All eight dead: the cascade abstains entirely rather than returning zero
+    // radiance, which is the difference between "ask someone else" and "black".
+    for (int i = 0; i < 8; ++i) {
+        const glm::ivec3 a = corner + glm::ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        field.dead.insert({0, a.x, a.y, a.z});
+    }
+    EXPECT_EQ(sample_cascade(0, bases[0], P, UP, UP, field).confidence, 0.0f);
+    const glm::vec3 blended = sample_field(bases, P, UP, UP, SKY, GROUND, field);
+    EXPECT_NEAR(blended.y, 1.0f, 1e-4f) << "cascade 1 should have taken over";
+}
+
+TEST(GiSample, ChebyshevOccludesPastTheMeanAndPassesInFrontOfIt) {
+    const float sp = cascade_spacing(0);
+    // A probe that consistently sees a wall 100 units away.
+    const float mean = 100.0f;
+    const float mean2 = mean * mean + 25.0f;
+    EXPECT_FLOAT_EQ(chebyshev_visibility(50.0f, mean, mean2, sp), 1.0f);
+    EXPECT_FLOAT_EQ(chebyshev_visibility(mean, mean, mean2, sp), 1.0f);
+    EXPECT_LT(chebyshev_visibility(400.0f, mean, mean2, sp), 0.05f);
+    // Monotonically non-increasing in distance, which is what makes it usable
+    // as a weight at all — a non-monotone occlusion term produces rings.
+    float previous = 1.0f;
+    for (float d = 0.0f; d < 1000.0f; d += 5.0f) {
+        const float v = chebyshev_visibility(d, mean, mean2, sp);
+        EXPECT_LE(v, previous + 1e-6f) << "at " << d;
+        previous = v;
+    }
+    // The variance floor is what keeps a texel that has only ever seen one
+    // distance from collapsing into a hard binary test that flickers as the ray
+    // set rotates.
+    EXPECT_GT(chebyshev_visibility(mean + 0.5f * sp, mean, mean * mean, sp), 0.0f);
+}
+
+TEST(GiSample, TheCascadeBlendIsContinuousAcrossABoundary) {
+    // NO VISIBLE SEAM AT A CASCADE BOUNDARY MEANS THE WEIGHTS ARE C0, and that
+    // is a numeric claim, so it is made numerically. Walk a fine line along +X
+    // straight through cascade 0's edge into cascade 1's interior, with each
+    // cascade answering a DIFFERENT colour so any discontinuity in the handover
+    // shows up at full contrast, and assert the frame-to-frame delta stays
+    // bounded by the step size.
+    const auto bases = bases_at(glm::vec3(0.0f));
+    BandedField field;
+    constexpr float STEP = 2.0f;
+    glm::vec3 previous = sample_field(bases, glm::vec3(0.0f), UP, UP, SKY, GROUND, field);
+    float worst = 0.0f;
+    bool saw_cascade0 = false;
+    bool saw_cascade1 = false;
+    bool saw_mixture = false;
+    for (float x = STEP; x <= 3400.0f; x += STEP) {
+        const glm::vec3 got = sample_field(bases, glm::vec3(x, 0.0f, 0.0f), UP, UP, SKY, GROUND, field);
+        worst = std::max(worst, glm::length(got - previous));
+        saw_cascade0 = saw_cascade0 || got.x > 0.99f;
+        saw_cascade1 = saw_cascade1 || got.y > 0.99f;
+        saw_mixture = saw_mixture || (got.x > 0.05f && got.y > 0.05f);
+        previous = got;
+    }
+    EXPECT_TRUE(saw_cascade0) << "the walk never started inside cascade 0";
+    EXPECT_TRUE(saw_cascade1) << "the walk never reached cascade 1 alone";
+    EXPECT_TRUE(saw_mixture) << "the handover was a step, not a blend";
+    // The fade band is one probe of cascade 0 = 150 units, over which the
+    // result travels a chromatic distance of sqrt(2); at 2 units per step that
+    // bounds a step at ~0.019. Ten times that is a generous ceiling that still
+    // fails loudly on any hard switch, which would jump the full sqrt(2).
+    EXPECT_LT(worst, 0.19f) << "cascade handover is discontinuous";
+}
+
+TEST(GiSample, TheSampleIsContinuousAcrossACellBoundary) {
+    // The other seam: the 8-tap cage changes membership every probe spacing.
+    // It stays continuous only because a probe leaving the cage does so with a
+    // trilinear factor of exactly zero — so make the probes disagree wildly and
+    // check the sample still cannot jump.
+    struct NoisyField {
+        ProbeReading operator()(int cascade, const glm::ivec3& a, int, const glm::vec3&) const {
+            ProbeReading r;
+            const float far = PROBE_VISIBILITY_DISTANCE_SCALE * cascade_spacing(cascade);
+            r.moments = {far, far * far};
+            const int h = (a.x * 73856093) ^ (a.y * 19349663) ^ (a.z * 83492791);
+            r.irradiance = glm::vec3(static_cast<float>((h >> 3) & 0xFF) / 255.0f);
+            return r;
+        }
+    } field;
+    const auto bases = bases_at(glm::vec3(0.0f));
+    constexpr float STEP = 1.0f;
+    glm::vec3 previous = sample_field(bases, glm::vec3(-600.0f, 0.0f, 0.0f), UP, UP, SKY, GROUND, field);
+    float worst = 0.0f;
+    for (float x = -600.0f + STEP; x <= 600.0f; x += STEP) {
+        const glm::vec3 got = sample_field(bases, glm::vec3(x, 0.0f, 0.0f), UP, UP, SKY, GROUND, field);
+        worst = std::max(worst, glm::length(got - previous));
+        previous = got;
+    }
+    // One step is 1/150th of a spacing, and the trilinear factor of the probe
+    // being swapped is zero at the crossing, so the bound is the Lipschitz
+    // constant of the interpolation alone: at most (max - min) / 150 per step
+    // in each channel, i.e. well under 0.05 for a sqrt(3)-long unit cube.
+    EXPECT_LT(worst, 0.05f) << "cell crossing is discontinuous";
+}
+
+TEST(GiSample, TheBiasPushesAlongTheNormalAndTowardTheCamera) {
+    // Both halves, and both scaled by the cascade's spacing rather than fixed —
+    // a coarse cascade's acceptable bias is proportionally larger.
+    const glm::vec3 P(10.0f, 20.0f, 30.0f);
+    const glm::vec3 N(0.0f, 1.0f, 0.0f);
+    const glm::vec3 V(1.0f, 0.0f, 0.0f);
+    for (int c = 0; c < CASCADE_COUNT; ++c) {
+        const glm::vec3 biased = sample_bias_position(P, N, V, c);
+        const float sp = cascade_spacing(c);
+        EXPECT_FLOAT_EQ(biased.y - P.y, SAMPLE_NORMAL_BIAS_FRACTION * sp);
+        EXPECT_FLOAT_EQ(biased.x - P.x, SAMPLE_VIEW_BIAS_FRACTION * sp);
+        EXPECT_FLOAT_EQ(biased.z, P.z);
+    }
+}
+
+TEST(GiSample, RelocatedProbesAreSampledWhereTheyActuallySat) {
+    // The R1c contract from probe_volume.hpp: a probe nudged out of a wall is
+    // not at its lattice position, and a sampler that ignores the offset reads
+    // it as if it were. Prove the offset reaches the weights by giving ONE
+    // probe all the radiance and then pushing it past the distance its own
+    // visibility moments call occluded — its weight must collapse, which cannot
+    // happen unless the offset is being applied to its world position.
+    // The probe the shading normal actually points at: N is +Y, so the cage
+    // corner ABOVE the sample point is the one carrying the weight.
+    static constexpr glm::ivec3 TARGET{0, 1, 0};
+    struct OffsetField {
+        glm::vec3 offset{0.0f};
+        ProbeReading operator()(int cascade, const glm::ivec3& a, int, const glm::vec3&) const {
+            (void)cascade;
+            ProbeReading r;
+            // A wall 120 units out in every direction. The biased sample point
+            // sits ~70 units under probe (0,1,0), inside that; pushing that
+            // probe up by the maximum relocation puts it ~138 units away, i.e.
+            // outside, which is the whole point of the test.
+            r.moments = {120.0f, 120.0f * 120.0f};
+            const bool target = a == TARGET;
+            r.irradiance = target ? glm::vec3(1.0f) : glm::vec3(0.0f);
+            if (target) {
+                r.offset = offset;
+            }
+            return r;
+        }
+    } field;
+    const auto bases = bases_at(glm::vec3(0.0f));
+    const glm::vec3 P(5.0f, 5.0f, 5.0f);
+    const CascadeSample unmoved = sample_cascade(0, bases[0], P, UP, UP, field);
+    ASSERT_GT(unmoved.irradiance.x, 0.3f) << "the probe above should dominate the cage";
+
+    field.offset = glm::vec3(0.0f, PROBE_MAX_OFFSET_FRACTION * cascade_spacing(0), 0.0f);
+    const CascadeSample moved = sample_cascade(0, bases[0], P, UP, UP, field);
+    EXPECT_LT(moved.irradiance.x, unmoved.irradiance.x * 0.5f)
+        << "the relocation offset never reached the weights";
 }

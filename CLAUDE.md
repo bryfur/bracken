@@ -83,9 +83,10 @@ Read the doc that matches the task before diving into code:
   the previous frame's rendering). Read §7
   (synchronization design) before touching any concurrency code.
 - [docs/rt_lighting_plan.md](docs/rt_lighting_plan.md) — **the plan of record
-  for the ray-traced lighting system** (no phase landed yet): probe-field GI,
-  froxel-reservoir local-light shadows, hit-lighting upgrades, screen-probe
-  gather, denoiser evolution, scalability tiers. Read it before touching
+  for the ray-traced lighting system** (R0 foundations and R1 probe-field GI
+  have landed; R2 onward is proposal): probe-field GI, froxel-reservoir
+  local-light shadows, hit-lighting upgrades, screen-probe gather, denoiser
+  evolution, scalability tiers. Read it before touching
   anything under `render/raytracing/` or the `rt_*` shaders.
 - [docs/skinned_mesh_format.md](docs/skinned_mesh_format.md) — the `.glb`
   authoring contract (bones, channels, clip naming, IK bone names).
@@ -113,7 +114,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) over `pipeline_catalog.hpp` (one `constexpr` row per `PipelineType`: shaders, resources, vertex layout, target, depth/blend state), `gpu_uniforms.hpp` (CPU↔GPU contract) |
 | `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO, TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas |
 | `render/raytracing/` | `render::rt` | software BVH (32-byte nodes, binned SAH, two-level BLAS/TLAS) + `RtScene`; `render/rt_renderer.hpp` drives the traced passes and their denoisers. **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
-| `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for the addressing R1b's shaders will mirror. **Structure only so far** — it allocates and scrolls, nothing traces into it and nothing samples it. Off by default (`gi_mode`) |
+| `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror — addressing, ray directions, the blend curve, and the sampler's cascade/weight math. **Complete as of R1c**: the field traces and accumulates itself, and `shaders/gi_sample.hlsli` replaces the DIFFUSE half of the ambient term in every scene fragment shader (three banded atlases, three sampler slots) plus the volumetric fog's in-scatter. Off by default (`gi_mode`); GI on builds the ray-tracing acceleration structure with attributes |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
 | `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
 | `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
@@ -439,6 +440,19 @@ evidence that no RT-series commit moved the RT-off path.
 | `--smoke 30` (RT off) | `86.6 / 44.9` |
 | `--smoke 30 PLAYGROUND_AO=0` | `87.0 / 44.5` |
 | `--smoke 30 PLAYGROUND_AO=2` | `86.4 / 45.0` |
+| `--smoke 30 PLAYGROUND_GI=probes` | `84.7 / 46.6` |
+
+**The GI row is the only one that is not RT-off, and it is deliberately
+different.** Phase R1c made the probe field light the frame, so a GI-pinned run
+*must* diverge — lower mean and wider histogram, because surfaces that cannot
+see the sky stop being lit as though they could. The RT-off rows are unchanged
+by R1c and are the regression gate; the GI row is the GI gate, and it reproduced
+identically over three consecutive runs.
+
+Backend caveat: the three RT-off rows above were measured on **Metal**; the GI
+row was measured on **Vulkan**, where the plain `--smoke 30` row reproduces as
+`86.5 / 44.9` — 0.1 off the Metal figure. Compare like with like, and judge
+smoke health from the diagnostics line first.
 
 Benchmarks: `build/src/bracken/bracken_benchmarks` (add
 `--benchmark_filter=<regex>` for a subset). Numbers from a default configure are

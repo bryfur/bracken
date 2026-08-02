@@ -137,24 +137,21 @@ struct ProbeUpdateParams {
  * irradiance + visibility probes, and the CPU addressing that says which texel
  * belongs to which point in the world.
  *
- * AFTER R1a THIS LIGHTS NOTHING. It allocates its atlases, snaps each cascade
- * to whole probe-spacing steps as the camera moves, and marks the probes that
- * entered the window as uninitialized. No ray is cast, no probe is shaded, and
- * no shader samples any of these textures — that is R1b (update/trace) and R1c
- * (consumption in the forward pass and the fog march). Splitting it this way
- * keeps the structure reviewable on its own: the addressing is the part that is
- * easy to get subtly wrong and impossible to see wrong once radiance is on top
- * of it.
- *
- * PER CASCADE, three 2D textures over the tiling defined in `gi_math.hpp`:
+ * FOUR 2D TEXTURES FOR THE WHOLE FIELD, each holding every cascade as a band of
+ * rows (`gi_math.hpp`, ATLAS_ROWS_ALL_CASCADES) over the tiling defined there:
  *   - irradiance, RGBA16F, 8x8 texels/probe (6x6 payload + 1 border ring)
- *     -> 2304 x 192, 3.375 MB
+ *     -> 2304 x 576, 10.125 MB
  *   - visibility, RG16F, 16x16 texels/probe (14x14 payload + border), storing
  *     mean and mean-squared ray distance for the Chebyshev leak test
- *     -> 4608 x 384, 6.75 MB
- *   - probe state, R8_UINT, one texel/probe -> 288 x 24, 6.75 KB
- * i.e. ~10.13 MB per cascade, ~30.4 MB for the field. That is the whole memory
- * story; `docs/rt_lighting_plan.md` §6 budgets ~35 MB for it.
+ *     -> 4608 x 1152, 20.25 MB
+ *   - probe offset, RGBA16F, one texel/probe -> 288 x 72, 162 KB
+ *   - probe state, R8_UINT, one texel/probe -> 288 x 72, 20.25 KB
+ * i.e. ~30.6 MB for the field, unchanged by the banding (the same texels, in
+ * three textures instead of nine). `docs/rt_lighting_plan.md` §6 budgets ~35 MB.
+ *
+ * Banding is a CONSUMPTION decision: the forward shaders sample the first three
+ * of those, and per-cascade textures would have cost them nine sampler slots
+ * where they have three to spare. See gi_math.hpp for the full argument.
  *
  * Tier: main-thread (owns GPU resources, records copy passes).
  */
@@ -200,23 +197,42 @@ public:
 
     [[nodiscard]] const GiStats& stats() const noexcept { return stats_; }
 
-    /// Atlases, for the update passes and (from R1c) the forward pass. Null
-    /// before init() or out of range.
-    [[nodiscard]] gpu::GPUTexture* irradiance(int cascade) const;
-    [[nodiscard]] gpu::GPUTexture* visibility(int cascade) const;
-    [[nodiscard]] gpu::GPUTexture* probe_state(int cascade) const;
+    /**
+     * The three atlases the forward pass and the fog march sample, and the
+     * fourth the update passes need. Each holds EVERY cascade, banded — see
+     * `gi_math.hpp`'s ATLAS_ROWS_ALL_CASCADES. Null before init().
+     *
+     * `irradiance` and `visibility` want a LINEAR clamp sampler (the border
+     * ring exists so a bilinear tap at a payload edge wraps the octahedron);
+     * `probe_offset` and `probe_state` are one texel per probe and want a
+     * POINT sampler or a Load.
+     */
+    [[nodiscard]] gpu::GPUTexture* irradiance() const { return irradiance_.get(); }
+    [[nodiscard]] gpu::GPUTexture* visibility() const { return visibility_.get(); }
+    [[nodiscard]] gpu::GPUTexture* probe_state() const { return state_.get(); }
     /**
      * Per-probe relocation offset (xyz, world units) + classification verdict
      * (w, one of the PROBE_CLASS_* values). RGBA16F, one texel per probe.
      *
-     * R1c CONTRACT: a probe's irradiance describes the world at
-     * `lattice position + offset.xyz`, not at its lattice position. A sampler
+     * R1c CONTRACT, both halves. A probe's irradiance describes the world at
+     * `lattice position + offset.xyz`, not at its lattice position: a sampler
      * that ignores this reads a probe that was nudged out of a wall as if it
-     * were still in it — which is precisely the leak the nudge existed to
-     * prevent. It must also drop probes whose `w` is
-     * PROBE_CLASS_INSIDE_GEOMETRY from the trilinear cage.
+     * were still in it, which is precisely the leak the nudge existed to
+     * prevent. And `w == PROBE_CLASS_INSIDE_GEOMETRY` is the ONLY "do not use
+     * this probe" signal a consumer gets — it covers both "buried" and "never
+     * filled", because init() seeds the whole plane with it. See gi_math.hpp.
      */
-    [[nodiscard]] gpu::GPUTexture* probe_offset(int cascade) const;
+    [[nodiscard]] gpu::GPUTexture* probe_offset() const { return offset_.get(); }
+
+    /// The bilinear clamp sampler the atlases want. Null before init().
+    [[nodiscard]] SDL_GPUSampler* linear_sampler() const { return linear_clamp_sampler_; }
+    /// The point clamp sampler the per-probe planes want. Null before init().
+    [[nodiscard]] SDL_GPUSampler* point_sampler() const { return point_clamp_sampler_; }
+
+    /// Absolute lattice coordinate of each cascade's (0,0,0) corner probe —
+    /// what a consumer needs to turn a world position into probe space.
+    /// Unplaced cascades report their last base (zero before the first update).
+    [[nodiscard]] std::array<glm::ivec3, CASCADE_COUNT> cascade_bases() const;
 
     /// CPU-side scroll state, for tests and the dev overlay.
     [[nodiscard]] const ProbeCascade& cascade(int index) const;
@@ -224,10 +240,6 @@ public:
 private:
     struct Cascade {
         ProbeCascade cpu;
-        std::unique_ptr<gpu::GPUTexture> irradiance;
-        std::unique_ptr<gpu::GPUTexture> visibility;
-        std::unique_ptr<gpu::GPUTexture> state;
-        std::unique_ptr<gpu::GPUTexture> offset;
     };
 
     /// Record one cascade's four dispatches. Returns probes traced.
@@ -239,6 +251,16 @@ private:
 
     gpu::GPUDevice* device_ = nullptr;
     std::array<Cascade, CASCADE_COUNT> cascades_;
+    /// ONE texture each, all cascades banded (gi_math.hpp).
+    std::unique_ptr<gpu::GPUTexture> irradiance_;
+    std::unique_ptr<gpu::GPUTexture> visibility_;
+    std::unique_ptr<gpu::GPUTexture> state_;
+    std::unique_ptr<gpu::GPUTexture> offset_;
+    /// CPU mirror of the whole banded state plane. The scroll re-uploads all of
+    /// it whenever ANY cascade's window moved: it is 20.25 KB, which is the
+    /// worst case R1a already budgeted for (three cascades scrolling at once),
+    /// and one whole-texture upload is what `GPUTexture::upload` offers.
+    std::vector<std::uint8_t> state_mirror_;
     bool ready_ = false;
     GiStats stats_{};
 
@@ -246,8 +268,12 @@ private:
     /// deterministic, and the only clock either depends on.
     std::uint64_t frame_counter_ = 0;
 
-    /// Bilinear clamp, for the previous-frame irradiance the bounce samples.
+    /// Bilinear clamp, for the previous-frame irradiance the bounce samples and
+    /// for every consumer of the octahedral payloads.
     SDL_GPUSampler* linear_clamp_sampler_ = nullptr;
+    /// Nearest clamp, for the one-texel-per-probe planes. A linear tap on those
+    /// would blend two unrelated probes' offsets.
+    SDL_GPUSampler* point_clamp_sampler_ = nullptr;
 
     /// Per-ray radiance + signed distance, sized for the largest single-cascade
     /// turn at any quality so a quality change never reallocates. Reused by

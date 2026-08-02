@@ -1,5 +1,6 @@
 #include "grass_renderer.hpp"
 #include "bracken/contracts/frustum.hpp"
+#include "bracken/render/gi/gi_bindings.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/core/jobs/job_system.hpp"
@@ -329,7 +330,8 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
                            const SDL_GPUTextureSamplerBinding* ao_binding, glm::vec2 ao_texel, bool depth_equal,
                            const SDL_GPUTextureSamplerBinding* ibl_bindings, bool ibl_enabled,
                            const SDL_GPUTextureSamplerBinding* rt_shadow_binding, bool rt_shadows_enabled,
-                           const SDL_GPUTextureSamplerBinding* local_shadow_binding) {
+                           const SDL_GPUTextureSamplerBinding* local_shadow_binding,
+                           const gi::GiBindings* gi) {
     BRACKEN_PROFILE_ZONE_COLOR("GrassRenderer::render", 0xC0392B);
     if (!initialized_ || !pipeline_registry_ || !pass || !cmd) {
         return;
@@ -383,6 +385,15 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
     fu.ibl_enabled = (ibl_enabled && ibl_bindings) ? 1.0f : 0.0f;
     fu.rt_shadow_enabled =
         (rt_shadows_enabled && rt_shadow_binding) ? 1.0f : 0.0f;
+    // Probe-field GI (R1c): the caller's one snapshot of the field. Gated on
+    // the bindings actually being there for the same reason ibl_enabled is —
+    // a flag without its textures samples an undefined descriptor.
+    if (gi != nullptr && gi->textures[0].texture != nullptr) {
+        fu.gi_cascade_base[0] = gi->cascade_base[0];
+        fu.gi_cascade_base[1] = gi->cascade_base[1];
+        fu.gi_cascade_base[2] = gi->cascade_base[2];
+        fu.gi_enabled = gi->enabled;
+    }
     SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
 
     // Vertex samplers: slot 0 = heightmap, slot 1 = splatmap (both CLAMP).
@@ -425,8 +436,13 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
 
     // Fragment sampler slot 7: local (point/spot) shadow atlas + comparison
     // sampler.
+    // Probe-field GI atlases at 7-9; the local-shadow atlas keeps its contract
+    // of sitting at this shader's LAST sampler slot, now 10.
+    if (gi != nullptr && gi->textures[0].texture != nullptr) {
+        SDL_BindGPUFragmentSamplers(pass, 7, gi->textures.data(), 3);
+    }
     if (local_shadow_binding) {
-        SDL_BindGPUFragmentSamplers(pass, 7, local_shadow_binding, 1);
+        SDL_BindGPUFragmentSamplers(pass, 10, local_shadow_binding, 1);
     }
 
     if (cluster_light_data_ && cluster_offsets_ && cluster_indices_ && cluster_params_) {

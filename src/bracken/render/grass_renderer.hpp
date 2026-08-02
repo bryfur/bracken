@@ -24,6 +24,11 @@ class JobSystem;
 
 namespace bracken::render {
 
+namespace gi {
+struct GiBindings;
+} // namespace gi
+
+
 namespace gpu = bracken::gpu;
 
 /**
@@ -114,10 +119,19 @@ struct alignas(16) GrassLightingUniforms {
     float ibl_enabled = 0.0f;    // offset 112 — 1 = sky IBL ambient (samplers 3-5), 0 = hemisphere
     float rt_shadow_enabled = 0.0f; // offset 116 — 1 = traced sun visibility replaces CSM
     float _pad_ibl[2] = {0.0f, 0.0f};
+    /// Probe-field GI (render/gi/), R1c — see
+    /// gpu::ModelLightingUniforms::giCascadeBase for the full contract.
+    glm::ivec4 gi_cascade_base[3] = {}; // offset 128
+    float gi_enabled = 0.0f;            // offset 176
+    float _gi_pad0 = 0.0f;
+    float _gi_pad1 = 0.0f;
+    float _gi_pad2 = 0.0f;
 };
 
 // Layout pins against grass.frag.hlsl GrassLightingUniforms.
-static_assert(sizeof(GrassLightingUniforms) == 128, "must match grass.frag.hlsl GrassLightingUniforms (128 B)");
+static_assert(sizeof(GrassLightingUniforms) == 192, "must match grass.frag.hlsl GrassLightingUniforms (192 B)");
+static_assert(offsetof(GrassLightingUniforms, gi_cascade_base) == 128);
+static_assert(offsetof(GrassLightingUniforms, gi_enabled) == 176);
 static_assert(offsetof(GrassLightingUniforms, camera_pos) == 0);
 static_assert(offsetof(GrassLightingUniforms, fog_start) == 12);
 static_assert(offsetof(GrassLightingUniforms, fog_color_horizon) == 16);
@@ -187,9 +201,15 @@ public:
     /// prefiltered specular cube, BRDF LUT — fragment slots 3-5; the slots
     /// must always be bound, with cube-typed dummies when IBL is off) and
     /// `ibl_enabled` sets the shader's iblEnabled flag.
-    /// `rt_shadow_binding` is the ray-traced sun visibility mask at slot 6;
+    /// `rt_shadow_binding` is the ray-traced sun visibility mask at slot 6.
+    /// `gi` is the probe field's three atlas bindings (slots 7-9) + per-cascade window
+    /// corners for this frame (render/gi/gi_bindings.hpp), or null when the
+    /// caller has no field. The slots are declared unconditionally by the
+    /// fragment shader, so a null here leaves them unbound — which SDL3 GPU
+    /// leaves undefined — and callers must pass the dummy-filled snapshot
+    /// `SceneRenderer::refresh_gi_bindings()` always produces.
     /// `local_shadow_binding` is the local (point/spot) shadow atlas +
-    /// comparison sampler at slot 7 (the shader's last sampler; sampled only
+    /// comparison sampler at slot 10 (the shader's last sampler; sampled only
     /// for lights with shadow_slot >= 0).
     void render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view, const glm::mat4& projection,
                 const glm::vec3& camera_pos, const glm::vec3& light_dir,
@@ -198,7 +218,8 @@ public:
                 bool depth_equal = false,
                 const SDL_GPUTextureSamplerBinding* ibl_bindings = nullptr, bool ibl_enabled = false,
                 const SDL_GPUTextureSamplerBinding* rt_shadow_binding = nullptr, bool rt_shadows_enabled = false,
-                const SDL_GPUTextureSamplerBinding* local_shadow_binding = nullptr);
+                const SDL_GPUTextureSamplerBinding* local_shadow_binding = nullptr,
+                const gi::GiBindings* gi = nullptr);
 
     /// Depth-prepass draw (velocity + depth, DepthPrepassGrass pipeline).
     /// Must use the SAME per-frame state as render() (same time/wind/chunks)

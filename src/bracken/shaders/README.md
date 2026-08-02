@@ -139,14 +139,21 @@ valid and the shaders branch to the hemisphere `ambientPBR` fallback.
 The very LAST sampler slot of every scene fragment shader is the LOCAL
 (point/spot) shadow atlas + `LESS_OR_EQUAL` comparison sampler, declared by
 `cluster_lighting.hlsli` at `CLUSTER_SSBO_BINDING_BASE - 1` (fragment sampler
-counts: model/instanced 12, terrain 10, grass 8). The slot below it is
+counts: model/instanced 15, terrain 13, grass 11). The THREE slots below it
+are the probe field's atlases (model/instanced 11–13, terrain 9–11, grass
+7–9): irradiance and visibility with a LINEAR clamp sampler, the per-probe
+metadata plane with a POINT one, read by `gi_sample.hlsli` and gated by the
+`giEnabled` uniform. All three cascades live in one texture each (banded rows
+— `render/gi/gi_math.hpp`), which is why the field costs three slots and not
+nine. Below THOSE is
 `rtShadowTexture` (model/instanced 10, terrain 8, grass 6), the R8 ray-traced
 sun-visibility mask — sampled with a NORMALIZED UV because it lives at the
 traced pass's own resolution, and bound to the 1x1 white dummy (= fully lit)
 when ray tracing is off. It used to be multiplexed into `screenAOTexture`'s
 G channel on the belief that a 12th sampler failed DXC legalization; it does
-not (12 compiles, verified to 17), and the packing zeroed the ambient term
-scene-wide whenever AO was off. Cluster lights whose
+not (12 compiles, verified to 17 — which is the headroom the three GI slots
+were spent out of), and the packing zeroed the ambient term scene-wide
+whenever AO was off. Cluster lights whose
 `shadow_slot >= 0` sample it inside `accumulateClusterLights` — point lights
 pick one of their 6 face tiles by the dominant axis of light→fragment
 (`localShadowCubeFace`; CPU mirror `lighting::local_shadow_cube_face`), then
@@ -335,7 +342,16 @@ ray directions and their R3/Shoemake per-frame rotation, and the
 change-adaptive blend curve — every function a transliteration of
 `render/gi/gi_math.hpp`, which is the source of truth and is tested with no GPU;
 binding-free by construction, so unlike `rt_trace.hlsli` it can be included
-anywhere), `rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
+anywhere), `gi_sample.hlsli` (the CONSUMPTION half of the probe field:
+DDGI-style sample bias, cascade selection with a half-spacing margin and a
+one-probe fade band, the 8-probe trilinear gather with backface, Chebyshev and
+relocation weights, the coarser-cascade blend and the hemisphere fallback,
+plus `giSampleVolume` for participating media — a transliteration of the
+`SAMPLE_*` block and `sample_field()` in `render/gi/gi_math.hpp`. Unlike
+`gi_probe.hlsli` it NAMES resources — `giIrradianceAtlas`, `giVisibilityAtlas`,
+`giProbeMeta` and their samplers, plus the `giCascadeBase[]`/`giEnabled`
+cbuffer members — so the including shader owns their slots and must declare
+them first, exactly like `cluster_lighting.hlsli`), `rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
 GGX-VNDF sampling, the packed visibility-tile helpers), `rt_trace.hlsli` (the
 software two-level BVH: `BvhNodeGpu`/`BvhTriangle`/`TlasInstance`, `slabTest`,
 `octDecode`, the any-hit `blasOccluded`/`sceneOccluded` walk and the

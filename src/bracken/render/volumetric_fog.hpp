@@ -12,6 +12,11 @@
 
 namespace bracken::render {
 
+namespace gi {
+struct GiBindings;
+} // namespace gi
+
+
 namespace gpu = bracken::gpu;
 
 /**
@@ -66,7 +71,8 @@ public:
      */
     void render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, SDL_GPUTexture* depth_texture,
                 const ShadowMap& shadow_map, const scene::CameraState& camera, const EnvironmentState& env,
-                bool god_rays_enabled = true, bool fog_enabled = true, float density_multiplier = 1.0f);
+                bool god_rays_enabled = true, bool fog_enabled = true, float density_multiplier = 1.0f,
+                const gi::GiBindings* gi = nullptr);
 
     /**
      * Build the uniform block render() pushes. Pure CPU (no GPU state
@@ -74,7 +80,7 @@ public:
      */
     gpu::VolumetricFogUniforms build_uniforms(const ShadowMap& shadow_map, const scene::CameraState& camera,
                                               const EnvironmentState& env, bool god_rays_enabled, bool fog_enabled,
-                                              float density_multiplier);
+                                              float density_multiplier, const gi::GiBindings* gi = nullptr);
 
     /**
      * Get the fog result texture for the composite pass.

@@ -25,6 +25,11 @@
 #define GI_PROBES_PER_CASCADE (GI_GRID_X * GI_GRID_Y * GI_GRID_Z)
 #define GI_PROBES_PER_ATLAS_ROW (GI_GRID_X * GI_GRID_Y)
 #define GI_ATLAS_ROWS GI_GRID_Z
+// Every atlas holds all three cascades, stacked: cascade c occupies rows
+// [c * GI_ATLAS_ROWS, (c+1) * GI_ATLAS_ROWS). See gi_math.hpp's
+// ATLAS_ROWS_ALL_CASCADES for why (three sampler slots in the forward pass
+// instead of nine).
+#define GI_ATLAS_ROWS_ALL (GI_ATLAS_ROWS * GI_CASCADE_COUNT)
 
 #define GI_BASE_PROBE_SPACING 150.0
 
@@ -73,15 +78,19 @@ int3 giWrapCoord(int3 absolute) {
 
 int giWrappedProbeIndex(int3 absolute) { return giProbeIndex(giWrapCoord(absolute)); }
 
-/// Top-left texel of a slot's tile, BORDER INCLUDED.
-int2 giProbeAtlasOrigin(int slot, int probeTexels) {
+/// Top-left texel of a slot's tile, BORDER INCLUDED, in cascade `cascade`'s band.
+int2 giProbeAtlasOrigin(int slot, int probeTexels, int cascade) {
     return int2((slot % GI_PROBES_PER_ATLAS_ROW) * probeTexels,
-                (slot / GI_PROBES_PER_ATLAS_ROW) * probeTexels);
+                (slot / GI_PROBES_PER_ATLAS_ROW + cascade * GI_ATLAS_ROWS) * probeTexels);
 }
 
-/// One texel of the probe-state plane (one texel per probe, no border).
-int2 giProbeStateTexel(int slot) {
-    return int2(slot % GI_PROBES_PER_ATLAS_ROW, slot / GI_PROBES_PER_ATLAS_ROW);
+/// One texel of the per-probe planes (probe state, probe offset): the same
+/// banding at a tile size of 1.
+int2 giProbeStateTexel(int slot, int cascade) { return giProbeAtlasOrigin(slot, 1, cascade); }
+
+/// Texel dimensions of a banded atlas with `probeTexels` per probe.
+float2 giAtlasSize(int probeTexels) {
+    return float2(GI_PROBES_PER_ATLAS_ROW * probeTexels, GI_ATLAS_ROWS_ALL * probeTexels);
 }
 
 float giCascadeSpacing(int cascade) { return GI_BASE_PROBE_SPACING * float(1 << cascade); }

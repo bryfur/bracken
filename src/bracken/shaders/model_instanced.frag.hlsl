@@ -61,6 +61,16 @@ cbuffer LightingUniforms {
     // zero at rtReflectionMaxRoughness. See reflection_gate.hlsli.
     float rtReflectionFadeStart;
     float _rtPad2;
+    // Probe-field GI (render/gi/), R1c. giCascadeBase is
+    // `render::gi::cascade_base()` of the position ProbeVolume was scrolled
+    // with — passed rather than re-derived from cameraPos so a shader and the
+    // CPU can never disagree about which probe answers for which point in the
+    // world. giEnabled gates every tap; 0 restores the pre-R1c ambient exactly.
+    int4 giCascadeBase[3];
+    float giEnabled;
+    float _giPad0;
+    float _giPad1;
+    float _giPad2;
 };
 
 [[vk::binding(1, 3)]]
@@ -142,14 +152,44 @@ Texture2D<float> rtShadowTexture;
 [[vk::combinedImageSampler]][[vk::binding(10, 2)]]
 SamplerState rtShadowSampler;
 
+// ---------------------------------------------------------------------------
+// Probe-field GI (render/gi/) — the three atlases gi_sample.hlsli reads.
+// ---------------------------------------------------------------------------
+// Every cascade is BANDED into one texture each, which is why the field costs
+// three sampler slots here and not nine (gi_math.hpp explains the trade). The
+// first two are octahedral payloads and want a LINEAR clamp sampler — their
+// one-texel border rings exist so a bilinear tap at a payload edge wraps the
+// octahedron. The third is one texel per probe and is read with Load(), never
+// filtered: a linear tap would blend two unrelated probes' relocation offsets
+// into a position that is neither.
+//
+// Always bound, like the IBL and AO slots and for the same reason: SDL3 GPU
+// leaves an unbound fragment sampler descriptor undefined, so dummies stand in
+// when GI is off and `giEnabled` is what decides whether anything is read.
+[[vk::combinedImageSampler]][[vk::binding(11, 2)]]
+Texture2D<float4> giIrradianceAtlas;
+[[vk::combinedImageSampler]][[vk::binding(11, 2)]]
+SamplerState giIrradianceAtlasSampler;
+
+[[vk::combinedImageSampler]][[vk::binding(12, 2)]]
+Texture2D<float2> giVisibilityAtlas;
+[[vk::combinedImageSampler]][[vk::binding(12, 2)]]
+SamplerState giVisibilityAtlasSampler;
+
+[[vk::combinedImageSampler]][[vk::binding(13, 2)]]
+Texture2D<float4> giProbeMeta;
+[[vk::combinedImageSampler]][[vk::binding(13, 2)]]
+SamplerState giProbeMetaSampler;
+
 #include "shadow_common.hlsli"
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
 #include "reflection_gate.hlsli"
-// Cluster SSBOs follow this shader's 12 fragment samplers in set 2 (slots
-// 0-10 above + the local-shadow atlas at 11, declared by the include).
-#define CLUSTER_SSBO_BINDING_BASE 12
+// Cluster SSBOs follow this shader's 15 fragment samplers in set 2 (slots
+// 0-13 above + the local-shadow atlas at 14, declared by the include).
+#define CLUSTER_SSBO_BINDING_BASE 15
+#include "gi_sample.hlsli"
 #include "cluster_lighting.hlsli"
 
 float4 PSMain(PSInput input) : SV_Target {
@@ -232,14 +272,30 @@ float4 PSMain(PSInput input) : SV_Target {
         1.0 - rtReflectionWeight(roughness, rtReflectionFadeStart, rtReflectionMaxRoughness);
 
     float ambientLift = lerp(ambientStrength, 1.0, shadow);
+    // Probe-field GI (R1c, render/gi/ + gi_sample.hlsli). It replaces the
+    // DIFFUSE half of whichever ambient branch runs below — ambientIBL's
+    // irradiance-cube tap or ambientPBR's hemisphere gradient — and leaves the
+    // SPECULAR half exactly as it was; R4 is what changes that, not this. The
+    // same combined AO and the same ambient lift multiply it as multiply the
+    // term it replaces, which is the lighting-quantity ledger in
+    // docs/rt_lighting_plan.md §4. giEnabled == 0 skips every tap and the
+    // ambient term is bit-identical to the pre-R1c image.
+    float3 giIrradiance = float3(0, 0, 0);
+    if (giEnabled > 0.5) {
+        giIrradiance = giSampleDiffuse(input.fragPos, N, V, ambientSky, ambientGround);
+    }
     float3 ambient;
     if (iblEnabled > 0.5) {
         ambient = ambientIBL(N, N_geo, V, baseColor.rgb, metallic, roughness, aoCombined, ambientLift,
                              iblIrradianceMap, iblIrradianceSampler, iblSpecularMap, iblSpecularSampler,
-                             iblBrdfLut, iblBrdfLutSampler, iblSpecularScale);
+                             iblBrdfLut, iblBrdfLutSampler, iblSpecularScale, giIrradiance, giEnabled);
     } else {
         ambient = ambientPBR(N, V, baseColor.rgb, metallic, roughness, aoCombined,
-                             ambientSky * ambientLift, ambientGround * ambientLift);
+                             ambientSky * ambientLift, ambientGround * ambientLift,
+                             // Pre-scaled by the lift, because the hemisphere
+                             // colours above are. ambientIBL's override is not:
+                             // that function applies ao * lift at the end.
+                             giIrradiance * ambientLift, giEnabled);
     }
 
     float3 result = direct + ambient;

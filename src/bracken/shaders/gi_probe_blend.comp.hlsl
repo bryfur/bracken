@@ -15,8 +15,8 @@
 // side covers exactly tile x (tile * probeCount) elements.
 //
 // WHAT IS STORED: cosine-weighted MEAN INCOMING RADIANCE, i.e. irradiance/pi.
-// Same convention as the IBL irradiance cube, so R1c can substitute one for the
-// other with no scale factor. See gi_probe_trace.comp.hlsl's units note.
+// Same convention as the IBL irradiance cube, so gi_sample.hlsli substitutes one
+// for the other with no scale factor. See gi_probe_trace.comp.hlsl's units note.
 
 #include "gi_probe.hlsli"
 
@@ -35,9 +35,9 @@ cbuffer GiProbeBlendUniforms : register(b0, space2) {
     float giDistanceClamp; // visibility blend only; shared struct
     float giRayMaxDistance;
     uint giFrameIndex;
+    uint giCascadeIndex; // which BAND of the shared atlas this dispatch writes
     uint _giPad0;
     uint _giPad1;
-    uint _giPad2;
 };
 
 // SET 0 ORDER: (no sampled textures) READ-ONLY storage textures, then
@@ -71,13 +71,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
     // notice when it stops being buried — but its tile is left alone. The test
     // is uniform across the group, so this early return cannot split the group
     // across the barrier below.
-    float4 offset = giProbeOffset.Load(int3(giProbeStateTexel(int(probe.slot)), 0));
+    float4 offset = giProbeOffset.Load(int3(giProbeStateTexel(int(probe.slot), int(giCascadeIndex)), 0));
     if (!fresh && offset.w == GI_CLASS_INSIDE_GEOMETRY) {
         return;
     }
 
     int2 tileLocal = int2(lid.xy);
-    int2 tileOrigin = giProbeAtlasOrigin(int(probe.slot), GI_IRRADIANCE_TILE);
+    int2 tileOrigin = giProbeAtlasOrigin(int(probe.slot), GI_IRRADIANCE_TILE, int(giCascadeIndex));
     bool isPayload = tileLocal.x >= GI_BORDER && tileLocal.x < GI_IRRADIANCE_TILE - GI_BORDER &&
                      tileLocal.y >= GI_BORDER && tileLocal.y < GI_IRRADIANCE_TILE - GI_BORDER;
 

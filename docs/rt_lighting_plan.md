@@ -1,8 +1,11 @@
 # Ray-Traced Lighting — Research & Plan of Record
 
-Status: **proposed** (research complete, no phase started). Written 2026-08-02
-against the working tree at the RT-denoiser series (post "RT shadows: stop
-multiplexing ambient occlusion into the shadow mask").
+Status: **in progress — R0 (foundations) and R1 (probe-field GI) have landed**;
+R2 onward is still proposal. Written 2026-08-02 against the working tree at the
+RT-denoiser series (post "RT shadows: stop multiplexing ambient occlusion into
+the shadow mask"); R0's landed work packages are marked in §5.0 and R1's three
+packages in §5.2. As of R1c the probe field lights the frame — the first
+intentional image change of the plan.
 
 This is the plan of record for growing the current two-effect ray tracer
 (stochastic sun shadows + GGX reflections) into a **full ray-traced lighting
@@ -17,10 +20,15 @@ shippable; each leaves the tree working, tested, and documented.
 
 **Note on doc tooling:** this file deliberately stays out of
 `docs_coherence.test.cpp`'s `DOCS[]` list while phases are unlanded — it cites
-files that do not exist yet, which check (a) of that test would fail. Add it to
-the list once R1 lands (the same reasoning that keeps `docs/refactor_plan.md`
-excluded, run in reverse). Everything cited from the *current* tree below was
-verified by hand on 2026-08-02.
+files that do not exist yet, which check (a) of that test would fail. The
+earlier plan was to add it once R1 landed; R1 has landed and that is **still
+wrong**, for a reason worth recording rather than silently deferring: §5.4 cites
+`rt_hit_shade.hlsli` and §5.0 cites an STBN `.inc`, neither of which exists, so
+check (a) would fail on a document that is accurate about everything it claims.
+The right trigger is "no unlanded phase cites a file that does not exist" —
+i.e. after R6, or an earlier split of this document into a landed-history half
+and a proposal half. Everything cited from the *current* tree below was
+verified by hand.
 
 ---
 
@@ -550,18 +558,81 @@ a weather flip or lightning drops history *locally*). Typical hysteresis
 which at real time-of-day rates is invisible — the adaptive α handles the
 step cases.
 
-**Consumption.**
+**Landed (R1c, 2026-08-02) — consumption: the field lights the frame.** The
+first intentional image change of this plan, still behind `GiMode`, still
+`Off` by default.
 
-- Forward shaders: third ambient branch — sample 8 surrounding probes with
-  trilinear × normal × Chebyshev weights, multiply by the same
-  `min(screenAO, ORM AO)` and ambient-lift the IBL branch uses today.
-  `ambientIBL`'s diffuse irradiance-cube term is replaced; its specular term
-  survives until R4. The hemisphere `ambientPBR` remains the GI-off tier.
-- Volumetric fog: replace the flat `fogColor * 0.2` in-scatter ambient with a
-  per-step probe fetch at the march position (SH0/mean irradiance is enough
-  for media). God rays already come from CSM; this adds *colored bounce* to
-  fog at ~one texture fetch per step.
-- The reflection hit shader and R2's DI pass sample the same field (§5.4).
+*The repack, done first because it sets the budget for everything after it.*
+The three cascades' atlases became **one texture each**, cascades stacked as
+row bands (`ATLAS_ROWS_ALL_CASCADES`, `probe_atlas_origin(slot, texels,
+cascade)`). Same texels, same 30.6 MB — `probe_volume.test.cpp` derives the
+total both ways to prove it — but the forward shaders now spend **three**
+sampler slots on the field instead of nine, which is the difference between
+fitting and not: they were at 12/10/8 samplers against a DXC ceiling measured
+at 17. The fog march and R4's screen probes reuse the same three. It also
+collapsed the trace pass's own bindings (6 sampled + 4 storage textures → 4 +
+2) and made the probe-state upload one contiguous 20.25 KB plane. R1b's
+behaviour is bit-identical across it: same `rays=110592 probes=1728 c0=1728
+relocated=66 inside=1`, same `86.5 / 44.9`.
+
+*`shaders/gi_sample.hlsli`*, the shared sampler, binding-declared by the
+including shader the way `cluster_lighting.hlsli` is. DDGI bias (0.2×spacing
+along the normal, 0.3 toward the camera — both scaled by the cascade's
+spacing); cascade select = finest cascade containing the biased point with a
+**half-spacing margin**; 8-probe trilinear × backface × **Chebyshev** (cubed
+bound, variance floored at 1e-4×spacing², compared past mean + 0.02×spacing) ×
+a skip on `probe_offset.w == INSIDE_GEOMETRY`, sampled at the probes'
+**relocated** positions; renormalised over the live weights; a weight-sum floor
+of 0.30 and a one-probe **edge fade** hand what is left to the next-coarser
+cascade, and the hemisphere ambient absorbs the remainder. `giCascadeBase[]` is
+sent, not re-derived from `cameraPos` — the two would agree until they were
+handed different camera positions. Everything above is mirrored in
+`render/gi/gi_math.hpp`'s `SAMPLE_*` block and `sample_field()`, and **C0
+continuity is asserted numerically** rather than eyeballed: one test walks a
+line through a cascade boundary with each cascade answering a different primary
+colour, another walks through cell boundaries with hashed per-probe values, and
+both bound the per-step delta.
+
+*The one narrowing.* Three slots, not four, means the CPU-owned `probe_state`
+texture does not reach the forward shaders, so `probe_offset.w` had to answer
+"never filled" as well as "buried". It does, because `ProbeVolume::init()`
+seeds the whole offset plane with `INSIDE_GEOMETRY` — a one-time upload before
+any GPU write, not a second writer — which also closes the last path to reading
+undefined texture memory now that something outside the update passes samples
+the atlases. Cost: GI fades in over the first ~16 frames rather than popping.
+
+*Forward integration.* `model` (which skinned reuses), `model_instanced`,
+`terrain` and `grass` each gained the three slots **below** their existing ones
+so the local-shadow atlas stays LAST per `cluster_lighting.hlsli`'s contract:
+`CLUSTER_SSBO_BINDING_BASE` 12→15, 12→15, 10→13, 8→11. `ambientIBL` and
+`ambientPBR` (`pbr.hlsli`) each took a trailing `giIrradiance`/`giWeight` pair
+whose branch is not taken at weight 0, so the GI-off path is bit-identical, not
+merely equal. The ledger of §4 holds exactly: the DIFFUSE ambient becomes
+`gi × kd × albedo × (min(screenAO, ORM AO) × ambientLift)` and the SPECULAR
+half is untouched.
+
+*Fog.* `giSampleVolume` — nearest usable probe, ±Y taps averaged, three fetches
+per march step, because the full sampler's 24 taps × 24 steps is three orders of
+magnitude more than this pass has ever spent on ambient. It does **not** replace
+`fogColor * 0.2`; it becomes a per-channel gain around 1 measured against the
+same hemisphere ambient the sampler falls back to. Where the field has no answer
+— which includes the horizon — the ratio is exactly 1 and the term is
+bit-identical, so the sky↔fog agreement `hazeSunColor` encodes holds by
+construction rather than by tuning.
+
+*Measured*, playground village, Medium, 1600×900: `--smoke 30` unchanged at
+`86.5 / 44.9` with `gi_mode` Off; `PLAYGROUND_GI=probes --smoke 30` moved to
+**`84.7 / 46.6`**, reproduced identically over three runs. Lower mean and wider
+histogram is the right direction — the diff is red (darker) on facades, crate
+sides, eave undersides and mortar recesses, green (brighter) on open ground and
+in canopy gaps, and exactly zero on the sky. `--rt-bench 120` puts `GIProbes`
+at 0.056 ms / 0.072 p95 CPU record (0.054 / 0.065 before the repack) with frame
+render 0.86 → 3.14 ms and `present_wait` 0.59 → 2.58 ms: the cost is GPU-side —
+acceleration structure, probe rays, and an 8-probe gather per forward pixel —
+not CPU record time. (`-O0` tree; ratios only.) 1358 tests pass.
+
+*Still to come here.* The reflection hit shader and R2's DI pass sample the same
+field (§5.4).
 
 **Settings.** `GiMode { Off = 0, Probes, ProbesScreen }` +
 `GiQuality { Low = 0, Medium, High }` (rays/probe × cadence × cascade count),

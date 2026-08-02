@@ -57,27 +57,29 @@ bool ProbeVolume::init(gpu::GPUDevice& device) {
     const int irr_h = atlas_height(IRRADIANCE_PROBE_TEXELS);
     const int vis_w = atlas_width(VISIBILITY_PROBE_TEXELS);
     const int vis_h = atlas_height(VISIBILITY_PROBE_TEXELS);
+    const int plane_w = PROBES_PER_ATLAS_ROW;
+    const int plane_h = ATLAS_ROWS_ALL_CASCADES;
 
     stats_ = GiStats{};
+    // One texture each for the whole field; cascade c is a band of rows.
+    irradiance_ = gpu::GPUTexture::create_2d(device, irr_w, irr_h,
+                                             SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, ATLAS_USAGE);
+    visibility_ =
+        gpu::GPUTexture::create_2d(device, vis_w, vis_h, SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, ATLAS_USAGE);
+    state_ = gpu::GPUTexture::create_2d(device, plane_w, plane_h, SDL_GPU_TEXTUREFORMAT_R8_UINT, ATLAS_USAGE);
+    // One texel per probe: xyz = relocation offset in world units,
+    // w = classification verdict. Half floats are ample for an offset
+    // bounded at 0.45 * 600 = 270 units.
+    offset_ = gpu::GPUTexture::create_2d(device, plane_w, plane_h,
+                                         SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, ATLAS_USAGE);
+    if (!irradiance_ || !visibility_ || !state_ || !offset_) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "ProbeVolume: could not allocate the field atlases");
+        shutdown();
+        return false;
+    }
+
     for (int c = 0; c < CASCADE_COUNT; ++c) {
-        Cascade& cascade = cascades_[static_cast<std::size_t>(c)];
-        cascade.cpu.reset(c);
-        cascade.irradiance = gpu::GPUTexture::create_2d(device, irr_w, irr_h,
-                                                        SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, ATLAS_USAGE);
-        cascade.visibility = gpu::GPUTexture::create_2d(device, vis_w, vis_h,
-                                                        SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, ATLAS_USAGE);
-        cascade.state = gpu::GPUTexture::create_2d(device, PROBES_PER_ATLAS_ROW, ATLAS_ROWS,
-                                                   SDL_GPU_TEXTUREFORMAT_R8_UINT, ATLAS_USAGE);
-        // One texel per probe: xyz = relocation offset in world units,
-        // w = classification verdict. Half floats are ample for an offset
-        // bounded at 0.45 * 600 = 270 units.
-        cascade.offset = gpu::GPUTexture::create_2d(device, PROBES_PER_ATLAS_ROW, ATLAS_ROWS,
-                                                    SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, ATLAS_USAGE);
-        if (!cascade.irradiance || !cascade.visibility || !cascade.state || !cascade.offset) {
-            BRACKEN_LOG_ERROR(LOG_TAG, "ProbeVolume: could not allocate cascade {} atlases", c);
-            shutdown();
-            return false;
-        }
+        cascades_[static_cast<std::size_t>(c)].cpu.reset(c);
 
         // One update list per cascade — see the member's comment for why they
         // cannot share one buffer.
@@ -93,12 +95,17 @@ bool ProbeVolume::init(gpu::GPUDevice& device) {
         GiCascadeStats& cs = stats_.per_cascade[static_cast<std::size_t>(c)];
         cs.spacing = cascade_spacing(c);
         cs.probes = static_cast<std::uint32_t>(PROBES_PER_CASCADE);
-        cs.atlas_bytes = texture_bytes(irr_w, irr_h, 8) + texture_bytes(vis_w, vis_h, 4) +
-                         texture_bytes(PROBES_PER_ATLAS_ROW, ATLAS_ROWS, 1) +
-                         texture_bytes(PROBES_PER_ATLAS_ROW, ATLAS_ROWS, 8);
+        // One cascade's SHARE of the banded textures — the totals below are
+        // unchanged by the banding, so the per-cascade figure stays comparable
+        // with R1a's.
+        cs.atlas_bytes = texture_bytes(irr_w, irr_h / CASCADE_COUNT, 8) +
+                         texture_bytes(vis_w, vis_h / CASCADE_COUNT, 4) +
+                         texture_bytes(plane_w, ATLAS_ROWS, 1) + texture_bytes(plane_w, ATLAS_ROWS, 8);
         stats_.atlas_bytes += cs.atlas_bytes;
         stats_.probes += cs.probes;
     }
+    state_mirror_.assign(static_cast<std::size_t>(plane_w) * static_cast<std::size_t>(plane_h),
+                         PROBE_UNINITIALIZED);
 
     // Sized for the largest single-cascade turn at ANY quality, so switching
     // GiQuality mid-session never reallocates and never resizes a dispatch's
@@ -122,8 +129,13 @@ bool ProbeVolume::init(gpu::GPUDevice& device) {
     sampler_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     sampler_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     linear_clamp_sampler_ = device.create_sampler(sampler_info);
-    if (linear_clamp_sampler_ == nullptr) {
-        BRACKEN_LOG_ERROR(LOG_TAG, "ProbeVolume: could not create the atlas sampler");
+    // The per-probe planes are one texel per probe: a linear tap on them blends
+    // two unrelated probes' relocation offsets into a position that is neither.
+    sampler_info.min_filter = SDL_GPU_FILTER_NEAREST;
+    sampler_info.mag_filter = SDL_GPU_FILTER_NEAREST;
+    point_clamp_sampler_ = device.create_sampler(sampler_info);
+    if (linear_clamp_sampler_ == nullptr || point_clamp_sampler_ == nullptr) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "ProbeVolume: could not create the atlas samplers");
         shutdown();
         return false;
     }
@@ -138,6 +150,39 @@ bool ProbeVolume::init(gpu::GPUDevice& device) {
         BRACKEN_LOG_WARN(LOG_TAG, "ProbeVolume: no counter readback buffer; relocation stats stay 0");
     }
 
+    // SEED THE OFFSET PLANE with PROBE_CLASS_INSIDE_GEOMETRY, once, before any
+    // GPU pass has written a byte of it. This is what makes `offset.w` a
+    // complete "do not use this probe" signal for R1c's samplers rather than
+    // just a buried-probe verdict: a probe reads as unusable from allocation
+    // until the classify pass — which only ever runs on probes the blend passes
+    // filled in the same dispatch chain — replaces it with PROBE_CLASS_OK. It
+    // is also what closes the last path to reading undefined texture memory,
+    // which the never-clear-the-atlases policy leaves open the moment something
+    // outside the update passes starts sampling them. See gi_math.hpp.
+    //
+    // Its own command buffer: init() has none, and this is a one-time 162 KB
+    // upload rather than anything the frame should carry.
+    {
+        constexpr std::uint16_t HALF_ZERO = 0x0000; // 0.0h
+        constexpr std::uint16_t HALF_TWO = 0x4000;  // 2.0h == PROBE_CLASS_INSIDE_GEOMETRY
+        static_assert(PROBE_CLASS_INSIDE_GEOMETRY == 2.0f,
+                      "HALF_TWO below encodes PROBE_CLASS_INSIDE_GEOMETRY literally");
+        std::vector<std::uint16_t> seed(static_cast<std::size_t>(plane_w) *
+                                            static_cast<std::size_t>(plane_h) * 4u,
+                                        HALF_ZERO);
+        for (std::size_t i = 3; i < seed.size(); i += 4) {
+            seed[i] = HALF_TWO;
+        }
+        SDL_GPUCommandBuffer* seed_cmd = SDL_AcquireGPUCommandBuffer(device.handle());
+        if (seed_cmd == nullptr) {
+            BRACKEN_LOG_ERROR(LOG_TAG, "ProbeVolume: could not seed the probe offset plane");
+            shutdown();
+            return false;
+        }
+        offset_->upload(seed_cmd, seed.data(), plane_w, plane_h);
+        SDL_SubmitGPUCommandBuffer(seed_cmd);
+    }
+
     scratch_slots_.reserve(gi_max_probes_per_dispatch());
     scratch_records_.reserve(gi_max_probes_per_dispatch());
 
@@ -147,8 +192,8 @@ bool ProbeVolume::init(gpu::GPUDevice& device) {
     frame_counter_ = 0;
 
     BRACKEN_LOG_INFO(LOG_TAG,
-                     "probe field: {} cascades x {}x{}x{} probes, spacing {:.0f}..{:.0f} world units, "
-                     "irradiance {}x{} visibility {}x{}, {:.1f} MB",
+                     "probe field: {} cascades x {}x{}x{} probes (banded into one atlas each), "
+                     "spacing {:.0f}..{:.0f} world units, irradiance {}x{} visibility {}x{}, {:.1f} MB",
                      CASCADE_COUNT, GRID_X, GRID_Y, GRID_Z, cascade_spacing(0),
                      cascade_spacing(CASCADE_COUNT - 1), irr_w, irr_h, vis_w, vis_h,
                      static_cast<double>(stats_.atlas_bytes) / (1024.0 * 1024.0));
@@ -172,16 +217,22 @@ void ProbeVolume::shutdown() {
             device_->release_sampler(linear_clamp_sampler_);
             linear_clamp_sampler_ = nullptr;
         }
+        if (point_clamp_sampler_ != nullptr) {
+            device_->release_sampler(point_clamp_sampler_);
+            point_clamp_sampler_ = nullptr;
+        }
     }
     readback_fence_ = nullptr;
     readback_transfer_ = nullptr;
     linear_clamp_sampler_ = nullptr;
+    point_clamp_sampler_ = nullptr;
 
+    irradiance_.reset();
+    visibility_.reset();
+    state_.reset();
+    offset_.reset();
+    state_mirror_.clear();
     for (Cascade& cascade : cascades_) {
-        cascade.irradiance.reset();
-        cascade.visibility.reset();
-        cascade.state.reset();
-        cascade.offset.reset();
         cascade.cpu.reset(cascade.cpu.cascade());
     }
     for (auto& list : update_lists_) {
@@ -200,6 +251,7 @@ void ProbeVolume::update(SDL_GPUCommandBuffer* cmd, const glm::vec3& camera_posi
         return;
     }
     stats_.probes_invalidated = 0;
+    bool any_dirty = false;
     for (int c = 0; c < CASCADE_COUNT; ++c) {
         Cascade& cascade = cascades_[static_cast<std::size_t>(c)];
         const std::uint32_t invalidated = cascade.cpu.update(camera_position);
@@ -209,28 +261,34 @@ void ProbeVolume::update(SDL_GPUCommandBuffer* cmd, const glm::vec3& camera_posi
         cs.probes_invalidated = invalidated;
         stats_.probes_invalidated += invalidated;
         stats_.probes_invalidated_total += invalidated;
+        any_dirty = any_dirty || cascade.cpu.state_dirty();
+    }
 
-        // The whole state texture is 6912 bytes, so a scrolled cascade
-        // re-uploads all of it rather than carrying a dirty-rect list. That is
-        // a measured trade, not laziness: the worst case is all three cascades
-        // scrolling in one frame, 20.25 KB of transfer — against which a rect
-        // scheme would have to describe an L-shaped slab (a diagonal scroll
-        // enters two overlapping arms), i.e. two or three partial copies plus
-        // the code that computes them, to save a few kilobytes on a bus that
-        // moves megabytes of instance data every frame.
-        //
-        // THE UPLOAD IS ALSO WHAT MAKES THE FIELD SELF-CONSISTENT, and the
-        // ordering is load-bearing: trace() promotes a scheduled probe to
-        // PROBE_ACTIVE on the CPU, but that reaches the GPU only here, on the
-        // NEXT frame — by which time the blend passes have filled its tile. So
-        // a probe reads as ACTIVE to the bounce sampler exactly one frame after
-        // its atlas texels were written, and no pass ever samples a texel that
-        // no pass has written. (That is also why the atlases are never cleared:
-        // there is no path that reads undefined texture memory.)
-        if (cmd != nullptr && cascade.cpu.state_dirty() && cascade.state) {
-            cascade.state->upload(cmd, cascade.cpu.state().data(), PROBES_PER_ATLAS_ROW, ATLAS_ROWS);
+    // The whole banded state plane is 20.25 KB, so ANY cascade going dirty
+    // re-uploads all three bands rather than carrying a dirty-rect list. That
+    // is a measured trade, not laziness: 20.25 KB was already R1a's worst case
+    // (all three cascades scrolling in one frame), and against it a rect scheme
+    // would have to describe an L-shaped slab — a diagonal scroll enters two
+    // overlapping arms — i.e. two or three partial copies plus the code that
+    // computes them, to save a few kilobytes on a bus that moves megabytes of
+    // instance data every frame. The banded layout is also why it is one upload
+    // and not three: `GPUTexture::upload` writes a whole texture.
+    //
+    // THE UPLOAD IS ALSO WHAT MAKES THE FIELD SELF-CONSISTENT, and the ordering
+    // is load-bearing: trace() promotes a scheduled probe to PROBE_ACTIVE on
+    // the CPU, but that reaches the GPU only here, on the NEXT frame — by which
+    // time the blend passes have filled its tile. So a probe reads as ACTIVE to
+    // the bounce sampler exactly one frame after its atlas texels were written,
+    // and no pass ever samples a texel that no pass has written.
+    if (cmd != nullptr && any_dirty && state_) {
+        for (int c = 0; c < CASCADE_COUNT; ++c) {
+            Cascade& cascade = cascades_[static_cast<std::size_t>(c)];
+            const std::vector<std::uint8_t>& src = cascade.cpu.state();
+            std::memcpy(state_mirror_.data() + static_cast<std::size_t>(c) * src.size(), src.data(),
+                        src.size());
             cascade.cpu.clear_state_dirty();
         }
+        state_->upload(cmd, state_mirror_.data(), PROBES_PER_ATLAS_ROW, ATLAS_ROWS_ALL_CASCADES);
     }
 }
 
@@ -373,20 +431,18 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
             // ORDER IS THE BINDING CONTRACT (shaders/README.md): sampled
             // textures, then read-only storage textures, then read-only storage
             // buffers, each run numbered from 0 and matching the shader's
-            // declaration order exactly.
-            const std::array<SDL_GPUTextureSamplerBinding, 6> textures{{
+            // declaration order exactly. Banding cost this pass four bindings:
+            // three per-cascade irradiance atlases and three state planes
+            // collapsed into one of each.
+            const std::array<SDL_GPUTextureSamplerBinding, 4> textures{{
                 {params.shadow_atlas, params.shadow_compare_sampler},
                 {params.shadow_atlas, params.shadow_raw_sampler},
                 {params.sky_cube != nullptr ? params.sky_cube : params.sky_cube_fallback,
                  params.sky_sampler},
-                {cascades_[0].irradiance->handle(), linear_clamp_sampler_},
-                {cascades_[1].irradiance->handle(), linear_clamp_sampler_},
-                {cascades_[2].irradiance->handle(), linear_clamp_sampler_},
+                {irradiance_->handle(), linear_clamp_sampler_},
             }};
             pass.bind_samplers(0, textures);
-            const std::array<SDL_GPUTexture*, 4> storage_textures{
-                cascade.offset->handle(), cascades_[0].state->handle(),
-                cascades_[1].state->handle(), cascades_[2].state->handle()};
+            const std::array<SDL_GPUTexture*, 2> storage_textures{offset_->handle(), state_->handle()};
             pass.bind_storage_textures(0, storage_textures);
             const std::array<SDL_GPUBuffer*, 7> buffers{
                 params.scene->tlas_nodes(),    params.scene->tlas_instances(),
@@ -405,17 +461,18 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
     blend.distanceClamp = PROBE_VISIBILITY_DISTANCE_SCALE * spacing;
     blend.rayMaxDistance = params.ray_max_distance;
     blend.frameIndex = static_cast<std::uint32_t>(frame_counter_);
+    blend.cascadeIndex = static_cast<std::uint32_t>(cascade_index);
 
     // ---- 2. irradiance blend + border -----------------------------------
     {
         // cycle = false: this is an accumulator. A fresh allocation would
         // discard every probe the rota did not touch this frame — i.e. all but
         // a quarter of the cascade.
-        const auto rw = rw_texture(cascade.irradiance->handle(), false);
+        const auto rw = rw_texture(irradiance_->handle(), false);
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
         if (pass) {
             pass.bind_pipeline(*blend_pipeline);
-            const std::array<SDL_GPUTexture*, 1> storage_textures{cascade.offset->handle()};
+            const std::array<SDL_GPUTexture*, 1> storage_textures{offset_->handle()};
             pass.bind_storage_textures(0, storage_textures);
             const std::array<SDL_GPUBuffer*, 2> buffers{ray_results_->handle(), list->handle()};
             pass.bind_storage_buffers(0, buffers);
@@ -431,11 +488,11 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
 
     // ---- 3. visibility moments + border ---------------------------------
     {
-        const auto rw = rw_texture(cascade.visibility->handle(), false);
+        const auto rw = rw_texture(visibility_->handle(), false);
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
         if (pass) {
             pass.bind_pipeline(*visibility_pipeline);
-            const std::array<SDL_GPUTexture*, 1> storage_textures{cascade.offset->handle()};
+            const std::array<SDL_GPUTexture*, 1> storage_textures{offset_->handle()};
             pass.bind_storage_textures(0, storage_textures);
             const std::array<SDL_GPUBuffer*, 2> buffers{ray_results_->handle(), list->handle()};
             pass.bind_storage_buffers(0, buffers);
@@ -458,7 +515,7 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
         u.probeSpacing = spacing;
         u.frameIndex = static_cast<std::uint32_t>(frame_counter_);
 
-        const auto rw_tex = rw_texture(cascade.offset->handle(), false);
+        const auto rw_tex = rw_texture(offset_->handle(), false);
         const auto rw_buf = rw_buffer(counters_->handle(), false);
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw_tex, 1}, {&rw_buf, 1});
         if (pass) {
@@ -532,32 +589,12 @@ void ProbeVolume::request_counter_readback() {
     readback_fence_ = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
 }
 
-gpu::GPUTexture* ProbeVolume::irradiance(int cascade) const {
-    if (cascade < 0 || cascade >= CASCADE_COUNT) {
-        return nullptr;
+std::array<glm::ivec3, CASCADE_COUNT> ProbeVolume::cascade_bases() const {
+    std::array<glm::ivec3, CASCADE_COUNT> bases{};
+    for (int c = 0; c < CASCADE_COUNT; ++c) {
+        bases[static_cast<std::size_t>(c)] = cascades_[static_cast<std::size_t>(c)].cpu.base();
     }
-    return cascades_[static_cast<std::size_t>(cascade)].irradiance.get();
-}
-
-gpu::GPUTexture* ProbeVolume::visibility(int cascade) const {
-    if (cascade < 0 || cascade >= CASCADE_COUNT) {
-        return nullptr;
-    }
-    return cascades_[static_cast<std::size_t>(cascade)].visibility.get();
-}
-
-gpu::GPUTexture* ProbeVolume::probe_state(int cascade) const {
-    if (cascade < 0 || cascade >= CASCADE_COUNT) {
-        return nullptr;
-    }
-    return cascades_[static_cast<std::size_t>(cascade)].state.get();
-}
-
-gpu::GPUTexture* ProbeVolume::probe_offset(int cascade) const {
-    if (cascade < 0 || cascade >= CASCADE_COUNT) {
-        return nullptr;
-    }
-    return cascades_[static_cast<std::size_t>(cascade)].offset.get();
+    return bases;
 }
 
 const ProbeCascade& ProbeVolume::cascade(int index) const {

@@ -342,7 +342,7 @@ PLAYGROUND_RT=both ./playground --rt-bench 240        # trace both signals
 PLAYGROUND_RT=both PLAYGROUND_RT_RANGE=1 ./playground --rt-bench 240   # ...with a Medium instance range
 ```
 
-`PLAYGROUND_RT=shadows|reflections|both` selects which traced effects run and `PLAYGROUND_RT_RANGE=0..3` pins `rt_max_instance_range` (Near/Medium/Far/Unlimited); both also work with `--smoke`. `PLAYGROUND_GI=probes|probes_screen|off` pins `gi_mode` on exactly the same terms — an **unset** variable means Off, because these settings persist and "leave it alone" would silently inherit the last interactive session's choice. With GI on, `--smoke` prints two extra lines: `[smoke] gi ...` (mode, cascades, probes, probes invalidated this frame and cumulatively, atlas MB) and `[smoke] gi update ...` (rays cast, probes updated per cascade, probes relocated and classified inside geometry, cumulative totals). After phase R1b it still renders **identically** to GI off, because the probe field is traced but sampled by nothing. Two standing caveats: the reported times are **CPU record times** (SDL3 has no GPU timestamp API — `present_wait` is the CPU-bound-vs-GPU-bound signal), and a number from a default `build/` is not a performance number, because no `CMAKE_BUILD_TYPE` means `-O0` with live assertions. Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
+`PLAYGROUND_RT=shadows|reflections|both` selects which traced effects run and `PLAYGROUND_RT_RANGE=0..3` pins `rt_max_instance_range` (Near/Medium/Far/Unlimited); both also work with `--smoke`. `PLAYGROUND_GI=probes|probes_screen|off` pins `gi_mode` on exactly the same terms — an **unset** variable means Off, because these settings persist and "leave it alone" would silently inherit the last interactive session's choice. With GI on, `--smoke` prints two extra lines: `[smoke] gi ...` (mode, cascades, probes, probes invalidated this frame and cumulatively, atlas MB) and `[smoke] gi update ...` (rays cast, probes updated per cascade, probes relocated and classified inside geometry, cumulative totals). Since phase R1c it renders **differently** from GI off — that is the point — and the smoke gate is now two figures: `mean_luma=86.5 stddev=44.9` with GI off, `84.7 / 46.6` with `PLAYGROUND_GI=probes`. Two standing caveats: the reported times are **CPU record times** (SDL3 has no GPU timestamp API — `present_wait` is the CPU-bound-vs-GPU-bound signal), and a number from a default `build/` is not a performance number, because no `CMAKE_BUILD_TYPE` means `-O0` with live assertions. Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
 
 ### Gotchas checklist
 
@@ -562,8 +562,8 @@ Enum modes are `enum class : int` with **stable underlying values** — they are
 | `ibl_enabled` | `true` | image-based lighting: ambient diffuse + specular come from the prefiltered procedural sky; `false` falls back to the two-color hemisphere ambient |
 | `bloom_enabled` / `bloom_strength` | `true` / `0.25f` | bloom toggle + intensity (0.0–1.0) |
 | `bloom_threshold` | `1.1f` | post-exposure HDR luminance above which bloom contributes |
-| `gi_mode` | `GiMode::Off` | diffuse GI from the probe clipmap: `Off` / `Probes` / `ProbesScreen` (0/1/2). `ProbesScreen` behaves as `Probes` until phase R4. See [Probe-field GI](#probe-field-gi-traced-not-yet-consumed) — today it traces and accumulates a probe field that nothing samples, and **it builds the ray-tracing acceleration structure to do it** |
-| `gi_quality` | `GiQuality::Medium` | probe ray budget (`Low`/`Medium`/`High`, 0/1/2): rays per probe and how much of each cascade is refreshed per turn. Peak {55 k, 221 k, 332 k} rays/frame — see [Probe-field GI](#probe-field-gi-traced-not-yet-consumed) |
+| `gi_mode` | `GiMode::Off` | diffuse GI from the probe clipmap: `Off` / `Probes` / `ProbesScreen` (0/1/2). `ProbesScreen` behaves as `Probes` until phase R4. See [Probe-field GI](#probe-field-gi) — it replaces the DIFFUSE half of the ambient term in every scene shader with occluded, bounced light from the probe field, and **it builds the ray-tracing acceleration structure to do it** |
+| `gi_quality` | `GiQuality::Medium` | probe ray budget (`Low`/`Medium`/`High`, 0/1/2): rays per probe and how much of each cascade is refreshed per turn. Peak {55 k, 221 k, 332 k} rays/frame — see [Probe-field GI](#probe-field-gi) |
 | `volumetric_fog` | `false` | expensive; off by default |
 | `god_rays` | `false` | requires `volumetric_fog` |
 | `window_mode` / `resolution_index` | `0` / `0` | see window management above |
@@ -2336,17 +2336,29 @@ The CPU-side bind calls map by slot, not by set:
 **Cluster-lighting include:** any scene fragment shader that wants clustered lights must define its sampler count before including `src/bracken/shaders/cluster_lighting.hlsli`, because the cluster SSBOs bind right after the samplers (the include `#error`s if you forget):
 
 ```hlsl
-// model.frag.hlsl has 12 fragment samplers (the last one is the local-shadow
-// atlas the include itself declares), so cluster SSBOs start at slot 12
-#define CLUSTER_SSBO_BINDING_BASE 12
+// model.frag.hlsl has 15 fragment samplers (the last one is the local-shadow
+// atlas the include itself declares), so cluster SSBOs start at slot 15
+#define CLUSTER_SSBO_BINDING_BASE 15
 #include "cluster_lighting.hlsli"
 ```
 
-Current values: `model.frag`/`model_instanced.frag` 12, `terrain.frag` 10,
-`grass.frag` 8. The include declares the local-shadow atlas + comparison
+Current values: `model.frag`/`model_instanced.frag` 15, `terrain.frag` 13,
+`grass.frag` 11. The include declares the local-shadow atlas + comparison
 sampler at `CLUSTER_SSBO_BINDING_BASE - 1` (your shader's LAST sampler slot)
 and a 4th storage buffer for the per-tile shadow slots, so
 `CLUSTER_SSBO_BINDING_BASE` = your in-file sampler count **plus one**.
+
+**Probe-field GI include:** the three slots immediately below the local-shadow
+atlas (model/instanced 11–13, terrain 9–11, grass 7–9) are the GI atlases
+`src/bracken/shaders/gi_sample.hlsli` reads. Like `cluster_lighting.hlsli` it
+names resources it does not own, so declare them yourself before including it —
+`giIrradianceAtlas` and `giVisibilityAtlas` (linear clamp), `giProbeMeta`
+(point clamp), plus `int4 giCascadeBase[3]` and `float giEnabled` in your
+lighting cbuffer — then call
+`giSampleDiffuse(worldPos, N, V, ambientSky, ambientGround)` when `giEnabled`
+and pass the result into `ambientIBL`/`ambientPBR`'s trailing
+`giIrradiance`/`giWeight` pair. All three cascades live in one texture each, so
+the field costs three slots rather than nine.
 
 The include also reserves fragment cbuffer `(2, 3)` for `ClusterParams` — don’t declare your own `b2` alongside it.
 
@@ -7717,7 +7729,7 @@ prerequisite the software BVH already has.
 the tree a ray can reach, so a shorter ray is cheaper *and* misses distant
 occluders. Trade it against `resolution` before reaching for anything else.
 
-## Probe-field GI (traced, not yet consumed)
+## Probe-field GI
 
 ```cpp
 gs.gi_mode = GiMode::Probes;     // Off (default) / Probes / ProbesScreen
@@ -7726,21 +7738,34 @@ gs.gi_quality = GiQuality::Medium;
 
 `GiMode::Probes` allocates and scrolls a probe field — three camera-centred
 cascades of 24×12×24 probes at 150 / 300 / 600 world-unit spacing, with
-octahedral irradiance and visibility atlases, about 30 MB in total — and, as of
-phase R1b, **traces it**: a fixed budget of rays per frame is cast from a
-rotating share of the probes, each hit is shaded (flat albedo × sun with a CSM
-visibility fetch + the frame's point/spot lights + last frame's own field for
-infinite bounce), misses take the sky, and the results accumulate into the
-atlases through a change-adaptive temporal blend. Probes that land inside walls
-are nudged out or written off.
+octahedral irradiance and visibility atlases, about 30 MB in total. A fixed
+budget of rays per frame is cast from a rotating share of the probes, each hit
+is shaded (flat albedo × sun with a CSM visibility fetch + the frame's
+point/spot lights + last frame's own field for infinite bounce), misses take
+the sky, and the results accumulate into the atlases through a change-adaptive
+temporal blend. Probes that land inside walls are nudged out or written off.
 
-**Nothing samples the result yet.** Your scene renders exactly as it does with
-`gi_mode = Off` — bit-identically, which is the property the engine's smoke test
-gates on. The forward-pass and fog consumption that makes bounce light visible
-is phase R1c of `docs/rt_lighting_plan.md`. Until it lands the reasons to turn
-this on are to measure what the update costs on your target hardware and to
-watch `SceneRenderer::gi_stats()` (probes invalidated, rays cast, probes
-updated/relocated/inside-geometry); the playground prints `[smoke] gi ...` and
+**What you get for it.** Every scene shader's **diffuse ambient** term now comes
+from that field instead of from the sky: a courtyard is lit by the sky it can
+actually see, an alcove goes dark, a wall next to a sunlit red roof picks the
+roof up, and all of it tracks the time of day with no bake. The **specular**
+ambient half is unchanged — prefiltered IBL or the analytic hemisphere, exactly
+as before. Volumetric fog picks up the same signal as a brightness/colour gain
+on its in-scatter, so fog darkens under an eave and warms in a lamp-lit street
+while still melting into the horizon exactly as it did.
+
+Where the field cannot answer — past the third cascade, or inside a cage of
+probes that are all buried — the term falls back to `EnvironmentState`'s
+`ambient_sky`/`ambient_ground` hemisphere, i.e. to precisely what you had
+before. That fallback is exact, not approximate, which is why turning GI off is
+a bit-identical revert rather than a look change.
+
+**It fades in.** Every probe reads as unusable until it has been traced once, so
+GI ramps up over the first ~16 frames after you enable it rather than popping.
+Deterministic, but worth knowing if you enable it during a cut.
+
+`SceneRenderer::gi_stats()` reports probes invalidated, rays cast, and probes
+updated/relocated/inside-geometry; the playground prints `[smoke] gi ...` and
 `[smoke] gi update ...` lines.
 
 **What it costs, and the part that will surprise you.** `gi_mode != Off` is a
@@ -7765,7 +7790,19 @@ cascade 1 every second and cascade 2 every fourth — phased so at most two
 cascades trace in any one frame. Peak: **55 k / 221 k / 332 k rays per frame**.
 All of it is timed as the `GIProbes` row of `RenderStats::pass_times_ms`; as
 always that is a CPU *record* time, so use `present_wait_ms()` to tell whether
-the GPU side is what is costing you.
+the GPU side is what is costing you — and here it usually is. On the playground
+village at Medium, `--rt-bench 120` in an `-O0` tree, turning GI on moved frame
+render 0.86 → 3.14 ms and `present_wait` 0.59 → 2.58 ms while `GIProbes` itself
+records 0.056 ms. Almost all of the cost is on the device: building and
+refitting the acceleration structure, tracing the probe rays, and the 8-probe
+gather every forward pixel now performs. Budget for GI as a **GPU** feature and
+measure it with `present_wait_ms()`, never with the pass row.
+
+The per-pixel half of that cost is why the three cascades are banded into one
+texture each rather than nine: the scene fragment shaders spend **three**
+sampler slots on the field (model/instanced 11–13, terrain 9–11, grass 7–9), and
+if you write your own cluster-lit shader you must declare those slots too. See
+the sampler-slot note under "Custom shaders" below.
 
 One forward-looking value you can set now and rely on later: `ProbesScreen` is a
 valid, persisted mode that behaves identically to `Probes` until the

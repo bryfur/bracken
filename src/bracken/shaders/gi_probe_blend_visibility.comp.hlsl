@@ -1,6 +1,6 @@
 // gi_probe_blend_visibility.comp.hlsl - fold one update's ray DISTANCES into
 // the visibility atlas: mean and mean-squared, for the Chebyshev leak test
-// R1c's sampler performs.
+// gi_sample.hlsli performs.
 //
 // Same shape as gi_probe_blend.comp.hlsl (one threadgroup per probe, one thread
 // per texel of the 16x16 tile, border replicated out of groupshared) and the
@@ -40,9 +40,9 @@ cbuffer GiProbeBlendUniforms : register(b0, space2) {
     float giDistanceClamp;
     float giRayMaxDistance;
     uint giFrameIndex;
+    uint giCascadeIndex; // which BAND of the shared atlas this dispatch writes
     uint _giPad0;
     uint _giPad1;
-    uint _giPad2;
 };
 
 // SET 0 ORDER: READ-ONLY storage textures, then READ-ONLY storage buffers.
@@ -68,13 +68,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
     GiProbeUpdate probe = giUpdates[probeIndex];
     bool fresh = (probe.flags & GI_UPDATE_FLAG_UNINITIALIZED) != 0u;
 
-    float4 offset = giProbeOffset.Load(int3(giProbeStateTexel(int(probe.slot)), 0));
+    float4 offset = giProbeOffset.Load(int3(giProbeStateTexel(int(probe.slot), int(giCascadeIndex)), 0));
     if (!fresh && offset.w == GI_CLASS_INSIDE_GEOMETRY) {
         return;
     }
 
     int2 tileLocal = int2(lid.xy);
-    int2 tileOrigin = giProbeAtlasOrigin(int(probe.slot), GI_VISIBILITY_TILE);
+    int2 tileOrigin = giProbeAtlasOrigin(int(probe.slot), GI_VISIBILITY_TILE, int(giCascadeIndex));
     bool isPayload = tileLocal.x >= GI_BORDER && tileLocal.x < GI_VISIBILITY_TILE - GI_BORDER &&
                      tileLocal.y >= GI_BORDER && tileLocal.y < GI_VISIBILITY_TILE - GI_BORDER;
 

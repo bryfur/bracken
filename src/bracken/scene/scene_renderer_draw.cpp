@@ -119,7 +119,7 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
                          have_ao_binding ? &ao_binding : nullptr, ao_texel, &frame_frustum_, frame_prepass_active_,
                          have_ibl_bindings ? ibl_bindings : nullptr, frame_ibl_active_,
                          have_rt_shadow_binding ? &rt_shadow_binding : nullptr, frame_rt_shadows_active_,
-                         have_local_shadow_binding ? &local_shadow_binding : nullptr);
+                         have_local_shadow_binding ? &local_shadow_binding : nullptr, &frame_gi_);
     }
 
     if (frame.should_draw_grass() && gfx.grass_enabled && grass_renderer_) {
@@ -130,7 +130,7 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
                                 have_ao_binding ? &ao_binding : nullptr, ao_texel, frame_prepass_active_,
                                 have_ibl_bindings ? ibl_bindings : nullptr, frame_ibl_active_,
                                 have_rt_shadow_binding ? &rt_shadow_binding : nullptr, frame_rt_shadows_active_,
-                                have_local_shadow_binding ? &local_shadow_binding : nullptr);
+                                have_local_shadow_binding ? &local_shadow_binding : nullptr, &frame_gi_);
     }
 
     // Render instanced static models (rocks, trees, etc.) - uses same frustum
@@ -226,7 +226,8 @@ bool SceneRenderer::bind_model_pipeline(bool double_sided, bool depth_equal) {
     bind_screen_ao(6);
     bind_ibl(7);
     bind_rt_shadow_mask(10);
-    bind_local_shadow_atlas(11);
+    bind_gi(11);
+    bind_local_shadow_atlas(14);
     model_pipeline_double_sided_ = double_sided;
     model_pipeline_depth_equal_ = depth_equal;
     model_pipeline_bound_ = true;
@@ -255,7 +256,8 @@ bool SceneRenderer::bind_skinned_pipeline(bool double_sided, bool depth_equal) {
     bind_screen_ao(6);
     bind_ibl(7);
     bind_rt_shadow_mask(10);
-    bind_local_shadow_atlas(11);
+    bind_gi(11);
+    bind_local_shadow_atlas(14);
     SDL_GPUBuffer* palette_buf = current_bone_palette_buffer()->handle();
     SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);
     skinned_pipeline_double_sided_ = double_sided;
@@ -323,6 +325,52 @@ void SceneRenderer::bind_ibl(uint32_t base_slot) {
     SDL_BindGPUFragmentSamplers(main_render_pass_, base_slot, bindings, 3);
 }
 
+void SceneRenderer::refresh_gi_bindings() {
+    frame_gi_ = render::gi::GiBindings{};
+
+    // The dummy set. Black for the two atlases and the metadata plane alike:
+    // with `enabled == 0` nothing samples them, and a black metadata texel
+    // reads as GI_CLASS_OK rather than as "skip", which is deliberately the
+    // LESS defensive choice — if a shader ever taps this while disabled, it
+    // should produce visibly black GI rather than silently fall back to the
+    // hemisphere and hide the bug.
+    SDL_GPUTexture* black = dummy_black_texture_ ? dummy_black_texture_->handle() : nullptr;
+    if (black != nullptr && default_sampler_ != nullptr) {
+        for (SDL_GPUTextureSamplerBinding& b : frame_gi_.textures) {
+            b = {black, default_sampler_};
+        }
+    }
+
+    if (!probe_volume_ || !probe_volume_->is_ready()) {
+        return;
+    }
+    SDL_GPUSampler* linear = probe_volume_->linear_sampler();
+    SDL_GPUSampler* point = probe_volume_->point_sampler();
+    if (linear == nullptr || point == nullptr) {
+        return;
+    }
+    // Slot order IS the binding contract — the three are bound as one run and
+    // gi_sample.hlsli declares them in exactly this order.
+    frame_gi_.textures[0] = {probe_volume_->irradiance()->handle(), linear};
+    frame_gi_.textures[1] = {probe_volume_->visibility()->handle(), linear};
+    frame_gi_.textures[2] = {probe_volume_->probe_offset()->handle(), point};
+
+    const std::array<glm::ivec3, render::gi::CASCADE_COUNT> bases = probe_volume_->cascade_bases();
+    for (std::size_t c = 0; c < bases.size(); ++c) {
+        frame_gi_.cascade_base[c] = glm::ivec4(bases[c], 0);
+    }
+    // Only now: a volume that exists but has never been placed has no window to
+    // address probes against, and every cascade would answer for the origin.
+    frame_gi_.enabled = probe_volume_->cascade(0).placed() ? 1.0f : 0.0f;
+}
+
+void SceneRenderer::bind_gi(uint32_t base_slot) {
+    if (!main_render_pass_ || frame_gi_.textures[0].texture == nullptr) {
+        return;
+    }
+    SDL_BindGPUFragmentSamplers(main_render_pass_, base_slot, frame_gi_.textures.data(), 3);
+}
+
 void SceneRenderer::bind_material_texture(uint32_t slot, SDL_GPUTexture* texture) {
     if (!texture || !default_sampler_ || last_frag_tex_[slot] == texture) {
         return;
@@ -380,6 +428,12 @@ gpu::ModelLightingUniforms SceneRenderer::make_model_lighting(const CameraState&
     u.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
     u.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
     u.rtReflectionFadeStart = frame_rt_reflection_fade_start_;
+    // Probe-field GI: the frame's ONE snapshot of the field (refresh_gi_bindings).
+    // giEnabled == 0 leaves every ambient branch on its pre-R1c arithmetic.
+    for (std::size_t c = 0; c < frame_gi_.cascade_base.size(); ++c) {
+        u.giCascadeBase[c] = frame_gi_.cascade_base[c];
+    }
+    u.giEnabled = frame_gi_.enabled;
 
     return u;
 }
@@ -523,6 +577,10 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
     lighting_uniforms.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
     lighting_uniforms.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
     lighting_uniforms.rtReflectionFadeStart = frame_rt_reflection_fade_start_;
+    for (std::size_t c = 0; c < frame_gi_.cascade_base.size(); ++c) {
+        lighting_uniforms.giCascadeBase[c] = frame_gi_.cascade_base[c];
+    }
+    lighting_uniforms.giEnabled = frame_gi_.enabled;
 
     SDL_GPUBuffer* storage_buf = instance_storage_buffer_->handle();
 
@@ -559,7 +617,8 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
         bind_screen_ao(6);
         bind_ibl(7);
         bind_rt_shadow_mask(10);
-        bind_local_shadow_atlas(11);
+        bind_gi(11);
+        bind_local_shadow_atlas(14);
         lighting_pushed = false;
         bound_type = want;
         return true;
@@ -777,7 +836,8 @@ void SceneRenderer::render_transparent_models(const CameraState& camera) {
             bind_screen_ao(6, /*enabled=*/false);
             bind_ibl(7);
             bind_rt_shadow_mask(10);
-            bind_local_shadow_atlas(11);
+            bind_gi(11);
+            bind_local_shadow_atlas(14);
             if (skinned) {
                 SDL_GPUBuffer* palette_buf = current_bone_palette_buffer()->handle();
                 SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);

@@ -42,6 +42,19 @@ cbuffer VolumetricFogUniforms : register(b0, space3) {
     float lastActiveSplit;  // far distance of the last active cascade (lit beyond it)
     float _padding0;
     float _padding1;
+    // The hemisphere ambient (EnvironmentState). Needed here only since R1c:
+    // it is both the probe field's fallback and the REFERENCE the GI gain
+    // below is measured against, so the two must be the same numbers.
+    float3 ambientSky;
+    float _ambientPad0;
+    float3 ambientGround;
+    float _ambientPad1;
+    // Probe-field GI (render/gi/), R1c — see gi_sample.hlsli.
+    int4 giCascadeBase[3];
+    float giEnabled;
+    float _giPad0;
+    float _giPad1;
+    float _giPad2;
 };
 
 // Depth texture
@@ -56,8 +69,31 @@ Texture2D shadowMap : register(t1, space2);
 [[vk::combinedImageSampler]][[vk::binding(1, 2)]]
 SamplerState shadowSampler : register(s1, space2);
 
+// Probe-field GI (render/gi/): the three atlases gi_sample.hlsli reads, at
+// this pass's slots 2-4. Bound to dummies when GI is off; giEnabled gates them.
+[[vk::combinedImageSampler]][[vk::binding(2, 2)]]
+Texture2D<float4> giIrradianceAtlas : register(t2, space2);
+[[vk::combinedImageSampler]][[vk::binding(2, 2)]]
+SamplerState giIrradianceAtlasSampler : register(s2, space2);
+
+[[vk::combinedImageSampler]][[vk::binding(3, 2)]]
+Texture2D<float2> giVisibilityAtlas : register(t3, space2);
+[[vk::combinedImageSampler]][[vk::binding(3, 2)]]
+SamplerState giVisibilityAtlasSampler : register(s3, space2);
+
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
+Texture2D<float4> giProbeMeta : register(t4, space2);
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
+SamplerState giProbeMetaSampler : register(s4, space2);
+
 // worldPosFromDepth + interleavedGradientNoise
 #include "lighting.hlsli"
+#include "gi_sample.hlsli"
+
+// The share of the horizon fog colour this pass in-scatters as ambient. It has
+// been 0.2 since the pass was written and R1c does not change it — see the
+// ambient block in the march below for why that is the whole point.
+static const float VOLUMETRIC_AMBIENT_SCALE = 0.2;
 
 // dist = camera distance of the march sample. It stands in for view depth
 // when selecting a cascade: distance >= view depth, so at worst a farther
@@ -135,8 +171,32 @@ float4 PSMain(PSInput input) : SV_Target {
         float density = getFogDensity(pos);
 
         if (density > 0.001) {
-            // Ambient fog contribution (always active)
-            float3 ambientFog = fogColor * 0.2;
+            // Ambient fog contribution (always active).
+            //
+            // THE SKY AGREEMENT CONTRACT, and how R1c keeps it. This pass is an
+            // additive in-scatter layer over a scene that has already had
+            // surface fog applied by `applyAtmosphericFog` (fog.hlsli), and
+            // that function shares `hazeSunColor` with the skybox's aerial haze
+            // — which is what makes ground fog and sky meet exactly at the
+            // horizon. The volumetric layer stays inside that agreement by
+            // being a fixed FRACTION of the same `fogColor`, so it can never
+            // pull the fog band away from the colour the sky is drawing.
+            //
+            // So GI does NOT replace the colour: it becomes a per-channel GAIN
+            // around 1, measured against the very hemisphere ambient the probe
+            // sampler falls back to. Where the field has no answer — which
+            // includes everything past cascade 2, i.e. the horizon itself —
+            // giSampleVolume returns that hemisphere mean exactly, the ratio is
+            // exactly 1, and this term is bit-identical to the pre-R1c
+            // `fogColor * 0.2`. The contract therefore holds by construction
+            // rather than by tuning, and what GI buys is what it should: fog
+            // that darkens under an eave and warms in a lamp-lit street.
+            float3 ambientFog = fogColor * VOLUMETRIC_AMBIENT_SCALE;
+            if (giEnabled > 0.5) {
+                float3 reference = max((ambientSky + ambientGround) * 0.5, 1e-4);
+                float3 gain = giSampleVolume(pos, ambientSky, ambientGround) / reference;
+                ambientFog *= clamp(gain, 0.0, GI_VOLUME_MAX_GAIN);
+            }
 
             // God rays: inscattered light through unshadowed fog
             float3 inScatter = float3(0, 0, 0);

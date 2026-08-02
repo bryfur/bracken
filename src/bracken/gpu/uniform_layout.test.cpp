@@ -591,7 +591,7 @@ TEST(UniformLayout, StructuredBufferStridesMatchCpuRecords) {
         // this frame, and three compute passes read it. Its slot differs per
         // shader because the trace binds the whole acceleration structure ahead
         // of it and the blend passes bind almost nothing.
-        {"gi_probe_trace.comp.spv", 0, 16, "gpu::GiProbeUpdateRecord",
+        {"gi_probe_trace.comp.spv", 0, 12, "gpu::GiProbeUpdateRecord",
          sizeof(bracken::gpu::GiProbeUpdateRecord)},
         {"gi_probe_blend.comp.spv", 0, 2, "gpu::GiProbeUpdateRecord",
          sizeof(bracken::gpu::GiProbeUpdateRecord)},

@@ -70,7 +70,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         return;
     }
     GiProbeUpdate probe = giUpdates[tid.x];
-    int2 texel = giProbeStateTexel(int(probe.slot));
+    int2 texel = giProbeStateTexel(int(probe.slot), int(giCascadeIndex));
 
     // A freshly scrolled-in probe inherits nothing: its slot's offset belongs
     // to a different point in the world.
@@ -117,8 +117,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         // Already nudged as far as it is allowed to go and STILL mostly looking
         // at backfaces: this probe is inside something, and no offset inside
         // half a cell will get it out. Mark it; the blend passes stop writing
-        // it and R1c's sampler will drop it from the trilinear cage rather than
-        // let it leak a wall's interior into the street.
+        // it and gi_sample.hlsli drops it from the trilinear cage rather than
+        // letting it leak a wall's interior into the street.
         if (fraction > GI_INSIDE_BACKFACE_FRACTION && length(previousOffset) >= giMaxOffset * 0.99) {
             classification = GI_CLASS_INSIDE_GEOMETRY;
         }

@@ -92,7 +92,15 @@ float3 evaluatePBR(float3 normal, float3 view, float3 light, float3 lightColor,
 // reflection vector against the same hemisphere. AO multiplies the whole
 // ambient. All colors linear.
 float3 ambientPBR(float3 N, float3 V, float3 baseColor, float metallic, float roughness,
-                  float ao, float3 skyColor, float3 groundColor) {
+                  float ao, float3 skyColor, float3 groundColor,
+                  // Probe-field GI (R1c, render/gi/): when giWeight > 0 this
+                  // REPLACES the hemisphere diffuse irradiance below. It must
+                  // arrive already scaled by the caller's ambient lift, because
+                  // skyColor/groundColor are — see model.frag.hlsl's call.
+                  // The SPECULAR half keeps reading the hemisphere; R4 is what
+                  // changes that, not R1c. giWeight == 0 leaves the branch
+                  // untaken, so the GI-off path is bit-identical.
+                  float3 giIrradiance = float3(0, 0, 0), float giWeight = 0.0) {
     float NdotV = max(dot(N, V), 1e-4);
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metallic);
 
@@ -101,6 +109,9 @@ float3 ambientPBR(float3 N, float3 V, float3 baseColor, float metallic, float ro
     float3 F = fresnelSchlickRoughness(NdotV, F0, roughness);
     float3 kd = (1.0 - F) * (1.0 - metallic);
     float3 irradiance = lerp(groundColor, skyColor, N.y * 0.5 + 0.5);
+    if (giWeight > 0.0) {
+        irradiance = lerp(irradiance, giIrradiance, giWeight);
+    }
     float3 diffuse = kd * baseColor * irradiance;
 
     // Specular: Karis mobile split-sum fit (UE4 EnvBRDFApprox) against the
@@ -137,7 +148,13 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
                   // ray-traced reflection is about to supply instead. Adding
                   // both would count the same specular energy twice, which
                   // reads as blown-out metal.
-                  float specularScale = 1.0) {
+                  float specularScale = 1.0,
+                  // Probe-field GI (R1c, render/gi/): when giWeight > 0 this
+                  // REPLACES the irradiance-cube diffuse below. NOT pre-scaled
+                  // by the ambient lift — unlike ambientPBR's, this function
+                  // applies `ao * lift` to everything at the end. The specular
+                  // half is untouched until R4.
+                  float3 giIrradiance = float3(0, 0, 0), float giWeight = 0.0) {
     float NdotV = max(dot(N, V), 1e-4);
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metallic);
 
@@ -146,6 +163,9 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
     float3 F = fresnelSchlickRoughness(NdotV, F0, roughness);
     float3 kd = (1.0 - F) * (1.0 - metallic);
     float3 irradiance = irradianceMap.SampleLevel(irradianceSampler, N, 0).rgb;
+    if (giWeight > 0.0) {
+        irradiance = lerp(irradiance, giIrradiance, giWeight);
+    }
     float3 diffuse = kd * baseColor * irradiance;
 
     // Specular: prefiltered radiance along R at the roughness-matched mip,

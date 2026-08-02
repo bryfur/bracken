@@ -28,29 +28,35 @@ constexpr ShaderResources k_ubo1_samp5{.num_samplers = 5, .num_uniform_buffers =
 
 /// `model.frag` / `model_instanced.frag`: baseColor + shadow atlas (cmp + raw)
 /// + normal + metallic-roughness + emissive + screen AO + IBL (irradiance /
-/// prefiltered / BRDF LUT) + traced sun-shadow mask + local-shadow atlas = 12
-/// samplers; light data + cluster offsets + light indices + local-shadow slots
-/// = 4 storage buffers; lighting + shadow data + cluster params = 3 uniform
-/// buffers.
+/// prefiltered / BRDF LUT) + traced sun-shadow mask + GI (irradiance /
+/// visibility / probe metadata) + local-shadow atlas = 15 samplers; light data
+/// + cluster offsets + light indices + local-shadow slots = 4 storage buffers;
+/// lighting + shadow data + cluster params = 3 uniform buffers.
 ///
-/// The RT shadow mask is slot 10 and the local-shadow atlas moved to 11
-/// (`CLUSTER_SSBO_BINDING_BASE` = 12). It was previously multiplexed into the
-/// screen-AO texture's G channel on the belief that a 12th sampler failed DXC
-/// legalization; that does not reproduce — model.frag compiles clean at 12,
-/// and was verified up to 17.
+/// The RT shadow mask is slot 10, the probe field occupies 11-13 and the
+/// local-shadow atlas moved to 14 (`CLUSTER_SSBO_BINDING_BASE` = 15). The
+/// atlas stays LAST because cluster_lighting.hlsli declares it at
+/// `CLUSTER_SSBO_BINDING_BASE - 1`, which is the contract every one of these
+/// three rows depends on.
+///
+/// The RT mask was previously multiplexed into the screen-AO texture's G
+/// channel on the belief that a 12th sampler failed DXC legalization; that does
+/// not reproduce — model.frag compiles clean at 12, and was verified up to 17,
+/// which is also the headroom R1c's three GI slots were spent out of.
 constexpr ShaderResources k_fs_lit_model{
-    .num_samplers = 12, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 15, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `terrain.frag`: material array + splatmap + shadow atlas (cmp + raw) +
 /// screen AO + IBL (irradiance / prefiltered / BRDF LUT) + traced sun mask +
-/// local-shadow atlas.
+/// GI (irradiance / visibility / probe metadata) + local-shadow atlas.
 constexpr ShaderResources k_fs_lit_terrain{
-    .num_samplers = 10, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 13, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `grass.frag`: shadow atlas (cmp + raw) + screen AO + IBL (irradiance /
-/// prefiltered / BRDF LUT) + traced sun mask + local-shadow atlas.
+/// prefiltered / BRDF LUT) + traced sun mask + GI (irradiance / visibility /
+/// probe metadata) + local-shadow atlas.
 constexpr ShaderResources k_fs_lit_grass{
-    .num_samplers = 8, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 11, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `grass.vert` / `prepass_grass.vert`: heightmap + splatmap samplers, plus the
 /// visible-chunk origin buffer for the chunked LOD.
@@ -326,7 +332,7 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .vertex_shader = "fullscreen.vert.spv",
      .fragment_shader = "volumetric_fog.frag.spv",
      .vs = k_none,
-     .fs = k_ubo1_samp2, // depth + shadow atlas
+     .fs = k_ubo1_samp5, // depth + shadow atlas + the GI field's three atlases
      .vertex_layout = VertexLayout::None,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::RGBA16F,
@@ -810,17 +816,19 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // The widest binding block in the engine, and every entry earns its slot.
      // Sampled: the CSM atlas twice (comparison + raw, because it includes
      // shadow_common.hlsli verbatim rather than reimplementing the cascade
-     // math), the IBL sky-capture cube for ray misses, and all three cascades'
-     // irradiance atlases for the previous-frame bounce. Read-only storage
-     // textures: this cascade's relocation offsets plus all three cascades'
-     // probe states (so the bounce can reject a slot whose previous occupant
-     // has not been overwritten yet). Read-only storage buffers: the four
-     // acceleration-structure buffers, the per-triangle attributes that make a
-     // hit shadeable, the clustered-lighting byte buffer, and the frame's
-     // update list. One read-write buffer out: the per-ray radiance + signed
-     // distance the three passes below consume.
-     .resources = {.num_samplers = 6,
-                   .num_readonly_storage_textures = 4,
+     // math), the IBL sky-capture cube for ray misses, and the BANDED
+     // irradiance atlas for the previous-frame bounce — one texture holding
+     // every cascade since R1c (gi_math.hpp), where R1b bound three.
+     // Read-only storage textures: the relocation/classification plane and the
+     // probe-state plane, both banded for the same reason, so the bounce can
+     // reject a slot whose previous occupant has not been overwritten yet.
+     // Read-only storage buffers: the four acceleration-structure buffers, the
+     // per-triangle attributes that make a hit shadeable, the
+     // clustered-lighting byte buffer, and the frame's update list. One
+     // read-write buffer out: the per-ray radiance + signed distance the three
+     // passes below consume.
+     .resources = {.num_samplers = 4,
+                   .num_readonly_storage_textures = 2,
                    .num_readonly_storage_buffers = 7,
                    .num_readwrite_storage_buffers = 1,
                    .num_uniform_buffers = 1}},

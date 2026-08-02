@@ -2174,7 +2174,7 @@ Cbuffer mirror inventory (binding as annotated in the header). Every size below 
 | Struct | Binding | Size | Notable fields / defaults |
 |---|---|---|---|
 | `ModelTransformUniforms` | vertex set 1, b0 | 288 | `model/view/projection/normalMatrix`, `cameraPos`, `paletteOffset` at offset 272 + 12-byte pad (index into the frame's bone-palette SSBO; read only by `skinned_model.vert.hlsl`) |
-| `ModelLightingUniforms` | fragment set 3, b0 | 224 | hemisphere ambient (`ambientSky`/`ambientGround`), fog params, PBR factors (`roughnessFactor = 0.85`), `alphaCutoff = 0` (0 disables MASK alpha test), `screenAOTexelX/Y` (SV_Position → screen-AO UV), `iblEnabled` (sky-IBL vs hemisphere ambient), `screenAOEnabled` (0 for MASK/BLEND — no background-AO bleed onto foliage) |
+| `ModelLightingUniforms` | fragment set 3, b0 | 304 | hemisphere ambient (`ambientSky`/`ambientGround`), fog params, PBR factors (`roughnessFactor = 0.85`), `alphaCutoff = 0` (0 disables MASK alpha test), `screenAOTexelX/Y` (SV_Position → screen-AO UV), `iblEnabled` (sky-IBL vs hemisphere ambient), `screenAOEnabled` (0 for MASK/BLEND — no background-AO bleed onto foliage), the RT-reflection handover window, and R1c's probe-field block (`giCascadeBase[3]` + `giEnabled`) |
 | `SkyboxFragmentUniforms` | fragment set 3, b0 | 192 | `invViewProjection`, sun/zenith/horizon/ground/fog colors + cloud coverage/density/scale + haze strength (linear, from `bracken::render::EnvironmentState`) |
 | `SkyCaptureUniforms` | fragment set 3, b0 | 176 | IBL sky-capture face basis (`faceForward/Right/Up`) + the same atmosphere/cloud fields as the skybox; `time` is the sky-time snapshot at refresh start so all six faces render one cloud state |
 | `IblFilterUniforms` | fragment set 3, b0 | 48 | face basis + `roughness` (specular prefilter mip; ignored by irradiance) + `sourceSize` (mip-bias) |
@@ -2186,7 +2186,7 @@ Cbuffer mirror inventory (binding as annotated in the header). Every size below 
 | `UIScreenUniforms` | vertex set 1, b0 | 16 | `width`, `height` |
 | `UIFragmentUniforms` | fragment set 3, b0 | 16 | `hasTexture` + 3 named int pads |
 | `InstancedCameraUniforms` | vertex set 1, b0 | 144 | shared by `model_instanced.vert.hlsl` and `particle.vert.hlsl` |
-| `InstancedLightingUniforms` | fragment set 3, b0 | 208 | `ModelLightingUniforms` minus `tintColor` (tint is per-instance) |
+| `InstancedLightingUniforms` | fragment set 3, b0 | 288 | `ModelLightingUniforms` minus `tintColor` (tint is per-instance) |
 | `InstancedShadowUniforms` | vertex set 1, b0 | 64 | `lightViewProjection` |
 | `ShadowTransformUniforms` | vertex set 1, b0 | 128 | `lightViewProjection`, `model` |
 | `ShadowSkinnedTransformUniforms` | vertex set 1, b0 | 144 | + `paletteOffset` |
@@ -2215,7 +2215,7 @@ Cbuffer mirror inventory (binding as annotated in the header). Every size below 
 | `GiProbeClassifyUniforms` | **compute** set 2, b0 | 32 | `probeCount`, `rayCount`, `cascadeIndex` (which counter slot to accumulate into), `maxOffset`, `probeSpacing`, `frameIndex` |
 | `BloomDownsampleUniforms` | fragment set 3, b0 | 32 | `threshold = 0.8` compared against **post-exposure** luminance; `isFirstPass = 1`, `exposure = 1` |
 | `BloomUpsampleUniforms` | fragment set 3, b0 | 16 | `bloomRadius = 1` |
-| `VolumetricFogUniforms` | fragment set 3, b0 | 448 | per-cascade matrices/bias for god rays; defaults `fogDensity = 0.0015`, `scatterStrength = 0.25`, `fogHeight = 100`, `fogFalloff = 0.005`, `startDist = 100`, `maxDist = 3000`, `godRaysEnabled = 1` |
+| `VolumetricFogUniforms` | fragment set 3, b0 | 544 | per-cascade matrices/bias for god rays; defaults `fogDensity = 0.0015`, `scatterStrength = 0.25`, `fogHeight = 100`, `fogFalloff = 0.005`, `startDist = 100`, `maxDist = 3000`, `godRaysEnabled = 1` |
 | (clustered lighting) | fragment set 3, b2 | 192 | defined by `render::lighting::ClusterParams` (`light_cluster.hpp`) — `SceneRenderer` pushes that struct directly; `gpu_uniforms.hpp` deliberately carries no mirror |
 
 Storage-buffer record structs (tight std430-style packing, no `alignas(16)`, no cbuffer padding rules):
@@ -2484,7 +2484,7 @@ Within a set, storage-buffer slots begin immediately after the shader's sampled 
 
 CPU-side slot mapping: `SDL_PushGPUVertexUniformData(cmd, i, ...)` → `(i, 1)`; `SDL_PushGPUFragmentUniformData(cmd, i, ...)` → `(i, 3)`; `SDL_BindGPUVertexStorageBuffers` / `SDL_BindGPUFragmentStorageBuffers(pass, first, ...)` → set-0/set-2 storage slots relative to the sampler count; `SDL_BindGPUFragmentSamplers(pass, first, ...)` → `(first.., 2)`.
 
-`cluster_lighting.hlsli` codifies this for clustered lighting: the including fragment shader must `#define CLUSTER_SSBO_BINDING_BASE <its sampler count>` first (compile-time `#error` otherwise); the include then declares `ClusterParamsCB` at `(2, 3)`, the local-shadow atlas + comparison sampler at the shader's LAST sampler slot (`BASE-1`, set 2), and four SSBOs (`lightDataBuf` ByteAddressBuffer, `clusterOffsetsBuf StructuredBuffer<uint2>`, `lightIndicesBuf StructuredBuffer<uint>`, `localShadowSlots StructuredBuffer<LocalShadowSlot>`) at set-2 slots `BASE+0..3`, matched by `SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4)` on the CPU. Slot `(2,3)`, the last sampler, and those four set-2 bindings are reserved in every cluster-lit shader (`model.frag` base 12, `model_instanced.frag` 12, `terrain.frag` 10, `grass.frag` 8). The preceding slot is the RT sun-visibility mask (10/8/6 respectively), with a white dummy while disabled.
+`cluster_lighting.hlsli` codifies this for clustered lighting: the including fragment shader must `#define CLUSTER_SSBO_BINDING_BASE <its sampler count>` first (compile-time `#error` otherwise); the include then declares `ClusterParamsCB` at `(2, 3)`, the local-shadow atlas + comparison sampler at the shader's LAST sampler slot (`BASE-1`, set 2), and four SSBOs (`lightDataBuf` ByteAddressBuffer, `clusterOffsetsBuf StructuredBuffer<uint2>`, `lightIndicesBuf StructuredBuffer<uint>`, `localShadowSlots StructuredBuffer<LocalShadowSlot>`) at set-2 slots `BASE+0..3`, matched by `SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4)` on the CPU. Slot `(2,3)`, the last sampler, and those four set-2 bindings are reserved in every cluster-lit shader (`model.frag` base 15, `model_instanced.frag` 15, `terrain.frag` 13, `grass.frag` 11). The three slots preceding the local-shadow atlas are the probe-field GI atlases `gi_sample.hlsli` reads — irradiance and visibility (linear clamp) plus the per-probe metadata plane (point clamp) — at 11–13 / 11–13 / 9–11 / 7–9 respectively; below those is the RT sun-visibility mask (10/10/8/6), with a white dummy while disabled.
 
 ### CPU↔GPU uniform contract — `src/bracken/gpu/gpu_uniforms.hpp`
 
@@ -2493,9 +2493,9 @@ Every cbuffer has an `alignas(16)` CPU mirror annotated with its `(set, binding)
 | CPU struct | (set, binding) | Shader cbuffer | Size |
 |---|---|---|---|
 | `ModelTransformUniforms` | (1, b0) | `model.vert` / `skinned_model.vert` `TransformUniforms` | 288 |
-| `ModelLightingUniforms` | (3, b0) | `model.frag` `LightingUniforms` | 224 (`iblEnabled` at offset 216) |
+| `ModelLightingUniforms` | (3, b0) | `model.frag` `LightingUniforms` | 304 (`iblEnabled` at 216, `giCascadeBase` at 240, `giEnabled` at 288) |
 | `InstancedCameraUniforms` | (1, b0) | `model_instanced.vert` / `particle.vert` `CameraUniforms` | 144 |
-| `InstancedLightingUniforms` | (3, b0) | `model_instanced.frag` (no `tintColor` — per-instance) | 208 (`iblEnabled` at offset 200) |
+| `InstancedLightingUniforms` | (3, b0) | `model_instanced.frag` (no `tintColor` — per-instance) | 288 (`iblEnabled` at 200, `giCascadeBase` at 224, `giEnabled` at 272) |
 | `SkyboxFragmentUniforms` | (3, b0) | `skybox.frag` `SkyUniforms` | 192 |
 | `SkyCaptureUniforms` | (3, b0) | `sky_capture.frag` `SkyCaptureUniforms` | 176 |
 | `IblFilterUniforms` | (3, b0) | `ibl_prefilter.frag` / `ibl_irradiance.frag` `IblFilterUniforms` | 48 |
@@ -2529,7 +2529,7 @@ Every cbuffer has an `alignas(16)` CPU mirror annotated with its `(set, binding)
 | `FxaaUniforms` | (3, b0) | `fxaa.frag` | 16 |
 | `BloomDownsampleUniforms` | (3, b0) | `bloom_downsample.frag` | 32 |
 | `BloomUpsampleUniforms` | (3, b0) | `bloom_upsample.frag` | 16 |
-| `VolumetricFogUniforms` | (3, b0) | `volumetric_fog.frag` | 448 |
+| `VolumetricFogUniforms` | (3, b0) | `volumetric_fog.frag` | 544 |
 | `ExposureHistogramUniforms` | compute (2, b0) | `exposure_histogram.comp` | 16 |
 | `ExposureAdaptUniforms` | compute (2, b0) | `exposure_adapt.comp` | 48 |
 | `ParticleFragmentUniforms` | (3, b0) | `particle.frag` | 16 |
@@ -3892,7 +3892,7 @@ class TerrainRenderer {                                   // bracken::render
 
 `TerrainTransformUniforms` (vertex uniform slot 0, 144 B, `alignas(16)`): `mat4 view` (0), `mat4 projection` (64), `vec3 cameraPos` (128), `float _padding0`. Pinned against `terrain.vert.hlsl` `TransformUniforms` by static_asserts.
 
-`TerrainLightingUniforms` (fragment uniform slot 0, 144 B, `alignas(16)`, pinned by static_asserts) — each vec3+float pair fills one 16-byte register: `fogColorHorizon/fogStart` (0/12), `fogColorSun/fogEnd` (16/28), `lightDir/fogHeightFalloff` (32/44), `cameraPos/screenAOTexelX` (48/60), `ambientSky/ambientStrength` (64/76), `ambientGround/sunIntensity` (80/92), `sunColor/screenAOTexelY` (96/108), `splat_params` (`glm::vec4`, offset 112) — `xy` = splat region origin (world XZ), `zw` = region X/Z size, so non-square/offset worlds map the splatmap correctly — `iblEnabled` (offset 128; 1 = sky-IBL ambient, samplers 5–7), `rtShadowEnabled` (132; traced mask at sampler 8 replaces CSM), then 8-byte pad.
+`TerrainLightingUniforms` (fragment uniform slot 0, 208 B, `alignas(16)`, pinned by static_asserts) — each vec3+float pair fills one 16-byte register: `fogColorHorizon/fogStart` (0/12), `fogColorSun/fogEnd` (16/28), `lightDir/fogHeightFalloff` (32/44), `cameraPos/screenAOTexelX` (48/60), `ambientSky/ambientStrength` (64/76), `ambientGround/sunIntensity` (80/92), `sunColor/screenAOTexelY` (96/108), `splat_params` (`glm::vec4`, offset 112) — `xy` = splat region origin (world XZ), `zw` = region X/Z size, so non-square/offset worlds map the splatmap correctly — `iblEnabled` (offset 128; 1 = sky-IBL ambient, samplers 5–7), `rtShadowEnabled` (132; traced mask at sampler 8 replaces CSM), 8-byte pad, then the probe-field GI block R1c added: `giCascadeBase[3]` (`glm::ivec4`, each cascade's window-corner probe coordinate) and `giEnabled` + three named pads (144/192).
 
 `gpu::ShadowTerrainUniforms` (`src/bracken/gpu/gpu_uniforms.hpp`, vertex slot 0 of the shadow pass): a single `alignas(16) glm::mat4 lightViewProjection`.
 
@@ -3962,7 +3962,7 @@ Pipeline: `PipelineType::Terrain` — vertex shader `terrain.vert.spv`, fragment
 | Slot | Stage | Content | Pushed/bound by |
 |---|---|---|---|
 | vertex uniform 0 | VS | `TerrainTransformUniforms` | `render()` |
-| fragment uniform 0 | FS | `TerrainLightingUniforms` (144 B) | `render()` |
+| fragment uniform 0 | FS | `TerrainLightingUniforms` (208 B) | `render()` |
 | fragment uniform 1 | FS | `ShadowDataUniforms` block (`shadow_common.hlsli` cbuffer) | **caller** — `SceneRenderer::render_3d_scene` pushes `frame_shadow_uniforms_` before calling `render()` |
 | fragment uniform 2 | FS | cluster params (`cluster_lighting.hlsli`) | `render()`, only when all four `set_cluster_lighting` pointers are non-null |
 | fragment sampler 0 | FS | material `Texture2DArray` + anisotropic sampler | `render()` |
@@ -3972,7 +3972,7 @@ Pipeline: `PipelineType::Terrain` — vertex shader `terrain.vert.spv`, fragment
 
 Skip conditions (all silent-with-log or fully silent): missing pipeline registry/buffers/pass/cmd (silent return); textures or sampler not ready (`SDL_Log`, return); pipeline lookup failure (`SDL_Log`, return).
 
-HLSL binding spaces (SDL3 GPU SPIR-V convention): FS combined image samplers in set 2 bindings 0–8 (material array, splatmap, shadow atlas ×2, screen AO, IBL irradiance/prefiltered/BRDF LUT, local-shadow atlas); FS cbuffers in set 3 (`LightingUniforms` b0, `ShadowUniforms` b1); the four cluster SSBOs follow the 9 samplers in set 2 (`CLUSTER_SSBO_BINDING_BASE 9`). VS cbuffer set 1 binding 0.
+HLSL binding spaces (SDL3 GPU SPIR-V convention): FS combined image samplers in set 2 bindings 0–12 (material array, splatmap, shadow atlas ×2, screen AO, IBL irradiance/prefiltered/BRDF LUT, RT sun mask, GI irradiance/visibility/probe metadata, local-shadow atlas); FS cbuffers in set 3 (`LightingUniforms` b0, `ShadowUniforms` b1); the four cluster SSBOs follow the 13 samplers in set 2 (`CLUSTER_SSBO_BINDING_BASE 13`). VS cbuffer set 1 binding 0.
 
 #### Fragment shading algorithm (`terrain.frag.hlsl`)
 
@@ -4073,7 +4073,7 @@ Binding contract:
 | vertex uniform 0 | VS | `GrassVertexUniforms` (304 B) | `render()` |
 | vertex samplers 0–1 | VS | heightmap; splatmap (**slot 1 is always bound** — the heightmap texture is substituted when no splatmap is set and the shader ignores it via `splatEnabled == 0`) | `render()` |
 | vertex storage 0 | VS | `StructuredBuffer<float4> ChunkOrigins` | `render()` |
-| fragment uniform 0 | FS | `GrassLightingUniforms` (128 B) | `render()` |
+| fragment uniform 0 | FS | `GrassLightingUniforms` (192 B) | `render()` |
 | fragment uniform 1 | FS | shadow data block | **caller** (`SceneRenderer::render_3d_scene`) |
 | fragment uniform 2 | FS | cluster params | `render()` (only when all cluster pointers non-null) |
 | fragment samplers 0–1 | FS | shadow atlas (cmp + raw) | `render()` from caller bindings |
@@ -4081,7 +4081,7 @@ Binding contract:
 
 Draw call: `SDL_DrawGPUIndexedPrimitives(pass, 24, visible_chunks * 144, 0, 0, 0)` — one instanced draw for the whole meadow.
 
-HLSL binding spaces: VS set 0 = 2 combined image samplers (bindings 0–1) then the storage buffer at binding 2; VS cbuffer set 1 b0. FS samplers set 2 bindings 0–6 (shadow atlas ×2, screen AO, IBL irradiance/prefiltered/BRDF LUT, local-shadow atlas); FS cbuffers set 3 (b0 lighting, b1 shadow); the four cluster SSBOs at `CLUSTER_SSBO_BINDING_BASE 7` in set 2.
+HLSL binding spaces: VS set 0 = 2 combined image samplers (bindings 0–1) then the storage buffer at binding 2; VS cbuffer set 1 b0. FS samplers set 2 bindings 0–10 (shadow atlas ×2, screen AO, IBL irradiance/prefiltered/BRDF LUT, RT sun mask, GI irradiance/visibility/probe metadata, local-shadow atlas); FS cbuffers set 3 (b0 lighting, b1 shadow); the four cluster SSBOs at `CLUSTER_SSBO_BINDING_BASE 11` in set 2.
 
 #### `GrassVertexUniforms` layout (304 B, pinned by static_asserts; the trailing `curr_vp_no_jitter`/`prev_vp_no_jitter` mat4 pair at offsets 176/240 feeds the depth-prepass velocity output and is ignored by the forward shader)
 
@@ -4099,7 +4099,7 @@ HLSL binding spaces: VS set 0 = 2 combined image samplers (bindings 0–1) then 
 | `camera_forward` | 148 | `-vec3(view[0][2], view[1][2], view[2][2])`; packs into the last 12 bytes of the register at 144 — the header warns that inserting any scalar before it silently desynchronizes CPU/GPU (`splat_params` then starts a fresh register at 160 on both sides) |
 | `splat_params` | 160 | `glm::vec4`: xy = splat region origin (world XZ), zw = region X/Z size — non-square worlds handled |
 
-`GrassLightingUniforms` (128 B) mirrors the terrain lighting block with grass field ordering: `camera_pos/fog_start`, `fog_color_horizon/fog_end`, `fog_color_sun/fog_height_falloff`, `light_dir/ambient_strength`, `sun_color/sun_intensity`, `ambient_sky/screen_ao_texel_x`, `ambient_ground/screen_ao_texel_y`, then `ibl_enabled` (offset 112), `rt_shadow_enabled` (116; traced mask at sampler 6 replaces CSM), and 8-byte pad — all pinned by static_asserts.
+`GrassLightingUniforms` (192 B) mirrors the terrain lighting block with grass field ordering: `camera_pos/fog_start`, `fog_color_horizon/fog_end`, `fog_color_sun/fog_height_falloff`, `light_dir/ambient_strength`, `sun_color/sun_intensity`, `ambient_sky/screen_ao_texel_x`, `ambient_ground/screen_ao_texel_y`, then `ibl_enabled` (offset 112), `rt_shadow_enabled` (116; traced mask at sampler 6 replaces CSM), 8-byte pad, then the probe-field GI block R1c added: `giCascadeBase[3]` (`glm::ivec4`, each cascade's window-corner probe coordinate) and `giEnabled` + three named pads (128/176) — all pinned by static_asserts.
 
 #### Vertex shader algorithm (`grass.vert.hlsl`)
 
@@ -4982,7 +4982,7 @@ This chapter specifies the shading algorithm applied to every model draw in the 
 
 Include chains (relevant to symbol availability):
 
-- `model.frag.hlsl` and `model_instanced.frag.hlsl` include, in order: `shadow_common.hlsli` (which itself includes `lighting.hlsli` for `interleavedGradientNoise`), `fog.hlsli`, `lighting.hlsli`, `pbr.hlsli`, then — after `#define CLUSTER_SSBO_BINDING_BASE 12` (= the fragment sampler count; the include itself declares the 12th sampler, the local-shadow atlas, at slot 11) — `cluster_lighting.hlsli`.
+- `model.frag.hlsl` and `model_instanced.frag.hlsl` include, in order: `shadow_common.hlsli` (which itself includes `lighting.hlsli` for `interleavedGradientNoise`), `fog.hlsli`, `lighting.hlsli`, `pbr.hlsli`, then — after `#define CLUSTER_SSBO_BINDING_BASE 15` (= the fragment sampler count; the include itself declares the 15th sampler, the local-shadow atlas, at slot 14) — `gi_sample.hlsli` and `cluster_lighting.hlsli`.
 - Direct `#include "lighting.hlsli"` consumers: `model.frag.hlsl`, `model_instanced.frag.hlsl`, `terrain.frag.hlsl`, `grass.frag.hlsl`, `skybox.frag.hlsl`, `composite.frag.hlsl`, and `shadow_common.hlsli` (which propagates it to every shadow-receiving shader). Both `.hlsli` libraries are include-guarded (`PBR_HLSLI`, `LIGHTING_HLSLI`), so the double inclusion via `shadow_common.hlsli` is harmless.
 - Direct `pbr.hlsli` consumer besides `clusters.hlsli`: none in the model family; `terrain.frag.hlsl` and `grass.frag.hlsl` also reach it via `cluster_lighting.hlsli`.
 
@@ -5167,8 +5167,9 @@ Position, normal (`w = 0`), and tangent (`w = 0`) are all transformed by the sam
 | set 2, sampler 6 | `screenAOTexture` (full-res R8 GTAO; 1×1 white dummy when AO off / BLEND draws) |
 | set 2, samplers 7–9 | `iblIrradianceMap` / `iblSpecularMap` (cubes) + `iblBrdfLut` (typed dummies when IBL off) |
 | set 2, sampler 10 | `rtShadowTexture` (R8 ray-traced sun visibility, 1 = lit, at the traced pass's OWN resolution — sample with a normalized UV; 1×1 white dummy when ray tracing is off, and read only when `rtShadowEnabled`) |
-| set 2, sampler 11 | `localShadowAtlas` + `SamplerComparisonState` (declared by `cluster_lighting.hlsli` at `CLUSTER_SSBO_BINDING_BASE − 1`; CSM atlas as filler when local shadows are unavailable) |
-| set 2, storage buffers 0–3 | cluster light data / offsets / indices / local-shadow slots (`CLUSTER_SSBO_BINDING_BASE = 12` for `model.frag` / `model_instanced.frag`, i.e. immediately after their 12 samplers per SDL GPU's set-2 layout: sampled textures, then storage textures, then storage buffers. Slot 10 is the ray-traced sun-visibility mask, slot 11 the local-shadow atlas) |
+| set 2, samplers 11–13 | probe-field GI: `giIrradianceAtlas` + `giVisibilityAtlas` (linear clamp) and `giProbeMeta` (point clamp), read by `gi_sample.hlsli`; 1×1 black dummies and `giEnabled == 0` when GI is off |
+| set 2, sampler 14 | `localShadowAtlas` + `SamplerComparisonState` (declared by `cluster_lighting.hlsli` at `CLUSTER_SSBO_BINDING_BASE − 1`; CSM atlas as filler when local shadows are unavailable) |
+| set 2, storage buffers 0–3 | cluster light data / offsets / indices / local-shadow slots (`CLUSTER_SSBO_BINDING_BASE = 15` for `model.frag` / `model_instanced.frag`, i.e. immediately after their 15 samplers per SDL GPU's set-2 layout: sampled textures, then storage textures, then storage buffers. Slot 10 is the ray-traced sun-visibility mask, 11–13 the probe field, 14 the local-shadow atlas) |
 
 Per-fragment algorithm, in order (`PSMain`):
 

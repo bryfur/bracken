@@ -1,9 +1,9 @@
 // gi_probe_trace.comp.hlsl - one thread per (probe scheduled this frame, ray).
 //
 // Phase R1b of docs/rt_lighting_plan.md §5.2: the probe field stops being an
-// empty structure and starts holding radiance. NOTHING SAMPLES IT YET — the
-// forward pass and the fog march adopt it in R1c — so this pass must leave the
-// rendered image bit-identical while doing all of the work.
+// empty structure and starts holding radiance. Since R1c the forward pass and
+// the fog march sample what this writes (shaders/gi_sample.hlsli), so an error
+// here is now visible rather than merely stored.
 //
 // THE BUDGET IS THE POINT. Every other traced signal in this engine costs rays
 // per PIXEL; this one costs rays per FRAME, fixed, chosen by GiQuality and
@@ -39,9 +39,9 @@
 //
 // UNITS. The atlas stores COSINE-WEIGHTED MEAN INCOMING RADIANCE, i.e.
 // irradiance/pi — deliberately the same convention as the IBL irradiance cube
-// (`ibl_irradiance.frag.hlsl` stores (1/pi) * integral of L*cos), so R1c's
-// consumer can substitute one for the other without a scale factor appearing
-// anywhere. That is why the shading below divides by pi once and multiplies the
+// (`ibl_irradiance.frag.hlsl` stores (1/pi) * integral of L*cos), which is what
+// lets gi_sample.hlsli substitute one for the other without a scale factor
+// appearing anywhere. That is why the shading below divides by pi once and multiplies the
 // sampled bounce by pi once.
 
 #include "gi_probe.hlsli"
@@ -127,7 +127,7 @@ cbuffer GiProbeTraceUniforms : register(b0, space2) {
 // validates cleanly and then binds the wrong resource to every slot.
 // ---------------------------------------------------------------------------
 
-// --- sampled (6) ---
+// --- sampled (4) ---
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
 Texture2D shadowAtlas : register(t0, space0);
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
@@ -143,40 +143,32 @@ SamplerState shadowRawSampler : register(s1, space0);
 TextureCube giSkyCube : register(t2, space0);
 [[vk::combinedImageSampler]][[vk::binding(2, 0)]]
 SamplerState giSkySampler : register(s2, space0);
+// The BANDED irradiance atlas: every cascade in one texture, cascade c at rows
+// [c * GI_ATLAS_ROWS, (c+1) * GI_ATLAS_ROWS). R1c's repack — see gi_math.hpp.
 [[vk::combinedImageSampler]][[vk::binding(3, 0)]]
-Texture2D<float4> giIrradiance0 : register(t3, space0);
+Texture2D<float4> giIrradiance : register(t3, space0);
 [[vk::combinedImageSampler]][[vk::binding(3, 0)]]
-SamplerState giIrradiance0Sampler : register(s3, space0);
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]]
-Texture2D<float4> giIrradiance1 : register(t4, space0);
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]]
-SamplerState giIrradiance1Sampler : register(s4, space0);
-[[vk::combinedImageSampler]][[vk::binding(5, 0)]]
-Texture2D<float4> giIrradiance2 : register(t5, space0);
-[[vk::combinedImageSampler]][[vk::binding(5, 0)]]
-SamplerState giIrradiance2Sampler : register(s5, space0);
+SamplerState giIrradianceSampler : register(s3, space0);
 
-// --- read-only storage textures (4) ---
-// This cascade's per-probe relocation offset (xyz) + classification (w).
-[[vk::binding(6, 0)]] Texture2D<float4> giProbeOffset : register(t6, space0);
-// Every cascade's scheduling state, so the bounce sample can reject a probe
-// whose storage still holds the previous occupant of its slot.
-[[vk::binding(7, 0)]] Texture2D<uint> giProbeState0 : register(t7, space0);
-[[vk::binding(8, 0)]] Texture2D<uint> giProbeState1 : register(t8, space0);
-[[vk::binding(9, 0)]] Texture2D<uint> giProbeState2 : register(t9, space0);
+// --- read-only storage textures (2) ---
+// Per-probe relocation offset (xyz) + classification (w), all cascades banded.
+[[vk::binding(4, 0)]] Texture2D<float4> giProbeOffset : register(t4, space0);
+// Per-probe scheduling state, all cascades banded, so the bounce sample can
+// reject a probe whose storage still holds the previous occupant of its slot.
+[[vk::binding(5, 0)]] Texture2D<uint> giProbeState : register(t5, space0);
 
 // --- read-only storage buffers (7) ---
-[[vk::binding(10, 0)]] StructuredBuffer<BvhNodeGpu> tlasNodes : register(t10, space0);
-[[vk::binding(11, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t11, space0);
-[[vk::binding(12, 0)]] StructuredBuffer<BvhNodeGpu> blasNodes : register(t12, space0);
-[[vk::binding(13, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t13, space0);
-[[vk::binding(14, 0)]] StructuredBuffer<TriangleAttributes> blasAttributes : register(t14, space0);
+[[vk::binding(6, 0)]] StructuredBuffer<BvhNodeGpu> tlasNodes : register(t6, space0);
+[[vk::binding(7, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t7, space0);
+[[vk::binding(8, 0)]] StructuredBuffer<BvhNodeGpu> blasNodes : register(t8, space0);
+[[vk::binding(9, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t9, space0);
+[[vk::binding(10, 0)]] StructuredBuffer<TriangleAttributes> blasAttributes : register(t10, space0);
 // The clustered-lighting buffer, read WITHOUT the cluster grid: a probe-ray hit
 // is a world-space point and the froxel grid is screen-space, so the only
 // correct traversal here is the flat list. Fine at probe-ray counts — the loop
 // is <= 256 range-rejected tests, against a BVH descent that costs far more.
-[[vk::binding(15, 0)]] ByteAddressBuffer lightDataBuf : register(t15, space0);
-[[vk::binding(16, 0)]] StructuredBuffer<GiProbeUpdate> giUpdates : register(t16, space0);
+[[vk::binding(11, 0)]] ByteAddressBuffer lightDataBuf : register(t11, space0);
+[[vk::binding(12, 0)]] StructuredBuffer<GiProbeUpdate> giUpdates : register(t12, space0);
 
 // --- read-write (set 1) ---
 // rgb = outgoing radiance at the hit (or the sky on a miss); w = hit distance,
@@ -218,10 +210,7 @@ float3 giSkyRadiance(float3 dir) {
 // ---------------------------------------------------------------------------
 
 uint giLoadState(int cascade, int slot) {
-    int2 t = giProbeStateTexel(slot);
-    if (cascade == 0) return giProbeState0.Load(int3(t, 0)).x;
-    if (cascade == 1) return giProbeState1.Load(int3(t, 0)).x;
-    return giProbeState2.Load(int3(t, 0)).x;
+    return giProbeState.Load(int3(giProbeStateTexel(slot, cascade), 0)).x;
 }
 
 float3 giLoadIrradiance(int cascade, int slot, float3 dir) {
@@ -229,14 +218,9 @@ float3 giLoadIrradiance(int cascade, int slot, float3 dir) {
     // lands exactly on the seam between the border texel and payload texel 0 —
     // which is the whole reason the border exists, and why this is a bilinear
     // sample rather than a Load.
-    const float2 atlasSize =
-        float2(GI_PROBES_PER_ATLAS_ROW * GI_IRRADIANCE_TILE, GI_ATLAS_ROWS * GI_IRRADIANCE_TILE);
-    float2 texel = float2(giProbeAtlasOrigin(slot, GI_IRRADIANCE_TILE)) + float(GI_BORDER) +
+    float2 texel = float2(giProbeAtlasOrigin(slot, GI_IRRADIANCE_TILE, cascade)) + float(GI_BORDER) +
                    giOctEncode(dir) * float(GI_IRRADIANCE_PAYLOAD);
-    float2 uv = texel / atlasSize;
-    if (cascade == 0) return giIrradiance0.SampleLevel(giIrradiance0Sampler, uv, 0).rgb;
-    if (cascade == 1) return giIrradiance1.SampleLevel(giIrradiance1Sampler, uv, 0).rgb;
-    return giIrradiance2.SampleLevel(giIrradiance2Sampler, uv, 0).rgb;
+    return giIrradiance.SampleLevel(giIrradianceSampler, texel / giAtlasSize(GI_IRRADIANCE_TILE), 0).rgb;
 }
 
 /// Cosine-weighted mean incoming radiance at `P` for a surface facing `N`,
@@ -247,8 +231,8 @@ float3 giLoadIrradiance(int cascade, int slot, float3 dir) {
 /// contributes almost nothing. R1b deliberately does NOT apply the Chebyshev
 /// visibility test here: this is a secondary bounce feeding a heavily filtered
 /// EMA, the visibility moments are themselves still converging while the field
-/// fills, and the leak it prevents is one bounce deep. R1c's primary sampler —
-/// the one whose leaks a player would see — applies it.
+/// fills, and the leak it prevents is one bounce deep. The PRIMARY sampler
+/// (gi_sample.hlsli) — the one whose leaks a player would see — applies it.
 float3 giSampleIrradiance(float3 P, float3 N) {
     for (int c = 0; c < GI_CASCADE_COUNT; ++c) {
         float sp = giCascadeSpacing(c);
@@ -379,7 +363,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // the lattice position; the classify pass writes it a fresh one.
     float3 offset = float3(0, 0, 0);
     if ((probe.flags & GI_UPDATE_FLAG_UNINITIALIZED) == 0u) {
-        offset = giProbeOffset.Load(int3(giProbeStateTexel(probe.slot), 0)).xyz;
+        offset = giProbeOffset.Load(int3(giProbeStateTexel(int(probe.slot), int(giCascadeIndex)), 0)).xyz;
     }
     float3 origin = probe.worldPosition + offset;
     float3 dir = giRayDirection(tid.x, giRayCount, giFrameIndex);

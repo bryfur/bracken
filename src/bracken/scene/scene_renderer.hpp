@@ -12,6 +12,7 @@
 #include "bracken/contracts/render_stats.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
+#include "bracken/render/gi/gi_bindings.hpp"
 #include "bracken/render/gi/probe_volume.hpp"
 #include "bracken/render/rt_renderer.hpp"
 #include "bracken/render/lighting/local_shadows.hpp"
@@ -455,6 +456,11 @@ private:
     // shaders always declare the slots (terrain/grass receive the same
     // bindings through their render() parameters instead).
     void bind_ibl(uint32_t base_slot);
+    /// Bind the probe field's three atlases as one contiguous run starting at
+    /// `base_slot` (model family; terrain/grass take `frame_gi_` by pointer).
+    void bind_gi(uint32_t base_slot);
+    /// Rebuild `frame_gi_` from the probe volume, or fill it with dummies.
+    void refresh_gi_bindings();
 
     // Setup
     void init_pipelines();
@@ -776,6 +782,14 @@ private:
     // Sky IBL is active this frame: settings flag on AND the prefilter chain
     // is alive. Drives the iblEnabled uniform flag of every scene shader.
     bool frame_ibl_active_ = false;
+
+    // The probe field's three atlas bindings + per-cascade window corners for
+    // this frame's forward draws and the fog march, or dummies with
+    // `enabled == 0` when GI is off. Rebuilt once per frame, right after the
+    // update passes, so every consumer in the frame reads ONE snapshot — a
+    // pixel shaded against cascade bases the volume has since scrolled past
+    // would sample the wrong probes.
+    render::gi::GiBindings frame_gi_{};
 
     // motion_id -> previous-frame state (model matrix, palette offset).
     MotionHistory motion_history_;

@@ -686,6 +686,10 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     // Sky IBL drives every scene shader's iblEnabled flag (the IBL sampler
     // slots are bound either way — dummies when inactive).
     frame_ibl_active_ = plan.ibl_active;
+    // Same reasoning as the ray-tracing state above: a stale `enabled` plus a
+    // stale atlas handle would keep lighting the scene from a field that has
+    // been destroyed. Cleared here, filled by refresh_gi_bindings() below.
+    frame_gi_ = render::gi::GiBindings{};
     // Always render 3D through the HDR offscreen target so scene lighting stays
     // in linear HDR; the composite pass tonemaps + gamma-corrects to the swapchain.
     const bool use_hdr_path = plan.use_hdr_path;
@@ -1131,6 +1135,13 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 probe_volume_.reset();
                 gi_init_failed_ = false;
             }
+            // ONE snapshot of the field for the whole frame (R1c). Taken after
+            // the update passes rather than before, so the cascade bases a
+            // forward draw uses are the ones the atlases were just written
+            // against; taken unconditionally, because the slots are declared by
+            // every scene shader and SDL3 GPU leaves an unbound fragment
+            // sampler descriptor undefined.
+            refresh_gi_bindings();
 
             // Ray-traced sun shadows. The mask is its own R8 texture on its
             // own fragment sampler slot; it does NOT touch frame_ao_texture_.
@@ -1400,7 +1411,8 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 // environment's base density (env_.fog_volumetric_density).
                 float fog_density_mul = gfx.fog_density / 0.05f;
                 volumetric_fog_->render(cmd, *pipeline_registry_, post_->offscreen_depth()->handle(), *shadow_map_,
-                                        draw_camera, env_, god_rays_active, gfx.volumetric_fog, fog_density_mul);
+                                        draw_camera, env_, god_rays_active, gfx.volumetric_fog, fog_density_mul,
+                                        &frame_gi_);
                 fog_tex = volumetric_fog_->fog_texture();
             }
 
