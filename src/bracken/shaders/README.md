@@ -137,9 +137,17 @@ specular (roughness → mip, `IBL_SPECULAR_MIPS` must match
 shadow-driven ambient lift. When off, cube-typed dummies keep the slots
 valid and the shaders branch to the hemisphere `ambientPBR` fallback.
 The very LAST sampler slot of every scene fragment shader is the LOCAL
-(point/spot) shadow atlas + `LESS_OR_EQUAL` comparison sampler, declared by
+(point/spot) shadow ATLAS + `LESS_OR_EQUAL` comparison sampler, declared by
 `cluster_lighting.hlsli` at `CLUSTER_SSBO_BINDING_BASE - 1` (fragment sampler
-counts: model/instanced 15, terrain 13, grass 11). The THREE slots below it
+counts: model/instanced 16, terrain 14, grass 12). Directly below it is
+`rtLocalShadowTexture` (model/instanced 14, terrain 12, grass 10), the R8
+ray-traced LOCAL-light visibility RATIO — sampled with a NORMALIZED UV, bound
+to the 1×1 white dummy and read only when `rtLocalShadowEnabled`, and
+multiplied into the whole point+spot subtotal by `accumulateClusterLights`
+(the Heitz ratio estimator, `LocalRtShadowMode::Ratio`). Note that the two are
+mutually exclusive by construction rather than by a branch: in Ratio mode the
+engine never assigns a `shadow_slot`, so the atlas taps above are already dead.
+The THREE slots below THAT
 are the probe field's atlases (model/instanced 11–13, terrain 9–11, grass
 7–9): irradiance and visibility with a LINEAR clamp sampler, the per-probe
 metadata plane with a POINT one, read by `gi_sample.hlsli` and gated by the
@@ -234,7 +242,22 @@ normalized by `rayMaxDistance`, 1.0 on a miss or any early-out (sky, roughness
 gate, water-receiver rejection), written by every in-bounds thread. Nothing
 reads `hitT` yet; it exists because the virtual-hit-point reprojection planned
 for the reflection denoiser needs the reflected point's distance, and the trace
-is the only place that number is free. When water is active, that resolved quarter-resolution target
+is the only place that number is free.
+
+`rt_local_shadow.comp` (R2b) is the third traced signal and the only one that
+reads the cluster grid: per pixel it draws six candidates from the pixel's
+froxel through `cluster_compute.hlsli`, weights them by `clusterLightTarget`,
+keeps one by weighted-reservoir sampling, merges the reprojected previous-frame
+reservoir (its light index resolved through the prev→current remap; a vanished
+light drops the history), and casts ONE sphere-cap ray at the winner. Its
+output is the same 8×4-packed bit tile `rt_shadow.comp` produces — which is the
+point, because it goes through the SAME `rt_shadow_denoise_*` chain, dispatched
+a second time against a second set of targets. Its two set-1 read-write storage
+buffers are the reservoir ping-pong, of which the second is only ever READ:
+SDL3 GPU allows a compute pipeline eight read-only storage buffers and the four
+acceleration-structure buffers plus four cluster buffers spend them exactly.
+
+When water is active, that resolved quarter-resolution target
 is recycled for a second analytic water-receiver dispatch: camera-ray/plane
 intersection is refined against the live wave field and the trace uses the
 same finite-difference + analytic-detail normal as `water.frag`. The water
@@ -344,15 +367,23 @@ to the including shader's fragment sampler count first),
 `cluster_compute.hlsli` (the COMPUTE path to the same froxel grid: SDL3 GPU
 puts compute storage buffers on set 0 and compute uniforms on set 2, so the
 bindings must differ from the fragment path — but the two includes above mean
-the index math and record decode cannot. Declares five consecutive set-0
+the index math and record decode cannot. Declares FOUR consecutive set-0
 storage buffers from `CLUSTER_COMPUTE_SSBO_BINDING_BASE` (light data, cluster
-offsets, light indices, light stable ids, prev→current index remap) plus
-`ClusterParams` at `CLUSTER_COMPUTE_PARAMS_BINDING` on set 2, and exposes
-`clusterFroxelIndex`/`clusterFroxelLightCount`/`clusterFroxelLight` plus the
-identity helpers `clusterLightStableId`/`clusterRemapPrevLight`. Its only
-current consumer is `cluster_compute_validate.comp` — a shader nothing
-dispatches, whose entire job is to make the include a compiled build artifact
-until R2b's real pass arrives), `shadow_common.hlsli` (cascade selection, PCF/PCSS),
+offsets, light indices, prev→current index remap) plus `ClusterParams` at
+`CLUSTER_COMPUTE_PARAMS_BINDING` on set 2, and exposes
+`clusterFroxelIndex`/`clusterFroxelLightCount`/`clusterFroxelLight` plus
+`clusterRemapPrevLight` and, since R2b, the RIS target function
+`clusterLightTarget` — shared with the fragment accumulator through
+`cluster_light_load.hlsli` so "the forward loop skips this light" and "the
+sampler weights it zero" stay one statement. A FIFTH buffer, the packed stable
+ids, and with it `clusterLightStableId`, are **opt-in** behind
+`CLUSTER_COMPUTE_WANT_STABLE_IDS`: SDL3 GPU caps a compute pipeline at EIGHT
+read-only storage buffers and any ray-tracing pass spends four on the
+acceleration structure before it gets here. A pass reusing a sample ACROSS
+FRAMES wants the remap, not the ids. Its consumer
+is `rt_local_shadow.comp`; the placeholder `cluster_compute_validate.comp` that
+kept the include a compiled artifact between R2a and R2b is gone),
+`shadow_common.hlsli` (cascade selection, PCF/PCSS),
 `fog.hlsli` (distance-fog factors + `hazeSunColor`, the sun-scatter /
 day-dimmed haze color shared by surface fog AND the sky's horizon haze —
 they must stay one function so fog melts into the sky at the horizon),
@@ -372,11 +403,16 @@ plus `giSampleVolume` for participating media — a transliteration of the
 `giProbeMeta` and their samplers, plus the `giCascadeBase[]`/`giEnabled`
 cbuffer members — so the including shader owns their slots and must declare
 them first, exactly like `cluster_lighting.hlsli`), `rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
-GGX-VNDF sampling, the packed visibility-tile helpers), `rt_trace.hlsli` (the
+GGX-VNDF sampling, the packed visibility-tile helpers, and `rtSeed`/`rtNextFloat`
+— a per-pixel per-frame random STREAM for passes like the froxel-RIS reservoir
+that make a dozen independent decisions per pixel, where feeding them all from
+one low-discrepancy sequence would correlate the candidate choice with the
+acceptance test), `rt_trace.hlsli` (the
 software two-level BVH: `BvhNodeGpu`/`BvhTriangle`/`TlasInstance`, `slabTest`,
 `octDecode`, the any-hit `blasOccluded`/`sceneOccluded` walk and the
 closest-hit `Hit`/`blasClosest`/`sceneClosest` walk — shared by
-`rt_shadow.comp`, `rt_reflection.comp` and `gi_probe_trace.comp`). The traversal node is **64 bytes
+`rt_shadow.comp`, `rt_local_shadow.comp`, `rt_reflection.comp` and
+`gi_probe_trace.comp`). The traversal node is **64 bytes
 and holds BOTH children** (Aila–Laine): two AABBs and two links, so one fetch
 resolves a binary decision and a leaf never needs a node of its own. The CPU
 build format is still the 32-byte one-AABB `BvhNode` (`bvh.hpp`); the
@@ -391,8 +427,9 @@ cbuffer, because the walks read `tlasNodes`/`tlasInstances`/`blasNodes`/
 `blasTriangles` and the `tlasNodeCount` uniform by name. Missing both macros is
 an `#error`, the same shape as `cluster_lighting.hlsli`'s required
 `CLUSTER_SSBO_BINDING_BASE`. Bindings deliberately stay in the entry shaders —
-the two passes have different sampled-texture counts and only reflections bind
-the per-triangle attribute buffer.
+the passes have different sampled-texture counts, only reflections bind the
+per-triangle attribute buffer, and only `rt_local_shadow.comp` binds the
+cluster grid.
 
 ## SDL3 GPU resource binding order
 

@@ -103,6 +103,75 @@ struct RtReflectionSettings {
     float clamp_sigma = 1.5f;
 };
 
+/**
+ * Ray-traced shadows for LOCAL (point/spot) lights — the Ratio tier of
+ * docs/rt_lighting_plan.md §5.3.
+ *
+ * ONE ray per pixel, aimed by a froxel-RIS reservoir rather than by a loop, so
+ * the cost does not scale with the light count and neither the atlas's 8-point /
+ * 16-spot budgets nor its 6-tile-per-frame refresh cap apply. Requires the
+ * frame's clustered-lighting buffers (RtClusterBindings) and the prepass
+ * G-buffer; the pass is skipped rather than approximated when either is absent.
+ */
+struct RtLocalShadowSettings {
+    bool enabled = false;
+    RtResolution resolution = RtResolution::Half;
+    float normal_bias = 1.5f;
+    float depth_bias = 0.5f;
+    /// Emitter radius in WORLD UNITS — the sphere the shadow ray samples a
+    /// point on, and therefore the penumbra-width dial. 10 units is 10 cm at
+    /// the playground's 100 units/metre: a lantern flame or a torch head. One
+    /// value for every light until per-light authoring arrives with the area
+    /// lights of R6; a per-light radius belongs on PointLightDesc, not here.
+    float source_radius = 10.0f;
+    /// M — candidates drawn from the pixel's froxel before one survives. The
+    /// froxel list is short (the playground's densest is single digits), so
+    /// beyond ~8 the extra draws mostly re-pick lights already considered.
+    uint32_t candidate_count = 6;
+    /// Cap on carried-over reservoir M, as a multiple of `candidate_count`.
+    /// 20x is the ReSTIR-standard figure: enough inertia to behave like dozens
+    /// of rays, little enough that a light that moves is followed within a
+    /// handful of frames.
+    float history_max_m_ratio = 20.0f;
+    /// Denoiser knobs, same meaning as RtShadowSettings' — the two signals go
+    /// through the same three pipelines.
+    float max_accum_frames = 32.0f;
+    float filter_radius = 3.0f;
+};
+
+/**
+ * The frame's clustered-lighting buffers, as the local-shadow trace needs them.
+ *
+ * Borrowed for the duration of one render() call and never retained. `params`
+ * is a `render::lighting::ClusterParams` passed as opaque bytes — the same
+ * arrangement TerrainRenderer::set_cluster_lighting uses, and for the same
+ * reason: this header has no business dragging the light-binning module into
+ * everything that includes it.
+ */
+struct RtClusterBindings {
+    SDL_GPUBuffer* light_data = nullptr;
+    SDL_GPUBuffer* cluster_offsets = nullptr;
+    SDL_GPUBuffer* light_indices = nullptr;
+    /// NOT the packed stable ids. They are ClusterGrid's fifth cluster buffer
+    /// and nothing here binds them: SDL3 GPU allows a compute pipeline eight
+    /// read-only storage buffers, the four acceleration ones are mandatory, and
+    /// a temporal reservoir's question is the REMAP's — "where did the light I
+    /// picked last frame go?" — not the ids'. See cluster_compute.hlsli's
+    /// CLUSTER_COMPUTE_WANT_STABLE_IDS.
+    SDL_GPUBuffer* light_remap = nullptr;
+    const void* params = nullptr;
+    uint32_t params_size = 0;
+    /// Lights the frame actually binned. Zero means the CPU skipped binning, in
+    /// which case every buffer above holds LAST frame's contents.
+    uint32_t total_lights = 0;
+
+    [[nodiscard]] bool complete() const {
+        return light_data != nullptr && cluster_offsets != nullptr && light_indices != nullptr &&
+               light_remap != nullptr && params != nullptr &&
+               params_size > 0 && total_lights > 0;
+    }
+};
+
 /** Analytic receiver description for the displaced WaterRenderer surface.
  *  Keeping it here avoids putting water geometry into the opaque depth buffer
  *  before refraction has captured the scene behind it. */
@@ -137,8 +206,18 @@ struct RtWaterReceiver {
 struct RtStats {
     bool shadows_traced = false;
     bool reflections_traced = false;
+    /// Whether the froxel-RIS local-light shadow pass ran. False whenever the
+    /// mode is Off, the cluster buffers were incomplete, or the scene had no
+    /// binned lights — which is also the signal that the rasterized atlas is
+    /// still the thing shadowing local lights this frame.
+    bool local_shadows_traced = false;
     uint32_t shadow_rays = 0;      ///< dispatched threads, not rays actually cast
     uint32_t reflection_rays = 0;  ///< dispatched opaque + water threads
+    /// Dispatched threads of the local-light pass. One RESERVOIR update each;
+    /// the ray itself is cast only where the froxel held a candidate, so the
+    /// true ray count is lower and this is the same honest over-estimate
+    /// `shadow_rays` is.
+    uint32_t local_shadow_rays = 0;
     /// Instances in the TLAS — i.e. AFTER the renderer's range filter, so this
     /// is what the rays actually see rather than what the frame drew.
     uint32_t instances = 0;
@@ -241,10 +320,17 @@ public:
     /// cannot accumulate across frames, so the result is the raw one-sample
     /// estimate spatially filtered — noticeably noisier, and it says so once
     /// in the log rather than looking like a shader bug.
+    ///
+    /// `local_shadows` additionally needs `clusters` — the frame's binned light
+    /// buffers. It is skipped, not degraded, when they are incomplete: a
+    /// reservoir drawn from a stale froxel list would shadow against lights
+    /// that are not in the frame.
     void render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                 SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
                 const FrameParams& params, const RtShadowSettings& shadows,
-                const RtReflectionSettings& reflections);
+                const RtReflectionSettings& reflections,
+                const RtLocalShadowSettings& local_shadows = {},
+                const RtClusterBindings& clusters = {});
 
     /** Trace the visible part of a displaced water surface into the same raw
      * reflection target after the opaque resolve consumed it. The dispatch
@@ -269,6 +355,10 @@ public:
      *  off. Sample it with a NORMALIZED UV — its resolution is independent of
      *  both the screen and the depth buffer. */
     [[nodiscard]] gpu::GPUTexture* shadow_mask() const;
+    /** Full-res R8 local-light visibility ratio (1 = lit). Null when the local
+     *  pass is off or has not produced a mask. The forward shaders multiply
+     *  their whole point+spot subtotal by it — see cluster_lighting.hlsli. */
+    [[nodiscard]] gpu::GPUTexture* local_shadow_mask() const;
     /** Reduced-resolution raw incoming radiance. Alpha is the trace validity
      *  gate consumed by resolve_reflections() or the specialized water pass;
      *  hosts should not composite this target directly. */
@@ -303,17 +393,66 @@ private:
     /// Bilinear, for the denoiser's sub-texel history reprojection only.
     SDL_GPUSampler* linear_clamp_sampler_ = nullptr;
 
-    /// Records the three shadow-denoiser dispatches. Split out of render()
-    /// because the trace is one dispatch and the denoiser is most of the pass.
-    void denoise_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
-                         SDL_GPUTexture* velocity, const FrameParams& params,
-                         const RtShadowSettings& shadows, int traced_w, int traced_h);
+    /**
+     * Every target and every flag one STOCHASTIC VISIBILITY signal needs on its
+     * way from packed bits to a full-resolution R8 mask.
+     *
+     * There are two such signals — the sun, and the froxel-RIS local lights —
+     * and they are the same mechanism, not two mechanisms that resemble each
+     * other: both produce one bit per pixel packed 8x4 per uint, and both are
+     * turned back into an image by the SAME three pipelines
+     * (RtShadowClassify/Temporal/Filter), dispatched twice against two of these
+     * structs. Forking the denoiser would have meant three more pipelines,
+     * three more catalogue rows and three more shaders to keep in step with the
+     * originals, in exchange for nothing: nothing in those passes is
+     * sun-specific. If something ever needs to be, it becomes a uniform.
+     */
+    struct VisibilityDenoiser {
+        /// One bit of raw traced visibility per pixel, 8x4 per uint (R32_UINT),
+        /// so the classifier reads 32 pixels' verdicts in one fetch.
+        std::unique_ptr<gpu::GPUTexture> bits;
+        /// Per-tile verdict: 0 uniformly lit, 1 uniformly shadowed, 2 mixed.
+        std::unique_ptr<gpu::GPUTexture> tile_class;
+        /// Ping-ponged accumulation (RGBA16F): mean, second moment, sample
+        /// count, linear depth. Two because a temporal filter cannot read and
+        /// write the same texture in one dispatch.
+        std::array<std::unique_ptr<gpu::GPUTexture>, 2> history;
+        /// Full-res R8 output — the denoiser's last pass fuses the upsample into
+        /// the filter, so the forward shaders sample it 1:1.
+        std::unique_ptr<gpu::GPUTexture> mask;
+        int history_index = 0;
+        /// False until a history has been written at this size. Cleared on
+        /// resize, on a resolution change, and whenever the signal was off last
+        /// frame — in all three cases the history describes a different image.
+        bool history_valid = false;
+        RtResolution resolution = RtResolution::Half;
+        /// Advances the sample sequence. Wraps freely; only its low bits matter
+        /// to the R2 sequence, and wrapping is what keeps it exact in a float.
+        /// PER SIGNAL, so the two never sample in lockstep.
+        uint32_t frame_index = 0;
+
+        void release_targets();
+        void release();
+    };
+
+    /// Records the three denoiser dispatches for one signal. Split out of
+    /// render() because the trace is one dispatch and the denoiser is most of
+    /// the pass.
+    void denoise_visibility(SDL_GPUCommandBuffer* cmd, VisibilityDenoiser& d, gpu::GPUTexture& depth,
+                            SDL_GPUTexture* velocity, const FrameParams& params, float max_accum_frames,
+                            float filter_radius, int traced_w, int traced_h);
+    /// Trace + denoise the froxel-RIS local-light signal. Returns whether the
+    /// trace ran.
+    [[nodiscard]] bool render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
+                                            SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
+                                            const FrameParams& params,
+                                            const RtLocalShadowSettings& settings,
+                                            const RtClusterBindings& clusters);
     /// Temporal accumulation of the GGX-sampled reflection signal. Opaque path
     /// only — see reflection_denoised_this_frame_.
     void denoise_reflections(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* velocity,
                              const RtReflectionSettings& reflections);
 
-    std::unique_ptr<gpu::GPUTexture> shadow_mask_; ///< full-res R8, the denoiser's output
     std::unique_ptr<gpu::GPUTexture> reflection_;
     /// NOTHING CONSUMES THIS YET. The reflection trace writes each pixel's
     /// normalized hit distance here (R16F, alongside `reflection_`) because it
@@ -326,16 +465,18 @@ private:
     /// change to the traversal everything else depends on.
     std::unique_ptr<gpu::GPUTexture> reflection_hit_distance_;
 
-    // ---- shadow denoiser state ----
-    /// One bit of raw traced visibility per pixel, 8x4 per uint (R32_UINT).
-    std::unique_ptr<gpu::GPUTexture> shadow_bits_;
-    /// Per-tile verdict: 0 uniformly lit, 1 uniformly shadowed, 2 mixed (R8_UINT).
-    std::unique_ptr<gpu::GPUTexture> shadow_tile_class_;
-    /// Ping-ponged accumulation history (RGBA16F): mean, second moment, sample
-    /// count, linear depth. Two because a temporal filter cannot read and write
-    /// the same texture in one dispatch.
-    std::array<std::unique_ptr<gpu::GPUTexture>, 2> shadow_history_;
-    int shadow_history_index_ = 0;
+    // ---- the two stochastic visibility signals ----
+    VisibilityDenoiser sun_shadow_;
+    VisibilityDenoiser local_shadow_;
+    /// Ping-ponged per-pixel reservoirs at the LOCAL pass's traced resolution,
+    /// 16 B each (render/lighting/reservoir.hpp). Not textures: the record is
+    /// four heterogeneous lanes, one of which is a light INDEX that must not be
+    /// filtered, converted or clamped by anything.
+    std::array<std::unique_ptr<gpu::GPUBuffer>, 2> local_reservoirs_;
+    int local_reservoir_index_ = 0;
+    /// Element count the pair is currently sized for; a change reallocates and
+    /// invalidates the history, because reservoir N describes a different pixel.
+    int local_reservoir_capacity_ = 0;
 
     // ---- reflection denoiser state ----
     /// Ping-ponged accumulation (RGBA16F): rgb = radiance, a = sample count.
@@ -351,17 +492,9 @@ private:
     /// the resolve must fall back to the raw target for it.
     bool reflection_denoised_this_frame_ = false;
     uint32_t reflection_frame_index_ = 0;
-    /// False until a history has been written at this size. Cleared on resize,
-    /// on a resolution change, and whenever shadows were off last frame — in
-    /// all three cases the history describes a different image.
-    bool shadow_history_valid_ = false;
-    /// Advances the sample sequence. Wraps freely; only its low bits matter to
-    /// the R2 sequence, and wrapping is what keeps it exact in a float.
-    uint32_t shadow_frame_index_ = 0;
 
     int screen_width_ = 0;
     int screen_height_ = 0;
-    RtResolution shadow_res_ = RtResolution::Half;
     RtResolution reflection_res_ = RtResolution::Quarter;
     bool built_with_attributes_ = false;
     bool warned_missing_attributes_ = false;

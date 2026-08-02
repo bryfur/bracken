@@ -38,6 +38,38 @@ float2 rtSample2D(uint2 pixel, uint frameIndex) {
     return frac(r2Sequence(frameIndex) + offset);
 }
 
+/// Seed a per-pixel, per-frame random STREAM.
+///
+/// rtSample2D answers "the one sample this pixel takes this frame", and is the
+/// right tool when there is exactly one — its whole value is that consecutive
+/// frames land at low-discrepancy offsets. A reservoir needs a DOZEN decisions
+/// per pixel (which candidate, whether to accept it, ...) and those are
+/// independent Bernoulli/uniform draws, not a set being stratified; feeding them
+/// from one low-discrepancy sequence would correlate the candidate choice with
+/// the acceptance test. So: a stream, seeded from the same (pixel, frame) pair
+/// so it is exactly as replayable — which is what the deterministic smoke gate
+/// and the A-SVGF gradient work of §5.7 both require.
+uint rtSeed(uint2 pixel, uint frameIndex) {
+    uint h = pixel.x * 73856093u ^ pixel.y * 19349663u ^ frameIndex * 83492791u;
+    // One round of the "lowbias32" finalizer — enough to decorrelate the three
+    // multiplied lanes above, which is all the seed has to do.
+    h ^= h >> 16; h *= 0x7feb352du;
+    h ^= h >> 15; h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+
+/// Next uniform float in [0, 1) from a stream seeded by rtSeed. PCG-XSH-RR's
+/// output function over an LCG state: two multiplies and three shifts, and it
+/// passes the only test that matters here — neighbouring seeds produce
+/// uncorrelated streams.
+float rtNextFloat(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint w = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    w = (w >> 22u) ^ w;
+    return float(w) * (1.0 / 4294967296.0);
+}
+
 /// Orthonormal basis around `n`. Duff et al. 2017 — branchless, and stable as
 /// n crosses the z = 0 plane, which the naive cross-with-up construction is
 /// not (it degenerates and makes the sampled cone spin).

@@ -115,6 +115,36 @@ enum class RtRange : int {
 };
 
 /**
+ * Ray-traced shadows for LOCAL (point/spot) lights.
+ *
+ * `Off` is the rasterized 8x8-tile shadow atlas the engine has always had
+ * (`render/lighting/local_shadows.hpp`): hard edges, and hard budgets — 8 point
+ * lights, 16 spot lights, 6 tile re-renders a frame. Light #9 gets nothing.
+ *
+ * `Ratio` replaces all of that with ONE stochastic shadow ray per pixel,
+ * whichever light it lands on. Per pixel the pass draws candidates from the
+ * froxel the pixel falls in, picks one by weighted-reservoir sampling against
+ * the light's own unshadowed contribution, merges the pick with the reprojected
+ * previous-frame reservoir, and traces a single sphere-cap ray at it. The
+ * denoised result is a scalar visibility RATIO the forward pass multiplies its
+ * whole point+spot subtotal by (Heitz 2018) — so the ANALYTIC lighting stays
+ * sharp and only the shadowing is stochastic, and every light in the frame
+ * casts a soft shadow for the price of the one ray. Requires the ray-traced
+ * scene and the prepass G-buffer, exactly as `rt_shadows` does; in this mode
+ * the atlas is not updated and no tile is rendered at all.
+ *
+ * `Full = 2` — the demodulated diffuse+specular traced-DI tier, where the
+ * traced lights leave the analytic loop entirely — IS PHASE R5 and is
+ * deliberately NOT declared yet. It appends here when it lands, so an on-disk
+ * `2` today is out of range and clamps to `Ratio` rather than silently meaning
+ * something it does not do.
+ */
+enum class LocalRtShadowMode : int {
+    Off = 0,
+    Ratio = 1,
+};
+
+/**
  * Diffuse global illumination.
  *
  * `Probes` is the scrolled probe clipmap (`render/gi/probe_volume.hpp`): three
@@ -321,6 +351,18 @@ struct GraphicsSettings {
     /// — a moving instance only costs a refit, but an instance dropping in or
     /// out of range changes the topology and there is no tree to refit onto.
     RtRange rt_max_instance_range = RtRange::Unlimited;
+    /// Ray-traced local (point/spot) light shadows — see LocalRtShadowMode.
+    /// OFF BY DEFAULT: `Ratio` builds the acceleration structure (like
+    /// rt_shadows), costs one more traced pass plus its denoiser, and RETIRES
+    /// the rasterized atlas for the frames it runs. `Off` is the atlas path
+    /// byte for byte.
+    LocalRtShadowMode rt_local_shadows = LocalRtShadowMode::Off;
+    /// Resolution the local-shadow ray is traced at. Half by default rather
+    /// than Full — unlike the sun, this signal picks a DIFFERENT light per
+    /// pixel per frame, so its raw variance is higher and the denoiser is
+    /// doing more work regardless; spending twice the rays to sharpen a
+    /// silhouette it is going to filter anyway is the wrong end of the trade.
+    RtResolution rt_local_shadow_resolution = RtResolution::Half;
     // --- Probe-field global illumination ---------------------------------
     /// Diffuse GI mode. OFF BY DEFAULT: the probe field costs ~30 MB of atlases
     /// the moment it is switched on, and (until R1b) buys nothing. `Off` is the

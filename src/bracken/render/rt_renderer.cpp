@@ -37,8 +37,23 @@ bool RtRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) 
     return nearest_clamp_sampler_ != nullptr && linear_clamp_sampler_ != nullptr;
 }
 
+// The traced-resolution targets only. The full-res mask survives, because it
+// is what the forward shaders are still bound to this frame; only a resize
+// (which reallocates it anyway) invalidates that.
+void RtRenderer::VisibilityDenoiser::release_targets() {
+    bits.reset();
+    tile_class.reset();
+    history[0].reset();
+    history[1].reset();
+    history_valid = false;
+}
+
+void RtRenderer::VisibilityDenoiser::release() {
+    release_targets();
+    mask.reset();
+}
+
 void RtRenderer::shutdown() {
-    shadow_mask_.reset();
     reflection_.reset();
     reflection_hit_distance_.reset();
     if (device_ != nullptr && nearest_clamp_sampler_ != nullptr) {
@@ -49,11 +64,11 @@ void RtRenderer::shutdown() {
     }
     nearest_clamp_sampler_ = nullptr;
     linear_clamp_sampler_ = nullptr;
-    shadow_bits_.reset();
-    shadow_tile_class_.reset();
-    shadow_history_[0].reset();
-    shadow_history_[1].reset();
-    shadow_history_valid_ = false;
+    sun_shadow_.release();
+    local_shadow_.release();
+    local_reservoirs_[0].reset();
+    local_reservoirs_[1].reset();
+    local_reservoir_capacity_ = 0;
     reflection_history_[0].reset();
     reflection_history_[1].reset();
     reflection_history_valid_ = false;
@@ -87,7 +102,11 @@ void RtRenderer::resize(gpu::GPUDevice& device, int width, int height) {
     // Targets are (re)created lazily in render(), where the resolution setting
     // is known — a game that never enables ray tracing should not allocate a
     // screen-sized target for it.
-    shadow_mask_.reset();
+    sun_shadow_.release();
+    local_shadow_.release();
+    local_reservoirs_[0].reset();
+    local_reservoirs_[1].reset();
+    local_reservoir_capacity_ = 0;
     reflection_.reset();
     reflection_hit_distance_.reset();
     (void)device;
@@ -127,13 +146,17 @@ void RtRenderer::publish_scene_stats() {
 void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                         SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
                         const FrameParams& params,
-                        const RtShadowSettings& shadows, const RtReflectionSettings& reflections) {
+                        const RtShadowSettings& shadows, const RtReflectionSettings& reflections,
+                        const RtLocalShadowSettings& local_shadows,
+                        const RtClusterBindings& clusters) {
     stats_.shadows_traced = false;
     stats_.reflections_traced = false;
+    stats_.local_shadows_traced = false;
     stats_.shadow_rays = 0;
     stats_.reflection_rays = 0;
+    stats_.local_shadow_rays = 0;
 
-    const bool want_any = shadows.enabled || reflections.enabled;
+    const bool want_any = shadows.enabled || reflections.enabled || local_shadows.enabled;
     if (!want_any || cmd == nullptr || device_ == nullptr || pipelines_ == nullptr) {
         return; // both off: not a single byte of work
     }
@@ -153,16 +176,12 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
         const int div = rt_resolution_divisor(shadows.resolution);
         const int w = std::max(1, screen_width_ / div);
         const int h = std::max(1, screen_height_ / div);
-        if (shadow_res_ != shadows.resolution) {
+        if (sun_shadow_.resolution != shadows.resolution) {
             // Every traced-resolution target changes shape, and the history
             // describes a different image; keeping it would smear the old
             // resolution across the first frames of the new one.
-            shadow_bits_.reset();
-            shadow_tile_class_.reset();
-            shadow_history_[0].reset();
-            shadow_history_[1].reset();
-            shadow_history_valid_ = false;
-            shadow_res_ = shadows.resolution;
+            sun_shadow_.release_targets();
+            sun_shadow_.resolution = shadows.resolution;
         }
 
         // Tile grid over the traced resolution. 8x4 pixels per uint.
@@ -170,18 +189,18 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
         const int tiles_y = (h + 3) / 4;
 
         const bool targets_ok =
-            ensure_target(*device_, shadow_bits_, tiles_x, tiles_y,
+            ensure_target(*device_, sun_shadow_.bits, tiles_x, tiles_y,
                           SDL_GPU_TEXTUREFORMAT_R32_UINT, "shadow bits") &&
-            ensure_target(*device_, shadow_tile_class_, tiles_x, tiles_y,
+            ensure_target(*device_, sun_shadow_.tile_class, tiles_x, tiles_y,
                           SDL_GPU_TEXTUREFORMAT_R8_UINT, "shadow tile class") &&
-            ensure_target(*device_, shadow_history_[0], w, h,
+            ensure_target(*device_, sun_shadow_.history[0], w, h,
                           SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, "shadow history 0") &&
-            ensure_target(*device_, shadow_history_[1], w, h,
+            ensure_target(*device_, sun_shadow_.history[1], w, h,
                           SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, "shadow history 1") &&
             // The mask is FULL resolution now: the denoiser's last pass fuses
             // the upsample into the filter, so the forward shaders sample it
             // 1:1 instead of stretching a half-res binary signal bilinearly.
-            ensure_target(*device_, shadow_mask_, screen_width_, screen_height_,
+            ensure_target(*device_, sun_shadow_.mask, screen_width_, screen_height_,
                           SDL_GPU_TEXTUREFORMAT_R8_UNORM, "shadow mask");
 
         const gpu::GPUComputePipeline* pipeline =
@@ -198,10 +217,10 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
             u.depthBias = shadows.depth_bias;
             u.sunCosThetaMax =
                 std::cos(glm::radians(std::max(shadows.sun_angular_radius_degrees, 0.0f)));
-            u.frameIndex = shadow_frame_index_;
+            u.frameIndex = sun_shadow_.frame_index;
             u.hasGBuffer = normal_rough != nullptr ? 1u : 0u;
 
-            const SDL_GPUStorageTextureReadWriteBinding rw{.texture = shadow_bits_->handle(),
+            const SDL_GPUStorageTextureReadWriteBinding rw{.texture = sun_shadow_.bits->handle(),
                                                            .mip_level = 0,
                                                            .layer = 0,
                                                            .cycle = true,
@@ -231,14 +250,29 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
         }
 
         if (stats_.shadows_traced) {
-            denoise_shadows(cmd, depth, velocity, params, shadows, w, h);
-            shadow_frame_index_++;
+            denoise_visibility(cmd, sun_shadow_, depth, velocity, params, shadows.max_accum_frames,
+                               shadows.filter_radius, w, h);
+            sun_shadow_.frame_index++;
         }
     } else {
         // Shadows off this frame: the next frame that turns them back on must
         // not reproject through a history describing an unknown number of
         // frames ago.
-        shadow_history_valid_ = false;
+        sun_shadow_.history_valid = false;
+    }
+
+    // ---- local (point/spot) light shadows --------------------------------
+    if (local_shadows.enabled) {
+        BRACKEN_PROFILE_ZONE("RtRenderer::local_shadows");
+        // Trace + the same three denoiser dispatches, as one entry in the
+        // scene renderer's RenderStats::pass_times_ms. String LITERALS only:
+        // PassTimeline interns the name by pointer.
+        BRACKEN_GPU_TIMER(timers_, cmd, "RTLocalShadows");
+        if (render_local_shadows(cmd, depth, normal_rough, velocity, params, local_shadows, clusters)) {
+            local_shadow_.frame_index++;
+        }
+    } else {
+        local_shadow_.history_valid = false;
     }
 
     // ---- opaque reflections ---------------------------------------------
@@ -258,10 +292,17 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
     }
 }
 
-void RtRenderer::denoise_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
-                                 SDL_GPUTexture* velocity, const FrameParams& params,
-                                 const RtShadowSettings& shadows, int traced_w, int traced_h) {
-    BRACKEN_PROFILE_ZONE("RtRenderer::denoise_shadows");
+// The denoiser, for EITHER stochastic visibility signal.
+//
+// Nothing below reads the sun, the light list, or anything else that would make
+// it one signal's property: it takes packed bits at a traced resolution and
+// produces a full-res R8 mask. That is why the local-light pass reuses these
+// three pipelines rather than forking them — see VisibilityDenoiser's comment.
+void RtRenderer::denoise_visibility(SDL_GPUCommandBuffer* cmd, VisibilityDenoiser& d,
+                                    gpu::GPUTexture& depth, SDL_GPUTexture* velocity,
+                                    const FrameParams& params, float max_accum_frames,
+                                    float filter_radius, int traced_w, int traced_h) {
+    BRACKEN_PROFILE_ZONE("RtRenderer::denoise_visibility");
 
     const auto tiles_x = static_cast<uint32_t>((traced_w + 7) / 8);
     const auto tiles_y = static_cast<uint32_t>((traced_h + 3) / 4);
@@ -283,13 +324,13 @@ void RtRenderer::denoise_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& dep
         gpu::RtShadowClassifyUniforms u{};
         u.tileCount = tile_count;
 
-        const SDL_GPUStorageTextureReadWriteBinding rw{.texture = shadow_tile_class_->handle(),
+        const SDL_GPUStorageTextureReadWriteBinding rw{.texture = d.tile_class->handle(),
                                                        .mip_level = 0, .layer = 0, .cycle = true,
                                                        .padding1 = 0, .padding2 = 0, .padding3 = 0};
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
         if (pass) {
             pass.bind_pipeline(*classify);
-            const std::array<SDL_GPUTexture*, 1> ro{shadow_bits_->handle()};
+            const std::array<SDL_GPUTexture*, 1> ro{d.bits->handle()};
             pass.bind_storage_textures(0, ro);
             pass.push_uniforms(0, &u, sizeof(u));
             pass.dispatch_for(*classify, tiles_x, tiles_y);
@@ -297,22 +338,22 @@ void RtRenderer::denoise_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& dep
     }
 
     // ---- 2. temporal accumulation ---------------------------------------
-    const int prev = shadow_history_index_;
-    const int next = 1 - shadow_history_index_;
+    const int prev = d.history_index;
+    const int next = 1 - d.history_index;
     {
         gpu::RtShadowTemporalUniforms u{};
         u.tracedSize = traced_size;
         u.tileCount = tile_count;
         u.depthA = params.depth_a;
         u.depthB = params.depth_b;
-        u.maxAccumFrames = std::max(shadows.max_accum_frames, 1.0f);
+        u.maxAccumFrames = std::max(max_accum_frames, 1.0f);
         u.depthRejectRelative = 0.05f;
         // No velocity buffer means no reprojection is possible; saying the
         // history is valid anyway would accumulate through camera motion and
         // smear the whole image.
-        u.historyValid = (shadow_history_valid_ && velocity != nullptr) ? 1u : 0u;
+        u.historyValid = (d.history_valid && velocity != nullptr) ? 1u : 0u;
 
-        const SDL_GPUStorageTextureReadWriteBinding rw{.texture = shadow_history_[next]->handle(),
+        const SDL_GPUStorageTextureReadWriteBinding rw{.texture = d.history[next]->handle(),
                                                        .mip_level = 0, .layer = 0, .cycle = true,
                                                        .padding1 = 0, .padding2 = 0, .padding3 = 0};
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
@@ -321,11 +362,10 @@ void RtRenderer::denoise_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& dep
             const std::array<SDL_GPUTextureSamplerBinding, 3> textures{{
                 {depth.handle(), nearest_clamp_sampler_},
                 {velocity != nullptr ? velocity : depth.handle(), nearest_clamp_sampler_},
-                {shadow_history_[prev]->handle(), linear_clamp_sampler_},
+                {d.history[prev]->handle(), linear_clamp_sampler_},
             }};
             pass.bind_samplers(0, textures);
-            const std::array<SDL_GPUTexture*, 2> ro{shadow_bits_->handle(),
-                                                    shadow_tile_class_->handle()};
+            const std::array<SDL_GPUTexture*, 2> ro{d.bits->handle(), d.tile_class->handle()};
             pass.bind_storage_textures(0, ro);
             pass.push_uniforms(0, &u, sizeof(u));
             pass.dispatch_for(*temporal, static_cast<uint32_t>(traced_w),
@@ -341,10 +381,10 @@ void RtRenderer::denoise_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& dep
         u.tileCount = tile_count;
         u.depthA = params.depth_a;
         u.depthB = params.depth_b;
-        u.maxRadius = std::max(shadows.filter_radius, 0.0f);
+        u.maxRadius = std::max(filter_radius, 0.0f);
         u.depthSigma = 0.05f;
 
-        const SDL_GPUStorageTextureReadWriteBinding rw{.texture = shadow_mask_->handle(),
+        const SDL_GPUStorageTextureReadWriteBinding rw{.texture = d.mask->handle(),
                                                        .mip_level = 0, .layer = 0, .cycle = true,
                                                        .padding1 = 0, .padding2 = 0, .padding3 = 0};
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
@@ -353,11 +393,11 @@ void RtRenderer::denoise_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& dep
             const std::array<SDL_GPUTextureSamplerBinding, 2> textures{{
                 // Linear: the filter's uniform-tile path samples the history
                 // at a sub-texel UV to upsample it continuously.
-                {shadow_history_[next]->handle(), linear_clamp_sampler_},
+                {d.history[next]->handle(), linear_clamp_sampler_},
                 {depth.handle(), nearest_clamp_sampler_},
             }};
             pass.bind_samplers(0, textures);
-            const std::array<SDL_GPUTexture*, 1> ro{shadow_tile_class_->handle()};
+            const std::array<SDL_GPUTexture*, 1> ro{d.tile_class->handle()};
             pass.bind_storage_textures(0, ro);
             pass.push_uniforms(0, &u, sizeof(u));
             pass.dispatch_for(*filter, static_cast<uint32_t>(screen_width_),
@@ -365,8 +405,164 @@ void RtRenderer::denoise_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& dep
         }
     }
 
-    shadow_history_index_ = next;
-    shadow_history_valid_ = true;
+    d.history_index = next;
+    d.history_valid = true;
+}
+
+// Froxel-RIS local-light shadows (docs/rt_lighting_plan.md §5.3, Ratio tier).
+//
+// One dispatch, then the shared denoiser. The dispatch is over the TILE grid
+// rather than the pixel grid — the shader's group IS the 8x4 tile whose bits it
+// packs, exactly as the sun trace's is.
+bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
+                                      SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
+                                      const FrameParams& params,
+                                      const RtLocalShadowSettings& settings,
+                                      const RtClusterBindings& clusters) {
+    if (!clusters.complete()) {
+        // No binned lights this frame, or the caller had no cluster buffers to
+        // give. Not an error and not worth a log line every frame: a scene with
+        // no local lights has nothing for this pass to shadow. But the history
+        // must go, because the next frame that DOES have lights would otherwise
+        // remap reservoirs against a frame that is not its predecessor.
+        local_shadow_.history_valid = false;
+        return false;
+    }
+    if (normal_rough == nullptr) {
+        // The G-buffer is what supplies the surface normal, and the normal is
+        // what the target function weights candidates by. Reconstructing one
+        // from depth taps is good enough for a binary sun test and is not good
+        // enough to CHOOSE A LIGHT with, so this is skipped rather than
+        // degraded — the atlas is already retired, so the frame simply shows
+        // unshadowed local lights instead of wrongly shadowed ones.
+        local_shadow_.history_valid = false;
+        return false;
+    }
+
+    const int div = rt_resolution_divisor(settings.resolution);
+    const int w = std::max(1, screen_width_ / div);
+    const int h = std::max(1, screen_height_ / div);
+    if (local_shadow_.resolution != settings.resolution) {
+        local_shadow_.release_targets();
+        local_shadow_.resolution = settings.resolution;
+    }
+
+    const int tiles_x = (w + 7) / 8;
+    const int tiles_y = (h + 3) / 4;
+
+    const bool targets_ok =
+        ensure_target(*device_, local_shadow_.bits, tiles_x, tiles_y,
+                      SDL_GPU_TEXTUREFORMAT_R32_UINT, "local shadow bits") &&
+        ensure_target(*device_, local_shadow_.tile_class, tiles_x, tiles_y,
+                      SDL_GPU_TEXTUREFORMAT_R8_UINT, "local shadow tile class") &&
+        ensure_target(*device_, local_shadow_.history[0], w, h,
+                      SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, "local shadow history 0") &&
+        ensure_target(*device_, local_shadow_.history[1], w, h,
+                      SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, "local shadow history 1") &&
+        ensure_target(*device_, local_shadow_.mask, screen_width_, screen_height_,
+                      SDL_GPU_TEXTUREFORMAT_R8_UNORM, "local shadow mask");
+    if (!targets_ok) {
+        return false;
+    }
+
+    // The reservoir ping-pong. ComputeStorage rather than Storage: one of the
+    // pair is bound read-only to this dispatch and the other read-write, and
+    // they swap every frame, so both need both usages.
+    const int reservoir_count = w * h;
+    if (local_reservoir_capacity_ != reservoir_count) {
+        const auto bytes = static_cast<std::size_t>(reservoir_count) * 16u;
+        local_reservoirs_[0] =
+            gpu::GPUBuffer::create_dynamic(*device_, gpu::GPUBuffer::Type::ComputeStorage, bytes);
+        local_reservoirs_[1] =
+            gpu::GPUBuffer::create_dynamic(*device_, gpu::GPUBuffer::Type::ComputeStorage, bytes);
+        local_reservoir_capacity_ =
+            (local_reservoirs_[0] && local_reservoirs_[1]) ? reservoir_count : 0;
+        // Reservoir N describes a different pixel at a different size, and the
+        // buffers are uninitialized besides.
+        local_shadow_.history_valid = false;
+    }
+    if (local_reservoir_capacity_ != reservoir_count) {
+        BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the local-shadow reservoirs ({}x{})", w, h);
+        return false;
+    }
+
+    const gpu::GPUComputePipeline* pipeline =
+        pipelines_->get_compute_pipeline(gpu::ComputePipelineType::RtLocalShadow);
+    if (pipeline == nullptr) {
+        return false;
+    }
+
+    const int prev = local_reservoir_index_;
+    const int next = 1 - local_reservoir_index_;
+
+    gpu::RtLocalShadowUniforms u{};
+    u.invViewProj = params.inv_view_proj;
+    u.outputSize = {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
+    u.tlasNodeCount = scene_.tlas_node_count();
+    u.normalBias = settings.normal_bias;
+    u.depthBias = settings.depth_bias;
+    u.lightSourceRadius = std::max(settings.source_radius, 0.0f);
+    u.historyMaxMRatio = std::max(settings.history_max_m_ratio, 1.0f);
+    u.frameIndex = local_shadow_.frame_index;
+    u.hasGBuffer = 1u;
+    // Same rule as the denoiser's: no velocity buffer means no reprojection is
+    // possible, and claiming otherwise would carry every reservoir straight
+    // through camera motion.
+    u.historyValid = (local_shadow_.history_valid && velocity != nullptr) ? 1u : 0u;
+    u.candidateCount = std::max(settings.candidate_count, 1u);
+
+    const SDL_GPUStorageTextureReadWriteBinding rw_tex{.texture = local_shadow_.bits->handle(),
+                                                       .mip_level = 0, .layer = 0, .cycle = true,
+                                                       .padding1 = 0, .padding2 = 0, .padding3 = 0};
+    // BOTH halves of the reservoir ping-pong bind here, and the second one is
+    // only ever READ. SDL3 GPU allows a compute pipeline eight read-only
+    // storage buffers and the eight above are spoken for (four acceleration,
+    // four cluster), so the previous frame's reservoirs ride a read-write slot
+    // instead of a read-only one.
+    //
+    // cycle = false on both: this is persistent state the NEXT frame reads
+    // back, and a cycled allocation would hand the dispatch a fresh, undefined
+    // buffer while leaving the one the ping-pong points at untouched.
+    const std::array<SDL_GPUStorageBufferReadWriteBinding, 2> rw_bufs{{
+        {.buffer = local_reservoirs_[next]->handle(), .cycle = false,
+         .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        {.buffer = local_reservoirs_[prev]->handle(), .cycle = false,
+         .padding1 = 0, .padding2 = 0, .padding3 = 0},
+    }};
+    gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw_tex, 1}, rw_bufs);
+    if (!pass) {
+        return false;
+    }
+    pass.bind_pipeline(*pipeline);
+    const std::array<SDL_GPUTextureSamplerBinding, 3> textures{{
+        {depth.handle(), nearest_clamp_sampler_},
+        {normal_rough, nearest_clamp_sampler_},
+        // Slot 2 must always be a valid texture; historyValid is what decides
+        // whether it is read, not the bind.
+        {velocity != nullptr ? velocity : depth.handle(), nearest_clamp_sampler_},
+    }};
+    pass.bind_samplers(0, textures);
+    // Binding ORDER is the shader's declaration order: the four acceleration
+    // buffers, then the four cluster_compute.hlsli claims. The packed stable
+    // ids are the fifth thing that header CAN declare and this pass does not
+    // ask for them — see the catalogue row for why eight is the whole budget.
+    const std::array<SDL_GPUBuffer*, 8> buffers{
+        scene_.tlas_nodes(),     scene_.tlas_instances(),  scene_.blas_nodes(),
+        scene_.blas_triangles(), clusters.light_data,      clusters.cluster_offsets,
+        clusters.light_indices,  clusters.light_remap};
+    pass.bind_storage_buffers(0, buffers);
+    pass.push_uniforms(0, &u, sizeof(u));
+    pass.push_uniforms(1, clusters.params, clusters.params_size);
+    pass.dispatch(static_cast<uint32_t>(tiles_x), static_cast<uint32_t>(tiles_y), 1);
+    pass.end();
+
+    local_reservoir_index_ = next;
+    stats_.local_shadows_traced = true;
+    stats_.local_shadow_rays = static_cast<uint32_t>(w * h);
+
+    denoise_visibility(cmd, local_shadow_, depth, velocity, params, settings.max_accum_frames,
+                       settings.filter_radius, w, h);
+    return true;
 }
 
 void RtRenderer::denoise_reflections(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* velocity,
@@ -591,7 +787,11 @@ bool RtRenderer::resolve_reflections(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture&
 }
 
 gpu::GPUTexture* RtRenderer::shadow_mask() const {
-    return shadow_mask_.get();
+    return sun_shadow_.mask.get();
+}
+
+gpu::GPUTexture* RtRenderer::local_shadow_mask() const {
+    return local_shadow_.mask.get();
 }
 
 gpu::GPUTexture* RtRenderer::reflection_target() const {

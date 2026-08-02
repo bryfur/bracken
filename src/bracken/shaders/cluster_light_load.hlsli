@@ -69,4 +69,91 @@ SpotLightGPU loadSpotLight(uint i) {
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// The RIS target function (R2b, docs/rt_lighting_plan.md §5.3).
+//
+// p̂ for a candidate light = luminance of its UNSHADOWED DIFFUSE contribution.
+// It lives HERE, next to the decode and above the fragment path's accumulator,
+// for exactly the reason the froxel index math lives in cluster_index.hlsli: the
+// compute pass that PICKS a light and the fragment pass that SUMS the lights
+// must agree about which of them contribute nothing, or the ratio estimator
+// stops being unbiased. Both zeros below are `continue`s in
+// accumulateClusterLights — `dist > radius`, and `cone <= 0` — and the
+// attenuation is the same pointFalloff()/spotConeFactor() that function calls,
+// not a second copy of the curve.
+//
+// What it deliberately is NOT: the albedo is absent (identical for every
+// candidate at a pixel, so it cancels out of the reservoir's normalized
+// weights) and so is the specular lobe (no view-dependent material term is
+// worth the divergence here; leaving it out only shifts which light a glancing
+// highlight prefers). A target function is allowed to approximate — that is
+// what RIS is for — as long as its SUPPORT matches.
+//
+// CPU mirror: render/lighting/light_target.hpp, pinned by light_target.test.cpp.
+// ---------------------------------------------------------------------------
+
+float clusterTargetLuminance(float3 c) {
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+/// p̂ of a point light at surface (P, N). 0 = contributes nothing here.
+float clusterPointLightTarget(PointLightGPU pl, float3 P, float3 N) {
+    float3 to_light = pl.position - P;
+    float dist = length(to_light);
+    if (dist > pl.radius) return 0.0;
+    float3 L = to_light / max(dist, 1e-4);
+    float ndotl = max(dot(N, L), 0.0);
+    if (ndotl <= 0.0) return 0.0;
+    return clusterTargetLuminance(pl.color * pl.intensity) * pointFalloff(dist, pl.radius) * ndotl;
+}
+
+/// p̂ of a spot light — the point target times the cone factor.
+float clusterSpotLightTarget(SpotLightGPU sl, float3 P, float3 N) {
+    float3 to_light = sl.position - P;
+    float dist = length(to_light);
+    if (dist > sl.radius) return 0.0;
+    float3 L = to_light / max(dist, 1e-4);
+    float cone = spotConeFactor(L, sl.direction, sl.inner_cos, sl.outer_cos);
+    if (cone <= 0.0) return 0.0;
+    float ndotl = max(dot(N, L), 0.0);
+    if (ndotl <= 0.0) return 0.0;
+    return clusterTargetLuminance(sl.color * sl.intensity) * pointFalloff(dist, sl.radius) * cone * ndotl;
+}
+
+/// Where a candidate light SITS and how big its emitter is, for the shadow ray.
+/// Both light types answer through one struct so the trace has no branch.
+struct ClusterLightSample {
+    float3 position;
+    float radius;   ///< the light's RANGE, not its emitter size
+    bool valid;
+};
+
+ClusterLightSample clusterLightGeometry(uint packed_index) {
+    ClusterLightSample s;
+    s.position = float3(0, 0, 0);
+    s.radius = 0.0;
+    s.valid = false;
+    LightHeader h = loadLightHeader(packed_index);
+    if (h.type == 0u) {
+        PointLightGPU pl = loadPointLight(h.payload_index);
+        s.position = pl.position;
+        s.radius = pl.radius;
+    } else {
+        SpotLightGPU sl = loadSpotLight(h.payload_index);
+        s.position = sl.position;
+        s.radius = sl.radius;
+    }
+    s.valid = true;
+    return s;
+}
+
+/// p̂ of whichever light `packed_index` names, dispatched on the header type.
+float clusterLightTarget(uint packed_index, float3 P, float3 N) {
+    LightHeader h = loadLightHeader(packed_index);
+    if (h.type == 0u) {
+        return clusterPointLightTarget(loadPointLight(h.payload_index), P, N);
+    }
+    return clusterSpotLightTarget(loadSpotLight(h.payload_index), P, N);
+}
+
 #endif // CLUSTER_LIGHT_LOAD_HLSLI

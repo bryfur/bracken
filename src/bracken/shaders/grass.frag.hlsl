@@ -31,7 +31,10 @@ cbuffer GrassLightingUniforms {
     float screenAOTexelY;
     float iblEnabled;      // 1 = sky IBL ambient (samplers 3-5), 0 = hemisphere fallback
     float rtShadowEnabled; // 1 = traced sun visibility replaces the cascades
-    float2 _padIbl;
+    // 1 = multiply the LOCAL (point/spot) subtotal by the ray-traced
+    // local-shadow mask (R2b Ratio tier). Was the first _padIbl lane.
+    float rtLocalShadowEnabled;
+    float _padIbl;
     // Probe-field GI (render/gi/), R1c. giCascadeBase is
     // `render::gi::cascade_base()` of the position ProbeVolume was scrolled
     // with — passed rather than re-derived from cameraPos so a shader and the
@@ -128,13 +131,22 @@ Texture2D<float4> giProbeMeta;
 [[vk::combinedImageSampler]][[vk::binding(9, 2)]]
 SamplerState giProbeMetaSampler;
 
+// Ray-traced LOCAL (point/spot) shadow ratio (R8, 1 = lit), at the local pass's
+// own traced resolution — so, like rtShadowTexture, ALWAYS sample it with a
+// normalized UV. Bound to the 1x1 white dummy and read only when
+// rtLocalShadowEnabled, which is the same no-op the sun mask uses.
+[[vk::combinedImageSampler]][[vk::binding(10, 2)]]
+Texture2D<float> rtLocalShadowTexture;
+[[vk::combinedImageSampler]][[vk::binding(10, 2)]]
+SamplerState rtLocalShadowSampler;
+
 #include "shadow_common.hlsli"
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
 // Cluster SSBOs follow this shader's 11 fragment samplers in set 2 (slots
-// 0-9 above + the local-shadow atlas at 10, declared by the include).
-#define CLUSTER_SSBO_BINDING_BASE 11
+// 0-10 above + the local-shadow ATLAS at 11, declared by the include).
+#define CLUSTER_SSBO_BINDING_BASE 12
 #include "gi_sample.hlsli"
 #include "cluster_lighting.hlsli"
 
@@ -208,9 +220,15 @@ float4 PSMain(PSInput input) : SV_Target {
 
     if (clusterParams.gridDim.w > 0u) {
         float2 screen_uv = input.position.xy * clusterParams.screenSize.zw;
+        // Ratio tier: one traced visibility multiplies the whole local
+        // subtotal. -1 is "no traced mask", which skips the multiply outright.
+        float localVis = -1.0;
+        if (rtLocalShadowEnabled > 0.5) {
+            localVis = rtLocalShadowTexture.SampleLevel(rtLocalShadowSampler, screen_uv, 0).r;
+        }
         color += accumulateClusterLights(input.worldPos, N, V,
                                          baseColor, GRASS_METALLIC, GRASS_ROUGHNESS, 1.0,
-                                         input.viewDepth, screen_uv);
+                                         input.viewDepth, screen_uv, localVis);
     }
 
     // Same atmospheric fog as terrain/models: blades dissolve into the scene

@@ -61,7 +61,8 @@ bool verify_smoke_screenshot(const char* path) {
 //            "[rtbench] ..." table: per-pass CPU record time (mean + p95 over
 //            the run, first 30 frames discarded as warm-up), the sim/render/
 //            fence/present_wait means, and the ray-tracing stats line. Honours
-//            PLAYGROUND_RT for which traced effects run. Exit code 0.
+//            PLAYGROUND_RT / PLAYGROUND_RT_LOCAL for which traced effects
+//            run. Exit code 0.
 //            This is the gate docs/rt_lighting_plan.md asks for before any
 //            traversal change may claim a performance win; the numbers are
 //            only worth quoting from a -DCMAKE_BUILD_TYPE=RelWithDebInfo tree.

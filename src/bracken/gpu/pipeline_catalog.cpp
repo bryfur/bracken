@@ -29,12 +29,14 @@ constexpr ShaderResources k_ubo1_samp5{.num_samplers = 5, .num_uniform_buffers =
 /// `model.frag` / `model_instanced.frag`: baseColor + shadow atlas (cmp + raw)
 /// + normal + metallic-roughness + emissive + screen AO + IBL (irradiance /
 /// prefiltered / BRDF LUT) + traced sun-shadow mask + GI (irradiance /
-/// visibility / probe metadata) + local-shadow atlas = 15 samplers; light data
+/// visibility / probe metadata) + traced LOCAL-light mask + local-shadow atlas
+/// = 16 samplers; light data
 /// + cluster offsets + light indices + local-shadow slots = 4 storage buffers;
 /// lighting + shadow data + cluster params = 3 uniform buffers.
 ///
-/// The RT shadow mask is slot 10, the probe field occupies 11-13 and the
-/// local-shadow atlas moved to 14 (`CLUSTER_SSBO_BINDING_BASE` = 15). The
+/// The RT sun mask is slot 10, the probe field occupies 11-13, R2b's traced
+/// LOCAL-light visibility ratio is 14, and the rasterized local-shadow atlas
+/// moved to 15 (`CLUSTER_SSBO_BINDING_BASE` = 16). The
 /// atlas stays LAST because cluster_lighting.hlsli declares it at
 /// `CLUSTER_SSBO_BINDING_BASE - 1`, which is the contract every one of these
 /// three rows depends on.
@@ -44,19 +46,20 @@ constexpr ShaderResources k_ubo1_samp5{.num_samplers = 5, .num_uniform_buffers =
 /// not reproduce — model.frag compiles clean at 12, and was verified up to 17,
 /// which is also the headroom R1c's three GI slots were spent out of.
 constexpr ShaderResources k_fs_lit_model{
-    .num_samplers = 15, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 16, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `terrain.frag`: material array + splatmap + shadow atlas (cmp + raw) +
 /// screen AO + IBL (irradiance / prefiltered / BRDF LUT) + traced sun mask +
-/// GI (irradiance / visibility / probe metadata) + local-shadow atlas.
+/// GI (irradiance / visibility / probe metadata) + traced LOCAL-light mask +
+/// local-shadow atlas.
 constexpr ShaderResources k_fs_lit_terrain{
-    .num_samplers = 13, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 14, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `grass.frag`: shadow atlas (cmp + raw) + screen AO + IBL (irradiance /
 /// prefiltered / BRDF LUT) + traced sun mask + GI (irradiance / visibility /
-/// probe metadata) + local-shadow atlas.
+/// probe metadata) + traced LOCAL-light mask + local-shadow atlas.
 constexpr ShaderResources k_fs_lit_grass{
-    .num_samplers = 11, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 12, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `grass.vert` / `prepass_grass.vert`: heightmap + splatmap samplers, plus the
 /// visible-chunk origin buffer for the chunked LOD.
@@ -810,6 +813,37 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      .resources = {.num_samplers = 3,                   // raw trace, velocity, history
                    .num_readwrite_storage_textures = 1, // accumulated history out
                    .num_uniform_buffers = 1}},
+    {.name = "RtLocalShadow",
+     .shader = "rt_local_shadow.comp.spv",
+     .entry_point = "CSMain",
+     // Sampled: depth, the prepass normal G-buffer, and velocity — the last
+     // because this pass reprojects its own RESERVOIR state, which is a
+     // different thing from the denoiser reprojecting the denoised signal.
+     // Read-only storage buffers: the four acceleration-structure buffers, the
+     // FIVE cluster buffers cluster_compute.hlsli claims (light data, froxel
+     // offsets, froxel indices, stable ids, prev->current remap), and the
+     // previous frame's reservoirs. Read-write: the packed visibility bits and
+     // this frame's reservoirs. Two uniform buffers, not one: b0 is this pass's
+     // own, b1 is ClusterGrid's own ClusterParams, pushed verbatim rather than
+     // copied field by field into a second struct that could drift from it.
+     // EIGHT read-only storage buffers, and eight is not a round number here —
+     // it is SDL3 GPU's hard ceiling for a compute pipeline ("Compute pipeline
+     // readonly storage buffer count cannot be higher than 8"). The four
+     // acceleration-structure buffers are non-negotiable, which leaves exactly
+     // four for the cluster grid: light data, froxel offsets, froxel indices,
+     // and the prev->current remap. The fifth buffer cluster_compute.hlsli can
+     // declare — the packed stable ids — is therefore OPT-IN and this pass does
+     // not take it: a reservoir carries identity ACROSS frames, which is the
+     // remap's job, not the ids'.
+     //
+     // The reservoir ping-pong consequently rides in set 1 as two READ-WRITE
+     // buffers, of which one is only ever read. That is the budget talking, and
+     // it is written down at the binding site too.
+     .resources = {.num_samplers = 3,
+                   .num_readonly_storage_buffers = 8,
+                   .num_readwrite_storage_textures = 1,
+                   .num_readwrite_storage_buffers = 2,
+                   .num_uniform_buffers = 2}},
     {.name = "GiProbeTrace",
      .shader = "gi_probe_trace.comp.spv",
      .entry_point = "CSMain",

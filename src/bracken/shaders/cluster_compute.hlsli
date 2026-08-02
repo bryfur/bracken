@@ -19,16 +19,31 @@
 //       set-0 slot of the first cluster storage buffer. Per the SDL3 GPU
 //       layout that is (sampled texture count + read-only storage texture
 //       count + preceding read-only storage buffer count). This file claims
-//       FIVE consecutive slots from there:
+//       FOUR consecutive slots from there:
 //         +0 lightDataBuf        ByteAddressBuffer  packed light data
 //         +1 clusterOffsetsBuf   uint2 per froxel   (offset, count)
 //         +2 lightIndicesBuf     uint               concatenated header indices
-//         +3 lightStableIdsBuf   uint               stable id, PACKED order
-//         +4 lightIndexRemapBuf  uint               prev packed idx -> current
+//         +3 lightIndexRemapBuf  uint               prev packed idx -> current
 //       Bind them with one SDL_BindGPUComputeStorageBuffers call starting at
 //       that base, in that order (ClusterGrid::light_data_buffer(),
-//       cluster_offsets_buffer(), light_indices_buffer(),
-//       light_stable_ids_buffer(), light_remap_buffer()).
+//       cluster_offsets_buffer(), light_indices_buffer(), light_remap_buffer()).
+//
+//   CLUSTER_COMPUTE_WANT_STABLE_IDS   (optional)
+//       Adds a FIFTH slot, +4 lightStableIdsBuf (ClusterGrid::
+//       light_stable_ids_buffer()), and with it clusterLightStableId().
+//
+//       OPT-IN RATHER THAN ALWAYS-ON because the budget is genuinely tight:
+//       SDL3 GPU caps a compute pipeline at EIGHT read-only storage buffers,
+//       and any pass that traces rays spends four of them on the acceleration
+//       structure before it gets here. R2b's local-shadow trace is exactly at
+//       that limit with four.
+//
+//       Which one a pass wants is not arbitrary. Carrying a sample ACROSS
+//       FRAMES wants the REMAP: it answers "the light I picked last frame is
+//       now at index k, or is gone", which is the whole question a temporal
+//       reservoir asks. The stable ids answer a different question — "which
+//       light is this, in terms something outside the frame would recognize" —
+//       and nothing in R2b needs to ask it.
 //
 //   CLUSTER_COMPUTE_PARAMS_BINDING
 //       set-2 uniform slot for the ClusterParams cbuffer
@@ -60,10 +75,12 @@ StructuredBuffer<uint2> clusterOffsetsBuf;
 StructuredBuffer<uint> lightIndicesBuf;
 
 [[vk::binding(CLUSTER_COMPUTE_SSBO_BINDING_BASE + 3, 0)]]
-StructuredBuffer<uint> lightStableIdsBuf;
-
-[[vk::binding(CLUSTER_COMPUTE_SSBO_BINDING_BASE + 4, 0)]]
 StructuredBuffer<uint> lightIndexRemapBuf;
+
+#ifdef CLUSTER_COMPUTE_WANT_STABLE_IDS
+[[vk::binding(CLUSTER_COMPUTE_SSBO_BINDING_BASE + 4, 0)]]
+StructuredBuffer<uint> lightStableIdsBuf;
+#endif
 
 // The decode. Reads lightDataBuf + clusterParams by name, so it goes after the
 // declarations above — same ordering rule as cluster_lighting.hlsli.
@@ -101,11 +118,13 @@ uint clusterFroxelLight(uint froxel, uint i) {
     return lightIndicesBuf[clusterOffsetsBuf[froxel].x + i];
 }
 
+#ifdef CLUSTER_COMPUTE_WANT_STABLE_IDS
 // Persistent identity of a packed light (contracts/light.hpp). Never 0 for a
 // light that made it into the frame.
 uint clusterLightStableId(uint packed_index) {
     return lightStableIdsBuf[packed_index];
 }
+#endif
 
 // PREVIOUS frame's packed index -> this frame's packed index, or
 // LIGHT_REMAP_INVALID when that light is no longer in the frame. This is what

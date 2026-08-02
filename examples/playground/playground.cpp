@@ -206,6 +206,13 @@ bool PlaygroundGame::on_init() {
     if (const char* rt = SDL_getenv("PLAYGROUND_RT"); rt != nullptr) {
         rt_mode_ = rt;
     }
+    // PLAYGROUND_RT_LOCAL=ratio|off — traced shadows for the village's point
+    // and spot lights. Read here for the same reason as the two above: it
+    // decides whether a BVH is needed, and models release their CPU geometry
+    // at upload.
+    if (const char* rl = SDL_getenv("PLAYGROUND_RT_LOCAL"); rl != nullptr) {
+        rt_local_mode_ = rl;
+    }
     // PLAYGROUND_GI=probes|probes_screen|off, read here for the same reason
     // PLAYGROUND_RT is: the setting has to be pinned before init_renderer()
     // could load a persisted one.
@@ -1512,6 +1519,11 @@ void PlaygroundGame::update_smoke_driver(float dt) {
 void PlaygroundGame::apply_rt_mode(bracken::GraphicsSettings& gs) const {
     gs.rt_shadows = rt_mode_ == "shadows" || rt_mode_ == "both";
     gs.rt_reflections = rt_mode_ == "reflections" || rt_mode_ == "both";
+    // Separate variable rather than another PLAYGROUND_RT word: local-light
+    // shadows are orthogonal to the sun and reflections, and the A/B that
+    // matters is "same RT effects, local shadows on vs off".
+    gs.rt_local_shadows = rt_local_mode_ == "ratio" ? bracken::LocalRtShadowMode::Ratio
+                                                    : bracken::LocalRtShadowMode::Off;
 }
 
 void PlaygroundGame::apply_gi_mode(bracken::GraphicsSettings& gs) const {
@@ -1908,19 +1920,22 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
             const auto& g = graphics_settings();
             std::cout << std::format(
                 "[smoke] settings persist={} shadow_mode={} ao_mode={} aa_mode={} draw_distance={} "
-                "rt_shadows={} rt_reflections={} rt_range={} sun={:.2f} local_shadows={}\n",
+                "rt_shadows={} rt_reflections={} rt_local_shadows={} rt_range={} sun={:.2f} "
+                "local_shadows={}\n",
                 settings_persistence() ? 1 : 0, static_cast<int>(g.shadow_mode), static_cast<int>(g.ao_mode),
                 static_cast<int>(g.aa_mode), static_cast<int>(g.draw_distance), g.rt_shadows ? 1 : 0,
-                g.rt_reflections ? 1 : 0, static_cast<int>(g.rt_max_instance_range), g.sun_intensity,
+                g.rt_reflections ? 1 : 0, static_cast<int>(g.rt_local_shadows),
+                static_cast<int>(g.rt_max_instance_range), g.sun_intensity,
                 g.local_shadows ? 1 : 0);
         }
         {   // Ray-tracing evidence: whether the passes actually ran, not just
             // whether the frame survived them.
             const auto& rt = scene_renderer().raytracing_stats();
             std::cout << std::format(
-                "[smoke] rt shadows_traced={} reflections_traced={} shadow_rays={} "
-                "reflection_rays={} accel={:.1f}MB\n",
-                rt.shadows_traced, rt.reflections_traced, rt.shadow_rays, rt.reflection_rays,
+                "[smoke] rt shadows_traced={} reflections_traced={} local_shadows_traced={} "
+                "shadow_rays={} reflection_rays={} local_shadow_rays={} accel={:.1f}MB\n",
+                rt.shadows_traced, rt.reflections_traced, rt.local_shadows_traced, rt.shadow_rays,
+                rt.reflection_rays, rt.local_shadow_rays,
                 static_cast<double>(rt.acceleration_bytes) / (1024.0 * 1024.0));
             // The structure, itemized. `instances` is post-range-filter, so it
             // is what the rays actually see; `tlas_builds` should read 1 while
@@ -2760,12 +2775,15 @@ void PlaygroundGame::print_rt_bench_report() {
         static_cast<double>(SDL_GetTicksNS() - smoke_start_ns_) / static_cast<double>(SDL_NS_PER_SECOND);
     const auto& g = graphics_settings();
     std::cout << std::format("[rtbench] run frames={} sampled={} warmup={} fps={:.1f} "
-                             "rt_shadows={} rt_reflections={} rt_shadow_res={} rt_reflection_res={} "
+                             "rt_shadows={} rt_reflections={} rt_local_shadows={} "
+                             "rt_shadow_res={} rt_reflection_res={} rt_local_shadow_res={} "
                              "rt_range={} driver={}\n",
                              frame_, rt_bench_sampled_frames_, RT_BENCH_WARMUP_FRAMES,
                              elapsed_s > 0.0 ? frame_ / elapsed_s : 0.0, g.rt_shadows ? 1 : 0,
-                             g.rt_reflections ? 1 : 0, static_cast<int>(g.rt_shadow_resolution),
+                             g.rt_reflections ? 1 : 0, static_cast<int>(g.rt_local_shadows),
+                             static_cast<int>(g.rt_shadow_resolution),
                              static_cast<int>(g.rt_reflection_resolution),
+                             static_cast<int>(g.rt_local_shadow_resolution),
                              static_cast<int>(g.rt_max_instance_range), gpu_driver_name());
     // CPU RECORD time, not GPU time — SDL3 has no timestamp API, so a pass can
     // record in 40 us and cost 4 ms on the device. present_wait below is the
@@ -2790,12 +2808,15 @@ void PlaygroundGame::print_rt_bench_report() {
                                  row.samples->size());
     }
     const auto& rt = scene_renderer().raytracing_stats();
-    std::cout << std::format("[rtbench] rt shadows_traced={} reflections_traced={} shadow_rays={} "
-                             "reflection_rays={} instances={} tlas_builds={} tlas_refits={} "
+    std::cout << std::format("[rtbench] rt shadows_traced={} reflections_traced={} "
+                             "local_shadows_traced={} shadow_rays={} "
+                             "reflection_rays={} local_shadow_rays={} "
+                             "instances={} tlas_builds={} tlas_refits={} "
                              "blas_mb={:.2f} "
                              "attrs_mb={:.2f} tlas_mb={:.3f} accel_mb={:.2f}\n",
-                             rt.shadows_traced, rt.reflections_traced, rt.shadow_rays,
-                             rt.reflection_rays, rt.instances, rt.tlas_builds, rt.tlas_refits,
+                             rt.shadows_traced, rt.reflections_traced, rt.local_shadows_traced,
+                             rt.shadow_rays, rt.reflection_rays, rt.local_shadow_rays,
+                             rt.instances, rt.tlas_builds, rt.tlas_refits,
                              static_cast<double>(rt.blas_bytes) / (1024.0 * 1024.0),
                              static_cast<double>(rt.attribute_bytes) / (1024.0 * 1024.0),
                              static_cast<double>(rt.tlas_bytes) / (1024.0 * 1024.0),

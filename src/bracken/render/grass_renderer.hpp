@@ -118,7 +118,11 @@ struct alignas(16) GrassLightingUniforms {
     float screen_ao_texel_y;     // offset 108
     float ibl_enabled = 0.0f;    // offset 112 — 1 = sky IBL ambient (samplers 3-5), 0 = hemisphere
     float rt_shadow_enabled = 0.0f; // offset 116 — 1 = traced sun visibility replaces CSM
-    float _pad_ibl[2] = {0.0f, 0.0f};
+    /// offset 120 — 1 = multiply the local (point/spot) subtotal by the traced
+    /// local-shadow mask. Rides in what used to be the first `_pad_ibl` lane,
+    /// so the cbuffer neither grew nor moved a field.
+    float rt_local_shadow_enabled = 0.0f;
+    float _pad_ibl = 0.0f;
     /// Probe-field GI (render/gi/), R1c — see
     /// gpu::ModelLightingUniforms::giCascadeBase for the full contract.
     glm::ivec4 gi_cascade_base[3] = {}; // offset 128
@@ -142,6 +146,7 @@ static_assert(offsetof(GrassLightingUniforms, ambient_sky) == 80);
 static_assert(offsetof(GrassLightingUniforms, ambient_ground) == 96);
 static_assert(offsetof(GrassLightingUniforms, ibl_enabled) == 112);
 static_assert(offsetof(GrassLightingUniforms, rt_shadow_enabled) == 116);
+static_assert(offsetof(GrassLightingUniforms, rt_local_shadow_enabled) == 120);
 
 /**
  * Axis-aligned world-space XZ rectangle excluded from grass placement
@@ -218,6 +223,8 @@ public:
                 bool depth_equal = false,
                 const SDL_GPUTextureSamplerBinding* ibl_bindings = nullptr, bool ibl_enabled = false,
                 const SDL_GPUTextureSamplerBinding* rt_shadow_binding = nullptr, bool rt_shadows_enabled = false,
+                const SDL_GPUTextureSamplerBinding* rt_local_shadow_binding = nullptr,
+                bool rt_local_shadows_enabled = false,
                 const SDL_GPUTextureSamplerBinding* local_shadow_binding = nullptr,
                 const gi::GiBindings* gi = nullptr);
 

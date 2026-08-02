@@ -96,7 +96,13 @@ struct alignas(16) ModelLightingUniforms {
     /// rtReflectionMaxRoughness == 0 is the "reflections off" encoding.
     float rtReflectionMaxRoughness = 0.0f;
     float rtReflectionFadeStart = 0.0f;
-    float _rtPad2 = 0.0f;
+    /// 1 = multiply the LOCAL (point/spot) light subtotal by the ray-traced
+    /// local-shadow mask (GraphicsSettings::rt_local_shadows == Ratio). Rides
+    /// in what used to be `_rtPad2`, so the cbuffer neither grew nor moved a
+    /// field. 0 leaves accumulateClusterLights' arithmetic bit-identical: the
+    /// mask is not sampled at all, exactly as `giEnabled == 0` skips the probe
+    /// tap rather than blending it at weight zero.
+    float rtLocalShadowEnabled = 0.0f;
     /// Probe-field GI (render/gi/), R1c. `giCascadeBase[c].xyz` is
     /// `render::gi::cascade_base()` of the position ProbeVolume was scrolled
     /// with — sent rather than re-derived from cameraPos in the shader, so the
@@ -147,6 +153,7 @@ BRACKEN_HLSL_FIELD(ModelLightingUniforms, screenAOEnabled, 220);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtShadowEnabled, 224);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionMaxRoughness, 228);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionFadeStart, 232);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtLocalShadowEnabled, 236);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, giCascadeBase, 240);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, giEnabled, 288);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, _giPad0, 292);
@@ -391,7 +398,13 @@ struct alignas(16) InstancedLightingUniforms {
     /// ModelLightingUniforms::rtReflectionMaxRoughness.
     float rtReflectionMaxRoughness = 0.0f;
     float rtReflectionFadeStart = 0.0f;
-    float _rtPad2 = 0.0f;
+    /// 1 = multiply the LOCAL (point/spot) light subtotal by the ray-traced
+    /// local-shadow mask (GraphicsSettings::rt_local_shadows == Ratio). Rides
+    /// in what used to be `_rtPad2`, so the cbuffer neither grew nor moved a
+    /// field. 0 leaves accumulateClusterLights' arithmetic bit-identical: the
+    /// mask is not sampled at all, exactly as `giEnabled == 0` skips the probe
+    /// tap rather than blending it at weight zero.
+    float rtLocalShadowEnabled = 0.0f;
     /// Probe-field GI (render/gi/), R1c — see ModelLightingUniforms::giCascadeBase.
     glm::ivec4 giCascadeBase[3] = {};
     float giEnabled = 0.0f;
@@ -436,6 +449,7 @@ BRACKEN_HLSL_FIELD(InstancedLightingUniforms, screenAOEnabled, 204);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtShadowEnabled, 208);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionMaxRoughness, 212);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionFadeStart, 216);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtLocalShadowEnabled, 220);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giCascadeBase, 224);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giEnabled, 272);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _giPad0, 276);
@@ -1200,6 +1214,50 @@ BRACKEN_HLSL_FIELD(RtShadowUniforms, sunCosThetaMax, 112);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, frameIndex, 116);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, hasGBuffer, 120);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, _pad0, 124);
+
+/**
+ * Froxel-RIS local-light shadow trace — matches rt_local_shadow.comp.hlsl
+ * (set 2, b0). Used by: render::RtRenderer. The pass ALSO takes ClusterParams
+ * at set 2, b1 — that cbuffer is ClusterGrid's and is pushed straight from
+ * `ClusterGrid::params()`, so it has no mirror here.
+ */
+struct alignas(16) RtLocalShadowUniforms {
+    glm::mat4 invViewProj;
+    glm::uvec2 outputSize;
+    uint32_t tlasNodeCount = 0;
+    float normalBias = 1.5f;
+    float depthBias = 0.5f;
+    /// Emitter radius in world units for the sphere-cap shadow ray. One value
+    /// for every light until per-light authoring lands in R6.
+    float lightSourceRadius = 10.0f;
+    /// Cap on carried-over reservoir M, as a multiple of this frame's candidate
+    /// count.
+    float historyMaxMRatio = 20.0f;
+    uint32_t frameIndex = 0;
+    uint32_t hasGBuffer = 0;
+    uint32_t historyValid = 0;
+    uint32_t candidateCount = 6;
+    /// NO depthA/depthB pair, deliberately: the froxel lookup needs an ABSOLUTE
+    /// view depth that agrees with the CPU binner's, and the shader takes it
+    /// from `clusterParams.view` — the matrix ClusterGrid binned against —
+    /// rather than from a reversed-Z linearization that only has to be
+    /// self-consistent everywhere else it is used.
+    uint32_t _pad0 = 0;
+};
+
+BRACKEN_HLSL_CBUFFER(RtLocalShadowUniforms, 112);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, invViewProj, 0);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, outputSize, 64);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, tlasNodeCount, 72);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, normalBias, 76);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, depthBias, 80);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, lightSourceRadius, 84);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, historyMaxMRatio, 88);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, frameIndex, 92);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, hasGBuffer, 96);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, historyValid, 100);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, candidateCount, 104);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, _pad0, 108);
 
 /**
  * Shadow-denoiser tile classification — matches

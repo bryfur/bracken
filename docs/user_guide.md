@@ -2336,9 +2336,9 @@ The CPU-side bind calls map by slot, not by set:
 **Cluster-lighting include:** any scene fragment shader that wants clustered lights must define its sampler count before including `src/bracken/shaders/cluster_lighting.hlsli`, because the cluster SSBOs bind right after the samplers (the include `#error`s if you forget):
 
 ```hlsl
-// model.frag.hlsl has 15 fragment samplers (the last one is the local-shadow
+// model.frag.hlsl has 16 fragment samplers (the last one is the local-shadow
 // atlas the include itself declares), so cluster SSBOs start at slot 15
-#define CLUSTER_SSBO_BINDING_BASE 15
+#define CLUSTER_SSBO_BINDING_BASE 16
 #include "cluster_lighting.hlsli"
 ```
 
@@ -4082,6 +4082,10 @@ Setting `casts_shadows = true` opts a light into the **local-shadow budget**
 frame): the engine scores candidates, renders the winners into a cached
 8×8-tile D32 atlas (6 cube-face tiles per point light, 1 per spot, ≤ 6 tile
 re-renders per frame), and everything over budget falls back to unshadowed.
+`GraphicsSettings::rt_local_shadows = LocalRtShadowMode::Ratio` replaces that
+whole scheme with one traced ray per pixel — every light casts, budgets and
+`casts_shadows` stop applying, and the atlas is not updated at all; see
+[Ray-traced shadows and reflections](#ray-traced-shadows-and-reflections).
 The full behavior — tile caching, dynamic-caster invalidation, the emissive
 "bulb" gotcha — is documented with the frame-building API in
 [Dynamic lights](#dynamic-lights) under the Scene chapter. `shadow_slot` is
@@ -4469,6 +4473,8 @@ traced instance list gets no sun shadow there rather than falling back to CSM.
 | `rt_shadow_resolution`, `rt_reflection_resolution` | `Full`, `Full` | The dominant ray-count dial (`RtResolution::Full`/`Half`/`Quarter` of screen resolution). The denoisers upsample back to full res either way, so a lower setting costs silhouette sharpness rather than producing a blocky image. This is the knob to give weaker GPUs. |
 | `rt_sun_softness_deg` | `0.35` | Angular *radius* of the sun disk in degrees (the real sun is ~0.265). **Free to trace** — the ray count is identical, only the denoiser works harder. `0` collapses the cone to a hard shadow, which is the honest way to A/B the soft path. |
 | `rt_reflection_max_roughness` | `0.75` | Roughness at which traced specular hands over entirely to the prefiltered IBL probe. Higher = more of the frame reflects. Nearly free, because the pass is bound by wave divergence rather than by traced-pixel count. `0` stops tracing without tearing the structure down. |
+| `rt_local_shadows` | `Off` | Soft shadows for **every point and spot light**, from one traced ray per pixel. `Off` is the rasterized 8×8-tile atlas exactly as it has always been. `Ratio` retires that atlas — no selector, no tile renders, no 8-point/16-spot/6-tiles-per-frame budget, no staleness — and replaces it with a froxel-RIS reservoir that picks one light per pixel and traces a single sphere-cap ray at it; the denoised R8 mask multiplies your whole point+spot subtotal, so the analytic lighting stays sharp and only the shadowing is stochastic. **Requires the acceleration structure** (same `set_retain_cpu_geometry` precondition as `rt_shadows`) **and the depth-prepass G-buffer**; without either it is skipped for that frame and local lights render unshadowed. The trade against the atlas: you gain unlimited shadowed lights, penumbrae that widen with occluder distance, and terrain/grass as occluders; you pay one more traced pass, ~2.7 MB × 2 of reservoirs at half res, and a temporally-filtered signal that lags fast-moving occluders. |
+| `rt_local_shadow_resolution` | `Half` | Ray count for the local pass. `Half` rather than `Full` on purpose: this signal picks a *different* light per pixel per frame, so its raw variance is high and the denoiser is working hard regardless — spending twice the rays to sharpen a silhouette it is about to filter is the wrong end of the trade. |
 | `rt_max_instance_range` | `Unlimited` | How far an instance may be and still be traced (`RtRange::Near`/`Medium`/`Far`/`Unlimited` → 1000 / 2000 / 4000 world units / ∞, the same scale as `draw_distance`). The only RT dial that cuts the **acceleration structure** rather than the ray count. Its price: with a finite range the instance list depends on camera position, so a camera crossing the threshold re-triggers TLAS rebuilds a static scene otherwise never pays. Distant sun shadows keep coming from the cascades. |
 
 #### Things to know before you ship it
@@ -4480,11 +4486,18 @@ traced instance list gets no sun shadow there rather than falling back to CSM.
   shading is an interpolated normal plus one flat colour per triangle, and the
   sun term at a reflection hit is unshadowed. Reflections therefore show no
   cast shadows and no bounced light.
-- **Both signals are one sample per pixel and stochastic**, so the denoisers
+- **Every signal is one sample per pixel and stochastic**, so the denoisers
   are load-bearing. Expect temporal lag behind fast-moving occluders; that is
   the accumulation window doing its job, not a bug.
+- **`rt_local_shadows = Ratio` takes local shadowing away from the atlas
+  entirely** for the frames it is on, and it decides that from the *setting*,
+  before the frame knows whether the trace will succeed. A frame that asks for
+  traced local shadows and cannot have them (no G-buffer, structure not built
+  yet) shows unshadowed local lights for that frame rather than paying for
+  both paths. `casts_shadows` on a light becomes advisory in this mode: every
+  light casts, whether you opted it in or not.
 - **Budget with the numbers, not with vibes.** `Application::render_stats()`
-  reports `RTInstances`, `RTShadows`, `RTReflectionTrace` and
+  reports `RTInstances`, `RTShadows`, `RTLocalShadows`, `RTReflectionTrace` and
   `RTReflectionResolve` in `pass_times_ms` (CPU record time — there is no GPU
   timestamp API), and `SceneRenderer::raytracing_stats()` returns an `RtStats`
   with the dispatched ray counts, the live instance count, the TLAS rebuild
@@ -4509,6 +4522,7 @@ traced instance list gets no sun shadow there rather than falling back to CSM.
 | Ambient source (sky IBL vs hemisphere) | `GraphicsSettings::ibl_enabled` | `true` (IBL) |
 | AO mode / strength / radius | `GraphicsSettings::ao_mode` / `ao_strength` / `ao_radius` | `GTAO_Half` / 1.0 / 1.0 |
 | Ray-traced shadows / reflections | `GraphicsSettings::rt_shadows` / `rt_reflections` (+ `ModelManager::set_retain_cpu_geometry` before loading) | both `false` |
+| Ray-traced LOCAL (point/spot) shadows | `GraphicsSettings::rt_local_shadows` (`Off` = the rasterized atlas, `Ratio` = one traced ray per pixel and the atlas retires) / `rt_local_shadow_resolution` | `Off` / `Half` |
 | Traced ray count / softness / roughness gate / instance range | `GraphicsSettings::rt_shadow_resolution` / `rt_reflection_resolution` / `rt_sun_softness_deg` / `rt_reflection_max_roughness` / `rt_max_instance_range` | Full / Full / 0.35 / 0.75 / `Unlimited` |
 
 ---

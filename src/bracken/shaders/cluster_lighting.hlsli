@@ -122,9 +122,30 @@ float localLightShadow(int shadow_slot, bool is_point, float3 light_pos, float r
 
 #include "cluster_light_load.hlsli"
 
+// ---------------------------------------------------------------------------
+// Ray-traced local shadows, Ratio tier (R2b, docs/rt_lighting_plan.md §5.3).
+//
+// `traced_visibility` is the denoised R8 mask rt_local_shadow.comp.hlsl +
+// the three shadow denoiser passes produced for this frame, sampled by the
+// INCLUDING shader at its own slot and passed in — this file does not declare
+// it, because the four including shaders sit at four different slot numbers and
+// a fifth #define would be one more thing to keep in step.
+//
+// It is a Heitz ratio estimator: the whole point+spot subtotal — the ANALYTIC
+// sum, unchanged, still sharp — is multiplied by one stochastic visibility
+// ratio. That is what buys soft shadows for every local light at one ray per
+// pixel; the alternative (a per-light traced term) would need a ray per light.
+//
+// The atlas path below is not deleted and not disabled: in Ratio mode the
+// engine simply never assigns a shadow_slot, so `localLightShadow` returns 1.0
+// through its existing `shadow_slot < 0` branch and the two cannot double-darken
+// a pixel. That is also what makes `Off` byte-identical — with the mask
+// argument left at its default the multiply is not merely by 1.0, it is absent.
+// ---------------------------------------------------------------------------
 float3 accumulateClusterLights(float3 P, float3 N, float3 V,
                                 float3 baseColor, float metallic, float roughness, float ao,
-                                float view_depth, float2 screen_uv) {
+                                float view_depth, float2 screen_uv,
+                                float traced_visibility = -1.0) {
     if (clusterParams.gridDim.w == 0u) return float3(0, 0, 0);
     uint cidx = clusterIndexFromScreen(screen_uv, view_depth, clusterParams);
     uint2 oc = clusterOffsetsBuf[cidx];
@@ -162,6 +183,9 @@ float3 accumulateClusterLights(float3 P, float3 N, float3 V,
             acc += evaluatePBRSpot(N, V, L, sl.color * sl.intensity, att, cone,
                                    baseColor, metallic, roughness, ao) * shadow;
         }
+    }
+    if (traced_visibility >= 0.0) {
+        acc *= traced_visibility;
     }
     return acc;
 }

@@ -474,6 +474,8 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
                              const scene::Frustum* frustum, bool depth_equal,
                              const SDL_GPUTextureSamplerBinding* ibl_bindings, bool ibl_enabled,
                              const SDL_GPUTextureSamplerBinding* rt_shadow_binding, bool rt_shadows_enabled,
+                             const SDL_GPUTextureSamplerBinding* rt_local_shadow_binding,
+                             bool rt_local_shadows_enabled,
                              const SDL_GPUTextureSamplerBinding* local_shadow_binding,
                              const gi::GiBindings* gi) {
     BRACKEN_PROFILE_ZONE_COLOR("TerrainRenderer::render", 0xC0392B);
@@ -531,6 +533,8 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
     lighting_uniforms.iblEnabled = (ibl_enabled && ibl_bindings) ? 1.0f : 0.0f;
     lighting_uniforms.rtShadowEnabled =
         (rt_shadows_enabled && rt_shadow_binding) ? 1.0f : 0.0f;
+    lighting_uniforms.rtLocalShadowEnabled =
+        (rt_local_shadows_enabled && rt_local_shadow_binding) ? 1.0f : 0.0f;
     // Probe-field GI (R1c): the caller's one snapshot of the field. Gated on
     // the bindings actually being there for the same reason iblEnabled is —
     // a flag without its textures samples an undefined descriptor.
@@ -573,14 +577,17 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
         SDL_BindGPUFragmentSamplers(pass, 8, rt_shadow_binding, 1);
     }
 
-    // Local (point/spot) shadow atlas + comparison sampler at slot 9.
-    // Probe-field GI atlases at 9-11; the local-shadow atlas keeps its
-    // contract of sitting at this shader's LAST sampler slot, now 12.
+    // Probe-field GI atlases at 9-11, the traced LOCAL-light visibility ratio
+    // at 12, and the rasterized local-shadow ATLAS at 13 — which keeps its
+    // contract of sitting at this shader's LAST sampler slot.
     if (gi != nullptr && gi->textures[0].texture != nullptr) {
         SDL_BindGPUFragmentSamplers(pass, 9, gi->textures.data(), 3);
     }
+    if (rt_local_shadow_binding) {
+        SDL_BindGPUFragmentSamplers(pass, 12, rt_local_shadow_binding, 1);
+    }
     if (local_shadow_binding) {
-        SDL_BindGPUFragmentSamplers(pass, 12, local_shadow_binding, 1);
+        SDL_BindGPUFragmentSamplers(pass, 13, local_shadow_binding, 1);
     }
 
     if (cluster_light_data_ && cluster_offsets_ && cluster_indices_ && cluster_params_) {

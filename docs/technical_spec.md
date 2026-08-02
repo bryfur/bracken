@@ -706,6 +706,8 @@ enum class GiQuality   : int { Low = 0, Medium = 1, High = 2 };
 | `rt_reflection_resolution` | RtResolution | Full | [Full, Quarter] (same dial for the reflection trace) |
 | `rt_sun_softness_deg` | float | 0.35 | [0, 10] (angular RADIUS of the sun disk in degrees; the real sun is ~0.265. 0 collapses the cone to a hard shadow. Free to trace — same ray count, the denoiser works harder) |
 | `rt_reflection_max_roughness` | float | 0.75 | [0, 1] (roughness at which traced specular hands over entirely to the prefiltered IBL probe; the two weights always sum to 1) |
+| `rt_local_shadows` | LocalRtShadowMode | **Off** | [Off, Ratio] (traced shadows for POINT and SPOT lights, `shaders/rt_local_shadow.comp.hlsl`. `Off` is the rasterized 8×8-tile atlas byte for byte. `Ratio` is one froxel-RIS reservoir shadow ray per pixel whose denoised R8 mask multiplies the whole clustered point+spot subtotal — the Heitz ratio estimator, so the analytic sum stays sharp. **Needs the acceleration structure and the prepass G-buffer**, and RETIRES the atlas for the frames it is on: no selector, no tile renders, every `shadow_slot` stays -1, and the smoke line's `local_tiles` reads 0. `Full = 2` — R5's demodulated traced-DI tier — is deliberately NOT declared, so an on-disk `2` clamps DOWN to Ratio rather than opting silently into a tier nobody chose; pinned by `LocalRtShadowModeClampsOutOfRangeValues`) |
+| `rt_local_shadow_resolution` | RtResolution | **Half** | [Full, Quarter] (Half rather than Full because this signal picks a DIFFERENT light per pixel per frame, so the denoiser is working hard regardless and sharper input mostly buys detail it is about to filter away) |
 | `rt_max_instance_range` | RtRange | **Unlimited** | [Near, Unlimited] → {1000, 2000, 4000, ∞} world units via `rt_range_units` (instances whose bounds lie entirely beyond it are dropped before the TLAS hashes; distant sun shadows fall back to the cascades. A finite value makes camera motion change the instance SET, which is a topology change and therefore a full TLAS rebuild rather than the refit a mere move costs — see architecture.md "Ray tracing") |
 | `gi_mode` | GiMode | **Off** | [Off, ProbesScreen] (diffuse GI from the scrolled probe clipmap, `render/gi/probe_volume.hpp`. Off by default: the field costs ~30 MB of atlases the moment it exists. `ProbesScreen` is a valid, clamping, persisted value that **behaves as `Probes` until phase R4** — declared early so the on-disk integer for the tier is fixed before players have settings files. After phase R1b the field traces, shades and accumulates probe rays but nothing samples it, so it still lights nothing; see architecture.md "Probe-field GI". **Turning it on builds the ray-tracing acceleration structure with per-triangle attributes even with `rt_shadows`/`rt_reflections` off** — probe rays shade what they hit) |
 | `gi_quality` | GiQuality | Medium | [Low, High] (probe ray budget — `render/gi/probe_schedule.hpp::gi_budget`: rays/probe {32, 64, 96} and probes per cascade turn {864, 1728, 1728}, i.e. {1/8, 1/4, 1/4} of a cascade. With the rota putting at most two cascades in any one frame, the peak is {55296, 221184, 331776} rays/frame) |
@@ -2158,6 +2160,7 @@ Compute pipelines (`ComputeResources` as `{samplers, ro_storage_tex, ro_storage_
 |---|---|---|---|---|
 | ExposureHistogram | `exposure_histogram.comp.spv` | {1,0,0,0,1,1} | 16×16×1 | sampler = HDR scene color; RW buffer = 256-bin histogram |
 | ExposureAdapt | `exposure_adapt.comp.spv` | {0,0,0,0,2,1} | 256×1×1 | RW buffers = histogram (read + zeroed) and exposure state |
+| RtLocalShadow | `rt_local_shadow.comp.spv` | {3,0,8,1,2,2} | 8×4×1 | froxel-RIS local-light shadows. Samplers = depth, prepass G-buffer, velocity. **Eight** RO buffers is SDL3 GPU's hard ceiling for a compute pipeline, not a choice: four acceleration-structure buffers + four cluster buffers (light data, froxel offsets, froxel indices, prev→current remap). `cluster_compute.hlsli`'s fifth, the packed stable ids, is opt-in (`CLUSTER_COMPUTE_WANT_STABLE_IDS`) and this pass declines it. The reservoir ping-pong therefore rides two RW buffers of which one is only ever read. Two uniform buffers: b0 `RtLocalShadowUniforms`, b1 ClusterGrid's own `ClusterParams`. One group per 8×4 output tile |
 
 Error handling: `get_pipeline` before `init` logs and returns `nullptr`; unknown enum values log; per-pipeline creation failure (usually a missing/uncompiled `.spv`) returns `nullptr` and is not cached (retried on next access).
 
@@ -2206,6 +2209,7 @@ Cbuffer mirror inventory (binding as annotated in the header). Every size below 
 | `ParticleBatchUniforms` | vertex set 1, b1 | 16 | `instanceOffset` into per-frame particle SSBO |
 | `RtReflectionUniforms` | compute set 2, b0 | 240 | opaque receiver fields through offset 143, optional analytic-water region/simulation/flow/detail fields at 144–223, `frameIndex` at 224 (advances the GGX sample sequence) |
 | `RtShadowUniforms` | compute set 2, b0 | 128 | trace fields through offset 111, then `sunCosThetaMax` (cos of the sun's angular radius; 1.0 = a point light, i.e. the old hard shadow), `frameIndex`, `hasGBuffer` |
+| `RtLocalShadowUniforms` | compute set 2, b0 | 112 | `invViewProj`, `outputSize`, `tlasNodeCount`, `normalBias`/`depthBias`, `lightSourceRadius = 10` world units (the emitter sphere the shadow ray samples — the penumbra-width dial, one value for every light until R6), `historyMaxMRatio = 20`, `frameIndex`, `hasGBuffer`, `historyValid`, `candidateCount = 6`. **No `depthA`/`depthB` pair**, unlike every other depth-reading pass: the froxel lookup needs an ABSOLUTE view depth that agrees with the CPU binner's, and a reversed-Z linearization that is only ever used for comparisons elsewhere is off by enough to land the pixel in a different Z slice — so the depth comes from `clusterParams.view`, the matrix `ClusterGrid` binned against. The pass takes ClusterGrid's own `ClusterParams` at **set 2, b1**, pushed verbatim rather than copied into a second struct |
 | `RtShadowClassifyUniforms` | compute set 2, b0 | 16 | `tileCount` of the packed-bit texture |
 | `RtShadowTemporalUniforms` | compute set 2, b0 | 48 | `tracedSize`/`tileCount`, `depthA`/`depthB` (reversed-Z linearization), `maxAccumFrames = 32`, `depthRejectRelative = 0.05`, `historyValid` |
 | `RtShadowFilterUniforms` | compute set 2, b0 | 48 | `outputSize` (full res) / `tracedSize` / `tileCount`, `depthA`/`depthB`, `maxRadius = 3` traced texels at maximum variance, `depthSigma = 0.05` |
@@ -2438,11 +2442,11 @@ VS/FS resource counts below are the `ShaderResources` declared in each catalogue
 
 | Pipeline | VS / FS | VS res | FS res | State highlights | Color |
 |---|---|---|---|---|---|
-| Model (+DS/Blend) | `model.vert` / `model.frag` | u1 | u3 s12 b4 | vertex3d; opaque or alpha_blended; no_cull if DS | scene |
-| SkinnedModel (+variants) | `skinned_model.vert` / `model.frag` | u1 b1 | u3 s12 b4 | skinned_vertex | scene |
-| InstancedModel (+DS) | `model_instanced.vert` / `model_instanced.frag` | u1 b1 | u3 s12 b4 | vertex3d, opaque | scene |
-| Terrain | `terrain.vert` / `terrain.frag` | u1 | u3 s10 b4 | custom 48-B layout | scene |
-| Grass | `grass.vert` / `grass.frag` | u1 s2 b1 | u3 s8 b4 | vertex3d, opaque, no_cull | scene |
+| Model (+DS/Blend) | `model.vert` / `model.frag` | u1 | u3 s16 b4 | vertex3d; opaque or alpha_blended; no_cull if DS | scene |
+| SkinnedModel (+variants) | `skinned_model.vert` / `model.frag` | u1 b1 | u3 s16 b4 | skinned_vertex | scene |
+| InstancedModel (+DS) | `model_instanced.vert` / `model_instanced.frag` | u1 b1 | u3 s16 b4 | vertex3d, opaque | scene |
+| Terrain | `terrain.vert` / `terrain.frag` | u1 | u3 s14 b4 | custom 48-B layout | scene |
+| Grass | `grass.vert` / `grass.frag` | u1 s2 b1 | u3 s12 b4 | vertex3d, opaque, no_cull | scene |
 | Skybox | `skybox.vert` / `skybox.frag` | — | u1 | pos-only layout; depth write off; GREATER_OR_EQUAL; z=0 in VS | scene |
 | Grid | `grid.vert` / `grid.frag` | u1 | — | 28-B layout, LINELIST, alpha, no_cull | scene |
 | Particle | `particle.vert` / `particle.frag` | u2 b1 | u1 s1 | vertex3d, additive, depth write off, GREATER_OR_EQUAL | scene |
@@ -2518,6 +2522,8 @@ Every cbuffer has an `alignas(16)` CPU mirror annotated with its `(set, binding)
 | `RtReflectionResolveUniforms` | (3, b0) | `rt_reflection_resolve.frag` | 112 |
 | `RtReflectionUniforms` | compute (2, b0) | `rt_reflection.comp` | 240 |
 | `RtShadowUniforms` | compute (2, b0) | `rt_shadow.comp` | 128 |
+| `RtLocalShadowUniforms` | compute (2, b0) | `rt_local_shadow.comp` | 112 |
+| `render::lighting::ClusterParams` | compute (2, b1) | `rt_local_shadow.comp` | 208 |
 | `RtShadowClassifyUniforms` | compute (2, b0) | `rt_shadow_denoise_classify.comp` | 16 |
 | `RtShadowTemporalUniforms` | compute (2, b0) | `rt_shadow_denoise_temporal.comp` | 48 |
 | `RtShadowFilterUniforms` | compute (2, b0) | `rt_shadow_denoise_filter.comp` | 48 |

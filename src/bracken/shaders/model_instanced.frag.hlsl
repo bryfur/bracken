@@ -60,7 +60,10 @@ cbuffer LightingUniforms {
     // Roughness at which the traced contribution starts fading out; it reaches
     // zero at rtReflectionMaxRoughness. See reflection_gate.hlsli.
     float rtReflectionFadeStart;
-    float _rtPad2;
+    // 1 = multiply the LOCAL (point/spot) subtotal by the ray-traced
+    // local-shadow mask at sampler 14 (R2b Ratio tier). Was _rtPad2, so
+    // the cbuffer neither grew nor moved a field.
+    float rtLocalShadowEnabled;
     // Probe-field GI (render/gi/), R1c. giCascadeBase is
     // `render::gi::cascade_base()` of the position ProbeVolume was scrolled
     // with — passed rather than re-derived from cameraPos so a shader and the
@@ -181,14 +184,23 @@ Texture2D<float4> giProbeMeta;
 [[vk::combinedImageSampler]][[vk::binding(13, 2)]]
 SamplerState giProbeMetaSampler;
 
+// Ray-traced LOCAL (point/spot) shadow ratio (R8, 1 = lit), at the local pass's
+// own traced resolution — so, like rtShadowTexture, ALWAYS sample it with a
+// normalized UV. Bound to the 1x1 white dummy and read only when
+// rtLocalShadowEnabled, which is the same no-op the sun mask uses.
+[[vk::combinedImageSampler]][[vk::binding(14, 2)]]
+Texture2D<float> rtLocalShadowTexture;
+[[vk::combinedImageSampler]][[vk::binding(14, 2)]]
+SamplerState rtLocalShadowSampler;
+
 #include "shadow_common.hlsli"
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
 #include "reflection_gate.hlsli"
 // Cluster SSBOs follow this shader's 15 fragment samplers in set 2 (slots
-// 0-13 above + the local-shadow atlas at 14, declared by the include).
-#define CLUSTER_SSBO_BINDING_BASE 15
+// 0-14 above + the local-shadow ATLAS at 15, declared by the include).
+#define CLUSTER_SSBO_BINDING_BASE 16
 #include "gi_sample.hlsli"
 #include "cluster_lighting.hlsli"
 
@@ -302,9 +314,15 @@ float4 PSMain(PSInput input) : SV_Target {
 
     if (clusterParams.gridDim.w > 0u) {
         float2 screen_uv = input.position.xy * clusterParams.screenSize.zw;
+        // Ratio tier: one traced visibility multiplies the whole local
+        // subtotal. -1 is "no traced mask", which skips the multiply outright.
+        float localVis = -1.0;
+        if (rtLocalShadowEnabled > 0.5) {
+            localVis = rtLocalShadowTexture.SampleLevel(rtLocalShadowSampler, screen_uv, 0).r;
+        }
         result += accumulateClusterLights(input.fragPos, N, V,
                                           baseColor.rgb, metallic, roughness, 1.0,
-                                          input.viewDepth, screen_uv);
+                                          input.viewDepth, screen_uv, localVis);
     }
 
     float3 emissive = emissiveFactor;

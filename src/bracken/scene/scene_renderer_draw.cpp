@@ -93,6 +93,12 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
     SDL_GPUTextureSamplerBinding rt_shadow_binding = {rt_shadow_tex, default_sampler_};
     const bool have_rt_shadow_binding = rt_shadow_tex && default_sampler_;
 
+    SDL_GPUTexture* rt_local_tex = frame_rt_local_shadow_texture_
+                                       ? frame_rt_local_shadow_texture_
+                                       : (dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr);
+    SDL_GPUTextureSamplerBinding rt_local_binding = {rt_local_tex, default_sampler_};
+    const bool have_rt_local_binding = rt_local_tex && default_sampler_;
+
     // Sky IBL bindings for terrain/grass (real chain or typed dummies) — the
     // model-family paths bind the same set via bind_ibl().
     SDL_GPUTextureSamplerBinding ibl_bindings[3];
@@ -119,6 +125,7 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
                          have_ao_binding ? &ao_binding : nullptr, ao_texel, &frame_frustum_, frame_prepass_active_,
                          have_ibl_bindings ? ibl_bindings : nullptr, frame_ibl_active_,
                          have_rt_shadow_binding ? &rt_shadow_binding : nullptr, frame_rt_shadows_active_,
+                         have_rt_local_binding ? &rt_local_binding : nullptr, frame_rt_local_shadows_active_,
                          have_local_shadow_binding ? &local_shadow_binding : nullptr, &frame_gi_);
     }
 
@@ -130,6 +137,7 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
                                 have_ao_binding ? &ao_binding : nullptr, ao_texel, frame_prepass_active_,
                                 have_ibl_bindings ? ibl_bindings : nullptr, frame_ibl_active_,
                                 have_rt_shadow_binding ? &rt_shadow_binding : nullptr, frame_rt_shadows_active_,
+                                have_rt_local_binding ? &rt_local_binding : nullptr, frame_rt_local_shadows_active_,
                                 have_local_shadow_binding ? &local_shadow_binding : nullptr, &frame_gi_);
     }
 
@@ -227,7 +235,8 @@ bool SceneRenderer::bind_model_pipeline(bool double_sided, bool depth_equal) {
     bind_ibl(7);
     bind_rt_shadow_mask(10);
     bind_gi(11);
-    bind_local_shadow_atlas(14);
+    bind_rt_local_shadow_mask(14);
+    bind_local_shadow_atlas(15);
     model_pipeline_double_sided_ = double_sided;
     model_pipeline_depth_equal_ = depth_equal;
     model_pipeline_bound_ = true;
@@ -257,7 +266,8 @@ bool SceneRenderer::bind_skinned_pipeline(bool double_sided, bool depth_equal) {
     bind_ibl(7);
     bind_rt_shadow_mask(10);
     bind_gi(11);
-    bind_local_shadow_atlas(14);
+    bind_rt_local_shadow_mask(14);
+    bind_local_shadow_atlas(15);
     SDL_GPUBuffer* palette_buf = current_bone_palette_buffer()->handle();
     SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);
     skinned_pipeline_double_sided_ = double_sided;
@@ -279,6 +289,21 @@ void SceneRenderer::bind_rt_shadow_mask(uint32_t slot) {
     // never actually sampled.
     SDL_GPUTexture* white = dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr;
     SDL_GPUTexture* tex = frame_rt_shadow_texture_ ? frame_rt_shadow_texture_ : white;
+    if (!tex || !default_sampler_ || !main_render_pass_) {
+        return;
+    }
+    SDL_GPUTextureSamplerBinding binding = {tex, default_sampler_};
+    SDL_BindGPUFragmentSamplers(main_render_pass_, slot, &binding, 1);
+}
+
+void SceneRenderer::bind_rt_local_shadow_mask(uint32_t slot) {
+    // Always bound, for the same reason bind_rt_shadow_mask always is: the
+    // slot is declared unconditionally and SDL3 GPU leaves an unbound fragment
+    // sampler descriptor undefined. The white dummy reads 1.0 from any UV,
+    // which for a visibility RATIO is "nothing is shadowed" — and
+    // rtLocalShadowEnabled is 0 anyway, so it is never sampled.
+    SDL_GPUTexture* white = dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr;
+    SDL_GPUTexture* tex = frame_rt_local_shadow_texture_ ? frame_rt_local_shadow_texture_ : white;
     if (!tex || !default_sampler_ || !main_render_pass_) {
         return;
     }
@@ -426,6 +451,7 @@ gpu::ModelLightingUniforms SceneRenderer::make_model_lighting(const CameraState&
     // mask is at the traced pass's own resolution, so the sampler does the
     // magnification; screenAOTexel* only converts SV_Position to [0,1].
     u.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
+    u.rtLocalShadowEnabled = frame_rt_local_shadows_active_ ? 1.0f : 0.0f;
     u.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
     u.rtReflectionFadeStart = frame_rt_reflection_fade_start_;
     // Probe-field GI: the frame's ONE snapshot of the field (refresh_gi_bindings).
@@ -575,6 +601,7 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
     lighting_uniforms.screenAOTexelY = 1.0f / static_cast<float>(std::max(context_->height(), 1));
     lighting_uniforms.iblEnabled = frame_ibl_active_ ? 1.0f : 0.0f;
     lighting_uniforms.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
+    lighting_uniforms.rtLocalShadowEnabled = frame_rt_local_shadows_active_ ? 1.0f : 0.0f;
     lighting_uniforms.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
     lighting_uniforms.rtReflectionFadeStart = frame_rt_reflection_fade_start_;
     for (std::size_t c = 0; c < frame_gi_.cascade_base.size(); ++c) {
@@ -618,7 +645,8 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
         bind_ibl(7);
         bind_rt_shadow_mask(10);
         bind_gi(11);
-        bind_local_shadow_atlas(14);
+        bind_rt_local_shadow_mask(14);
+        bind_local_shadow_atlas(15);
         lighting_pushed = false;
         bound_type = want;
         return true;
@@ -837,7 +865,8 @@ void SceneRenderer::render_transparent_models(const CameraState& camera) {
             bind_ibl(7);
             bind_rt_shadow_mask(10);
             bind_gi(11);
-            bind_local_shadow_atlas(14);
+            bind_rt_local_shadow_mask(14);
+            bind_local_shadow_atlas(15);
             if (skinned) {
                 SDL_GPUBuffer* palette_buf = current_bone_palette_buffer()->handle();
                 SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);

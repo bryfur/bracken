@@ -1,7 +1,7 @@
 # Ray-Traced Lighting — Research & Plan of Record
 
-Status: **in progress — R0 (foundations) and R1 (probe-field GI) have landed**;
-R2 onward is still proposal. Written 2026-08-02 against the working tree at the
+Status: **in progress — R0 (foundations), R1 (probe-field GI) and R2
+(froxel-RIS local-light shadows) have landed**; R3 onward is still proposal. Written 2026-08-02 against the working tree at the
 RT-denoiser series (post "RT shadows: stop multiplexing ambient occlusion into
 the shadow mask"); R0's landed work packages are marked in §5.0 and R1's three
 packages in §5.2. As of R1c the probe field lights the frame — the first
@@ -761,7 +761,79 @@ frame path reads any of it.
 - **`cluster_compute_validate.comp`** exists only so the new include is a
   compiled artifact rather than a text file. Nothing dispatches it; it is
   registered in no pipeline; delete it when R2b's real pass includes the same
-  header.
+  header. *(Deleted in R2b, as planned.)*
+
+**Landed (R2b, 2026-08-02) — the Ratio tier: one ray per pixel, and every
+local light casts a soft shadow. R2 is complete.** `LocalRtShadowMode
+{ Off = 0, Ratio = 1 }` + `rt_local_shadow_resolution` (Half), both `Off`/
+default, seven touch points, dev-panel row, `[smoke] settings` field and a
+`PLAYGROUND_RT_LOCAL=ratio|off` pin.
+
+- **`shaders/rt_local_shadow.comp.hlsl`** is the pass: surface from depth +
+  G-buffer, candidates from the pixel's froxel, RIS over M = 6 uniform draws
+  weighted by `clusterLightTarget`, a temporal merge with the reprojected
+  previous reservoir, and ONE sphere-cap any-hit ray at the winner. Output is
+  the same 8×4-packed bit tile the sun pass writes, which is the whole point.
+- **The target function moved to the shared level**, `cluster_light_load.hlsli`,
+  next to the decode — the same anti-drift move as R2a's froxel index. It is
+  built from the `pointFalloff`/`spotConeFactor` the FORWARD accumulator calls,
+  so "the forward loop skips this light" and "the sampler weights it zero" are
+  one statement rather than two that agree today. `render/lighting/
+  light_target.hpp` is the CPU third, and `light_target.test.cpp` pins its
+  support against the binner's own radius cull across a light row.
+- **Reservoir: 16 B/px**, `{light index, W, M, linear depth}`, ping-ponged at
+  the traced resolution. p̂ is deliberately NOT stored: the only consumer of a
+  stored reservoir is next frame's merge, which must re-evaluate p̂ at the
+  CURRENT surface — the stored value is the one number it may not use — so the
+  freed lane carries the depth the merge cannot reconstruct instead. That
+  re-evaluation is also why no normal test is needed: a light the new surface
+  cannot see evaluates to zero and contributes nothing but M. History M is
+  clamped to 20× the current candidate count. `render/lighting/reservoir.hpp` +
+  `reservoir.test.cpp` pin the maths that a screenshot cannot: selection
+  probability proportional to weight, streaming-merge == batch weights,
+  zero-weight candidates still advancing M, and the remap dropping a vanished
+  light rather than re-pointing it.
+- **The denoiser was NOT cloned.** §5.3 above proposed "a scalar clone of the
+  existing shadow denoiser"; there is no clone. The sun path's targets and flags
+  became `RtRenderer::VisibilityDenoiser`, and the local signal is a second
+  instance of it dispatched through the SAME three pipelines. Nothing in those
+  passes was sun-specific. The proof that the refactor is behaviour-neutral is
+  that `PLAYGROUND_RT=both --smoke 30` still reproduces `83.9 / 47.9` bit for
+  bit.
+- **Atlas retirement.** In Ratio mode `SceneRenderer` skips the selector and the
+  tile renders entirely, so no `shadow_slot` is assigned and the atlas branch is
+  dead through its existing `shadow_slot < 0` path rather than through a new
+  one. `[smoke] ... local_tiles=0` under the pin. `Off` is byte-identical to
+  before.
+- **Two ceilings found the hard way**, both now documented where they bite.
+  (1) SDL3 GPU refuses a compute pipeline declaring more than EIGHT read-only
+  storage buffers; the four acceleration buffers plus four cluster buffers spend
+  the budget exactly, so `cluster_compute.hlsli`'s packed stable-id buffer became
+  **opt-in** (`CLUSTER_COMPUTE_WANT_STABLE_IDS`, which this pass declines — a
+  temporal reservoir wants the remap, not the ids) and the reservoir ping-pong
+  moved to two read-write slots of which one is only ever read. (2) The froxel
+  lookup needs an ABSOLUTE view depth agreeing with the CPU binner's, and the
+  `depthB / (d - depthA)` linearization every other depth-reading pass uses is
+  wrong by ~33 % at typical distances — invisible everywhere it is only compared
+  against itself, and enough here to land every pixel in a Z slice with an empty
+  light list. The pass takes its view depth from `clusterParams.view` instead,
+  the matrix `ClusterGrid` binned against, and carries no depthA/depthB at all.
+- **Measured**, playground village, 1600×900, Linux/Vulkan, `--smoke 30`:
+  `PLAYGROUND_RT=both` unchanged at `83.9 / 47.9`; adding
+  `PLAYGROUND_RT_LOCAL=ratio` gives **`85.3 / 47.5`**, reproduced identically
+  over three runs. Brighter, because the atlas it replaced was over-darkening
+  the plaza with a hard-edged tile shadow. `--rt-bench 120` (`-O0` tree, ratios
+  only): `RTLocalShadows` records **0.0087 ms mean / 0.0097 p95** CPU — and
+  `LocalShadowPass`, the rasterized atlas it replaced, **disappears from the
+  table**, having cost 0.0384 / 0.0423. Frame render 2.069 → 2.177 ms and
+  `present_wait` 1.631 → 1.762 ms: the real cost is on the device, as it should
+  be for 360 k more rays. 1398 tests pass.
+- **Still open here.** No spatial reuse pass (§5.3's "High only" pairwise-MIS
+  neighbours) — temporal alone is enough at this light count. The emitter
+  radius is one global constant (10 world units); per-light authoring is R6's.
+  And the Full-DI tier remains R5's, deliberately not declared as an
+  enumerator so an on-disk `2` clamps down rather than opting into a tier that
+  does not exist.
 
 ### 5.4 R3 — Honest hit lighting (reflections meet GI)
 

@@ -81,7 +81,11 @@ struct alignas(16) TerrainLightingUniforms {
     glm::vec4 splat_params;    // offset 112 — xy = splat origin (world XZ), zw = splat X/Z size
     float iblEnabled = 0.0f;   // offset 128 — 1 = sky IBL ambient (samplers 5-7), 0 = hemisphere
     float rtShadowEnabled = 0.0f; // offset 132 — 1 = traced sun visibility replaces CSM
-    float _padIbl[2] = {0.0f, 0.0f};
+    /// offset 136 — 1 = multiply the local (point/spot) subtotal by the traced
+    /// local-shadow mask. Rides in what used to be the first `_padIbl` lane, so
+    /// the cbuffer neither grew nor moved a field.
+    float rtLocalShadowEnabled = 0.0f;
+    float _padIbl = 0.0f;
     /// Probe-field GI (render/gi/), R1c — see
     /// gpu::ModelLightingUniforms::giCascadeBase for the full contract.
     glm::ivec4 giCascadeBase[3] = {}; // offset 144
@@ -103,6 +107,7 @@ static_assert(offsetof(TerrainLightingUniforms, sunColor) == 96);
 static_assert(offsetof(TerrainLightingUniforms, splat_params) == 112);
 static_assert(offsetof(TerrainLightingUniforms, iblEnabled) == 128);
 static_assert(offsetof(TerrainLightingUniforms, rtShadowEnabled) == 132);
+static_assert(offsetof(TerrainLightingUniforms, rtLocalShadowEnabled) == 136);
 static_assert(offsetof(TerrainLightingUniforms, giCascadeBase) == 144);
 static_assert(offsetof(TerrainLightingUniforms, giEnabled) == 192);
 
@@ -172,6 +177,9 @@ public:
      *        IBL chain for ambient, 0 = hemisphere ambient fallback.
      * @param rt_shadow_binding Ray-traced sun visibility mask (slot 8; a
      *        white dummy keeps the descriptor valid while disabled).
+     * @param rt_local_shadow_binding Ray-traced LOCAL (point/spot) visibility
+     *        ratio (slot 12; a white dummy while the mode is Off). Multiplies
+     *        the clustered point+spot subtotal — see cluster_lighting.hlsli.
      * @param local_shadow_binding Local (point/spot) shadow atlas +
      *        comparison sampler (slot 12 — the shader's last sampler; sampled
      *        only for lights with shadow_slot >= 0, so any D32 depth texture
@@ -190,6 +198,8 @@ public:
                 const scene::Frustum* frustum = nullptr, bool depth_equal = false,
                 const SDL_GPUTextureSamplerBinding* ibl_bindings = nullptr, bool ibl_enabled = false,
                 const SDL_GPUTextureSamplerBinding* rt_shadow_binding = nullptr, bool rt_shadows_enabled = false,
+                const SDL_GPUTextureSamplerBinding* rt_local_shadow_binding = nullptr,
+                bool rt_local_shadows_enabled = false,
                 const SDL_GPUTextureSamplerBinding* local_shadow_binding = nullptr,
                 const gi::GiBindings* gi = nullptr);
 

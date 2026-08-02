@@ -30,6 +30,13 @@ void GraphicsSettings::clamp_to_valid_ranges() {
     rt_sun_softness_deg = std::clamp(rt_sun_softness_deg, 0.0f, 10.0f);
     rt_reflection_max_roughness = std::clamp(rt_reflection_max_roughness, 0.0f, 1.0f);
     rt_max_instance_range = clamp_enum(rt_max_instance_range, RtRange::Near, RtRange::Unlimited);
+    // Deliberately NOT the GiMode::ProbesScreen treatment: R5's `Full` tier is
+    // not declared, so a file holding 2 clamps down to Ratio. A value that does
+    // not exist yet must not survive into the version that implements it —
+    // it would arrive as a silent opt-in to a tier nobody chose.
+    rt_local_shadows = clamp_enum(rt_local_shadows, LocalRtShadowMode::Off, LocalRtShadowMode::Ratio);
+    rt_local_shadow_resolution =
+        clamp_enum(rt_local_shadow_resolution, RtResolution::Full, RtResolution::Quarter);
     // ProbesScreen is a real enumerator and clamps like one, even though it
     // behaves as Probes until phase R4 — a settings file that already holds it
     // must survive the version that implements it unchanged.
@@ -98,6 +105,8 @@ bool GraphicsSettings::save(const std::string& path) const {
     out << "rt_sun_softness_deg=" << rt_sun_softness_deg << "\n";
     out << "rt_reflection_max_roughness=" << rt_reflection_max_roughness << "\n";
     out << "rt_max_instance_range=" << static_cast<int>(rt_max_instance_range) << "\n";
+    out << "rt_local_shadows=" << static_cast<int>(rt_local_shadows) << "\n";
+    out << "rt_local_shadow_resolution=" << static_cast<int>(rt_local_shadow_resolution) << "\n";
     out << "gi_mode=" << static_cast<int>(gi_mode) << "\n";
     out << "gi_quality=" << static_cast<int>(gi_quality) << "\n";
     out << "volumetric_fog=" << volumetric_fog << "\n";
@@ -203,6 +212,8 @@ bool GraphicsSettings::load(const std::string& path) {
     read_float("rt_sun_softness_deg", rt_sun_softness_deg);
     read_float("rt_reflection_max_roughness", rt_reflection_max_roughness);
     read_enum("rt_max_instance_range", rt_max_instance_range);
+    read_enum("rt_local_shadows", rt_local_shadows);
+    read_enum("rt_local_shadow_resolution", rt_local_shadow_resolution);
     read_enum("gi_mode", gi_mode);
     read_enum("gi_quality", gi_quality);
     read_bool("rt_reflections", rt_reflections);

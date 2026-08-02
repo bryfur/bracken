@@ -169,6 +169,11 @@ enum class ComputePipelineType {
     RtShadowFilter,    ///< Shadow denoiser 3/3: variance-guided filter fused with the upsample to full res
     RtReflection,      ///< Ray-traced specular reflections over the same BVH (closest-hit, GGX-sampled)
     RtReflectionTemporal, ///< Reflection denoiser: velocity reprojection + neighbourhood-clamped accumulation
+    /// Froxel-RIS local (point/spot) light shadows: reservoir pick + one
+    /// sphere-cap any-hit ray, packed bits. Denoised by the RtShadow* three
+    /// above, dispatched a second time against a second set of targets — there
+    /// is no RtLocalShadowClassify/Temporal/Filter, and that is the design.
+    RtLocalShadow,
 
     // Probe-field GI (render/gi/, docs/rt_lighting_plan.md §5.2). All four run
     // inside one GIProbes timer scope, in this order, once per cascade whose

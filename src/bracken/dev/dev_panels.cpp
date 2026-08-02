@@ -308,9 +308,23 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
                           "Costs more than RT shadows: closest-hit cannot stop early.");
     }
 
+    {
+        static const char* const LOCAL_RT_MODES[] = {"Off (atlas)", "Ratio (traced)"};
+        changed |= combo_enum("RT local shadows", settings.rt_local_shadows, LOCAL_RT_MODES, 2);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Shadows for POINT and SPOT lights.\n"
+                              "Off  = the rasterized 8x8 tile atlas: hard edges, and hard\n"
+                              "       budgets (8 point / 16 spot / 6 tile updates a frame).\n"
+                              "Ratio = one traced ray per pixel, aimed by a froxel reservoir.\n"
+                              "       EVERY local light casts a soft shadow and the atlas is\n"
+                              "       not updated at all. Needs the BVH and the G-buffer.");
+        }
+    }
+
     // Quality dials, shown only when something is actually tracing — they are
     // meaningless otherwise and the panel is long enough already.
-    if (settings.rt_shadows || settings.rt_reflections) {
+    const bool rt_local_on = settings.rt_local_shadows != LocalRtShadowMode::Off;
+    if (settings.rt_shadows || settings.rt_reflections || rt_local_on) {
         ImGui::Indent();
         constexpr const char* k_rt_res[] = {"Full", "Half", "Quarter"};
 
@@ -361,8 +375,23 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
             }
         }
 
-        // Shared by both effects — it cuts the acceleration structure, not
-        // either signal's ray count, so it sits outside the two blocks above.
+        if (rt_local_on) {
+            int res = static_cast<int>(settings.rt_local_shadow_resolution);
+            if (ImGui::Combo("Local shadow rays", &res, k_rt_res, IM_ARRAYSIZE(k_rt_res))) {
+                settings.rt_local_shadow_resolution = static_cast<RtResolution>(res);
+                changed = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Rays cast per frame, relative to the screen.\n"
+                                  "Half by default rather than Full: this signal picks a\n"
+                                  "DIFFERENT light per pixel per frame, so the denoiser is\n"
+                                  "working hard regardless and sharper input mostly buys\n"
+                                  "detail it is about to filter away.");
+            }
+        }
+
+        // Shared by every traced effect — it cuts the acceleration structure,
+        // not any one signal's ray count, so it sits outside the blocks above.
         static const char* const RT_RANGES[] = {"Near (1000)", "Medium (2000)", "Far (4000)",
                                                 "Unlimited"};
         changed |= combo_enum("Instance range", settings.rt_max_instance_range, RT_RANGES, 4);

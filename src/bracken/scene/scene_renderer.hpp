@@ -444,6 +444,7 @@ private:
     // unbound sampler descriptor is undefined behaviour in SDL3 GPU. The white
     // dummy reads 1.0 = fully lit from any UV, which is the correct no-op.
     void bind_rt_shadow_mask(uint32_t slot);
+    void bind_rt_local_shadow_mask(uint32_t slot);
 
     // Fill the 3-entry sky IBL binding array (irradiance cube, prefiltered
     // specular cube, BRDF LUT — real chain when the IBL renderer is ready,
@@ -520,6 +521,11 @@ private:
     // off by default and nothing is built unless one is on.
     std::unique_ptr<render::RtRenderer> rt_renderer_; // created in init()
     bool frame_rt_shadows_active_ = false;
+    /// Whether the froxel-RIS local-light shadow pass produced a mask this
+    /// frame. Also the reason `frame_local_shadows_active_` is false: in Ratio
+    /// mode the traced signal OWNS local shadowing and the rasterized atlas is
+    /// not updated at all.
+    bool frame_rt_local_shadows_active_ = false;
     /// Normal+roughness G-buffer for ray-traced reflections. Allocated only
     /// while reflections are on, and released the moment they go off — a game
     /// that never enables them never pays for a screen-sized target.
@@ -778,6 +784,12 @@ private:
     // which case the model shaders get the white dummy and never read it
     // (rtShadowEnabled == 0). Reset at the top of every render_frame.
     SDL_GPUTexture* frame_rt_shadow_texture_ = nullptr;
+
+    // The traced LOCAL (point/spot) visibility ratio forward draws multiply
+    // their clustered subtotal by this frame (full-res R8), or null in Off mode
+    // — in which case every scene shader gets the white dummy and never reads
+    // it (rtLocalShadowEnabled == 0). Reset at the top of every render_frame.
+    SDL_GPUTexture* frame_rt_local_shadow_texture_ = nullptr;
 
     // Sky IBL is active this frame: settings flag on AND the prefilter chain
     // is alive. Drives the iblEnabled uniform flag of every scene shader.

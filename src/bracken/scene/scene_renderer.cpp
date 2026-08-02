@@ -681,6 +681,8 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     // frame's traced shadows after ray tracing is switched off.
     frame_rt_shadows_active_ = false;
     frame_rt_shadow_texture_ = nullptr;
+    frame_rt_local_shadows_active_ = false;
+    frame_rt_local_shadow_texture_ = nullptr;
     frame_rt_reflection_max_roughness_ = 0.0f;
     frame_rt_reflection_fade_start_ = 0.0f;
     // Sky IBL drives every scene shader's iblEnabled flag (the IBL sampler
@@ -793,8 +795,24 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
         // their last-uploaded state (initially zero).
         const bool any_dyn_lights = !frame.point_lights().empty() || !frame.spot_lights().empty();
         const bool cluster_upload_needed = cluster_grid_ready_ && any_dyn_lights;
-        frame_local_shadows_active_ =
-            cluster_upload_needed && gfx.local_shadows && local_shadows_ && local_shadows_->is_ready();
+        // ATLAS RETIREMENT. In Ratio mode the traced pass owns local shadowing
+        // outright: the selector never runs, no tile is ever rendered, and
+        // every shadow_slot stays -1 — which makes the atlas branch in
+        // cluster_lighting.hlsli naturally dead rather than disabled, so the
+        // two can never double-darken a pixel. The atlas CODE is untouched and
+        // is still exactly what `Off` runs.
+        //
+        // Decided on the SETTING, not on whether the trace succeeded, and that
+        // is deliberate: the alternative is deciding here and discovering three
+        // hundred lines later that the acceleration structure was not ready, by
+        // which time the tile renders have either happened or not. A frame that
+        // asks for traced local shadows and cannot have them shows unshadowed
+        // local lights for that frame — visible, recoverable, and honest —
+        // where the alternative would be a frame that pays for both.
+        const bool rt_local_shadows_wanted =
+            gfx.rt_local_shadows != LocalRtShadowMode::Off && rt_renderer_ != nullptr;
+        frame_local_shadows_active_ = cluster_upload_needed && gfx.local_shadows && !rt_local_shadows_wanted &&
+                                      local_shadows_ && local_shadows_->is_ready();
         if (cluster_upload_needed) {
             // Local (point/spot) light shadows: the selector picks the
             // budgeted shadow casters, assigns atlas tiles, decides which
@@ -986,7 +1004,15 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // frames, and since the pass hard-cuts to "shadowed" at N.L <= 0,
             // the flip is full-amplitude. That was the speckle, and no denoiser
             // can undo it — the signal is wrong before it is noisy.
-            if (gfx.rt_reflections || gfx.rt_shadows) {
+            //
+            // The local-light pass needs it for a THIRD reason, and a stricter
+            // one: the sun pass can fall back to a depth-tap normal because it
+            // only asks a binary question, but the froxel-RIS pass weights
+            // candidate LIGHTS by N.L and picks one. A normal that flickers
+            // between neighbouring pixels there does not add noise to an
+            // answer, it changes which question was asked — so that pass is
+            // skipped outright without a G-buffer rather than degraded.
+            if (gfx.rt_reflections || gfx.rt_shadows || gfx.rt_local_shadows != LocalRtShadowMode::Off) {
                 const int gw = context_->width();
                 const int gh = context_->height();
                 if (!normal_rough_texture_ || normal_rough_texture_->width() != gw ||
@@ -1055,7 +1081,13 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // would return immediately, and the setting would silently do
             // nothing. =====
             const bool gi_active = gfx.gi_mode != GiMode::Off;
-            const bool rt_traces_active = gfx.rt_shadows || gfx.rt_reflections;
+            // Local-light shadows join the same gate: they trace the same BVH
+            // and therefore need the same acceleration structure built. They do
+            // NOT need triangle ATTRIBUTES — a shadow ray asks a yes/no
+            // question and never shades what it hits — so want_attributes below
+            // stays driven by reflections and GI alone.
+            const bool rt_traces_active =
+                gfx.rt_shadows || gfx.rt_reflections || gfx.rt_local_shadows != LocalRtShadowMode::Off;
             render::RtRenderer::FrameParams rt_frame_params;
             render::RtReflectionSettings rt_reflection_settings;
             bool rt_reflection_resolve_ready = false;
@@ -1179,6 +1211,28 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 rt_reflection_settings.fade_start =
                     std::min(rt_reflection_settings.fade_start, gfx.rt_reflection_max_roughness * 0.5f);
 
+                render::RtLocalShadowSettings ls;
+                ls.enabled = gfx.rt_local_shadows != LocalRtShadowMode::Off;
+                ls.resolution = gfx.rt_local_shadow_resolution;
+
+                // The frame's binned light buffers. Handed over as one struct
+                // that knows when it is incomplete, because "trace against a
+                // stale froxel list" is a wrong picture rather than a missing
+                // one: the reservoir would sample lights the frame does not
+                // have. frame_cluster_params_ (not cluster_grid_.params()) for
+                // the same reason bind_cluster_lights uses it — a frame with no
+                // dynamic lights publishes gridDim.w == 0 there.
+                render::RtClusterBindings cluster_bindings;
+                if (ls.enabled && cluster_upload_needed) {
+                    cluster_bindings.light_data = cluster_grid_.light_data_buffer();
+                    cluster_bindings.cluster_offsets = cluster_grid_.cluster_offsets_buffer();
+                    cluster_bindings.light_indices = cluster_grid_.light_indices_buffer();
+                    cluster_bindings.light_remap = cluster_grid_.light_remap_buffer();
+                    cluster_bindings.params = &frame_cluster_params_;
+                    cluster_bindings.params_size = sizeof(frame_cluster_params_);
+                    cluster_bindings.total_lights = frame_cluster_params_.gridDim.w;
+                }
+
                 // Reflections need the prepass G-buffer; without it (allocation
                 // failed, or the prepass did not run this frame) the pass has
                 // no way to tell a mirror from a wall, so it is skipped rather
@@ -1190,10 +1244,16 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     opaque_reflection_settings.enabled && normal_rough != nullptr;
                 rt_renderer_->render(cmd, *post_->offscreen_depth(), normal_rough,
                                      velocity_texture_ ? velocity_texture_->handle() : nullptr,
-                                     rt_frame_params, rs, opaque_reflection_settings);
+                                     rt_frame_params, rs, opaque_reflection_settings, ls,
+                                     cluster_bindings);
                 if (rt_renderer_->stats().shadows_traced && rt_renderer_->shadow_mask() != nullptr) {
                     frame_rt_shadow_texture_ = rt_renderer_->shadow_mask()->handle();
                     frame_rt_shadows_active_ = true;
+                }
+                if (rt_renderer_->stats().local_shadows_traced &&
+                    rt_renderer_->local_shadow_mask() != nullptr) {
+                    frame_rt_local_shadow_texture_ = rt_renderer_->local_shadow_mask()->handle();
+                    frame_rt_local_shadows_active_ = true;
                 }
                 if (rt_renderer_->stats().reflections_traced &&
                     rt_renderer_->reflection_target() != nullptr) {

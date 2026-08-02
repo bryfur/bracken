@@ -339,6 +339,9 @@ private:
     // PLAYGROUND_ASYNC=0 restores serial model loading (the A/B baseline).
     bool async_load_disabled_ = false;
     std::string rt_mode_; // PLAYGROUND_RT: shadows | reflections | both
+    /// PLAYGROUND_RT_LOCAL: ratio | off. Pinned on the same rule as
+    /// PLAYGROUND_RT — unset means OFF, never "keep what was persisted".
+    std::string rt_local_mode_;
     std::string gi_mode_; // PLAYGROUND_GI: probes | probes_screen | off
     float ambient_ripple_timer_ = 0.0f; // occasional ambient rings on the river
 

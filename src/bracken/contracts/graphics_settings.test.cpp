@@ -56,6 +56,12 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
     // Unlimited by default: the range filter must be inert until dialed, or
     // adding the knob would silently change what every existing scene traces.
     EXPECT_EQ(s.rt_max_instance_range, RtRange::Unlimited);
+    // Traced local-light shadows are OFF by default, and the default is
+    // load-bearing twice over: `Ratio` builds an acceleration structure (like
+    // rt_shadows) AND retires the rasterized atlas, so a defaulted-on value
+    // would change how local lights shadow in every existing scene.
+    EXPECT_EQ(s.rt_local_shadows, LocalRtShadowMode::Off);
+    EXPECT_EQ(s.rt_local_shadow_resolution, RtResolution::Half);
     // Diffuse GI is OFF by default: the probe field costs ~30 MB of atlases the
     // moment it exists, and until phase R1b it buys nothing. gi_quality is
     // stored regardless (R1b reads it) so the file format does not change again.
@@ -133,12 +139,15 @@ TEST_F(GraphicsSettingsTest, RayTracingFlagsRoundTrip) {
     written.rt_reflection_max_roughness = 0.42f;
     written.rt_reflections = true;
     written.rt_max_instance_range = bracken::RtRange::Medium;
+    written.rt_local_shadows = bracken::LocalRtShadowMode::Ratio;
+    written.rt_local_shadow_resolution = bracken::RtResolution::Quarter;
     ASSERT_TRUE(written.save(TEST_FILE));
 
     GraphicsSettings read;
     ASSERT_FALSE(read.rt_shadows);
     ASSERT_FALSE(read.rt_reflections);
     ASSERT_EQ(read.rt_max_instance_range, bracken::RtRange::Unlimited);
+    ASSERT_EQ(read.rt_local_shadows, bracken::LocalRtShadowMode::Off);
     ASSERT_TRUE(read.load(TEST_FILE));
     EXPECT_TRUE(read.rt_shadows);
     EXPECT_EQ(read.rt_shadow_resolution, bracken::RtResolution::Full);
@@ -147,6 +156,8 @@ TEST_F(GraphicsSettingsTest, RayTracingFlagsRoundTrip) {
     EXPECT_FLOAT_EQ(read.rt_reflection_max_roughness, 0.42f);
     EXPECT_TRUE(read.rt_reflections);
     EXPECT_EQ(read.rt_max_instance_range, bracken::RtRange::Medium);
+    EXPECT_EQ(read.rt_local_shadows, bracken::LocalRtShadowMode::Ratio);
+    EXPECT_EQ(read.rt_local_shadow_resolution, bracken::RtResolution::Quarter);
 
     // ...and back off again, so a file holding `0` really does clear them
     // rather than leaving the previous value standing.
@@ -156,7 +167,9 @@ TEST_F(GraphicsSettingsTest, RayTracingFlagsRoundTrip) {
     reread.rt_shadows = true;
     reread.rt_reflections = true;
     reread.rt_max_instance_range = bracken::RtRange::Near;
+    reread.rt_local_shadows = bracken::LocalRtShadowMode::Ratio;
     ASSERT_TRUE(reread.load(TEST_FILE));
+    EXPECT_EQ(reread.rt_local_shadows, bracken::LocalRtShadowMode::Off);
     EXPECT_FALSE(reread.rt_shadows);
     EXPECT_FALSE(reread.rt_reflections);
     EXPECT_EQ(reread.rt_max_instance_range, bracken::RtRange::Unlimited);
@@ -815,4 +828,30 @@ TEST_F(GraphicsSettingsTest, AutoExposureSerializesNumerically) {
     EXPECT_FLOAT_EQ(loaded.auto_exposure_max_ev, 2.5f);
     EXPECT_FLOAT_EQ(loaded.auto_exposure_speed_up, 4.0f);
     EXPECT_FLOAT_EQ(loaded.auto_exposure_speed_down, 0.25f);
+}
+
+// R5's `Full` tier is not declared yet, so an on-disk 2 must clamp DOWN to
+// Ratio rather than surviving. This is deliberately the opposite of
+// GiMode::ProbesScreen's treatment (which IS declared and does survive): a
+// value that does not exist yet must never arrive as a silent opt-in to a tier
+// nobody chose, and the enum says so.
+TEST_F(GraphicsSettingsTest, LocalRtShadowModeClampsOutOfRangeValues) {
+    {
+        std::ofstream out(TEST_FILE);
+        ASSERT_TRUE(out.is_open());
+        out << "settings_version=" << GraphicsSettings::CURRENT_SETTINGS_VERSION << "\n";
+        out << "rt_local_shadows=2\n";
+        out << "rt_local_shadow_resolution=17\n";
+    }
+    GraphicsSettings read;
+    ASSERT_TRUE(read.load(TEST_FILE));
+    EXPECT_EQ(read.rt_local_shadows, LocalRtShadowMode::Ratio);
+    EXPECT_EQ(read.rt_local_shadow_resolution, RtResolution::Quarter);
+
+    GraphicsSettings negative;
+    negative.rt_local_shadows = static_cast<LocalRtShadowMode>(-3);
+    negative.rt_local_shadow_resolution = static_cast<RtResolution>(-1);
+    negative.clamp_to_valid_ranges();
+    EXPECT_EQ(negative.rt_local_shadows, LocalRtShadowMode::Off);
+    EXPECT_EQ(negative.rt_local_shadow_resolution, RtResolution::Full);
 }

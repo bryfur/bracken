@@ -441,6 +441,17 @@ evidence that no RT-series commit moved the RT-off path.
 | `--smoke 30 PLAYGROUND_AO=0` | `87.0 / 44.5` |
 | `--smoke 30 PLAYGROUND_AO=2` | `86.4 / 45.0` |
 | `--smoke 30 PLAYGROUND_GI=probes` | `84.7 / 46.6` |
+| `PLAYGROUND_RT=both --smoke 30` | `83.9 / 47.9` |
+| `PLAYGROUND_RT_LOCAL=ratio PLAYGROUND_RT=both --smoke 30` | `85.3 / 47.5` |
+
+The last two rows were measured on a **Linux/Vulkan** box, not the Metal
+machine the three above came from, so compare them with each other and not
+across the table. The R2b row reads *brighter* than plain `RT=both` because
+`LocalRtShadowMode::Ratio` retires the rasterized local-shadow atlas whose
+hard-edged tile shadow over-darkened the plaza; the difference is concentrated
+in the orb light's pool around the character, where the traced pass puts a
+soft, distance-widening shadow in place of a hard blob. `local_tiles` reads 0
+under that pin — the atlas retirement showing up in the smoke line itself.
 
 **The GI row is the only one that is not RT-off, and it is deliberately
 different.** Phase R1c made the probe field light the frame, so a GI-pinned run

@@ -467,8 +467,11 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("terrain.frag.spv", 3, 2, render::lighting::ClusterParams),
     ROW("grass.frag.spv", 3, 2, render::lighting::ClusterParams),
     // The compute mirror of the same cbuffer — cluster_compute.hlsli binds it
-    // on set 2 (compute uniforms) instead of set 3 (fragment uniforms).
-    ROW("cluster_compute_validate.comp.spv", 2, 0, render::lighting::ClusterParams),
+    // on set 2 (compute uniforms) instead of set 3 (fragment uniforms), at
+    // whatever slot the including shader hands it. R2b's local-shadow trace is
+    // its first and only real consumer; the R2a placeholder that existed purely
+    // to make the include a compiled artifact is gone with it.
+    ROW("rt_local_shadow.comp.spv", 2, 1, render::lighting::ClusterParams),
     ROW("terrain.vert.spv", 1, 0, render::TerrainTransformUniforms),
     ROW("terrain.frag.spv", 3, 0, render::TerrainLightingUniforms),
     ROW("grass.vert.spv", 1, 0, render::GrassVertexUniforms),
@@ -481,6 +484,10 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("rt_shadow_denoise_filter.comp.spv", 2, 0, gpu::RtShadowFilterUniforms),
     ROW("rt_reflection_denoise_temporal.comp.spv", 2, 0, gpu::RtReflectionTemporalUniforms),
     ROW("rt_reflection.comp.spv", 2, 0, gpu::RtReflectionUniforms),
+    // b1 of the same shader is ClusterGrid's own ClusterParams, pushed straight
+    // from ClusterGrid::params() — its row is with the renderer-owned mirrors
+    // above.
+    ROW("rt_local_shadow.comp.spv", 2, 0, gpu::RtLocalShadowUniforms),
     ROW("rt_reflection_resolve.frag.spv", 3, 0, gpu::RtReflectionResolveUniforms),
     ROW("water.vert.spv", 1, 0, render::WaterRenderer::VertexUniforms),
     ROW("water.frag.spv", 3, 0, render::WaterRenderer::FragmentUniforms),

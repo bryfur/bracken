@@ -580,8 +580,10 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    (`ShadowPass:Cascade0..3`), only when `shadow_mode != ShadowMode::Off`
    (settings modes are `enum class`es in `graphics_settings.hpp`; the on-disk
    settings format stays numeric).
-5. **`LocalShadowPass`** (only when `local_shadows` is on and the scene has
-   dynamic lights) — re-renders this frame's dirty local-shadow tiles into
+5. **`LocalShadowPass`** (only when `local_shadows` is on, the scene has
+   dynamic lights, **and `rt_local_shadows` is `Off`** — the traced Ratio tier
+   retires this pass wholesale, see "Ray tracing") — re-renders this frame's
+   dirty local-shadow tiles into
    the 8×8-tile D32 atlas (`render::lighting::LocalShadowMap`; independent of
    the CSM toggle). Point lights own 6 consecutive face tiles (~90° FOV,
    slightly widened so seam PCF taps stay valid), spots one tile at their
@@ -730,13 +732,16 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
      believed to be at an 11-sampler DXC legalization ceiling; that does not
      reproduce (12 compiles, verified to 17). `frame_ao_texture_` therefore
      means exactly "GTAO's output, or the 1×1 white dummy" — nothing else.
-   * `CLUSTER_SSBO_BINDING_BASE` is **15** for the two model fragment shaders
-     (0–9 material/AO/IBL, 10 traced mask, 11–13 the probe field's three
-     atlases, 14 local-shadow atlas), **13** for terrain (8 / 9–11 / 12), and
-     **11** for grass (6 / 7–9 / 10). The local-shadow atlas stays LAST in all
-     three, which is the contract `cluster_lighting.hlsli` encodes as
-     `CLUSTER_SSBO_BINDING_BASE - 1`; R1c inserted the GI slots between the
-     traced mask and it rather than after it for exactly that reason.
+   * `CLUSTER_SSBO_BINDING_BASE` is **16** for the two model fragment shaders
+     (0–9 material/AO/IBL, 10 traced SUN mask, 11–13 the probe field's three
+     atlases, 14 traced LOCAL-light mask, 15 local-shadow atlas), **14** for
+     terrain (8 / 9–11 / 12 / 13), and **12** for grass (6 / 7–9 / 10 / 11).
+     The local-shadow atlas stays LAST in all three, which is the contract
+     `cluster_lighting.hlsli` encodes as `CLUSTER_SSBO_BINDING_BASE - 1`; R1c
+     inserted the GI slots between the traced mask and it rather than after it
+     for exactly that reason, and R2b inserted its own mask the same way. All
+     three stay under the 17-sampler ceiling that was measured when the
+     believed 11-sampler DXC limit failed to reproduce.
    * Scene depth (and the reflection G-buffer) are compute **sampled**
      textures, bound with the RT renderer's point-clamp sampler. This is the
      portable SDL3 GPU path for D32 depth: depth textures cannot legally carry
@@ -1045,6 +1050,71 @@ combining with it (fragment sampler slots: model/instanced 10, terrain 8, grass
 has *no* sun shadow rather than falling back to cascades, and beyond
 `RtShadowSettings::max_distance` the cascades take over.
 
+**Local-light shadows** (`shaders/rt_local_shadow.comp.hlsl`,
+`LocalRtShadowMode::Ratio`, R2b — off by default). One shadow ray per pixel
+makes *every* point and spot light cast a soft shadow, which is possible only
+because the ray is aimed by a **reservoir** rather than by a loop over lights.
+Per pixel:
+
+1. Surface reconstructed exactly as the sun pass does it — world position from
+   the depth prepass, normal from the G-buffer's octahedral pair. Unlike the
+   sun pass this one is **skipped, not degraded, without a G-buffer**: a
+   depth-tap normal is good enough for a binary visibility test and is not good
+   enough to *choose a light* with.
+2. Candidates come from the pixel's froxel in the cluster grid the frame
+   already binned (`shaders/cluster_compute.hlsli`, R2a). The froxel list is
+   the only light-culling structure needed, which is what makes this cost no
+   new per-frame infrastructure.
+3. **RIS** over M = 6 candidates drawn uniformly (with replacement) from that
+   list, weighted by `clusterLightTarget` — the luminance of the light's
+   unshadowed diffuse contribution, built from the *same* `pointFalloff` /
+   `spotConeFactor` the forward accumulator applies. Sharing that arithmetic is
+   what keeps the estimator bias-free: the sampler weights a light zero exactly
+   where `accumulateClusterLights` skips it.
+4. **Temporal merge** with the reprojected previous-frame reservoir. Its stored
+   light index is a *previous* packed index, resolved through the frame's
+   prev→current remap; a vanished light drops the history rather than silently
+   becoming whatever now occupies that slot. History M is clamped to 20× the
+   current candidate count, and a relative depth test rejects disocclusions.
+   The candidate's p̂ is re-evaluated at the current surface, which is also why
+   no normal test is needed — a light the new surface cannot see evaluates to
+   zero and contributes nothing but M.
+5. One any-hit ray to a point sampled on the winner's emitter sphere
+   (`sampleCone` with `cosThetaMax` from `RtLocalShadowSettings::source_radius`
+   over the distance — 10 world units, one value for every light until R6's
+   per-light authoring). Output is one bit per pixel packed 8×4 per uint, the
+   same format the sun pass produces; a pixel whose froxel is empty writes LIT.
+
+Reservoir state is 16 B/px (`render/lighting/reservoir.hpp`: light index, W, M,
+linear depth) in a ping-ponged buffer pair at the traced resolution. p̂ is
+deliberately *not* stored — the only consumer of a stored reservoir is next
+frame's merge, which must re-evaluate it at the current surface anyway — and
+the freed lane carries the depth the merge cannot reconstruct.
+
+The fold-back is the **Heitz ratio estimator**: the forward pass multiplies its
+whole point+spot subtotal by the denoised mask, so the analytic sum stays sharp
+and only the shadowing is stochastic. With one reservoir sample the ratio
+collapses to the selected light's visibility bit, because p̂(y)·W estimates the
+candidate sum that is also the denominator.
+
+**Atlas coexistence.** In `Ratio` mode `SceneRenderer` skips the local-shadow
+selector and the tile renders entirely, so no `shadow_slot` is ever assigned and
+the atlas branch in `cluster_lighting.hlsli` is naturally dead through its
+existing `shadow_slot < 0` path — the two cannot double-darken a pixel. The
+decision is made on the *setting*, before the frame knows whether the trace will
+succeed: a frame that asks for traced local shadows and cannot have them shows
+unshadowed local lights, which is visible and recoverable, where deciding later
+would mean paying for both. `Off` is the atlas path byte for byte.
+
+**One denoiser, two signals.** The sun mask and the local mask go through the
+*same* three pipelines (`RtShadowClassify` / `RtShadowTemporal` /
+`RtShadowFilter`), dispatched twice against two instances of
+`RtRenderer::VisibilityDenoiser` — bits, tile classes, a history ping-pong, a
+full-res R8 mask, a validity flag and a per-signal frame counter. Nothing in
+those passes is sun-specific, so forking them would have bought three more
+shaders to keep in step and nothing else. If something ever has to differ, it
+becomes a uniform.
+
 **Reflections** (`shaders/rt_reflection.comp.hlsl`). GGX visible-NDF importance
 sampling, closest-hit traversal with near-child-first ordering and
 `hit.t`-tightened culling, and a roughness-gated handover to the prefiltered IBL
@@ -1099,11 +1169,14 @@ which already outrange the traced mask.
 
 ### Timing and instrumentation
 
-Three entries appear in `RenderStats::pass_times_ms` when tracing:
+Four entries appear in `RenderStats::pass_times_ms` when tracing:
 **`RTInstances`** (the CPU-side range filter, content hash and any rebuild),
-**`RTShadows`** (trace plus the three denoiser dispatches) and
-**`RTReflectionTrace`** (trace plus its temporal denoise); the full-res resolve
-is separately timed as `RTReflectionResolve`. The two inside `RtRenderer` are
+**`RTShadows`** (trace plus the three denoiser dispatches), **`RTLocalShadows`**
+(the froxel-RIS trace plus the same three denoiser dispatches against the second
+target set) and **`RTReflectionTrace`** (trace plus its temporal denoise); the
+full-res resolve is separately timed as `RTReflectionResolve`. In `Ratio` mode
+`LocalShadowPass` disappears from the table entirely, which is the atlas
+retirement showing up as a measurement. The two inside `RtRenderer` are
 timed there rather than at the call site because `SceneRenderer` makes one
 `render()` call for both signals and cannot tell them apart —
 `RtRenderer::set_timer_pool` lends it the scene renderer's timeline, and a null
@@ -1113,8 +1186,9 @@ times**; there is no GPU-side number to report.
 The playground's `--rt-bench N` flag (`examples/playground/main.cpp`) is the
 measurement jig: a pinned camera, no screenshot, none of the smoke run's
 scripted mid-run settings flips, and a machine-readable per-pass mean/p95 table
-at exit. `PLAYGROUND_RT` selects which effects run and `PLAYGROUND_RT_RANGE`
-pins the range enum.
+at exit. `PLAYGROUND_RT` selects which effects run, `PLAYGROUND_RT_LOCAL`
+(`ratio` / `off`) pins the local-light mode, and `PLAYGROUND_RT_RANGE` pins the
+range enum.
 
 ### Known limits
 
@@ -1129,6 +1203,13 @@ pins the range enum.
   stop.
 - **Reflection hit lighting is unshadowed and its ambient is a constant**, so
   reflections show neither cast shadows nor bounced light.
+- **A compute pipeline gets EIGHT read-only storage buffers, hard.** SDL3 GPU
+  refuses to create one that declares more ("Compute pipeline readonly storage
+  buffer count cannot be higher than 8"), and the four acceleration-structure
+  buffers are non-negotiable. That is why `cluster_compute.hlsli`'s packed
+  stable-id buffer is **opt-in** (`CLUSTER_COMPUTE_WANT_STABLE_IDS`) and the
+  local-shadow trace does not take it, and why its reservoir ping-pong rides
+  two *read-write* slots of which one is only ever read.
 - **Ray tracing requires the CPU geometry the BVH is built from.** A host must
   call `ModelManager::set_retain_cpu_geometry(true)` (`model_loader.hpp`)
   *before* loading, or the builder finds nothing to build from and says so
@@ -2292,7 +2373,11 @@ debugging "why is this value zero / where did my draw go":
   enclosing its own light must set `mesh.cast_shadows = false` or it
   occludes the light entirely (the shadow map renders from inside it). A
   light whose tiles haven't all rendered yet (fresh assignment over the cap)
-  falls back to **unshadowed**, never to garbage.
+  falls back to **unshadowed**, never to garbage. Every limitation in this
+  bullet is a property of the ATLAS: `LocalRtShadowMode::Ratio` retires the
+  atlas entirely and has none of them (no budget, no tile cap, no staleness,
+  and terrain and grass occlude like anything else in the BVH) at the cost of
+  one traced ray per pixel and a stochastic signal.
 - **`render_graph/` is not in the frame path** — `SceneRenderer` issues passes
   directly. The graph is kept (with its tests) for when pass count or
   transient aliasing justifies it.
