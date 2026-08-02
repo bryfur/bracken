@@ -30,11 +30,11 @@ void GraphicsSettings::clamp_to_valid_ranges() {
     rt_sun_softness_deg = std::clamp(rt_sun_softness_deg, 0.0f, 10.0f);
     rt_reflection_max_roughness = std::clamp(rt_reflection_max_roughness, 0.0f, 1.0f);
     rt_max_instance_range = clamp_enum(rt_max_instance_range, RtRange::Near, RtRange::Unlimited);
-    // Deliberately NOT the GiMode::ProbesScreen treatment: R5's `Full` tier is
-    // not declared, so a file holding 2 clamps down to Ratio. A value that does
-    // not exist yet must not survive into the version that implements it —
-    // it would arrive as a silent opt-in to a tier nobody chose.
-    rt_local_shadows = clamp_enum(rt_local_shadows, LocalRtShadowMode::Off, LocalRtShadowMode::Ratio);
+    // `Full` is a real enumerator since R5c, so a file holding 2 now survives.
+    // It could not before, and deliberately: until the tier existed, a 2 on
+    // disk clamped DOWN to Ratio rather than arriving as a silent opt-in to a
+    // tier nobody chose. 3 and up still clamp to Full, and -1 to Off.
+    rt_local_shadows = clamp_enum(rt_local_shadows, LocalRtShadowMode::Off, LocalRtShadowMode::Full);
     rt_local_shadow_resolution =
         clamp_enum(rt_local_shadow_resolution, RtResolution::Full, RtResolution::Quarter);
     // ProbesScreen is a real enumerator and clamps like one, even though it

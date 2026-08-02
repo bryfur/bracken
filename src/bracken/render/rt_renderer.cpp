@@ -66,6 +66,23 @@ void RtRenderer::VisibilityDenoiser::release() {
     mask.reset();
 }
 
+void RtRenderer::RadianceDenoiser::release() {
+    raw[0].reset();
+    raw[1].reset();
+    for (auto& pair : history) {
+        pair[0].reset();
+        pair[1].reset();
+    }
+    filtered[0].reset();
+    filtered[1].reset();
+    // The 1x1 stand-ins deliberately survive `release()`'s callers that only
+    // mean "the resolution changed": they are size-independent and creating
+    // them again would be work for nothing. shutdown() drops them explicitly.
+    history_valid = false;
+    width = 0;
+    height = 0;
+}
+
 void RtRenderer::shutdown() {
     reflection_.reset();
     reflection_hit_distance_.reset();
@@ -81,6 +98,10 @@ void RtRenderer::shutdown() {
     linear_clamp_sampler_ = nullptr;
     sun_shadow_.release();
     local_shadow_.release();
+    local_di_.release();
+    local_di_.dummy[0].reset();
+    local_di_.dummy[1].reset();
+    local_di_ready_ = false;
     local_reservoirs_[0].reset();
     local_reservoirs_[1].reset();
     local_reservoir_capacity_ = 0;
@@ -311,6 +332,8 @@ void RtRenderer::resize(gpu::GPUDevice& device, int width, int height) {
     // screen-sized target for it.
     sun_shadow_.release();
     local_shadow_.release();
+    local_di_.release();
+    local_di_ready_ = false;
     local_reservoirs_[0].reset();
     local_reservoirs_[1].reset();
     local_reservoir_capacity_ = 0;
@@ -359,6 +382,11 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
     stats_.shadows_traced = false;
     stats_.reflections_traced = false;
     stats_.local_shadows_traced = false;
+    stats_.local_di_traced = false;
+    // Cleared here rather than only in the Full path: an early return below
+    // (nothing enabled, no acceleration structure) must not leave last frame's
+    // DI targets advertised as this frame's.
+    local_di_ready_ = false;
     stats_.shadow_rays = 0;
     stats_.reflection_rays = 0;
     stats_.local_shadow_rays = 0;
@@ -517,6 +545,8 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
     } else {
         local_shadow_.history_valid = false;
         local_shadow_.gradient_valid = false;
+        local_di_.history_valid = false;
+        local_di_ready_ = false;
     }
 
     // ---- opaque reflections ---------------------------------------------
@@ -857,6 +887,199 @@ bool RtRenderer::reconstruct_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoi
 // One dispatch, then the shared denoiser. The dispatch is over the TILE grid
 // rather than the pixel grid — the shader's group IS the 8x4 tile whose bits it
 // packs, exactly as the sun trace's is.
+// The Full-DI tier's six RGBA16F targets, plus the two 1x1 stand-ins the Ratio
+// path binds into the trace's DI slots (R5c, docs/rt_lighting_plan.md §5.3).
+//
+// The usage flags are the interesting part and they differ per role:
+//  - `raw` and `history` never leave the compute stage, so compute storage
+//    read/write plus SAMPLER (the temporal pass reprojects its history with a
+//    bilinear tap, which needs a real sampler);
+//  - `filtered` is written by compute and read by the FRAGMENT stage as a
+//    read-only storage texture, so it carries GRAPHICS_STORAGE_READ instead of
+//    SAMPLER — there is no seventeenth fragment sampler to bind it to, which is
+//    the whole reason this signal is a storage texture downstream.
+bool RtRenderer::ensure_di_dummies() {
+    if (local_di_.dummy[0] && local_di_.dummy[1]) {
+        return true;
+    }
+    if (device_ == nullptr) {
+        return false;
+    }
+    for (auto& d : local_di_.dummy) {
+        d = gpu::GPUTexture::create_2d(*device_, 1, 1, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+                                       SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ |
+                                           SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE);
+    }
+    if (!local_di_.dummy[0] || !local_di_.dummy[1]) {
+        BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the local-DI stand-in textures");
+        return false;
+    }
+    return true;
+}
+
+bool RtRenderer::ensure_di_targets(int traced_w, int traced_h) {
+    if (device_ == nullptr || traced_w <= 0 || traced_h <= 0) {
+        return false;
+    }
+    if (local_di_.width == traced_w && local_di_.height == traced_h && local_di_.filtered[1]) {
+        return true;
+    }
+
+    local_di_.release();
+    const SDL_GPUTextureUsageFlags internal_usage = SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ |
+                                                    SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE |
+                                                    SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    const SDL_GPUTextureUsageFlags output_usage = SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ |
+                                                  SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE |
+                                                  SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ;
+    bool ok = true;
+    for (int i = 0; i < 2; ++i) {
+        local_di_.raw[i] =
+            gpu::GPUTexture::create_2d(*device_, traced_w, traced_h,
+                                       SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, internal_usage);
+        local_di_.filtered[i] =
+            gpu::GPUTexture::create_2d(*device_, traced_w, traced_h,
+                                       SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, output_usage);
+        ok = ok && local_di_.raw[i] != nullptr && local_di_.filtered[i] != nullptr;
+        for (int p = 0; p < 2; ++p) {
+            local_di_.history[p][i] =
+                gpu::GPUTexture::create_2d(*device_, traced_w, traced_h,
+                                           SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, internal_usage);
+            ok = ok && local_di_.history[p][i] != nullptr;
+        }
+    }
+    if (!ok) {
+        BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the local-DI targets ({}x{})", traced_w,
+                          traced_h);
+        local_di_.release();
+        return false;
+    }
+    local_di_.width = traced_w;
+    local_di_.height = traced_h;
+    // A history at a different size describes a different image, and the new
+    // allocations are uninitialized besides.
+    local_di_.history_valid = false;
+    return true;
+}
+
+// The two DI dispatches. Deliberately NOT folded into denoise_visibility: that
+// function turns packed bits into an R8 mask through three shared pipelines and
+// nothing in it is sun-specific, which is exactly why the local VISIBILITY
+// signal could reuse it verbatim in R2b. A radiance estimate shares none of
+// that machinery — no bit packing, no tile classification, no second moment —
+// so reusing it would have meant a flag through every one of those passes.
+void RtRenderer::denoise_local_di(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
+                                  SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
+                                  const FrameParams& params,
+                                  const RtLocalShadowSettings& settings, int traced_w,
+                                  int traced_h) {
+    BRACKEN_PROFILE_ZONE("RtRenderer::denoise_local_di");
+    local_di_ready_ = false;
+
+    const gpu::GPUComputePipeline* temporal =
+        pipelines_->get_compute_pipeline(gpu::ComputePipelineType::RtDiTemporal);
+    const gpu::GPUComputePipeline* spatial =
+        pipelines_->get_compute_pipeline(gpu::ComputePipelineType::RtDiSpatial);
+    if (temporal == nullptr || spatial == nullptr || !local_shadow_.gradient[1]) {
+        return;
+    }
+
+    const auto groups_x = static_cast<uint32_t>((traced_w + 7) / 8);
+    const auto groups_y = static_cast<uint32_t>((traced_h + 7) / 8);
+    const int hist_in = local_di_.history_index;
+    const int hist_out = 1 - local_di_.history_index;
+
+    // ---- temporal --------------------------------------------------------
+    {
+        gpu::RtDiTemporalUniforms u{};
+        u.tracedSize = {static_cast<uint32_t>(traced_w), static_cast<uint32_t>(traced_h)};
+        u.stratumCount = {static_cast<uint32_t>(gradient_stratum_count(traced_w)),
+                          static_cast<uint32_t>(gradient_stratum_count(traced_h))};
+        u.maxAccumFrames = std::max(settings.di_max_accum_frames, 1.0f);
+        u.clampSigma = std::max(settings.di_clamp_sigma, 0.0f);
+        u.lightingReset = params.lighting_reset;
+        // No velocity buffer means no reprojection is possible, and claiming
+        // otherwise would carry every texel straight through camera motion.
+        u.historyValid = (local_di_.history_valid && velocity != nullptr) ? 1u : 0u;
+        // The LOCAL signal's gradient, shared with its visibility denoiser: a
+        // reservoir that switched light is a lighting change for both.
+        u.gradientValid = (local_shadow_.gradient_valid && local_shadow_.gradient[1]) ? 1u : 0u;
+        u.exposureEnabled = params.exposure_state != nullptr ? 1u : 0u;
+        u.manualExposureEv = params.manual_exposure_ev;
+
+        const std::array<SDL_GPUStorageTextureReadWriteBinding, 2> rw{{
+            {.texture = local_di_.history[hist_out][0]->handle(), .mip_level = 0, .layer = 0,
+             .cycle = false, .padding1 = 0, .padding2 = 0, .padding3 = 0},
+            {.texture = local_di_.history[hist_out][1]->handle(), .mip_level = 0, .layer = 0,
+             .cycle = false, .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        }};
+        gpu::ComputePass pass = gpu::ComputePass::begin(cmd, rw, {});
+        if (!pass) {
+            return;
+        }
+        pass.bind_pipeline(*temporal);
+        const std::array<SDL_GPUTextureSamplerBinding, 5> textures{{
+            {local_di_.raw[0]->handle(), nearest_clamp_sampler_},
+            {local_di_.raw[1]->handle(), nearest_clamp_sampler_},
+            // Slot 2 must hold a valid texture even with no velocity buffer;
+            // historyValid is what decides whether it is read.
+            {velocity != nullptr ? velocity : depth.handle(), linear_clamp_sampler_},
+            {local_di_.history[hist_in][0]->handle(), linear_clamp_sampler_},
+            {local_di_.history[hist_in][1]->handle(), linear_clamp_sampler_},
+        }};
+        pass.bind_samplers(0, textures);
+        // Always the gradient target, never a stand-in of another format: it is
+        // R16F and this slot is a typed storage image, so an RGBA16F filler
+        // would be a format mismatch rather than merely unread data. It is
+        // allocated whenever this function can be reached (ensure_gradient_
+        // targets ran in render_local_shadows), and `gradientValid` is what
+        // decides whether its contents mean anything.
+        SDL_GPUTexture* gradient = local_shadow_.gradient[1]->handle();
+        pass.bind_storage_textures(0, {&gradient, 1});
+        SDL_GPUBuffer* exposure =
+            params.exposure_state != nullptr ? params.exposure_state : exposure_dummy_->handle();
+        pass.bind_storage_buffers(0, {&exposure, 1});
+        pass.push_uniforms(0, &u, sizeof(u));
+        pass.dispatch(groups_x, groups_y, 1);
+        pass.end();
+    }
+
+    // ---- spatial ---------------------------------------------------------
+    {
+        gpu::RtDiSpatialUniforms u{};
+        u.tracedSize = {static_cast<uint32_t>(traced_w), static_cast<uint32_t>(traced_h)};
+        u.depthA = params.depth_a;
+        u.depthB = params.depth_b;
+        u.maxRadius = std::max(settings.di_filter_radius, 0.0f);
+
+        const std::array<SDL_GPUStorageTextureReadWriteBinding, 2> rw{{
+            {.texture = local_di_.filtered[0]->handle(), .mip_level = 0, .layer = 0,
+             .cycle = false, .padding1 = 0, .padding2 = 0, .padding3 = 0},
+            {.texture = local_di_.filtered[1]->handle(), .mip_level = 0, .layer = 0,
+             .cycle = false, .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        }};
+        gpu::ComputePass pass = gpu::ComputePass::begin(cmd, rw, {});
+        if (!pass) {
+            return;
+        }
+        pass.bind_pipeline(*spatial);
+        const std::array<SDL_GPUTextureSamplerBinding, 4> textures{{
+            {local_di_.history[hist_out][0]->handle(), nearest_clamp_sampler_},
+            {local_di_.history[hist_out][1]->handle(), nearest_clamp_sampler_},
+            {depth.handle(), nearest_clamp_sampler_},
+            {normal_rough != nullptr ? normal_rough : depth.handle(), nearest_clamp_sampler_},
+        }};
+        pass.bind_samplers(0, textures);
+        pass.push_uniforms(0, &u, sizeof(u));
+        pass.dispatch(groups_x, groups_y, 1);
+        pass.end();
+    }
+
+    local_di_.history_index = hist_out;
+    local_di_.history_valid = true;
+    local_di_ready_ = true;
+}
+
 bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                                       SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
                                       const FrameParams& params,
@@ -956,14 +1179,42 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     // through camera motion.
     u.historyValid = (local_shadow_.history_valid && velocity != nullptr) ? 1u : 0u;
     u.candidateCount = std::max(settings.candidate_count, 1u);
+    // The Full-DI tier, if its targets came up. A failed allocation degrades to
+    // Ratio for the frame rather than dropping the pass: the reservoir, the ray
+    // and the visibility mask are all still correct, and the forward shaders
+    // read `local_di_ready_` to decide which tier they are in.
+    if (!ensure_di_dummies()) {
+        return false; // the trace's DI slots have to hold SOMETHING in either tier
+    }
+    const bool want_di = settings.full_di && ensure_di_targets(w, h);
+    if (!want_di) {
+        // Ratio (or a failed DI allocation): the next frame that turns Full
+        // back on must not accumulate against a history from an unknown number
+        // of frames ago.
+        local_di_.history_valid = false;
+        local_di_ready_ = false;
+    }
+    u.diMode = want_di ? 2u : 0u;
+    u.cameraPosition = params.camera_position;
 
     // The bits ping-pong (R5b): this frame writes the half the gradient pass is
     // not reading. cycle = false for exactly the reason the reservoirs use it.
     const int bits_next = 1 - local_shadow_.bits_index;
-    const SDL_GPUStorageTextureReadWriteBinding rw_tex{
-        .texture = local_shadow_.bits[bits_next]->handle(),
-        .mip_level = 0, .layer = 0, .cycle = false,
-        .padding1 = 0, .padding2 = 0, .padding3 = 0};
+    // Three read-write storage textures: the packed bits, and the Full-DI
+    // tier's two demodulated targets. In Ratio mode the latter two are the 1x1
+    // stand-ins — a storage-image descriptor may not be empty, and `diMode` is
+    // what stops the shader writing through them.
+    const std::array<SDL_GPUStorageTextureReadWriteBinding, 3> rw_tex{{
+        {.texture = local_shadow_.bits[bits_next]->handle(),
+         .mip_level = 0, .layer = 0, .cycle = false,
+         .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        {.texture = want_di ? local_di_.raw[0]->handle() : local_di_.dummy[0]->handle(),
+         .mip_level = 0, .layer = 0, .cycle = false,
+         .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        {.texture = want_di ? local_di_.raw[1]->handle() : local_di_.dummy[1]->handle(),
+         .mip_level = 0, .layer = 0, .cycle = false,
+         .padding1 = 0, .padding2 = 0, .padding3 = 0},
+    }};
     // BOTH halves of the reservoir ping-pong bind here, and the second one is
     // only ever READ. SDL3 GPU allows a compute pipeline eight read-only
     // storage buffers and the eight above are spoken for (four acceleration,
@@ -979,7 +1230,7 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
         {.buffer = local_reservoirs_[prev]->handle(), .cycle = false,
          .padding1 = 0, .padding2 = 0, .padding3 = 0},
     }};
-    gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw_tex, 1}, rw_bufs);
+    gpu::ComputePass pass = gpu::ComputePass::begin(cmd, rw_tex, rw_bufs);
     if (!pass) {
         return false;
     }
@@ -1008,6 +1259,7 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
 
     stats_.local_shadows_traced = true;
     stats_.local_shadow_rays = static_cast<uint32_t>(w * h);
+    stats_.local_di_traced = want_di;
 
     // The gradient replays against `prev`'s reservoirs and the retained bits,
     // so it must run before either index advances.
@@ -1021,6 +1273,15 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
 
     denoise_visibility(cmd, local_shadow_, depth, velocity, params, settings.max_accum_frames,
                        settings.filter_radius, w, h);
+
+    // The radiance denoiser last, and after denoise_visibility rather than
+    // before it, because it reads the LOCAL signal's reconstructed gradient —
+    // which trace_local_gradient + reconstruct_gradient produced above and
+    // which denoise_visibility only consumes.
+    if (want_di) {
+        denoise_local_di(cmd, depth, normal_rough, velocity, params, settings, w, h);
+        stats_.local_di_traced = local_di_ready_;
+    }
     return true;
 }
 
@@ -1366,6 +1627,14 @@ gpu::GPUTexture* RtRenderer::shadow_mask() const {
 
 gpu::GPUTexture* RtRenderer::local_shadow_mask() const {
     return local_shadow_.mask.get();
+}
+
+gpu::GPUTexture* RtRenderer::local_di_diffuse() const {
+    return local_di_ready_ ? local_di_.filtered[0].get() : nullptr;
+}
+
+gpu::GPUTexture* RtRenderer::local_di_specular() const {
+    return local_di_ready_ ? local_di_.filtered[1].get() : nullptr;
 }
 
 gpu::GPUTexture* RtRenderer::reflection_target() const {

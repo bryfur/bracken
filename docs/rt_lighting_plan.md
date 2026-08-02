@@ -848,7 +848,150 @@ default, seven touch points, dev-panel row, `[smoke] settings` field and a
   radius is one global constant (10 world units); per-light authoring is R6's.
   And the Full-DI tier remains R5's, deliberately not declared as an
   enumerator so an on-disk `2` clamps down rather than opting into a tier that
-  does not exist.
+  does not exist. *(Declared and implemented in R5c below.)*
+
+**Landed (R5c, 2026-08-02) — the Full-DI tier. `LocalRtShadowMode::Full = 2`
+exists, and phase R5 is complete.** Same reservoir, same one ray, same
+`rt_local_shadow.comp.hlsl`; what changes is what is done with the winner. The
+pass now also evaluates the winner's own BRDF, splits it into a diffuse and a
+specular half with the per-pixel material factors DIVIDED OUT, and the four
+scene fragment shaders stop calling `accumulateClusterLights` altogether.
+
+- **`Full` is a real enumerator now**, appended (stable values), and
+  `clamp_to_valid_ranges` widened to match — so an on-disk `2` survives where it
+  used to clamp down to `Ratio`. `PLAYGROUND_RT_LOCAL=full` pins it. Full needs
+  exactly what Ratio needs (the acceleration structure and the prepass
+  G-buffer) and nothing more; `RtLocalShadowSettings::full_di` is a second flag
+  on the same `enabled`, not a second ensure path.
+- **The split, and why both metal hooks are EXACT rather than approximations.**
+  `render/lighting/local_di.hpp` is the CPU source of truth and
+  `shaders/local_di.hlsli` its transliteration. Writing
+  `E = lightColor · atten · cone · N·L · V · W` (the ReSTIR estimate of the
+  whole point+spot sum, not of one light), the trace writes
+  `diffuse.rgb = (1 − F_d)(1 − metallic)(ls·vs/π)·E` and
+  `spec.rgb = D·Vis·F_d·E`, where `F_d` is Schlick against the DIELECTRIC
+  F0 = 0.04 — the G-buffer has roughness and metallic but no albedo, so a
+  metal's real F0 is not knowable there.
+
+  §5.3 above proposed "F0 = 0.04 + a metallic-scaled remodulation hook". Both
+  hooks turned out to be computable rather than merely approximable, and the
+  package takes the exact form of each:
+
+  * *Diffuse.* `kd = (1 − F)(1 − metallic)` and Schlick factors as
+    `1 − F = (1 − F0)(1 − f)`, so the half-vector term cancels out of the ratio
+    entirely: `kd_true / kd_dielectric = 1 − metallic·(albedo − 0.04)/0.96`,
+    needing only the albedo. It is 1 for a dielectric and **0** for a white
+    metal, which is the physically right answer — leaving `(1 − 0.04)` standing
+    where `(1 − F0)` belonged says a pure metal has 4% of a diffuse lobe.
+    Skipping this hook costs ~9% at metallic 0.5, which is exactly what the
+    energy test below caught on its first run.
+  * *Specular.* Here `f` does not cancel, so the specular buffer's **alpha lane
+    carries it** — `(1 − LdotH)⁵` of the winning light — and the forward pass
+    rebuilds `F_true / F_d = lerp(1, albedoTint, metallic)` with
+    `albedoTint = 1 + (albedo − 0.04)(1 − f)/(0.04 + 0.96f)`. That is §5.3's
+    `lerp(1.0, albedo_tint_factor, metallic)` with the honest tint factor: at
+    normal incidence it is `albedo/0.04`, and at grazing it relaxes to 1,
+    because every material's Fresnel goes to white at the horizon and a fixed
+    `albedo/0.04` would claim a metal is 22× brighter there. The denominator is
+    bounded below by 0.04, so there is no division hazard in the domain.
+
+  `local_di.test.cpp` pins the whole thing against an INDEPENDENT longhand
+  transliteration of `pbr.hlsli`'s `evaluatePBR` across seven surfaces
+  (dielectric/gold/half-metal × head-on/oblique/grazing), to a **relative
+  1e-5** — float round-off, not a tolerance band. That test is the thing that
+  keeps the two tiers honest against each other, and it is why the diffuse hook
+  exists at all.
+- **The denoiser is a RadianceDenoiser, and this time the reuse argument went
+  the other way.** R2b's local visibility signal reuses all three sun denoiser
+  pipelines verbatim; this signal reuses none of them, because a radiance
+  estimate shares none of that machinery — no bit packing, no tile
+  classification, no Bernoulli second moment. It is instead the REFLECTION
+  temporal pass's shape instantiated for a second signal: σ-clamped EMA against
+  the 3×3 neighbourhood, R5b's exposure-aware σ floor and firefly ceiling, and
+  R5b's LOCAL gradient (the same reconstructed texture the visibility temporal
+  pass reads — a reservoir that switched light is a lighting change for both) as
+  the reset driver. Two things stopped it being literally
+  `RtReflectionTemporal`: that pass owns alpha as its sample count, and this one
+  needs alpha for DATA; and diffuse and specular reproject together, once.
+  Virtual-hit-point reprojection is deliberately NOT taken — a reflection is an
+  image of a point that is not on the surface and direct lighting is not.
+  Then one edge-aware spatial gather whose radius is driven by the accumulation
+  count (`di_filter_radius`: full radius at one sample, a **floor of 1 traced
+  texel** at eight — not zero, because a 1-spp radiance estimate keeps a
+  residual forever where a binary visibility signal's tile classifier can
+  certify convergence).
+- **No joint-bilateral upsample, and that is a decision rather than an
+  omission.** The chain ends at the traced resolution and the forward shaders
+  reconstruct with their own depth-aware 4-tap (`localDiSample`, weights from
+  each traced texel's own linear view depth carried in the diffuse alpha). The
+  visibility denoiser fuses filter and upsample because its output is one R8
+  channel four shaders then sample with a hardware bilinear; here the output is
+  two RGBA16F targets those shaders read as STORAGE textures, where there is no
+  hardware filter to be had — so upsampling in the denoiser would mean writing
+  two FULL-resolution RGBA16F targets to save a gather that has to happen
+  anyway.
+- **Fragment storage textures, because there is no seventeenth sampler.** The
+  four scene shaders sit at SDL's 16-sampler ceiling exactly (R1c's three GI
+  slots spent the last of it). SDL3 GPU lays fragment set 2 out as sampled
+  textures → STORAGE textures → storage buffers, so the DI pair goes in the gap
+  and the cluster SSBOs move up by two. `CLUSTER_SSBO_BINDING_BASE` therefore
+  stopped being a synonym for the sampler count and **`CLUSTER_SAMPLER_COUNT`
+  was split out of it** — the local-shadow atlas follows the samplers, the
+  cluster buffers follow the buffers, and a shader with no storage textures may
+  still define only the old spelling.
+- **Measured**, playground village, 1600×900, Linux/Vulkan, RelWithDebInfo,
+  3-run identical everywhere:
+
+  | Invocation | mean_luma / stddev |
+  |---|---|
+  | `--smoke 30` (RT off) | `86.3 / 45.5` — **bit-identical** |
+  | `PLAYGROUND_RT=both PLAYGROUND_RT_LOCAL=ratio --smoke 30` | `85.0 / 47.9` — **bit-identical** |
+  | `PLAYGROUND_RT=both PLAYGROUND_RT_LOCAL=full --smoke 30` | `85.0 / 47.7` |
+  | night, `PLAYGROUND_TOD_HOUR=1 … RT_LOCAL=ratio` | `36.2 / 58.8` |
+  | night, `PLAYGROUND_TOD_HOUR=1 … RT_LOCAL=full` | `36.3 / 58.6` |
+
+  **The energy gate passes with room to spare**: Ratio and Full land on the same
+  mean to 0.1 luma by day and by night, which is what two estimates of the same
+  integral should do and is the number to re-check first if anyone touches the
+  demodulation. `--rt-bench 120`: `RTLocalShadows` CPU record **0.0169 →
+  0.0208 ms** mean (two more dispatches inside the scope), frame render 2.582 →
+  2.769 ms and `present_wait` 2.093 → 2.293 ms — so **~0.20 ms on the device**
+  for two extra half-res passes over six RGBA16F targets, and fps 299 → 279.
+  Validated (`BRACKEN_GPU_DEBUG=1`) run clean.
+- **What the night A/B actually shows, both halves of it.** Read the plaza under
+  the character's flashlight at `PLAYGROUND_TOD_HOUR=1`.
+
+  *Full wins on shadow structure*, exactly where the tier was supposed to: the
+  market stall's legs cast three distinct, separated shadows, where Ratio
+  flattens them into one soft blob. That is the aggregate approximation showing
+  its seam — Ratio's one scalar has to describe every light at the pixel at
+  once, so a pixel shadowed from one light and lit by another averages to a
+  partial ratio and the individual occluders stop being legible.
+
+  *Full loses per-texel relief, and this is the tier's principal cost.* The
+  cobbles under the flashlight read FLAT: the albedo is there, the bump
+  lighting is not. Three things compound, in decreasing order of blame. The
+  prepass G-buffer carries the **geometric** world normal, not the
+  normal-mapped one, so `N·L` in the demodulated estimate has no per-brick
+  variation to begin with; the estimate is at half resolution; and the spatial
+  gather's normal weight is computed from that same geometric normal, so it
+  blurs happily across bumps it cannot see. Ratio has none of this because it
+  never moves the lighting evaluation off the forward pass — only the
+  visibility.
+
+  That is inherent to a two-target demodulation and not a bug to be fixed in
+  place: a demodulated estimate has no light DIRECTION for the forward pass to
+  re-apply `N·L` with. The fix is a third target carrying a dominant light
+  direction (an irradiance-plus-direction basis, as directional lightmaps do),
+  so the forward pass can re-apply the cosine with its own normal-mapped
+  normal. That is a package of its own and is listed in §5.7. Until it lands,
+  **`Ratio` remains the default recommendation**, and `Full` is the right
+  choice for scenes whose local lights are coloured and disagree — where the
+  aggregate ratio's error is structural rather than a lost bump.
+- **Still open from this tier**: the directional basis above; hit-distance
+  moments driving the DI spatial radius (it uses the accumulation count as a
+  proxy); and per-light opt-out, which would let the atlas keep a gameplay-
+  critical hard shadow while everything else is traced.
 
 ### 5.4 R3 — Honest hit lighting (reflections meet GI)
 
@@ -1395,8 +1538,14 @@ seam in indirect); tier A/B screenshots.
   Also still open from this bullet: hit-distance MOMENTS driving a
   penumbra-width filter radius (SIGMA's idea) on the two shadow signals, and the
   Full-DI tier below.
-- **Full-DI tier** of local lights lands here (§5.3's second fold), reusing
-  the matured denoiser core.
+- ~~**Full-DI tier** of local lights lands here (§5.3's second fold), reusing
+  the matured denoiser core.~~ (**R5c, landed 2026-08-02 — the full ledger is
+  in §5.3, with the tier's landed note.**) It did reuse the matured core, and
+  the reuse is the reflection temporal pass's shape rather than the visibility
+  chain's: σ-clamped EMA, R5b's exposure-aware σ floor and firefly ceiling, and
+  R5b's LOCAL traced gradient as the reset driver, instantiated against two
+  demodulated RGBA16F radiance targets. **Phase R5 is complete** (R5a SSILVB +
+  bent cone, R5b the denoiser core, R5c Full-DI).
 
 ### 5.7 R6 — Emissive meshes, area lights, stretch caches
 
@@ -1409,6 +1558,16 @@ seam in indirect); tier A/B screenshots.
   the street is the money shot of this whole plan).
 - Sphere/disk **area-light** polish for the DI pass (solid-angle sampling is
   already correct; this is authoring surface: radius on `PointLightDesc`).
+- **A DIRECTIONAL basis for the Full-DI tier** — a third traced target carrying
+  the winning light's dominant direction, so the forward pass can re-apply
+  `N·L` with its own NORMAL-MAPPED normal instead of inheriting the prepass
+  G-buffer's geometric one. This is the named cost of R5c (§5.3): under a
+  flashlight at night the cobbles keep their albedo and lose their bump
+  lighting, because a two-target demodulation has no direction for the forward
+  pass to re-apply a cosine with. It belongs here rather than as a rider on
+  R5c: it is a third RGBA16F at traced resolution, a third fragment storage
+  texture in four scene shaders, and its own denoising question (a direction is
+  not a radiance and must be renormalized, not averaged).
 - **Stretch, only if screen feedback + probe recursion measurably starve
   secondary lighting**: SHaRC-shaped world hash radiance cache (reimplemented
   from the papers — the NVIDIA repo's license forbids lifting), 2²⁰ entries ≈
@@ -1477,7 +1636,7 @@ Dependency-ordered; each phase ships alone.
 | **R2** | froxel-RIS local shadows (Ratio), light IDs, scalar denoise clone | 32-light night scene fully shadowed (atlas caps exceeded) within budget; penumbra-vs-radius test; atlas A/B luma parity on atlas-sized scenes |
 | **R3** | `rt_hit_shade.hlsli`, CSM-at-hit, probe-at-hit, virtual reproj, rough→probe fallback | reflection interiors/shadows correct in pinned shots; orbit-ghosting metric improves; no reflection cost regression >10 % |
 | **R4** | ~~HZB + indirect dispatch wrapper~~ (**R4a, landed**), screen probes, probe-space filtering, mid-rough specular from probes (R4b) | R4a: every configuration bit-identical, `probes_screen` == `probes` luma with the `HZB` row present. R4b: `ProbesScreen` vs `Probes` A/B sharpness; handoff-seam scene clean; Silver budget held |
-| **R5** | ~~SSILVB/bent-cone~~ (**R5a, landed**), denoiser core (gradients, dual history, exposure-aware), Full-DI tier | lightning/toggle scene: history resets locally within 2 frames, no global flash-smear; contact-GI A/B |
+| **R5** | ~~SSILVB/bent-cone (R5a), denoiser core — gradients, dual history, exposure-aware (R5b), Full-DI tier (R5c)~~ (**COMPLETE, 2026-08-02**) | lightning/toggle scene: history resets locally within 2 frames, no global flash-smear; contact-GI A/B. **Met**: R5b's sweep table shows the gradient response and the local signal's independence from the sun; R5c's Ratio-vs-Full energy gate lands inside 0.1 luma by day and by night |
 | **R6** | emissive mesh lights, area-light authoring, stretch cache decision | dusk-windows shot; emissive in reflections + probes; watch-list re-evaluation recorded here |
 
 Standing rules for every phase: TSAN suite run after any job-system-adjacent

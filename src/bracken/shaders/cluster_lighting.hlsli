@@ -4,18 +4,30 @@
 // are reserved for clustered lighting.
 //
 // SDL GPU lays out fragment set 2 as sampled textures, then storage textures,
-// then storage buffers. The SSBO bindings therefore start right after the
-// including shader's sampled textures: define CLUSTER_SSBO_BINDING_BASE to
-// that shader's fragment sampler count BEFORE including this file.
+// then storage buffers. The SSBO bindings therefore start after BOTH: define
+// CLUSTER_SSBO_BINDING_BASE to the including shader's fragment sampler count
+// PLUS its storage-texture count BEFORE including this file, and
+// CLUSTER_SAMPLER_COUNT to the sampler count alone when the two differ.
 // SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4) then maps slots 0..3
 // onto these bindings.
 //
 // This header also owns the LOCAL (point/spot) shadow bindings: the shadow
 // atlas + comparison sampler pair is expected at the including shader's LAST
-// sampler slot (CLUSTER_SSBO_BINDING_BASE - 1), and the per-tile slot data
+// sampler slot (CLUSTER_SAMPLER_COUNT - 1), and the per-tile slot data
 // rides the 4th storage buffer. Local shadow maps are standard-Z perspective
 // depth (near -> 0, far -> 1, LESS_OR_EQUAL compare) rendered by
 // render::lighting::LocalShadowMap — see local_shadows.hpp for the CPU side.
+//
+// CLUSTER_SAMPLER_COUNT AND CLUSTER_SSBO_BINDING_BASE USED TO BE THE SAME
+// NUMBER, and stopped being so in R5c. Fragment set 2 is laid out as sampled
+// textures, then STORAGE textures, then storage buffers, so a shader that
+// declares storage textures pushes its storage buffers up past its sampler
+// count — and the Full-DI tier declares two (local_di.hlsli), because these
+// shaders sit at SDL's 16-sampler ceiling and there is no seventeenth to be
+// had. The atlas slot follows the SAMPLERS and the SSBO base follows the
+// BUFFERS, which are now two different numbers. A shader with no storage
+// textures may still define only CLUSTER_SSBO_BINDING_BASE; the fallback below
+// keeps that spelling meaning what it always meant.
 
 #ifndef CLUSTER_LIGHTING_HLSLI
 #define CLUSTER_LIGHTING_HLSLI
@@ -23,7 +35,11 @@
 #include "clusters.hlsli"
 
 #ifndef CLUSTER_SSBO_BINDING_BASE
-#error "Define CLUSTER_SSBO_BINDING_BASE (= fragment sampler count) before including cluster_lighting.hlsli"
+#error "Define CLUSTER_SSBO_BINDING_BASE (= fragment storage-buffer base) before including cluster_lighting.hlsli"
+#endif
+
+#ifndef CLUSTER_SAMPLER_COUNT
+#define CLUSTER_SAMPLER_COUNT CLUSTER_SSBO_BINDING_BASE
 #endif
 
 [[vk::binding(2, 3)]]
@@ -45,9 +61,9 @@ StructuredBuffer<uint> lightIndicesBuf;
 // D32 local-shadow atlas (8x8 tiles) at the including shader's last sampler
 // slot, sampled through a LESS_OR_EQUAL comparison sampler (each
 // SampleCmpLevelZero tap is a free 2x2 hardware PCF).
-[[vk::combinedImageSampler]][[vk::binding(CLUSTER_SSBO_BINDING_BASE - 1, 2)]]
+[[vk::combinedImageSampler]][[vk::binding(CLUSTER_SAMPLER_COUNT - 1, 2)]]
 Texture2D localShadowAtlas;
-[[vk::combinedImageSampler]][[vk::binding(CLUSTER_SSBO_BINDING_BASE - 1, 2)]]
+[[vk::combinedImageSampler]][[vk::binding(CLUSTER_SAMPLER_COUNT - 1, 2)]]
 SamplerComparisonState localShadowCmpSampler;
 
 // Mirrors render::lighting::LocalShadowSlotGPU (local_shadows.hpp), 96 bytes.
@@ -141,6 +157,15 @@ float localLightShadow(int shadow_slot, bool is_point, float3 light_pos, float r
 // through its existing `shadow_slot < 0` branch and the two cannot double-darken
 // a pixel. That is also what makes `Off` byte-identical — with the mask
 // argument left at its default the multiply is not merely by 1.0, it is absent.
+//
+// IN THE FULL-DI TIER (R5c) THIS FUNCTION IS NOT CALLED AT ALL. Every point and
+// spot light is traced there, so there is no analytic subtotal to multiply and
+// nothing for a ratio to correct; the four scene shaders branch to
+// `localDiLighting` (local_di.hlsli) instead of calling this. That is a
+// stronger statement than "the mask is 1": the loop below does not run, so a
+// light the traced pass could not reach contributes nothing rather than
+// contributing unshadowed. Both tiers are estimates of the same integral, which
+// is what the energy identity in local_di.test.cpp pins.
 // ---------------------------------------------------------------------------
 float3 accumulateClusterLights(float3 P, float3 N, float3 V,
                                 float3 baseColor, float metallic, float roughness, float ao,

@@ -463,6 +463,23 @@ private:
     // dummy reads 1.0 = fully lit from any UV, which is the correct no-op.
     void bind_rt_shadow_mask(uint32_t slot);
     void bind_rt_local_shadow_mask(uint32_t slot);
+    /// The Full-DI tier's two demodulated targets as fragment READ-ONLY STORAGE
+    /// textures (R5c). `first_slot` is a storage-texture slot, numbered from 0
+    /// independently of the sampler slots — SDL3 GPU binds the three classes
+    /// through three separate calls even though the shader sees one contiguous
+    /// set-2 run. Always called, with the 1x1 stand-in outside Full mode.
+    void bind_local_di(uint32_t first_slot);
+    /// `GraphicsSettings::rt_local_shadows` as the float every scene cbuffer
+    /// carries: 2 in Full, 1 in Ratio, 0 otherwise. Derived from what actually
+    /// came out of the renderer this frame, not from the setting, so a frame
+    /// that could not produce the DI pair renders as Ratio rather than as
+    /// nothing.
+    [[nodiscard]] float local_rt_shadow_mode_value() const {
+        if (frame_rt_local_di_active_) {
+            return 2.0f;
+        }
+        return frame_rt_local_shadows_active_ ? 1.0f : 0.0f;
+    }
 
     // Fill the 3-entry sky IBL binding array (irradiance cube, prefiltered
     // specular cube, BRDF LUT — real chain when the IBL renderer is ready,
@@ -562,6 +579,12 @@ private:
     /// mode the traced signal OWNS local shadowing and the rasterized atlas is
     /// not updated at all.
     bool frame_rt_local_shadows_active_ = false;
+    /// Whether that pass ran in the FULL-DI tier this frame (R5c). When it did,
+    /// the four scene shaders drop their analytic point/spot loop entirely and
+    /// read the two demodulated DI storage textures below instead — so this is
+    /// not "an extra effect on top of Ratio", it is which of two mutually
+    /// exclusive code paths the frame's local lighting came out of.
+    bool frame_rt_local_di_active_ = false;
     /// Normal+roughness G-buffer for ray-traced reflections. Allocated only
     /// while reflections are on, and released the moment they go off — a game
     /// that never enables them never pays for a screen-sized target.
@@ -842,8 +865,21 @@ private:
     // The traced LOCAL (point/spot) visibility ratio forward draws multiply
     // their clustered subtotal by this frame (full-res R8), or null in Off mode
     // — in which case every scene shader gets the white dummy and never reads
-    // it (rtLocalShadowEnabled == 0). Reset at the top of every render_frame.
+    // it (rtLocalShadowMode == 0). Reset at the top of every render_frame.
     SDL_GPUTexture* frame_rt_local_shadow_texture_ = nullptr;
+
+    // The Full-DI tier's two demodulated targets (R5c), at the traced
+    // resolution, bound to the four scene shaders as READ-ONLY STORAGE textures
+    // — never as samplers, because those shaders sit at SDL's 16-sampler
+    // ceiling exactly. Null outside Full mode, where the 1x1 stand-in below
+    // holds the slots and `rtLocalShadowMode < 2` is what stops them being read.
+    SDL_GPUTexture* frame_rt_local_di_diffuse_ = nullptr;
+    SDL_GPUTexture* frame_rt_local_di_specular_ = nullptr;
+    /// 1x1 RGBA16F zero, GRAPHICS_STORAGE_READ. Zeroed rather than left
+    /// undefined for the reason every dummy here is: alpha 0 is the "no answer"
+    /// the reconstruction rejects, so even a shader that ignored the mode flag
+    /// would read no contribution rather than garbage.
+    std::unique_ptr<gpu::GPUTexture> dummy_di_texture_;
 
     // Sky IBL is active this frame: settings flag on AND the prefilter chain
     // is alive. Drives the iblEnabled uniform flag of every scene shader.

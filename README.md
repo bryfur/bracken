@@ -22,7 +22,10 @@ glm-typed API over vendored Jolt Physics). It builds as a static library
 - **Clustered-forward renderer** (`src/bracken/render/`) — linear-space PBR
   with an HDR pipeline: clustered point/spot lighting (up to 256 lights),
   cascaded shadow maps (PCF/PCSS), budgeted point/spot light shadows
-  (cached-tile atlas, host opt-in per light), horizon-based GTAO (temporally
+  (cached-tile atlas, host opt-in per light — or, opt-in, one ray-traced
+  reservoir shadow ray per pixel that gives EVERY local light a soft shadow
+  with no budget at all, in either a visibility-ratio or a full demodulated-DI
+  tier), horizon-based GTAO (temporally
   accumulated, ambient-only), image-based lighting prefiltered live from the
   procedural sky (diffuse irradiance + GGX specular cubemaps + split-sum
   BRDF LUT, amortized regeneration on sky changes), histogram auto exposure

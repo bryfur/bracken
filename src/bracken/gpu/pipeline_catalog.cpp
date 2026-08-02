@@ -37,10 +37,19 @@ constexpr ShaderResources k_ubo1_samp5{.num_samplers = 5, .num_uniform_buffers =
 ///
 /// The RT sun mask is slot 10, the probe field occupies 11-13, R2b's traced
 /// LOCAL-light visibility ratio is 14, and the rasterized local-shadow atlas
-/// is 15 (`CLUSTER_SSBO_BINDING_BASE` = 16). The
+/// is 15 (`CLUSTER_SAMPLER_COUNT` = 16). The
 /// atlas stays LAST because cluster_lighting.hlsli declares it at
-/// `CLUSTER_SSBO_BINDING_BASE - 1`, which is the contract every one of these
+/// `CLUSTER_SAMPLER_COUNT - 1`, which is the contract every one of these
 /// three rows depends on.
+///
+/// R5c ADDED TWO STORAGE TEXTURES to each of these three rows: the Full-DI
+/// tier's demodulated diffuse and specular targets. They are not samplers
+/// because there is no seventeenth sampler to be had (see below), and SDL3 GPU
+/// lays fragment set 2 out as sampled textures, then STORAGE textures, then
+/// storage buffers — so they sit in the gap, and the cluster storage buffers
+/// moved up by two. That is why `CLUSTER_SSBO_BINDING_BASE` stopped being a
+/// synonym for the sampler count and `CLUSTER_SAMPLER_COUNT` was split out of
+/// it; `cluster_lighting.hlsli` explains the split at the declaration site.
 ///
 /// The RT mask was previously multiplexed into the screen-AO texture's G
 /// channel on the belief that a 12th sampler failed DXC legalization; that does
@@ -52,21 +61,21 @@ constexpr ShaderResources k_ubo1_samp5{.num_samplers = 5, .num_uniform_buffers =
 /// not a seventeenth sampler (gpu::GiScreenProbeSh). The next feature that
 /// wants a per-pixel texture in these shaders has to pack or use a buffer.
 constexpr ShaderResources k_fs_lit_model{
-    .num_samplers = 16, .num_storage_buffers = 5, .num_uniform_buffers = 3};
+    .num_samplers = 16, .num_storage_textures = 2, .num_storage_buffers = 5, .num_uniform_buffers = 3};
 
 /// `terrain.frag`: material array + splatmap + shadow atlas (cmp + raw) +
 /// screen AO + IBL (irradiance / prefiltered / BRDF LUT) + traced sun mask +
 /// GI (irradiance / visibility / probe metadata) + traced LOCAL-light mask +
 /// local-shadow atlas; R4b's screen-probe SH is the fifth storage buffer.
 constexpr ShaderResources k_fs_lit_terrain{
-    .num_samplers = 14, .num_storage_buffers = 5, .num_uniform_buffers = 3};
+    .num_samplers = 14, .num_storage_textures = 2, .num_storage_buffers = 5, .num_uniform_buffers = 3};
 
 /// `grass.frag`: shadow atlas (cmp + raw) + screen AO + IBL (irradiance /
 /// prefiltered / BRDF LUT) + traced sun mask + GI (irradiance / visibility /
 /// probe metadata) + traced LOCAL-light mask + local-shadow atlas; R4b's
 /// screen-probe SH is the fifth storage buffer.
 constexpr ShaderResources k_fs_lit_grass{
-    .num_samplers = 12, .num_storage_buffers = 5, .num_uniform_buffers = 3};
+    .num_samplers = 12, .num_storage_textures = 2, .num_storage_buffers = 5, .num_uniform_buffers = 3};
 
 /// `grass.vert` / `prepass_grass.vert`: heightmap + splatmap samplers, plus the
 /// visible-chunk origin buffer for the chunked LOD.
@@ -922,11 +931,43 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // The reservoir ping-pong consequently rides in set 1 as two READ-WRITE
      // buffers, of which one is only ever read. That is the budget talking, and
      // it is written down at the binding site too.
+     //
+     // R5c added TWO read-write storage textures, not read-only ones and not
+     // buffers: the Full-DI tier's demodulated diffuse and specular targets.
+     // The read-only budget was already spent to the last slot, which is
+     // precisely why they are outputs of this pass rather than inputs to a
+     // second one. In Ratio mode they are 1x1 stand-ins and `diMode` is what
+     // stops anything being written to them.
      .resources = {.num_samplers = 3,
                    .num_readonly_storage_buffers = 8,
-                   .num_readwrite_storage_textures = 1,
+                   .num_readwrite_storage_textures = 3,
                    .num_readwrite_storage_buffers = 2,
                    .num_uniform_buffers = 2}},
+    {.name = "RtDiTemporal",
+     .shader = "rt_di_denoise_temporal.comp.spv",
+     .entry_point = "CSMain",
+     // Sampled: the two raw demodulated targets, velocity, and the two
+     // histories. Read-only storage texture: R5b's reconstructed gradient for
+     // the LOCAL signal — the same texture the visibility temporal pass reads,
+     // because a reservoir that switched light is a lighting change for both.
+     // Read-only storage buffer: render::AutoExposure's state block, for the
+     // R5b exposure-aware sigma floor and firefly ceiling.
+     .resources = {.num_samplers = 5,
+                   .num_readonly_storage_textures = 1,
+                   .num_readonly_storage_buffers = 1,
+                   .num_readwrite_storage_textures = 2,
+                   .num_uniform_buffers = 1}},
+    {.name = "RtDiSpatial",
+     .shader = "rt_di_denoise_spatial.comp.spv",
+     .entry_point = "CSMain",
+     // The two accumulated targets in, depth + the prepass G-buffer for the
+     // edge-aware weights, the two filtered targets out. Stays at the TRACED
+     // resolution: the forward shaders reconstruct with their own depth-aware
+     // 4-tap, so a fused upsample here would write two full-res RGBA16F targets
+     // to save a gather that has to happen anyway.
+     .resources = {.num_samplers = 4,
+                   .num_readwrite_storage_textures = 2,
+                   .num_uniform_buffers = 1}},
     {.name = "GiProbeTrace",
      .shader = "gi_probe_trace.comp.spv",
      .entry_point = "CSMain",

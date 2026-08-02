@@ -116,6 +116,18 @@ struct RtReflectionSettings {
  */
 struct RtLocalShadowSettings {
     bool enabled = false;
+    /**
+     * The Full-DI tier (R5c): the same reservoir and the same ray, but the pass
+     * ALSO writes two demodulated radiance targets and the forward shaders drop
+     * the analytic point/spot loop entirely.
+     *
+     * Requires exactly what `enabled` requires and nothing more — the
+     * acceleration structure and the prepass G-buffer — so there is no separate
+     * ensure path and no way for this to be on while the trace is off. It is a
+     * second flag rather than a mode enum here because `enabled` is what gates
+     * the whole pass and every caller already sets it.
+     */
+    bool full_di = false;
     RtResolution resolution = RtResolution::Half;
     float normal_bias = 1.5f;
     float depth_bias = 0.5f;
@@ -138,6 +150,22 @@ struct RtLocalShadowSettings {
     /// through the same three pipelines.
     float max_accum_frames = 32.0f;
     float filter_radius = 3.0f;
+
+    // ---- Full-DI tier only (R5c) ----
+
+    /// Frames the DI radiance denoiser accumulates over. Longer than the
+    /// reflection denoiser's 16: direct lighting is painted on the surface
+    /// carrying it, so it does not move at twice the parallax rate and a long
+    /// tail costs no smear.
+    float di_max_accum_frames = 32.0f;
+    /// Neighbourhood standard deviations the reprojected DI history may sit
+    /// outside before being clamped back — the reflection denoiser's dial, same
+    /// meaning and the same default.
+    float di_clamp_sigma = 1.5f;
+    /// Radius in TRACED texels of the DI spatial gather at one accumulated
+    /// sample. `render::lighting::di_filter_radius` maps the count down from
+    /// here to its floor.
+    float di_filter_radius = 3.0f;
 };
 
 /**
@@ -280,6 +308,19 @@ struct RtStats {
     /// true ray count is lower and this is the same honest over-estimate
     /// `shadow_rays` is.
     uint32_t local_shadow_rays = 0;
+    /**
+     * Whether the local pass ran in the Full-DI tier this frame — i.e. whether
+     * the two demodulated radiance targets below are live and the forward
+     * shaders dropped their analytic point/spot loop.
+     *
+     * Distinct from `local_shadows_traced`, which is true in both traced tiers:
+     * this is the one that says which of the two the frame you are looking at
+     * actually used. Both targets are RGBA16F at the LOCAL pass's traced
+     * resolution — RGB demodulated radiance, and the alpha lanes carrying the
+     * texel's linear view depth and the Schlick fraction the forward shaders
+     * rebuild a metal's Fresnel from (render/lighting/local_di.hpp).
+     */
+    bool local_di_traced = false;
     /// Instances in the TLAS — i.e. AFTER the renderer's range filter, so this
     /// is what the rays actually see rather than what the frame drew.
     uint32_t instances = 0;
@@ -508,6 +549,13 @@ public:
      *  pass is off or has not produced a mask. The forward shaders multiply
      *  their whole point+spot subtotal by it — see cluster_lighting.hlsli. */
     [[nodiscard]] gpu::GPUTexture* local_shadow_mask() const;
+    /** The Full-DI tier's two denoised, demodulated local-light targets, at the
+     *  LOCAL pass's traced resolution (R5c). Null unless the last render() ran
+     *  with `full_di`. The scene shaders bind them as READ-ONLY STORAGE
+     *  textures, never as samplers — they sit at SDL's 16-sampler ceiling —
+     *  and reconstruct with `localDiSample`. See shaders/local_di.hlsli. */
+    [[nodiscard]] gpu::GPUTexture* local_di_diffuse() const;
+    [[nodiscard]] gpu::GPUTexture* local_di_specular() const;
     /** Reduced-resolution raw incoming radiance. Alpha is the trace validity
      *  gate consumed by resolve_reflections() or the specialized water pass;
      *  hosts should not composite this target directly. */
@@ -648,6 +696,19 @@ private:
     /// Poll the lagged counter readback and, when one lands, difference it
     /// against the previous to fill `stats_.denoise`. Called once per render().
     void update_denoise_stats();
+    /// Create (once) the 1x1 stand-ins the trace binds into its two DI slots in
+    /// Ratio mode. Size-independent, so they outlive a resolution change.
+    [[nodiscard]] bool ensure_di_dummies();
+    /// Allocate/keep the Full-DI tier's six RGBA16F targets at the local
+    /// signal's traced resolution. Invalidates the DI history on any change.
+    [[nodiscard]] bool ensure_di_targets(int traced_w, int traced_h);
+    /// The two DI denoiser dispatches (temporal EMA, then the accumulation-
+    /// driven edge-aware gather). No-op when the trace did not write the raw
+    /// pair.
+    void denoise_local_di(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
+                          SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
+                          const FrameParams& params, const RtLocalShadowSettings& settings,
+                          int traced_w, int traced_h);
     /// Trace + denoise the froxel-RIS local-light signal. Returns whether the
     /// trace ran.
     [[nodiscard]] bool render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
@@ -690,6 +751,41 @@ private:
     /// four heterogeneous lanes, one of which is a light INDEX that must not be
     /// filtered, converted or clamped by anything.
     std::array<std::unique_ptr<gpu::GPUBuffer>, 2> local_reservoirs_;
+
+    /**
+     * The Full-DI tier's targets (R5c), all RGBA16F at the LOCAL signal's
+     * traced resolution.
+     *
+     * A RADIANCE denoiser, not a visibility one, and that is why it is a
+     * separate block rather than two more fields on VisibilityDenoiser: there
+     * is no bit packing, no tile classification and no second moment here — the
+     * quantity is unbounded and continuous, so the reflection denoiser's
+     * sigma-clamped EMA is the right shape and the visibility chain's is not.
+     *
+     * `raw` is what the trace wrote; `history` is the ping-ponged temporal
+     * accumulation; `filtered` is what the forward shaders read. Six targets
+     * rather than four because the last pass must not read the texture it
+     * writes, and rather than eight because the raw pair has no reader after
+     * the temporal dispatch that consumed it.
+     */
+    struct RadianceDenoiser {
+        std::array<std::unique_ptr<gpu::GPUTexture>, 2> raw;      ///< [0] diffuse, [1] specular
+        std::array<std::array<std::unique_ptr<gpu::GPUTexture>, 2>, 2> history; ///< [ping][diffuse|spec]
+        std::array<std::unique_ptr<gpu::GPUTexture>, 2> filtered; ///< [0] diffuse, [1] specular
+        /// 1x1 stand-ins bound into the trace's two DI slots in Ratio mode. A
+        /// storage-image descriptor may not be empty, and `diMode` is what
+        /// stops anything being written through them.
+        std::array<std::unique_ptr<gpu::GPUTexture>, 2> dummy;
+        int history_index = 0;
+        bool history_valid = false;
+        int width = 0;
+        int height = 0;
+
+        void release();
+    };
+    RadianceDenoiser local_di_;
+    /// Whether the last render() produced live `local_di_.filtered` targets.
+    bool local_di_ready_ = false;
     int local_reservoir_index_ = 0;
     /// Element count the pair is currently sized for; a change reallocates and
     /// invalidates the history, because reservoir N describes a different pixel.

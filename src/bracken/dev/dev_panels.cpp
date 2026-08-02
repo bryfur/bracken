@@ -309,15 +309,24 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
     }
 
     {
-        static const char* const LOCAL_RT_MODES[] = {"Off (atlas)", "Ratio (traced)"};
-        changed |= combo_enum("RT local shadows", settings.rt_local_shadows, LOCAL_RT_MODES, 2);
+        static const char* const LOCAL_RT_MODES[] = {"Off (atlas)", "Ratio (traced)",
+                                                     "Full DI (traced)"};
+        changed |= combo_enum("RT local shadows", settings.rt_local_shadows, LOCAL_RT_MODES, 3);
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Shadows for POINT and SPOT lights.\n"
+            ImGui::SetTooltip("Shadows for POINT and SPOT lights. Ratio and Full cost the\n"
+                              "SAME ONE RAY per pixel and need the BVH and the G-buffer;\n"
+                              "they differ in what is done with it.\n"
                               "Off  = the rasterized 8x8 tile atlas: hard edges, and hard\n"
                               "       budgets (8 point / 16 spot / 6 tile updates a frame).\n"
-                              "Ratio = one traced ray per pixel, aimed by a froxel reservoir.\n"
-                              "       EVERY local light casts a soft shadow and the atlas is\n"
-                              "       not updated at all. Needs the BVH and the G-buffer.");
+                              "Ratio = one denoised visibility scalar multiplies the whole\n"
+                              "       analytic point+spot subtotal. Sharp lighting, soft\n"
+                              "       shadows, but ONE number for every light at a pixel.\n"
+                              "Full = the traced lights leave the analytic loop entirely and\n"
+                              "       the pass writes demodulated diffuse+specular radiance\n"
+                              "       instead. Per-light correct: coloured lights cast\n"
+                              "       coloured shadows and highlights pool under the light\n"
+                              "       that made them. Noisier, and reconstructed from the\n"
+                              "       traced resolution rather than shaded per pixel.");
         }
     }
 

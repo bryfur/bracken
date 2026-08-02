@@ -500,6 +500,9 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("rt_shadow_denoise_temporal.comp.spv", 2, 0, gpu::RtShadowTemporalUniforms),
     ROW("rt_shadow_denoise_filter.comp.spv", 2, 0, gpu::RtShadowFilterUniforms),
     ROW("rt_reflection_denoise_temporal.comp.spv", 2, 0, gpu::RtReflectionTemporalUniforms),
+    // R5c's Full-DI denoiser, the two passes of it.
+    ROW("rt_di_denoise_temporal.comp.spv", 2, 0, gpu::RtDiTemporalUniforms),
+    ROW("rt_di_denoise_spatial.comp.spv", 2, 0, gpu::RtDiSpatialUniforms),
     ROW("rt_reflection.comp.spv", 2, 0, gpu::RtReflectionUniforms),
     // b1 of the same shader is ClusterGrid's own ClusterParams, pushed straight
     // from ClusterGrid::params() — its row is with the renderer-owned mirrors

@@ -206,7 +206,7 @@ bool PlaygroundGame::on_init() {
     if (const char* rt = SDL_getenv("PLAYGROUND_RT"); rt != nullptr) {
         rt_mode_ = rt;
     }
-    // PLAYGROUND_RT_LOCAL=ratio|off — traced shadows for the village's point
+    // PLAYGROUND_RT_LOCAL=ratio|full|off — traced shadows for the village's point
     // and spot lights. Read here for the same reason as the two above: it
     // decides whether a BVH is needed, and models release their CPU geometry
     // at upload.
@@ -1522,8 +1522,13 @@ void PlaygroundGame::apply_rt_mode(bracken::GraphicsSettings& gs) const {
     // Separate variable rather than another PLAYGROUND_RT word: local-light
     // shadows are orthogonal to the sun and reflections, and the A/B that
     // matters is "same RT effects, local shadows on vs off".
-    gs.rt_local_shadows = rt_local_mode_ == "ratio" ? bracken::LocalRtShadowMode::Ratio
-                                                    : bracken::LocalRtShadowMode::Off;
+    if (rt_local_mode_ == "full") {
+        gs.rt_local_shadows = bracken::LocalRtShadowMode::Full;
+    } else if (rt_local_mode_ == "ratio") {
+        gs.rt_local_shadows = bracken::LocalRtShadowMode::Ratio;
+    } else {
+        gs.rt_local_shadows = bracken::LocalRtShadowMode::Off;
+    }
 }
 
 void PlaygroundGame::apply_gi_mode(bracken::GraphicsSettings& gs) const {
@@ -1942,8 +1947,10 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
             const auto& rt = scene_renderer().raytracing_stats();
             std::cout << std::format(
                 "[smoke] rt shadows_traced={} reflections_traced={} local_shadows_traced={} "
+                "local_di_traced={} "
                 "shadow_rays={} reflection_rays={} local_shadow_rays={} accel={:.1f}MB\n",
-                rt.shadows_traced, rt.reflections_traced, rt.local_shadows_traced, rt.shadow_rays,
+                rt.shadows_traced, rt.reflections_traced, rt.local_shadows_traced,
+                rt.local_di_traced, rt.shadow_rays,
                 rt.reflection_rays, rt.local_shadow_rays,
                 static_cast<double>(rt.acceleration_bytes) / (1024.0 * 1024.0));
             // The structure, itemized. `instances` is post-range-filter, so it

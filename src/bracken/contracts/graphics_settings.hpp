@@ -133,15 +133,36 @@ enum class RtRange : int {
  * scene and the prepass G-buffer, exactly as `rt_shadows` does; in this mode
  * the atlas is not updated and no tile is rendered at all.
  *
- * `Full = 2` — the demodulated diffuse+specular traced-DI tier, where the
- * traced lights leave the analytic loop entirely — IS PHASE R5 and is
- * deliberately NOT declared yet. It appends here when it lands, so an on-disk
- * `2` today is out of range and clamps to `Ratio` rather than silently meaning
- * something it does not do.
+ * `Full` (R5c) is the same one ray, spent differently. Instead of a scalar
+ * ratio the trace evaluates the WINNER'S OWN BRDF and writes two DEMODULATED
+ * radiance estimates — diffuse without albedo, specular without Fresnel-F0 —
+ * which are denoised as radiance and remodulated per pixel in the forward
+ * shaders. The point and spot lights then leave the analytic cluster loop
+ * ENTIRELY: nothing multiplies them, because nothing sums them.
+ *
+ * What that buys over `Ratio`, and it is not "more accurate shadows" — the
+ * shadow ray is the same ray:
+ *
+ *  - **Colour.** A ratio is one scalar for the whole point+spot subtotal, so a
+ *    red lantern and a blue one shadowing the same pixel dim each other's
+ *    colour. Full carries the winner's radiance, so a shadow cast out of the
+ *    red lantern leaves the blue light's colour behind it.
+ *  - **Specular.** The ratio multiplies diffuse and specular alike, which is
+ *    wrong whenever the light that dominates the highlight is not the light
+ *    that dominates the irradiance. Full estimates the two lobes separately.
+ *
+ * What it costs: the estimate is stochastic in the SURFACE now, not only in
+ * the shadowing, so it is noisier than `Ratio` at the same ray count and leans
+ * harder on the denoiser; and the traced pass runs at its own resolution, so
+ * local lighting is reconstructed by a depth-aware bilinear rather than
+ * evaluated per pixel. `Ratio` remains the default recommendation and the iGPU
+ * answer. Full needs everything Ratio needs — the acceleration structure and
+ * the prepass G-buffer — and nothing more.
  */
 enum class LocalRtShadowMode : int {
     Off = 0,
     Ratio = 1,
+    Full = 2,
 };
 
 /**

@@ -96,13 +96,17 @@ struct alignas(16) ModelLightingUniforms {
     /// rtReflectionMaxRoughness == 0 is the "reflections off" encoding.
     float rtReflectionMaxRoughness = 0.0f;
     float rtReflectionFadeStart = 0.0f;
-    /// 1 = multiply the LOCAL (point/spot) light subtotal by the ray-traced
-    /// local-shadow mask (GraphicsSettings::rt_local_shadows == Ratio). Rides
-    /// in what used to be `_rtPad2`, so the cbuffer neither grew nor moved a
-    /// field. 0 leaves accumulateClusterLights' arithmetic bit-identical: the
-    /// mask is not sampled at all, exactly as `giEnabled == 0` skips the probe
-    /// tap rather than blending it at weight zero.
-    float rtLocalShadowEnabled = 0.0f;
+    /// `GraphicsSettings::rt_local_shadows` as a float, because a cbuffer has
+    /// no enums: 0 = Off, 1 = Ratio, 2 = Full-DI. Rides in what used to be
+    /// `_rtPad2`, so the cbuffer neither grew nor moved a field.
+    ///
+    /// 0 leaves accumulateClusterLights' arithmetic bit-identical — the mask is
+    /// not sampled at all, exactly as `giEnabled == 0` skips the probe tap
+    /// rather than blending it at weight zero. 1 multiplies the whole
+    /// point+spot subtotal by the traced visibility ratio. 2 (R5c) does not
+    /// call accumulateClusterLights AT ALL and reads the two demodulated DI
+    /// storage textures instead — see shaders/local_di.hlsli.
+    float rtLocalShadowMode = 0.0f;
     /// Probe-field GI (render/gi/), R1c. `giCascadeBase[c].xyz` is
     /// `render::gi::cascade_base()` of the position ProbeVolume was scrolled
     /// with — sent rather than re-derived from cameraPos in the shader, so the
@@ -158,7 +162,7 @@ BRACKEN_HLSL_FIELD(ModelLightingUniforms, screenAOEnabled, 220);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtShadowEnabled, 224);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionMaxRoughness, 228);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionFadeStart, 232);
-BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtLocalShadowEnabled, 236);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtLocalShadowMode, 236);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, giCascadeBase, 240);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, giEnabled, 288);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, giScreenEnabled, 292);
@@ -403,13 +407,17 @@ struct alignas(16) InstancedLightingUniforms {
     /// ModelLightingUniforms::rtReflectionMaxRoughness.
     float rtReflectionMaxRoughness = 0.0f;
     float rtReflectionFadeStart = 0.0f;
-    /// 1 = multiply the LOCAL (point/spot) light subtotal by the ray-traced
-    /// local-shadow mask (GraphicsSettings::rt_local_shadows == Ratio). Rides
-    /// in what used to be `_rtPad2`, so the cbuffer neither grew nor moved a
-    /// field. 0 leaves accumulateClusterLights' arithmetic bit-identical: the
-    /// mask is not sampled at all, exactly as `giEnabled == 0` skips the probe
-    /// tap rather than blending it at weight zero.
-    float rtLocalShadowEnabled = 0.0f;
+    /// `GraphicsSettings::rt_local_shadows` as a float, because a cbuffer has
+    /// no enums: 0 = Off, 1 = Ratio, 2 = Full-DI. Rides in what used to be
+    /// `_rtPad2`, so the cbuffer neither grew nor moved a field.
+    ///
+    /// 0 leaves accumulateClusterLights' arithmetic bit-identical — the mask is
+    /// not sampled at all, exactly as `giEnabled == 0` skips the probe tap
+    /// rather than blending it at weight zero. 1 multiplies the whole
+    /// point+spot subtotal by the traced visibility ratio. 2 (R5c) does not
+    /// call accumulateClusterLights AT ALL and reads the two demodulated DI
+    /// storage textures instead — see shaders/local_di.hlsli.
+    float rtLocalShadowMode = 0.0f;
     /// Probe-field GI (render/gi/), R1c — see ModelLightingUniforms::giCascadeBase.
     glm::ivec4 giCascadeBase[3] = {};
     float giEnabled = 0.0f;
@@ -459,7 +467,7 @@ BRACKEN_HLSL_FIELD(InstancedLightingUniforms, screenAOEnabled, 204);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtShadowEnabled, 208);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionMaxRoughness, 212);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionFadeStart, 216);
-BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtLocalShadowEnabled, 220);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtLocalShadowMode, 220);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giCascadeBase, 224);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giEnabled, 272);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giScreenEnabled, 276);
@@ -1273,10 +1281,19 @@ struct alignas(16) RtLocalShadowUniforms {
     /// from `clusterParams.view` — the matrix ClusterGrid binned against —
     /// rather than from a reversed-Z linearization that only has to be
     /// self-consistent everywhere else it is used.
-    uint32_t _pad0 = 0;
+    ///
+    /// `LocalRtShadowMode` as a uint: 0/1 = Ratio (packed visibility bits
+    /// only), 2 = Full-DI (also the two demodulated radiance targets). Took the
+    /// slot that was `_pad0` through R5b.
+    uint32_t diMode = 0;
+    /// The eye, for the Full-DI tier's specular half. A visibility bit has no
+    /// view dependence, which is why the Ratio tier never needed this and R5c
+    /// is where it arrives.
+    glm::vec3 cameraPosition{0.0f};
+    float _pad1 = 0.0f;
 };
 
-BRACKEN_HLSL_CBUFFER(RtLocalShadowUniforms, 112);
+BRACKEN_HLSL_CBUFFER(RtLocalShadowUniforms, 128);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, invViewProj, 0);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, outputSize, 64);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, tlasNodeCount, 72);
@@ -1288,7 +1305,67 @@ BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, frameIndex, 92);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, hasGBuffer, 96);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, historyValid, 100);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, candidateCount, 104);
-BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, _pad0, 108);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, diMode, 108);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, cameraPosition, 112);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, _pad1, 124);
+
+/**
+ * The Full-DI tier's temporal denoiser — matches
+ * rt_di_denoise_temporal.comp.hlsl (set 2, b0). R5c, docs/rt_lighting_plan.md
+ * §5.3.
+ */
+struct alignas(16) RtDiTemporalUniforms {
+    glm::uvec2 tracedSize{0, 0};
+    /// Gradient dimensions (traced / render::GRADIENT_STRATUM).
+    glm::uvec2 stratumCount{0, 0};
+    float maxAccumFrames = 32.0f;
+    float clampSigma = 1.5f;
+    /// R5b's analytic sun gradient, already a global hysteresis floor. 0 is the
+    /// identity.
+    float lightingReset = 0.0f;
+    uint32_t historyValid = 0;
+    uint32_t gradientValid = 0;
+    uint32_t exposureEnabled = 0;
+    float manualExposureEv = 0.0f;
+    uint32_t _pad0 = 0;
+};
+
+BRACKEN_HLSL_CBUFFER(RtDiTemporalUniforms, 48);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, tracedSize, 0);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, stratumCount, 8);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, maxAccumFrames, 16);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, clampSigma, 20);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, lightingReset, 24);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, historyValid, 28);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, gradientValid, 32);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, exposureEnabled, 36);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, manualExposureEv, 40);
+BRACKEN_HLSL_FIELD(RtDiTemporalUniforms, _pad0, 44);
+
+/**
+ * The Full-DI tier's spatial denoiser — matches rt_di_denoise_spatial.comp.hlsl
+ * (set 2, b0). R5c.
+ */
+struct alignas(16) RtDiSpatialUniforms {
+    glm::uvec2 tracedSize{0, 0};
+    float depthA = 0.0f;
+    float depthB = 0.0f;
+    /// Radius in traced texels for a one-sample pixel; the curve down to
+    /// render::lighting::DI_FILTER_MIN_RADIUS is `di_filter_radius`.
+    float maxRadius = 3.0f;
+    float depthSigma = 0.05f;
+    float normalPower = 8.0f;
+    uint32_t _pad0 = 0;
+};
+
+BRACKEN_HLSL_CBUFFER(RtDiSpatialUniforms, 32);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, tracedSize, 0);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, depthA, 8);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, depthB, 12);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, maxRadius, 16);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, depthSigma, 20);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, normalPower, 24);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, _pad0, 28);
 
 /**
  * Shadow-denoiser tile classification — matches

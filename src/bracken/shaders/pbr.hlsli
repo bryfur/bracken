@@ -246,7 +246,12 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
 
 // Kaplanyan-style specular anti-aliasing: widen perceptual roughness by the
 // screen-space normal variance so curved/thin geometry doesn't shimmer.
-// Fragment-shader only (uses derivatives).
+//
+// FRAGMENT-SHADER ONLY: ddx/ddy exist in no other stage, so a compute module
+// that wants the BRDF halves above defines PBR_NO_DERIVATIVES and this one
+// function goes away. It is the only thing in this header that is not stage
+// agnostic, which is why the guard is around it rather than around the file.
+#ifndef PBR_NO_DERIVATIVES
 float specularAARoughness(float3 N, float roughness) {
     float3 dndx = ddx(N);
     float3 dndy = ddy(N);
@@ -254,5 +259,6 @@ float specularAARoughness(float3 N, float roughness) {
     float kernel = min(variance, 0.18);
     return clamp(sqrt(roughness * roughness + kernel), roughness, 1.0);
 }
+#endif // PBR_NO_DERIVATIVES
 
 #endif // PBR_HLSLI

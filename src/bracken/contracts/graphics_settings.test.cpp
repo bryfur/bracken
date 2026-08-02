@@ -830,11 +830,10 @@ TEST_F(GraphicsSettingsTest, AutoExposureSerializesNumerically) {
     EXPECT_FLOAT_EQ(loaded.auto_exposure_speed_down, 0.25f);
 }
 
-// R5's `Full` tier is not declared yet, so an on-disk 2 must clamp DOWN to
-// Ratio rather than surviving. This is deliberately the opposite of
-// GiMode::ProbesScreen's treatment (which IS declared and does survive): a
-// value that does not exist yet must never arrive as a silent opt-in to a tier
-// nobody chose, and the enum says so.
+// R5c declared `Full = 2`, so an on-disk 2 now SURVIVES where it used to clamp
+// down to Ratio. Both halves of that are the contract and both are pinned here:
+// a value the build understands round-trips, and a value past the last
+// enumerator (3) still clamps to the last one rather than being stored raw.
 TEST_F(GraphicsSettingsTest, LocalRtShadowModeClampsOutOfRangeValues) {
     {
         std::ofstream out(TEST_FILE);
@@ -845,8 +844,18 @@ TEST_F(GraphicsSettingsTest, LocalRtShadowModeClampsOutOfRangeValues) {
     }
     GraphicsSettings read;
     ASSERT_TRUE(read.load(TEST_FILE));
-    EXPECT_EQ(read.rt_local_shadows, LocalRtShadowMode::Ratio);
+    EXPECT_EQ(read.rt_local_shadows, LocalRtShadowMode::Full);
     EXPECT_EQ(read.rt_local_shadow_resolution, RtResolution::Quarter);
+
+    {
+        std::ofstream out(TEST_FILE);
+        ASSERT_TRUE(out.is_open());
+        out << "settings_version=" << GraphicsSettings::CURRENT_SETTINGS_VERSION << "\n";
+        out << "rt_local_shadows=7\n";
+    }
+    GraphicsSettings past_end;
+    ASSERT_TRUE(past_end.load(TEST_FILE));
+    EXPECT_EQ(past_end.rt_local_shadows, LocalRtShadowMode::Full);
 
     GraphicsSettings negative;
     negative.rt_local_shadows = static_cast<LocalRtShadowMode>(-3);
@@ -854,4 +863,16 @@ TEST_F(GraphicsSettingsTest, LocalRtShadowModeClampsOutOfRangeValues) {
     negative.clamp_to_valid_ranges();
     EXPECT_EQ(negative.rt_local_shadows, LocalRtShadowMode::Off);
     EXPECT_EQ(negative.rt_local_shadow_resolution, RtResolution::Full);
+}
+
+// The Full tier round-trips through the file like every other mode field.
+TEST_F(GraphicsSettingsTest, LocalRtShadowFullTierRoundTrips) {
+    GraphicsSettings written;
+    written.rt_local_shadows = LocalRtShadowMode::Full;
+    ASSERT_TRUE(written.save(TEST_FILE));
+
+    GraphicsSettings read;
+    ASSERT_EQ(read.rt_local_shadows, LocalRtShadowMode::Off);
+    ASSERT_TRUE(read.load(TEST_FILE));
+    EXPECT_EQ(read.rt_local_shadows, LocalRtShadowMode::Full);
 }

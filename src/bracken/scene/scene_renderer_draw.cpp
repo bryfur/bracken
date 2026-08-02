@@ -99,6 +99,22 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
     SDL_GPUTextureSamplerBinding rt_local_binding = {rt_local_tex, default_sampler_};
     const bool have_rt_local_binding = rt_local_tex && default_sampler_;
 
+    // The Full-DI tier's storage-texture pair, or the 1x1 stand-in (R5c). The
+    // sub-renderers hold it rather than taking it through their already-long
+    // render() argument list, and `active` is what turns their mode uniform to
+    // 2 — so a frame that lost one of the two targets falls back to Ratio in
+    // both of them at once.
+    {
+        SDL_GPUTexture* stand_in = dummy_di_texture_ ? dummy_di_texture_->handle() : nullptr;
+        SDL_GPUTexture* di_diffuse = frame_rt_local_di_diffuse_ ? frame_rt_local_di_diffuse_ : stand_in;
+        SDL_GPUTexture* di_specular =
+            frame_rt_local_di_specular_ ? frame_rt_local_di_specular_ : stand_in;
+        terrain_->set_local_di(di_diffuse, di_specular, frame_rt_local_di_active_);
+        if (grass_renderer_) {
+            grass_renderer_->set_local_di(di_diffuse, di_specular, frame_rt_local_di_active_);
+        }
+    }
+
     // Sky IBL bindings for terrain/grass (real chain or typed dummies) — the
     // model-family paths bind the same set via bind_ibl().
     SDL_GPUTextureSamplerBinding ibl_bindings[3];
@@ -237,6 +253,8 @@ bool SceneRenderer::bind_model_pipeline(bool double_sided, bool depth_equal) {
     bind_gi(11);
     bind_rt_local_shadow_mask(14);
     bind_local_shadow_atlas(15);
+    // Storage textures follow the 16 samplers in fragment set 2 (R5c).
+    bind_local_di(0);
     model_pipeline_double_sided_ = double_sided;
     model_pipeline_depth_equal_ = depth_equal;
     model_pipeline_bound_ = true;
@@ -268,6 +286,8 @@ bool SceneRenderer::bind_skinned_pipeline(bool double_sided, bool depth_equal) {
     bind_gi(11);
     bind_rt_local_shadow_mask(14);
     bind_local_shadow_atlas(15);
+    // Storage textures follow the 16 samplers in fragment set 2 (R5c).
+    bind_local_di(0);
     SDL_GPUBuffer* palette_buf = current_bone_palette_buffer()->handle();
     SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);
     skinned_pipeline_double_sided_ = double_sided;
@@ -301,7 +321,7 @@ void SceneRenderer::bind_rt_local_shadow_mask(uint32_t slot) {
     // slot is declared unconditionally and SDL3 GPU leaves an unbound fragment
     // sampler descriptor undefined. The white dummy reads 1.0 from any UV,
     // which for a visibility RATIO is "nothing is shadowed" — and
-    // rtLocalShadowEnabled is 0 anyway, so it is never sampled.
+    // rtLocalShadowMode is 0 anyway, so it is never sampled.
     SDL_GPUTexture* white = dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr;
     SDL_GPUTexture* tex = frame_rt_local_shadow_texture_ ? frame_rt_local_shadow_texture_ : white;
     if (!tex || !default_sampler_ || !main_render_pass_) {
@@ -309,6 +329,23 @@ void SceneRenderer::bind_rt_local_shadow_mask(uint32_t slot) {
     }
     SDL_GPUTextureSamplerBinding binding = {tex, default_sampler_};
     SDL_BindGPUFragmentSamplers(main_render_pass_, slot, &binding, 1);
+}
+
+void SceneRenderer::bind_local_di(uint32_t first_slot) {
+    // Always bound, for the same reason every dummy in this file is always
+    // bound: the four scene shaders declare these two slots unconditionally and
+    // SDL3 GPU leaves an unbound descriptor undefined. Unlike the sampler
+    // dummies these are STORAGE textures, so the white 1x1 cannot stand in —
+    // it carries SAMPLER usage only — and `dummy_di_texture_` exists for
+    // exactly this. `rtLocalShadowMode < 2` is what stops them being read.
+    SDL_GPUTexture* stand_in = dummy_di_texture_ ? dummy_di_texture_->handle() : nullptr;
+    SDL_GPUTexture* diffuse = frame_rt_local_di_diffuse_ ? frame_rt_local_di_diffuse_ : stand_in;
+    SDL_GPUTexture* specular = frame_rt_local_di_specular_ ? frame_rt_local_di_specular_ : stand_in;
+    if (!diffuse || !specular || !main_render_pass_) {
+        return;
+    }
+    SDL_GPUTexture* textures[2] = {diffuse, specular};
+    SDL_BindGPUFragmentStorageTextures(main_render_pass_, first_slot, textures, 2);
 }
 
 void SceneRenderer::bind_screen_ao(uint32_t slot, bool enabled) {
@@ -463,7 +500,7 @@ gpu::ModelLightingUniforms SceneRenderer::make_model_lighting(const CameraState&
     // mask is at the traced pass's own resolution, so the sampler does the
     // magnification; screenAOTexel* only converts SV_Position to [0,1].
     u.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
-    u.rtLocalShadowEnabled = frame_rt_local_shadows_active_ ? 1.0f : 0.0f;
+    u.rtLocalShadowMode = local_rt_shadow_mode_value();
     u.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
     u.rtReflectionFadeStart = frame_rt_reflection_fade_start_;
     // Probe-field GI: the frame's ONE snapshot of the field (refresh_gi_bindings).
@@ -616,7 +653,7 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
     lighting_uniforms.screenAOTexelY = 1.0f / static_cast<float>(std::max(context_->height(), 1));
     lighting_uniforms.iblEnabled = frame_ibl_active_ ? 1.0f : 0.0f;
     lighting_uniforms.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
-    lighting_uniforms.rtLocalShadowEnabled = frame_rt_local_shadows_active_ ? 1.0f : 0.0f;
+    lighting_uniforms.rtLocalShadowMode = local_rt_shadow_mode_value();
     lighting_uniforms.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
     lighting_uniforms.rtReflectionFadeStart = frame_rt_reflection_fade_start_;
     for (std::size_t c = 0; c < frame_gi_.cascade_base.size(); ++c) {
@@ -665,6 +702,7 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
         bind_gi(11);
         bind_rt_local_shadow_mask(14);
         bind_local_shadow_atlas(15);
+        bind_local_di(0);
         lighting_pushed = false;
         bound_type = want;
         return true;
@@ -885,6 +923,7 @@ void SceneRenderer::render_transparent_models(const CameraState& camera) {
             bind_gi(11);
             bind_rt_local_shadow_mask(14);
             bind_local_shadow_atlas(15);
+            bind_local_di(0);
             if (skinned) {
                 SDL_GPUBuffer* palette_buf = current_bone_palette_buffer()->handle();
                 SDL_BindGPUVertexStorageBuffers(main_render_pass_, 0, &palette_buf, 1);

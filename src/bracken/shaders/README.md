@@ -152,16 +152,40 @@ counts: model/instanced 16, terrain 14, grass 12).
 slow one. DXC legalizes 17 — that is the measurement that retired the old
 belief in an 11-sampler limit — but DXC's ceiling and SDL's are different
 numbers and SDL's binds. `model`/`model_instanced` are AT it. Anything further
-these shaders need is a storage buffer: R4b's screen-probe SH is exactly that,
-a FIFTH fragment storage buffer at `CLUSTER_SSBO_BINDING_BASE + 4`, declared by
-`gi_screen_sample.hlsli`. Directly below it is
+these shaders need is a storage buffer or a STORAGE TEXTURE: R4b's screen-probe
+SH is the first, a FIFTH fragment storage buffer at
+`CLUSTER_SSBO_BINDING_BASE + 4` declared by `gi_screen_sample.hlsli`; R5c's
+Full-DI pair is the second.
+
+**R5c split `CLUSTER_SAMPLER_COUNT` out of `CLUSTER_SSBO_BINDING_BASE`, and the
+two are no longer the same number.** Fragment set 2 is laid out as sampled
+textures → STORAGE textures → storage buffers, so `local_di.hlsli`'s two
+read-only storage textures (`localDiDiffuseTexture` / `localDiSpecularTexture`,
+storage-texture slots 0 and 1, bound with `SDL_BindGPUFragmentStorageTextures`)
+sit in the gap and push the cluster buffers up by two. The local-shadow ATLAS
+follows the samplers (`CLUSTER_SAMPLER_COUNT - 1`) and the cluster buffers
+follow the buffers, which is why `cluster_lighting.hlsli` now takes both
+defines — with a fallback that keeps the old single-define spelling meaning
+what it always meant. The pair is declared WITHOUT a
+`[[vk::combinedImageSampler]]` partner on purpose: DXC only merges a
+`Texture2D` with its sampler where executed code pairs them, so an unpaired
+`Load()`-only texture reflects as a storage texture, which is exactly the slot
+class wanted. They are bound unconditionally — the 1×1 zero RGBA16F stand-in
+`SceneRenderer::dummy_di_texture_` when the tier is off, since the white sampler
+dummy carries SAMPLER usage only and cannot stand in for a storage texture —
+and `rtLocalShadowMode < 2` is what stops them being read.
+
+Directly below it is
 `rtLocalShadowTexture` (model/instanced 14, terrain 12, grass 10), the R8
 ray-traced LOCAL-light visibility RATIO — sampled with a NORMALIZED UV, bound
-to the 1×1 white dummy and read only when `rtLocalShadowEnabled`, and
+to the 1×1 white dummy and read only when `rtLocalShadowMode`, and
 multiplied into the whole point+spot subtotal by `accumulateClusterLights`
 (the Heitz ratio estimator, `LocalRtShadowMode::Ratio`). Note that the two are
 mutually exclusive by construction rather than by a branch: in Ratio mode the
 engine never assigns a `shadow_slot`, so the atlas taps above are already dead.
+At `rtLocalShadowMode == 2` (`::Full`, R5c) this sampler is not read either:
+`accumulateClusterLights` is not called at all and `localDiLighting` supplies
+the whole local-light term from the two storage textures instead.
 The THREE slots below THAT
 are the probe field's atlases (model/instanced 11–13, terrain 9–11, grass
 7–9): irradiance and visibility with a LINEAR clamp sampler, the per-probe
@@ -320,6 +344,21 @@ a second time against a second set of targets. Its two set-1 read-write storage
 buffers are the reservoir ping-pong, of which the second is only ever READ:
 SDL3 GPU allows a compute pipeline eight read-only storage buffers and the four
 acceleration-structure buffers plus four cluster buffers spend them exactly.
+
+Under `diMode >= 2` (`LocalRtShadowMode::Full`, R5c) the same shader — one
+shader, not a variant, because R5b's gradient sibling replays its sampling
+decisions and a second trace variant would need a second gradient variant —
+ALSO evaluates the winner's BRDF into two extra read-write storage textures:
+demodulated diffuse (no albedo) and demodulated specular (dielectric Fresnel),
+with the alpha lanes carrying the texel's view depth and the winning light's
+Schlick fraction. `shaders/local_di.hlsli` owns the layout and the
+multiply-back; `render/lighting/local_di.hpp` is the CPU source of truth and
+carries the derivation of both remodulation hooks. In Ratio mode those two
+slots take 1×1 stand-ins and the uniform branch leaves them unwritten. The
+pair is denoised by `rt_di_denoise_temporal.comp` + `rt_di_denoise_spatial.comp`
+— a RADIANCE denoiser, the reflection temporal pass's shape rather than the
+visibility chain's, because a radiance estimate has no packed bits, no tile
+classification and no Bernoulli second moment to share.
 
 `rt_shadow_gradient.comp` and `rt_local_shadow_gradient.comp` (R5b) are the
 **A-SVGF temporal gradient** for the two visibility signals — the only thing in

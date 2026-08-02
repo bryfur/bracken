@@ -187,6 +187,14 @@ enum class ComputePipelineType {
     /// above, dispatched a second time against a second set of targets — there
     /// is no RtLocalShadowClassify/Temporal/Filter, and that is the design.
     RtLocalShadow,
+    /// The Full-DI tier's denoiser (R5c, §5.3): temporal sigma-clamped EMA over
+    /// the two demodulated radiance targets, then one accumulation-driven
+    /// edge-aware spatial gather. Two pipelines rather than a reuse of
+    /// RtReflectionTemporal, for the two reasons written down at the top of
+    /// rt_di_denoise_temporal.comp.hlsl — the alpha lane carries data here, and
+    /// the two targets share one reprojection.
+    RtDiTemporal,
+    RtDiSpatial,
 
     // Probe-field GI (render/gi/, docs/rt_lighting_plan.md §5.2). All four run
     // inside one GIProbes timer scope, in this order, once per cascade whose

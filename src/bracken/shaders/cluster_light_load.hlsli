@@ -147,6 +147,61 @@ ClusterLightSample clusterLightGeometry(uint packed_index) {
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// The full shading terms of ONE light (R5c, docs/rt_lighting_plan.md §5.3).
+//
+// The Full-DI tier's trace has to evaluate the winning light's actual BRDF, not
+// just its target function, and it must use the SAME attenuation and cone the
+// forward accumulator does or the tier stops being an estimate of the thing the
+// Ratio tier estimates. So the terms live here, next to the decode and the
+// target function, for the third time and the same reason: one copy of the
+// arithmetic, shared verbatim by the fragment path and the compute path.
+//
+// `radiance` is everything up to but NOT including N.L and the BRDF —
+// `color * intensity * pointFalloff * spotCone`, which is exactly the
+// `lightColor * attenuation * cone` evaluatePBRSpot passes down.
+// ---------------------------------------------------------------------------
+struct ClusterLightShading {
+    float3 L;         ///< unit surface -> light
+    float3 radiance;  ///< color * intensity * attenuation * cone
+    float dist;
+    bool valid;       ///< false when the surface is outside the range or the cone
+};
+
+ClusterLightShading clusterLightShading(uint packed_index, float3 P) {
+    ClusterLightShading s;
+    s.L = float3(0, 1, 0);
+    s.radiance = float3(0, 0, 0);
+    s.dist = 0.0;
+    s.valid = false;
+
+    LightHeader h = loadLightHeader(packed_index);
+    if (h.type == 0u) {
+        PointLightGPU pl = loadPointLight(h.payload_index);
+        float3 to_light = pl.position - P;
+        float dist = length(to_light);
+        if (dist > pl.radius) return s;
+        s.L = to_light / max(dist, 1e-4);
+        s.dist = dist;
+        s.radiance = pl.color * pl.intensity * pointFalloff(dist, pl.radius);
+        s.valid = true;
+        return s;
+    }
+
+    SpotLightGPU sl = loadSpotLight(h.payload_index);
+    float3 to_light = sl.position - P;
+    float dist = length(to_light);
+    if (dist > sl.radius) return s;
+    float3 L = to_light / max(dist, 1e-4);
+    float cone = spotConeFactor(L, sl.direction, sl.inner_cos, sl.outer_cos);
+    if (cone <= 0.0) return s;
+    s.L = L;
+    s.dist = dist;
+    s.radiance = sl.color * sl.intensity * (pointFalloff(dist, sl.radius) * cone);
+    s.valid = true;
+    return s;
+}
+
 /// p̂ of whichever light `packed_index` names, dispatched on the header type.
 float clusterLightTarget(uint packed_index, float3 P, float3 N) {
     LightHeader h = loadLightHeader(packed_index);

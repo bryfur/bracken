@@ -84,7 +84,7 @@ struct alignas(16) TerrainLightingUniforms {
     /// offset 136 — 1 = multiply the local (point/spot) subtotal by the traced
     /// local-shadow mask. Rides in what used to be the first `_padIbl` lane, so
     /// the cbuffer neither grew nor moved a field.
-    float rtLocalShadowEnabled = 0.0f;
+    float rtLocalShadowMode = 0.0f;
     float _padIbl = 0.0f;
     /// Probe-field GI (render/gi/), R1c — see
     /// gpu::ModelLightingUniforms::giCascadeBase for the full contract.
@@ -112,7 +112,7 @@ static_assert(offsetof(TerrainLightingUniforms, sunColor) == 96);
 static_assert(offsetof(TerrainLightingUniforms, splat_params) == 112);
 static_assert(offsetof(TerrainLightingUniforms, iblEnabled) == 128);
 static_assert(offsetof(TerrainLightingUniforms, rtShadowEnabled) == 132);
-static_assert(offsetof(TerrainLightingUniforms, rtLocalShadowEnabled) == 136);
+static_assert(offsetof(TerrainLightingUniforms, rtLocalShadowMode) == 136);
 static_assert(offsetof(TerrainLightingUniforms, giCascadeBase) == 144);
 static_assert(offsetof(TerrainLightingUniforms, giEnabled) == 192);
 
@@ -231,6 +231,23 @@ public:
                               const void* params, size_t params_size, SDL_GPUBuffer* local_shadow_slots = nullptr);
 
     /**
+     * The Full-DI tier's two demodulated local-light targets (R5c,
+     * docs/rt_lighting_plan.md §5.3), bound as fragment READ-ONLY STORAGE
+     * textures — never samplers, because this shader has no spare sampler slot.
+     *
+     * `active` is what turns the shader's `rtLocalShadowMode` to 2, i.e. what
+     * makes it DROP the analytic point/spot loop and read these instead. The
+     * two textures must be non-null in either case: an unbound storage-texture
+     * descriptor is undefined, so the caller passes its 1x1 stand-in when the
+     * tier is off. Borrowed for one frame and never retained.
+     */
+    void set_local_di(SDL_GPUTexture* diffuse, SDL_GPUTexture* specular, bool active) {
+        local_di_diffuse_ = diffuse;
+        local_di_specular_ = specular;
+        local_di_active_ = active;
+    }
+
+    /**
      * Render terrain into a shadow depth map.
      */
     void render_shadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& light_view_projection,
@@ -346,6 +363,10 @@ private:
     SDL_GPUBuffer* cluster_offsets_ = nullptr;
     SDL_GPUBuffer* cluster_indices_ = nullptr;
     SDL_GPUBuffer* cluster_local_shadow_slots_ = nullptr;
+    /// R5c's Full-DI pair + its flag. Borrowed, per frame; see set_local_di.
+    SDL_GPUTexture* local_di_diffuse_ = nullptr;
+    SDL_GPUTexture* local_di_specular_ = nullptr;
+    bool local_di_active_ = false;
     const void* cluster_params_ = nullptr;
     size_t cluster_params_size_ = 0;
 

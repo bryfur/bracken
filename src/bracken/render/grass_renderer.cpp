@@ -387,8 +387,13 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
     fu.ibl_enabled = (ibl_enabled && ibl_bindings) ? 1.0f : 0.0f;
     fu.rt_shadow_enabled =
         (rt_shadows_enabled && rt_shadow_binding) ? 1.0f : 0.0f;
-    fu.rt_local_shadow_enabled =
-        (rt_local_shadows_enabled && rt_local_shadow_binding) ? 1.0f : 0.0f;
+    // 2 = Full-DI (R5c: the analytic point/spot loop does not run and the two
+    // demodulated storage textures supply the local lighting), 1 = Ratio,
+    // 0 = the rasterized atlas. Gated on the bindings actually being there for
+    // the same reason ibl_enabled is.
+    fu.rt_local_shadow_mode =
+        (local_di_active_ && local_di_diffuse_ && local_di_specular_) ? 2.0f
+        : ((rt_local_shadows_enabled && rt_local_shadow_binding) ? 1.0f : 0.0f);
     // Probe-field GI (R1c): the caller's one snapshot of the field. Gated on
     // the bindings actually being there for the same reason ibl_enabled is —
     // a flag without its textures samples an undefined descriptor.
@@ -471,6 +476,15 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
                                   screen_sh};
         SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 5);
         SDL_PushGPUFragmentUniformData(cmd, 2, cluster_params_, static_cast<Uint32>(cluster_params_size_));
+    }
+
+    // R5c: the Full-DI pair, as READ-ONLY STORAGE textures. Bound
+    // unconditionally — an unbound storage-texture descriptor is undefined, so
+    // the caller hands over its 1x1 stand-in when the tier is off and
+    // `rt_local_shadow_mode < 2` is what stops the shader reading it.
+    if (local_di_diffuse_ != nullptr && local_di_specular_ != nullptr) {
+        SDL_GPUTexture* di[2] = {local_di_diffuse_, local_di_specular_};
+        SDL_BindGPUFragmentStorageTextures(pass, 0, di, 2);
     }
 
     // Blade mesh.

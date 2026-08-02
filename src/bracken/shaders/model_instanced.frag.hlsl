@@ -60,10 +60,12 @@ cbuffer LightingUniforms {
     // Roughness at which the traced contribution starts fading out; it reaches
     // zero at rtReflectionMaxRoughness. See reflection_gate.hlsli.
     float rtReflectionFadeStart;
-    // 1 = multiply the LOCAL (point/spot) subtotal by the ray-traced
-    // local-shadow mask at sampler 14 (R2b Ratio tier). Was _rtPad2, so
-    // the cbuffer neither grew nor moved a field.
-    float rtLocalShadowEnabled;
+    // GraphicsSettings::rt_local_shadows as a float (a cbuffer has no enums):
+    // 0 = Off, 1 = Ratio (multiply the LOCAL subtotal by the traced mask),
+    // 2 = Full-DI (R5c: do not run the analytic local loop at all and read the
+    // two demodulated DI storage textures instead). Was _rtPad2, so the cbuffer
+    // neither grew nor moved a field.
+    float rtLocalShadowMode;
     // Probe-field GI (render/gi/), R1c. giCascadeBase is
     // `render::gi::cascade_base()` of the position ProbeVolume was scrolled
     // with — passed rather than re-derived from cameraPos so a shader and the
@@ -193,7 +195,7 @@ SamplerState giProbeMetaSampler;
 // Ray-traced LOCAL (point/spot) shadow ratio (R8, 1 = lit), at the local pass's
 // own traced resolution — so, like rtShadowTexture, ALWAYS sample it with a
 // normalized UV. Bound to the 1x1 white dummy and read only when
-// rtLocalShadowEnabled, which is the same no-op the sun mask uses.
+// rtLocalShadowMode, which is the same no-op the sun mask uses.
 [[vk::combinedImageSampler]][[vk::binding(14, 2)]]
 Texture2D<float> rtLocalShadowTexture;
 [[vk::combinedImageSampler]][[vk::binding(14, 2)]]
@@ -210,7 +212,17 @@ SamplerState rtLocalShadowSampler;
 // 0-14 above + the local-shadow ATLAS at 15, declared by the include). R4b's
 // screen-probe SH buffer is a FIFTH storage buffer at base + 4, declared by
 // gi_screen_sample.hlsli.
-#define CLUSTER_SSBO_BINDING_BASE 16
+// R5c: the Full-DI tier's two demodulated targets are READ-ONLY STORAGE
+// TEXTURES, which SDL3 GPU places between the sampled textures and the storage
+// buffers in fragment set 2. So the sampler count and the SSBO base are no
+// longer the same number, and both are declared: the local-shadow atlas
+// cluster_lighting.hlsli owns follows CLUSTER_SAMPLER_COUNT, the cluster
+// buffers follow CLUSTER_SSBO_BINDING_BASE. local_di.hlsli explains why the DI
+// pair cannot be samplers here.
+#define CLUSTER_SAMPLER_COUNT 16
+#define LOCAL_DI_BINDING_BASE CLUSTER_SAMPLER_COUNT
+#define CLUSTER_SSBO_BINDING_BASE (CLUSTER_SAMPLER_COUNT + 2)
+#include "local_di.hlsli"
 #include "gi_sample.hlsli"
 #include "cluster_lighting.hlsli"
 #include "gi_screen_sample.hlsli"
@@ -346,15 +358,24 @@ float4 PSMain(PSInput input) : SV_Target {
 
     if (clusterParams.gridDim.w > 0u) {
         float2 screen_uv = input.position.xy * clusterParams.screenSize.zw;
-        // Ratio tier: one traced visibility multiplies the whole local
-        // subtotal. -1 is "no traced mask", which skips the multiply outright.
-        float localVis = -1.0;
-        if (rtLocalShadowEnabled > 0.5) {
-            localVis = rtLocalShadowTexture.SampleLevel(rtLocalShadowSampler, screen_uv, 0).r;
+        // Which tier owns the local lights this frame (rtLocalShadowMode):
+        //   2 = Full-DI  — they are ALL traced and this loop does not run.
+        //   1 = Ratio    — the analytic loop runs and one traced visibility
+        //                  multiplies its whole point+spot subtotal.
+        //   0 = Off      — the rasterized atlas, untouched.
+        // -1 as the localVis argument is "no traced mask", which skips the
+        // multiply outright rather than multiplying by 1.0.
+        if (rtLocalShadowMode > 1.5) {
+            result += localDiLighting(screen_uv, input.viewDepth, baseColor.rgb, metallic);
+        } else {
+            float localVis = -1.0;
+            if (rtLocalShadowMode > 0.5) {
+                localVis = rtLocalShadowTexture.SampleLevel(rtLocalShadowSampler, screen_uv, 0).r;
+            }
+            result += accumulateClusterLights(input.fragPos, N, V,
+                                              baseColor.rgb, metallic, roughness, 1.0,
+                                              input.viewDepth, screen_uv, localVis);
         }
-        result += accumulateClusterLights(input.fragPos, N, V,
-                                          baseColor.rgb, metallic, roughness, 1.0,
-                                          input.viewDepth, screen_uv, localVis);
     }
 
     float3 emissive = emissiveFactor;

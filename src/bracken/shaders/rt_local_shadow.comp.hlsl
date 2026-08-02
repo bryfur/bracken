@@ -42,8 +42,42 @@
 // visibility bit — p̂(y) x W is the estimate of the candidate sum, which is
 // also the denominator, so the two cancel — which is why the analytic lighting
 // stays sharp and only the SHADOWING is stochastic.
+//
+// ---------------------------------------------------------------------------
+// THE FULL-DI TIER (R5c, docs/rt_lighting_plan.md §5.3), `diMode != 0`
+// ---------------------------------------------------------------------------
+//
+// Same reservoir, same ray, same everything above. What changes is what is done
+// with the winner: instead of writing only its visibility BIT and letting the
+// forward loop supply the lighting, the pass evaluates the winner's own BRDF
+// and writes two DEMODULATED radiance estimates, and the forward loop then does
+// not run at all for point and spot lights.
+//
+// `estimate = f(y) * W` is the ReSTIR estimator of the WHOLE candidate sum, not
+// of one light — which is the same fact the ratio tier leans on, spent
+// differently. Ratio keeps p̂(y)*W in the denominator so the two cancel and only
+// V survives; Full keeps W and carries the radiance, which is what makes it
+// correct for coloured lights and for specular highlights the aggregate ratio
+// can only flatten. See render/lighting/local_di.hpp for the split itself.
+//
+// ONE SHADER, NOT A VARIANT, and the reason is the sibling: R5b's
+// rt_local_shadow_gradient.comp.hlsl replays this pass's sampling decisions
+// exactly, and a second trace variant would have to be mirrored by a second
+// gradient variant to stay a replay of the thing that ran. The DI block is a
+// uniform-branch tail on a shader whose cost is dominated by a BVH walk — it
+// adds no traversal, no memory traffic on the Ratio path (the two extra
+// storage-texture slots take 1x1 stand-ins there), and its register pressure is
+// paid only where the branch is taken.
 
 #include "rt_sampling.hlsli"
+
+// For the BRDF halves the DI block evaluates: ndfGGX, visibilitySmithGGX and
+// diffuseBurley. PBR_NO_DERIVATIVES drops specularAARoughness, the one function
+// in that header that calls ddx/ddy and therefore cannot exist in a compute
+// module.
+#define PBR_NO_DERIVATIVES
+#include "pbr.hlsli"
+#include "local_di.hlsli"
 
 #define RT_TRACE_TYPES
 #include "rt_trace.hlsli"
@@ -67,7 +101,15 @@ cbuffer RtLocalShadowUniforms : register(b0, space2) {
     uint hasGBuffer;         // 0 = reconstruct the normal from depth taps
     uint historyValid;       // 0 on the first frame, after a resize, after a gap
     uint candidateCount;     // M, before the froxel-length clamp
-    uint _pad0;
+    /// LocalRtShadowMode: 0/1 = Ratio (bits only), 2 = Full (bits + the two
+    /// demodulated DI targets). Ratio binds 1x1 stand-ins for those targets and
+    /// this branch is what keeps them unwritten.
+    uint diMode;
+    /// The eye, for the specular half's view vector. The Ratio tier never
+    /// needed it — a visibility bit has no view dependence — which is why it
+    /// arrives with R5c rather than having been there all along.
+    float3 cameraPosition;
+    float _pad0;
 };
 
 // NOTE THE ABSENCE of the depthA/depthB pair every other depth-reading pass
@@ -136,14 +178,28 @@ struct RtReservoir {
 
 /// One bit of local-light visibility per pixel, 8x4 pixels per uint. 1 = lit.
 [[vk::binding(0, 1)]] RWTexture2D<uint> localShadowBits : register(u0, space1);
-[[vk::binding(1, 1)]] RWStructuredBuffer<RtReservoir> reservoirOut : register(u1, space1);
+/// The Full-DI tier's two outputs (R5c), at this pass's traced resolution.
+/// RGB is demodulated radiance — the material factors this pass does not know
+/// divided out — and the alpha lanes carry what the reconstruction downstream
+/// cannot recover: the texel's linear view depth, and the Schlick fraction that
+/// lets the forward shader rebuild a metal's Fresnel exactly. local_di.hlsli
+/// owns the layout and the derivation.
+///
+/// In Ratio mode these are 1x1 stand-ins and nothing writes them. A storage
+/// image with no explicit format may only be written, never read, which is all
+/// this pass does with them.
+[[vk::image_format("rgba16f")]]
+[[vk::binding(1, 1)]] RWTexture2D<float4> diDiffuseOut : register(u1, space1);
+[[vk::image_format("rgba16f")]]
+[[vk::binding(2, 1)]] RWTexture2D<float4> diSpecularOut : register(u2, space1);
+[[vk::binding(3, 1)]] RWStructuredBuffer<RtReservoir> reservoirOut : register(u3, space1);
 /// LAST FRAME'S reservoirs — READ ONLY, despite the read-write declaration.
 /// The eight read-only storage-buffer slots SDL3 allows a compute pipeline are
 /// exactly spent above (four acceleration buffers + four cluster buffers), so
 /// this one lives in set 1 instead. Nothing writes it; the ping-pong swaps the
 /// two bindings every frame, both with cycle = false so the contents survive
 /// into the frame that reads them.
-[[vk::binding(2, 1)]] RWStructuredBuffer<RtReservoir> prevReservoirs : register(u2, space1);
+[[vk::binding(4, 1)]] RWStructuredBuffer<RtReservoir> prevReservoirs : register(u4, space1);
 
 // The buffers and `tlasNodeCount` above are what the walks bind to.
 #define RT_TRACE_TRAVERSAL
@@ -203,6 +259,12 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
     outRes.sampleCount = 0.0;
     outRes.depth = 0.0;
 
+    // Full-DI accumulators. Alpha stays 0 for anything the pass cannot answer
+    // for — sky, and out-of-bounds lanes — which is the validity gate the DI
+    // denoiser and the forward reconstruction both read.
+    float4 diDiffuse = float4(0.0, 0.0, 0.0, 0.0);
+    float4 diSpecular = float4(0.0, 0.0, 0.0, 0.0);
+
     if (inBounds) {
         uint2 depthSize;
         sceneDepth.GetDimensions(depthSize.x, depthSize.y);
@@ -214,9 +276,14 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
         // binned lights every buffer below holds LAST frame's contents, which
         // is why clusterTotalLights() is checked before any of them is read.
         if (depth > 0.0 && clusterTotalLights() > 0u) {
+            // The G-buffer's whole texel: RG = octahedral world normal,
+            // B = roughness, A = metallic. Ratio only ever needed the normal;
+            // the DI block needs the material half too, and it is the same
+            // fetch.
+            const float4 gbuf = sceneNormal.Load(int3(depthCoord, 0));
             float3 normal;
             if (hasGBuffer != 0u) {
-                normal = octDecode(sceneNormal.Load(int3(depthCoord, 0)).xy);
+                normal = octDecode(gbuf.xy);
             } else {
                 normal = reconstructNormal(depthCoord, depthSize);
             }
@@ -230,6 +297,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
             // view matrix (render/lighting/cluster_index.hpp's contract). A
             // right-handed view matrix looks down -z, hence the negation.
             const float viewDepth = -mul(clusterParams.view, float4(worldPos, 1.0)).z;
+
+            // The DI validity gate, set for every SHADED pixel and not only for
+            // pixels a light reached: a froxel that has just emptied must
+            // report "geometry here, no local light" (rgb 0, alpha > 0) so the
+            // denoiser accumulates toward black, where "no answer" (alpha 0)
+            // would freeze the previous frame's lighting in place.
+            diDiffuse.a = viewDepth;
 
             const uint froxel = clusterFroxelIndex(uv, viewDepth);
             const uint listCount = clusterFroxelLightCount(froxel);
@@ -362,12 +436,62 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                         }
                     }
                 }
+
+                // ---- 6. the Full-DI tier's demodulated estimate -------------
+                //
+                // Deliberately AFTER the ray and outside its N.L early-out: the
+                // BRDF is evaluated once, here, from the winner and the bit the
+                // ray produced, so the two tiers cannot disagree about which
+                // light was picked or whether it was visible.
+                if (diMode >= 2u && y != RT_RESERVOIR_NO_LIGHT) {
+                    const ClusterLightShading sh = clusterLightShading(y, worldPos);
+                    const float ndotl = max(dot(normal, sh.L), 0.0);
+                    if (sh.valid && ndotl > 0.0) {
+                        const float3 Vdir = normalize(cameraPosition - worldPos);
+                        const float NdotV = max(dot(normal, Vdir), 1e-4);
+                        const float3 hsum = Vdir + sh.L;
+                        const float3 H = hsum / max(length(hsum), 1e-5);
+                        const float NdotH = max(dot(normal, H), 0.0);
+                        const float LdotH = max(dot(sh.L, H), 0.0);
+
+                        // The G-buffer's material half. It is the same
+                        // roughness the forward pass shades with — the prepass
+                        // writes the MR-modulated, specular-AA-widened value —
+                        // which is what makes the split reconstructable there.
+                        const float roughness = saturate(gbuf.z);
+                        const float metallic = saturate(gbuf.w);
+
+                        const float schlick = localDiSchlickFraction(LdotH);
+                        const float Fd = localDiDielectricFresnel(schlick);
+                        const float D = ndfGGX(NdotH, roughness);
+                        const float Vis = visibilitySmithGGX(NdotV, ndotl, roughness);
+                        // diffuseBurley with a white albedo IS the (ls*vs/PI)
+                        // scalar the split calls for — called rather than
+                        // re-typed, so pbr.hlsli stays the one owner of the
+                        // curve the forward pass will multiply an albedo into.
+                        const float burley =
+                            diffuseBurley(float3(1.0, 1.0, 1.0), roughness, NdotV, ndotl, LdotH).x;
+
+                        // E = the ReSTIR estimate of the WHOLE point+spot sum:
+                        // the winner's incident radiance, its N.L, the traced
+                        // visibility bit, and the reservoir's unbiasing weight.
+                        const float3 E = sh.radiance * (ndotl * (lit ? 1.0 : 0.0) * outRes.weight);
+
+                        diDiffuse.rgb = ((1.0 - Fd) * (1.0 - metallic) * burley) * E;
+                        diSpecular.rgb = (D * Vis * Fd) * E;
+                        diSpecular.a = schlick;
+                    }
+                }
             }
         }
     }
 
     if (inBounds) {
         reservoirOut[uint(coord.y) * outputSize.x + uint(coord.x)] = outRes;
+        if (diMode >= 2u) {
+            diDiffuseOut[coord] = diDiffuse;
+            diSpecularOut[coord] = diSpecular;
+        }
     }
 
     if (lit) {

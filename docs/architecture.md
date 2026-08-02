@@ -581,8 +581,8 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    (settings modes are `enum class`es in `graphics_settings.hpp`; the on-disk
    settings format stays numeric).
 5. **`LocalShadowPass`** (only when `local_shadows` is on, the scene has
-   dynamic lights, **and `rt_local_shadows` is `Off`** — the traced Ratio tier
-   retires this pass wholesale, see "Ray tracing") — re-renders this frame's
+   dynamic lights, **and `rt_local_shadows` is `Off`** — either traced tier
+   (`Ratio` or `Full`) retires this pass wholesale, see "Ray tracing") — re-renders this frame's
    dirty local-shadow tiles into
    the 8×8-tile D32 atlas (`render::lighting::LocalShadowMap`; independent of
    the CSM toggle). Point lights own 6 consecutive face tiles (~90° FOV,
@@ -1119,7 +1119,7 @@ has *no* sun shadow rather than falling back to cascades, and beyond
 `RtShadowSettings::max_distance` the cascades take over.
 
 **Local-light shadows** (`shaders/rt_local_shadow.comp.hlsl`,
-`LocalRtShadowMode::Ratio`, R2b — off by default). One shadow ray per pixel
+`LocalRtShadowMode::Ratio` R2b / `::Full` R5c — off by default). One shadow ray per pixel
 makes *every* point and spot light cast a soft shadow, which is possible only
 because the ray is aimed by a **reservoir** rather than by a loop over lights.
 Per pixel:
@@ -1159,13 +1159,53 @@ deliberately *not* stored — the only consumer of a stored reservoir is next
 frame's merge, which must re-evaluate it at the current surface anyway — and
 the freed lane carries the depth the merge cannot reconstruct.
 
-The fold-back is the **Heitz ratio estimator**: the forward pass multiplies its
-whole point+spot subtotal by the denoised mask, so the analytic sum stays sharp
-and only the shadowing is stochastic. With one reservoir sample the ratio
-collapses to the selected light's visibility bit, because p̂(y)·W estimates the
-candidate sum that is also the denominator.
+**The fold-back is where the two traced tiers differ, and it is the ONLY place
+they differ** — same reservoir, same ray, same shader.
 
-**Atlas coexistence.** In `Ratio` mode `SceneRenderer` skips the local-shadow
+`Ratio` is the **Heitz ratio estimator**: the forward pass multiplies its whole
+point+spot subtotal by the denoised mask, so the analytic sum stays sharp and
+only the shadowing is stochastic. With one reservoir sample the ratio collapses
+to the selected light's visibility bit, because p̂(y)·W estimates the candidate
+sum that is also the denominator.
+
+`Full` (R5c) instead keeps the W and carries the radiance. Under `diMode >= 2`
+the trace also evaluates the winner's own BRDF and writes two **demodulated**
+RGBA16F targets at the traced resolution, and the four scene shaders stop
+calling `accumulateClusterLights` at all:
+
+| | rgb | alpha |
+|---|---|---|
+| diffuse | `(1 − F_d)(1 − metallic)(ls·vs/π) · E` — no albedo | linear view depth (written by the spatial pass) |
+| specular | `D · Vis · F_d · E` — dielectric Fresnel | the Schlick fraction `(1 − LdotH)⁵` of the winning light |
+
+where `E = lightColor · atten · cone · N·L · V · W` and `F_d` is Schlick against
+F0 = 0.04, because the G-buffer carries roughness and metallic but not albedo.
+The forward pass multiplies the material back in
+(`shaders/local_di.hlsli`, CPU source of truth `render/lighting/local_di.hpp`),
+and **both Fresnel corrections are exact rather than approximate**: the diffuse
+one needs only the albedo (Schlick's `(1 − f)` cancels out of the ratio), and
+the specular one reads the alpha lane. `local_di.test.cpp` pins the round trip
+against a longhand `evaluatePBR` to relative 1e-5 across seven materials —
+the test that keeps the two tiers estimating the same integral.
+
+The reconstruction is a **manual depth-aware 4-tap** in the forward shader
+(`localDiSample`), not a hardware bilinear and not a fused upsample in the
+denoiser: the targets are read as fragment STORAGE textures, where no hardware
+filter exists, and upsampling in compute would mean two full-resolution RGBA16F
+targets to save a gather that has to happen anyway.
+
+**The named cost of `Full`**: local lighting is evaluated on the prepass
+G-buffer's **geometric** normal, at the traced resolution, and spatially
+filtered with a normal weight computed from that same geometric normal — so
+normal-map relief is absent from local-light shading. Under a flashlight at
+night the cobbles keep their albedo and lose their bump lighting where `Ratio`
+keeps both. It is inherent to a two-target demodulation (there is no light
+DIRECTION for the forward pass to re-apply a cosine with) and the fix — a third
+directional target — is R6's in `docs/rt_lighting_plan.md` §5.7. `Ratio`
+remains the default recommendation; `Full` is the answer when local lights are
+coloured and disagree, where the aggregate ratio's error is structural.
+
+**Atlas coexistence.** In `Ratio` and `Full` modes alike `SceneRenderer` skips the local-shadow
 selector and the tile renders entirely, so no `shadow_slot` is ever assigned and
 the atlas branch in `cluster_lighting.hlsli` is naturally dead through its
 existing `shadow_slot < 0` path — the two cannot double-darken a pixel. The
@@ -1173,6 +1213,24 @@ decision is made on the *setting*, before the frame knows whether the trace will
 succeed: a frame that asks for traced local shadows and cannot have them shows
 unshadowed local lights, which is visible and recoverable, where deciding later
 would mean paying for both. `Off` is the atlas path byte for byte.
+
+**A second denoiser for the radiance signal, and the reuse argument went the
+other way.** The visibility chain below is shared by both visibility signals
+verbatim; the `Full` tier's two radiance targets share none of it — no bit
+packing, no tile classification, no Bernoulli second moment — and go instead
+through `RtDiTemporal` + `RtDiSpatial` against
+`RtRenderer::RadianceDenoiser` (raw pair → ping-ponged history pair → filtered
+pair, six RGBA16F targets). The temporal pass is the REFLECTION denoiser's
+shape instantiated for a second signal (σ-clamped EMA against the 3×3
+neighbourhood, R5b's exposure-aware σ floor and firefly ceiling, R5b's LOCAL
+gradient as the reset driver) minus virtual-hit-point reprojection, which is a
+reflection property. It is not literally `RtReflectionTemporal` because that
+pass owns alpha as its sample count and this signal needs alpha for data, and
+because diffuse and specular reproject together. The spatial pass is one
+edge-aware gather whose radius is driven by the accumulation count
+(`render::lighting::di_filter_radius`, floor 1 traced texel — a 1-spp radiance
+estimate keeps a residual forever where a binary signal's tile classifier can
+certify convergence).
 
 **One denoiser, two signals.** The sun mask and the local mask go through the
 *same* three pipelines (`RtShadowClassify` / `RtShadowTemporal` /
@@ -2937,8 +2995,8 @@ debugging "why is this value zero / where did my draw go":
   occludes the light entirely (the shadow map renders from inside it). A
   light whose tiles haven't all rendered yet (fresh assignment over the cap)
   falls back to **unshadowed**, never to garbage. Every limitation in this
-  bullet is a property of the ATLAS: `LocalRtShadowMode::Ratio` retires the
-  atlas entirely and has none of them (no budget, no tile cap, no staleness,
+  bullet is a property of the ATLAS: `LocalRtShadowMode::Ratio` and `::Full`
+  retire the atlas entirely and have none of them (no budget, no tile cap, no staleness,
   and terrain and grass occlude like anything else in the BVH) at the cost of
   one traced ray per pixel and a stochastic signal.
 - **`render_graph/` is not in the frame path** — `SceneRenderer` issues passes

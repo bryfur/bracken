@@ -121,7 +121,7 @@ struct alignas(16) GrassLightingUniforms {
     /// offset 120 — 1 = multiply the local (point/spot) subtotal by the traced
     /// local-shadow mask. Rides in what used to be the first `_pad_ibl` lane,
     /// so the cbuffer neither grew nor moved a field.
-    float rt_local_shadow_enabled = 0.0f;
+    float rt_local_shadow_mode = 0.0f;
     float _pad_ibl = 0.0f;
     /// Probe-field GI (render/gi/), R1c — see
     /// gpu::ModelLightingUniforms::giCascadeBase for the full contract.
@@ -151,7 +151,7 @@ static_assert(offsetof(GrassLightingUniforms, ambient_sky) == 80);
 static_assert(offsetof(GrassLightingUniforms, ambient_ground) == 96);
 static_assert(offsetof(GrassLightingUniforms, ibl_enabled) == 112);
 static_assert(offsetof(GrassLightingUniforms, rt_shadow_enabled) == 116);
-static_assert(offsetof(GrassLightingUniforms, rt_local_shadow_enabled) == 120);
+static_assert(offsetof(GrassLightingUniforms, rt_local_shadow_mode) == 120);
 
 /**
  * Axis-aligned world-space XZ rectangle excluded from grass placement
@@ -277,6 +277,23 @@ public:
         cluster_params_ = params;
         cluster_params_size_ = params_size;
         cluster_local_shadow_slots_ = local_shadow_slots;
+    }
+
+    /**
+     * The Full-DI tier's two demodulated local-light targets (R5c,
+     * docs/rt_lighting_plan.md §5.3), bound as fragment READ-ONLY STORAGE
+     * textures — never samplers, because this shader has no spare sampler slot.
+     *
+     * `active` is what turns the shader's `rtLocalShadowMode` to 2, i.e. what
+     * makes it DROP the analytic point/spot loop and read these instead. The
+     * two textures must be non-null in either case: an unbound storage-texture
+     * descriptor is undefined, so the caller passes its 1x1 stand-in when the
+     * tier is off. Borrowed for one frame and never retained.
+     */
+    void set_local_di(SDL_GPUTexture* diffuse, SDL_GPUTexture* specular, bool active) {
+        local_di_diffuse_ = diffuse;
+        local_di_specular_ = specular;
+        local_di_active_ = active;
     }
 
     // Wind parameters (host-facing). Direction is a world-XZ vector,
@@ -409,6 +426,10 @@ private:
     SDL_GPUBuffer* cluster_offsets_ = nullptr;
     SDL_GPUBuffer* cluster_indices_ = nullptr;
     SDL_GPUBuffer* cluster_local_shadow_slots_ = nullptr;
+    /// R5c's Full-DI pair + its flag. Borrowed, per frame; see set_local_di.
+    SDL_GPUTexture* local_di_diffuse_ = nullptr;
+    SDL_GPUTexture* local_di_specular_ = nullptr;
+    bool local_di_active_ = false;
     const void* cluster_params_ = nullptr;
     size_t cluster_params_size_ = 0;
 };

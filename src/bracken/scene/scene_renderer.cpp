@@ -309,6 +309,31 @@ void SceneRenderer::init_pipelines() {
             gpu::GPUTexture::create_2d(context_->device(), 1, 1, gpu::TextureFormat::RGBA8, &white_pixel);
     }
 
+    // 1x1 zero RGBA16F for the Full-DI tier's two READ-ONLY STORAGE texture
+    // slots when that tier is off (R5c). Storage-read usage, not SAMPLER: the
+    // four scene shaders Load() these rather than sampling them, because they
+    // have no seventeenth sampler to spare (shaders/local_di.hlsli). Alpha 0 is
+    // the "no answer" localDiSample rejects, so even a shader that ignored
+    // rtLocalShadowMode would read no contribution rather than garbage.
+    {
+        const std::array<uint16_t, 4> zero{0, 0, 0, 0};
+        dummy_di_texture_ = gpu::GPUTexture::create_2d(
+            context_->device(), 1, 1, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+            SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ);
+        if (dummy_di_texture_) {
+            // One-shot upload on its own command buffer: init() has no frame
+            // command buffer to ride, and this is a 16-byte copy that happens
+            // once per process.
+            if (SDL_GPUCommandBuffer* upload_cmd =
+                    SDL_AcquireGPUCommandBuffer(context_->device().handle())) {
+                dummy_di_texture_->upload(upload_cmd, zero.data(), 1, 1);
+                SDL_SubmitGPUCommandBuffer(upload_cmd);
+            }
+        } else {
+            BRACKEN_LOG_WARN(LOG_TAG, "Failed to create the 1x1 local-DI stand-in texture");
+        }
+    }
+
     // 1x1 flat tangent-space normal: (0,0,1) packed as UNORM (128,128,255).
     // Bound on the normal-map slot when the material has no normal map, purely
     // to keep the binding valid for SDL3 GPU: the model shaders branch on
@@ -709,6 +734,9 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     frame_rt_shadow_texture_ = nullptr;
     frame_rt_local_shadows_active_ = false;
     frame_rt_local_shadow_texture_ = nullptr;
+    frame_rt_local_di_active_ = false;
+    frame_rt_local_di_diffuse_ = nullptr;
+    frame_rt_local_di_specular_ = nullptr;
     frame_rt_reflection_max_roughness_ = 0.0f;
     frame_rt_reflection_fade_start_ = 0.0f;
     // Sky IBL drives every scene shader's iblEnabled flag (the IBL sampler
@@ -1471,6 +1499,10 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
 
                 render::RtLocalShadowSettings ls;
                 ls.enabled = gfx.rt_local_shadows != LocalRtShadowMode::Off;
+                // Full needs exactly what Ratio needs — the acceleration
+                // structure and the prepass G-buffer — so there is no second
+                // ensure path here, only a second flag.
+                ls.full_di = gfx.rt_local_shadows == LocalRtShadowMode::Full;
                 ls.resolution = gfx.rt_local_shadow_resolution;
 
                 // The frame's binned light buffers. Handed over as one struct
@@ -1512,6 +1544,18 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     rt_renderer_->local_shadow_mask() != nullptr) {
                     frame_rt_local_shadow_texture_ = rt_renderer_->local_shadow_mask()->handle();
                     frame_rt_local_shadows_active_ = true;
+                }
+                // The Full-DI tier, only if BOTH targets came out of the
+                // denoiser. Half a pair would mean the forward shaders
+                // remodulate a diffuse estimate against a stale specular one,
+                // which is a wrong picture rather than a missing one — so this
+                // falls back to Ratio, whose mask is live either way.
+                if (rt_renderer_->stats().local_di_traced &&
+                    rt_renderer_->local_di_diffuse() != nullptr &&
+                    rt_renderer_->local_di_specular() != nullptr) {
+                    frame_rt_local_di_diffuse_ = rt_renderer_->local_di_diffuse()->handle();
+                    frame_rt_local_di_specular_ = rt_renderer_->local_di_specular()->handle();
+                    frame_rt_local_di_active_ = true;
                 }
                 if (rt_renderer_->stats().reflections_traced &&
                     rt_renderer_->reflection_target() != nullptr) {
