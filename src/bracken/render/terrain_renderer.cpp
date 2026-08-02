@@ -543,6 +543,13 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
         lighting_uniforms.giCascadeBase[1] = gi->cascade_base[1];
         lighting_uniforms.giCascadeBase[2] = gi->cascade_base[2];
         lighting_uniforms.giEnabled = gi->enabled;
+        // The R4b screen-probe tier, gated on its own texture for the same
+        // reason: a flag without its atlas samples an undefined descriptor.
+        if (gi->screen_sh != nullptr) {
+            lighting_uniforms.giScreenEnabled = gi->screen_enabled;
+            lighting_uniforms.giScreenProbesX = gi->screen_probes.x;
+            lighting_uniforms.giScreenProbesY = gi->screen_probes.y;
+        }
     }
 
     SDL_PushGPUFragmentUniformData(cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));
@@ -579,7 +586,8 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
 
     // Probe-field GI atlases at 9-11, the traced LOCAL-light visibility ratio
     // at 12, and the rasterized local-shadow ATLAS at 13 — which keeps its
-    // contract of sitting at this shader's LAST sampler slot.
+    // contract of sitting at this shader's LAST sampler slot. R4b's
+    // screen-probe SH rides the storage buffers below, not a sampler.
     if (gi != nullptr && gi->textures[0].texture != nullptr) {
         SDL_BindGPUFragmentSamplers(pass, 9, gi->textures.data(), 3);
     }
@@ -595,8 +603,14 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
         // when local shadows are unavailable (declared but never read while
         // every light's shadow_slot is -1).
         SDL_GPUBuffer* slots = cluster_local_shadow_slots_ ? cluster_local_shadow_slots_ : cluster_light_data_;
-        SDL_GPUBuffer* bufs[4] = {cluster_light_data_, cluster_offsets_, cluster_indices_, slots};
-        SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4);
+        // 5th SSBO = R4b's screen-probe SH (gi_screen_sample.hlsli). Same
+        // substitution rule as the 4th: the slot must hold a valid buffer, and
+        // giScreenEnabled == 0 is what stops it being read.
+        SDL_GPUBuffer* screen_sh =
+            (gi != nullptr && gi->screen_sh != nullptr) ? gi->screen_sh : cluster_light_data_;
+        SDL_GPUBuffer* bufs[5] = {cluster_light_data_, cluster_offsets_, cluster_indices_, slots,
+                                  screen_sh};
+        SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 5);
         SDL_PushGPUFragmentUniformData(cmd, 2, cluster_params_, static_cast<Uint32>(cluster_params_size_));
     }
 

@@ -90,9 +90,14 @@ struct alignas(16) TerrainLightingUniforms {
     /// gpu::ModelLightingUniforms::giCascadeBase for the full contract.
     glm::ivec4 giCascadeBase[3] = {}; // offset 144
     float giEnabled = 0.0f;           // offset 192
-    float _giPad0 = 0.0f;
-    float _giPad1 = 0.0f;
-    float _giPad2 = 0.0f;
+    /// Screen-probe gather (R4b, render/gi/screen_probes.hpp). These three were
+    /// the trailing GI pads, so the cbuffer neither grew nor moved a field.
+    /// `giScreenEnabled` gates every tap in `gi_screen_sample.hlsli`; 0 leaves the
+    /// pure probe-field ambient of R1c. The grid rides as floats because the
+    /// pads were floats, and the shader casts them back.
+    float giScreenEnabled = 0.0f;
+    float giScreenProbesX = 0.0f;
+    float giScreenProbesY = 0.0f;
 };
 
 // Layout pins against terrain.frag.hlsl LightingUniforms.

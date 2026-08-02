@@ -387,6 +387,18 @@ void SceneRenderer::refresh_gi_bindings() {
     // Only now: a volume that exists but has never been placed has no window to
     // address probes against, and every cascade would answer for the origin.
     frame_gi_.enabled = probe_volume_->cascade(0).placed() ? 1.0f : 0.0f;
+
+    // R4b's screen-probe tier rides on top. `stats().active` is the gather's own
+    // statement that it ran all six passes THIS frame — not that the object
+    // exists — so a frame that lost its prepass, its G-buffer or a pipeline
+    // leaves giScreenEnabled at 0 and the field answers alone.
+    if (screen_probes_ && screen_probes_->is_ready() && screen_probes_->stats().active &&
+        screen_probes_->sh_buffer() != nullptr) {
+        frame_gi_.screen_sh = screen_probes_->sh_buffer();
+        const glm::ivec2 grid = screen_probes_->grid();
+        frame_gi_.screen_probes = glm::vec2(static_cast<float>(grid.x), static_cast<float>(grid.y));
+        frame_gi_.screen_enabled = frame_gi_.enabled;
+    }
 }
 
 void SceneRenderer::bind_gi(uint32_t base_slot) {
@@ -460,6 +472,9 @@ gpu::ModelLightingUniforms SceneRenderer::make_model_lighting(const CameraState&
         u.giCascadeBase[c] = frame_gi_.cascade_base[c];
     }
     u.giEnabled = frame_gi_.enabled;
+    u.giScreenEnabled = frame_gi_.screen_enabled;
+    u.giScreenProbesX = frame_gi_.screen_probes.x;
+    u.giScreenProbesY = frame_gi_.screen_probes.y;
 
     return u;
 }
@@ -608,6 +623,9 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
         lighting_uniforms.giCascadeBase[c] = frame_gi_.cascade_base[c];
     }
     lighting_uniforms.giEnabled = frame_gi_.enabled;
+    lighting_uniforms.giScreenEnabled = frame_gi_.screen_enabled;
+    lighting_uniforms.giScreenProbesX = frame_gi_.screen_probes.x;
+    lighting_uniforms.giScreenProbesY = frame_gi_.screen_probes.y;
 
     SDL_GPUBuffer* storage_buf = instance_storage_buffer_->handle();
 

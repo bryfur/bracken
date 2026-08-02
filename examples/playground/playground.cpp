@@ -1992,6 +1992,24 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
                     gi.per_cascade[1].probes_updated, gi.per_cascade[2].probes_updated,
                     gi.probes_relocated, gi.probes_inside_geometry, gi.rays_total,
                     gi.probes_updated_total);
+                // R4b's screen-probe gather, APPENDED as its own line rather
+                // than folded into either above, for the same reason the hzb
+                // field is appended: a `PLAYGROUND_GI=probes` run must stay
+                // byte-identical line for line against the pre-R4b baseline.
+                //
+                // `hits` and `world` are the design's economic claim made
+                // measurable: most rays are expected to resolve on screen, and
+                // `world` is what it costs when they do not. Both are LAGGED —
+                // fenced, polled counters, never waited on.
+                if (const auto* sp = scene_renderer().screen_probes();
+                    sp != nullptr && sp->stats().active) {
+                    const auto& s = sp->stats();
+                    std::cout << std::format(
+                        "[smoke] gi screen sp={}x{} probes={} hits={} world={} world_hits={} "
+                        "fb={} dropped={} {:.2f}MB\n",
+                        s.grid.x, s.grid.y, s.probes, s.screen_hits, s.world_rays, s.world_hits,
+                        s.fallbacks, s.dropped, static_cast<double>(s.bytes) / (1024.0 * 1024.0));
+                }
             }
         }
         // Tier-3 evidence: that the controller left the ground, that the nav

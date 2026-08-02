@@ -14,6 +14,7 @@
 #include "bracken/render/lighting/light_cluster.hpp"
 #include "bracken/render/gi/gi_bindings.hpp"
 #include "bracken/render/gi/probe_volume.hpp"
+#include "bracken/render/gi/screen_probes.hpp"
 #include "bracken/render/hzb.hpp"
 #include "bracken/render/rt_renderer.hpp"
 #include "bracken/render/lighting/local_shadows.hpp"
@@ -215,6 +216,14 @@ public:
      *  allocates it or spends a dispatch on it. Exposed so a host can report
      *  `hzb=WxH mips=N`; the pyramid's texture is renderer-internal. */
     [[nodiscard]] const render::HzbPyramid* hzb() const { return hzb_.get(); }
+
+    /** The screen-probe gather, or null when it is not allocated.
+     *
+     *  Built only for `gi_mode == GiMode::ProbesScreen` (R4b). Exposed for the
+     *  smoke line and the dev overlay; the atlases are renderer-internal. */
+    [[nodiscard]] const render::gi::ScreenProbeGather* screen_probes() const {
+        return screen_probes_.get();
+    }
 
     /** Effect/particle counts of the LAST CONSUMED packet's effect-instance
      *  snapshot — render-side data, safe for the dev overlay to read while
@@ -469,7 +478,8 @@ private:
     /// Bind the probe field's three atlases as one contiguous run starting at
     /// `base_slot` (model family; terrain/grass take `frame_gi_` by pointer).
     void bind_gi(uint32_t base_slot);
-    /// Rebuild `frame_gi_` from the probe volume, or fill it with dummies.
+    /// Rebuild `frame_gi_` from the probe volume + screen-probe gather, or fill
+    /// it with dummies.
     void refresh_gi_bindings();
 
     // Setup
@@ -535,6 +545,13 @@ private:
     /// Latched init failure (the device may not support R32_FLOAT with
     /// SIMULTANEOUS read-write) — same one-attempt policy as gi_init_failed_.
     bool hzb_init_failed_ = false;
+
+    /// The R4b screen-probe gather. Same lazy-create / destroy-on-off policy as
+    /// the pyramid it marches, and gated on the same mode: it is the quality
+    /// tier of GiMode::ProbesScreen and nothing else allocates it.
+    std::unique_ptr<render::gi::ScreenProbeGather> screen_probes_;
+    /// Latched allocation failure — same one-attempt policy as gi_init_failed_.
+    bool screen_probes_init_failed_ = false;
 
     // Compute-shader ray tracing. Null-checked everywhere: both features are
     // off by default and nothing is built unless one is on.

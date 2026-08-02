@@ -127,9 +127,14 @@ struct alignas(16) GrassLightingUniforms {
     /// gpu::ModelLightingUniforms::giCascadeBase for the full contract.
     glm::ivec4 gi_cascade_base[3] = {}; // offset 128
     float gi_enabled = 0.0f;            // offset 176
-    float _gi_pad0 = 0.0f;
-    float _gi_pad1 = 0.0f;
-    float _gi_pad2 = 0.0f;
+    /// Screen-probe gather (R4b, render/gi/screen_probes.hpp). These three were
+    /// the trailing GI pads, so the cbuffer neither grew nor moved a field.
+    /// `gi_screen_enabled` gates every tap in `gi_screen_sample.hlsli`; 0 leaves the
+    /// pure probe-field ambient of R1c. The grid rides as floats because the
+    /// pads were floats, and the shader casts them back.
+    float gi_screen_enabled = 0.0f;
+    float gi_screen_probes_x = 0.0f;
+    float gi_screen_probes_y = 0.0f;
 };
 
 // Layout pins against grass.frag.hlsl GrassLightingUniforms.

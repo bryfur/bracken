@@ -626,11 +626,11 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    SAMPLER — a depth format cannot be a compute storage texture), then
    `HzbReduce` runs **once per further mip, each in its own compute pass**
    because SDL3 GPU offers no intra-pass synchronization. Timed as `HZB`.
-   **Nothing reads it** — the pass is R4a of `docs/rt_lighting_plan.md` §5.5
-   and is gated on its future consumer (R4b's screen-probe gather) precisely so
-   that every configuration that exists today is bit-identical. See the HZB
-   subsection under "Ray tracing" for the reduction direction and the odd-edge
-   footprint rule.
+   Its consumer is the **screen-probe gather** later in the same frame (step
+   11a). See the HZB subsection under "Ray tracing" for the reduction direction
+   and the odd-edge footprint rule — in particular that the last texel of each
+   axis has an OVERSIZED footprint, which is why the march addresses the
+   pyramid by `screenSize / 2^level` and not by the mip's own dimensions.
 8. **`GTAO`** (only when `ao_mode != Off` and the prepass ran this frame) —
    `render::GTAO`, computed from the prepass depth alone BEFORE the forward
    pass; the forward shaders sample the result in their ambient term (screen
@@ -752,9 +752,18 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
      The local-shadow atlas stays LAST in all three, which is the contract
      `cluster_lighting.hlsli` encodes as `CLUSTER_SSBO_BINDING_BASE - 1`; R1c
      inserted the GI slots between the traced mask and it rather than after it
-     for exactly that reason, and R2b inserted its own mask the same way. All
-     three stay under the 17-sampler ceiling that was measured when the
-     believed 11-sampler DXC limit failed to reproduce.
+     for exactly that reason, and R2b inserted its own mask the same way.
+   * **SIXTEEN samplers is the hard ceiling for a shader stage, and it is
+     SDL's, not DXC's.** The measurement that retired the believed 11-sampler
+     limit went as far as 17 through DXC and stopped there; `SDL_CreateGPUShader`
+     asserts `"Shader sampler count cannot be higher than 16!"` and returns
+     null, so a 17-sampler `model.frag` produces a missing pipeline and an
+     unrendered scene rather than a slow one. R1c's three GI slots spent the
+     last of that headroom. That is why **R4b's screen-probe SH is a fifth
+     fragment STORAGE BUFFER** (`gi_screen_sample.hlsli`, at
+     `CLUSTER_SSBO_BINDING_BASE + 4`) and not a seventeenth sampler — and why
+     the next per-pixel texture any of these shaders wants has to pack into an
+     existing slot or become a buffer too.
    * Scene depth (and the reflection G-buffer) are compute **sampled**
      textures, bound with the RT renderer's point-clamp sampler. This is the
      portable SDL3 GPU path for D32 depth: depth textures cannot legally carry
@@ -1527,7 +1536,9 @@ after the update passes rather than before, because a pixel shaded against
 cascade bases the volume has since scrolled past would sample the wrong probes.
 It is filled with dummies and `enabled = 0` when GI is off — the slots are
 declared unconditionally by every scene shader and SDL3 GPU leaves an unbound
-fragment sampler descriptor undefined.
+fragment sampler descriptor undefined. Since R4b the same snapshot carries the
+screen-probe tier's SH buffer, its probe grid and its own enable flag; see
+"Screen-probe gather" below.
 
 What the GI setting actually costs on that village, `--rt-bench 120` in an
 `-O0` tree: frame render 0.86 → 3.14 ms and `present_wait` 0.59 → 2.58 ms.
@@ -1844,9 +1855,8 @@ positions and the transmittance-weighted integral over 24 steps hide it.
 
 ### Known limits (R1c)
 
-- **`GiMode::ProbesScreen` behaves as `Probes`.** It is declared early so the
-  on-disk integer is fixed before players have settings files; the screen-probe
-  gather it names is phase R4.
+- ~~**`GiMode::ProbesScreen` behaves as `Probes`.**~~ Landed in R4b — see
+  "Screen-probe gather" below. It is still the same on-disk integer.
 - **The bounce sample inside the trace still skips the Chebyshev test.** It is
   a secondary term feeding a heavily filtered EMA, and the visibility moments
   are themselves still converging while the field fills. The primary sampler —
@@ -1869,12 +1879,202 @@ positions and the transmittance-weighted integral over 24 steps hide it.
 
 ---
 
+## Screen-probe gather (R4b) — `render/gi/screen_probes.hpp`
+
+Phase R4 of `docs/rt_lighting_plan.md` §5.5, complete as of R4b. The **quality
+tier above the probe field**, not a replacement for it: the field is still
+traced, still lights the fog, and is still what every pixel this gather cannot
+answer for falls back to. `GiMode::ProbesScreen` only — which, before this
+phase, behaved exactly as `Probes`.
+
+One 8×8 octahedral probe per **16×16 screen tile** (1600×900 ⇒ 100×57 = 5700
+probes), anchored on the depth buffer, traced screen-first and BVH-second,
+filtered in probe space, and published as an L1 spherical-harmonic record per
+probe that the four scene fragment shaders read.
+
+### Why a screen march at all, given there is a BVH
+
+Two reasons, and the second is the one that cannot be bought any other way:
+
+1. A screen hit costs log-n texture fetches instead of triangle tests.
+2. **The depth buffer contains the skinned and dynamic geometry whose BLAS is a
+   bind pose** (`docs/rt_lighting_plan.md` §1, limit 3). The villager's own
+   bounce light exists in this pass and cannot exist in the world trace. The
+   march is not an optimization of the BVH; it answers a question the BVH
+   answers wrong.
+
+What it costs is one frame of latency and a feedback loop: the radiance a
+screen hit reads is the **previous frame's resolved scene colour** (the TAA
+history, `render::TAA::previous_result()`), so it contains that frame's own
+indirect. Infinite bounce for free, with the standard caveat that it also feeds
+back its own error; the probe-space EMA is the damping on it. With TAA off
+there is no history at all, and the march is skipped entirely — every ray goes
+to the BVH, which is slower and correct rather than fast and invented.
+
+### Six passes, in order, one compute pass each
+
+All inside one **`GIScreenProbes`** timer scope. Each is its own pass because
+SDL3 GPU has no intra-pass synchronization and every one reads the previous
+one's output — and pass 4 additionally requires it, because indirect arguments
+are not synchronized against the pass that wrote them.
+
+1. **`GiScreenProbePlace`** — one thread per probe. Walks a FIXED nine-pixel
+   candidate order inside the tile (centre, four quarter-points, four edge
+   midpoints; `screen_probe_anchor_offset`) and takes the first with non-sky
+   depth; unprojects it with the JITTERED inverse view-projection (the depth
+   buffer's own matrix) and reads its normal from the prepass G-buffer. Writes
+   a 32-byte `GiScreenProbeHeader` (world position, packed flags + in-tile
+   anchor offset, normal, camera distance). A sky tile gets no probe and the
+   forward gather falls back to the field there, which is the correct answer —
+   there is no surface to gather for. This pass also **zeroes** the miss-buffer
+   header and the diagnostic counters, because it is the only one that runs
+   before the march's first atomic.
+2. **`GiScreenProbeMarch`** — one threadgroup per probe, 64 threads = the whole
+   octahedral payload. Only the **hemisphere above the anchor** is traced (32
+   rays); zero below is not an approximation for the anchor's own normal, it
+   reproduces the hemisphere integral exactly once convolved with the cosine
+   lobe (proved numerically in `screen_probe_math.test.cpp`). Each ray is
+   projected into screen space — where UV and device depth are both affine in
+   the screen parameter, which is what lets the march step linearly — and
+   walked up and down the Hi-Z ladder (start mip 2, ≤48 steps). On a confirmed
+   hit the world position is reprojected through the previous UNJITTERED
+   view-projection and the TAA history is sampled there. Everything else is
+   **compacted into a miss buffer** with one `InterlockedAdd` per threadgroup
+   (the exposure histogram's LDS-merge shape, for the same reason: 365 k
+   atomics on one address would serialize the pass).
+3. **`GiScreenProbeArgs`** — one thread; turns the miss count into an
+   `SDL_GPUIndirectDispatchCommand`. **The engine's first runtime use of
+   `ComputePass::dispatch_indirect`**, which R4a landed unexercised.
+4. **`GiScreenProbeTrace`** — INDIRECT dispatch over the compacted misses.
+   Wavefront, not branch: the naive shape is one dispatch over every probe texel
+   with an early return, which is exactly the wave-divergence problem §1 limit 6
+   already measured in the reflection pass. Each ray resumes at its handoff
+   distance as a **short** BVH ray (600 world units — the coarsest cascade's
+   probe spacing, i.e. the scale below which the world field resolves nothing)
+   and is shaded by `rt_hit_shade.hlsli`, the same recipe the probe field and
+   the reflection trace use.
+5. **`GiScreenProbeFilter`** — probe-space TEMPORAL. Firefly clamp against the
+   probe's own mean luminance (scale-free, so it survives the day/night
+   cycle's ~10³ swing; R5's exposure-aware clamp is the successor), then an EMA
+   (α = 0.1) against the previous frame's probe at the anchor's
+   velocity-reprojected pixel, accepted only if that probe's plane and distance
+   agree. Ping-ponged atlases and ping-ponged probe headers — the acceptance
+   test needs the PREVIOUS frame's header, which this frame's has overwritten.
+6. **`GiScreenProbeProject`** — the 3×3 probe-space SPATIAL filter fused with
+   the L1 projection. Thread *i* owns octahedral texel *i* and gathers texel *i*
+   from the nine neighbours weighted by plane agreement: averaging what nine
+   probes saw IN THE SAME DIRECTION is variance reduction, where averaging the
+   probes themselves would smear a wall's radiance onto the floor. The spatial
+   half lives here rather than in pass 5 because it needs its neighbours'
+   temporal results complete, which only a later pass can guarantee.
+
+### Addressing the pyramid — the bug the CPU mirror caught
+
+`render/hzb.hpp` extends the **last** destination texel of each axis to the end
+of the source, so a 900-row image's mip 4 has footprints of 16, 16, …, 16 and
+**24** rows. Addressing that mip with `floor(uv * mipSize)` therefore asks the
+wrong texel above uv ≈ 0.67, and the march walks straight through whatever that
+texel was reporting. The correct grid is `screenSize / 2^level` (boundaries at
+source multiples of 2^level), with the index clamped to `mip_size - 1` **for
+the lookup only** — the step function keeps the unclamped grid so a ray in the
+oversized last cell leaves the screen rather than stalling against a boundary
+that is not there. It also means the pyramid is read with `Load`, not a uv
+sample, since a hardware sampler addresses a mip the wrong way here.
+`ScreenTraceMarch.NeverStepsOverASurfaceTheBruteWalkFinds` found this against a
+texel-by-texel reference walk before any pixel was rendered; fixing it took the
+playground's screen-hit count from 20900 to 32204 on the same frame.
+
+### Publication and consumption
+
+The projection pass writes one 64-byte `gpu::GiScreenProbeSh` per probe: three
+coefficient quads (one per colour channel) and one metadata quad (anchor normal
++ camera distance, `w == 0` meaning "no probe here"). **A storage buffer, not a
+texture**, because SDL3 GPU caps a shader stage at 16 samplers and the scene
+shaders are already there — see the sampler-ceiling note under "Ray tracing".
+It rides as their fifth fragment storage buffer, right after
+`cluster_lighting.hlsli`'s four.
+
+`gi_screen_sample.hlsli` does the per-pixel gather: manual bilinear over the
+2×2 nearest probes, each tap rejected individually on camera distance and
+normal, renormalised over the probes that answered and then ramped by how much
+of the cage that was (weight floor 0.5). The result is the **same unit** the
+probe field returns — cosine-weighted mean incoming radiance, irradiance/π —
+so the scene shaders blend one into the other with a plain `lerp` and no scale
+factor:
+
+```hlsl
+giIrradiance = giSampleDiffuse(P, N, V, ambientSky, ambientGround);
+float w; float3 sp = giScreenSampleDiffuse(pixel, P, N, cameraPos, w);
+giIrradiance = lerp(giIrradiance, sp, w);
+```
+
+`w` going to zero is not a degradation. A tile that was all sky, a pixel whose
+four probes sit on other surfaces (thin railings, silhouettes), geometry
+disoccluded this frame — those are the cases the world field handles fine, and
+the floor is what hands them back to it. The fog is untouched: `giSampleVolume`
+still reads the field directly.
+
+### Cost and what it resolved
+
+`--rt-bench 120` on the playground village, RelWithDebInfo, 1600×900,
+`PLAYGROUND_RT=both`:
+
+| | `PLAYGROUND_GI=probes` | `PLAYGROUND_GI=probes_screen` |
+|---|---|---|
+| frame render | 4.478 ms | 5.032 ms |
+| `present_wait` | 3.893 ms | 4.427 ms |
+| `GIProbes` (CPU record) | 0.051 / 0.059 p95 | 0.050 / 0.057 |
+| `HZB` (CPU record) | — | 0.017 / 0.021 |
+| `GIScreenProbes` (CPU record) | — | 0.016 / 0.019 |
+
+So the tier costs about **0.55 ms of wall time**, comfortably inside the
+2.5–4 ms §5.5 budgets — and essentially none of it is CPU record time, which is
+the expected shape: six dispatches to record, 180 k rays to run.
+
+**The economics, measured rather than assumed.** On the smoke frame: 32204 rays
+resolved on screen, 148734 were handed to the BVH, of which 36589 hit geometry
+and 112145 found nothing within the 600-unit clamp. So **47 % of the rays that
+found any geometry at all resolved on screen**, and 62 % of all traced rays hit
+nothing — which is what an outdoor village under open sky looks like, and is not
+the "most rays resolve on screen" the design sketch assumed. That claim holds
+for interiors and dense geometry; it does not hold here, and the honest number
+is the one above.
+
+### Known limits (R4b)
+
+- **No adaptive extra probes.** §5.5 sketched an indirect-dispatched second
+  round of probes where depth/normal interpolation fails; v1 does not have it.
+  The depth/normal-weighted 4-probe gather plus the field fallback cover
+  discontinuities without visible seams on the playground, and the right time
+  to add adaptive placement is when a measured seam motivates it.
+- **Alpha-MASK foliage is not in the depth prepass**, so a probe anchored in a
+  canopy tile describes the geometry behind the leaves. Visible in a
+  probes/probes_screen difference image as coloured fringing on tree
+  silhouettes. It is the same limitation the screen-AO term already has.
+- **The disocclusion guard is partial.** The engine keeps no previous-frame
+  depth target (§1, limit 7), so a screen hit's reprojection is validated
+  against THIS frame's depth at the reprojected texel. Exact for a static
+  camera, good for a slow one, and it rejects (handing the ray to the BVH,
+  which is the safe direction) for a fast one.
+- **The escaped-ray fallback is a heuristic, twice.** It blends sky radiance
+  toward the probe field's tap across the horizon, and the field's octahedral
+  tap is cosine-convolved mean radiance rather than radiance along the
+  direction. Energy-reasonable is the bar; both approximations are stated at
+  the call site in `gi_screen_probe_trace.comp.hlsl`.
+- **Mid-roughness specular is not wired.** §5.5 also proposed importance-
+  sampling the probe radiance by the GGX lobe so the reflection trace could
+  hand off earlier. R4b publishes L1 SH, which is a diffuse basis; that
+  proposal needs the octahedral atlas exposed to the forward pass and is not
+  part of this phase.
+
+---
+
 ## GPU layer
 
 - **Registry vs catalogue.** These are two files on purpose.
   **`gpu/pipeline_catalog.hpp`** is the catalogue: one `constexpr`
   `PipelineDesc` row per `PipelineType` (67) and one `ComputePipelineDesc` per
-  `ComputePipelineType` (16), carrying the shader pair, the resource counts
+  `ComputePipelineType` (22), carrying the shader pair, the resource counts
   those shaders declare, the vertex layout (`VertexLayout`), the render target
   (`TargetFormat`) and the fixed-function state — cull, blend, the depth
   triple, depth clip, depth bias. `build_pipeline_config(desc, formats)` turns

@@ -1,9 +1,9 @@
 # Ray-Traced Lighting — Research & Plan of Record
 
 Status: **in progress — R0 (foundations), R1 (probe-field GI), R2
-(froxel-RIS local-light shadows), R3 (honest hit lighting) and R4a (the HZB +
-the `gpu/` layer's indirect-dispatch wrapper) have landed**; R4b onward is still
-proposal. Written 2026-08-02 against the working tree at the
+(froxel-RIS local-light shadows), R3 (honest hit lighting) and R4 (the HZB +
+indirect dispatch in R4a, the screen-probe gather in R4b) have landed**; R5
+onward is still proposal. Written 2026-08-02 against the working tree at the
 RT-denoiser series (post "RT shadows: stop multiplexing ambient occlusion into
 the shadow mask"); R0's landed work packages are marked in §5.0 and R1's three
 packages in §5.2. As of R1c the probe field lights the frame — the first
@@ -1024,9 +1024,83 @@ adding an `HZB` timer row and an `hzb=1600x900 mips=11` field to the
   *and* gives the pyramid a live path to run in, which an unreachable pass would
   not have.
 
-*Still to come here:* the screen probes themselves, the trace ladder that
-marches this pyramid, probe-space filtering, and the mid-roughness specular
-hand-off — all R4b.
+**Landed (R4b, 2026-08-02) — the screen-probe gather. R4 is complete.**
+`render/gi/screen_probes.hpp` + six compute passes, `GiMode::ProbesScreen` only,
+and the mode finally means something: `--smoke 30 PLAYGROUND_RT=both
+PLAYGROUND_GI=probes_screen` moved from `81.7 / 49.8` (identical to `probes`) to
+**`82.3 / 50.4`**, reproduced over three runs, while `--smoke 30` and
+`PLAYGROUND_GI=probes` stay bit-identical at `86.5 / 44.9` and `81.7 / 49.8`.
+
+**Shape.** One 8x8 octahedral probe per **16x16** screen tile (1600x900 =>
+100x57 = 5700 probes), not §5.5's 8x8 tile: only the hemisphere above the anchor
+is traced, so a tile is 32 rays, and at an 8x8 pitch that is one ray per two
+pixels — a per-pixel budget wearing a probe's clothes, which §2 says does not
+fit this engine's hardware floor. 16x16 puts it at one ray per eight pixels.
+The price is paid in the interpolation, which is why there is a weight floor and
+a field fallback at all. Radiance atlas 800x456 RGBA16F x3 (raw + a ping-ponged
+filtered pair), probe headers ping-ponged, ~11.8 MB with the miss buffer.
+
+**Six passes, one `GIScreenProbes` scope**, each its own compute pass because
+SDL3 has no intra-pass synchronization: *place* (fixed nine-candidate anchor
+search on the depth buffer; also zeroes the frame's counters), *march* (the Hi-Z
+ladder, the TAA-history radiance tap, and a groupshared compaction of every
+unresolved ray into a miss buffer with one atomic per threadgroup), *args* (the
+miss count -> `SDL_GPUIndirectDispatchCommand` — **the first runtime use of the
+`ComputePass::dispatch_indirect` R4a landed unexercised**), *trace* (indirect
+dispatch over the compacted misses; short 600-unit BVH rays through
+`rt_hit_shade.hlsli`, sky/field blend beyond the clamp), *filter* (probe-space
+temporal: firefly clamp against the probe's own mean, velocity-reprojected EMA),
+*project* (3x3 probe-space spatial fused with the L1 SH projection).
+
+**Two things the design assumed that the platform refused.**
+
+1. **The seventeenth sampler does not exist.** §5.5's consumption plan was one
+   new fragment sampler per scene shader (model/instanced 16 -> 17). DXC
+   legalizes 17 — that measurement is real and is what retired the old
+   11-sampler belief — but `SDL_CreateGPUShader` asserts *"Shader sampler count
+   cannot be higher than 16!"* and returns null, so it is a missing pipeline and
+   a black scene, not a slow frame. The SH is a **fifth fragment storage
+   buffer** instead (`gpu::GiScreenProbeSh`, 64 B/probe), which is also the
+   better fit: probe-indexed records read by index and never filtered.
+2. **The pyramid cannot be addressed by `uv * mipSize`.** R4a's own odd-edge
+   rule — the last destination texel of each axis extends to the end of the
+   source — makes mip N's footprints non-uniform, so a uv-addressed sample asks
+   the wrong texel near the right and bottom edges and the march walks through
+   whatever it was reporting. The correct grid is `screenSize / 2^level` with a
+   `Load`. The CPU mirror's brute-force march test found this before a pixel was
+   rendered; fixing it took the playground's screen-hit count from 20900 to
+   32204 on the same frame.
+
+**The economics claim, measured.** On the smoke frame: 32204 rays resolved on
+screen, 148734 handed to the BVH, of which 36589 hit and 112145 found nothing
+inside the clamp. So **47 % of the rays that found any geometry resolved on
+screen**, and 62 % of all traced rays hit nothing — an outdoor village under
+open sky. "Most rays resolve on screen" holds for interiors and dense geometry;
+it does not hold here, and this is the honest number.
+
+**Cost.** `--rt-bench 120`, RelWithDebInfo, 1600x900, `PLAYGROUND_RT=both`:
+frame render 4.478 -> 5.032 ms and `present_wait` 3.893 -> 4.427 ms against
+`PLAYGROUND_GI=probes`, i.e. **~0.55 ms** for the tier — inside this section's
+2.5-4 ms budget. `HZB` records 0.017 ms and `GIScreenProbes` 0.016 ms of CPU
+time; the work is on the device.
+
+**Visually**, against the `probes` shot: warmer bounce on the open cobbles,
+cooler and darker on facades and eave undersides where local geometry occludes
+what 1.5 m probes blur through, and the animated villager changed most of all —
+he is in the depth buffer and only bind-pose in the BVH. No tile structure: the
+mean 16x16 intra-tile pattern of the difference image spans 0.086 against a
+difference standard deviation of 2.33, i.e. under 4 %.
+
+**Deliberately not in v1**, both documented rather than deferred silently: no
+adaptive extra probes (the depth/normal gather and the field fallback cover
+discontinuities without a measured seam to motivate them), and no mid-roughness
+specular hand-off (L1 SH is a diffuse basis; that proposal needs the octahedral
+atlas exposed to the forward pass). Alpha-MASK foliage is not in the depth
+prepass, so canopy-tile anchors describe what is behind the leaves — the same
+limitation the screen AO term has.
+
+*Still to come in this section:* nothing. R4 is complete; the mid-roughness
+specular hand-off moves to R5's scope alongside the near-field work.
 
 *Follow-up (2026-08-02): a validated run is clean again.* Two defects the R1b/R1c
 and R4a work left behind are fixed with no pixel moving: the integer-format
@@ -1047,24 +1121,25 @@ GI-1.0's shape over our tracer, `GiMode::ProbesScreen`, mid/high GPUs only:
   `GPUBuffer::Type::Indirect`).~~ **Landed (R4a)** — see above; the pyramid is a
   reversed-Z *closest-surface* (MAX) pyramid, which is this bullet's "min-depth"
   under the engine's depth convention.
-- **Probes.** One 8×8 octahedral probe per 8×8 screen tile (adaptive extras
+- ~~**Probes.** One 8×8 octahedral probe per 8×8 screen tile (adaptive extras
   where depth/normal interpolation fails — the indirect dispatch consumer),
-  placed on G-buffer depth, jittered. ~32 k probes at 1080p ⇒ ~2 M ray
-  *slots*, most resolved cheaply:
-- **Trace ladder per ray:** HZB screen march first (hits cost texture
-  fetches; dynamic/skinned objects included via the depth buffer — the
-  bind-pose problem sidestepped where it is most visible); on miss/handoff
-  a *short* BVH ray (few-meter clamp); beyond that, sample the R1 probe
-  field. The world field bounds the per-ray cost — screen probes buy
-  *sharpness near geometry*, not range.
-- **Filtering in probe space** (temporal reproject + 3×3 probe spatial with
-  plane/depth weights, then per-pixel 4-probe integrate against the BRDF) —
-  ~0.6 ms-class where pixel-space GI denoising costs 2.5+ ms. No per-pixel GI
-  denoiser exists in this plan at any tier.
+  placed on G-buffer depth, jittered.~~ **Landed (R4b)** at a 16×16 tile and
+  without the adaptive extras — see the note above for both arguments. The
+  indirect dispatch found a better consumer: the compacted MISS list of the
+  screen march, whose length only the GPU knows.
+- ~~**Trace ladder per ray:**~~ **Landed (R4b)**, exactly as written: HZB march,
+  then a 600-unit BVH ray, then a sky/field blend.
+- ~~**Filtering in probe space**~~ **Landed (R4b)**, with the spatial half fused
+  into the projection pass rather than standing alone — it needs its
+  neighbours' temporal results complete, which only a later pass can guarantee,
+  and that pass was already visiting every texel. No per-pixel GI denoiser
+  exists in this plan at any tier.
 - Screen probes also serve **mid-roughness specular** (importance-sample the
   probe's radiance by the GGX lobe) — this is when `ambientIBL` retires to
   sky-visible-surfaces duty and the reflection trace can hand off *earlier*
-  (gate `fade_start` drops), cutting reflection rays on rough scenes.
+  (gate `fade_start` drops), cutting reflection rays on rough scenes. **NOT in
+  R4b**: L1 SH is a diffuse basis, and this needs the octahedral radiance atlas
+  itself exposed to the forward pass. Carried into R5.
 
 *Costs:* GI-1.0 measured 1.9–3.4 ms @1080p on 6900 XT/3080-class for the full
 stack over *its* tracer; budget 2.5–4 ms on our mid tier, gated by

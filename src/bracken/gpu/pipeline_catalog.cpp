@@ -31,35 +31,42 @@ constexpr ShaderResources k_ubo1_samp5{.num_samplers = 5, .num_uniform_buffers =
 /// prefiltered / BRDF LUT) + traced sun-shadow mask + GI (irradiance /
 /// visibility / probe metadata) + traced LOCAL-light mask + local-shadow atlas
 /// = 16 samplers; light data
-/// + cluster offsets + light indices + local-shadow slots = 4 storage buffers;
+/// + cluster offsets + light indices + local-shadow slots + R4b's screen-probe
+/// SH = 5 storage buffers;
 /// lighting + shadow data + cluster params = 3 uniform buffers.
 ///
 /// The RT sun mask is slot 10, the probe field occupies 11-13, R2b's traced
 /// LOCAL-light visibility ratio is 14, and the rasterized local-shadow atlas
-/// moved to 15 (`CLUSTER_SSBO_BINDING_BASE` = 16). The
+/// is 15 (`CLUSTER_SSBO_BINDING_BASE` = 16). The
 /// atlas stays LAST because cluster_lighting.hlsli declares it at
 /// `CLUSTER_SSBO_BINDING_BASE - 1`, which is the contract every one of these
 /// three rows depends on.
 ///
 /// The RT mask was previously multiplexed into the screen-AO texture's G
 /// channel on the belief that a 12th sampler failed DXC legalization; that does
-/// not reproduce — model.frag compiles clean at 12, and was verified up to 17,
-/// which is also the headroom R1c's three GI slots were spent out of.
+/// not reproduce — model.frag compiles clean at 12, and was verified up to 17
+/// through DXC. SIXTEEN IS THE REAL CEILING, though, and it is SDL's, not
+/// DXC's: `SDL_CreateGPUShader` asserts "Shader sampler count cannot be higher
+/// than 16!" and returns null. R1c's three GI slots spent the last of that
+/// headroom, which is why R4b's screen-probe SH is a fifth STORAGE BUFFER and
+/// not a seventeenth sampler (gpu::GiScreenProbeSh). The next feature that
+/// wants a per-pixel texture in these shaders has to pack or use a buffer.
 constexpr ShaderResources k_fs_lit_model{
-    .num_samplers = 16, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 16, .num_storage_buffers = 5, .num_uniform_buffers = 3};
 
 /// `terrain.frag`: material array + splatmap + shadow atlas (cmp + raw) +
 /// screen AO + IBL (irradiance / prefiltered / BRDF LUT) + traced sun mask +
 /// GI (irradiance / visibility / probe metadata) + traced LOCAL-light mask +
-/// local-shadow atlas.
+/// local-shadow atlas; R4b's screen-probe SH is the fifth storage buffer.
 constexpr ShaderResources k_fs_lit_terrain{
-    .num_samplers = 14, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 14, .num_storage_buffers = 5, .num_uniform_buffers = 3};
 
 /// `grass.frag`: shadow atlas (cmp + raw) + screen AO + IBL (irradiance /
 /// prefiltered / BRDF LUT) + traced sun mask + GI (irradiance / visibility /
-/// probe metadata) + traced LOCAL-light mask + local-shadow atlas.
+/// probe metadata) + traced LOCAL-light mask + local-shadow atlas; R4b's
+/// screen-probe SH is the fifth storage buffer.
 constexpr ShaderResources k_fs_lit_grass{
-    .num_samplers = 12, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 12, .num_storage_buffers = 5, .num_uniform_buffers = 3};
 
 /// `grass.vert` / `prepass_grass.vert`: heightmap + splatmap samplers, plus the
 /// visible-chunk origin buffer for the chunked LOD.
@@ -923,6 +930,68 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // point the read-write binding, with its explicit mip_level, is the only
      // way to name a single level.
      .resources = {.num_readwrite_storage_textures = 2, .num_uniform_buffers = 1}},
+
+    // ---- screen-probe gather (render/gi/screen_probes.hpp, R4b) ------------
+    {.name = "GiScreenProbePlace",
+     .shader = "gi_screen_probe_place.comp.spv",
+     .entry_point = "CSMain",
+     // Hi-Z mip 0 (= this frame's depth) + the prepass G-buffer in; the probe
+     // header buffer out, plus the miss-buffer header and the counters, which
+     // this pass owns the zeroing of because it is the only one that runs
+     // before the march's first atomic.
+     .resources = {.num_samplers = 2, .num_readwrite_storage_buffers = 3, .num_uniform_buffers = 1}},
+    {.name = "GiScreenProbeMarch",
+     .shader = "gi_screen_probe_march.comp.spv",
+     .entry_point = "CSMain",
+     // The pyramid and last frame's resolved scene colour in, the probe headers
+     // alongside; the radiance atlas, the compacted miss buffer and the
+     // counters out.
+     .resources = {.num_samplers = 2,
+                   .num_readonly_storage_buffers = 1,
+                   .num_readwrite_storage_textures = 1,
+                   .num_readwrite_storage_buffers = 2,
+                   .num_uniform_buffers = 1}},
+    {.name = "GiScreenProbeArgs",
+     .shader = "gi_screen_probe_args.comp.spv",
+     .entry_point = "CSMain",
+     // One thread. Reads the miss buffer's count word, writes one
+     // SDL_GPUIndirectDispatchCommand.
+     .resources = {.num_readonly_storage_buffers = 1,
+                   .num_readwrite_storage_buffers = 1,
+                   .num_uniform_buffers = 1}},
+    {.name = "GiScreenProbeTrace",
+     .shader = "gi_screen_probe_trace.comp.spv",
+     .entry_point = "CSMain",
+     // EIGHT read-only storage buffers, which is SDL3 GPU's ceiling exactly:
+     // the four acceleration-structure buffers, the per-triangle attributes,
+     // the clustered-light byte buffer, the probe headers and the miss records.
+     // That budget is why the miss COUNT lives in the miss buffer's own header
+     // rather than in the counters buffer — a ninth binding for one uint would
+     // not have fit. Sampled and read-only-storage-texture counts mirror
+     // GiProbeTrace's because it shares rt_hit_shade.hlsli with it.
+     .resources = {.num_samplers = 4,
+                   .num_readonly_storage_textures = 1,
+                   .num_readonly_storage_buffers = 8,
+                   .num_readwrite_storage_textures = 1,
+                   .num_readwrite_storage_buffers = 1,
+                   .num_uniform_buffers = 1}},
+    {.name = "GiScreenProbeFilter",
+     .shader = "gi_screen_probe_filter.comp.spv",
+     .entry_point = "CSMain",
+     // Raw atlas + previous filtered atlas + velocity in, both frames' probe
+     // headers alongside (the temporal test asks whether the PREVIOUS frame's
+     // probe described a compatible surface); the filtered atlas out.
+     .resources = {.num_samplers = 3,
+                   .num_readonly_storage_buffers = 2,
+                   .num_readwrite_storage_textures = 1,
+                   .num_uniform_buffers = 1}},
+    {.name = "GiScreenProbeProject",
+     .shader = "gi_screen_probe_project.comp.spv",
+     .entry_point = "CSMain",
+     .resources = {.num_samplers = 1,
+                   .num_readonly_storage_buffers = 1,
+                   .num_readwrite_storage_buffers = 1, // the published L1 SH records
+                   .num_uniform_buffers = 1}},
 }};
 
 static_assert(k_compute_descs.size() == static_cast<size_t>(ComputePipelineType::Count),

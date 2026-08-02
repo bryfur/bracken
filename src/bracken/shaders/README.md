@@ -139,7 +139,17 @@ valid and the shaders branch to the hemisphere `ambientPBR` fallback.
 The very LAST sampler slot of every scene fragment shader is the LOCAL
 (point/spot) shadow ATLAS + `LESS_OR_EQUAL` comparison sampler, declared by
 `cluster_lighting.hlsli` at `CLUSTER_SSBO_BINDING_BASE - 1` (fragment sampler
-counts: model/instanced 16, terrain 14, grass 12). Directly below it is
+counts: model/instanced 16, terrain 14, grass 12).
+
+**SIXTEEN IS A HARD CEILING, and it is SDL's.** `SDL_CreateGPUShader` asserts
+`"Shader sampler count cannot be higher than 16!"` and returns null, so a
+17-sampler `model.frag` is a missing pipeline and an unrendered scene, not a
+slow one. DXC legalizes 17 — that is the measurement that retired the old
+belief in an 11-sampler limit — but DXC's ceiling and SDL's are different
+numbers and SDL's binds. `model`/`model_instanced` are AT it. Anything further
+these shaders need is a storage buffer: R4b's screen-probe SH is exactly that,
+a FIFTH fragment storage buffer at `CLUSTER_SSBO_BINDING_BASE + 4`, declared by
+`gi_screen_sample.hlsli`. Directly below it is
 `rtLocalShadowTexture` (model/instanced 14, terrain 12, grass 10), the R8
 ray-traced LOCAL-light visibility RATIO — sampled with a NORMALIZED UV, bound
 to the 1×1 white dummy and read only when `rtLocalShadowEnabled`, and
@@ -169,10 +179,13 @@ pick one of their 6 face tiles by the dominant axis of light→fragment
 slope bias and a smooth fade at the light radius. Per-tile matrices/rects
 ride a 4th fragment storage buffer (`StructuredBuffer<LocalShadowSlot>`,
 96 B/entry — CPU mirror `lighting::LocalShadowSlotGPU`), so
-`SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4)` now binds cluster
-light data / offsets / indices / local-shadow slots. When local shadows are
-unavailable the slot binds any D32 texture (the CSM atlas) and the SSBO slot
-binds the light-data buffer — never sampled while every `shadow_slot` is -1.
+`SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 5)` binds cluster
+light data / offsets / indices / local-shadow slots / **R4b's screen-probe SH**.
+When local shadows are unavailable the slot binds any D32 texture (the CSM
+atlas) and the SSBO slot binds the light-data buffer — never sampled while
+every `shadow_slot` is -1; the fifth slot takes the same substitution when the
+screen-probe gather is not running, and `giScreenEnabled == 0` is what stops it
+being read.
 `skinned_model.vert`: skeletal skinning; bone matrices come from a per-frame
 `StructuredBuffer<float4x4>` of tightly-packed palettes (vertex set 0,
 binding 0) indexed by a `paletteOffset` uniform — no compile-time bone count
@@ -342,8 +355,8 @@ ray's direction rather than having it written out, which is why `frameIndex` is
 a uniform of all of them.
 
 **Hierarchical-Z pyramid (compute)** — two passes, both timed as one `HZB`
-scope, and both **built but unconsumed** (R4a of `docs/rt_lighting_plan.md`
-§5.5; R4b's screen-probe gather is the reader). They run only when
+scope, and read by R4b's screen-probe march (`docs/rt_lighting_plan.md` §5.5).
+They run only when
 `gi_mode == GiMode::ProbesScreen`. `hzb_copy.comp` writes mip 0 of an R32_FLOAT
 mip chain from the D32 prepass depth — the depth arrives through a **sampler**
 because a depth format cannot be a compute storage texture — and stores the raw
@@ -367,6 +380,38 @@ gather drops the last row/column of an odd mip, and clamping does not fix it —
 it re-reads a column already covered). `render/hzb.hpp` carries the CPU mirror
 of both rules and `render/hzb.test.cpp` brute-forces the whole pyramid against
 it.
+
+**A CONSUMER MUST NOT ADDRESS THIS PYRAMID BY `uv * mipSize`.** Because the last
+destination texel of each axis is oversized, mip N's footprints are 2^N, 2^N, …,
+2^N + r — so a hardware uv sample (which maps uv linearly onto the mip's
+dimensions) asks the wrong texel near the right and bottom edges. The correct
+grid is `screenSize / 2^level`, with the index clamped to the mip's dimension
+for the LOOKUP only, and the fetch is a `Load` rather than a `SampleLevel`.
+`gi_screen_probe.hlsli`'s `giSpCellGrid`/`giSpCell` are that, and the CPU mirror
+test caught the mistake before a pixel was rendered.
+
+**Screen-probe gather (compute, six passes)** — R4b, all inside one
+`GIScreenProbes` scope, in this order and each in its own compute pass:
+`gi_screen_probe_place.comp` (one thread per probe: the fixed nine-candidate
+anchor search on the depth buffer, the probe header, and the frame's counter
+zeroing), `gi_screen_probe_march.comp` (one threadgroup per probe, 64 threads =
+the whole octahedral payload; hemisphere-only rays, the Hi-Z ladder, the TAA
+history tap, and a groupshared compaction of everything unresolved into a miss
+buffer with ONE `InterlockedAdd` per group), `gi_screen_probe_args.comp` (one
+thread; the miss count becomes an `SDL_GPUIndirectDispatchCommand` — the
+engine's first runtime use of `ComputePass::dispatch_indirect`),
+`gi_screen_probe_trace.comp` (**indirectly dispatched** over the compacted
+misses; short BVH rays through `rt_trace.hlsli`, shaded by `rt_hit_shade.hlsli`,
+with a sky/probe-field blend beyond the 600-unit clamp — and at EIGHT read-only
+storage buffers, SDL3 GPU's ceiling exactly, which is why the miss count lives
+in the miss buffer's own header rather than in a ninth binding),
+`gi_screen_probe_filter.comp` (probe-space temporal: firefly clamp against the
+probe's own mean, then a velocity-reprojected EMA), and
+`gi_screen_probe_project.comp` (the 3x3 probe-space spatial filter fused with
+the L1 SH projection, writing the `GiScreenProbeSh` record the scene shaders
+read). The pass boundaries are not stylistic: SDL3 GPU has no intra-pass
+synchronization and each reads the previous one's output, and the indirect
+dispatch additionally requires its producing pass to have ENDED.
 
 **Auto exposure (compute)** — `exposure_histogram.comp` builds a 256-bin
 log2-luminance histogram of the TAA-resolved (pre-bloom) HDR scene color:
@@ -453,7 +498,21 @@ reads `giVisibilityAtlas` is compiled out and that pair must NOT be declared,
 because an unread `Texture2D`/`SamplerState` pair does not survive DXC's
 combined-image-sampler legalization and reflects as a storage texture instead
 of a sampler — see "Declared resource counts" below. `volumetric_fog.frag` is
-the one shader that takes the opt-out), `rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
+the one shader that takes the opt-out), `gi_screen_probe.hlsli` (R4b's screen-probe constants, tile/probe indexing, the
+fixed anchor search order, the jittered octahedral directions, the Hi-Z march's
+cell-step and mip-addressing functions, the L1 SH basis and evaluation, and the
+`GiScreenProbe` / `GiScreenProbeSh` / miss-record layouts — every function a
+transliteration of `render/gi/screen_probe_math.hpp`, which is the source of
+truth and is tested headless against a brute-force marcher. Binding-free, like
+`gi_probe.hlsli`), `gi_screen_sample.hlsli` (the CONSUMPTION half of the screen
+probes: the 2x2 probe gather with per-tap depth/normal rejection, renormalised
+and ramped by a weight floor, returning the SAME unit as `gi_sample.hlsli` so
+the scene shaders blend one into the other with a plain `lerp`. Unlike
+`gi_sample.hlsli` it OWNS its binding — the fifth fragment storage buffer at
+`CLUSTER_SSBO_BINDING_BASE + 4` — so it must be included AFTER
+`cluster_lighting.hlsli`; it still names three cbuffer members
+(`giScreenEnabled`, `giScreenProbesX/Y`) the including shader must declare),
+`rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
 GGX-VNDF sampling, the packed visibility-tile helpers, and `rtSeed`/`rtNextFloat`
 — a per-pixel per-frame random STREAM for passes like the froxel-RIS reservoir
 that make a dozen independent decisions per pixel, where feeding them all from
@@ -472,7 +531,8 @@ the required cbuffer separate its callers: `giEnabled` (0 binds 1×1 dummies and
 the ambient falls to the hemisphere) and `giAmbientFallback` — 1 for reflection
 rays, **0 for probe rays**, because a probe already collects sky through its ray
 misses and adding a hemisphere on top would double-count it and break the bounce
-series' convergence. Consumers: `rt_reflection.comp` and `gi_probe_trace.comp`),
+series' convergence. Consumers: `rt_reflection.comp`, `gi_probe_trace.comp` and
+`gi_screen_probe_trace.comp`),
 `rt_trace.hlsli` (the
 software two-level BVH: `BvhNodeGpu`/`BvhTriangle`/`TlasInstance`, `slabTest`,
 `octDecode`, the any-hit `blasOccluded`/`sceneOccluded` walk and the

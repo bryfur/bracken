@@ -535,16 +535,20 @@ void SceneRenderer::bind_cluster_lights(SDL_GPURenderPass* pass, SDL_GPUCommandB
     // light's shadow_slot is -1.
     SDL_GPUBuffer* local_slots =
         (local_shadows_ && local_shadows_->is_ready()) ? local_shadows_->slot_buffer() : nullptr;
-    SDL_GPUBuffer* bufs[4] = {
+    // 5th SSBO = R4b's screen-probe SH (gi_screen_sample.hlsli), under the same
+    // substitution rule: the slot must hold a valid buffer, and
+    // giScreenEnabled == 0 is what stops it being read.
+    SDL_GPUBuffer* bufs[5] = {
         cluster_grid_.light_data_buffer(),
         cluster_grid_.cluster_offsets_buffer(),
         cluster_grid_.light_indices_buffer(),
         local_slots ? local_slots : cluster_grid_.light_data_buffer(),
+        frame_gi_.screen_sh ? frame_gi_.screen_sh : cluster_grid_.light_data_buffer(),
     };
     if (!bufs[0] || !bufs[1] || !bufs[2]) {
         return;
     }
-    SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4);
+    SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 5);
     // frame_cluster_params_ (not cluster_grid_.params()) so frames with zero
     // dynamic lights publish gridDim.w == 0 rather than stale counts.
     SDL_PushGPUFragmentUniformData(cmd, uniform_slot, &frame_cluster_params_, sizeof(frame_cluster_params_));

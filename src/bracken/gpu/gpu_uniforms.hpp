@@ -111,9 +111,14 @@ struct alignas(16) ModelLightingUniforms {
     /// gates every tap: 0 restores the pre-R1c ambient term exactly.
     glm::ivec4 giCascadeBase[3] = {};
     float giEnabled = 0.0f;
-    float _giPad0 = 0.0f;
-    float _giPad1 = 0.0f;
-    float _giPad2 = 0.0f;
+    /// Screen-probe gather (R4b, render/gi/screen_probes.hpp). These three were
+    /// the trailing GI pads, so the cbuffer neither grew nor moved a field.
+    /// `giScreenEnabled` gates every tap in `gi_screen_sample.hlsli`; 0 leaves the
+    /// pure probe-field ambient of R1c. The grid rides as floats because the
+    /// pads were floats, and the shader casts them back.
+    float giScreenEnabled = 0.0f;
+    float giScreenProbesX = 0.0f;
+    float giScreenProbesY = 0.0f;
 };
 BRACKEN_HLSL_CBUFFER(ModelLightingUniforms, 304);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, lightDir, 0);
@@ -156,9 +161,9 @@ BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionFadeStart, 232);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtLocalShadowEnabled, 236);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, giCascadeBase, 240);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, giEnabled, 288);
-BRACKEN_HLSL_FIELD(ModelLightingUniforms, _giPad0, 292);
-BRACKEN_HLSL_FIELD(ModelLightingUniforms, _giPad1, 296);
-BRACKEN_HLSL_FIELD(ModelLightingUniforms, _giPad2, 300);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, giScreenEnabled, 292);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, giScreenProbesX, 296);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, giScreenProbesY, 300);
 
 /**
  * Skybox fragment shader uniforms - matches skybox.frag.hlsl SkyUniforms (set 3, b0)
@@ -408,9 +413,14 @@ struct alignas(16) InstancedLightingUniforms {
     /// Probe-field GI (render/gi/), R1c — see ModelLightingUniforms::giCascadeBase.
     glm::ivec4 giCascadeBase[3] = {};
     float giEnabled = 0.0f;
-    float _giPad0 = 0.0f;
-    float _giPad1 = 0.0f;
-    float _giPad2 = 0.0f;
+    /// Screen-probe gather (R4b, render/gi/screen_probes.hpp). These three were
+    /// the trailing GI pads, so the cbuffer neither grew nor moved a field.
+    /// `giScreenEnabled` gates every tap in `gi_screen_sample.hlsli`; 0 leaves the
+    /// pure probe-field ambient of R1c. The grid rides as floats because the
+    /// pads were floats, and the shader casts them back.
+    float giScreenEnabled = 0.0f;
+    float giScreenProbesX = 0.0f;
+    float giScreenProbesY = 0.0f;
 };
 BRACKEN_HLSL_CBUFFER(InstancedLightingUniforms, 288);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, lightDir, 0);
@@ -452,9 +462,9 @@ BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionFadeStart, 216);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtLocalShadowEnabled, 220);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giCascadeBase, 224);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giEnabled, 272);
-BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _giPad0, 276);
-BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _giPad1, 280);
-BRACKEN_HLSL_FIELD(InstancedLightingUniforms, _giPad2, 284);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giScreenEnabled, 276);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giScreenProbesX, 280);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, giScreenProbesY, 284);
 
 /**
  * Per-instance data for instanced model rendering (storage buffer).
@@ -1743,5 +1753,304 @@ BRACKEN_HLSL_FIELD(HzbReduceUniforms, dstWidth, 0);
 BRACKEN_HLSL_FIELD(HzbReduceUniforms, dstHeight, 4);
 BRACKEN_HLSL_FIELD(HzbReduceUniforms, srcWidth, 8);
 BRACKEN_HLSL_FIELD(HzbReduceUniforms, srcHeight, 12);
+
+// ===========================================================================
+// Screen-probe gather (render/gi/screen_probes.hpp, R4b —
+// docs/rt_lighting_plan.md §5.5). Six passes, six cbuffers, three records.
+// ===========================================================================
+
+/**
+ * One screen probe, as the placement pass writes it and every later pass reads
+ * it. 32 B, mirrored by `GiScreenProbe` in shaders/gi_screen_probe.hlsli.
+ *
+ * `flags` carries the validity bit AND the anchor's in-tile pixel offset (four
+ * bits per axis, which is exactly a 16-pixel tile). The offset is there so the
+ * temporal filter can reproject the probe through the VELOCITY buffer at the
+ * pixel the anchor actually sat on, rather than at the tile centre — which for
+ * a probe anchored on a foreground silhouette is a different object.
+ */
+struct alignas(16) GiScreenProbeHeader {
+    glm::vec3 worldPosition{0.0f};
+    uint32_t flags = 0;
+    glm::vec3 normal{0.0f, 1.0f, 0.0f};
+    /// Distance from the camera, world units. The bilateral weight's depth term
+    /// on both sides (spatial filter and forward gather). Zero means "no probe
+    /// here" — a tile that was all sky.
+    float cameraDistance = 0.0f;
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbeHeader, 32);
+BRACKEN_HLSL_FIELD(GiScreenProbeHeader, worldPosition, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbeHeader, flags, 12);
+BRACKEN_HLSL_FIELD(GiScreenProbeHeader, normal, 16);
+BRACKEN_HLSL_FIELD(GiScreenProbeHeader, cameraDistance, 28);
+
+/**
+ * One ray the screen march could not resolve, appended by the march pass and
+ * consumed by the INDIRECT-dispatched BVH pass. 16 B.
+ *
+ * The buffer's first 16 bytes are a header whose first word is the record
+ * count; records start at byte 16 (`giSpMissRecordOffset`). That is why the
+ * count is not in a buffer of its own: stage B is at SDL3 GPU's eight
+ * read-only storage buffers exactly, and a ninth for a single uint would not
+ * fit.
+ */
+/// Bytes reserved at the head of the miss buffer, before record 0. Word 0 is
+/// the record count; the other three keep the records 16-byte aligned.
+/// Mirrored as GI_SP_MISS_HEADER_BYTES in shaders/gi_screen_probe.hlsli.
+inline constexpr uint32_t GI_SCREEN_PROBE_MISS_HEADER_BYTES = 16;
+
+struct alignas(16) GiScreenProbeMiss {
+    uint32_t probeIndex = 0;
+    uint32_t texelIndex = 0;
+    /// World distance already covered on screen before the handoff. The BVH ray
+    /// starts here, so a ray that walked 30 m across a courtyard before leaving
+    /// the frustum does not re-trace those 30 m.
+    float resumeDistance = 0.0f;
+    uint32_t _pad0 = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbeMiss, 16);
+BRACKEN_HLSL_FIELD(GiScreenProbeMiss, probeIndex, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbeMiss, texelIndex, 4);
+BRACKEN_HLSL_FIELD(GiScreenProbeMiss, resumeDistance, 8);
+BRACKEN_HLSL_FIELD(GiScreenProbeMiss, _pad0, 12);
+
+/**
+ * The gather's diagnostic counters, zeroed by the placement pass, incremented
+ * once per threadgroup by the march and trace passes, and read back through the
+ * same fenced/polled download `ProbeVolume` uses. Lagged and honestly so —
+ * nothing in the frame waits on them.
+ */
+struct alignas(16) GiScreenProbeCounters {
+    uint32_t screenHits = 0;
+    uint32_t worldHits = 0;
+    uint32_t fallbacks = 0;
+    /// Miss records the capacity clamp DROPPED. Should be zero: the buffer is
+    /// sized for every traced ray missing (screen_probe_math.hpp), so a nonzero
+    /// value means the sizing rule and the shader disagree.
+    uint32_t dropped = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbeCounters, 16);
+BRACKEN_HLSL_FIELD(GiScreenProbeCounters, screenHits, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbeCounters, worldHits, 4);
+BRACKEN_HLSL_FIELD(GiScreenProbeCounters, fallbacks, 8);
+BRACKEN_HLSL_FIELD(GiScreenProbeCounters, dropped, 12);
+
+/**
+ * The published per-probe L1 spherical harmonics: three coefficient quads (one
+ * per colour channel) and one metadata quad. 64 B, mirrored by
+ * `GiScreenProbeSh` in shaders/gi_screen_probe.hlsli.
+ *
+ * A STORAGE BUFFER, NOT A TEXTURE, and the reason is a hard platform limit
+ * rather than taste. The design this implements called for one new fragment
+ * SAMPLER in each scene shader (model/instanced 16 -> 17). SDL3 GPU refuses:
+ * `SDL_CreateGPUShader` asserts "Shader sampler count cannot be higher than
+ * 16!" (SDL_gpu.c:1208) and the pipeline is never created. Seventeen is DXC's
+ * legalization ceiling, which is a different ceiling from SDL's, and SDL's is
+ * the binding one.
+ *
+ * A buffer is also the better fit once forced: this is probe-INDEXED data read
+ * with a plain index and never filtered — which is exactly what a texture bound
+ * POINT-clamp and read with Load() was pretending not to be — and the scene
+ * shaders had storage-buffer headroom (four of SDL's eight) where they had no
+ * sampler headroom at all.
+ */
+struct alignas(16) GiScreenProbeSh {
+    /// (c0, c1, c2, c3) of the red / green / blue channel.
+    glm::vec4 shR{0.0f};
+    glm::vec4 shG{0.0f};
+    glm::vec4 shB{0.0f};
+    /// xyz = the anchor's world normal, w = its camera distance. w == 0 is the
+    /// "no probe here" signal (a tile that was all sky) and the ONLY one the
+    /// forward gather gets, so it is written even for an invalid probe rather
+    /// than left holding the previous frame's occupant.
+    glm::vec4 meta{0.0f};
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbeSh, 64);
+BRACKEN_HLSL_FIELD(GiScreenProbeSh, shR, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbeSh, shG, 16);
+BRACKEN_HLSL_FIELD(GiScreenProbeSh, shB, 32);
+BRACKEN_HLSL_FIELD(GiScreenProbeSh, meta, 48);
+
+/** GiScreenProbePlaceUniforms (set 2, b0) — gi_screen_probe_place.comp.hlsl. */
+struct alignas(16) GiScreenProbePlaceUniforms {
+    /// Clip -> world of the DRAW (jittered) camera. It must be the jittered one:
+    /// the depth buffer this pass unprojects was rendered with the jitter, and
+    /// unprojecting it with the unjittered matrix offsets every anchor by the
+    /// jitter's world-space equivalent — small, but systematically biased in a
+    /// direction that changes every frame, which is the one thing a temporally
+    /// filtered probe cannot absorb.
+    glm::mat4 invViewProj{1.0f};
+    glm::vec3 cameraPosition{0.0f};
+    uint32_t frameIndex = 0;
+    glm::ivec2 probeGrid{0};
+    glm::ivec2 screenSize{0};
+    uint32_t missCapacity = 0;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+    uint32_t _pad2 = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbePlaceUniforms, 112);
+BRACKEN_HLSL_FIELD(GiScreenProbePlaceUniforms, invViewProj, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbePlaceUniforms, cameraPosition, 64);
+BRACKEN_HLSL_FIELD(GiScreenProbePlaceUniforms, frameIndex, 76);
+BRACKEN_HLSL_FIELD(GiScreenProbePlaceUniforms, probeGrid, 80);
+BRACKEN_HLSL_FIELD(GiScreenProbePlaceUniforms, screenSize, 88);
+BRACKEN_HLSL_FIELD(GiScreenProbePlaceUniforms, missCapacity, 96);
+
+/** GiScreenProbeMarchUniforms (set 2, b0) — gi_screen_probe_march.comp.hlsl. */
+struct alignas(16) GiScreenProbeMarchUniforms {
+    /// World -> clip, JITTERED: the march walks the depth buffer, and the depth
+    /// buffer is the jittered projection's.
+    glm::mat4 viewProj{1.0f};
+    /// UNJITTERED previous frame, the pair the velocity buffer was built from —
+    /// so a hit's reprojection into the TAA history agrees with how the history
+    /// itself was resolved.
+    glm::mat4 prevViewProjUnjittered{1.0f};
+    glm::vec3 cameraPosition{0.0f};
+    /// projection[2][2] of the draw projection (reversed-Z linearization).
+    float depthA = 0.0f;
+    glm::ivec2 probeGrid{0};
+    glm::ivec2 screenSize{0};
+    /// projection[3][2] of the draw projection.
+    float depthB = 0.0f;
+    /// How far a screen ray may travel in world units before it is handed off.
+    float rayMaxDistance = 0.0f;
+    /// Offset along the anchor normal before projecting the ray origin, world
+    /// units. Without it every ray's first sample is the anchor's own surface.
+    float normalBias = 0.0f;
+    /// 1 when the TAA history holds a resolved previous frame. 0 sends EVERY
+    /// ray straight to the BVH pass: there is no other source of screen
+    /// radiance, and marching a pyramid to sample a texture that means nothing
+    /// would be a confident wrong answer rather than a handoff.
+    float historyValid = 0.0f;
+    uint32_t frameIndex = 0;
+    uint32_t mipCount = 0;
+    uint32_t missCapacity = 0;
+    uint32_t _pad0 = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbeMarchUniforms, 192);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, viewProj, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, prevViewProjUnjittered, 64);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, cameraPosition, 128);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, depthA, 140);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, probeGrid, 144);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, screenSize, 152);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, depthB, 160);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, rayMaxDistance, 164);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, normalBias, 168);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, historyValid, 172);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, frameIndex, 176);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, mipCount, 180);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, missCapacity, 184);
+BRACKEN_HLSL_FIELD(GiScreenProbeMarchUniforms, _pad0, 188);
+
+/** GiScreenProbeArgsUniforms (set 2, b0) — gi_screen_probe_args.comp.hlsl. */
+struct alignas(16) GiScreenProbeArgsUniforms {
+    uint32_t missCapacity = 0;
+    /// The BVH pass's [numthreads].x. Sent rather than duplicated as a literal:
+    /// the args pass computes ceil(count / threadsPerGroup) for a DIFFERENT
+    /// shader's threadgroup size, and hardcoding another shader's constant is
+    /// exactly the kind of thing that survives a refactor of that shader.
+    uint32_t threadsPerGroup = 64;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbeArgsUniforms, 16);
+BRACKEN_HLSL_FIELD(GiScreenProbeArgsUniforms, missCapacity, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbeArgsUniforms, threadsPerGroup, 4);
+BRACKEN_HLSL_FIELD(GiScreenProbeArgsUniforms, _pad0, 8);
+BRACKEN_HLSL_FIELD(GiScreenProbeArgsUniforms, _pad1, 12);
+
+/**
+ * GiScreenProbeTraceUniforms (set 2, b0) — gi_screen_probe_trace.comp.hlsl.
+ *
+ * Leading 336 bytes ARE `ShadowDataUniforms`, for the same reason
+ * `GiProbeTraceUniforms`'s are: the pass includes `shadow_common.hlsli` and
+ * calls the forward pass's own `calcShadow()` rather than transliterating the
+ * standard-Z cascade math a second time.
+ */
+struct alignas(16) GiScreenProbeTraceUniforms {
+    ShadowDataUniforms shadow{};
+    glm::vec3 cameraPosition{0.0f};
+    /// GI_SP_WORLD_RAY_CLAMP — the handed-off ray's own length, NOT the screen
+    /// march's range.
+    float rayMaxDistance = 600.0f;
+    glm::vec3 cameraForward{0.0f, 0.0f, -1.0f};
+    float normalBias = 1.0f;
+    glm::vec3 sunDirection{0.0f, -1.0f, 0.0f};
+    float bounceScale = 1.0f;
+    glm::vec3 sunColor{0.0f};
+    float useSkyCube = 0.0f;
+    glm::vec3 ambientSky{0.0f};
+    float giEnabled = 1.0f;
+    glm::vec3 ambientGround{0.0f};
+    /// Pinned to 1: a screen-probe ray that escapes the clamp is shaded by the
+    /// sky/field blend below, and where the field has no answer the engine's
+    /// documented no-GI ambient tier — the hemisphere — is what is left.
+    float giAmbientFallback = 1.0f;
+    glm::ivec4 cascadeBase[3]{};
+    uint32_t tlasNodeCount = 0;
+    uint32_t lightCount = 0;
+    uint32_t lightCapacity = 0;
+    uint32_t missCapacity = 0;
+    glm::ivec2 probeGrid{0};
+    uint32_t frameIndex = 0;
+    /// Strength of the downward blend from sky radiance toward the probe
+    /// field's mean radiance on a ray that escaped the clamp. 1 = the full
+    /// heuristic; 0 = sky only. See rtScreenProbeFallback.
+    float horizonBlend = 1.0f;
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbeTraceUniforms, 512);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, shadow, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, cameraPosition, 336);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, rayMaxDistance, 348);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, cameraForward, 352);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, normalBias, 364);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, sunDirection, 368);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, bounceScale, 380);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, sunColor, 384);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, useSkyCube, 396);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, ambientSky, 400);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, giEnabled, 412);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, ambientGround, 416);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, giAmbientFallback, 428);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, cascadeBase, 432);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, tlasNodeCount, 480);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, lightCount, 484);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, lightCapacity, 488);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, missCapacity, 492);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, probeGrid, 496);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, frameIndex, 504);
+BRACKEN_HLSL_FIELD(GiScreenProbeTraceUniforms, horizonBlend, 508);
+
+/** GiScreenProbeFilterUniforms (set 2, b0) — gi_screen_probe_filter.comp.hlsl. */
+struct alignas(16) GiScreenProbeFilterUniforms {
+    glm::ivec2 probeGrid{0};
+    glm::ivec2 screenSize{0};
+    float alpha = 0.1f;
+    /// 0 on the first frame at a size and after any reallocation: there is no
+    /// previous atlas, so the EMA takes this frame whole.
+    float historyValid = 0.0f;
+    float fireflyMax = 8.0f;
+    uint32_t frameIndex = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbeFilterUniforms, 32);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, probeGrid, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, screenSize, 8);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, alpha, 16);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, historyValid, 20);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, fireflyMax, 24);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, frameIndex, 28);
+
+/** GiScreenProbeProjectUniforms (set 2, b0) — gi_screen_probe_project.comp.hlsl. */
+struct alignas(16) GiScreenProbeProjectUniforms {
+    glm::ivec2 probeGrid{0};
+    float normalPower = 8.0f;
+    uint32_t frameIndex = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiScreenProbeProjectUniforms, 16);
+BRACKEN_HLSL_FIELD(GiScreenProbeProjectUniforms, probeGrid, 0);
+BRACKEN_HLSL_FIELD(GiScreenProbeProjectUniforms, normalPower, 8);
+BRACKEN_HLSL_FIELD(GiScreenProbeProjectUniforms, frameIndex, 12);
 
 } // namespace bracken::gpu

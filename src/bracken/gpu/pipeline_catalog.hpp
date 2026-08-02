@@ -188,6 +188,18 @@ enum class ComputePipelineType {
     HzbCopy,   ///< Mip 0: D32 prepass depth (sampled) -> R32F storage level
     HzbReduce, ///< Mip N: conservative (reversed-Z MAX) reduction of mip N-1, one dispatch per mip
 
+    // Screen-probe gather (render/gi/screen_probes.hpp,
+    // docs/rt_lighting_plan.md §5.5, R4b). All six run inside one
+    // GIScreenProbes timer scope, in this order, once per frame, only under
+    // GiMode::ProbesScreen. Each is its own compute PASS: SDL3 GPU has no
+    // intra-pass synchronization and every one reads the previous one's output.
+    GiScreenProbePlace,   ///< Anchor one probe per 16x16 tile on the depth buffer; zero the counters
+    GiScreenProbeMarch,   ///< Stage A: Hi-Z screen march + TAA-history radiance; compact the misses
+    GiScreenProbeArgs,    ///< Miss count -> SDL_GPUIndirectDispatchCommand (one thread)
+    GiScreenProbeTrace,   ///< Stage B: INDIRECT dispatch, short BVH rays, sky/field fallback
+    GiScreenProbeFilter,  ///< Probe-space temporal: firefly clamp + reprojected EMA (ping-pong)
+    GiScreenProbeProject, ///< 3x3 probe-space spatial filter fused with the L1 SH projection
+
     // Count for iteration
     Count
 };

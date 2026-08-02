@@ -342,7 +342,7 @@ PLAYGROUND_RT=both ./playground --rt-bench 240        # trace both signals
 PLAYGROUND_RT=both PLAYGROUND_RT_RANGE=1 ./playground --rt-bench 240   # ...with a Medium instance range
 ```
 
-`PLAYGROUND_RT=shadows|reflections|both` selects which traced effects run and `PLAYGROUND_RT_RANGE=0..3` pins `rt_max_instance_range` (Near/Medium/Far/Unlimited); both also work with `--smoke`. `PLAYGROUND_GI=probes|probes_screen|off` pins `gi_mode` on exactly the same terms — an **unset** variable means Off, because these settings persist and "leave it alone" would silently inherit the last interactive session's choice. With GI on, `--smoke` prints two extra lines: `[smoke] gi ...` (mode, cascades, probes, probes invalidated this frame and cumulatively, atlas MB) and `[smoke] gi update ...` (rays cast, probes updated per cascade, probes relocated and classified inside geometry, cumulative totals). Since phase R1c it renders **differently** from GI off — that is the point — and the smoke gate is now two figures: `mean_luma=86.5 stddev=44.9` with GI off, `84.7 / 46.6` with `PLAYGROUND_GI=probes`. Two standing caveats: the reported times are **CPU record times** (SDL3 has no GPU timestamp API — `present_wait` is the CPU-bound-vs-GPU-bound signal), and a number from a default `build/` is not a performance number, because no `CMAKE_BUILD_TYPE` means `-O0` with live assertions. Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
+`PLAYGROUND_RT=shadows|reflections|both` selects which traced effects run and `PLAYGROUND_RT_RANGE=0..3` pins `rt_max_instance_range` (Near/Medium/Far/Unlimited); both also work with `--smoke`. `PLAYGROUND_GI=probes|probes_screen|off` pins `gi_mode` on exactly the same terms — an **unset** variable means Off, because these settings persist and "leave it alone" would silently inherit the last interactive session's choice. With GI on, `--smoke` prints two extra lines: `[smoke] gi ...` (mode, cascades, probes, probes invalidated this frame and cumulatively, atlas MB) and `[smoke] gi update ...` (rays cast, probes updated per cascade, probes relocated and classified inside geometry, cumulative totals). Since phase R1c it renders **differently** from GI off — that is the point — and the smoke gate is now three figures: `mean_luma=86.5 stddev=44.9` with GI off, `81.7 / 49.8` with `PLAYGROUND_GI=probes PLAYGROUND_RT=both`, and `82.3 / 50.4` with `PLAYGROUND_GI=probes_screen PLAYGROUND_RT=both` (which adds a third line, `[smoke] gi screen ...`, carrying the probe grid and the screen-hit / world-ray split). Two standing caveats: the reported times are **CPU record times** (SDL3 has no GPU timestamp API — `present_wait` is the CPU-bound-vs-GPU-bound signal), and a number from a default `build/` is not a performance number, because no `CMAKE_BUILD_TYPE` means `-O0` with live assertions. Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
 
 ### Gotchas checklist
 
@@ -562,7 +562,7 @@ Enum modes are `enum class : int` with **stable underlying values** — they are
 | `ibl_enabled` | `true` | image-based lighting: ambient diffuse + specular come from the prefiltered procedural sky; `false` falls back to the two-color hemisphere ambient |
 | `bloom_enabled` / `bloom_strength` | `true` / `0.25f` | bloom toggle + intensity (0.0–1.0) |
 | `bloom_threshold` | `1.1f` | post-exposure HDR luminance above which bloom contributes |
-| `gi_mode` | `GiMode::Off` | diffuse GI from the probe clipmap: `Off` / `Probes` / `ProbesScreen` (0/1/2). `ProbesScreen` behaves as `Probes` until phase R4. See [Probe-field GI](#probe-field-gi) — it replaces the DIFFUSE half of the ambient term in every scene shader with occluded, bounced light from the probe field, and **it builds the ray-tracing acceleration structure to do it** |
+| `gi_mode` | `GiMode::Off` | diffuse GI from the probe clipmap: `Off` / `Probes` / `ProbesScreen` (0/1/2). `ProbesScreen` adds the screen-probe gather on top of the field (sharper near-field GI, and bounce from SKINNED geometry the BVH cannot see) for ~0.55 ms and ~20 MB more. See [Probe-field GI](#probe-field-gi) — it replaces the DIFFUSE half of the ambient term in every scene shader with occluded, bounced light from the probe field, and **it builds the ray-tracing acceleration structure to do it** |
 | `gi_quality` | `GiQuality::Medium` | probe ray budget (`Low`/`Medium`/`High`, 0/1/2): rays per probe and how much of each cascade is refreshed per turn. Peak {55 k, 221 k, 332 k} rays/frame — see [Probe-field GI](#probe-field-gi) |
 | `volumetric_fog` | `false` | expensive; off by default |
 | `god_rays` | `false` | requires `volumetric_fog` |
@@ -7845,7 +7845,55 @@ sampler slots on the field (model/instanced 11–13, terrain 9–11, grass 7–9
 if you write your own cluster-lit shader you must declare those slots too. See
 the sampler-slot note under "Custom shaders" below.
 
-One forward-looking value you can set now and rely on later: `ProbesScreen` is a
-valid, persisted mode that behaves identically to `Probes` until the
-screen-probe gather of phase R4 lands. It exists early so a settings file
-written today keeps its meaning.
+### `GiMode::ProbesScreen` — the quality tier
+
+```cpp
+gs.gi_mode = GiMode::ProbesScreen;   // everything Probes does, plus a screen gather
+```
+
+Everything above still happens — the field is still traced, still lights the
+fog, and is still the fallback. On top of it, one 8x8 octahedral probe is placed
+per **16x16 screen tile** (100x57 = 5700 probes at 1600x900), traced against a
+hierarchical-Z pyramid first and short BVH rays second, filtered in probe space
+and published as L1 spherical harmonics that every scene shader blends over the
+field's answer where it is confident.
+
+**What it adds.** Sharpness at the scale the world field averages away. The
+field's finest cascade is 1.5 m; anything smaller than that — a crate against a
+wall, a doorway recess, the bounce under a cart — is a blur to it and is
+resolved by the screen probes. And the one thing the world field structurally
+cannot do: **skinned and dynamic geometry bounces light**. The BVH holds bind
+poses, but the depth buffer holds the animated character, so his own bounce and
+the darkening he casts on the ground beneath him exist in this tier and only in
+this tier.
+
+**What it costs.**
+
+- About **0.55 ms** of GPU wall time at 1600x900 on a mid discrete GPU, on top
+  of `Probes` (measured: frame render 4.48 → 5.03 ms, `present_wait`
+  3.89 → 4.43 ms, `--rt-bench 120` on the playground village in a
+  RelWithDebInfo tree). Two new timer rows, `HZB` and `GIScreenProbes`, both
+  CPU record times of ~0.016 ms — the work is on the device, as always.
+- About **20 MB**: ~7.7 MB of Hi-Z pyramid and ~11.8 MB of probe atlases,
+  buffers and the miss list.
+- It switches the depth prepass to its **G-buffer variants** — the probes need
+  real normals, not depth-tap reconstructions — exactly as `rt_shadows` /
+  `rt_reflections` do. If you already have either of those on, that is free.
+- It reads the **TAA history** as its screen radiance. With `aa_mode != TAA`
+  there is no history, so every ray is handed to the BVH instead: correct,
+  and slower. Turn TAA on if you turn this on.
+
+**Where it declines to answer**, and hands the pixel back to the world field: a
+tile that was all sky, a pixel whose four surrounding probes sit on other
+surfaces (thin railings, silhouettes), and geometry disoccluded this frame. That
+is a designed hand-off with a weight ramp, not a fallback path with a seam — the
+two tiers return the same unit, so the blend is a plain interpolation.
+
+Alpha-MASK foliage is the known rough edge: it is not in the depth prepass, so a
+probe anchored in a canopy tile describes what is behind the leaves. The same
+limitation the screen-space AO term already has.
+
+`SceneRenderer::screen_probes()` reports the grid, the probe count, and the
+lagged ray split (screen hits / world rays / world hits / sky-and-field
+fallbacks); the playground prints it as `[smoke] gi screen sp=... hits=...
+world=...`.

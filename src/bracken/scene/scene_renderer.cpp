@@ -247,6 +247,7 @@ void SceneRenderer::shutdown() {
     // Before the device goes: the probe atlases and the Hi-Z pyramid's mip
     // chain + sampler are released through it.
     probe_volume_.reset();
+    screen_probes_.reset();
     hzb_.reset();
 
     if (default_sampler_ && context_) {
@@ -1014,7 +1015,19 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // between neighbouring pixels there does not add noise to an
             // answer, it changes which question was asked — so that pass is
             // skipped outright without a G-buffer rather than degraded.
-            if (gfx.rt_reflections || gfx.rt_shadows || gfx.rt_local_shadows != LocalRtShadowMode::Off) {
+            //
+            // AND THE SCREEN PROBES NEED IT TOO (R4b). Their anchors' NORMALS
+            // are what every bilateral weight in the gather is measured
+            // against — the temporal history test, the 3x3 spatial filter and
+            // the forward 4-probe interpolation all ask "is this the same
+            // surface?" and answer with a dot product. A depth-tap
+            // reconstruction there would not add noise to an answer, it would
+            // move the plane the answer is about. So GiMode::ProbesScreen
+            // switches the prepass to the G-buffer set exactly as the traced
+            // effects do.
+            if (gfx.rt_reflections || gfx.rt_shadows ||
+                gfx.rt_local_shadows != LocalRtShadowMode::Off ||
+                gfx.gi_mode == GiMode::ProbesScreen) {
                 const int gw = context_->width();
                 const int gh = context_->height();
                 if (!normal_rough_texture_ || normal_rough_texture_->width() != gw ||
@@ -1217,6 +1230,112 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 probe_volume_.reset();
                 gi_init_failed_ = false;
             }
+
+            // ===== Screen-probe gather (R4b, docs/rt_lighting_plan.md §5.5):
+            // one 8x8 octahedral probe per 16x16 screen tile, traced against
+            // the Hi-Z pyramid first and the BVH second, filtered in probe
+            // space, published as an L1 SH atlas the scene shaders sample.
+            //
+            // AFTER the probe field's own update, deliberately and necessarily:
+            // the handed-off rays shade their hits with the field (R3's
+            // rt_hit_shade), and the rays that escape the 600-unit clamp fall
+            // back to it. A gather that ran first would be lit by the previous
+            // frame's field while claiming to be this frame's.
+            //
+            // BEFORE the forward pass, equally necessarily: the forward shaders
+            // read the SH atlas this block writes.
+            //
+            // The TAA history it samples is the PREVIOUS frame's resolve —
+            // `TAA::render` does not run until after the offscreen pass, which
+            // is what makes `previous_result()` mean what its name says here
+            // and not two hundred lines later. =====
+            const bool screen_probes_wanted =
+                gfx.gi_mode == GiMode::ProbesScreen && cmd != nullptr && hzb_ && hzb_->is_ready() &&
+                frame_prepass_active_ && normal_rough_texture_ && velocity_texture_ &&
+                probe_volume_ && probe_volume_->is_ready();
+            if (screen_probes_wanted) {
+                if (!screen_probes_ && !screen_probes_init_failed_) {
+                    auto gather = std::make_unique<render::gi::ScreenProbeGather>();
+                    if (gather->init(context_->device(), context_->width(), context_->height())) {
+                        screen_probes_ = std::move(gather);
+                    } else {
+                        // init() logged the reason. Latch it: retrying a
+                        // multi-megabyte allocation every frame would be a
+                        // per-frame stall and a log flood.
+                        screen_probes_init_failed_ = true;
+                        BRACKEN_LOG_WARN(LOG_TAG,
+                                         "screen-probe gather unavailable; gi_mode=ProbesScreen "
+                                         "behaves as Probes");
+                    }
+                }
+                if (screen_probes_) {
+                    screen_probes_->resize(context_->width(), context_->height());
+                    BRACKEN_PROFILE_ZONE_COLOR("GIScreenProbes", 0x1E8449);
+                    BRACKEN_GPU_SCOPE(cmd, "GIScreenProbes");
+                    BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "GIScreenProbes");
+
+                    render::gi::ScreenProbeParams sp;
+                    sp.pipelines = pipeline_registry_.get();
+                    sp.scene = rt_renderer_ ? &rt_renderer_->scene() : nullptr;
+                    sp.hzb = hzb_->texture();
+                    sp.hzb_mip_count = hzb_->mip_count();
+                    sp.gbuffer_normal = normal_rough_texture_->handle();
+                    // Only when TAA actually resolved a previous frame. Without
+                    // it every ray goes to the BVH — slower, and correct,
+                    // rather than fast and invented.
+                    gpu::GPUTexture* taa_prev =
+                        (taa_active && taa_) ? taa_->previous_result() : nullptr;
+                    sp.scene_history = taa_prev ? taa_prev->handle() : nullptr;
+                    sp.velocity = velocity_texture_->handle();
+                    sp.screen_width = context_->width();
+                    sp.screen_height = context_->height();
+                    // The DRAW (jittered) pair — the depth buffer's matrices.
+                    sp.view_projection = draw_camera.view_projection;
+                    sp.inv_view_projection = glm::inverse(draw_camera.view_projection);
+                    sp.prev_view_projection_unjittered = prev_view_proj_unjittered_;
+                    sp.camera_position = draw_camera.position;
+                    sp.camera_forward = -glm::vec3(draw_camera.view[0][2], draw_camera.view[1][2],
+                                                   draw_camera.view[2][2]);
+                    sp.depth_a = draw_camera.projection[2][2];
+                    sp.depth_b = draw_camera.projection[3][2];
+                    sp.environment = env_;
+                    sp.sun_intensity = gfx.sun_intensity;
+                    sp.shadow = frame_shadow_uniforms_;
+                    sp.shadow_atlas = shadow_map_->atlas_texture();
+                    sp.shadow_compare_sampler = shadow_map_->shadow_compare_sampler();
+                    sp.shadow_raw_sampler = shadow_map_->shadow_sampler();
+                    sp.sky_cube = (ibl_ && ibl_->is_ready()) ? ibl_->capture_map() : nullptr;
+                    sp.sky_cube_fallback = dummy_black_cube_ ? dummy_black_cube_->handle() : nullptr;
+                    sp.sky_sampler = (ibl_ && ibl_->cube_sampler() != nullptr) ? ibl_->cube_sampler()
+                                                                              : default_sampler_;
+                    sp.light_data = cluster_grid_.light_data_buffer();
+                    sp.light_count = cluster_grid_.total_lights();
+                    sp.light_capacity = render::lighting::MAX_LIGHTS;
+                    sp.gi_irradiance = probe_volume_->irradiance()->handle();
+                    sp.gi_irradiance_sampler = probe_volume_->linear_sampler();
+                    sp.gi_probe_state = probe_volume_->probe_state()->handle();
+                    const std::array<glm::ivec3, render::gi::CASCADE_COUNT> bases =
+                        probe_volume_->cascade_bases();
+                    for (std::size_t c = 0; c < bases.size(); ++c) {
+                        sp.gi_cascade_base[c] = glm::ivec4(bases[c], 0);
+                    }
+                    sp.gi_enabled = probe_volume_->cascade(0).placed() ? 1.0f : 0.0f;
+                    screen_probes_->render(cmd, sp);
+                }
+            } else {
+                if (screen_probes_ && gfx.gi_mode == GiMode::ProbesScreen) {
+                    // A transient (no prepass this frame, no G-buffer yet):
+                    // keep the allocation, drop the temporal history so the
+                    // next good frame does not EMA against a stale camera.
+                    screen_probes_->invalidate_history();
+                } else if (screen_probes_ || screen_probes_init_failed_) {
+                    // A real mode change. Released the moment the mode leaves
+                    // ProbesScreen, mirroring probe_volume_ and hzb_.
+                    screen_probes_.reset();
+                    screen_probes_init_failed_ = false;
+                }
+            }
+
             // ONE snapshot of the field for the whole frame (R1c). Taken after
             // the update passes rather than before, so the cascade bases a
             // forward draw uses are the ones the atlases were just written

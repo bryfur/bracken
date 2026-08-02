@@ -463,6 +463,16 @@ const UniformRow UNIFORM_TABLE[] = {
     // Hierarchical-Z pyramid (render/hzb.hpp).
     ROW("hzb_copy.comp.spv", 2, 0, gpu::HzbCopyUniforms),
     ROW("hzb_reduce.comp.spv", 2, 0, gpu::HzbReduceUniforms),
+    // Screen-probe gather (render/gi/screen_probes.hpp, R4b). Six passes, six
+    // cbuffers. GiScreenProbeTraceUniforms's leading 336 bytes are
+    // ShadowDataUniforms field for field, for the same reason
+    // GiProbeTraceUniforms's are — so this row pins that embedding too.
+    ROW("gi_screen_probe_place.comp.spv", 2, 0, gpu::GiScreenProbePlaceUniforms),
+    ROW("gi_screen_probe_march.comp.spv", 2, 0, gpu::GiScreenProbeMarchUniforms),
+    ROW("gi_screen_probe_args.comp.spv", 2, 0, gpu::GiScreenProbeArgsUniforms),
+    ROW("gi_screen_probe_trace.comp.spv", 2, 0, gpu::GiScreenProbeTraceUniforms),
+    ROW("gi_screen_probe_filter.comp.spv", 2, 0, gpu::GiScreenProbeFilterUniforms),
+    ROW("gi_screen_probe_project.comp.spv", 2, 0, gpu::GiScreenProbeProjectUniforms),
 
     // ---- renderer-owned mirrors (same contract, different header) ----
     ROW("model.frag.spv", 3, 2, render::lighting::ClusterParams),
@@ -610,6 +620,20 @@ TEST(UniformLayout, StructuredBufferStridesMatchCpuRecords) {
          sizeof(bracken::gpu::GiProbeUpdateRecord)},
         {"gi_probe_classify.comp.spv", 0, 1, "gpu::GiProbeUpdateRecord",
          sizeof(bracken::gpu::GiProbeUpdateRecord)},
+        // The screen-probe header, written by the placement pass and read by
+        // the four after it. Every one of them indexes the same array by probe
+        // id, so a stride disagreement would not be a wrong value, it would be
+        // a different probe.
+        {"gi_screen_probe_place.comp.spv", 1, 0, "gpu::GiScreenProbeHeader",
+         sizeof(bracken::gpu::GiScreenProbeHeader)},
+        {"gi_screen_probe_march.comp.spv", 0, 2, "gpu::GiScreenProbeHeader",
+         sizeof(bracken::gpu::GiScreenProbeHeader)},
+        {"gi_screen_probe_trace.comp.spv", 0, 11, "gpu::GiScreenProbeHeader",
+         sizeof(bracken::gpu::GiScreenProbeHeader)},
+        {"gi_screen_probe_filter.comp.spv", 0, 3, "gpu::GiScreenProbeHeader",
+         sizeof(bracken::gpu::GiScreenProbeHeader)},
+        {"gi_screen_probe_project.comp.spv", 0, 1, "gpu::GiScreenProbeHeader",
+         sizeof(bracken::gpu::GiScreenProbeHeader)},
     };
     for (const StrideRow& row : rows) {
         SCOPED_TRACE(::testing::Message() << row.cpu_type << " vs " << row.shader);

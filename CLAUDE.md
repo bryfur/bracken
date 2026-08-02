@@ -113,7 +113,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload; opt-in via `BRACKEN_HOT_RELOAD=1`) + `AssetRegistry` (host-facing utility — engine systems register on the watcher directly) |
 | `memory/` | `bracken::memory` | arena allocator, frame allocator |
 | `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) over `pipeline_catalog.hpp` (one `constexpr` row per `PipelineType`: shaders, resources, vertex layout, target, depth/blend state), `gpu_uniforms.hpp` (CPU↔GPU contract) |
-| `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO, TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas |
+| `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO, TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI, hierarchical-Z pyramid (`hzb.hpp`); `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas; `gi/` = the probe-field clipmap and the screen-probe gather |
 | `render/raytracing/` | `render::rt` | software BVH (32-byte nodes, binned SAH, two-level BLAS/TLAS) + `RtScene`; `render/rt_renderer.hpp` drives the traced passes and their denoisers. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
 | `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror — addressing, ray directions, the blend curve, and the sampler's cascade/weight math. **Complete as of R1c**: the field traces and accumulates itself, and `shaders/gi_sample.hlsli` replaces the DIFFUSE half of the ambient term in every scene fragment shader (three banded atlases, three sampler slots) plus the volumetric fog's in-scatter. Off by default (`gi_mode`); GI on builds the ray-tracing acceleration structure with attributes |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
@@ -441,6 +441,20 @@ evidence that no RT-series commit moved the RT-off path.
 | `--smoke 30` (RT off) | `86.6 / 44.9` |
 | `--smoke 30 PLAYGROUND_AO=0` | `87.0 / 44.5` |
 | `--smoke 30 PLAYGROUND_AO=2` | `86.4 / 45.0` |
+
+Re-measured on the Linux/GCC/Vulkan checkout at R4b (this machine reads `86.5`
+where the Metal table above reads `86.6` — see the memory note on Metal-only
+baselines). The three the ray-tracing phases gate on:
+
+| Invocation | mean_luma / stddev |
+|---|---|
+| `--smoke 30` (RT off, GI off) | `86.5 / 44.9` |
+| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes` | `81.7 / 49.8` |
+| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes_screen` | `82.3 / 50.4` |
+
+The third stopped being a copy of the second at R4b, when `GiMode::ProbesScreen`
+gained the screen-probe gather (`render/gi/screen_probes.hpp`,
+docs/rt_lighting_plan.md §5.5) instead of behaving as `Probes`.
 | `--smoke 30 PLAYGROUND_GI=probes` | `84.3 / 46.9` |
 | `PLAYGROUND_RT=both --smoke 30` | `83.9 / 47.9` |
 | `PLAYGROUND_RT=both PLAYGROUND_GI=probes --smoke 30` | `81.7 / 49.8` |

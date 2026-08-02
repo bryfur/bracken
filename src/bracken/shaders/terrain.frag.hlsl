@@ -44,9 +44,14 @@ cbuffer LightingUniforms {
     // world. giEnabled gates every tap; 0 restores the pre-R1c ambient exactly.
     int4 giCascadeBase[3];
     float giEnabled;
-    float _giPad0;
-    float _giPad1;
-    float _giPad2;
+    // Screen-probe gather (R4b, render/gi/screen_probes.hpp). These three were
+    // _giPad0.._giPad2, so the cbuffer neither grew nor moved a field.
+    // giScreenEnabled gates every tap; 0 restores the pure probe-field ambient.
+    // The grid arrives as floats because the pads were floats — the SH atlas's
+    // addressing casts them back to ints in gi_screen_sample.hlsli.
+    float giScreenEnabled;
+    float giScreenProbesX;
+    float giScreenProbesY;
 };
 
 [[vk::binding(1, 3)]]
@@ -152,15 +157,19 @@ Texture2D<float> rtLocalShadowTexture;
 [[vk::combinedImageSampler]][[vk::binding(12, 2)]]
 SamplerState rtLocalShadowSampler;
 
+
 #include "shadow_common.hlsli"
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
-// Cluster SSBOs follow this shader's 13 fragment samplers in set 2 (slots
-// 0-12 above + the local-shadow ATLAS at 13, declared by the include).
+// Cluster SSBOs follow this shader's 14 fragment samplers in set 2 (slots
+// 0-12 above + the local-shadow ATLAS at 13, declared by the include). R4b's
+// screen-probe SH buffer is a FIFTH storage buffer at base + 4, declared by
+// gi_screen_sample.hlsli.
 #define CLUSTER_SSBO_BINDING_BASE 14
 #include "gi_sample.hlsli"
 #include "cluster_lighting.hlsli"
+#include "gi_screen_sample.hlsli"
 
 static const float TERRAIN_METALLIC = 0.0;
 static const float TERRAIN_AO = 1.0;
@@ -295,6 +304,15 @@ float4 PSMain(PSInput input) : SV_Target {
     float3 giIrradiance = float3(0, 0, 0);
     if (giEnabled > 0.5) {
         giIrradiance = giSampleDiffuse(worldPos, N, V, ambientSky, ambientGround);
+        // Screen probes (R4b) on TOP of the field, never instead of it. Same
+        // unit — irradiance/pi — so this is a straight lerp, and the weight is
+        // what makes the hand-off safe: a pixel whose four probes sit on other
+        // surfaces, or whose tile was sky, gets weight 0 and keeps the field's
+        // answer exactly.
+        float giScreenWeight;
+        float3 giScreen =
+            giScreenSampleDiffuse(input.position.xy, worldPos, N, cameraPos, giScreenWeight);
+        giIrradiance = lerp(giIrradiance, giScreen, giScreenWeight);
     }
     float3 ambient;
     if (iblEnabled > 0.5) {

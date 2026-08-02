@@ -40,6 +40,25 @@ struct GiBindings {
     /// 1 only when the field exists, is placed, and `gi_mode != GiMode::Off`.
     /// Every shader gates every tap on this; 0 is the pre-R1c ambient exactly.
     float enabled = 0.0f;
+
+    /**
+     * The R4b screen-probe tier's published L1 spherical harmonics: one
+     * `gpu::GiScreenProbeSh` per probe, bound as the scene shaders' FIFTH
+     * fragment storage buffer (right after `cluster_lighting.hlsli`'s four).
+     *
+     * A BUFFER RATHER THAN A SAMPLER because SDL3 GPU hard-caps a shader stage
+     * at 16 samplers — `SDL_CreateGPUShader` asserts past it and the pipeline
+     * is never created — and every scene shader is already there. It is also
+     * the better fit: probe-indexed records, read by index, never filtered.
+     */
+    SDL_GPUBuffer* screen_sh = nullptr;
+    /// The probe grid (tiles across, tiles down). Sent as floats because the
+    /// scene cbuffers had float pads to spend; the shaders cast them back.
+    glm::vec2 screen_probes{0.0f};
+    /// 1 only when `gi_mode == GiMode::ProbesScreen` AND the gather actually
+    /// ran this frame. 0 makes every scene shader keep the field's answer
+    /// exactly, which is what `probes_screen` did before this phase.
+    float screen_enabled = 0.0f;
 };
 
 } // namespace bracken::render::gi

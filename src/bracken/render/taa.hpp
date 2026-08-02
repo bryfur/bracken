@@ -89,6 +89,23 @@ public:
     void invalidate_history() { history_valid_ = false; }
     bool history_valid() const { return history_valid_; }
 
+    /**
+     * The PREVIOUS frame's resolved linear-HDR scene colour, or null when there
+     * is none (before the first resolve, after a resize, after
+     * invalidate_history).
+     *
+     * Published for the R4b screen-probe gather, which reads it as the radiance
+     * of a screen-space hit — a hit is an arbitrary world point that was
+     * shaded last frame, and this is the only buffer that holds what it looked
+     * like. VALID ONLY BEFORE `render()` runs for the current frame: after it,
+     * this slot holds the frame just resolved. The gather runs long before TAA
+     * in `SceneRenderer::render_frame`, which is what makes the contract
+     * satisfiable rather than merely stated.
+     */
+    [[nodiscard]] gpu::GPUTexture* previous_result() const {
+        return history_valid_ ? history_[static_cast<std::size_t>(history_write_ ^ 1)].get() : nullptr;
+    }
+
     /** Post-resolve unsharp-mask strength (0 = plain copy-back). The default
      *  is a deliberately subtle counter to residual temporal softness. */
     static constexpr float DEFAULT_SHARPEN_STRENGTH = 0.25f;
