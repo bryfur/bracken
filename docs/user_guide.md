@@ -4469,7 +4469,7 @@ traced instance list gets no sun shadow there rather than falling back to CSM.
 | Setting | Default | What it buys / costs |
 |---|---|---|
 | `rt_shadows` | `false` | Soft sun shadows with real distance-growing penumbrae. One any-hit ray per pixel; the cheaper of the two, because an occlusion ray can stop at the first hit. |
-| `rt_reflections` | `false` | Traced specular on smooth surfaces. Costs **more** than shadows: closest-hit cannot stop early, and it additionally needs per-triangle shading attributes, which more than doubles the structure's triangle memory. Enabling it after the structure was built for shadows alone forces a rebuild — a visible hitch, logged. |
+| `rt_reflections` | `false` | Traced specular on smooth surfaces, with hit lighting shared with the GI probe rays (shadowed sun + local lights + probe/hemisphere ambient). Costs **more** than shadows: closest-hit cannot stop early, and it additionally needs per-triangle shading attributes, which more than doubles the structure's triangle memory. Enabling it after the structure was built for shadows alone forces a rebuild — a visible hitch, logged. |
 | `rt_shadow_resolution`, `rt_reflection_resolution` | `Full`, `Full` | The dominant ray-count dial (`RtResolution::Full`/`Half`/`Quarter` of screen resolution). The denoisers upsample back to full res either way, so a lower setting costs silhouette sharpness rather than producing a blocky image. This is the knob to give weaker GPUs. |
 | `rt_sun_softness_deg` | `0.35` | Angular *radius* of the sun disk in degrees (the real sun is ~0.265). **Free to trace** — the ray count is identical, only the denoiser works harder. `0` collapses the cone to a hard shadow, which is the honest way to A/B the soft path. |
 | `rt_reflection_max_roughness` | `0.75` | Roughness at which traced specular hands over entirely to the prefiltered IBL probe. Higher = more of the frame reflects. Nearly free, because the pass is bound by wave divergence rather than by traced-pixel count. `0` stops tracing without tearing the structure down. |
@@ -4483,9 +4483,25 @@ traced instance list gets no sun shadow there rather than falling back to CSM.
   shadow tracks it around the world but does not animate with it. Since the
   traced mask replaces CSM, that *is* the shadow, not a fallback.
 - **A ray hit cannot sample textures** — no bindless, no UVs at the hit. Hit
-  shading is an interpolated normal plus one flat colour per triangle, and the
-  sun term at a reflection hit is unshadowed. Reflections therefore show no
-  cast shadows and no bounced light.
+  shading is an interpolated normal plus one flat colour per triangle, baked
+  from the albedo map's centroid sample at load. That restriction stands; the
+  *lighting* on it no longer does. Since R3 a reflection hit is shaded by the
+  same `shaders/rt_hit_shade.hlsli` the GI probe rays use: the sun term is
+  **CSM-shadowed**, the frame's point/spot lights are summed, and the ambient
+  comes from the probe field when `gi_mode` is on and from the
+  `EnvironmentState` hemisphere when it is off. A miss returns the real sky in
+  the ray's direction rather than one flat horizon colour. So reflections DO
+  show cast shadows, local lights and (with GI on) bounced light — and turning
+  GI on changes what a reflection looks like, not just what a directly-drawn
+  surface looks like.
+
+  Two consequences worth budgeting for. Reflected surfaces are **darker** than
+  they were before R3, because the old shading was missing the Lambertian 1/π
+  and the `sun_intensity` multiplier in opposite directions and only looked
+  right at `sun_intensity == 3`; if you had tuned `rt_reflection_intensity`
+  against that, re-tune it. And the trace now binds the CSM atlas, the sky
+  capture cube, the light buffer and the probe atlases, so it must run after
+  all of those are built — which it already does.
 - **Every signal is one sample per pixel and stochastic**, so the denoisers
   are load-bearing. Expect temporal lag behind fast-moving occluders; that is
   the accumulation window doing its job, not a bug.

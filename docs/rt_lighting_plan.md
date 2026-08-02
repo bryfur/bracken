@@ -1,7 +1,8 @@
 # Ray-Traced Lighting — Research & Plan of Record
 
-Status: **in progress — R0 (foundations), R1 (probe-field GI) and R2
-(froxel-RIS local-light shadows) have landed**; R3 onward is still proposal. Written 2026-08-02 against the working tree at the
+Status: **in progress — R0 (foundations), R1 (probe-field GI), R2
+(froxel-RIS local-light shadows) and R3 (honest hit lighting) have landed**;
+R4 onward is still proposal. Written 2026-08-02 against the working tree at the
 RT-denoiser series (post "RT shadows: stop multiplexing ambient occlusion into
 the shadow mask"); R0's landed work packages are marked in §5.0 and R1's three
 packages in §5.2. As of R1c the probe field lights the frame — the first
@@ -22,9 +23,10 @@ shippable; each leaves the tree working, tested, and documented.
 `docs_coherence.test.cpp`'s `DOCS[]` list while phases are unlanded — it cites
 files that do not exist yet, which check (a) of that test would fail. The
 earlier plan was to add it once R1 landed; R1 has landed and that is **still
-wrong**, for a reason worth recording rather than silently deferring: §5.4 cites
-`rt_hit_shade.hlsli` and §5.0 cites an STBN `.inc`, neither of which exists, so
-check (a) would fail on a document that is accurate about everything it claims.
+wrong**, for a reason worth recording rather than silently deferring: §5.0 cites
+an STBN `.inc` that does not exist, so check (a) would fail on a document that is
+accurate about everything it claims. (§5.4's `rt_hit_shade.hlsli` was the other
+half of that argument until R3 created it.)
 The right trigger is "no unlanded phase cites a file that does not exist" —
 i.e. after R6, or an earlier split of this document into a landed-history half
 and a proposal half. Everything cited from the *current* tree below was
@@ -93,8 +95,10 @@ ambient term is a hard-coded `fogColor * 0.2`, and histogram auto-exposure.
 
 1. A ray hit cannot sample textures — no UVs, no material index, no bindless.
    Hit shading is interpolated normal + flat color, full stop.
-2. Reflection hit lighting is wrong twice: the sun term is unshadowed and the
-   ambient is a flat constant. Reflections show no GI and no shadows.
+2. ~~Reflection hit lighting is wrong twice: the sun term is unshadowed and the
+   ambient is a flat constant. Reflections show no GI and no shadows.~~
+   **Fixed by R3** — reflection and probe rays now share
+   `shaders/rt_hit_shade.hlsli`. See §5.4.
 3. Skinned meshes trace their **bind pose** (translated/rotated into place).
    Because the traced sun mask *replaces* CSM, an animated character's RT
    shadow does not animate.
@@ -871,6 +875,95 @@ binding-compatible (catalog counts); reflection luma A/B (interiors darken,
 lit walls brighten — banded assertions per pinned ToD); virtual-reproj
 ghosting scene (orbiting camera over water/mirror floor, stddev of frame
 delta must drop vs. baseline).
+
+**Landed (R3, 2026-08-02) — reflections stop lying about their hits, and the
+denoiser stops reprojecting the wrong point. R3 is complete.** No new pass, no
+new setting, no new default: everything below is a change to what two existing
+dispatches compute.
+
+- **`shaders/rt_hit_shade.hlsli`** is the extraction, and it went out of
+  `gi_probe_trace.comp.hlsl` verbatim — the recipe, the units argument and the
+  reasoning for every term moved with the code. Two-phase include, the
+  `rt_trace.hlsli` contract (`TriangleAttributes` in phase 1, so the including
+  shader can declare its attribute buffer; the functions in phase 2, because
+  they read `shadowAtlas`/`giIrradiance`/`lightDataBuf` by name). It includes
+  `shadow_common.hlsli` ITSELF rather than requiring the entry shader to, so a
+  consumer cannot forget it and silently get the unshadowed sun back. The proof
+  the extraction is behaviour-neutral is that `PLAYGROUND_GI=probes --smoke 30`
+  reproduces `84.7 / 46.6` bit for bit with the rough-specular change below
+  disabled — the two were measured separately for exactly this reason.
+- **Two flags, not knobs**, are what let one function serve both callers.
+  `giEnabled` is 0 when `gi_mode` is Off, where `RtRenderer` binds its own 1×1
+  stand-ins; the probe-state plane is a read-only STORAGE texture and the
+  engine's shared dummies carry sampler usage only, which is why they are owned
+  here rather than borrowed. `giAmbientFallback` is 1 for reflection rays and
+  **0 for probe rays**: a probe already collects sky through its ray misses, so
+  a hemisphere added where the field has no answer would double-count it AND
+  break the bounce series' convergence argument (the series sums albedo^k only
+  because each term is the previous field, not the previous field plus a
+  constant). A reflected rooftop outside the field has no such source and must
+  fall back.
+- **The π that was hiding.** The old reflection shading was wrong by π twice, in
+  opposite directions: no Lambertian 1/π, and `sunColor` pushed without
+  `GraphicsSettings::sun_intensity`. At the playground's `sun_intensity` of 3
+  those very nearly cancel (3/π ≈ 0.955), which is why the flat shading looked
+  plausible and would not have at any other value. Both are fixed together;
+  reflected surfaces are correspondingly darker and now match the same surface
+  drawn directly.
+- **Budget.** The reflection pass went to 6 samplers + 1 read-only storage
+  texture + **6** read-only storage buffers. Six, not ten: the light list is
+  read FLAT, out of the same byte layout `cluster_lighting.hlsli` decodes,
+  rather than through `cluster_compute.hlsli`'s froxel grid — which would have
+  cost four more read-only storage buffers against a ceiling of eight, and
+  which cannot answer for a world-space hit anyway. R2b's ceiling held without
+  a fight.
+- **Virtual-hit-point reprojection** in `rt_reflection_denoise_temporal.comp.hlsl`
+  finally consumes R0's `hitT`. The virtual point is built off the MIRROR
+  direction, not the traced GGX sample: the lobe axis is the only part of it
+  stable frame to frame, and reconstructing the stochastic sample would make the
+  reprojection as noisy as the signal it cleans. Both motion vectors are UV
+  deltas in the velocity buffer's own convention (current minus previous,
+  unjittered), so the TAA jitter cancels inside each difference rather than
+  having to be removed — which also means the pass never needs to know whether
+  jitter is on. Blended, not switched, by
+  `render/rt_reflection_math.hpp`'s `virtual_reprojection_weight` (1 at
+  roughness 0.05, 0 by 0.40, both below `fade_start`), so no roughness makes a
+  pixel's history jump texels. `max_accum_frames` was NOT raised off 16 in this
+  phase: the smoke camera is static, which makes the mechanism exactly neutral
+  and therefore proves nothing about how far the window can now be pushed.
+  Raising it wants a moving-camera A/B that this phase did not build.
+- **Rough-tier ambient specular goes local.** `pbr.hlsli`'s `ambientIBL` blends
+  the sky-only prefiltered lobe toward the probe field over a 0.6→1.0 roughness
+  band, scaled by the existing `giWeight`. This is the one change that moves the
+  GI-on image without any RT setting: `PLAYGROUND_GI=probes --smoke 30` goes
+  `84.7 / 46.6` → **`84.3 / 46.9`**. GI off is bit-identical, branch untaken.
+- **One incidental fix.** `rt_sampling.hlsli` carried a byte-identical private
+  copy of `interleavedGradientNoise`, which collided the moment the reflection
+  pass included both it and `shadow_common.hlsli`. It now includes
+  `lighting.hlsli` like everything else. One definition in the tree.
+- **Measured**, playground village, 1600×900, Linux/Vulkan, `--smoke 30`, three
+  identical runs each. `--smoke 30` unchanged at `86.5 / 44.9`;
+  `PLAYGROUND_RT=both` unchanged at `83.9 / 47.9` — which is a COINCIDENCE of
+  the aggregate, not a null result: 94% of the screenshot's bytes differ, to a
+  maximum of 172/255, because reflections of sky-facing foliage brightened by
+  exactly as much as reflections of shadowed facades darkened.
+  `PLAYGROUND_RT=both PLAYGROUND_GI=probes` moves `82.1 / 49.6` → **`81.7 /
+  49.8`**. The chrome orb over the plaza is the readable evidence: before, a
+  featureless cream blob with brown smears (every reflected surface lit as if in
+  full sun and washed toward one horizon colour); after, a proper mirror ball
+  with a blue sky hemisphere, visible cloud and sun, a clean horizon line, and a
+  dark lower hemisphere — warm and bounce-varied with GI on, neutral grey with
+  it off. `--rt-bench 120 PLAYGROUND_RT=both` (`-O0` tree, ratios only):
+  `RTReflectionTrace` CPU record 0.0043 → 0.0052 ms mean (four more sampler
+  binds and a 240 → 672-byte uniform push), everything else flat, and
+  `present_wait` 1.408 → 1.372 ms — i.e. **no measurable GPU cost**, which is
+  what the pass being wave-divergence bound rather than ALU bound predicts.
+  1406 tests pass (+8).
+- **Still open here.** `max_accum_frames` (above). The rough-specular band's
+  edges are eyeballed constants pinned by test, not derived. And the reflection
+  hit still has no shadowed LOCAL lights — R2b's froxel-RIS mask is screen-space
+  and cannot answer for a world-space hit, so the loop stays unshadowed, exactly
+  as the probe rays' does.
 
 ### 5.5 R4 — Screen-probe gather (the quality tier)
 

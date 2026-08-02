@@ -139,6 +139,18 @@ float3 ambientPBR(float3 N, float3 V, float3 baseColor, float metallic, float ro
 // linear.
 static const float IBL_SPECULAR_MIPS = 7.0; // render::IBL::SPECULAR_MIPS — keep in sync
 
+// How much of the ambient SPECULAR lobe the probe field supplies instead of the
+// sky-only prefilter chain, as a function of roughness. TRANSLITERATION of
+// `rough_specular_gi_weight` in render/rt_reflection_math.hpp, which is the
+// source of truth, carries the reasoning for both edges, and is tested with no
+// GPU. Change one, change both.
+#define GI_ROUGH_SPECULAR_START 0.6
+#define GI_ROUGH_SPECULAR_END 1.0
+
+float giRoughSpecularWeight(float roughness) {
+    return smoothstep(GI_ROUGH_SPECULAR_START, GI_ROUGH_SPECULAR_END, roughness);
+}
+
 float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metallic,
                   float roughness, float ao, float lift,
                   TextureCube<float4> irradianceMap, SamplerState irradianceSampler,
@@ -152,8 +164,9 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
                   // Probe-field GI (R1c, render/gi/): when giWeight > 0 this
                   // REPLACES the irradiance-cube diffuse below. NOT pre-scaled
                   // by the ambient lift — unlike ambientPBR's, this function
-                  // applies `ao * lift` to everything at the end. The specular
-                  // half is untouched until R4.
+                  // applies `ao * lift` to everything at the end. Since R3 the
+                  // ROUGH end of the specular half uses it too — see
+                  // giRoughSpecularWeight.
                   float3 giIrradiance = float3(0, 0, 0), float giWeight = 0.0) {
     float NdotV = max(dot(N, V), 1e-4);
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metallic);
@@ -173,6 +186,22 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
     float3 R = reflect(-V, N);
     float mip = roughness * (IBL_SPECULAR_MIPS - 1.0);
     float3 prefiltered = specularMap.SampleLevel(specularSampler, R, mip).rgb;
+    // ROUGH-TIER FALLBACK GOES LOCAL (R3, docs/rt_lighting_plan.md §5.4).
+    //
+    // The prefilter chain is built over the procedural SKY alone, so at the
+    // rough end — where the reflection trace has already handed over and the
+    // lobe is wide enough to be an average of everything the surface can see —
+    // it returns an average of open sky the surface may be nowhere near. Rough
+    // metal in a courtyard mirrors a sky it cannot see.
+    //
+    // The probe field's irradiance is the occluded version of exactly that
+    // average (at alpha near 1 the GGX and cosine lobes integrate to nearly the
+    // same thing), so above the band it takes over. Scaled by giWeight, so with
+    // GI off the branch is not taken and this path is bit-identical.
+    float roughSpecWeight = giRoughSpecularWeight(roughness) * giWeight;
+    if (roughSpecWeight > 0.0) {
+        prefiltered = lerp(prefiltered, giIrradiance, roughSpecWeight);
+    }
     float2 envBRDF = brdfLut.SampleLevel(brdfLutSampler, float2(NdotV, roughness), 0).rg;
     // Horizon occlusion: fade lobes that dip below the geometric surface.
     // No-op when N == Ngeo (dot(R, N) == NdotV >= 0).

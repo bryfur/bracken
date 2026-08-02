@@ -11,38 +11,17 @@
 // That is the single property that makes diffuse GI affordable on hardware that
 // cannot trace one ray per pixel.
 //
-// HIT SHADING v1, the recipe the plan specifies:
-//
-//   L_out = albedo_flat * ( sunColor * max(0, N.L) * sunVisibility
-//                         + local point/spot lights, range-windowed
-//                         + pi * previous-frame probe irradiance ) / pi
-//         | on a miss: the sky radiance in the ray direction
-//
-// Three of those terms are things this engine could already answer and no other
-// renderer's probe pass gets for free:
-//
-//  * `albedo_flat` is TriangleAttributes::baseColor, baked from the real albedo
-//    texture's centroid-UV sample at load. SDL3 GPU has no bindless, so a ray
-//    hit cannot sample a texture — the flat table is the answer, and it was
-//    already built for reflections.
-//  * `sunVisibility` is a CSM ATLAS FETCH, not a second ray. The cascades are
-//    already rendered this frame, so the probe field re-lights itself for free
-//    whenever the sun moves: next frame's probe rays see the new atlas, and the
-//    response lag is the accumulation hysteresis alone.
-//  * the bounce term is LAST FRAME'S OWN FIELD sampled at the hit. That is the
-//    standard DDGI recursion and it is what makes the result an infinite-bounce
-//    solution out of a single-bounce trace: update n contains n-1 bounces, so
-//    the series converges to sum(albedo^k) = 1/(1-albedo) — bounded for any
-//    physical albedo below 1, which is why it converges rather than ringing.
-//    `bounceScale` below 1 shortens the series if a scene is bright enough to
-//    make that a problem.
+// HIT SHADING LIVES IN `rt_hit_shade.hlsli` (R3). It used to live here, and the
+// reflection pass had its own worse copy; the recipe, the units argument and
+// the reasoning for each term all moved to that file verbatim. What is left
+// below is this pass's own business: which probe, which direction, and what a
+// BACKFACE hit means to the classifier.
 //
 // UNITS. The atlas stores COSINE-WEIGHTED MEAN INCOMING RADIANCE, i.e.
 // irradiance/pi — deliberately the same convention as the IBL irradiance cube
 // (`ibl_irradiance.frag.hlsl` stores (1/pi) * integral of L*cos), which is what
 // lets gi_sample.hlsli substitute one for the other without a scale factor
-// appearing anywhere. That is why the shading below divides by pi once and multiplies the
-// sampled bounce by pi once.
+// appearing anywhere.
 
 #include "gi_probe.hlsli"
 
@@ -51,17 +30,10 @@
 #define RT_TRACE_TYPES
 #include "rt_trace.hlsli"
 
-// Only reflections and this pass bind per-triangle attributes; shadows must not
-// pay for them. Same declaration as rt_reflection.comp.hlsl.
-struct TriangleAttributes {
-    float3 n0;
-    float pad0;
-    float3 n1;
-    float pad1;
-    float3 n2;
-    float pad2;
-    float4 baseColor;
-};
+// TriangleAttributes + the hit-shading model, phase 1 (the struct alone). The
+// binding block below needs the struct to declare its attribute buffer.
+#define RT_HIT_SHADE_TYPES
+#include "rt_hit_shade.hlsli"
 
 // One probe scheduled this frame. Mirrors gpu::GiProbeUpdateRecord (32 B).
 struct GiProbeUpdate {
@@ -118,6 +90,15 @@ cbuffer GiProbeTraceUniforms : register(b0, space2) {
     uint giLightCapacity;
     uint giFrameIndex;
     uint _giPad0;
+    // rt_hit_shade.hlsli's two ambient flags, pinned by ProbeVolume::trace to
+    // (1, 0): the probe field is by definition available here, and a probe's
+    // own bounce term must NOT fall back to the hemisphere where the field has
+    // no answer — see rtHitAmbient for why that would double-count sky and
+    // break the bounce series.
+    float giEnabled;
+    float giAmbientFallback;
+    float _giPad1;
+    float _giPad2;
 };
 
 // ---------------------------------------------------------------------------
@@ -181,173 +162,13 @@ SamplerState giIrradianceSampler : register(s3, space0);
 #define RT_TRACE_TRAVERSAL
 #include "rt_trace.hlsli"
 
-// calcShadow() + selectShadowCascade() over the cbuffer members declared above.
+// Hit shading, phase 2: rtHitSkyRadiance / rtShadeHit over the resources and
+// cbuffer members declared above. It includes shadow_common.hlsli itself, so
+// the calcShadow() this pass's hits get is the same one the forward pass calls.
 // Included AFTER the bindings for the same reason rt_trace.hlsli's second phase
-// is: it reads shadowAtlas/shadowCmpSampler by name.
-#include "shadow_common.hlsli"
-
-// ---------------------------------------------------------------------------
-// Sky
-// ---------------------------------------------------------------------------
-
-/// Radiance of a ray that escaped the scene.
-///
-/// The IBL sky-capture cube is the SAME radiance function the skybox draws
-/// (sky_common.hlsli, shared by skybox.frag and sky_capture.frag), so probes
-/// carry the real time-of-day sky WITH occlusion — blue in a courtyard, dark
-/// under an eave, which is exactly what a flat `ambient_sky` constant could
-/// never do. When IBL is off the cube slot holds the engine's cube dummy, so
-/// `useSkyCube` gates it and the EnvironmentState hemisphere takes over.
-float3 giSkyRadiance(float3 dir) {
-    if (useSkyCube > 0.5) {
-        return giSkyCube.SampleLevel(giSkySampler, dir, 0).rgb;
-    }
-    return lerp(ambientGround, ambientSky, saturate(dir.y * 0.5 + 0.5));
-}
-
-// ---------------------------------------------------------------------------
-// Previous-frame probe irradiance — the bounce
-// ---------------------------------------------------------------------------
-
-uint giLoadState(int cascade, int slot) {
-    return giProbeState.Load(int3(giProbeStateTexel(slot, cascade), 0)).x;
-}
-
-float3 giLoadIrradiance(int cascade, int slot, float3 dir) {
-    // Payload texel centres live at origin + border + oct * payload, so oct = 0
-    // lands exactly on the seam between the border texel and payload texel 0 —
-    // which is the whole reason the border exists, and why this is a bilinear
-    // sample rather than a Load.
-    float2 texel = float2(giProbeAtlasOrigin(slot, GI_IRRADIANCE_TILE, cascade)) + float(GI_BORDER) +
-                   giOctEncode(dir) * float(GI_IRRADIANCE_PAYLOAD);
-    return giIrradiance.SampleLevel(giIrradianceSampler, texel / giAtlasSize(GI_IRRADIANCE_TILE), 0).rgb;
-}
-
-/// Cosine-weighted mean incoming radiance at `P` for a surface facing `N`,
-/// from the FINEST cascade that covers `P` with a one-probe margin.
-///
-/// Trilinear over the 8 surrounding probes, each weighted by a smooth
-/// backface term ((dot + 1)/2)^2 so a probe on the far side of the surface
-/// contributes almost nothing. R1b deliberately does NOT apply the Chebyshev
-/// visibility test here: this is a secondary bounce feeding a heavily filtered
-/// EMA, the visibility moments are themselves still converging while the field
-/// fills, and the leak it prevents is one bounce deep. The PRIMARY sampler
-/// (gi_sample.hlsli) — the one whose leaks a player would see — applies it.
-float3 giSampleIrradiance(float3 P, float3 N) {
-    for (int c = 0; c < GI_CASCADE_COUNT; ++c) {
-        float sp = giCascadeSpacing(c);
-        float3 local = P / sp - float3(giCascadeBase[c].xyz);
-        // One-probe margin: the 8-tap cage must lie wholly inside the window,
-        // or a tap wraps around the torus and reads the opposite side of the
-        // world.
-        if (any(local < 1.0) || any(local > float3(GI_GRID_X - 2, GI_GRID_Y - 2, GI_GRID_Z - 2))) {
-            continue;
-        }
-        float3 baseF = floor(local);
-        float3 f = local - baseF;
-        int3 b = int3(baseF);
-
-        float3 sum = float3(0, 0, 0);
-        float wsum = 0.0;
-        [unroll]
-        for (int i = 0; i < 8; ++i) {
-            int3 o = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
-            int3 absolute = giCascadeBase[c].xyz + b + o;
-            int slot = giWrappedProbeIndex(absolute);
-            if (giLoadState(c, slot) == GI_PROBE_UNINITIALIZED) {
-                continue;
-            }
-            float3 tri = lerp(1.0 - f, f, float3(o));
-            float3 toProbe = float3(absolute) * sp - P;
-            float len = length(toProbe);
-            float wrapped = len > 1e-4 ? (dot(toProbe / len, N) + 1.0) * 0.5 : 1.0;
-            // The +0.02 floor keeps a probe cage from collapsing to zero weight
-            // on a surface that faces away from all eight, which would leave
-            // the hit unlit rather than dimly lit.
-            float w = tri.x * tri.y * tri.z * (wrapped * wrapped + 0.02);
-            sum += w * giLoadIrradiance(c, slot, N);
-            wsum += w;
-        }
-        return wsum > 1e-6 ? sum / wsum : float3(0, 0, 0);
-    }
-    return float3(0, 0, 0);
-}
-
-// ---------------------------------------------------------------------------
-// Local (point/spot) lights
-// ---------------------------------------------------------------------------
-//
-// The byte layout is render::lighting's, and the offsets below are the same
-// ones cluster_lighting.hlsli hardcodes:
-//   [u32 headerCount][u32 pointCount][u32 spotCount][u32 pad]
-//   [LightHeader * capacity][PointLight * capacity][SpotLight * capacity]
-
-uint giPointLightsBase() { return 16u + giLightCapacity * 8u; }
-uint giSpotLightsBase() { return 16u + giLightCapacity * (8u + 48u); }
-
-/// Smooth windowed inverse-square falloff. Operation-identical to
-/// `pointFalloff` in clusters.hlsli — a probe and a pixel must agree about how
-/// far a lamp reaches, or the bounce brightens at a distance the direct term
-/// has already cut off.
-float giPointFalloff(float dist, float radius) {
-    float r = saturate(dist / max(radius, 1e-4));
-    float r2 = r * r;
-    float win = saturate(1.0 - r2 * r2);
-    return (win * win) / max(dist * dist, 1e-4);
-}
-
-/// IRRADIANCE (not radiance) at `P` from every packet light in range.
-/// No shadow test: local-light ray shadows are R2, and an unshadowed lamp in a
-/// secondary bounce is a far smaller error than no lamp at all.
-float3 giLocalLights(float3 P, float3 N) {
-    float3 acc = float3(0, 0, 0);
-    uint count = min(giLightCount, 256u);
-    for (uint i = 0; i < count; ++i) {
-        uint2 header = lightDataBuf.Load2(16u + i * 8u);
-        if (header.x == 0u) {
-            uint base = giPointLightsBase() + header.y * 48u;
-            uint4 a = lightDataBuf.Load4(base);
-            uint4 b = lightDataBuf.Load4(base + 16u);
-            float3 position = asfloat(a.xyz);
-            float radius = asfloat(a.w);
-            float3 toLight = position - P;
-            float dist = length(toLight);
-            if (dist > radius || dist < 1e-4) {
-                continue;
-            }
-            float3 L = toLight / dist;
-            float ndotl = saturate(dot(N, L));
-            if (ndotl <= 0.0) {
-                continue;
-            }
-            acc += asfloat(b.xyz) * asfloat(b.w) * giPointFalloff(dist, radius) * ndotl;
-        } else {
-            uint base = giSpotLightsBase() + header.y * 64u;
-            uint4 a = lightDataBuf.Load4(base);
-            uint4 b = lightDataBuf.Load4(base + 16u);
-            uint4 c = lightDataBuf.Load4(base + 32u);
-            uint4 d = lightDataBuf.Load4(base + 48u);
-            float3 position = asfloat(a.xyz);
-            float radius = asfloat(a.w);
-            float3 toLight = position - P;
-            float dist = length(toLight);
-            if (dist > radius || dist < 1e-4) {
-                continue;
-            }
-            float3 L = toLight / dist;
-            float ndotl = saturate(dot(N, L));
-            if (ndotl <= 0.0) {
-                continue;
-            }
-            float cone = smoothstep(asfloat(c.w), asfloat(b.w), dot(asfloat(b.xyz), -L));
-            if (cone <= 0.0) {
-                continue;
-            }
-            acc += asfloat(c.xyz) * asfloat(d.x) * giPointFalloff(dist, radius) * ndotl * cone;
-        }
-    }
-    return acc;
-}
+// is: it reads shadowAtlas/giIrradiance/lightDataBuf by name.
+#define RT_HIT_SHADE_FUNCTIONS
+#include "rt_hit_shade.hlsli"
 
 // ---------------------------------------------------------------------------
 
@@ -373,7 +194,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float3 radiance;
     float distance;
     if (!hit.valid) {
-        radiance = giSkyRadiance(dir);
+        radiance = rtHitSkyRadiance(dir);
         distance = rayMaxDistance;
     } else {
         TriangleAttributes attr = blasAttributes[hit.triIndex];
@@ -393,25 +214,10 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             distance = -hit.t;
         } else {
             float3 P = origin + dir * hit.t;
-            float3 toSun = -sunDirection;
-            float ndotl = saturate(dot(N, toSun));
-
-            // calcShadow selects a cascade by VIEW depth, so the hit needs one.
-            float viewDepth = dot(P - cameraPosition, cameraForward);
-            // The screenPos argument only rotates the PCSS poisson disk, which
-            // shadowEnabled = 1 (PCF) never reaches; feeding it the ray/probe
-            // pair keeps it deterministic either way.
-            float vis = calcShadow(P, N, toSun, viewDepth, float2(tid.xy));
-
-            // IRRADIANCE at the hit. The bounce is stored as mean radiance, so
-            // it becomes irradiance by multiplying by pi (see the units note at
-            // the top of the file).
-            float3 E = sunColor * ndotl * vis;
-            E += giLocalLights(P, N);
-            E += GI_PI * bounceScale * giSampleIrradiance(P + N * normalBias, N);
-
-            // Lambertian outgoing radiance.
-            radiance = attr.baseColor.rgb * E / GI_PI;
+            // The noise argument only rotates calcShadow's PCSS poisson disk,
+            // which shadowEnabled = 1 (PCF) never reaches; feeding it the
+            // ray/probe pair keeps it deterministic either way.
+            radiance = rtShadeHit(P, N, attr.baseColor.rgb, float2(tid.xy));
             distance = hit.t;
         }
     }

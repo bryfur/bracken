@@ -410,6 +410,14 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
         u.ambientSky = params.environment.ambient_sky;
         u.ambientGround = params.environment.ambient_ground;
         u.useSkyCube = params.sky_cube != nullptr ? 1.0f : 0.0f;
+        // rt_hit_shade.hlsli's two ambient flags. The field is by definition
+        // available to a probe ray; the fallback is 0 because a probe already
+        // collects sky through its ray MISSES, so a hemisphere added where the
+        // field has no answer would double-count it and break the bounce
+        // series' convergence. The reflection pass passes 1 for the opposite
+        // reason — see rtHitAmbient.
+        u.giEnabled = 1.0f;
+        u.giAmbientFallback = 0.0f;
         for (int i = 0; i < CASCADE_COUNT; ++i) {
             const glm::ivec3 base = cascades_[static_cast<std::size_t>(i)].cpu.base();
             u.cascadeBase[i] = glm::ivec4(base, 0);

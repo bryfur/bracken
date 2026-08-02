@@ -1192,12 +1192,56 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 BRACKEN_PROFILE_ZONE_COLOR("RT shadows", 0x8E44AD);
                 BRACKEN_GPU_SCOPE(cmd, "RT shadows");
                 rt_frame_params.inv_view_proj = glm::inverse(draw_camera.view_projection);
+                // UNJITTERED, both — the pair the velocity buffer was built
+                // from, which is what makes the reflection denoiser's virtual
+                // motion vector directly comparable with it.
+                rt_frame_params.view_proj_unjittered = frame_cam_.view_proj_unjittered;
+                rt_frame_params.prev_view_proj_unjittered = prev_view_proj_unjittered_;
                 rt_frame_params.camera_position = draw_camera.position;
+                // Third ROW of the view matrix is the camera's -forward in
+                // world space; calcShadow needs a view depth for the hit.
+                rt_frame_params.camera_forward = -glm::vec3(
+                    draw_camera.view[0][2], draw_camera.view[1][2], draw_camera.view[2][2]);
                 rt_frame_params.environment = env_;
+                rt_frame_params.sun_intensity = gfx.sun_intensity;
                 rt_frame_params.screen_width = context_->width();
                 rt_frame_params.screen_height = context_->height();
                 rt_frame_params.depth_a = draw_camera.projection[2][2];
                 rt_frame_params.depth_b = draw_camera.projection[3][2];
+
+                // What the reflection trace shades its hits with (R3). Every
+                // one of these is already built and bound elsewhere this frame
+                // — the CSM atlas the forward pass filters, the sky capture the
+                // skybox draws, the light buffer the cluster loop reads, the
+                // probe field the ambient term samples — which is the whole
+                // argument for sharing them rather than approximating them.
+                render::RtHitShadeBindings& hit_shade = rt_frame_params.hit_shade;
+                hit_shade.shadow = frame_shadow_uniforms_;
+                hit_shade.shadow_atlas = shadow_map_->atlas_texture();
+                hit_shade.shadow_compare_sampler = shadow_map_->shadow_compare_sampler();
+                hit_shade.shadow_raw_sampler = shadow_map_->shadow_sampler();
+                // The sky-CAPTURE cube (raw radiance), not the irradiance
+                // convolution: a reflection-ray miss is a look straight at the
+                // sky in one direction.
+                hit_shade.sky_cube = (ibl_ && ibl_->is_ready()) ? ibl_->capture_map() : nullptr;
+                hit_shade.sky_cube_fallback =
+                    dummy_black_cube_ ? dummy_black_cube_->handle() : nullptr;
+                hit_shade.sky_sampler =
+                    (ibl_ && ibl_->cube_sampler() != nullptr) ? ibl_->cube_sampler() : default_sampler_;
+                hit_shade.light_data = cluster_grid_.light_data_buffer();
+                hit_shade.light_count = cluster_grid_.total_lights();
+                hit_shade.light_capacity = render::lighting::MAX_LIGHTS;
+                // The probe field, when there is one. Not frame_gi_'s three
+                // slots: the hit shader wants the probe STATE plane (has this
+                // slot ever been filled?) where the forward sampler wants the
+                // OFFSET plane, and it has no use for the visibility moments —
+                // a secondary bounce does not run the Chebyshev test.
+                if (probe_volume_ && probe_volume_->is_ready() && frame_gi_.enabled > 0.0f) {
+                    hit_shade.gi_irradiance = probe_volume_->irradiance()->handle();
+                    hit_shade.gi_irradiance_sampler = probe_volume_->linear_sampler();
+                    hit_shade.gi_probe_state = probe_volume_->probe_state()->handle();
+                    hit_shade.gi_cascade_base = frame_gi_.cascade_base;
+                }
 
                 render::RtShadowSettings rs;
                 rs.enabled = gfx.rt_shadows;

@@ -83,8 +83,9 @@ Read the doc that matches the task before diving into code:
   the previous frame's rendering). Read §7
   (synchronization design) before touching any concurrency code.
 - [docs/rt_lighting_plan.md](docs/rt_lighting_plan.md) — **the plan of record
-  for the ray-traced lighting system** (R0 foundations and R1 probe-field GI
-  have landed; R2 onward is proposal): probe-field GI, froxel-reservoir
+  for the ray-traced lighting system** (R0 foundations, R1 probe-field GI,
+  R2 froxel-reservoir local-light shadows and R3 honest hit lighting have
+  landed; R4 onward is proposal): probe-field GI, froxel-reservoir
   local-light shadows, hit-lighting upgrades, screen-probe gather, denoiser
   evolution, scalability tiers. Read it before touching
   anything under `render/raytracing/` or the `rt_*` shaders.
@@ -113,7 +114,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `memory/` | `bracken::memory` | arena allocator, frame allocator |
 | `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) over `pipeline_catalog.hpp` (one `constexpr` row per `PipelineType`: shaders, resources, vertex layout, target, depth/blend state), `gpu_uniforms.hpp` (CPU↔GPU contract) |
 | `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO, TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas |
-| `render/raytracing/` | `render::rt` | software BVH (32-byte nodes, binned SAH, two-level BLAS/TLAS) + `RtScene`; `render/rt_renderer.hpp` drives the traced passes and their denoisers. **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
+| `render/raytracing/` | `render::rt` | software BVH (32-byte nodes, binned SAH, two-level BLAS/TLAS) + `RtScene`; `render/rt_renderer.hpp` drives the traced passes and their denoisers. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
 | `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror — addressing, ray directions, the blend curve, and the sampler's cascade/weight math. **Complete as of R1c**: the field traces and accumulates itself, and `shaders/gi_sample.hlsli` replaces the DIFFUSE half of the ambient term in every scene fragment shader (three banded atlases, three sampler slots) plus the volumetric fog's in-scatter. Off by default (`gi_mode`); GI on builds the ray-tracing acceleration structure with attributes |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
 | `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
@@ -440,9 +441,18 @@ evidence that no RT-series commit moved the RT-off path.
 | `--smoke 30` (RT off) | `86.6 / 44.9` |
 | `--smoke 30 PLAYGROUND_AO=0` | `87.0 / 44.5` |
 | `--smoke 30 PLAYGROUND_AO=2` | `86.4 / 45.0` |
-| `--smoke 30 PLAYGROUND_GI=probes` | `84.7 / 46.6` |
+| `--smoke 30 PLAYGROUND_GI=probes` | `84.3 / 46.9` |
 | `PLAYGROUND_RT=both --smoke 30` | `83.9 / 47.9` |
+| `PLAYGROUND_RT=both PLAYGROUND_GI=probes --smoke 30` | `81.7 / 49.8` |
 | `PLAYGROUND_RT_LOCAL=ratio PLAYGROUND_RT=both --smoke 30` | `85.3 / 47.5` |
+
+The GI row moved from `84.7 / 46.6` at R3 (`pbr.hlsli`'s rough-tier ambient
+specular now blends toward the probe field above roughness 0.6). The
+`PLAYGROUND_RT=both` row did **not** move at R3 and that is a coincidence of
+the aggregate, not a null result: 94% of the screenshot's bytes differ, to a
+maximum of 172/255, because reflections of sky-facing foliage brightened by as
+much as reflections of shadowed facades darkened. If you are checking the
+reflection path, read the chrome orb over the plaza, not the mean.
 
 The last two rows were measured on a **Linux/Vulkan** box, not the Metal
 machine the three above came from, so compare them with each other and not

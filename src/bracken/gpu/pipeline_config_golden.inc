@@ -736,9 +736,9 @@ RtShadowTemporal
 RtShadowFilter
   cs        rt_shadow_denoise_filter.comp.spv entry=CSMain samplers=2 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtReflection
-  cs        rt_reflection.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=5 rw_textures=2 rw_buffers=0 uniform_buffers=1
+  cs        rt_reflection.comp.spv entry=CSMain samplers=6 ro_textures=1 ro_buffers=6 rw_textures=2 rw_buffers=0 uniform_buffers=1
 RtReflectionTemporal
-  cs        rt_reflection_denoise_temporal.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        rt_reflection_denoise_temporal.comp.spv entry=CSMain samplers=6 ro_textures=0 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtLocalShadow
   cs        rt_local_shadow.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=8 rw_textures=1 rw_buffers=2 uniform_buffers=2
 GiProbeTrace

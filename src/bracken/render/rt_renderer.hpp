@@ -5,6 +5,7 @@
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_compute.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
+#include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/render/raytracing/rt_scene.hpp"
 
@@ -172,6 +173,67 @@ struct RtClusterBindings {
     }
 };
 
+/**
+ * Everything `shaders/rt_hit_shade.hlsli` needs to shade a reflection-ray hit
+ * honestly — phase R3 of docs/rt_lighting_plan.md §5.4.
+ *
+ * Before R3 a reflection hit was `albedo * (sunColor * N·L + skyColor * 0.25)`:
+ * an unshadowed sun and a flat ambient constant. Every field below exists to
+ * replace one of those two with the answer the rest of the frame already has —
+ * the CSM atlas the forward pass filters, the light buffer it loops, the probe
+ * field it samples for ambient. All of it is already built by the time the
+ * traced passes run; none of it is retained past one `render()` call.
+ *
+ * The GI half degrades rather than branching: with `gi_mode == Off` the caller
+ * binds this renderer's own 1×1 dummies and leaves `gi_enabled` at 0, the probe
+ * term is skipped, and the hit's ambient falls to the `EnvironmentState`
+ * hemisphere. That is deliberately still an improvement on the flat constant —
+ * reflections get shadowed sun and local lights with GI off as well as on.
+ *
+ * Tier: main-thread (live GPU handles, valid for exactly one frame).
+ */
+struct RtHitShadeBindings {
+    /// This frame's CSM uniforms, exactly as the forward pass received them.
+    /// The trace shader embeds them and calls the shared `calcShadow`.
+    gpu::ShadowDataUniforms shadow{};
+    SDL_GPUTexture* shadow_atlas = nullptr;
+    SDL_GPUSampler* shadow_compare_sampler = nullptr;
+    SDL_GPUSampler* shadow_raw_sampler = nullptr;
+
+    /// IBL sky-capture cube (raw radiance) for ray misses, or null to fall back
+    /// to the EnvironmentState hemisphere. `sky_cube_fallback` must always be a
+    /// valid cube texture — a binding slot cannot be left empty.
+    SDL_GPUTexture* sky_cube = nullptr;
+    SDL_GPUTexture* sky_cube_fallback = nullptr;
+    SDL_GPUSampler* sky_sampler = nullptr;
+
+    /// The probe field's irradiance atlas and per-probe state plane, banded
+    /// (render/gi/gi_math.hpp). Null on both means "GI is off" and this
+    /// renderer substitutes its own dummies; `gi_enabled` is the flag the
+    /// shader actually reads.
+    SDL_GPUTexture* gi_irradiance = nullptr;
+    SDL_GPUSampler* gi_irradiance_sampler = nullptr;
+    SDL_GPUTexture* gi_probe_state = nullptr;
+    /// `render::gi::cascade_base()` per cascade, xyz used. Sent rather than
+    /// re-derived, for the reason `gi_sample.hlsli` spells out.
+    std::array<glm::ivec4, 3> gi_cascade_base{};
+
+    /// The clustered-lighting byte buffer and its counts. A ray hit reads the
+    /// FLAT list, not the froxel grid — a world-space point has no froxel, and
+    /// the grid would not fit inside SDL3 GPU's eight read-only storage buffers
+    /// next to the four acceleration ones.
+    SDL_GPUBuffer* light_data = nullptr;
+    std::uint32_t light_count = 0;
+    std::uint32_t light_capacity = 0;
+
+    /// Whether the probe atlases above are a live field. Zero is a valid,
+    /// tested configuration, not a failure.
+    [[nodiscard]] bool gi_ready() const {
+        return gi_irradiance != nullptr && gi_probe_state != nullptr &&
+               gi_irradiance_sampler != nullptr;
+    }
+};
+
 /** Analytic receiver description for the displaced WaterRenderer surface.
  *  Keeping it here avoids putting water geometry into the opaque depth buffer
  *  before refraction has captured the scene behind it. */
@@ -296,12 +358,32 @@ public:
 
     struct FrameParams {
         glm::mat4 inv_view_proj{1.0f};
+        /// UNJITTERED, current and previous — the exact pair the velocity
+        /// buffer was built from (contracts/velocity_math.hpp). R3's
+        /// virtual-hit-point reprojection subtracts one projection of the same
+        /// world point from the other, so the TAA jitter cancels inside the
+        /// difference instead of having to be removed from either.
+        glm::mat4 view_proj_unjittered{1.0f};
+        glm::mat4 prev_view_proj_unjittered{1.0f};
         glm::vec3 camera_position{0.0f};
+        /// Unit view direction. `calcShadow` selects a cascade by VIEW depth,
+        /// and a reflection-ray hit has to be projected onto this to have one.
+        glm::vec3 camera_forward{0.0f, 0.0f, -1.0f};
         EnvironmentState environment{};
+        /// GraphicsSettings::sun_intensity. It lives outside EnvironmentState
+        /// and every consumer multiplies it in at its own use site, so this
+        /// pass has to be told. Getting it wrong makes a reflected surface
+        /// disagree with the same surface drawn directly by a factor of three
+        /// in the playground — which is exactly what happened before R3, where
+        /// it cancelled the equally-missing Lambertian 1/pi.
+        float sun_intensity = 1.0f;
         int screen_width = 0;
         int screen_height = 0;
         float depth_a = 0.0f;
         float depth_b = 0.0f;
+        /// What the reflection trace shades its hits with. Ignored by the
+        /// shadow and local-shadow passes, which never shade anything.
+        RtHitShadeBindings hit_shade{};
     };
 
     /** Record the traced passes. Each is skipped entirely when its feature is
@@ -375,6 +457,8 @@ private:
     /// Copy RtScene's accounting (instances, TLAS builds, the byte split) into
     /// stats_. Called after every upload so the two can never disagree.
     void publish_scene_stats();
+    /// Create (once) the 1x1 probe-field stand-ins bound when GI is off.
+    [[nodiscard]] bool ensure_gi_dummies(SDL_GPUCommandBuffer* cmd);
     [[nodiscard]] bool ensure_target(gpu::GPUDevice& device, std::unique_ptr<gpu::GPUTexture>& tex,
                                      int width, int height, SDL_GPUTextureFormat format,
                                      const char* label);
@@ -450,8 +534,9 @@ private:
                                             const RtClusterBindings& clusters);
     /// Temporal accumulation of the GGX-sampled reflection signal. Opaque path
     /// only — see reflection_denoised_this_frame_.
-    void denoise_reflections(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* velocity,
-                             const RtReflectionSettings& reflections);
+    void denoise_reflections(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
+                             SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
+                             const FrameParams& params, const RtReflectionSettings& reflections);
 
     std::unique_ptr<gpu::GPUTexture> reflection_;
     /// NOTHING CONSUMES THIS YET. The reflection trace writes each pixel's
@@ -464,6 +549,15 @@ private:
     /// Producing it now means that lands as a denoiser change rather than as a
     /// change to the traversal everything else depends on.
     std::unique_ptr<gpu::GPUTexture> reflection_hit_distance_;
+    /// 1x1 stand-ins for the probe field, bound whenever `gi_mode` is Off so
+    /// the reflection pass's slots are valid rather than dangling. Owned here
+    /// rather than borrowed from SceneRenderer because the probe-state plane is
+    /// a READ-ONLY STORAGE texture and the engine's shared dummies carry
+    /// sampler usage only. The state texel is zero, which is
+    /// GI_PROBE_UNINITIALIZED, so even a shader that ignored `gi_enabled` and
+    /// read them would get no contribution rather than garbage.
+    std::unique_ptr<gpu::GPUTexture> gi_dummy_irradiance_;
+    std::unique_ptr<gpu::GPUTexture> gi_dummy_probe_state_;
 
     // ---- the two stochastic visibility signals ----
     VisibilityDenoiser sun_shadow_;

@@ -1,6 +1,12 @@
 #ifndef BRACKEN_RT_SAMPLING_HLSLI
 #define BRACKEN_RT_SAMPLING_HLSLI
 
+// interleavedGradientNoise — the per-pixel decorrelating hash. This file used
+// to carry a byte-identical private copy, which was fine until R3 gave the
+// reflection pass both this include AND shadow_common.hlsli (which includes
+// lighting.hlsli for the same function) and the two collided. One definition.
+#include "lighting.hlsli"
+
 // Sampling and packing shared by the ray-traced shadow/reflection passes and
 // their denoisers.
 //
@@ -21,12 +27,6 @@
 /// two constants are 1/phi2 and 1/phi2^2 where phi2 is the plastic number.
 float2 r2Sequence(uint index) {
     return frac(float2(0.7548776662466927, 0.5698402909980532) * float(index));
-}
-
-/// Per-pixel decorrelating hash. Interleaved gradient noise: one dot product,
-/// one frac, and it has no visible structure at the tile sizes used here.
-float interleavedGradientNoise(float2 pixel) {
-    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
 /// The per-pixel, per-frame 2D sample point. Both components are rotated by

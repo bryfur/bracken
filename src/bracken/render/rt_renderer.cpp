@@ -56,6 +56,8 @@ void RtRenderer::VisibilityDenoiser::release() {
 void RtRenderer::shutdown() {
     reflection_.reset();
     reflection_hit_distance_.reset();
+    gi_dummy_irradiance_.reset();
+    gi_dummy_probe_state_.reset();
     if (device_ != nullptr && nearest_clamp_sampler_ != nullptr) {
         device_->release_sampler(nearest_clamp_sampler_);
     }
@@ -93,6 +95,41 @@ bool RtRenderer::ensure_target(gpu::GPUDevice& device, std::unique_ptr<gpu::GPUT
         BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create {} ({}x{})", label, width, height);
         return false;
     }
+    return true;
+}
+
+// 1x1 stand-ins for the probe field, so the reflection pass's GI slots are
+// always bound even with gi_mode Off. Created on first use rather than in
+// init(): a game that never enables reflections should not pay for them, small
+// as they are.
+//
+// `cmd` writes zeros into both. The state texel then reads
+// GI_PROBE_UNINITIALIZED and the irradiance texel reads black, so a shader that
+// ignored `giEnabled` would get no contribution rather than undefined memory —
+// which is the same argument ProbeVolume::init() makes for seeding its whole
+// offset plane.
+bool RtRenderer::ensure_gi_dummies(SDL_GPUCommandBuffer* cmd) {
+    if (gi_dummy_irradiance_ && gi_dummy_probe_state_) {
+        return true;
+    }
+    if (device_ == nullptr || cmd == nullptr) {
+        return false;
+    }
+    gi_dummy_irradiance_ = gpu::GPUTexture::create_2d(
+        *device_, 1, 1, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+    gi_dummy_probe_state_ = gpu::GPUTexture::create_2d(
+        *device_, 1, 1, SDL_GPU_TEXTUREFORMAT_R8_UINT,
+        SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ);
+    if (!gi_dummy_irradiance_ || !gi_dummy_probe_state_) {
+        BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the GI dummy textures");
+        gi_dummy_irradiance_.reset();
+        gi_dummy_probe_state_.reset();
+        return false;
+    }
+    const std::array<uint16_t, 4> black{0, 0, 0, 0};
+    gi_dummy_irradiance_->upload(cmd, black.data(), 1, 1);
+    const uint8_t uninitialized = 0;
+    gi_dummy_probe_state_->upload(cmd, &uninitialized, 1, 1);
     return true;
 }
 
@@ -282,7 +319,7 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
         // pass on the scene renderer's own timeline ("RTReflectionResolve").
         BRACKEN_GPU_TIMER(timers_, cmd, "RTReflectionTrace");
         if (trace_reflections(cmd, depth, normal_rough, params, reflections, nullptr)) {
-            denoise_reflections(cmd, velocity, reflections);
+            denoise_reflections(cmd, depth, normal_rough, velocity, params, reflections);
             reflection_frame_index_++;
         }
     } else {
@@ -565,7 +602,9 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     return true;
 }
 
-void RtRenderer::denoise_reflections(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* velocity,
+void RtRenderer::denoise_reflections(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
+                                     SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
+                                     const FrameParams& params,
                                      const RtReflectionSettings& reflections) {
     BRACKEN_PROFILE_ZONE("RtRenderer::denoise_reflections");
     if (reflection_ == nullptr) {
@@ -590,11 +629,23 @@ void RtRenderer::denoise_reflections(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* 
     const int prev = reflection_history_index_;
     const int next = 1 - reflection_history_index_;
 
+    // R3's virtual-hit-point reprojection needs all three of the hit distance,
+    // the depth buffer and the G-buffer to place the reflected point. Any one
+    // missing and the pass falls back to pure surface motion, which is exactly
+    // what it did before R3 — a degradation, not a skip.
+    const bool virtual_ready = reflection_hit_distance_ != nullptr && normal_rough != nullptr;
+
     gpu::RtReflectionTemporalUniforms u{};
+    u.invViewProj = params.inv_view_proj;
+    u.viewProjUnjittered = params.view_proj_unjittered;
+    u.prevViewProjUnjittered = params.prev_view_proj_unjittered;
+    u.cameraPosition = params.camera_position;
+    u.rayMaxDistance = reflections.max_distance;
     u.tracedSize = {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
     u.maxAccumFrames = std::max(reflections.max_accum_frames, 1.0f);
     u.clampSigma = std::max(reflections.clamp_sigma, 0.0f);
     u.historyValid = (reflection_history_valid_ && velocity != nullptr) ? 1u : 0u;
+    u.virtualValid = virtual_ready ? 1u : 0u;
 
     const SDL_GPUStorageTextureReadWriteBinding rw{.texture = reflection_history_[next]->handle(),
                                                    .mip_level = 0, .layer = 0, .cycle = true,
@@ -604,10 +655,16 @@ void RtRenderer::denoise_reflections(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* 
         return;
     }
     pass.bind_pipeline(*pipeline);
-    const std::array<SDL_GPUTextureSamplerBinding, 3> textures{{
+    // Slots 3-5 must be valid textures even when `virtualValid` is 0; the flag,
+    // not the bind, is what decides whether they are read.
+    const std::array<SDL_GPUTextureSamplerBinding, 6> textures{{
         {reflection_->handle(), nearest_clamp_sampler_},
         {velocity != nullptr ? velocity : reflection_->handle(), nearest_clamp_sampler_},
         {reflection_history_[prev]->handle(), linear_clamp_sampler_},
+        {virtual_ready ? reflection_hit_distance_->handle() : reflection_->handle(),
+         nearest_clamp_sampler_},
+        {depth.handle(), nearest_clamp_sampler_},
+        {virtual_ready ? normal_rough : depth.handle(), nearest_clamp_sampler_},
     }};
     pass.bind_samplers(0, textures);
     pass.push_uniforms(0, &u, sizeof(u));
@@ -663,16 +720,51 @@ bool RtRenderer::trace_reflections(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& d
         return false;
     }
 
+    const RtHitShadeBindings& hit = params.hit_shade;
+    const bool gi_ready = hit.gi_ready();
+    if (!gi_ready && !ensure_gi_dummies(cmd)) {
+        return false;
+    }
+
     gpu::RtReflectionUniforms u{};
+    u.shadow = hit.shadow;
+    // PCF, never PCSS: a reflection is temporally accumulated over up to
+    // max_accum_frames, so paying 20 atlas taps per ray to soften ONE sample
+    // buys nothing the accumulation does not already give. The same clamp
+    // ProbeVolume::trace applies, for the same reason. `shadowEnabled` of 0
+    // still means "no shadows at all", which is honoured — a host with shadows
+    // off gets unshadowed reflections, exactly as it gets an unshadowed image.
+    if (u.shadow.shadowEnabled > 1.5f) {
+        u.shadow.shadowEnabled = 1.0f;
+    }
     u.invViewProj = params.inv_view_proj;
     u.cameraPosition = params.camera_position;
+    u.cameraForward = params.camera_forward;
     u.rayMaxDistance = reflections.max_distance;
     u.sunDirection = params.environment.sun_dir;
     u.maxRoughness = reflections.max_roughness;
-    u.fadeStart = reflections.fade_start;
-    u.sunColor = params.environment.sun_color;
+    u.gateFadeStart = reflections.fade_start;
+    // WITH sun_intensity. Without it a reflected facade is three times darker
+    // than the same facade drawn directly — invisible before R3 only because
+    // the missing Lambertian 1/pi cancelled it at the playground's value of 3.
+    u.sunColor = params.environment.sun_color * params.sun_intensity;
     u.normalBias = reflections.normal_bias;
-    u.skyColor = params.environment.sky_horizon;
+    u.ambientSky = params.environment.ambient_sky;
+    u.ambientGround = params.environment.ambient_ground;
+    u.useSkyCube = hit.sky_cube != nullptr ? 1.0f : 0.0f;
+    u.bounceScale = 1.0f;
+    u.giEnabled = gi_ready ? 1.0f : 0.0f;
+    // Always: a reflected point the field does not cover has to be lit by the
+    // hemisphere rather than by nothing. Probe rays pass 0 — see rtHitAmbient.
+    u.giAmbientFallback = 1.0f;
+    static_assert(std::size(gpu::RtReflectionUniforms{}.giCascadeBase) ==
+                      std::tuple_size_v<decltype(RtHitShadeBindings::gi_cascade_base)>,
+                  "cascade count must agree between the binding struct and the cbuffer");
+    for (std::size_t i = 0; i < hit.gi_cascade_base.size(); ++i) {
+        u.giCascadeBase[i] = hit.gi_cascade_base[i];
+    }
+    u.giLightCount = hit.light_data != nullptr ? hit.light_count : 0;
+    u.giLightCapacity = hit.light_capacity;
     u.frameIndex = reflection_frame_index_;
     u.outputSize = {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
     u.tlasNodeCount = scene_.tlas_node_count();
@@ -687,6 +779,26 @@ bool RtRenderer::trace_reflections(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& d
         u.waterDetail = {water->detail_wave_strength, 1.0f, 0.5f, 0.0f};
     }
 
+    SDL_GPUTexture* const shadow_atlas =
+        hit.shadow_atlas != nullptr ? hit.shadow_atlas : depth.handle();
+    SDL_GPUSampler* const shadow_cmp = hit.shadow_compare_sampler != nullptr
+                                           ? hit.shadow_compare_sampler
+                                           : nearest_clamp_sampler_;
+    SDL_GPUSampler* const shadow_raw =
+        hit.shadow_raw_sampler != nullptr ? hit.shadow_raw_sampler : nearest_clamp_sampler_;
+    SDL_GPUTexture* const sky_cube =
+        hit.sky_cube != nullptr ? hit.sky_cube : hit.sky_cube_fallback;
+    SDL_GPUSampler* const sky_sampler =
+        hit.sky_sampler != nullptr ? hit.sky_sampler : linear_clamp_sampler_;
+    // A ray miss samples a CUBE, and no 2D texture can stand in for one. The
+    // caller always has the engine's dummy black cube to offer; without it
+    // there is nothing valid to bind, so skip the pass rather than bind
+    // garbage.
+    if (sky_cube == nullptr) {
+        BRACKEN_LOG_ERROR("rt", "Reflections need a sky cube (or the engine's dummy) to bind");
+        return false;
+    }
+
     // Order is the binding order: u0 = radiance, u1 = hit distance.
     const std::array<SDL_GPUStorageTextureReadWriteBinding, 2> rw{{
         {.texture = reflection_->handle(), .mip_level = 0, .layer = 0, .cycle = true,
@@ -699,14 +811,40 @@ bool RtRenderer::trace_reflections(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& d
         return false;
     }
     pass.bind_pipeline(*pipeline);
-    const std::array<SDL_GPUTextureSamplerBinding, 2> textures{{
+    // ORDER IS THE BINDING CONTRACT (shaders/README.md): sampled textures, then
+    // read-only storage textures, then read-only storage buffers, each run
+    // numbered from 0 and matching the shader's declaration order exactly.
+    //
+    // Every slot must hold a VALID resource even where the shader will not read
+    // it — an unbound descriptor is undefined, not empty — which is why the
+    // shadow atlas falls back to the depth texture (also D32, also comparison-
+    // sampleable) and the probe atlases fall back to this renderer's dummies.
+    // What decides whether they are READ is `shadowEnabled` and `giEnabled`.
+    const std::array<SDL_GPUTextureSamplerBinding, 6> textures{{
         {depth.handle(), nearest_clamp_sampler_},
         {receiver_data, nearest_clamp_sampler_},
+        {shadow_atlas, shadow_cmp},
+        {shadow_atlas, shadow_raw},
+        // A miss with no cube at all falls back to the hemisphere via
+        // useSkyCube = 0, but the slot still needs a cube; the caller supplies
+        // the engine's dummy. Without even that, the depth texture is not a
+        // cube and the bind would be invalid, so bail rather than guess.
+        {sky_cube, sky_sampler},
+        {gi_ready ? hit.gi_irradiance : gi_dummy_irradiance_->handle(),
+         gi_ready ? hit.gi_irradiance_sampler : linear_clamp_sampler_},
     }};
     pass.bind_samplers(0, textures);
-    const std::array<SDL_GPUBuffer*, 5> buffers{
-        scene_.tlas_nodes(), scene_.tlas_instances(), scene_.blas_nodes(),
-        scene_.blas_triangles(), scene_.triangle_attributes()};
+    const std::array<SDL_GPUTexture*, 1> storage_textures{
+        gi_ready ? hit.gi_probe_state : gi_dummy_probe_state_->handle()};
+    pass.bind_storage_textures(0, storage_textures);
+    // SIX of SDL3 GPU's eight read-only storage buffers. The light buffer is
+    // optional: with no binned lights the shader's loop count is zero, but the
+    // slot still has to hold something, so it borrows an acceleration buffer.
+    const std::array<SDL_GPUBuffer*, 6> buffers{
+        scene_.tlas_nodes(),      scene_.tlas_instances(),
+        scene_.blas_nodes(),      scene_.blas_triangles(),
+        scene_.triangle_attributes(),
+        hit.light_data != nullptr ? hit.light_data : scene_.blas_triangles()};
     pass.bind_storage_buffers(0, buffers);
     pass.push_uniforms(0, &u, sizeof(u));
     pass.dispatch_for(*pipeline, static_cast<uint32_t>(w), static_cast<uint32_t>(h));

@@ -1327,21 +1327,53 @@ BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, _pad0, 40);
  * RtReflectionUniforms (set 2, b0). Used by: render::RtRenderer.
  */
 struct alignas(16) RtReflectionUniforms {
-    glm::mat4 invViewProj;
-    glm::vec3 cameraPosition;
-    float rayMaxDistance;
-    glm::vec3 sunDirection;
-    float maxRoughness;   // above this the IBL probe is used instead of a ray
-    glm::vec3 sunColor;
-    float normalBias;
-    glm::vec3 skyColor;
-    float _pad0 = 0.0f;
-    glm::uvec2 outputSize;
-    uint32_t tlasNodeCount;
+    /// R3: the leading 336 bytes ARE `ShadowDataUniforms`, field for field and
+    /// in order, exactly as `GiProbeTraceUniforms` carries them and for exactly
+    /// the same reason — the shader declares them under the names
+    /// `shadow_common.hlsli` requires and calls the forward pass's own
+    /// `calcShadow()` at the hit, so a reflected facade standing in a shadow
+    /// reflects as shadowed. Reimplementing the cascade math here is named as a
+    /// trap in `docs/rt_lighting_plan.md` §8; this is the answer to it.
+    ShadowDataUniforms shadow{};
+    glm::mat4 invViewProj{1.0f};
+    glm::vec3 cameraPosition{0.0f};
+    float rayMaxDistance = 0.0f;
+    /// Unit view direction — `calcShadow` selects a cascade by VIEW depth, and
+    /// a reflection-ray hit has to be projected onto this to have one.
+    glm::vec3 cameraForward{0.0f, 0.0f, -1.0f};
+    float maxRoughness = 0.0f; // above this the IBL probe is used instead of a ray
+    glm::vec3 sunDirection{0.0f, -1.0f, 0.0f};
+    float normalBias = 0.0f;
+    /// ALREADY multiplied by GraphicsSettings::sun_intensity. Before R3 it was
+    /// not, and the resulting factor-of-three deficit happened to cancel the
+    /// missing Lambertian 1/pi at the playground's sun_intensity of 3.
+    glm::vec3 sunColor{0.0f};
     /// Roughness at which the traced contribution starts fading out; it
     /// reaches zero at maxRoughness. Shared with the forward shaders through
     /// shaders/reflection_gate.hlsli so traced + IBL specular sum to one.
-    float fadeStart;
+    /// NOT `fadeStart`: since R3 that name belongs to `shadow`'s cascade
+    /// distance fade, which shadow_common.hlsli reads by name.
+    float gateFadeStart = 0.0f;
+    glm::vec3 ambientSky{0.0f};
+    /// 1 when the IBL sky-capture cube is bound and valid; 0 falls back to the
+    /// ambientSky/ambientGround hemisphere on a ray miss.
+    float useSkyCube = 0.0f;
+    glm::vec3 ambientGround{0.0f};
+    /// Scale on the probe-field term at the hit; 1 is the field as stored.
+    float bounceScale = 1.0f;
+    /// 1 when the probe atlases hold a live field. 0 binds the engine's dummies
+    /// and the hit's ambient falls to the hemisphere above — which is what
+    /// makes reflections improve with GI off as well as on.
+    float giEnabled = 0.0f;
+    /// Always 1 here: a reflected point outside the field's coverage must be
+    /// lit by SOMETHING, and the hemisphere is the engine's documented no-GI
+    /// ambient tier. Probe rays pass 0. See `rtHitAmbient`.
+    float giAmbientFallback = 1.0f;
+    float _pad0 = 0.0f;
+    float _pad1 = 0.0f;
+    /// Absolute lattice coordinate of each cascade's corner probe (xyz; w
+    /// unused), sent rather than re-derived — see `gi_sample.hlsli`.
+    glm::ivec4 giCascadeBase[3]{};
     /// Optional analytic water receiver. receiverMode == 0 reads the regular
     /// depth/G-buffer pair; == 1 intersects the camera ray with this displaced
     /// water surface and reads the simulation state from sceneNormal.
@@ -1350,51 +1382,96 @@ struct alignas(16) RtReflectionUniforms {
     glm::vec4 waterSimWindow{0.0f}; // minX, minZ, inverse extent, edge fade width
     glm::vec4 waterFlowTime{0.0f};  // flow XZ, speed, absolute time
     glm::vec4 waterDetail{0.0f};    // detail strength, receiver mode, visibility bias, unused
+    glm::uvec2 outputSize{0, 0};
+    uint32_t tlasNodeCount = 0;
     /// Advances the GGX sample sequence. Must change every frame or the
     /// temporal pass averages the same lobe sample forever.
     uint32_t frameIndex = 0;
-    glm::vec3 _pad1{0.0f};
+    uint32_t giLightCount = 0;
+    /// The light buffer's per-array capacity (MAX_LIGHTS) — the payload strides
+    /// are derived from it exactly as cluster_lighting.hlsli derives them.
+    uint32_t giLightCapacity = 0;
+    uint32_t _pad2 = 0;
+    uint32_t _pad3 = 0;
 };
 
-BRACKEN_HLSL_CBUFFER(RtReflectionUniforms, 240);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, invViewProj, 0);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, cameraPosition, 64);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, rayMaxDistance, 76);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, sunDirection, 80);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, maxRoughness, 92);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, sunColor, 96);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, normalBias, 108);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, skyColor, 112);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, _pad0, 124);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, outputSize, 128);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, tlasNodeCount, 136);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, fadeStart, 140);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterBounds, 144);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterSurface, 160);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterSimWindow, 176);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterFlowTime, 192);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterDetail, 208);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, frameIndex, 224);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, _pad1, 228);
+BRACKEN_HLSL_CBUFFER(RtReflectionUniforms, 672);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, shadow, 0);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, invViewProj, 336);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, cameraPosition, 400);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, rayMaxDistance, 412);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, cameraForward, 416);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, maxRoughness, 428);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, sunDirection, 432);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, normalBias, 444);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, sunColor, 448);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, gateFadeStart, 460);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, ambientSky, 464);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, useSkyCube, 476);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, ambientGround, 480);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, bounceScale, 492);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, giEnabled, 496);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, giAmbientFallback, 500);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, _pad0, 504);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, _pad1, 508);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, giCascadeBase, 512);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterBounds, 560);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterSurface, 576);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterSimWindow, 592);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterFlowTime, 608);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterDetail, 624);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, outputSize, 640);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, tlasNodeCount, 648);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, frameIndex, 652);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, giLightCount, 656);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, giLightCapacity, 660);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, _pad2, 664);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, _pad3, 668);
 
 /**
  * Reflection-denoiser temporal accumulation — matches
  * rt_reflection_denoise_temporal.comp.hlsl (set 2, b0).
  */
 struct alignas(16) RtReflectionTemporalUniforms {
-    glm::uvec2 tracedSize;
+    /// R3, virtual-hit-point reprojection. `invViewProj` reconstructs the
+    /// RECEIVER's world position from the depth buffer (so it must be the same
+    /// matrix the trace used, jitter and all); the two unjittered view-projs
+    /// then bracket the VIRTUAL point's motion, and their difference is a
+    /// virtual motion vector directly comparable to the velocity buffer's —
+    /// which is itself built from unjittered matrices (velocity_math.hpp), so
+    /// the jitter cancels on both sides rather than having to be removed.
+    glm::mat4 invViewProj{1.0f};
+    glm::mat4 viewProjUnjittered{1.0f};
+    glm::mat4 prevViewProjUnjittered{1.0f};
+    glm::vec3 cameraPosition{0.0f};
+    /// The trace's ray range, which is what its R16F hitT target is normalized
+    /// by. Multiplying it back is the only way to recover metres here.
+    float rayMaxDistance = 0.0f;
+    glm::uvec2 tracedSize{0, 0};
     float maxAccumFrames = 16.0f;
     float clampSigma = 1.5f;
     uint32_t historyValid = 0;
-    glm::uvec3 _pad0{0, 0, 0};
+    /// 1 when the hit-distance, depth and G-buffer textures are all real. 0
+    /// binds valid-but-meaningless stand-ins and takes the pure surface-motion
+    /// path, which is exactly the pre-R3 behaviour.
+    uint32_t virtualValid = 0;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
 };
 
-BRACKEN_HLSL_CBUFFER(RtReflectionTemporalUniforms, 32);
-BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, tracedSize, 0);
-BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, maxAccumFrames, 8);
-BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, clampSigma, 12);
-BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, historyValid, 16);
-BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, _pad0, 20);
+BRACKEN_HLSL_CBUFFER(RtReflectionTemporalUniforms, 240);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, invViewProj, 0);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, viewProjUnjittered, 64);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, prevViewProjUnjittered, 128);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, cameraPosition, 192);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, rayMaxDistance, 204);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, tracedSize, 208);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, maxAccumFrames, 216);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, clampSigma, 220);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, historyValid, 224);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, virtualValid, 228);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, _pad0, 232);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, _pad1, 236);
 
 /**
  * Full-resolution material/depth/normal-guided resolve of the sparse traced
@@ -1524,8 +1601,20 @@ struct alignas(16) GiProbeTraceUniforms {
     /// of a probe re-samples the same directions and the estimate is biased.
     uint32_t frameIndex = 0;
     uint32_t _pad0 = 0;
+    /// `shaders/rt_hit_shade.hlsli`'s two ambient flags, pinned by
+    /// `ProbeVolume::trace` to (1, 0). The probe field is by definition
+    /// available to a probe ray, and a probe's own bounce term must NOT fall
+    /// back to the hemisphere where the field has no answer: the probe already
+    /// collects sky through its ray MISSES, so a hemisphere on top would
+    /// double-count it and break the bounce series' convergence argument. The
+    /// reflection pass passes (giEnabled, 1) for the opposite reason — see
+    /// `rtHitAmbient`.
+    float giEnabled = 1.0f;
+    float giAmbientFallback = 0.0f;
+    float _pad1 = 0.0f;
+    float _pad2 = 0.0f;
 };
-BRACKEN_HLSL_CBUFFER(GiProbeTraceUniforms, 512);
+BRACKEN_HLSL_CBUFFER(GiProbeTraceUniforms, 528);
 BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, shadow, 0);
 BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, cameraPosition, 336);
 BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, rayMaxDistance, 348);
@@ -1548,6 +1637,10 @@ BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, lightCount, 496);
 BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, lightCapacity, 500);
 BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, frameIndex, 504);
 BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, _pad0, 508);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, giEnabled, 512);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, giAmbientFallback, 516);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, _pad1, 520);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, _pad2, 524);
 
 /**
  * GiProbeBlendUniforms (set 2, b0) — shared by gi_probe_blend.comp.hlsl and

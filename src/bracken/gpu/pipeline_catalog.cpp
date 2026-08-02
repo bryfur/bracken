@@ -801,16 +801,30 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
     {.name = "RtReflection",
      .shader = "rt_reflection.comp.spv",
      .entry_point = "CSMain",
-     // Same, plus per-triangle attributes to shade the hit. Two RW targets:
-     // raw radiance, and the normalized hit distance R3's reprojection wants.
-     .resources = {.num_samplers = 2,
-                   .num_readonly_storage_buffers = 5,
+     // Widened by R3, because the hit is now shaded honestly (rt_hit_shade.hlsli).
+     // Sampled: depth + the prepass G-buffer, then the CSM atlas twice (the
+     // comparison pair calcShadow filters with and the raw pair its PCSS blocker
+     // search names), the IBL sky-capture cube a miss returns, and the banded
+     // probe irradiance atlas. Read-only storage texture: the probe-state plane,
+     // so an ambient tap can reject a slot the field has not filled yet.
+     // Read-only storage buffers: the four acceleration ones, the per-triangle
+     // attributes that make a hit shadeable, and the clustered-lighting byte
+     // buffer — SIX of SDL3 GPU's eight. Not the froxel grid: a ray hit is a
+     // world-space point, and the grid would cost the two remaining slots plus
+     // two more. Two RW targets: raw radiance, and the normalized hit distance
+     // the temporal denoiser reprojects through.
+     .resources = {.num_samplers = 6,
+                   .num_readonly_storage_textures = 1,
+                   .num_readonly_storage_buffers = 6,
                    .num_readwrite_storage_textures = 2,
                    .num_uniform_buffers = 1}},
     {.name = "RtReflectionTemporal",
      .shader = "rt_reflection_denoise_temporal.comp.spv",
      .entry_point = "CSMain",
-     .resources = {.num_samplers = 3,                   // raw trace, velocity, history
+     // The last three arrived with R3's virtual-hit-point reprojection: the
+     // trace's R16F hit distance, plus the receiver's depth and G-buffer, which
+     // together place the virtual point and say how much to trust it.
+     .resources = {.num_samplers = 6, // raw trace, velocity, history, hitT, depth, G-buffer
                    .num_readwrite_storage_textures = 1, // accumulated history out
                    .num_uniform_buffers = 1}},
     {.name = "RtLocalShadow",

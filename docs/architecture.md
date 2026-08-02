@@ -708,10 +708,10 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    * The reflection chain is **trace → temporal**. The trace writes two
      read-write targets: the RGBA16F raw radiance, and an R16F **hit distance**
      normalized by the ray's max distance (1.0 on a miss or any early-out).
-     Nothing consumes the second one yet — it is produced now because the
-     virtual-hit-point reprojection the temporal pass wants next needs the
-     reflected point's distance, and the trace is the only place it is free.
-     The temporal pass reprojects
+     Since R3 the temporal pass CONSUMES that second target: it extends the eye
+     ray by the hit distance to place the reflection's **virtual point**, and
+     blends that point's motion vector against the surface's by roughness (see
+     "Reflections" below). The temporal pass otherwise reprojects
      through velocity and constrains the history to its own neighbourhood's
      colour range (a TAA-style clamp) rather than to a depth test: what
      invalidates a reflection is the REFLECTED content changing, which a depth
@@ -1121,24 +1121,84 @@ sampling, closest-hit traversal with near-child-first ordering and
 probe — `shaders/reflection_gate.hlsli` is shared by the compute pass and the
 forward shaders precisely so the traced weight and the IBL weight always sum to
 one (a hard cutoff put a visible seam through any surface whose roughness
-crossed it). Hit shading is the interpolated `TriangleAttributes` normal and
-flat colour lit by sun N·L with **no visibility test**, plus a flat ambient.
-Denoise is temporal only (σ-clamped neighbourhood, accumulation count in
-alpha), then a full-res material/depth/normal-guided resolve
+crossed it). Denoise is temporal only (σ-clamped neighbourhood + virtual-point
+reprojection, accumulation count in alpha), then a full-res
+material/depth/normal-guided resolve
 (`shaders/rt_reflection_resolve.frag.hlsl`) evaluates the *receiver* BRDF. A
 separate analytic water path (`RtWaterReceiver`,
 `RtRenderer::render_water_reflections`) reuses the same target undenoised,
 because its alpha carries a handoff weight rather than a sample count.
 
-**Hit distance.** The reflection trace writes each pixel's normalized hit
-distance (`hit.t / max_distance`, 1.0 on a miss or any early-out) to a second
-R16F target at the traced resolution, exposed as
-`RtRenderer::reflection_hit_distance`. **Nothing consumes it yet.** It exists
-because that is the one point in the frame where the number is free, and
-virtual-hit-point reprojection — reprojecting the reflected point rather than
-the surface carrying it — is what stops low-roughness reflections smearing
-under camera motion. Producing it now means that lands as a denoiser change
-rather than as a change to the traversal everything depends on.
+**Hit shading is shared** (`shaders/rt_hit_shade.hlsli`, phase R3). Until R3
+there were two answers to "a ray hit a triangle; how bright is it?" and only one
+was honest: probe rays shaded with a CSM-shadowed sun, a loop over the frame's
+point/spot lights and the probe field's own irradiance, while the reflection
+pass used `albedo × (sunColor·N·L + skyColor × 0.25)` — an **unshadowed** sun,
+so a reflected facade standing in a building's shadow reflected as if in full
+sun, and a **flat constant** ambient, so every reflection was uniformly lifted
+by open sky regardless of what the reflected point could see. It was also off by
+a factor of π twice in opposite directions (no Lambertian 1/π, and `sunColor`
+arriving without `sun_intensity`), which is why it looked roughly right at the
+playground's `sun_intensity` of 3 and would not have at any other value.
+
+`rt_hit_shade.hlsli` is the first answer extracted verbatim, so there is exactly
+one. Two-phase include, the same contract as `rt_trace.hlsli` and for the same
+reason (`TriangleAttributes` is needed to declare the attribute buffer; the
+functions need that buffer and a dozen uniforms to exist). The recipe is
+`albedo_flat × (sunColor · max(0, N·L) · CSM(hitPos) + local point/spot lights,
+range-windowed + π × probe-field irradiance at the hit) / π`, and a miss returns
+the IBL sky-CAPTURE cube's radiance in the ray direction — the same function the
+skybox draws — falling back to the `EnvironmentState` hemisphere when IBL is
+off. The include pulls in `shadow_common.hlsli` itself, so a consumer cannot
+forget it and silently get an unshadowed sun back.
+
+Two flags separate the callers, and they are not knobs. `giEnabled` is 0 when
+`gi_mode` is Off, where `RtRenderer` binds its own 1×1 probe stand-ins (the
+probe-state plane is a read-only STORAGE texture, and the engine's shared
+dummies carry sampler usage only). `giAmbientFallback` is 1 for reflection rays
+and **0 for probe rays**: a probe already collects sky through its ray misses,
+so a hemisphere added where the field has no answer would double-count it and
+break the bounce series' convergence argument — while a reflected rooftop three
+cascades outside the field has to be lit by *something*, and the hemisphere is
+the engine's documented no-GI ambient tier. That is also what makes reflections
+improve with GI off as well as on: shadowed sun + local lights + hemisphere
+beats a flat constant either way.
+
+**Hit distance, consumed.** The reflection trace writes each pixel's normalized
+hit distance (`hit.t / max_distance`, 1.0 on a miss or any early-out) to a
+second R16F target at the traced resolution, exposed as
+`RtRenderer::reflection_hit_distance`. Since R3 the temporal denoiser reads it.
+A reflection is an image of a point that is not on the surface — on a mirror,
+the *virtual* point, the eye ray reflected about the normal and extended by the
+hit distance — and under camera motion that point sweeps the screen at roughly
+**twice** the parallax rate of the surface carrying it. Reprojecting it through
+the surface's own motion vector therefore fetches the wrong texel by a margin
+that grows with hit distance, which is the smear that held `max_accum_frames`
+at 16 and which no amount of clamping fixes (a clamp can only throw the bad
+history away, at the cost of the accumulation).
+
+So the pass computes a second motion vector — the virtual point projected
+through the previous frame's camera — and blends it against the velocity
+buffer's by roughness (`render/rt_reflection_math.hpp` is the CPU source of
+truth for the curve; mirror-ish at 0.05, fully surface-driven by 0.40, both
+below the trace's own `fade_start`). Both vectors are UV deltas in the velocity
+buffer's convention (current minus previous, **unjittered**), so the TAA jitter
+cancels inside each difference rather than having to be removed from either.
+The MIRROR direction builds the virtual point, not the traced GGX sample: the
+lobe axis is the only part of it that is the same from one frame to the next,
+and reconstructing the stochastic sample would make the reprojection as noisy as
+the signal it is cleaning. Sky-reflecting texels (`hitT == 1`) and rough ones
+fall back to surface motion; a static camera makes both vectors identically
+zero, so the whole mechanism is **exactly** neutral there.
+
+**Rough-tier ambient specular goes local.** Above the trace's gate the engine's
+only specular answer was the IBL prefilter chain, which is built over the
+procedural SKY alone — so at high roughness it returns an average of open sky
+the surface may be nowhere near. `pbr.hlsli`'s `ambientIBL` now blends the
+prefiltered lobe toward the probe field's irradiance over a 0.6→1.0 roughness
+band (`giRoughSpecularWeight`, mirrored by `rough_specular_gi_weight`), scaled
+by the existing `giWeight`. With GI off the branch is not taken and the path is
+bit-identical.
 
 **Determinism.** Both passes seed from their own frame counter, so a traced
 frame is reproducible and the smoke gate applies to it unchanged.

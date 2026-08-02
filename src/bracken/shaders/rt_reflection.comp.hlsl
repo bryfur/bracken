@@ -13,12 +13,21 @@
 //  * CLOSEST hit, not any hit — unlike shadows, we have to shade what we find,
 //    so traversal cannot stop early. This is precisely why reflections cost
 //    several times what shadows do, and why they are a separate toggle.
-//  * ONE BOUNCE. The hit is shaded with sun lighting plus a flat ambient, not
-//    by recursing. A second bounce roughly squares the cost to change pixels
-//    almost nobody looks at.
+//  * ONE BOUNCE. The hit is shaded, not recursed into. A second bounce roughly
+//    squares the cost to change pixels almost nobody looks at.
 //  * MISSES FALL BACK TO THE SKY, matching the skybox the raster path draws,
 //    so a ray that escapes the scene is not a black hole in the reflection.
+//
+// HIT SHADING IS SHARED (R3, docs/rt_lighting_plan.md §5.4). Until R3 this pass
+// shaded a hit as `albedo * (sunColor * N.L + skyColor * 0.25)`: an UNSHADOWED
+// sun, so a reflected facade standing in a building's shadow reflected as if it
+// were in full sun, and a FLAT ambient constant, so every reflection was
+// uniformly lifted by open sky no matter what the reflected point could see.
+// Both are `rt_hit_shade.hlsli`'s job now — the same CSM-shadowed sun, local
+// light loop and probe-field ambient the GI probe rays have used since R1b —
+// and the flat constant is gone. The trace itself is unchanged.
 
+#include "gi_probe.hlsli"      // GI_CASCADE_COUNT for the cbuffer below
 #include "reflection_gate.hlsli"
 #include "rt_sampling.hlsli"
 
@@ -27,41 +36,84 @@
 #define RT_TRACE_TYPES
 #include "rt_trace.hlsli"
 
-// Stays here: only reflections bind the attribute buffer, and hit SHADING is
-// this pass's business, not the traversal's.
-struct TriangleAttributes {
-    float3 n0;
-    float pad0;
-    float3 n1;
-    float pad1;
-    float3 n2;
-    float pad2;
-    float4 baseColor;
-};
+// TriangleAttributes, phase 1 of the hit-shading include: the binding block
+// below needs the struct to declare its attribute buffer.
+#define RT_HIT_SHADE_TYPES
+#include "rt_hit_shade.hlsli"
 
+// ---------------------------------------------------------------------------
+// Uniforms (set 2, b0) — mirrors gpu::RtReflectionUniforms.
+//
+// The FIRST TEN MEMBERS are ShadowDataUniforms verbatim, under exactly the
+// names shadow_common.hlsli requires, so rt_hit_shade.hlsli can include that
+// file and call the forward pass's own calcShadow() at the hit. The atlas is
+// deliberately STANDARD-Z while the scene is reversed-Z, and
+// docs/rt_lighting_plan.md §8 names reimplementing that here as a trap.
+// ---------------------------------------------------------------------------
 [[vk::binding(0, 2)]]
 cbuffer RtReflectionUniforms : register(b0, space2) {
+    float4x4 shadowLightViewProjection[4];
+    float4 cascadeSplits;
+    float4 cascadeTexelWorld;
+    float4 cascadeDepthRange;
+    float shadowMapResolution;
+    float lightSize;
+    float shadowEnabled;
+    float lastActiveSplit;
+    float fadeStart;         // the CASCADE distance fade, shadow_common.hlsli's
+    float fadeEnd;
+    float _shadowPad0;
+    float _shadowPad1;
+
     float4x4 invViewProj;
     float3 cameraPosition;
     float rayMaxDistance;
-    float3 sunDirection;    // direction light TRAVELS
+    float3 cameraForward;   // calcShadow selects a cascade by VIEW depth
     float maxRoughness;     // the traced contribution reaches zero here
-    float3 sunColor;
+    float3 sunDirection;    // direction light TRAVELS
     float normalBias;
-    float3 skyColor;
+    float3 sunColor;        // already scaled by GraphicsSettings::sun_intensity
+    float gateFadeStart;    // roughness at which the trace starts handing over
+    float3 ambientSky;
+    float useSkyCube;
+    float3 ambientGround;
+    float bounceScale;
+    float giEnabled;
+    float giAmbientFallback; // always 1 here — see rtHitAmbient
     float _pad0;
-    uint2 outputSize;
-    uint tlasNodeCount;
-    float fadeStart;        // ...and starts fading out here (< maxRoughness)
+    float _pad1;
+    int4 giCascadeBase[GI_CASCADE_COUNT];
     float4 waterBounds;     // minX, minZ, maxX, maxZ
     float4 waterSurface;    // height, roughness, displacement, normal strength
     float4 waterSimWindow;  // min XZ, inverse extent, edge fade width
     float4 waterFlowTime;   // flow XZ, speed, absolute time
     float4 waterDetail;     // detail strength, receiver mode, visibility bias, unused
+    uint2 outputSize;
+    uint tlasNodeCount;
     uint frameIndex;        // advances the GGX sample sequence
-    float3 _pad1;
+    uint giLightCount;
+    uint giLightCapacity;
+    uint _pad2;
+    uint _pad3;
 };
 
+// NOTE the two fades. `fadeStart`/`fadeEnd` are the CASCADE distance fade and
+// belong to shadow_common.hlsli, which reads them by those names. The roughness
+// handover this pass owns is `gateFadeStart` — it used to be called `fadeStart`
+// and had to yield the name when the shadow block moved in.
+
+// ---------------------------------------------------------------------------
+// Bindings. SET 0 IS ORDER-SENSITIVE: sampled textures, then READ-ONLY storage
+// textures, then READ-ONLY storage buffers, each run numbered contiguously
+// (shaders/README.md). Declaring them in any other order compiles, reflects and
+// validates cleanly and then binds the wrong resource to every slot.
+//
+// SIX read-only storage buffers of SDL3 GPU's eight, so the budget survives:
+// the four acceleration ones, the per-triangle attributes, and the flat light
+// list. Not the froxel grid — a ray hit is a world-space point.
+// ---------------------------------------------------------------------------
+
+// --- sampled (6) ---
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
 Texture2D<float> sceneDepth : register(t0, space0);
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
@@ -70,25 +122,68 @@ SamplerState sceneDepthSampler : register(s0, space0);
 Texture2D<float4> sceneNormal : register(t1, space0);
 [[vk::combinedImageSampler]][[vk::binding(1, 0)]]
 SamplerState sceneNormalSampler : register(s1, space0);
-[[vk::binding(2, 0)]] StructuredBuffer<BvhNodeGpu> tlasNodes : register(t2, space0);
-[[vk::binding(3, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t3, space0);
-[[vk::binding(4, 0)]] StructuredBuffer<BvhNodeGpu> blasNodes : register(t4, space0);
-[[vk::binding(5, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t5, space0);
-[[vk::binding(6, 0)]] StructuredBuffer<TriangleAttributes> blasAttributes : register(t6, space0);
+// The CSM atlas, twice: the comparison pair calcShadow() filters with, and the
+// raw pair its PCSS blocker search reads. `shadowEnabled` is clamped to 1 (PCF)
+// for reflection hits — a reflection is temporally accumulated, so paying 20
+// atlas taps to soften one sample buys nothing — so the raw pair is never
+// sampled, but shadow_common.hlsli names it and a bound slot beats a dangling
+// one.
+[[vk::combinedImageSampler]][[vk::binding(2, 0)]]
+Texture2D shadowAtlas : register(t2, space0);
+[[vk::combinedImageSampler]][[vk::binding(2, 0)]]
+SamplerComparisonState shadowCmpSampler : register(s2, space0);
+[[vk::combinedImageSampler]][[vk::binding(3, 0)]]
+Texture2D shadowAtlasRaw : register(t3, space0);
+[[vk::combinedImageSampler]][[vk::binding(3, 0)]]
+SamplerState shadowRawSampler : register(s3, space0);
+// The IBL sky-CAPTURE cube (raw radiance) a ray miss returns.
+[[vk::combinedImageSampler]][[vk::binding(4, 0)]]
+TextureCube giSkyCube : register(t4, space0);
+[[vk::combinedImageSampler]][[vk::binding(4, 0)]]
+SamplerState giSkySampler : register(s4, space0);
+// The BANDED probe irradiance atlas — every cascade in one texture (R1c). Holds
+// the engine's 1x1 dummy when gi_mode is Off, which `giEnabled` gates.
+[[vk::combinedImageSampler]][[vk::binding(5, 0)]]
+Texture2D<float4> giIrradiance : register(t5, space0);
+[[vk::combinedImageSampler]][[vk::binding(5, 0)]]
+SamplerState giIrradianceSampler : register(s5, space0);
+
+// --- read-only storage textures (1) ---
+// Per-probe scheduling state, all cascades banded, so the ambient tap can
+// reject a probe whose storage still holds the previous occupant of its slot.
+[[vk::binding(6, 0)]] Texture2D<uint> giProbeState : register(t6, space0);
+
+// --- read-only storage buffers (6 of 8) ---
+[[vk::binding(7, 0)]] StructuredBuffer<BvhNodeGpu> tlasNodes : register(t7, space0);
+[[vk::binding(8, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t8, space0);
+[[vk::binding(9, 0)]] StructuredBuffer<BvhNodeGpu> blasNodes : register(t9, space0);
+[[vk::binding(10, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t10, space0);
+[[vk::binding(11, 0)]] StructuredBuffer<TriangleAttributes> blasAttributes : register(t11, space0);
+// The clustered-lighting buffer, read WITHOUT the cluster grid: a reflection
+// hit is a world-space point and the froxel grid is screen-space, so the only
+// correct traversal is the flat list. Also the only one that FITS — the grid
+// costs four more read-only storage buffers and eight is the ceiling.
+[[vk::binding(12, 0)]] ByteAddressBuffer lightDataBuf : register(t12, space0);
 
 [[vk::binding(0, 1)]] RWTexture2D<float4> reflectionOut : register(u0, space1);
 // Normalized hit distance (hit.t / rayMaxDistance), 1.0 on a miss or any
 // early-out. R16F, traced resolution, written by every in-bounds thread so the
-// target never carries a stale frame's geometry. NOTHING CONSUMES IT YET: it
-// exists because R3's virtual-hit-point reprojection needs the reflected
-// point's distance to reproject the *virtual* position rather than the surface
-// carrying it, and the trace is the only place that number is free. Writing it
-// now keeps that from being a change to the traversal later.
+// target never carries a stale frame's geometry. Produced by R0, CONSUMED since
+// R3 by rt_reflection_denoise_temporal.comp.hlsl, which extends the eye ray by
+// it to reproject the reflection's VIRTUAL position instead of the surface
+// carrying it.
 [[vk::binding(1, 1)]] RWTexture2D<float> reflectionHitDistance : register(u1, space1);
 
 // The buffers and `tlasNodeCount` above are what the walks bind to.
 #define RT_TRACE_TRAVERSAL
 #include "rt_trace.hlsli"
+
+// Hit shading, phase 2: rtHitSkyRadiance / rtShadeHit over the resources and
+// cbuffer members declared above. It includes shadow_common.hlsli itself, so
+// the calcShadow() a reflected point gets is the same one the forward pass
+// applies to that point when it is drawn directly.
+#define RT_HIT_SHADE_FUNCTIONS
+#include "rt_hit_shade.hlsli"
 
 // Must stay operation-identical to water.frag.hlsl. The analytic receiver
 // uses this normal for the ray; the water forward pass uses it for Fresnel,
@@ -230,7 +325,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // the forward pass scales its IBL lobe by exactly 1 - gate, so the two
     // hand over continuously instead of stepping (shaders/reflection_gate.hlsli).
     // alpha = 0 tells the full-resolution resolve to keep using the probe alone.
-    float gate = rtReflectionWeight(roughness, fadeStart, maxRoughness);
+    float gate = rtReflectionWeight(roughness, gateFadeStart, maxRoughness);
     if (gate <= 0.0) {
         reflectionOut[coord] = float4(0, 0, 0, 0);
         reflectionHitDistance[coord] = 1.0;
@@ -282,20 +377,21 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (!hit.valid) {
         // Water already owns a high-quality SSR/IBL fallback. Leave alpha at
         // zero on a miss so that path remains authoritative instead of
-        // replacing it with the RT pass's deliberately cheap flat sky.
+        // replacing it with the RT pass's sky.
         if (waterDetail.y > 0.5) {
             reflectionOut[coord] = float4(0, 0, 0, 0);
             return;
         }
         // Escaped the scene: return sky, matching what the raster path draws.
         // Returning black here is the classic ray-traced-reflection artifact —
-        // dark voids wherever geometry is thin.
-        reflectionOut[coord] = float4(skyColor, gate);
+        // dark voids wherever geometry is thin. Since R3 this is the REAL sky
+        // in the ray's direction (the IBL capture cube, the same radiance
+        // function the skybox draws) rather than one flat horizon colour, so a
+        // reflection of the zenith and a reflection of the horizon differ.
+        reflectionOut[coord] = float4(rtHitSkyRadiance(rayDir), gate);
         return;
     }
 
-    // Shade the hit: interpolated normal, base colour, one sun term plus a
-    // flat ambient. Deliberately not a second bounce.
     TriangleAttributes attr = blasAttributes[hit.triIndex];
     float w = 1.0 - hit.bary.x - hit.bary.y;
     float3 hitNormalModel = normalize(attr.n0 * w + attr.n1 * hit.bary.x + attr.n2 * hit.bary.y);
@@ -305,14 +401,28 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // instances light from the wrong direction inside reflections.
     TlasInstance hitInstance = tlasInstances[hit.instanceIndex];
     float3 hitNormal = normalize(mul((float3x3)transpose(hitInstance.worldToModel), hitNormalModel));
+    // A reflection ray that lands on a backface is looking at the inside of a
+    // one-sided wall — flip the normal and shade it rather than returning
+    // black. (The probe pass does the opposite, because a backface is its
+    // classification signal; the shared shader deliberately owns neither
+    // policy.)
+    if (dot(hitNormal, rayDir) > 0.0) {
+        hitNormal = -hitNormal;
+    }
 
-    float3 toLight = -sunDirection;
-    float ndotl = saturate(dot(hitNormal, toLight));
-    float3 albedo = attr.baseColor.rgb;
-    float3 shaded = albedo * (sunColor * ndotl + skyColor * 0.25);
+    // THE HIT, shaded exactly as a probe ray's is: CSM-shadowed sun, the
+    // frame's point/spot lights, and the probe field's ambient (hemisphere
+    // where the field has no answer, or when GI is off entirely). `coord` is a
+    // stable per-pixel value for calcShadow's PCSS disk rotation, which PCF
+    // never reaches.
+    float3 hitPos = rayOrigin + rayDir * hit.t;
+    float3 shaded = rtShadeHit(hitPos, hitNormal, attr.baseColor.rgb, float2(coord));
 
     // Fade with distance so a reflection that runs out of ray fades into the
-    // sky rather than ending at a hard edge.
+    // sky rather than ending at a hard edge. Into the SAME sky a miss returns
+    // (R3) — with a flat `skyColor` here and a directional cube tap there, a
+    // ray that ran out of range and a ray that escaped disagreed about what
+    // they were looking at.
     float fade = saturate(1.0 - hit.t / rayMaxDistance);
     if (waterDetail.y > 0.5) {
         // For water alpha is the hand-off to SSR/IBL. Fade the traced result's
@@ -321,7 +431,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         reflectionOut[coord] = float4(shaded, gate * fade);
         return;
     }
-    shaded = lerp(skyColor, shaded, fade);
+    shaded = lerp(rtHitSkyRadiance(rayDir), shaded, fade);
 
     // Store incoming radiance, not a material-weighted contribution. The
     // full-resolution resolve evaluates the RECEIVING pixel's BRDF after its

@@ -239,10 +239,27 @@ and the G-buffer as sampled textures with a point-clamp sampler, never as
 compute storage. `rt_reflection.comp` writes TWO read-write storage textures:
 `u0` the RGBA16F raw radiance, and `u1` an R16F `hitT` — the hit distance
 normalized by `rayMaxDistance`, 1.0 on a miss or any early-out (sky, roughness
-gate, water-receiver rejection), written by every in-bounds thread. Nothing
-reads `hitT` yet; it exists because the virtual-hit-point reprojection planned
-for the reflection denoiser needs the reflected point's distance, and the trace
-is the only place that number is free.
+gate, water-receiver rejection), written by every in-bounds thread.
+
+Since R3 that pass shades its hits through **`rt_hit_shade.hlsli`** (below), not
+with the flat `albedo × (sunColor·N·L + skyColor × 0.25)` it used to: the sun is
+CSM-shadowed, the frame's point/spot lights are looped, the ambient comes from
+the probe field (or the hemisphere), and a miss samples the sky cube
+directionally instead of returning one horizon colour. That widened its binding
+block to 6 samplers + 1 read-only storage texture + **6** read-only storage
+buffers — two under SDL3 GPU's eight, which is why the light list is read flat
+rather than through `cluster_compute.hlsli`'s froxel grid (a ray hit is a
+world-space point and has no froxel anyway).
+
+`rt_reflection_denoise_temporal.comp` now CONSUMES `hitT`, plus the receiver's
+depth and G-buffer: it extends the eye ray by the hit distance to place the
+reflection's **virtual point**, projects that through the previous frame's
+unjittered camera, and blends the resulting motion vector against the velocity
+buffer's by roughness (mirror-ish → virtual, rough → surface;
+`render/rt_reflection_math.hpp` is the CPU source of truth for the curve). Both
+vectors are UV deltas in the velocity buffer's own convention, so the TAA jitter
+cancels inside each difference. A static camera makes both identically zero and
+the mechanism exactly neutral.
 
 `rt_local_shadow.comp` (R2b) is the third traced signal and the only one that
 reads the cluster grid: per pixel it draws six candidates from the pixel's
@@ -291,7 +308,8 @@ atlases, recorded once per cascade whose turn the rota gives it and all timed as
 one `GIProbes` scope. `gi_probe_trace.comp` casts one ray per (scheduled probe,
 ray slot) over the SAME software BVH the other traced effects walk — it includes
 `rt_trace.hlsli` in both phases and uses the **closest-hit** walk, because a
-probe ray has to shade what it finds. Hit shading is flat `TriangleAttributes`
+probe ray has to shade what it finds. Hit shading moved to `rt_hit_shade.hlsli`
+in R3 and is shared with `rt_reflection.comp`: flat `TriangleAttributes`
 albedo times (sun N·L with a **CSM atlas fetch** for visibility + the frame's
 point/spot lights, range-windowed, read straight out of the cluster light
 buffer's byte layout + π × last frame's own probe irradiance at the hit, which
@@ -407,7 +425,22 @@ GGX-VNDF sampling, the packed visibility-tile helpers, and `rtSeed`/`rtNextFloat
 — a per-pixel per-frame random STREAM for passes like the froxel-RIS reservoir
 that make a dozen independent decisions per pixel, where feeding them all from
 one low-discrepancy sequence would correlate the candidate choice with the
-acceptance test), `rt_trace.hlsli` (the
+acceptance test), `rt_hit_shade.hlsli` (**the one
+hit-shading model** every traced signal uses, R3: `TriangleAttributes` in phase
+1, then `rtHitSkyRadiance` for a miss and `rtShadeHit` for a hit —
+`albedo_flat × (CSM-shadowed sun N·L + range-windowed point/spot lights + π ×
+probe-field irradiance) / π`. A **two-phase** include like `rt_trace.hlsli`, and
+it names resources it does not own — `shadowAtlas`/`shadowCmpSampler`,
+`shadowAtlasRaw`/`shadowRawSampler`, `giSkyCube`, `giIrradiance`, `giProbeState`,
+`lightDataBuf` — so the including shader owns their slots, exactly like
+`cluster_lighting.hlsli`. It includes `shadow_common.hlsli` itself, so a
+consumer cannot forget it and silently get an unshadowed sun back. Two flags in
+the required cbuffer separate its callers: `giEnabled` (0 binds 1×1 dummies and
+the ambient falls to the hemisphere) and `giAmbientFallback` — 1 for reflection
+rays, **0 for probe rays**, because a probe already collects sky through its ray
+misses and adding a hemisphere on top would double-count it and break the bounce
+series' convergence. Consumers: `rt_reflection.comp` and `gi_probe_trace.comp`),
+`rt_trace.hlsli` (the
 software two-level BVH: `BvhNodeGpu`/`BvhTriangle`/`TlasInstance`, `slabTest`,
 `octDecode`, the any-hit `blasOccluded`/`sceneOccluded` walk and the
 closest-hit `Hit`/`blasClosest`/`sceneClosest` walk — shared by
