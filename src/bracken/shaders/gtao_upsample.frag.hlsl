@@ -2,7 +2,7 @@
  * GTAO Upsample/Finalize Fragment Shader.
  *
  * Joint-bilateral (depth-aware) upsample of the working-res blurred AO to
- * the full-res R8 texture the forward pass samples in its ambient term.
+ * the full-res RGBA8 texture the forward pass samples in its ambient term.
  * Plain bilinear would mix foreground and background AO across depth
  * discontinuities (dark fringes around silhouettes); each of the 4 nearest
  * working-res taps is weighted by bilinear weight x linear-depth similarity
@@ -10,8 +10,15 @@
  * upsample). When the working res equals the target res (AOMode GTAO_Full)
  * the filter degenerates to an exact passthrough.
  *
- * Also applies GraphicsSettings::ao_strength as pow(ao, strength): 0 = off
- * (AO forced to 1), 1 = stock, >1 = stronger darkening.
+ * All four channels ride through (shaders/bent_cone.hlsli): AO and aperture
+ * filter directly, the bent normal is decoded per tap, weighted, renormalised
+ * and re-encoded.
+ *
+ * Also applies GraphicsSettings::ao_strength as pow(x, strength) to BOTH
+ * occlusion channels: 0 = off (AO and aperture both forced to 1, which is the
+ * fully-open escape value, so the GI gate reverts to the scalar path too),
+ * 1 = stock, >1 = stronger darkening. Shaping only one of the two would let
+ * the knob turn AO off while the bent cone kept gating.
  */
 
 struct PSInput {
@@ -31,7 +38,7 @@ cbuffer GtaoUpsampleUniforms : register(b0, space3) {
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
-Texture2D<float> aoTexture : register(t0, space2);
+Texture2D<float4> aoTexture : register(t0, space2);
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
 SamplerState aoSampler : register(s0, space2);
 
@@ -40,12 +47,14 @@ Texture2D<float> depthTexture : register(t1, space2);
 [[vk::combinedImageSampler]][[vk::binding(1, 2)]]
 SamplerState depthSampler : register(s1, space2);
 
+#include "bent_cone.hlsli"
+
 // Positive linear view depth from non-linear [0,1] depth.
 float linearizeDepth(float depth) {
     return abs(depthB / (depth + depthA));
 }
 
-float PSMain(PSInput input) : SV_Target {
+float4 PSMain(PSInput input) : SV_Target {
     float2 uv = input.texCoord;
 
     // The 4 nearest working-res texel centers around this full-res pixel.
@@ -81,10 +90,18 @@ float PSMain(PSInput input) : SV_Target {
     w = (sum > 1e-4) ? (w / sum) : bilinear;
 
     float ao = 0.0;
+    float aperture = 0.0;
+    float3 dir = float3(0.0, 0.0, 0.0);
+    float3 nearestDir = bentOctDecode(aoTexture.SampleLevel(aoSampler, tapUV[0], 0).gb);
     [unroll]
     for (int tap = 0; tap < 4; ++tap) {
-        ao += aoTexture.SampleLevel(aoSampler, tapUV[tap], 0) * w[tap];
+        float4 s = aoTexture.SampleLevel(aoSampler, tapUV[tap], 0);
+        ao += s.r * w[tap];
+        aperture += s.a * w[tap];
+        dir += bentOctDecode(s.gb) * w[tap];
     }
 
-    return saturate(pow(max(ao, 1e-4), strength));
+    return float4(saturate(pow(max(ao, 1e-4), strength)),
+                  bentOctEncode(bentNormalize(dir, nearestDir)),
+                  saturate(pow(max(aperture, 1e-4), strength)));
 }

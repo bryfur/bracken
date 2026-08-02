@@ -100,7 +100,17 @@ float3 ambientPBR(float3 N, float3 V, float3 baseColor, float metallic, float ro
                   // The SPECULAR half keeps reading the hemisphere; R4 is what
                   // changes that, not R1c. giWeight == 0 leaves the branch
                   // untaken, so the GI-off path is bit-identical.
-                  float3 giIrradiance = float3(0, 0, 0), float giWeight = 0.0) {
+                  float3 giIrradiance = float3(0, 0, 0), float giWeight = 0.0,
+                  // BENT-CONE GATE (R5a). The GI term is the only ambient
+                  // quantity with a direction of its own, so it is the only one
+                  // the AO pass's bent cone can gate directionally: pass the
+                  // cone's aperture here and the caller's giIrradiance sampled
+                  // along the BENT normal. Negative means "no cone" and the
+                  // scalar `ao` gates the GI term like everything else, which
+                  // is what keeps the AO-off and pre-R5a paths bit-identical.
+                  // The two are never both applied — that is the double-count
+                  // rule of docs/rt_lighting_plan.md §5.6.
+                  float giGate = -1.0) {
     float NdotV = max(dot(N, V), 1e-4);
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metallic);
 
@@ -109,10 +119,18 @@ float3 ambientPBR(float3 N, float3 V, float3 baseColor, float metallic, float ro
     float3 F = fresnelSchlickRoughness(NdotV, F0, roughness);
     float3 kd = (1.0 - F) * (1.0 - metallic);
     float3 irradiance = lerp(groundColor, skyColor, N.y * 0.5 + 0.5);
+    // Each half of the diffuse blend carries its OWN occlusion — the
+    // hemisphere's is the scalar AO, the probe's is the bent cone's aperture
+    // (or the scalar AO again when there is no cone). Folding them in here
+    // rather than multiplying `ao` over the sum at the end is what makes the
+    // bent-cone gate REPLACE the scalar one instead of stacking with it;
+    // giGate == ao reproduces the pre-R5a arithmetic exactly.
+    float gate = (giGate >= 0.0) ? giGate : ao;
+    float3 diffuseIrradiance = irradiance * ao;
     if (giWeight > 0.0) {
-        irradiance = lerp(irradiance, giIrradiance, giWeight);
+        diffuseIrradiance = lerp(diffuseIrradiance, giIrradiance * gate, giWeight);
     }
-    float3 diffuse = kd * baseColor * irradiance;
+    float3 diffuse = kd * baseColor * diffuseIrradiance;
 
     // Specular: Karis mobile split-sum fit (UE4 EnvBRDFApprox) against the
     // hemisphere color sampled toward the reflection vector.
@@ -126,7 +144,9 @@ float3 ambientPBR(float3 N, float3 V, float3 baseColor, float metallic, float ro
     float3 envColor = lerp(groundColor, skyColor, R.y * 0.5 + 0.5);
     float3 specular = envColor * (F0 * AB.x + AB.y);
 
-    return (diffuse + specular) * ao;
+    // The diffuse half is already gated above (per-source); specular keeps the
+    // plain scalar AO it always had.
+    return diffuse + specular * ao;
 }
 
 // Image-based ambient from the sky prefilter chain (render/ibl.hpp):
@@ -167,7 +187,13 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
                   // applies `ao * lift` to everything at the end. Since R3 the
                   // ROUGH end of the specular half uses it too — see
                   // giRoughSpecularWeight.
-                  float3 giIrradiance = float3(0, 0, 0), float giWeight = 0.0) {
+                  float3 giIrradiance = float3(0, 0, 0), float giWeight = 0.0,
+                  // BENT-CONE GATE (R5a) — see ambientPBR's giGate. Applies to
+                  // the DIFFUSE probe term only: the rough-specular handover
+                  // below reuses giIrradiance as a wide GGX lobe, which the
+                  // cone (a cosine-lobe fit) does not describe, so that one
+                  // keeps the scalar AO. Negative = no cone.
+                  float giGate = -1.0) {
     float NdotV = max(dot(N, V), 1e-4);
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metallic);
 
@@ -176,10 +202,14 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
     float3 F = fresnelSchlickRoughness(NdotV, F0, roughness);
     float3 kd = (1.0 - F) * (1.0 - metallic);
     float3 irradiance = irradianceMap.SampleLevel(irradianceSampler, N, 0).rgb;
+    // Per-source occlusion — see ambientPBR's identical block. `ao` is NOT
+    // applied over the sum at the end any more; each term carries its own.
+    float gate = (giGate >= 0.0) ? giGate : ao;
+    float3 diffuseIrradiance = irradiance * ao;
     if (giWeight > 0.0) {
-        irradiance = lerp(irradiance, giIrradiance, giWeight);
+        diffuseIrradiance = lerp(diffuseIrradiance, giIrradiance * gate, giWeight);
     }
-    float3 diffuse = kd * baseColor * irradiance;
+    float3 diffuse = kd * baseColor * diffuseIrradiance;
 
     // Specular: prefiltered radiance along R at the roughness-matched mip,
     // scaled/biased by the split-sum LUT.
@@ -209,7 +239,9 @@ float3 ambientIBL(float3 N, float3 Ngeo, float3 V, float3 baseColor, float metal
     horizon *= horizon;
     float3 specular = prefiltered * (F0 * envBRDF.x + envBRDF.y) * horizon;
 
-    return (diffuse + specular * specularScale) * (ao * lift);
+    // Diffuse is already occluded per-source above; specular keeps the plain
+    // scalar AO. Both still take the shadow-driven ambient lift.
+    return (diffuse + specular * specularScale * ao) * lift;
 }
 
 // Kaplanyan-style specular anti-aliasing: widen perceptual roughness by the

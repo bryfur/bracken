@@ -805,7 +805,7 @@ private:
     // *DepthEqual pipeline variants (EQUAL compare, depth writes off).
     bool frame_prepass_active_ = false;
 
-    // The AO texture forward draws sample this frame: gtao_'s full-res R8
+    // The AO texture forward draws sample this frame: gtao_'s full-res RGBA8
     // output when AO ran, otherwise the 1x1 white dummy. Reset at the top of
     // every render_frame (never dangles across resizes/mode switches).
     //

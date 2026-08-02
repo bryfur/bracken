@@ -71,7 +71,7 @@ enum class PipelineType {
     // Post-processing pipelines (fullscreen triangle, no vertex input)
     GTAO,            ///< GTAO (horizon-based) ambient occlusion from prepass depth
     GTAOTemporal,    ///< GTAO temporal accumulation (velocity reprojection + depth reject)
-    GTAOUpsample,    ///< GTAO joint-bilateral upsample to the full-res R8 AO texture
+    GTAOUpsample,    ///< GTAO joint-bilateral upsample to the full-res RGBA8 AO + bent-cone texture
     BlurAO,          ///< Bilateral blur for AO
     RtReflectionResolve, ///< Material/depth/normal-guided RT reflection resolve into HDR, before TAA
     Composite,       ///< Final composite (scene + bloom + fog, tonemap) to swapchain
@@ -247,8 +247,11 @@ enum class TargetFormat : uint8_t {
     Swapchain,  ///< The presentable surface format
     SceneColor, ///< The HDR offscreen scene target
     Velocity,   ///< The motion-vector target written by the depth prepass
-    R8,         ///< Single-channel unorm (ambient occlusion)
-    RG16F,      ///< Two-channel half float (AO history, BRDF LUT)
+    R8,         ///< Single-channel unorm
+    /// Four-channel unorm: the screen-space AO chain's (AO, octahedral bent
+    /// normal, cone aperture) — see shaders/bent_cone.hlsli.
+    RGBA8,
+    RG16F,      ///< Two-channel half float (AO depth history, BRDF LUT)
     RGBA16F,    ///< Four-channel half float (bloom chain, fog, IBL cubes)
     /// RGBA8: world normal encoded to [0,1] in RGB, linear roughness in A.
     /// The optional second prepass attachment that feeds ray-traced

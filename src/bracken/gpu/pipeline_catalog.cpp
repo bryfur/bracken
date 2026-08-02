@@ -260,6 +260,8 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .color = TargetFormat::DepthOnly},
 
     // --- Post-process (fullscreen triangle, no vertex input, no depth) --------
+    // RGBA8 everywhere in the AO chain since R5a: R = AO, GB = octahedral
+    // world bent normal, A = cone aperture (shaders/bent_cone.hlsli).
     {.name = "GTAO",
      .vertex_shader = "fullscreen.vert.spv",
      .fragment_shader = "gtao.frag.spv",
@@ -267,17 +269,21 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .fs = k_ubo1_samp1, // GTAOUniforms + depth
      .vertex_layout = VertexLayout::None,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
-     .color = TargetFormat::R8,
+     .color = TargetFormat::RGBA8,
      .depth_target = false},
-    // RG16F history: R = accumulated AO, G = linear view depth (disocclusion).
+    // TWO targets: RGBA16F history (AO, oct.xy, aperture) and an RG16F depth
+    // history (R = linear view depth) for the next frame's disocclusion test.
+    // Five linearly filtered quantities do not fit in four channels and none
+    // of them survives bit-packing under the history's linear sampler.
     {.name = "GTAOTemporal",
      .vertex_shader = "fullscreen.vert.spv",
      .fragment_shader = "gtao_temporal.frag.spv",
      .vs = k_none,
-     .fs = k_ubo1_samp4, // raw AO + history + velocity + depth
+     .fs = {.num_samplers = 5, .num_uniform_buffers = 1}, // raw + history + velocity + depth + depth history
      .vertex_layout = VertexLayout::None,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
-     .color = TargetFormat::RG16F,
+     .color = TargetFormat::RGBA16F,
+     .color2 = TargetFormat::RG16F,
      .depth_target = false},
     {.name = "GTAOUpsample",
      .vertex_shader = "fullscreen.vert.spv",
@@ -286,7 +292,7 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .fs = k_ubo1_samp2, // blurred AO + depth
      .vertex_layout = VertexLayout::None,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
-     .color = TargetFormat::R8,
+     .color = TargetFormat::RGBA8,
      .depth_target = false},
     {.name = "BlurAO",
      .vertex_shader = "fullscreen.vert.spv",
@@ -295,7 +301,7 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .fs = k_ubo1_samp2, // AO + depth
      .vertex_layout = VertexLayout::None,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
-     .color = TargetFormat::R8,
+     .color = TargetFormat::RGBA8,
      .depth_target = false},
     {.name = "RtReflectionResolve",
      .vertex_shader = "fullscreen.vert.spv",
@@ -1137,6 +1143,8 @@ SDL_GPUTextureFormat resolve_target_format(TargetFormat target, const PipelineFo
             return formats.velocity;
         case TargetFormat::R8:
             return SDL_GPU_TEXTUREFORMAT_R8_UNORM;
+        case TargetFormat::RGBA8:
+            return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
         case TargetFormat::RG16F:
             return SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
         case TargetFormat::RGBA16F:

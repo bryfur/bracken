@@ -635,25 +635,71 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    `render::GTAO`, computed from the prepass depth alone BEFORE the forward
    pass; the forward shaders sample the result in their ambient term (screen
    AO never touches direct sun light or speculars, and is min-combined with
-   material ORM AO to avoid double-darkening). Chain of 5 raster fullscreen
-   passes at the AO working resolution (half res for `GTAO_Half`, full res
-   for `GTAO_Full`): horizon-based GTAO (Jimenez et al.; 3 slices × 4 steps
-   per side, per-pixel IGN + per-frame golden-ratio jitter, edge-aware
-   depth-reconstructed normals, thin-occluder heuristic, world-unit radius ×
-   `ao_radius`) → temporal accumulation (velocity reprojection into a
-   double-buffered RG16F history storing AO + linear depth; relative-depth
-   disocclusion rejection, feedback ≤ 0.9; history invalidates on
-   resize/quality change/AO-off/prepass gaps — same policy as TAA) →
-   `BlurAO` ×2 (depth-aware separable blur of the accumulated AO; the
-   history itself stays unfiltered) → joint-bilateral upsample to the
-   full-res R8 AO texture (+ `ao_strength` as a power curve; exact
-   passthrough at full working res). MASK geometry is IN the prepass (the
-   alpha-tested variants above), so foliage both receives and casts screen
-   AO — leaf-on-leaf occlusion is what visually separates a canopy from a
-   flat blob. BLEND geometry stays absent: it neither receives its own AO
-   nor occludes (enforced by `screenAOEnabled = 0` in its per-mesh uniforms —
-   without the gate the forward pass would sample the AO of whatever is
-   BEHIND the surface).
+   material ORM AO to avoid double-darkening).
+
+   **The pass produces a bent cone, not a scalar (R5a).** Same slices, same
+   steps, same jitter, same cosine weighting — three answers. Every texture in
+   the chain is RGBA and the layout is owned by `shaders/bent_cone.hlsli`:
+   **R** = AO (1 = unoccluded), **GB** = the world-space **bent normal** (the
+   mean unoccluded direction), octahedral-encoded with the engine's existing
+   `octEncode`/`octDecode` mapping, **A** = the cone **aperture** stored as
+   sin²(half-angle), i.e. the fraction of the hemisphere's projected solid
+   angle the cone covers. `A ≥ 0.998` is the ESCAPE VALUE — "fully open, no
+   directional data" — which is what sky pixels, far-field pixels, the
+   init/resize clear and the 1×1 white dummy all report, and it is why turning
+   AO off needs no uniform flag anywhere: white decodes to AO 1, gate 1, bent
+   normal = shading normal, i.e. exactly the pre-R5a ambient. `AOMode` is
+   unchanged in meaning; this is an upgrade of the same pass, not a new mode.
+
+   Chain of 5 raster fullscreen passes at the AO working resolution (half res
+   for `GTAO_Half`, full res for `GTAO_Full`):
+   * **`GTAO`** → RGBA8 raw. Per slice the hemicircle around the projected
+     normal is cut into a **32-sector visibility bitmask** (SSILVB, Therrien
+     et al. 2023) — one `uint`, plain ALU, no wave intrinsics. Each of the
+     3 slices × 4 steps × 2 sides depth samples marks the sectors its occluder
+     covers, modelled as a **slab of `GTAOUniforms::occluderThickness` = 1.0
+     world units along the view ray** (scaled by `ao_radius` alongside the
+     radius). What is left is integrated with the *same* cosine weight the old
+     analytic arc integral used, so an unoccluded pixel reproduces the arc
+     value exactly — `render/gtao.hpp`'s `gtao_sector_weight` is the CPU
+     reference and `GtaoSectorWeights.SumMatchesArcIntegral` pins the identity.
+     The bent normal is the first moment of the surviving sectors; the aperture
+     is a cone fitted to that moment's length.
+     This **replaces the `thinOccluderCompensation` heuristic**: a horizon pair
+     can only say "everything past this angle is blocked", and the old knob was
+     a unitless (0.2) guess at thickness that treated a fence plank and a barn
+     wall identically. A slab states the geometry — an occluder blocks a BAND
+     and nothing beyond it — and the two hemicircle edge cases (a coplanar
+     neighbour, a background sample below the tangent plane) fall out as
+     zero-width spans instead of needing the guess.
+   * **`GTAOTemporal`** → **two** targets: an RGBA16F history (AO, oct.xy,
+     aperture) and an RG16F depth history (R = linear view Z). Two because
+     five linearly-filtered quantities do not fit in four channels and the
+     history is sampled with a LINEAR filter at arbitrary reprojection
+     positions, so nothing can be bit-packed; RGBA16F rather than RGBA8
+     because a 0.9-feedback accumulation stalls against an 8-bit grid.
+     Velocity reprojection, relative-depth disocclusion rejection, history
+     invalidated on resize/quality change/AO-off/prepass gaps — same policy
+     as TAA.
+   * **`BlurAO` ×2** — depth-aware separable blur of all four channels; the
+     history itself stays unfiltered so the kernel never compounds.
+   * **`GTAOUpsample`** — joint-bilateral upsample to the full-res RGBA8
+     texture, `ao_strength` applied as a power curve to **both** occlusion
+     channels (shaping only one would let `ao_strength = 0` turn AO off while
+     the bent cone kept gating). Exact passthrough at full working res.
+
+   At every filtering stage the bent normal is decoded, filtered as a
+   **direction**, renormalised and re-encoded — averaging octahedral
+   coordinates is not averaging directions across the fold seam. The aperture
+   is a projected solid angle and filters linearly as stored. 8:8 octahedral
+   is ≈1° of worst-case angular error, far under what a diffuse cone resolves.
+
+   MASK geometry is IN the prepass (the alpha-tested variants above), so
+   foliage both receives and casts screen AO — leaf-on-leaf occlusion is what
+   visually separates a canopy from a flat blob. BLEND geometry stays absent:
+   it neither receives its own AO nor occludes (enforced by
+   `screenAOEnabled = 0` in its per-mesh uniforms — without the gate the
+   forward pass would sample the AO of whatever is BEHIND the surface).
 7b. **`RT shadows` / `RT reflections`** (only when `rt_shadows` or
    `rt_reflections` is on) — `render::RtRenderer`, a chain of compute
    dispatches over the engine's own software BVH (SDL3 GPU exposes no hardware
@@ -1807,7 +1853,9 @@ mechanisms carry it, and there are two seams to carry:
 `docs/rt_lighting_plan.md` §4's ledger, with `giEnabled`:
 
 ```
-diffuse ambient = giSampleDiffuse(P, N, V) × kd × albedo × (min(screenAO, ORM AO) × ambientLift)
+diffuse ambient = giSampleDiffuse(P, N, bentN, V) × kd × albedo × (giGate × ambientLift)
+giGate          = bent cone present ? min(ORM AO, cone aperture)
+                                    : min(screenAO, ORM AO)      // pre-R5a
 ```
 
 replacing `ambientIBL`'s irradiance-cube diffuse and `ambientPBR`'s hemisphere
@@ -1817,10 +1865,52 @@ diffuse. **The specular ambient half is untouched** — prefiltered IBL or
 `giIrradiance` + `giWeight` pair whose branch is not taken at `giWeight == 0`,
 so the GI-off arithmetic is bit-identical rather than merely equal. The
 override arrives **pre-scaled by the ambient lift for `ambientPBR`** (whose
-hemisphere colours are) and **raw for `ambientIBL`** (which applies `ao × lift`
-to everything at the end). The unit is the same on both sides:
+hemisphere colours are) and **raw for `ambientIBL`** (which applies `lift` to
+everything at the end). The unit is the same on both sides:
 cosine-weighted mean incoming radiance, irradiance/π, the IBL irradiance cube's
 own convention — which is why no scale factor appears anywhere.
+
+**Bent-cone gating (R5a).** The GI term is the only ambient quantity with a
+direction of its own, so it is the only one the AO pass's bent cone can gate
+directionally, and since R5a it is gated that way and *not* by the scalar
+screen AO. Two changes, both in the four scene shaders rather than in
+`pbr.hlsli`:
+
+* the probe field and the screen probes are **evaluated along the bent normal**
+  — `giSampleDiffuse` and `giScreenSampleDiffuse` gained a `sampleDir`
+  parameter separate from `N`. The split is deliberate: probe SELECTION (the
+  surface bias, the backface wrap, the screen-probe forward-normal test) is
+  geometry and keeps the surface normal, while the octahedral / SH TAP is a
+  directional query and takes the cone axis. Feeding the bent normal to both
+  would let a bent normal tilted off a wall reject the probes on its own
+  surface.
+* the term is scaled by the cone's **aperture** instead of the scalar screen
+  AO. That curve is derived, not tuned: irradiance along the bent normal is the
+  mean radiance over the hemisphere about it, and the cosine-weighted solid
+  angle of a cone of half-angle α about its own axis is π·sin²α — divide out
+  the π the irradiance/π convention already carries and the factor is sin²α,
+  which is exactly what channel A stores.
+
+`shaders/bent_cone.hlsli::bentConeGiGate` is the one place that decides,
+and it enforces §5.6's **double-count rule**: the cone REPLACES the scalar-AO
+multiply for the GI term, the two are never both applied. Material (ORM) AO
+still min-combines, because it is a different measurement at a different scale
+— the same reasoning that already min-combines it with screen AO. Without a
+cone (`A ≥ 0.998`, i.e. AO off, sky, far field, or a genuinely open pixel) the
+gate is the pre-R5a scalar and the arithmetic is unchanged.
+
+`pbr.hlsli` had to stop multiplying `ao` over the whole ambient sum for this:
+each ambient source now carries its own occlusion (hemisphere/cube diffuse ×
+`ao`, GI diffuse × `giGate`, specular × `ao`), which is the same value at
+`giGate == ao` and is what makes "replaces" mean replaces.
+
+**What R5a deliberately does NOT include.** SSILVB's other half — near-field
+screen-space indirect DIFFUSE, where the unoccluded sectors gather last frame's
+lit colour instead of only counting — is deferred. It needs the previous
+frame's lit colour bound into the AO pass and its own energy rules against the
+probe field (§5.6's "SS indirect *replaces* probe irradiance within its sampled
+radius, never adds"), which is a second package's worth of ledger. The bitmask
+and the bent cone are R5a.
 
 **Fog** (`shaders/volumetric_fog.frag.hlsl`, slots 2–3 — irradiance and the
 metadata plane; it compiles `gi_sample.hlsli` with `GI_SAMPLE_VOLUME_ONLY` and
@@ -2712,6 +2802,14 @@ debugging "why is this value zero / where did my draw go":
   opaque-only prepass depth, so alpha-tested foliage neither occludes nor
   receives its own AO (MASK pixels sample the AO of whatever opaque surface
   is behind them; BLEND draws bind the white dummy and get none).
+- **The AO texture's alpha channel is load-bearing and has no flag beside
+  it.** `A >= BENT_CONE_OPEN` (0.998) is the "no directional data" escape that
+  makes a 1×1 white dummy, a sky pixel and a far-field pixel all decode to the
+  pre-bent-cone behaviour. Anything that writes into that chain — a debug
+  visualiser, a new filter, a format change — must preserve it, and anything
+  that reads GB without checking A will read a bent normal that was never
+  computed. `shaders/bent_cone.hlsli` is the only place that should decide;
+  do not open-code the comparison at a call site.
 - **Cluster light SSBOs keep stale contents** when a frame has zero dynamic
   lights — correctness is preserved by zeroed `ClusterParams`
   (`gridDim.w == 0` short-circuits the shader path), not by clearing buffers.

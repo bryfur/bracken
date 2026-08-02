@@ -131,7 +131,8 @@ Texture2D emissiveTexture;
 [[vk::combinedImageSampler]][[vk::binding(5, 2)]]
 SamplerState emissiveSampler;
 
-// Full-res screen-space GTAO (R8, 1 = unoccluded), computed before this pass
+// Full-res screen-space GTAO (RGBA8 since R5a: R = AO with 1 = unoccluded,
+// GB = octahedral world bent normal, A = cone aperture — bent_cone.hlsli), computed before this pass
 // from the prepass depth. Bound to a 1x1 white dummy when AO is off, which is
 // why the white dummy has to be white: this is sampled unconditionally
 // wherever screenAOEnabled is set.
@@ -143,7 +144,7 @@ SamplerState emissiveSampler;
 // texture's dimensions, which read out of bounds -- returning 0 -- and zeroed
 // the ambient term scene-wide whenever AO was off. See rtShadowTexture below.
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
-Texture2D<float> screenAOTexture;
+Texture2D<float4> screenAOTexture;
 [[vk::combinedImageSampler]][[vk::binding(6, 2)]]
 SamplerState screenAOSampler;
 
@@ -222,6 +223,7 @@ SamplerState rtLocalShadowSampler;
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
+#include "bent_cone.hlsli"
 #include "reflection_gate.hlsli"
 // Cluster SSBOs follow this shader's 16 fragment samplers in set 2 (slots
 // 0-14 above + the local-shadow ATLAS at 15, declared by the include, which
@@ -305,16 +307,23 @@ float4 PSMain(PSInput input) : SV_Target {
     float3 directLight = lightColor * sunIntensity * shadow;
     float3 direct = evaluatePBR(N, V, L, directLight, baseColor.rgb, metallic, roughness, 1.0);
 
-    // Screen-space GTAO, ambient only: min-combined with the material (ORM)
-    // AO — both estimate the same occlusion at overlapping scales, min avoids
+    // Screen-space GTAO, ambient only. Since R5a the texel carries a whole
+    // BENT CONE, not a scalar (shaders/bent_cone.hlsli): R is the occlusion,
+    // GB the mean unoccluded direction, A the cone's aperture. The scalar half
+    // is min-combined with the material (ORM) AO exactly as before — both
+    // estimate the same occlusion at overlapping scales, min avoids
     // double-darkening. Direct sun light, speculars, and cluster lights are
     // NEVER attenuated by screen-space AO.
-    float screenAO = 1.0;
+    BentCone cone = decodeBentCone(float4(1.0, 1.0, 1.0, 1.0), N);
     if (screenAOEnabled > 0.5) {
-        screenAO = screenAOTexture.Sample(
-            screenAOSampler, input.position.xy * float2(screenAOTexelX, screenAOTexelY)).r;
+        cone = decodeBentCone(screenAOTexture.Sample(
+            screenAOSampler, input.position.xy * float2(screenAOTexelX, screenAOTexelY)), N);
     }
-    float aoCombined = min(matAO, screenAO);
+    float aoCombined = min(matAO, cone.ao);
+    // The DIFFUSE GI term is gated by the cone instead of that scalar — never
+    // by both (docs/rt_lighting_plan.md §5.6). Falls back to aoCombined on any
+    // pixel without a cone, which is every pixel when AO is off.
+    float giGate = bentConeGiGate(cone, matAO, aoCombined);
 
     // See rtReflectionMaxRoughness: hand the specular lobe over to the traced
     // reflection rather than adding both.
@@ -342,7 +351,7 @@ float4 PSMain(PSInput input) : SV_Target {
     // ambient term is bit-identical to the pre-R1c image.
     float3 giIrradiance = float3(0, 0, 0);
     if (giEnabled > 0.5) {
-        giIrradiance = giSampleDiffuse(input.fragPos, N, V, ambientSky, ambientGround);
+        giIrradiance = giSampleDiffuse(input.fragPos, N, cone.direction, V, ambientSky, ambientGround);
         // Screen probes (R4b) on TOP of the field, never instead of it. They
         // are the same unit — irradiance/pi — so this is a straight lerp, and
         // the weight is what makes the hand-off safe: a pixel whose four probes
@@ -350,21 +359,24 @@ float4 PSMain(PSInput input) : SV_Target {
         // the field's answer exactly.
         float giScreenWeight;
         float3 giScreen =
-            giScreenSampleDiffuse(input.position.xy, input.fragPos, N, cameraPos, giScreenWeight);
+            giScreenSampleDiffuse(input.position.xy, input.fragPos, N, cone.direction, cameraPos,
+                                  giScreenWeight);
         giIrradiance = lerp(giIrradiance, giScreen, giScreenWeight);
     }
     float3 ambient;
     if (iblEnabled > 0.5) {
         ambient = ambientIBL(N, N_geo, V, baseColor.rgb, metallic, roughness, aoCombined, ambientLift,
                              iblIrradianceMap, iblIrradianceSampler, iblSpecularMap, iblSpecularSampler,
-                             iblBrdfLut, iblBrdfLutSampler, iblSpecularScale, giIrradiance, giEnabled);
+                             iblBrdfLut, iblBrdfLutSampler, iblSpecularScale, giIrradiance, giEnabled,
+                             giGate);
     } else {
         ambient = ambientPBR(N, V, baseColor.rgb, metallic, roughness, aoCombined,
                              ambientSky * ambientLift, ambientGround * ambientLift,
                              // Pre-scaled by the lift, because the hemisphere
                              // colours above are. ambientIBL's override is not:
-                             // that function applies ao * lift at the end.
-                             giIrradiance * ambientLift, giEnabled);
+                             // that function applies the lift at the end (and
+                             // the occlusion per ambient source, since R5a).
+                             giIrradiance * ambientLift, giEnabled, giGate);
     }
 
     float3 result = direct + ambient;

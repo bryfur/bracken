@@ -1112,6 +1112,10 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 // buffer the prepass just wrote.
                 ao_params.projection = draw_camera.projection;
                 ao_params.inv_projection = cached_inv_projection_;
+                // The pass publishes a WORLD-space bent normal, so it needs
+                // view->world. Not cached like the projection: the view matrix
+                // changes every frame anyway.
+                ao_params.inv_view = glm::inverse(draw_camera.view);
                 ao_params.radius_scale = gfx.ao_radius;
                 ao_params.strength = gfx.ao_strength;
                 ao_params.frame_index = frame_index_;

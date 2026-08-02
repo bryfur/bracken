@@ -66,6 +66,8 @@ void GTAO::shutdown() {
     ao_blurred_.reset();
     history_[0].reset();
     history_[1].reset();
+    history_depth_[0].reset();
+    history_depth_[1].reset();
     ao_full_.reset();
     history_valid_ = false;
 
@@ -112,13 +114,21 @@ void GTAO::create_textures() {
 
     constexpr SDL_GPUTextureUsageFlags USAGE = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
 
-    ao_raw_ = gpu::GPUTexture::create_2d(*device_, ao_width_, ao_height_, SDL_GPU_TEXTUREFORMAT_R8_UNORM, USAGE);
-    blur_tmp_ = gpu::GPUTexture::create_2d(*device_, ao_width_, ao_height_, SDL_GPU_TEXTUREFORMAT_R8_UNORM, USAGE);
-    ao_blurred_ = gpu::GPUTexture::create_2d(*device_, ao_width_, ao_height_, SDL_GPU_TEXTUREFORMAT_R8_UNORM, USAGE);
+    // (AO, oct.x, oct.y, aperture) everywhere — shaders/bent_cone.hlsli.
+    ao_raw_ =
+        gpu::GPUTexture::create_2d(*device_, ao_width_, ao_height_, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, USAGE);
+    blur_tmp_ =
+        gpu::GPUTexture::create_2d(*device_, ao_width_, ao_height_, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, USAGE);
+    ao_blurred_ =
+        gpu::GPUTexture::create_2d(*device_, ao_width_, ao_height_, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, USAGE);
     for (auto& slot : history_) {
+        slot = gpu::GPUTexture::create_2d(*device_, ao_width_, ao_height_,
+                                          SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, USAGE);
+    }
+    for (auto& slot : history_depth_) {
         slot = gpu::GPUTexture::create_2d(*device_, ao_width_, ao_height_, SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, USAGE);
     }
-    ao_full_ = gpu::GPUTexture::create_2d(*device_, width_, height_, SDL_GPU_TEXTUREFORMAT_R8_UNORM, USAGE);
+    ao_full_ = gpu::GPUTexture::create_2d(*device_, width_, height_, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, USAGE);
 
     history_valid_ = false;
 }
@@ -129,8 +139,10 @@ void GTAO::clear_full_res_texture() {
     }
 
     // One-off command buffer: init/resize/quality changes happen outside the
-    // frame loop's recording. White = no occlusion, so the forward pass can
-    // bind the texture before the first render() (e.g. AO mode Off).
+    // frame loop's recording. White decodes as AO 1 with the fully-open
+    // aperture escape (shaders/bent_cone.hlsli) — "unoccluded, no directional
+    // data" — so the forward pass can bind the texture before the first
+    // render() (e.g. AO mode Off) and get exactly the pre-R5a ambient.
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device_->handle());
     if (!cmd) {
         BRACKEN_LOG_ERROR(LOG_TAG, "GTAO: Failed to acquire command buffer for AO clear: {}", SDL_GetError());
@@ -151,8 +163,9 @@ void GTAO::clear_full_res_texture() {
 }
 
 bool GTAO::is_ready() const {
-    return ao_raw_ && blur_tmp_ && ao_blurred_ && history_[0] && history_[1] && ao_full_ &&
-           (nearest_clamp_sampler_ != nullptr) && (linear_clamp_sampler_ != nullptr);
+    return ao_raw_ && blur_tmp_ && ao_blurred_ && history_[0] && history_[1] && history_depth_[0] &&
+           history_depth_[1] && ao_full_ && (nearest_clamp_sampler_ != nullptr) &&
+           (linear_clamp_sampler_ != nullptr);
 }
 
 void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, gpu::GPUTexture& depth,
@@ -175,18 +188,19 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
     const float depth_a = params.projection[2][2];
     const float depth_b = params.projection[3][2];
 
-    // ---- 1. GTAO: depth -> raw AO ----
+    // ---- 1. GTAO: depth -> raw AO + bent cone ----
     {
         gpu::GTAOUniforms uniforms = {};
         uniforms.projection = params.projection;
         uniforms.invProjection = params.inv_projection;
+        uniforms.invView = params.inv_view;
         uniforms.screenSize = working_size;
         uniforms.invScreenSize = inv_working;
         uniforms.radiusScale = params.radius_scale;
         uniforms.temporalRotation = temporal_sequence(params.frame_index, GOLDEN_RATIO_CONJUGATE);
         uniforms.temporalOffset = temporal_sequence(params.frame_index, 1.0f - GOLDEN_RATIO_CONJUGATE);
-        // radius / falloffRange / thinOccluderCompensation / maxDistance keep
-        // their NSDMI tuning defaults.
+        // radius / falloffRange / occluderThickness / maxDistance keep their
+        // NSDMI tuning defaults.
 
         SDL_GPUColorTargetInfo color_target = {};
         color_target.texture = ao_raw_->handle();
@@ -212,8 +226,11 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
 
     gpu::GPUTexture* history_write = history_[history_write_].get();
     gpu::GPUTexture* history_read = history_[history_write_ ^ 1].get();
+    gpu::GPUTexture* history_depth_write = history_depth_[history_write_].get();
+    gpu::GPUTexture* history_depth_read = history_depth_[history_write_ ^ 1].get();
 
-    // ---- 2. Temporal accumulation: raw AO + history + velocity + depth -> new history ----
+    // ---- 2. Temporal accumulation: raw + history + velocity + depth ->
+    //         new history (RGBA16F) + new depth history (RG16F) ----
     {
         gpu::GtaoTemporalUniforms uniforms = {};
         uniforms.invScreenSize = inv_working;
@@ -222,12 +239,15 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
         uniforms.historyValid = history_valid_ ? 1.0f : 0.0f;
         // feedbackMax / depthRejectScale keep their NSDMI tuning defaults.
 
-        SDL_GPUColorTargetInfo color_target = {};
-        color_target.texture = history_write->handle();
-        color_target.load_op = SDL_GPU_LOADOP_DONT_CARE;
-        color_target.store_op = SDL_GPU_STOREOP_STORE;
+        SDL_GPUColorTargetInfo color_targets[2] = {};
+        color_targets[0].texture = history_write->handle();
+        color_targets[0].load_op = SDL_GPU_LOADOP_DONT_CARE;
+        color_targets[0].store_op = SDL_GPU_STOREOP_STORE;
+        color_targets[1].texture = history_depth_write->handle();
+        color_targets[1].load_op = SDL_GPU_LOADOP_DONT_CARE;
+        color_targets[1].store_op = SDL_GPU_STOREOP_STORE;
 
-        SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, nullptr);
+        SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, color_targets, 2, nullptr);
         if (!pass) {
             return;
         }
@@ -235,7 +255,7 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
         temporal_pipeline->bind(pass);
         SDL_PushGPUFragmentUniformData(cmd, 0, &uniforms, sizeof(uniforms));
 
-        SDL_GPUTextureSamplerBinding bindings[4] = {};
+        SDL_GPUTextureSamplerBinding bindings[5] = {};
         bindings[0].texture = ao_raw_->handle();
         bindings[0].sampler = nearest_clamp_sampler_;
         // History reprojects to arbitrary sub-texel positions: linear filter.
@@ -246,15 +266,20 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
         bindings[2].sampler = nearest_clamp_sampler_;
         bindings[3].texture = depth.handle();
         bindings[3].sampler = nearest_clamp_sampler_;
-        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 4);
+        // Reprojected alongside the history it belongs to, so it takes the
+        // same linear filter.
+        bindings[4].texture = history_depth_read->handle();
+        bindings[4].sampler = linear_clamp_sampler_;
+        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 5);
 
         SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
         SDL_EndGPURenderPass(pass);
     }
 
-    // ---- 3+4. Depth-aware separable blur of the accumulated AO ----
-    // Reads the RG16F history's R channel; the history itself stays
-    // unfiltered so the blur kernel never compounds across frames.
+    // ---- 3+4. Depth-aware separable blur of the accumulated result ----
+    // Pass 1 reads the RGBA16F history, pass 2 the RGBA8 ping — same channel
+    // layout, so one pipeline serves both. The history itself stays unfiltered
+    // so the blur kernel never compounds across frames.
     const auto blur_pass = [&](gpu::GPUTexture* src, gpu::GPUTexture* dst, glm::vec2 direction) {
         gpu::BlurUniforms uniforms = {};
         uniforms.direction = direction;
@@ -288,7 +313,7 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
     blur_pass(history_write, blur_tmp_.get(), glm::vec2(1.0f, 0.0f));
     blur_pass(blur_tmp_.get(), ao_blurred_.get(), glm::vec2(0.0f, 1.0f));
 
-    // ---- 5. Joint-bilateral upsample/finalize to the full-res AO texture ----
+    // ---- 5. Joint-bilateral upsample/finalize to the full-res RGBA8 texture ----
     // At full working res (GTAO_Full) the filter is an exact passthrough;
     // ao_strength applies here either way.
     {

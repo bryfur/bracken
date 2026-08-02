@@ -1,9 +1,10 @@
 # Ray-Traced Lighting — Research & Plan of Record
 
 Status: **in progress — R0 (foundations), R1 (probe-field GI), R2
-(froxel-RIS local-light shadows), R3 (honest hit lighting) and R4 (the HZB +
-indirect dispatch in R4a, the screen-probe gather in R4b) have landed**; R5
-onward is still proposal. Written 2026-08-02 against the working tree at the
+(froxel-RIS local-light shadows), R3 (honest hit lighting), R4 (the HZB +
+indirect dispatch in R4a, the screen-probe gather in R4b) and R5a (the SSILVB
+visibility bitmask + bent-cone GI gating) have landed**; the rest of R5 and R6
+are still proposal. Written 2026-08-02 against the working tree at the
 RT-denoiser series (post "RT shadows: stop multiplexing ambient occlusion into
 the shadow mask"); R0's landed work packages are marked in §5.0 and R1's three
 packages in §5.2. As of R1c the probe field lights the frame — the first
@@ -1149,12 +1150,60 @@ seam in indirect); tier A/B screenshots.
 
 ### 5.6 R5 — Near field, denoiser core, full-DI
 
-- **SSILVB upgrade of GTAO**: same horizon loop, sectors become a 32-bit
-  visibility bitmask (thin-occluder correctness), outputs AO + bent cone +
-  optional half-res near-field indirect from last frame's lit color. Bent
-  cone gates the probe/screen-probe irradiance (directional occlusion instead
-  of scalar AO) — and the double-count rule is explicit: SS indirect *replaces*
-  probe irradiance within its sampled radius, never adds.
+- ~~**SSILVB upgrade of GTAO**~~ (**R5a, landed**): same horizon loop, sectors
+  became a 32-bit visibility bitmask (thin-occluder correctness), outputting
+  AO + bent cone. Bent cone gates the probe/screen-probe irradiance
+  (directional occlusion instead of scalar AO), and the double-count rule is
+  honoured: the cone REPLACES the scalar-AO multiply for the GI term, never
+  joins it.
+
+  **What landed.** `gtao.frag.hlsl` keeps its 3 slices × 4 steps × 2 sides and
+  its jitter; per slice it now marks a 32-sector `uint` mask, each depth sample
+  occluding the sectors subtended by a slab `GTAOUniforms::occluderThickness`
+  = **1.0 world units** deep along the view ray (scaled by `ao_radius`). That
+  constant replaces the unitless `thinOccluderCompensation = 0.2` horizon
+  decay; it was chosen by A/B at 0.5 / 1.0 / 2.0 / 4.0 against the village
+  smoke shot — below 1.0 fence posts and crates lose their ground contact,
+  above it the crop foliage starts greying again, and 1.0 is also ¼ of the
+  sampling radius and roughly a plank's thickness at this project's scale
+  (~6 cm per unit). The surviving sectors are integrated with the SAME cosine
+  weight as the arc integral they replace, so an unoccluded pixel is unchanged
+  by construction (`GtaoSectorWeights.SumMatchesArcIntegral`). No wave
+  intrinsics: `countbits`-class ALU only.
+
+  The whole chain went R8 → RGBA8 — R = AO, GB = octahedral WORLD bent normal,
+  A = cone aperture as sin²(half-angle) — with `shaders/bent_cone.hlsli` as the
+  single owner of the layout, the `A >= 0.998` "fully open / no directional
+  data" escape value, and the gate. `GTAOTemporal` became MRT (RGBA16F history
+  + RG16F depth history) because five linearly filtered quantities do not fit
+  in four channels; every filter round-trips the bent normal through decode /
+  average-as-direction / renormalise / re-encode. The escape value is what
+  makes the 1×1 white dummy decode to exactly the pre-R5a behaviour, so **no
+  new uniform flag was needed in any scene cbuffer**.
+
+  `giSampleDiffuse` / `giScreenSampleDiffuse` gained a `sampleDir` argument
+  distinct from `N`: probe SELECTION stays on the surface normal (bias,
+  backface wrap, screen-probe forward-normal test — geometry), the octahedral
+  and SH TAPS take the bent normal (a directional query). `pbr.hlsli` now
+  occludes each ambient source separately instead of multiplying `ao` over the
+  sum, which is what makes "replaces" mean replaces.
+
+  **Deliberately deferred to a later package**: SSILVB's near-field screen-
+  space indirect DIFFUSE half (gathering last frame's lit colour into the
+  unoccluded sectors). It needs the previous frame's lit colour bound into the
+  AO pass and its own energy rules against the probe field — "SS indirect
+  *replaces* probe irradiance within its sampled radius, never adds" — which is
+  a package's worth of ledger on its own, not a rider on this one.
+
+  **Measured** (Linux/Vulkan, RelWithDebInfo, `--smoke 30`, 3-run identical):
+  default `86.5 / 44.9` → `86.3 / 45.5`; `PLAYGROUND_GI=probes` `81.7 / 49.8` →
+  `81.8 / 50.0`; `probes_screen` `82.3 / 50.4` → `82.2 / 50.5`. Mean unmoved,
+  spread up: thin geometry (fences, crop rows, grass tufts, distant canopies)
+  lost the grey wash, solid crevices and eaves gained contact depth. The GTAO
+  chain's CPU RECORD time went 0.0118 → ~0.0132 ms mean (`--rt-bench 120`,
+  `probes_screen`); the GPU-side ALU cost of the sector loop is not measurable
+  here — SDL3 exposes no timestamp queries — and the observable proxies (frame
+  render 4.95 ms, present_wait ~4.3 ms, fps 179 → 182) did not move.
 - **Denoiser core evolution** (shared by sun/local/reflection paths):
   dual fast/slow history with fast-clamp; exposure-aware clamp and firefly
   thresholds (feed the adapted EV from the exposure SSBO); hit-distance
@@ -1247,7 +1296,7 @@ Dependency-ordered; each phase ships alone.
 | **R2** | froxel-RIS local shadows (Ratio), light IDs, scalar denoise clone | 32-light night scene fully shadowed (atlas caps exceeded) within budget; penumbra-vs-radius test; atlas A/B luma parity on atlas-sized scenes |
 | **R3** | `rt_hit_shade.hlsli`, CSM-at-hit, probe-at-hit, virtual reproj, rough→probe fallback | reflection interiors/shadows correct in pinned shots; orbit-ghosting metric improves; no reflection cost regression >10 % |
 | **R4** | ~~HZB + indirect dispatch wrapper~~ (**R4a, landed**), screen probes, probe-space filtering, mid-rough specular from probes (R4b) | R4a: every configuration bit-identical, `probes_screen` == `probes` luma with the `HZB` row present. R4b: `ProbesScreen` vs `Probes` A/B sharpness; handoff-seam scene clean; Silver budget held |
-| **R5** | SSILVB/bent-cone, denoiser core (gradients, dual history, exposure-aware), Full-DI tier | lightning/toggle scene: history resets locally within 2 frames, no global flash-smear; contact-GI A/B |
+| **R5** | ~~SSILVB/bent-cone~~ (**R5a, landed**), denoiser core (gradients, dual history, exposure-aware), Full-DI tier | lightning/toggle scene: history resets locally within 2 frames, no global flash-smear; contact-GI A/B |
 | **R6** | emissive mesh lights, area-light authoring, stretch cache decision | dusk-windows shot; emissive in reflections + probes; watch-list re-evaluation recorded here |
 
 Standing rules for every phase: TSAN suite run after any job-system-adjacent

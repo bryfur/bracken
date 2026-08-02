@@ -2863,7 +2863,7 @@ Text parameters are `std::string_view` and are **copied into the packet at emit 
 2. One consolidated copy pass uploading everything (instances, shadow instances, bone palettes from packet memory, snapshot particles, debug lines, grass, cluster buffers, local-shadow slot data).
 3. IBL upkeep (when `ibl_enabled` and the sky-relevant environment fields changed): a few amortized cube-face prefilter passes.
 4. Shadow cascade passes (when `shadow_mode != ShadowMode::Off`), then this frame's dirty local-shadow tiles (when `local_shadows` is on).
-5. Depth prepass: opaque geometry writes scene depth + RG16F motion vectors, then the GTAO chain (raw → temporal → blur → upsample; when `ao_mode != Off`) — both BEFORE the forward pass, which samples the AO texture in its ambient term.
+5. Depth prepass: opaque geometry writes scene depth + RG16F motion vectors, then the GTAO chain (raw → temporal → blur → upsample; when `ao_mode != Off`) — both BEFORE the forward pass, which samples the RGBA AO + bent-cone texture in its ambient term.
 6. The 3D scene into a linear-HDR offscreen target (opaques depth-test `EQUAL` against the prepass): terrain → grass → instanced models → non-instanced models → skinned models → skybox → sorted transparent (glTF `BLEND`) meshes → particles → debug lines.
 7. Post chain: TAA resolve (when `aa_mode == TAA`; stabilizes the HDR image before bloom reads it) → auto exposure (when `auto_exposure`; two compute dispatches metering the resolved image) → bloom → volumetric fog → composite (exposure/white balance/tonemap/CDL grade) → FXAA only when `aa_mode == FXAA`.
 8. UI + 3D billboards to the swapchain, then the optional post-UI callback.
@@ -4030,7 +4030,8 @@ Rules that bite:
 
 This chapter covers the three systems that light a Bracken frame: **clustered
 dynamic lights** (point + spot), the **directional sun with cascaded shadow
-maps** (CSM), and **screen-space ambient occlusion** (horizon-based GTAO).
+maps** (CSM), and **screen-space ambient occlusion** (horizon-based GTAO with an SSILVB
+visibility bitmask and a bent cone).
 All three are orchestrated by `scene::SceneRenderer` — as a game developer
 you mostly feed data (lights into the frame via `FrameBuilder`, settings into
 `GraphicsSettings`, sun/sky into `EnvironmentState`) and the engine does the
@@ -4318,10 +4319,23 @@ files map 1 → `GTAO_Half` and 2 → `GTAO_Full`.
 
 How it behaves:
 
-- This is **true ground-truth AO** (Jimenez et al. 2016): per-pixel horizon
-  search along rotating screen-space slices with cosine-weighted arc
-  integration, computed **from the depth-prepass depth only** (normals
-  reconstructed edge-aware from depth) **before the forward pass**.
+- This is **true ground-truth AO** (Jimenez et al. 2016) with a **visibility
+  bitmask** (SSILVB, Therrien et al. 2023): per-pixel horizon search along
+  rotating screen-space slices, but instead of tracking one horizon angle per
+  side the pass keeps a 32-sector occlusion bitmask per slice and integrates
+  the same cosine weight over whatever is left. Computed **from the
+  depth-prepass depth only** (normals reconstructed edge-aware from depth)
+  **before the forward pass**.
+- What that buys you, visibly: an occluder blocks a **band** of directions and
+  nothing beyond it, because each depth sample is treated as a slab 1.0 world
+  unit deep along the view ray. Fences, railings, grass blades and leaf edges
+  stop casting the unbounded grey wash a horizon pair produces, while solid
+  walls and crevices keep (in fact deepen) their contact darkening. There is
+  no thin-occluder fudge factor any more; the slab thickness is a length.
+- The pass also publishes a **bent normal** (the mean unoccluded direction) and
+  a **cone aperture** alongside the scalar AO, all four in one RGBA texture.
+  You do not have to do anything with them — see "Bent-cone GI gating" below
+  for the one place they change the image.
 - AO attenuates the **ambient term only**: the forward shaders min-combine
   the screen AO with the material's ORM occlusion and feed it to the ambient
   BRDF (sky-IBL or hemisphere). Direct sun light, speculars, and dynamic
@@ -4331,17 +4345,43 @@ How it behaves:
   motion vectors, depth-rejected on disocclusion — same invalidation policy
   as TAA), bilaterally blurred, and joint-bilaterally upsampled, so it is
   stable under camera motion with no silhouette halos or trails.
-- The base radius is 4.0 world units with a 12000-unit distance cutoff
-  (defaults in `gpu::GTAOUniforms`, `src/bracken/gpu/gpu_uniforms.hpp`) —
-  `ao_radius` scales the radius, `ao_strength` is applied as a power curve;
-  the other tunables aren't exposed through `GraphicsSettings`.
+- The base radius is 4.0 world units with a 12000-unit distance cutoff, and
+  the occluder slab is 1.0 world unit deep (defaults in `gpu::GTAOUniforms`,
+  `src/bracken/gpu/gpu_uniforms.hpp`) — `ao_radius` scales both the radius and
+  the slab, `ao_strength` is applied as a power curve; the other tunables
+  aren't exposed through `GraphicsSettings`.
 - `AOMode::Off` skips the whole AO chain and the forward pass samples a 1×1
-  white dummy (no occlusion). The frame still renders through the offscreen
+  white dummy, which decodes as "no occlusion, cone fully open, bent normal =
+  shading normal" — i.e. every AO-derived term reverts to its pre-bent-cone
+  behaviour with no flag to set. The frame still renders through the offscreen
   HDR path — AO-off is not a different render path.
+- `ao_strength` shapes the aperture as well as the AO, so `ao_strength = 0`
+  turns the bent-cone gate off along with AO rather than leaving it acting
+  alone.
 - OPAQUE and alpha-tested (MASK) geometry are both in the depth prepass —
   foliage occludes and receives screen AO (that inter-leaf occlusion is what
   keeps a canopy from reading as a flat blob). BLEND transparents (and the
   rare skinned MASK mesh) neither occlude nor receive their own AO.
+
+#### Bent-cone GI gating
+
+When global illumination is on (`gi_mode != GiMode::Off`), the **diffuse GI
+term is occluded directionally** rather than by the scalar AO:
+
+- the probe field / screen probes are evaluated along the **bent normal**
+  instead of the shading normal, so a surface under an eave receives what it
+  can actually see rather than a hemisphere average that included open sky;
+- the term is scaled by the cone's **aperture** — `sin²(half-angle)`, the
+  fraction of the hemisphere the visible cone covers — **instead of** the
+  scalar screen AO, never in addition to it. Material (ORM) occlusion still
+  min-combines, because it measures something else.
+
+Everything that is not GI is unchanged: the hemisphere / sky-IBL diffuse and
+the ambient specular are still gated by plain scalar AO exactly as before.
+The practical effect is more directional ambient — corners and interiors that
+face darkness get darker, surfaces whose opening faces the sky get brighter —
+rather than the uniform grey dimming a scalar produces. Nothing to enable; it
+follows AO and GI both being on.
 
 #### Direct `PostProcessStack` / `GTAO` use (custom renderers)
 
@@ -4362,10 +4402,12 @@ post.set_clear_color(env.fog_color_horizon); // linear; uncovered pixels melt in
 //    (SceneRenderer does this; GTAO and TAA both consume it).
 
 // 2. GTAO from the prepass depth — BEFORE the forward pass. The forward
-//    shaders sample gtao.ao_texture() (full-res R8) in their ambient term.
+//    shaders sample gtao.ao_texture() (full-res RGBA8: AO + bent cone) in
+//    their ambient term.
 render::GTAO::FrameParams ao_params;
 ao_params.projection     = camera.projection;   // the DRAW (jittered) projection
 ao_params.inv_projection = inv_projection;
+ao_params.inv_view       = glm::inverse(camera.view); // bent normal is world-space
 ao_params.radius_scale   = gs.ao_radius;
 ao_params.strength       = gs.ao_strength;
 ao_params.frame_index    = frame_index;
@@ -4862,7 +4904,8 @@ gamma-encode, and write the **RGBA8 UNORM** swapchain:
 
 ```text
 IBL upkeep (only when the sky changed: ~9 cube-face prefilter passes/frame)
-Depth prepass ──▶ GTAO chain (raw AO ▸ temporal ▸ blur ▸ upsample; full-res R8)
+Depth prepass ──▶ GTAO chain (raw ▸ temporal ▸ blur ▸ upsample; full-res RGBA8:
+                    AO + octahedral bent normal + cone aperture)
                         │ (AO + the IBL cubemaps feed the forward ambient term)
 3D scene ──▶ RGBA16F offscreen (clear = env.fog_color_horizon)
                 │

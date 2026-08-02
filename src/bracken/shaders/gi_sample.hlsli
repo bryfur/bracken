@@ -189,8 +189,18 @@ float3 giBiasPosition(float3 P, float3 N, float3 V, int cascade) {
 /// Trilinear-plus-weights gather over the eight probes surrounding `P` in
 /// cascade `cascade`. Returns the renormalised irradiance; `confidence` is how
 /// much of the final result this cascade is entitled to, in [0,1].
-/// CPU mirror: `sample_cascade`.
-float3 giSampleCascade(int cascade, float3 P, float3 N, float3 V, out float confidence) {
+///
+/// `N` is the SURFACE normal and `sampleDir` the direction the irradiance is
+/// wanted along — the same vector until R5a handed the second one to the AO
+/// pass's bent normal. The split is deliberate: probe SELECTION (the surface
+/// bias, the backface wrap, the visibility test) is geometry and belongs to the
+/// surface normal, while the octahedral TAP is a directional query and belongs
+/// to the bent cone's axis. Passing the bent normal for both would let a bent
+/// normal tilted off a wall reject the probes on its own surface.
+/// CPU mirror: `sample_cascade` (the sampleDir == N case, which is what its
+/// tests exercise).
+float3 giSampleCascade(int cascade, float3 P, float3 N, float3 sampleDir, float3 V,
+                       out float confidence) {
     confidence = 0.0;
     float sp = giCascadeSpacing(cascade);
     float3 biased = giBiasPosition(P, N, V, cascade);
@@ -236,7 +246,7 @@ float3 giSampleCascade(int cascade, float3 P, float3 N, float3 V, out float conf
         if (w <= 0.0) {
             continue;
         }
-        sum += w * giTapIrradiance(cascade, slot, N);
+        sum += w * giTapIrradiance(cascade, slot, sampleDir);
         wsum += w;
     }
     if (wsum <= 1e-6) {
@@ -256,8 +266,9 @@ float3 giSampleCascade(int cascade, float3 P, float3 N, float3 V, out float conf
 // ---------------------------------------------------------------------------
 
 /**
- * Diffuse irradiance/pi at `P` for a surface facing `N`, seen from a camera in
- * direction `V` (surface -> camera, unit).
+ * Diffuse irradiance/pi at `P` for a surface facing `N`, evaluated along
+ * `sampleDir` (the bent-cone axis since R5a; pass `N` for the plain query),
+ * seen from a camera in direction `V` (surface -> camera, unit).
  *
  * Finest cascade first, each taking as much of the remaining weight as its
  * confidence allows, with the hemisphere ambient absorbing what is left. The
@@ -265,9 +276,9 @@ float3 giSampleCascade(int cascade, float3 P, float3 N, float3 V, out float conf
  * irradiance cube even when IBL is on: it is the engine's GI-off tier, so a
  * pixel the field cannot answer for looks exactly as it did before this phase.
  *
- * CPU mirror: `sample_field`.
+ * CPU mirror: `sample_field` (the sampleDir == N case).
  */
-float3 giSampleDiffuse(float3 P, float3 N, float3 V, float3 ambientSkyColor,
+float3 giSampleDiffuse(float3 P, float3 N, float3 sampleDir, float3 V, float3 ambientSkyColor,
                        float3 ambientGroundColor) {
     float3 accum = float3(0, 0, 0);
     float remaining = 1.0;
@@ -277,7 +288,7 @@ float3 giSampleDiffuse(float3 P, float3 N, float3 V, float3 ambientSkyColor,
             continue;
         }
         float confidence;
-        float3 irradiance = giSampleCascade(c, P, N, V, confidence);
+        float3 irradiance = giSampleCascade(c, P, N, sampleDir, V, confidence);
         if (confidence <= 0.0) {
             continue;
         }
@@ -285,7 +296,7 @@ float3 giSampleDiffuse(float3 P, float3 N, float3 V, float3 ambientSkyColor,
         accum += irradiance * take;
         remaining -= take;
     }
-    float3 hemisphere = lerp(ambientGroundColor, ambientSkyColor, saturate(N.y * 0.5 + 0.5));
+    float3 hemisphere = lerp(ambientGroundColor, ambientSkyColor, saturate(sampleDir.y * 0.5 + 0.5));
     return accum + hemisphere * remaining;
 }
 

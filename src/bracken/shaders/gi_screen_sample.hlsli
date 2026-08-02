@@ -8,7 +8,7 @@
 //
 //     float3 gi = giSampleDiffuse(P, N, V, ambientSky, ambientGround);
 //     float  w;
-//     float3 sp = giScreenSampleDiffuse(pixel, P, N, cameraPos, w);
+//     float3 sp = giScreenSampleDiffuse(pixel, P, N, bentN, cameraPos, w);
 //     gi = lerp(gi, sp, w);
 //
 // The weight is the whole contract. Screen probes are SHARPER than the world
@@ -71,8 +71,8 @@ StructuredBuffer<GiScreenProbeSh> giScreenShBuf;
  * render/gi/screen_probe_math.hpp (`screen_probe_bilateral_weight`,
  * `sh_l1_irradiance_over_pi`).
  */
-float3 giScreenSampleDiffuse(float2 pixel, float3 worldPos, float3 N, float3 cameraPosition,
-                             out float weight) {
+float3 giScreenSampleDiffuse(float2 pixel, float3 worldPos, float3 N, float3 sampleDir,
+                             float3 cameraPosition, out float weight) {
     weight = 0.0;
     if (giScreenEnabled <= 0.0) {
         return float3(0, 0, 0);
@@ -111,7 +111,7 @@ float3 giScreenSampleDiffuse(float2 pixel, float3 worldPos, float3 N, float3 cam
         if (w <= 1e-5) {
             continue;
         }
-        acc += w * giSpShEval(probe.shR, probe.shG, probe.shB, N);
+        acc += w * giSpShEval(probe.shR, probe.shG, probe.shB, sampleDir);
         wsum += w;
     }
 

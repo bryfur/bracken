@@ -7,6 +7,13 @@
  * non-linear depth differences collapse with distance, which used to let AO
  * bleed across far silhouettes (halos). Linear view-Z relative to the center
  * sample keeps edge preservation uniform across the depth range.
+ *
+ * Since R5a it filters all four channels of the AO texture
+ * (shaders/bent_cone.hlsli): AO and aperture with the bilateral weights
+ * directly, and the bent normal as a DIRECTION — every tap decoded, summed
+ * with the same weights, renormalised and re-encoded. Both source textures in
+ * the chain (the RGBA16F history for pass 1, the RGBA8 ping for pass 2) carry
+ * the same channel layout, so one pipeline serves both passes.
  */
 
 struct PSInput {
@@ -29,7 +36,7 @@ cbuffer BlurUniforms : register(b0, space3) {
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
-Texture2D<float> aoTexture : register(t0, space2);
+Texture2D<float4> aoTexture : register(t0, space2);
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
 SamplerState aoSampler : register(s0, space2);
 
@@ -38,21 +45,23 @@ Texture2D<float> depthTexture : register(t1, space2);
 [[vk::combinedImageSampler]][[vk::binding(1, 2)]]
 SamplerState depthSampler : register(s1, space2);
 
+#include "bent_cone.hlsli"
+
 // Positive linear view depth from non-linear [0,1] depth.
 float linearizeDepth(float depth) {
     return abs(depthB / (depth + depthA));
 }
 
-float PSMain(PSInput input) : SV_Target {
-    float centerAO = aoTexture.SampleLevel(aoSampler, input.texCoord, 0);
+float4 PSMain(PSInput input) : SV_Target {
+    float4 center = aoTexture.SampleLevel(aoSampler, input.texCoord, 0);
     float centerDepth = depthTexture.SampleLevel(depthSampler, input.texCoord, 0);
 
     // Sky: reversed-Z cleared/skybox depth is exactly 0.0 (same test as the AO
-    // passes and volumetric_fog.frag). Pass the AO value through (it is 1.0
-    // there) rather than returning a constant that could disagree with the AO
-    // pass.
+    // passes and volumetric_fog.frag). Pass the value through (it is the
+    // fully-open escape there) rather than returning a constant that could
+    // disagree with the AO pass.
     if (centerDepth <= 0.0) {
-        return centerAO;
+        return center;
     }
 
     float centerZ = linearizeDepth(centerDepth);
@@ -62,14 +71,18 @@ float PSMain(PSInput input) : SV_Target {
     // `depth >= 0.9999` test put this boundary at a near-plane-dependent
     // distance and returned a constant across it.
     if (centerZ > maxDistance) {
-        return centerAO;
+        return center;
     }
 
     static const int KERNEL_RADIUS = 3;
     static const float weights[7] = {0.03125, 0.109375, 0.21875, 0.28125, 0.21875, 0.109375, 0.03125};
 
+    float3 centerDir = bentOctDecode(center.gb);
+
     float totalWeight = weights[KERNEL_RADIUS]; // center weight
-    float blurredAO = centerAO * totalWeight;
+    float blurredAO = center.r * totalWeight;
+    float blurredAperture = center.a * totalWeight;
+    float3 blurredDir = centerDir * totalWeight;
 
     float2 step = direction * invScreenSize;
 
@@ -77,7 +90,7 @@ float PSMain(PSInput input) : SV_Target {
         if (i == 0) continue;
 
         float2 sampleUV = input.texCoord + step * float(i);
-        float sampleAO = aoTexture.SampleLevel(aoSampler, sampleUV, 0);
+        float4 s = aoTexture.SampleLevel(aoSampler, sampleUV, 0);
         float sampleZ = linearizeDepth(depthTexture.SampleLevel(depthSampler, sampleUV, 0));
 
         // Depth-aware weight on relative linear view-Z difference: a fixed
@@ -86,9 +99,13 @@ float PSMain(PSInput input) : SV_Target {
         float depthWeight = exp(-relDiff * sharpness);
 
         float w = weights[i + KERNEL_RADIUS] * depthWeight;
-        blurredAO += sampleAO * w;
+        blurredAO += s.r * w;
+        blurredAperture += s.a * w;
+        blurredDir += bentOctDecode(s.gb) * w;
         totalWeight += w;
     }
 
-    return blurredAO / totalWeight;
+    float inv = 1.0 / totalWeight;
+    return float4(blurredAO * inv, bentOctEncode(bentNormalize(blurredDir, centerDir)),
+                  blurredAperture * inv);
 }

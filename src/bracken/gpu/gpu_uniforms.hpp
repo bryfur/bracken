@@ -707,11 +707,13 @@ BRACKEN_HLSL_FIELD(ShadowDataUniforms, _pad1, 332);
 /**
  * GTAO pass fragment uniforms (set 3, b0) — matches gtao.frag.hlsl.
  *
- * Horizon-based ground-truth AO (Jimenez et al. 2016): per-slice horizon
- * search with cosine-weighted arc integration. Slice/step counts are
- * compile-time constants in the shader (SLICE_COUNT / STEPS_PER_SLICE).
+ * Horizon-based ground-truth AO (Jimenez et al. 2016) upgraded in R5a to a
+ * per-slice 32-sector VISIBILITY BITMASK (SSILVB, Therrien et al. 2023) that
+ * also publishes a bent normal and cone aperture. Slice/step/sector counts are
+ * compile-time constants in the shader (SLICE_COUNT / STEPS_PER_SLICE /
+ * SECTOR_COUNT).
  *
- * Tuning: render::GTAO assigns projection/screen sizes, radiusScale
+ * Tuning: render::GTAO assigns projection/view/screen sizes, radiusScale
  * (GraphicsSettings::ao_radius), and the temporal jitter per frame. The
  * remaining NSDMI defaults ARE the live values (GTAO-style engine constants);
  * changing them requires a rebuild. maxDistance must stay equal to
@@ -720,6 +722,10 @@ BRACKEN_HLSL_FIELD(ShadowDataUniforms, _pad1, 332);
 struct alignas(16) GTAOUniforms {
     glm::mat4 projection;
     glm::mat4 invProjection;
+    // View -> world. The pass works in view space and publishes the bent
+    // normal in WORLD space, because no consumer of the AO texture carries a
+    // view matrix to undo a view-space one with.
+    glm::mat4 invView;
     glm::vec2 screenSize;    // AO working resolution (half or full res)
     glm::vec2 invScreenSize;
     // World/view-unit sample radius. Characters here are 25-35 units tall, so
@@ -730,11 +736,24 @@ struct alignas(16) GTAOUniforms {
     // Fraction of the radius over which sample occlusion fades to zero
     // (XeGTAO-style linear falloff at the edge of the sampling sphere).
     float falloffRange = 0.615f;
-    // Thickness heuristic: when a sample lowers the running horizon, blend
-    // toward it by this factor — models finite occluder thickness so thin
-    // features don't cast unbounded occlusion. 0 = pure max (infinitely
-    // thick occluders).
-    float thinOccluderCompensation = 0.2f;
+    // OCCLUDER THICKNESS, in world units, along the view ray. Every depth
+    // sample occludes the sectors subtended by a slab this deep and nothing
+    // past it (render/gtao.hpp detail::gtao_slab_span). Scaled by radiusScale
+    // alongside `radius`, so the slab stays a fixed fraction of the sampling
+    // sphere at any ao_radius.
+    //
+    // 1.0 is a quarter of the default radius and, at this project's scale
+    // (characters 25-35 units tall, so ~6 cm per unit), about the thickness of
+    // a fence plank or a door — the smallest silhouette in the village that
+    // should still cast real contact occlusion. Smaller under-occludes solid
+    // walls seen edge-on; larger brings back exactly the over-darkening of
+    // railings and grass that the bitmask exists to remove.
+    //
+    // This REPLACES `thinOccluderCompensation` (0.2, unitless), which blended
+    // a lowered horizon back down by a fixed fraction: a guess at thickness
+    // with no length in it, identical for a plank and a barn wall, and unable
+    // to express an occluder that blocks a band and nothing beyond it.
+    float occluderThickness = 1.0f;
     // Per-frame slice-rotation / step-offset jitter in [0,1) (golden-ratio
     // sequence, render::GTAO::render). The temporal accumulation pass
     // integrates the rotating sample pattern over time.
@@ -747,19 +766,20 @@ struct alignas(16) GTAOUniforms {
     float maxDistance = 12000.0f;
     float _padding0 = 0.0f;
 };
-BRACKEN_HLSL_CBUFFER(GTAOUniforms, 176);
+BRACKEN_HLSL_CBUFFER(GTAOUniforms, 240);
 BRACKEN_HLSL_FIELD(GTAOUniforms, projection, 0);
 BRACKEN_HLSL_FIELD(GTAOUniforms, invProjection, 64);
-BRACKEN_HLSL_FIELD(GTAOUniforms, screenSize, 128);
-BRACKEN_HLSL_FIELD(GTAOUniforms, invScreenSize, 136);
-BRACKEN_HLSL_FIELD(GTAOUniforms, radius, 144);
-BRACKEN_HLSL_FIELD(GTAOUniforms, radiusScale, 148);
-BRACKEN_HLSL_FIELD(GTAOUniforms, falloffRange, 152);
-BRACKEN_HLSL_FIELD(GTAOUniforms, thinOccluderCompensation, 156);
-BRACKEN_HLSL_FIELD(GTAOUniforms, temporalRotation, 160);
-BRACKEN_HLSL_FIELD(GTAOUniforms, temporalOffset, 164);
-BRACKEN_HLSL_FIELD(GTAOUniforms, maxDistance, 168);
-BRACKEN_HLSL_FIELD(GTAOUniforms, _padding0, 172);
+BRACKEN_HLSL_FIELD(GTAOUniforms, invView, 128);
+BRACKEN_HLSL_FIELD(GTAOUniforms, screenSize, 192);
+BRACKEN_HLSL_FIELD(GTAOUniforms, invScreenSize, 200);
+BRACKEN_HLSL_FIELD(GTAOUniforms, radius, 208);
+BRACKEN_HLSL_FIELD(GTAOUniforms, radiusScale, 212);
+BRACKEN_HLSL_FIELD(GTAOUniforms, falloffRange, 216);
+BRACKEN_HLSL_FIELD(GTAOUniforms, occluderThickness, 220);
+BRACKEN_HLSL_FIELD(GTAOUniforms, temporalRotation, 224);
+BRACKEN_HLSL_FIELD(GTAOUniforms, temporalOffset, 228);
+BRACKEN_HLSL_FIELD(GTAOUniforms, maxDistance, 232);
+BRACKEN_HLSL_FIELD(GTAOUniforms, _padding0, 236);
 
 /**
  * GTAO temporal accumulation pass fragment uniforms (set 3, b0) — matches
@@ -797,7 +817,8 @@ BRACKEN_HLSL_FIELD(GtaoTemporalUniforms, _pad0, 28);
 /**
  * GTAO upsample/finalize pass fragment uniforms (set 3, b0) — matches
  * gtao_upsample.frag.hlsl. Joint-bilateral (depth-aware) upsample of the
- * working-res blurred AO to the full-res R8 texture the forward pass samples;
+ * working-res blurred AO + bent cone to the full-res RGBA8 texture the
+ * forward pass samples;
  * degrades to an exact passthrough when working res == full res (GTAO_Full).
  * strength = GraphicsSettings::ao_strength, applied as pow(ao, strength).
  */

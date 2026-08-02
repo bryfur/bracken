@@ -126,12 +126,16 @@ TEST(UniformDefaults, GtaoDefaults) {
     GTAOUniforms u;
     EXPECT_FLOAT_EQ(u.radius, 4.0f);
     EXPECT_FLOAT_EQ(u.radiusScale, 1.0f);
-    // Falloff spans a sane fraction of the radius; thin-occluder decay is a
-    // blend factor in [0, 1].
+    // Falloff spans a sane fraction of the radius.
     EXPECT_GT(u.falloffRange, 0.0f);
     EXPECT_LE(u.falloffRange, 1.0f);
-    EXPECT_GE(u.thinOccluderCompensation, 0.0f);
-    EXPECT_LE(u.thinOccluderCompensation, 1.0f);
+    // The SSILVB slab is a LENGTH in world units, not the unitless
+    // thin-occluder blend it replaced, and it has to stay a real fraction of
+    // the sampling radius: at zero every occluder is infinitely thin and
+    // nothing occludes, at the radius it swallows the whole sampling sphere
+    // and every occluder is a wall again.
+    EXPECT_GT(u.occluderThickness, 0.0f);
+    EXPECT_LT(u.occluderThickness, u.radius);
     EXPECT_FLOAT_EQ(u.maxDistance, 12000.0f);
     // The blur pass must agree with the AO pass on the far cutoff.
     EXPECT_FLOAT_EQ(u.maxDistance, BlurUniforms{}.maxDistance);

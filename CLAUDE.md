@@ -84,11 +84,13 @@ Read the doc that matches the task before diving into code:
   (synchronization design) before touching any concurrency code.
 - [docs/rt_lighting_plan.md](docs/rt_lighting_plan.md) — **the plan of record
   for the ray-traced lighting system** (R0 foundations, R1 probe-field GI,
-  R2 froxel-reservoir local-light shadows and R3 honest hit lighting have
-  landed; R4 onward is proposal): probe-field GI, froxel-reservoir
-  local-light shadows, hit-lighting upgrades, screen-probe gather, denoiser
-  evolution, scalability tiers. Read it before touching
-  anything under `render/raytracing/` or the `rt_*` shaders.
+  R2 froxel-reservoir local-light shadows, R3 honest hit lighting, R4 HZB +
+  screen probes and R5a SSILVB/bent-cone have landed; the rest of R5 onward is
+  proposal): probe-field GI, froxel-reservoir local-light shadows,
+  hit-lighting upgrades, screen-probe gather, denoiser evolution, scalability
+  tiers. Read it before touching
+  anything under `render/raytracing/` or the `rt_*` shaders — and before touching the GTAO
+chain, whose visibility bitmask and bent cone are R5a of that plan.
 - [docs/skinned_mesh_format.md](docs/skinned_mesh_format.md) — the `.glb`
   authoring contract (bones, channels, clip naming, IK bone names).
 - [docs/effects_system.md](docs/effects_system.md) — particle effects:
@@ -113,7 +115,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload; opt-in via `BRACKEN_HOT_RELOAD=1`) + `AssetRegistry` (host-facing utility — engine systems register on the watcher directly) |
 | `memory/` | `bracken::memory` | arena allocator, frame allocator |
 | `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) over `pipeline_catalog.hpp` (one `constexpr` row per `PipelineType`: shaders, resources, vertex layout, target, depth/blend state), `gpu_uniforms.hpp` (CPU↔GPU contract) |
-| `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO, TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI, hierarchical-Z pyramid (`hzb.hpp`); `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas; `gi/` = the probe-field clipmap and the screen-probe gather |
+| `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO (SSILVB visibility bitmask + bent cone), TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI, hierarchical-Z pyramid (`hzb.hpp`); `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas; `gi/` = the probe-field clipmap and the screen-probe gather |
 | `render/raytracing/` | `render::rt` | software BVH (32-byte nodes, binned SAH, two-level BLAS/TLAS) + `RtScene`; `render/rt_renderer.hpp` drives the traced passes and their denoisers. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
 | `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror — addressing, ray directions, the blend curve, and the sampler's cascade/weight math. **Complete as of R1c**: the field traces and accumulates itself, and `shaders/gi_sample.hlsli` replaces the DIFFUSE half of the ambient term in every scene fragment shader (three banded atlases, three sampler slots) plus the volumetric fog's in-scatter. Off by default (`gi_mode`); GI on builds the ray-tracing acceleration structure with attributes |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
@@ -436,29 +438,46 @@ settings file. `--smoke 30` at commit `8f21a3d` — which predates the entire
 G-buffer/reflection series — produces the identical figure below, which is the
 evidence that no RT-series commit moved the RT-off path.
 
-| Invocation | mean_luma / stddev |
-|---|---|
-| `--smoke 30` (RT off) | `86.6 / 44.9` |
-| `--smoke 30 PLAYGROUND_AO=0` | `87.0 / 44.5` |
-| `--smoke 30 PLAYGROUND_AO=2` | `86.4 / 45.0` |
+| Invocation | mean_luma / stddev (pre-R5a) | at R5a |
+|---|---|---|
+| `--smoke 30` (RT off) | `86.6 / 44.9` | `86.3 / 45.5` |
+| `--smoke 30 PLAYGROUND_AO=0` | `87.0 / 44.5` | `87.0 / 44.5` (unchanged — AO off) |
+| `--smoke 30 PLAYGROUND_AO=2` | `86.4 / 45.0` | `86.0 / 45.7` |
+
+**R5a moved every AO-ON row on purpose** (SSILVB visibility bitmask + bent
+cone, docs/rt_lighting_plan.md §5.6): mean essentially unmoved, spread up.
+Thin geometry — fences, crop rows, grass tufts, distant canopies — lost the
+grey wash the old thin-occluder heuristic produced, and solid crevices, eaves
+and beam junctions gained real contact depth. `PLAYGROUND_AO=0` reproducing
+its old figure to the digit is the evidence that the AO-off path is untouched;
+the "R5a" figures here were measured on Linux/Vulkan and the pre-R5a column is
+the Metal history, so compare within a column, not across.
 
 Re-measured on the Linux/GCC/Vulkan checkout at R4b (this machine reads `86.5`
 where the Metal table above reads `86.6` — see the memory note on Metal-only
 baselines). The three the ray-tracing phases gate on:
 
-| Invocation | mean_luma / stddev |
-|---|---|
-| `--smoke 30` (RT off, GI off) | `86.5 / 44.9` |
-| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes` | `81.7 / 49.8` |
-| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes_screen` | `82.3 / 50.4` |
+| Invocation | pre-R5a | at R5a |
+|---|---|---|
+| `--smoke 30` (RT off, GI off) | `86.5 / 44.9` | `86.3 / 45.5` |
+| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes` | `81.7 / 49.8` | `81.8 / 50.0` |
+| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes_screen` | `82.3 / 50.4` | `82.2 / 50.5` |
+
+The GI rows moved for a second reason on top of the AO change: since R5a the
+diffuse GI term is gated by the AO pass's BENT CONE — sampled along the bent
+normal, scaled by the cone aperture — instead of by the scalar screen AO,
+never by both. Every row above is 3-run identical.
 
 The third stopped being a copy of the second at R4b, when `GiMode::ProbesScreen`
 gained the screen-probe gather (`render/gi/screen_probes.hpp`,
 docs/rt_lighting_plan.md §5.5) instead of behaving as `Probes`.
-| `--smoke 30 PLAYGROUND_GI=probes` | `84.3 / 46.9` |
-| `PLAYGROUND_RT=both --smoke 30` | `83.9 / 47.9` |
-| `PLAYGROUND_RT=both PLAYGROUND_GI=probes --smoke 30` | `81.7 / 49.8` |
-| `PLAYGROUND_RT_LOCAL=ratio PLAYGROUND_RT=both --smoke 30` | `85.3 / 47.5` |
+
+| Invocation | pre-R5a | at R5a |
+|---|---|---|
+| `--smoke 30 PLAYGROUND_GI=probes` | `84.3 / 46.9` | `84.6 / 46.8` |
+| `PLAYGROUND_RT=both --smoke 30` | `83.9 / 47.9` | `83.7 / 48.4` |
+| `PLAYGROUND_RT=both PLAYGROUND_GI=probes --smoke 30` | `81.7 / 49.8` | `81.8 / 50.0` |
+| `PLAYGROUND_RT_LOCAL=ratio PLAYGROUND_RT=both --smoke 30` | `85.3 / 47.5` | `85.0 / 47.9` |
 
 The GI row moved from `84.7 / 46.6` at R3 (`pbr.hlsli`'s rough-tier ambient
 specular now blends toward the probe field above roughness 0.6). The

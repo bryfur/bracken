@@ -109,7 +109,8 @@ The scene renders **reversed-Z** (glm `RH_ZO` projection with near/far
 swapped): the near plane is device depth **1.0**, the far plane / cleared
 background is **0.0**, and scene pipelines depth-test `GREATER_OR_EQUAL`. The
 skybox vertex shader emits z = 0.0 so it passes only where nothing was drawn.
-Depth-reading shaders (`gtao`, `gtao_temporal`, `blur_ao`, `volumetric_fog`)
+Depth-reading shaders (`gtao`, `gtao_temporal`, `blur_ao`, `gtao_upsample`,
+`volumetric_fog`)
 test `depth <= 0.0` for sky; linearization/reconstruction goes through the (inverse)
 projection matrix and needs no convention-specific math.
 **Exception:** the shadow passes stay standard-Z — the CSM atlas is cleared
@@ -126,8 +127,12 @@ Every scene fragment shader (model/instanced/terrain/grass; skinned reuses
 `model.frag`) samples the full-res screen-space GTAO texture (UV from
 `SV_Position` × a texel-size uniform) and multiplies it into the AMBIENT term
 only, min-combined with the material ORM AO — direct sun light and speculars
-are never attenuated by screen AO. The slot is bound to a 1×1 white dummy
-when AO is off (and always for BLEND draws). The LAST THREE sampler slots of
+are never attenuated by screen AO. Since R5a that texture is RGBA
+(`bent_cone.hlsli`), and the DIFFUSE GI term is gated by the decoded bent
+cone — evaluated along the bent normal, scaled by the cone aperture — INSTEAD
+of the scalar screen AO, never by both. The slot is bound to a 1×1 white dummy
+when AO is off (and always for BLEND draws), which decodes to the fully-open
+escape and restores the scalar path exactly. The LAST THREE sampler slots of
 every scene fragment shader are the sky IBL chain (irradiance cube,
 GGX-prefiltered specular cube, split-sum BRDF LUT — `render/ibl.hpp`);
 when the `iblEnabled` uniform flag is on, `ambientIBL()` (pbr.hlsli) replaces
@@ -233,15 +238,27 @@ convention.
 
 **Post-processing** — all use `fullscreen.vert` (fullscreen triangle, no
 vertex input). The AO chain runs BEFORE the forward pass, from the prepass
-depth: `gtao` (true horizon-based GTAO, Jimenez et al. 2016 — per-slice
-horizon search with cosine-weighted arc integration, 3 slices × 4 steps per
-side, per-pixel IGN + per-frame golden-ratio temporal jitter, edge-aware
-depth-reconstructed normals, thin-occluder heuristic; CPU reference for the
-arc integral: `render/gtao.hpp`), `gtao_temporal` (velocity-reprojected
-accumulation into an RG16F history of AO + linear depth, relative-depth
-disocclusion rejection), `blur_ao` (bilateral, ×2 separable),
-`gtao_upsample` (joint-bilateral upsample to the full-res R8 texture the
-forward pass samples; applies `ao_strength`). Ray-traced reflections are
+depth: `gtao` (horizon-based GTAO, Jimenez et al. 2016, with an SSILVB
+**visibility bitmask**, Therrien et al. 2023 — per slice a 32-sector `uint`
+occlusion mask marked by constant-thickness slabs instead of a horizon pair,
+integrated with the same cosine weight, 3 slices × 4 steps per side, per-pixel
+IGN + per-frame golden-ratio temporal jitter, edge-aware depth-reconstructed
+normals; no wave intrinsics — `countbits`-class work only. CPU reference for
+every piece of that math: `render/gtao.hpp`), `gtao_temporal` (velocity-
+reprojected accumulation into an RGBA16F history plus a separate RG16F depth
+history, relative-depth disocclusion rejection — MRT, because five linearly
+filtered quantities do not fit in four channels), `blur_ao` (bilateral, ×2
+separable), `gtao_upsample` (joint-bilateral upsample to the full-res RGBA8
+texture the forward pass samples; applies `ao_strength` to both occlusion
+channels).
+
+Every texture in that chain carries FOUR channels, and `bent_cone.hlsli` is
+the single owner of the layout: R = AO, GB = octahedral WORLD-space **bent
+normal**, A = **cone aperture** as sin²(half-angle). Filters decode the bent
+normal, average it as a direction, renormalise and re-encode — averaging
+octahedral coordinates across the fold seam averages nothing. `A >= 0.998`
+(`BENT_CONE_OPEN`) means "fully open, no directional data", which is what the
+1×1 white dummy decodes to, and is why AO-off needs no uniform flag. Ray-traced reflections are
 resolved after forward lighting by `rt_reflection_resolve`: it rejects
 ineligible centre materials, performs a depth/normal/roughness/metallic-guided
 4-tap gather from the reduced-resolution raw-radiance texture, evaluates the
@@ -435,7 +452,16 @@ and drawn as UI rects — there is no billboard pipeline). `grid.*`: debug grid
 overlay.
 
 **Includes** — `pbr.hlsli` (GGX/Smith/Schlick/Burley BRDF, `evaluatePBR`,
-hemisphere `ambientPBR`, sky-IBL `ambientIBL`, specular AA),
+hemisphere `ambientPBR`, sky-IBL `ambientIBL`, specular AA; both ambient
+functions occlude each ambient SOURCE separately since R5a — hemisphere/cube
+diffuse and specular by the scalar `ao`, the GI diffuse by the bent-cone
+`giGate` — which is what lets the cone REPLACE the scalar for that one term
+rather than stack with it; `giGate < 0` means "no cone" and reproduces the
+old arithmetic), `bent_cone.hlsli` (the AO texture's four channels in one
+place: octahedral encode/decode for the bent normal, the `BENT_CONE_OPEN`
+escape value, `decodeBentCone`, and `bentConeGiGate` — the single place the
+GI double-count rule is decided. Written by the whole GTAO chain, read by
+every scene fragment shader),
 `sky_common.hlsli` (the procedural sky radiance function shared by the
 skybox and sky-capture passes; includes `fog.hlsli` for the shared
 `hazeSunColor`), `lighting.hlsli` (luminance,

@@ -2113,7 +2113,7 @@ Formats (member initializers, `pipeline_registry.hpp`):
 | `scene_color_format_` | `SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT` (linear HDR scene target) |
 | `depth_format_` | `SDL_GPU_TEXTUREFORMAT_D32_FLOAT` |
 | `velocity_format_` | `SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT` (motion-vector target written by the `DepthPrepass*` pipelines; `get_velocity_format()`) |
-| AO pipelines' color target | `SDL_GPU_TEXTUREFORMAT_R8_UNORM` (GTAO/BlurAO/GTAOUpsample creators; the GTAOTemporal history is `R16G16_FLOAT`) |
+| AO pipelines' color target | `SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM` (GTAO/BlurAO/GTAOUpsample creators — AO + octahedral bent normal + cone aperture; GTAOTemporal writes an `R16G16B16A16_FLOAT` history plus an `R16G16_FLOAT` depth history) |
 
 Shader path resolution (`init()`): `SDL_GetBasePath() + "shaders/"`, fallback `"shaders/"` (logged). This matches `bracken_copy_shaders()` (defined in `src/bracken/CMakeLists.txt`), which stages compiled `.spv` next to the consumer executable.
 
@@ -2140,9 +2140,9 @@ Per-pipeline configuration summary (from the catalogue rows in `pipeline_catalog
 | ShadowTerrain | `shadow_terrain.vert.spv` / `shadow_depth_opaque.frag.spv` | {1,0,0} | {0,0,0} | terrain layout | as ShadowModel but **no cull** |
 | LocalShadowClear | `fullscreen.vert.spv` / `shadow_depth_opaque.frag.spv` | {0,0,0} | {0,0,0} | none (SV_VertexID triangle) | depth-only, `ALWAYS` compare + write; drawn per local-shadow tile with viewport depth range [1,1] |
 | InstancedShadowModel | `shadow_depth_instanced.vert.spv` / `shadow_depth.frag.spv` | {1,0,1} | {1,1,0} | Vertex3D | as ShadowModel |
-| GTAO | `fullscreen.vert.spv` / `gtao.frag.spv` | {0,0,0} | {1,1,0} | none (SV_VertexID triangle) | no depth, no cull, `R8_UNORM` target |
-| GTAOTemporal | `fullscreen.vert.spv` / `gtao_temporal.frag.spv` | {0,0,0} | {1,4,0} | none | `R16G16_FLOAT` history (AO + linear depth) |
-| GTAOUpsample | `fullscreen.vert.spv` / `gtao_upsample.frag.spv` | {0,0,0} | {1,2,0} | none | `R8_UNORM` (full-res AO the forward pass samples) |
+| GTAO | `fullscreen.vert.spv` / `gtao.frag.spv` | {0,0,0} | {1,1,0} | none (SV_VertexID triangle) | no depth, no cull, `R8G8B8A8_UNORM` target |
+| GTAOTemporal | `fullscreen.vert.spv` / `gtao_temporal.frag.spv` | {0,0,0} | {1,5,0} | none | MRT: `R16G16B16A16_FLOAT` history (AO + bent oct + aperture) + `R16G16_FLOAT` depth history |
+| GTAOUpsample | `fullscreen.vert.spv` / `gtao_upsample.frag.spv` | {0,0,0} | {1,2,0} | none | `R8G8B8A8_UNORM` (full-res AO + bent cone the forward pass samples) |
 | BlurAO | `fullscreen.vert.spv` / `blur_ao.frag.spv` | {0,0,0} | {1,2,0} | none | `R8_UNORM` |
 | RtReflectionResolve | `fullscreen.vert.spv` / `rt_reflection_resolve.frag.spv` | {0,0,0} | {1,3,0} | none | additive RGB with destination alpha preserved; `R16G16B16A16_FLOAT` |
 | Water | `water.vert.spv` / `water.frag.spv` | {1,1,0} | {1,5,0} | float2 world XZ | opaque/no-cull; refraction + SSR/RT/IBL reflection; HDR color, D32 |
@@ -2198,7 +2198,7 @@ Cbuffer mirror inventory (binding as annotated in the header). Every size below 
 | `ShadowTerrainUniforms` | vertex set 1, b0 | 64 | terrain verts already world-space |
 | `ShadowFragUniforms` | fragment set 3, b0 | 16 | `hasTexture` (alpha-tested casters) |
 | `ShadowDataUniforms` | fragment set 3, b1 | 336 | per-cascade `lightViewProjection[4]`, splits/texel/depth-range vec4s; `shadowEnabled`: 0 = off, 1 = PCF, 2 = PCSS; 2×2 atlas, cascade i at quadrant (i%2, i/2) |
-| `GTAOUniforms` | fragment set 3, b0 | 176 | defaults `radius = 4.0` (world units), `falloffRange = 0.615`, `thinOccluderCompensation = 0.2`, `maxDistance = 12000`; `radiusScale` = `ao_radius`, `temporalRotation/Offset` = per-frame golden-ratio jitter |
+| `GTAOUniforms` | fragment set 3, b0 | 240 | defaults `radius = 4.0` (world units), `falloffRange = 0.615`, `occluderThickness = 1.0` (SSILVB slab depth in world units, replaced `thinOccluderCompensation = 0.2`), `maxDistance = 12000`; `radiusScale` = `ao_radius`, `invView` = view→world for the world-space bent normal, `temporalRotation/Offset` = per-frame golden-ratio jitter |
 | `GtaoTemporalUniforms` | fragment set 3, b0 | 32 | `feedbackMax = 0.9`, `depthRejectScale = 10`; `historyValid` 0 on first frame/resize/mode gaps |
 | `GtaoUpsampleUniforms` | fragment set 3, b0 | 32 | joint-bilateral upsample constants + `strength` (`ao_strength`, applied as a power curve) |
 | `BlurUniforms` | fragment set 3, b0 | 32 | `sharpness = 40`; `depthA = proj[2][2]`, `depthB = proj[3][2]` linearize depth (`viewZ = |B/(depth+A)|`, valid for standard and reversed-Z); `maxDistance` must equal `GTAOUniforms::maxDistance` (asserted in tests) |
@@ -2471,9 +2471,9 @@ VS/FS resource counts below are the `ShaderResources` declared in each catalogue
 | ShadowSkinnedModel | `shadow_skinned.vert` / `shadow_depth_opaque.frag` | u1 b1 | — | skinned_vertex + shadow state | — |
 | ShadowTerrain | `shadow_terrain.vert` / `shadow_depth_opaque.frag` | u1 | — | terrain layout, **no_cull**, shadow state | — |
 | LocalShadowClear | `fullscreen.vert` / `shadow_depth_opaque.frag` | — | — | no vertex input, `ALWAYS` compare, depth write on | — |
-| GTAO | `fullscreen.vert` / `gtao.frag` | — | u1 s1 | no vertex input, no_depth | R8 |
-| GTAOTemporal | `fullscreen.vert` / `gtao_temporal.frag` | — | u1 s4 | no_depth | RG16F |
-| GTAOUpsample | `fullscreen.vert` / `gtao_upsample.frag` | — | u1 s2 | no_depth | R8 |
+| GTAO | `fullscreen.vert` / `gtao.frag` | — | u1 s1 | no vertex input, no_depth | RGBA8 |
+| GTAOTemporal | `fullscreen.vert` / `gtao_temporal.frag` | — | u1 s5 | no_depth | RGBA16F + RG16F (MRT) |
+| GTAOUpsample | `fullscreen.vert` / `gtao_upsample.frag` | — | u1 s2 | no_depth | RGBA8 |
 | BlurAO | `fullscreen.vert` / `blur_ao.frag` | — | u1 s2 | no_depth | R8 |
 | RtReflectionResolve | `fullscreen.vert` / `rt_reflection_resolve.frag` | — | u1 s3 | no_depth; RGB additive, destination alpha preserved | RGBA16F |
 | Water | `water.vert` / `water.frag` | u1 s1 | u1 s5 | position2; opaque/no-cull, reversed-Z depth write | scene |
@@ -2529,7 +2529,7 @@ Every cbuffer has an `alignas(16)` CPU mirror annotated with its `(set, binding)
 | `ShadowTerrainUniforms` / `InstancedShadowUniforms` | (1, b0) | `shadow_terrain.vert` / `shadow_depth_instanced.vert` | 64 |
 | `ShadowFragUniforms` | (3, b0) | `shadow_depth.frag` | 16 |
 | `ShadowDataUniforms` | (3, b1) | every shadow-receiving frag (`ShadowUniforms`) | 336 |
-| `GTAOUniforms` | (3, b0) | `gtao.frag` | 176 |
+| `GTAOUniforms` | (3, b0) | `gtao.frag` | 240 |
 | `GtaoTemporalUniforms` | (3, b0) | `gtao_temporal.frag` | 32 |
 | `GtaoUpsampleUniforms` | (3, b0) | `gtao_upsample.frag` | 32 |
 | `BlurUniforms` | (3, b0) | `blur_ao.frag` | 32 |
@@ -2568,7 +2568,7 @@ Storage-buffer record mirrors (tight packing, no cbuffer rules): `InstanceData` 
 
 Packing rules the mirrors follow (and any new struct must): every `glm::vec3` is chased by a scalar or named pad so no field straddles a 16-byte register; padding is **named scalars, never arrays** (HLSL cbuffer arrays stride at 16 B — a `float _pad[3]` on the HLSL side would declare a 52-byte block; see the comment in `ui.frag.hlsl` and the `ShadowFragUniformsLayout` test); total size a multiple of 16.
 
-Notable defaults living in these structs (pushed as-is unless the renderer overrides): `GTAOUniforms{radius 4.0, falloffRange 0.615, thinOccluderCompensation 0.2, maxDistance 12000}`, `GtaoTemporalUniforms{feedbackMax 0.9, depthRejectScale 10}`, `BlurUniforms{sharpness 40, maxDistance 12000}` (the two `maxDistance`s must agree — asserted in the tests), `CompositeUniforms{bloomStrength 0.25, exposure 1, tonemapMode 0, all exposure/grading gates neutral}`, `ExposureAdaptUniforms{percentiles 0.60/0.05, speeds 1.5/2.5 EV/s, EV clamp ±4, log2TargetGray −1.80}`, `BloomDownsampleUniforms{threshold 0.8 (post-exposure luminance), exposure 1}`, `VolumetricFogUniforms{fogDensity 0.0015, scatterStrength 0.25, fogHeight 100, fogFalloff 0.005, startDist 100, maxDist 3000, godRaysEnabled 1}`, `ModelLightingUniforms{roughnessFactor 0.85, ambientStrength 0.5, alphaCutoff 0 (=alpha test off)}`. Retained-geometry model upload also bakes `Mesh::rt_triangle_base_colors` (one linear RGBA value per triangle, sampled from the sRGB base-colour texture at centroid UV and multiplied by averaged vertex colour plus `baseColorFactor`); RT reflection attributes consume this compact proxy after source pixels have been released.
+Notable defaults living in these structs (pushed as-is unless the renderer overrides): `GTAOUniforms{radius 4.0, falloffRange 0.615, occluderThickness 1.0, maxDistance 12000}`, `GtaoTemporalUniforms{feedbackMax 0.9, depthRejectScale 10}`, `BlurUniforms{sharpness 40, maxDistance 12000}` (the two `maxDistance`s must agree — asserted in the tests), `CompositeUniforms{bloomStrength 0.25, exposure 1, tonemapMode 0, all exposure/grading gates neutral}`, `ExposureAdaptUniforms{percentiles 0.60/0.05, speeds 1.5/2.5 EV/s, EV clamp ±4, log2TargetGray −1.80}`, `BloomDownsampleUniforms{threshold 0.8 (post-exposure luminance), exposure 1}`, `VolumetricFogUniforms{fogDensity 0.0015, scatterStrength 0.25, fogHeight 100, fogFalloff 0.005, startDist 100, maxDist 3000, godRaysEnabled 1}`, `ModelLightingUniforms{roughnessFactor 0.85, ambientStrength 0.5, alphaCutoff 0 (=alpha test off)}`. Retained-geometry model upload also bakes `Mesh::rt_triangle_base_colors` (one linear RGBA value per triangle, sampled from the sRGB base-colour texture at centroid UV and multiplied by averaged vertex colour plus `baseColorFactor`); RT reflection attributes consume this compact proxy after source pixels have been released.
 
 ### Skinned/instanced storage-buffer contracts
 
@@ -2855,7 +2855,7 @@ Preconditions: main thread (`BRACKEN_ASSERT_MAIN_THREAD()`); `frame` is a sealed
    e. **`IBL`** (only when `gfx.ibl_enabled` and `render::IBL` is ready) — `ibl_->update(cmd, pipelines, env_, world_->sky_time())`: re-snapshot the sky-relevant environment fields, and when a refresh is in flight record up to `IBL::UNITS_PER_FRAME` prefilter passes (usually records nothing). See the IBL section in the Environment chapter.
    f. **`ShadowPass`** — see below. Then **`LocalShadowPass`** (when local shadows are active this frame; independent of the CSM toggle): `render_local_shadow_passes` re-renders this frame's dirty tiles into the 8×8-tile atlas — see the local-shadow section in the Lighting chapter.
    g. Cache `frame_shadow_uniforms_ = shadow_map_->get_shadow_uniforms(mode)`; hand cluster buffers + params (and the local-shadow slot SSBO) to terrain/grass.
-   h. **HDR path** (whenever `post_->is_ready()`, regardless of `ao_mode`): resize post targets (incl. `gtao_->set_half_res`/`resize` and `taa_->resize`, all of which invalidate their history on change); offscreen clear = `env_.fog_color_horizon`; **`DepthPrepass`** (velocity + opaque scene depth, plus the RGBA8 oct-normal/roughness/metallic G-buffer when RT reflections are enabled); **`GTAO`** (only when `ao_mode != Off` and the prepass ran: `render::GTAO::render` — raw horizon-based GTAO from the prepass depth, temporal accumulation against the velocity target, bilateral blur, joint-bilateral upsample into the full-res R8 AO texture the forward pass samples; otherwise `gtao_->invalidate_history()` and the forward pass gets the 1×1 white dummy); **RT compute** records shadows and reduced-resolution raw reflection radiance using sampled depth/G-buffer bindings; `HDROffscreen` renders `render_3d_scene` into the linear-HDR target (forward shaders min-combine the screen AO with material ORM AO in their ambient term, every opaque receiver including terrain/grass uses the traced sun mask when enabled, and eligible opaque model materials smoothly surrender IBL specular to tracing); **`RtReflectionResolve`** adds the depth/normal/material-guided full-resolution receiver-BRDF result to HDR; when water is active, **`RtWaterReflection`** then recycles the raw target for a wave-aware analytic water receiver and the water shader consumes it as the SSR-gap signal; **`TAA`** (only when `aa_mode == AAMode::TAA` and the depth prepass ran this frame: `render::TAA::render` resolves the jittered offscreen color + velocity + depth into the double-buffered RGBA16F history and writes the sharpened result back over the offscreen color; if TAA is active but the prepass/velocity is unavailable, the history is invalidated instead); **`AutoExposure`** (only when `auto_exposure` and the system is ready: `render::AutoExposure::render` records the histogram + adapt compute dispatches over the TAA-resolved offscreen color, with speeds/clamps from the settings; any frame it cannot record calls `auto_exposure_->invalidate()` so the next run snaps to the metered target); `Bloom` (if enabled + ready — reads the TAA-stabilized color when TAA ran; thresholds against the MANUAL exposure only, the adapted EV is not visible to it); `VolumetricFog` (if `volumetric_fog || god_rays`; god rays force-off when shadows are off — the atlas would be garbage); **late swapchain acquire**; `Composite` (bloom strength, exposure = manual bias with the adapted-EV SSBO + `auto_exposure` flag, tonemap mode, contrast, saturation, white-balance coefficients from `render::white_balance_coefficients(env_.grade_temperature, env_.grade_tint)` + the CDL triple from `env_.grade_slope/offset/power`, `depth_a = proj[2][2]`, `depth_b = proj[3][2]` for the fog upsample — neither AO nor RT reflections are composited here) into the swapchain, or into an LDR intermediate followed by `FXAA` only when `aa_mode == AAMode::FXAA` (TAA and Off composite straight to the swapchain). A failed late acquire sets `swapchain_unavailable` — composite + UI are skipped, the buffer still submits.
+   h. **HDR path** (whenever `post_->is_ready()`, regardless of `ao_mode`): resize post targets (incl. `gtao_->set_half_res`/`resize` and `taa_->resize`, all of which invalidate their history on change); offscreen clear = `env_.fog_color_horizon`; **`DepthPrepass`** (velocity + opaque scene depth, plus the RGBA8 oct-normal/roughness/metallic G-buffer when RT reflections are enabled); **`GTAO`** (only when `ao_mode != Off` and the prepass ran: `render::GTAO::render` — raw horizon-based GTAO from the prepass depth, temporal accumulation against the velocity target, bilateral blur, joint-bilateral upsample into the full-res RGBA8 AO + bent-cone texture the forward pass samples; otherwise `gtao_->invalidate_history()` and the forward pass gets the 1×1 white dummy); **RT compute** records shadows and reduced-resolution raw reflection radiance using sampled depth/G-buffer bindings; `HDROffscreen` renders `render_3d_scene` into the linear-HDR target (forward shaders min-combine the screen AO with material ORM AO in their ambient term, every opaque receiver including terrain/grass uses the traced sun mask when enabled, and eligible opaque model materials smoothly surrender IBL specular to tracing); **`RtReflectionResolve`** adds the depth/normal/material-guided full-resolution receiver-BRDF result to HDR; when water is active, **`RtWaterReflection`** then recycles the raw target for a wave-aware analytic water receiver and the water shader consumes it as the SSR-gap signal; **`TAA`** (only when `aa_mode == AAMode::TAA` and the depth prepass ran this frame: `render::TAA::render` resolves the jittered offscreen color + velocity + depth into the double-buffered RGBA16F history and writes the sharpened result back over the offscreen color; if TAA is active but the prepass/velocity is unavailable, the history is invalidated instead); **`AutoExposure`** (only when `auto_exposure` and the system is ready: `render::AutoExposure::render` records the histogram + adapt compute dispatches over the TAA-resolved offscreen color, with speeds/clamps from the settings; any frame it cannot record calls `auto_exposure_->invalidate()` so the next run snaps to the metered target); `Bloom` (if enabled + ready — reads the TAA-stabilized color when TAA ran; thresholds against the MANUAL exposure only, the adapted EV is not visible to it); `VolumetricFog` (if `volumetric_fog || god_rays`; god rays force-off when shadows are off — the atlas would be garbage); **late swapchain acquire**; `Composite` (bloom strength, exposure = manual bias with the adapted-EV SSBO + `auto_exposure` flag, tonemap mode, contrast, saturation, white-balance coefficients from `render::white_balance_coefficients(env_.grade_temperature, env_.grade_tint)` + the CDL triple from `env_.grade_slope/offset/power`, `depth_a = proj[2][2]`, `depth_b = proj[3][2]` for the fog upsample — neither AO nor RT reflections are composited here) into the swapchain, or into an LDR intermediate followed by `FXAA` only when `aa_mode == AAMode::FXAA` (TAA and Off composite straight to the swapchain). A failed late acquire sets `swapchain_unavailable` — composite + UI are skipped, the buffer still submits.
    i. **Fallback** (post stack not ready): single `MainScene` pass direct to swapchain via `begin_main_pass` (color clear `{0.35, 0.45, 0.6, 1}`, depth clear **0.0** with explicit `LOADOP_CLEAR`); no prepass, no AO (white dummy bound).
 5. **`UI`** — `begin_ui` (acquires swapchain if not yet held), replay of `frame.ui_commands()` (a `std::visit` over each `UiCommand` onto the matching `render::UIRenderer::draw_*` call, in submission order), then `draw_billboard_3d` per `frame.billboards()` entry, `end_ui` (clears the background iff no main pass ran this frame).
 6. **`PostUICallback`** — invoked with `(command_buffer, swapchain_texture)` only when a swapchain image is held.
@@ -4693,13 +4693,19 @@ The former `AmbientOcclusion` class was split in the AO rearchitecture:
   (fog upsample + tonemap) pass, and the optional **FXAA** resolve via a
   lazily created LDR intermediate.
 - **`render::GTAO`** (`src/bracken/render/gtao.hpp`) owns the screen-space
-  ambient-occlusion chain: true horizon-based GTAO (Jimenez et al. 2016)
-  computed from the depth-prepass depth **before the forward pass**, plus
-  temporal accumulation, bilateral blur, and a joint-bilateral upsample to
-  the full-res R8 texture the forward shaders sample. Screen AO attenuates
+  ambient-occlusion chain: horizon-based GTAO (Jimenez et al. 2016) whose
+  per-slice horizon pair became a 32-sector **visibility bitmask** in R5a
+  (SSILVB, Therrien et al. 2023), computed from the depth-prepass depth
+  **before the forward pass**, plus temporal accumulation, bilateral blur,
+  and a joint-bilateral upsample to the full-res **RGBA8** texture the forward
+  shaders sample. That texture carries R = AO, GB = octahedral world-space
+  **bent normal**, A = **cone aperture** as sin²(half-angle); the layout,
+  the `A >= 0.998` "fully open / no directional data" escape value and the
+  GI gate curve all live in `shaders/bent_cone.hlsli`. Screen AO attenuates
   the forward **ambient term only** (min-combined with material ORM AO in
-  the `ao` argument of `ambientPBR`/`ambientIBL`); direct sun light,
-  speculars, and cluster lights are never attenuated.
+  the `ao` argument of `ambientPBR`/`ambientIBL`), and the diffuse GI term is
+  gated by the cone aperture INSTEAD of that scalar, never by both; direct sun
+  light, speculars, and cluster lights are never attenuated.
 
 #### `render::GTAO` public API
 
@@ -4710,9 +4716,10 @@ void resize(int width, int height);   // no-op when unchanged; invalidates histo
 void set_half_res(bool);              // AOMode::GTAO_Half vs GTAO_Full working res
 bool is_ready() const;
 void invalidate_history();            // next render() outputs the current frame
-SDL_GPUTexture* ao_texture() const;   // full-res R8, white-cleared at init/resize
+SDL_GPUTexture* ao_texture() const;   // full-res RGBA8, white-cleared at init/resize
 struct FrameParams { glm::mat4 projection;      // the DRAW (jittered) projection
                      glm::mat4 inv_projection;
+                     glm::mat4 inv_view;        // bent normal is published in WORLD space
                      float radius_scale = 1.0f; // GraphicsSettings::ao_radius
                      float strength = 1.0f;     // GraphicsSettings::ao_strength
                      uint64_t frame_index = 0; };
@@ -4720,11 +4727,23 @@ void render(SDL_GPUCommandBuffer*, gpu::PipelineRegistry&,
             gpu::GPUTexture& depth, gpu::GPUTexture& velocity, const FrameParams&);
 ```
 
-Plus the test-exposed CPU reference `detail::gtao_slice_visibility(
-horizon_cos0, horizon_cos1, n)` — the cosine-weighted horizon arc integral
-mirrored by `gtao.frag.hlsl` (pinned by `gtao.test.cpp`: unoccluded facing
-surface = 1, fully raised horizons = 0, half occluded = 0.5, tilted
-unoccluded = `cos n + n·sin n`, monotonic in the horizons).
+Plus the test-exposed CPU reference in `detail::`, which is the authority the
+shader transliterates (all pinned by `gtao.test.cpp`):
+
+| Function | What it is |
+|---|---|
+| `gtao_slice_visibility(h0, h1, n)` | the pre-R5a cosine-weighted arc integral; kept as the analytic ground truth the 32 sector weights must sum to |
+| `gtao_sector_angle(k, n)` / `gtao_arc_antiderivative` / `gtao_arc_cumulative` | the hemicircle parameterisation and the antiderivative `A(θ) = ∫₀^θ sin φ·cos(φ−n) dφ` |
+| `gtao_sector_weight(k, n)` | exact cosine weight of sector `k`; strictly positive, and the 32 of them sum to the unoccluded arc value |
+| `gtao_mark_sectors(lo, hi)` | which bits a normalised angular span sets (width rounds outward, start inward) |
+| `gtao_slab_span(front, back, side, n)` | the constant-thickness occluder's span, normalised onto the hemicircle |
+| `gtao_slice_visibility_bitmask(mask, n)` | visibility of the clear sectors |
+| `gtao_cone_cos_from_resultant(r)` / `gtao_cone_aperture(r)` | the cone fitted to the visibility lobe's first moment, and its stored sin²α |
+
+`GTAO_SECTOR_COUNT = 32` (one `uint`, `countbits` is plain ALU — no wave
+intrinsics in the pass). The tests include a **brute-force gate**: 200 random
+synthetic depth profiles integrated exactly over the true visible set at 20k
+samples, bounded against the bitmask result by the sector quantisation.
 
 #### `render::PostProcessStack` public API
 
@@ -4769,32 +4788,52 @@ PostProcessStack:
 GTAO (working res = `max(1, w/2) × max(1, h/2)` for `GTAO_Half`, full res
 for `GTAO_Full`):
 
-- `ao_raw_`, `blur_tmp_`, `ao_blurred_`: working-res `R8_UNORM`.
-- `history_[2]`: working-res `R16G16_FLOAT` double buffer — R = accumulated
-  AO, G = that frame's linear view depth (disocclusion rejection input).
-- `ao_full_`: **full-res** `R8_UNORM`, the texture the forward pass samples;
-  white-cleared (1.0 = no occlusion) at init/resize/quality change via a
-  one-off command buffer so it is safe to bind before the first render().
+- `ao_raw_`, `blur_tmp_`, `ao_blurred_`: working-res `R8G8B8A8_UNORM`
+  (AO, oct.x, oct.y, aperture).
+- `history_[2]`: working-res `R16G16B16A16_FLOAT` double buffer — the same
+  four channels. 16F rather than 8-bit because a 0.9-feedback accumulation
+  stalls against an 8-bit grid (a per-frame delta under half an LSB never
+  lands).
+- `history_depth_[2]`: working-res `R16G16_FLOAT` double buffer — R = that
+  frame's linear view depth (disocclusion rejection input). A SECOND target
+  because the four channels above are full, all five values are linearly
+  filtered under the history's linear sampler, and therefore none of them can
+  be bit-packed. `GTAOTemporal` writes both in one MRT pass.
+- `ao_full_`: **full-res** `R8G8B8A8_UNORM`, the texture the forward pass
+  samples; white-cleared at init/resize/quality change via a one-off command
+  buffer so it is safe to bind before the first render() — white decodes as
+  "AO 1, cone fully open, bent normal = shading normal", exactly the pre-R5a
+  no-AO behaviour, which is why no uniform flag gates the bent cone.
 - Both classes own a `nearest_clamp_sampler_` + `linear_clamp_sampler_`.
 
 #### Uniform contracts (`src/bracken/gpu/gpu_uniforms.hpp`, all set 3 b0)
 
-- `GTAOUniforms` (176 B): `{mat4 projection, mat4 invProjection, vec2
-  screenSize (working res), vec2 invScreenSize, float radius = 4.0,
-  radiusScale = 1.0, falloffRange = 0.615, thinOccluderCompensation = 0.2,
-  temporalRotation, temporalOffset, maxDistance = 12000.0, pad}`. `radius`
-  is in world units, tuned for 25–35-unit-tall characters; `radiusScale`
-  carries `GraphicsSettings::ao_radius`; the temporal fields carry the
-  per-frame golden-ratio jitter; `maxDistance` is an explicit
+- `GTAOUniforms` (**240 B** since R5a): `{mat4 projection, mat4 invProjection,
+  mat4 invView, vec2 screenSize (working res), vec2 invScreenSize, float
+  radius = 4.0, radiusScale = 1.0, falloffRange = 0.615,
+  occluderThickness = 1.0, temporalRotation, temporalOffset,
+  maxDistance = 12000.0, pad}`. `invView` is view→world, needed because the
+  pass reconstructs in view space and publishes the bent normal in WORLD space
+  (no consumer of the AO texture carries a view matrix). `radius` is in world
+  units, tuned for 25–35-unit-tall characters; `radiusScale` carries
+  `GraphicsSettings::ao_radius`; **`occluderThickness` is the SSILVB slab
+  depth along the view ray, in world units**, scaled by `radiusScale`
+  alongside the radius — it replaces the unitless
+  `thinOccluderCompensation = 0.2` horizon-decay heuristic. The temporal
+  fields carry the per-frame golden-ratio jitter; `maxDistance` is an explicit
   linear-view-distance AO cutoff faded over its last 10% in-shader and
   **must equal `BlurUniforms::maxDistance`** (pinned by `gtao.test.cpp`).
-  Slice/step counts are shader compile-time constants
-  (`SLICE_COUNT = 3`, `STEPS_PER_SLICE = 4`).
-- `GtaoTemporalUniforms` (32 B): `{vec2 invScreenSize, float depthA, depthB,
-  historyValid, feedbackMax = 0.9, depthRejectScale = 10.0, pad}`.
-- `GtaoUpsampleUniforms` (32 B): `{vec2 lowResTexelSize, float depthA,
-  depthB, strength, pads}` — `strength` = `ao_strength`, applied as
-  `pow(ao, strength)`.
+  Slice/step/sector counts are shader compile-time constants
+  (`SLICE_COUNT = 3`, `STEPS_PER_SLICE = 4`, `SECTOR_COUNT = 32`).
+- `GtaoTemporalUniforms` (32 B, unchanged): `{vec2 invScreenSize, float
+  depthA, depthB, historyValid, feedbackMax = 0.9, depthRejectScale = 10.0,
+  pad}`. The pass now declares **5 samplers** (raw, history, velocity, depth,
+  depth history) and **2 colour targets**.
+- `GtaoUpsampleUniforms` (32 B, unchanged): `{vec2 lowResTexelSize, float
+  depthA, depthB, strength, pads}` — `strength` = `ao_strength`, applied as
+  `pow(x, strength)` to BOTH the AO and the aperture channel, so
+  `ao_strength = 0` disables the bent-cone gate along with AO instead of
+  leaving it gating on its own.
 - `BlurUniforms`: `{vec2 direction, vec2 invScreenSize, float sharpness =
   40.0, float depthA, float depthB, float maxDistance = 12000.0}`.
 - `CompositeUniforms` (112 B): `{float bloomStrength = 0.25,
@@ -5224,7 +5263,7 @@ Position, normal (`w = 0`), and tangent (`w = 0`) are all transformed by the sam
 | set 2, sampler 3 | `normalMapTexture` (`RGBA8` UNORM) |
 | set 2, sampler 4 | `metallicRoughnessTexture` (`RGBA8` UNORM) |
 | set 2, sampler 5 | `emissiveTexture` (`RGBA8_SRGB`) |
-| set 2, sampler 6 | `screenAOTexture` (full-res R8 GTAO; 1×1 white dummy when AO off / BLEND draws) |
+| set 2, sampler 6 | `screenAOTexture` (full-res RGBA8 GTAO: AO + octahedral bent normal + cone aperture; 1×1 white dummy when AO off / BLEND draws) |
 | set 2, samplers 7–9 | `iblIrradianceMap` / `iblSpecularMap` (cubes) + `iblBrdfLut` (typed dummies when IBL off) |
 | set 2, sampler 10 | `rtShadowTexture` (R8 ray-traced sun visibility, 1 = lit, at the traced pass's OWN resolution — sample with a normalized UV; 1×1 white dummy when ray tracing is off, and read only when `rtShadowEnabled`) |
 | set 2, samplers 11–13 | probe-field GI: `giIrradianceAtlas` + `giVisibilityAtlas` (linear clamp) and `giProbeMeta` (point clamp), read by `gi_sample.hlsli`; 1×1 black dummies and `giEnabled == 0` when GI is off |

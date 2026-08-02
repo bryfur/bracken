@@ -90,10 +90,11 @@ Texture2D shadowAtlasRaw;
 [[vk::combinedImageSampler]][[vk::binding(3, 2)]]
 SamplerState shadowRawSampler;
 
-// Full-res screen-space GTAO (R8, 1 = unoccluded), computed before this pass
+// Full-res screen-space GTAO (RGBA8 since R5a: R = AO with 1 = unoccluded,
+// GB = octahedral world bent normal, A = cone aperture — bent_cone.hlsli), computed before this pass
 // from the prepass depth. Bound to a 1x1 white dummy when AO is off.
 [[vk::combinedImageSampler]][[vk::binding(4, 2)]]
-Texture2D<float> screenAOTexture;
+Texture2D<float4> screenAOTexture;
 [[vk::combinedImageSampler]][[vk::binding(4, 2)]]
 SamplerState screenAOSampler;
 
@@ -162,6 +163,7 @@ SamplerState rtLocalShadowSampler;
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
+#include "bent_cone.hlsli"
 // Cluster SSBOs follow this shader's 14 fragment samplers in set 2 (slots
 // 0-12 above + the local-shadow ATLAS at 13, declared by the include). R4b's
 // screen-probe SH buffer is a FIFTH storage buffer at base + 4, declared by
@@ -289,8 +291,15 @@ float4 PSMain(PSInput input) : SV_Target {
 
     // Screen-space GTAO, ambient only (terrain has no material AO map, so
     // min(TERRAIN_AO, screenAO) == screenAO). Direct light stays untouched.
-    float screenAO = screenAOTexture.Sample(
-        screenAOSampler, input.position.xy * float2(screenAOTexelX, screenAOTexelY));
+    // Since R5a the texel is a whole BENT CONE — shaders/bent_cone.hlsli.
+    BentCone cone = decodeBentCone(
+        screenAOTexture.Sample(screenAOSampler,
+                               input.position.xy * float2(screenAOTexelX, screenAOTexelY)),
+        N);
+    float screenAO = cone.ao;
+    // The DIFFUSE GI term is gated by the cone instead of that scalar — never
+    // by both (docs/rt_lighting_plan.md §5.6); without a cone it IS the scalar.
+    float giGate = bentConeGiGate(cone, TERRAIN_AO, min(TERRAIN_AO, screenAO));
 
     float ambientLift = lerp(ambientStrength, 1.0, shadow);
     // Probe-field GI (R1c, render/gi/ + gi_sample.hlsli). It replaces the
@@ -303,7 +312,7 @@ float4 PSMain(PSInput input) : SV_Target {
     // ambient term is bit-identical to the pre-R1c image.
     float3 giIrradiance = float3(0, 0, 0);
     if (giEnabled > 0.5) {
-        giIrradiance = giSampleDiffuse(worldPos, N, V, ambientSky, ambientGround);
+        giIrradiance = giSampleDiffuse(worldPos, N, cone.direction, V, ambientSky, ambientGround);
         // Screen probes (R4b) on TOP of the field, never instead of it. Same
         // unit — irradiance/pi — so this is a straight lerp, and the weight is
         // what makes the hand-off safe: a pixel whose four probes sit on other
@@ -311,7 +320,8 @@ float4 PSMain(PSInput input) : SV_Target {
         // answer exactly.
         float giScreenWeight;
         float3 giScreen =
-            giScreenSampleDiffuse(input.position.xy, worldPos, N, cameraPos, giScreenWeight);
+            giScreenSampleDiffuse(input.position.xy, worldPos, N, cone.direction, cameraPos,
+                                  giScreenWeight);
         giIrradiance = lerp(giIrradiance, giScreen, giScreenWeight);
     }
     float3 ambient;
@@ -319,14 +329,15 @@ float4 PSMain(PSInput input) : SV_Target {
         ambient = ambientIBL(N, N, V, baseColor, TERRAIN_METALLIC, roughness, min(TERRAIN_AO, screenAO),
                              ambientLift, iblIrradianceMap, iblIrradianceSampler,
                              iblSpecularMap, iblSpecularSampler, iblBrdfLut, iblBrdfLutSampler,
-                             1.0, giIrradiance, giEnabled);
+                             1.0, giIrradiance, giEnabled, giGate);
     } else {
         ambient = ambientPBR(N, V, baseColor, TERRAIN_METALLIC, roughness, min(TERRAIN_AO, screenAO),
                              ambientSky * ambientLift, ambientGround * ambientLift,
                              // Pre-scaled by the lift, because the hemisphere
                              // colours above are. ambientIBL's override is not:
-                             // that function applies ao * lift at the end.
-                             giIrradiance * ambientLift, giEnabled);
+                             // that function applies the lift at the end (and
+                             // the occlusion per ambient source, since R5a).
+                             giIrradiance * ambientLift, giEnabled, giGate);
     }
 
     float3 color = direct + ambient;
