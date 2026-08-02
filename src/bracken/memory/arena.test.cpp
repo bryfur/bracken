@@ -115,14 +115,14 @@ TEST(Arena, ZeroAlignmentIsRemappedNotRejected) {
     EXPECT_EQ(reinterpret_cast<uintptr_t>(p) % alignof(std::max_align_t), 0u);
 }
 
-// --- Owner-thread enforcement (debug builds; no-op in release) ---
-// EXPECT_DEBUG_DEATH runs the statement without expecting death under NDEBUG,
-// so these also verify the release-build no-op path compiles and passes.
+// --- Owner-thread enforcement ---
+// The owner binding is a BRACKEN_CONTRACT and is compiled into every build, so
+// these are plain EXPECT_DEATH: a violation aborts in release too.
 
 TEST(ArenaOwnerDeathTest, AllocateFromForeignThreadAsserts) {
     Arena a(1024);
     ASSERT_NE(a.allocate(8, 8), nullptr); // binds the arena to this thread
-    EXPECT_DEBUG_DEATH(
+    EXPECT_DEATH(
         {
             std::thread t([&] { (void)a.allocate(8, 8); });
             t.join();
@@ -133,7 +133,7 @@ TEST(ArenaOwnerDeathTest, AllocateFromForeignThreadAsserts) {
 TEST(ArenaOwnerDeathTest, ResetFromForeignThreadAsserts) {
     Arena a(1024);
     ASSERT_NE(a.allocate(8, 8), nullptr); // binds the arena to this thread
-    EXPECT_DEBUG_DEATH(
+    EXPECT_DEATH(
         {
             std::thread t([&] { a.reset(); });
             t.join();
@@ -145,7 +145,7 @@ TEST(ArenaOwnerDeathTest, FixedBufferArenaEnforcesOwnerToo) {
     alignas(16) std::byte buf[128];
     Arena a(buf, sizeof(buf));
     ASSERT_NE(a.allocate(8, 8), nullptr); // binds the arena to this thread
-    EXPECT_DEBUG_DEATH(
+    EXPECT_DEATH(
         {
             std::thread t([&] { (void)a.allocate(8, 8); });
             t.join();
@@ -160,7 +160,7 @@ TEST(ArenaOwnerDeathTest, BindOwnerBlocksOtherThreads) {
     // thread is spawned *inside* the death statement so gtest's fast-style
     // fork() happens while the parent process is still single-threaded
     // (forking after spawning a thread crashes in the objc runtime on macOS).
-    EXPECT_DEBUG_DEATH(
+    EXPECT_DEATH(
         {
             std::thread claim([&] { a.bind_owner(); });
             claim.join();

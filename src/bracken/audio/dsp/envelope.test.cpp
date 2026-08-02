@@ -1,4 +1,3 @@
-#if BRACKEN_SYNTH
 
 #include <gtest/gtest.h>
 
@@ -116,4 +115,3 @@ TEST(Envelope, NoteOffOnIdleIsIgnored) {
     EXPECT_EQ(e.stage(), Envelope::Stage::Idle);
 }
 
-#endif // BRACKEN_SYNTH

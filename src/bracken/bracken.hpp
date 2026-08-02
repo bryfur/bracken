@@ -86,12 +86,10 @@
 #include "bracken/core/asset/asset_pack.hpp"   // ship assets as one file instead of thousands
 #include "bracken/core/random.hpp"             // deterministic RNG: seed it, do not derive from game state
 #include "bracken/audio/audio_engine.hpp"      // playback device, mixer, 3D voices — Application::audio()
-#if BRACKEN_SYNTH
 #include "bracken/audio/music/song.hpp"         // Song/Track/Pattern — the data play_music() takes
 #include "bracken/audio/synth/instrument.hpp"   // patches: the synthesizer's authoring surface
 #include "bracken/audio/synth/render.hpp"       // bake a patch into a clip: SFX without audio assets
 #include "bracken/audio/wav_writer.hpp"         // dump a rendered mix for inspection
-#endif
 #include "bracken/save/save_document.hpp"      // saved games: typed, versioned, atomic, checksummed
 #include "bracken/effects/effect_definition.hpp" // EffectDefinition and its curves/emitters — spawned through the FrameSink
 

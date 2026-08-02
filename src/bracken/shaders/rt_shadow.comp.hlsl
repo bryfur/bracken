@@ -81,7 +81,10 @@ cbuffer RtShadowUniforms : register(b0, space2) {
     float depthBias;
 };
 
-[[vk::binding(0, 0)]] Texture2D<float> sceneDepth : register(t0, space0);
+[[vk::combinedImageSampler]][[vk::binding(0, 0)]]
+Texture2D<float> sceneDepth : register(t0, space0);
+[[vk::combinedImageSampler]][[vk::binding(0, 0)]]
+SamplerState sceneDepthSampler : register(s0, space0);
 [[vk::binding(1, 0)]] StructuredBuffer<BvhNode> tlasNodes : register(t1, space0);
 [[vk::binding(2, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t2, space0);
 [[vk::binding(3, 0)]] StructuredBuffer<BvhNode> blasNodes : register(t3, space0);

@@ -1,4 +1,3 @@
-#if BRACKEN_SYNTH
 
 #include <gtest/gtest.h>
 
@@ -104,8 +103,8 @@ TEST(Sequencer, OutputIsIndependentOfBufferSize) {
     }
 }
 
-// Determinism, for the same reason the packet digest exists: a rendered song
-// must be comparable between runs or it cannot be regression-tested.
+// Determinism: a rendered song must be comparable between runs or it cannot
+// be regression-tested.
 TEST(Sequencer, RenderIsReproducible) {
     Sequencer a;
     a.set_song(two_note_song());
@@ -212,4 +211,3 @@ TEST(Sequencer, RenderAddsRatherThanOverwrites) {
     EXPECT_TRUE(preserved);
 }
 
-#endif // BRACKEN_SYNTH

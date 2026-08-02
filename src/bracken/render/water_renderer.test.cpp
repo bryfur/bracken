@@ -27,11 +27,12 @@ TEST(WaterUniformLayout, VertexUniformsMatchShader) {
 
 TEST(WaterUniformLayout, FragmentUniformsMatchShader) {
     EXPECT_EQ(alignof(WaterRenderer::FragmentUniforms), 16u);
-    EXPECT_EQ(sizeof(WaterRenderer::FragmentUniforms), 256u);
+    EXPECT_EQ(sizeof(WaterRenderer::FragmentUniforms), 272u);
     EXPECT_EQ(offsetof(WaterRenderer::FragmentUniforms, screenDepthAB), 112u);
     EXPECT_EQ(offsetof(WaterRenderer::FragmentUniforms, misc), 160u);
     EXPECT_EQ(offsetof(WaterRenderer::FragmentUniforms, viewProjSSR), 176u);
     EXPECT_EQ(offsetof(WaterRenderer::FragmentUniforms, ssrParams), 240u);
+    EXPECT_EQ(offsetof(WaterRenderer::FragmentUniforms, rtParams), 256u);
 }
 
 TEST(WaterGrid, SquareRegionUsesMaxCellsBothAxes) {

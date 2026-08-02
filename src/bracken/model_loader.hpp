@@ -20,6 +20,7 @@
 // Include GPU abstraction headers for proper type definitions
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
+#include "bracken/texture_cache.hpp"
 #include "bracken/gpu/gpu_types.hpp"
 
 // Animation types from the dedicated animation module
@@ -77,9 +78,11 @@ struct PBRMaterial {
     std::vector<uint8_t> emissive_pixels;
     int emissive_width = 0;
     int emissive_height = 0;
-    std::unique_ptr<gpu::GPUTexture> metallic_roughness_texture;
-    std::unique_ptr<gpu::GPUTexture> normal_texture;
-    std::unique_ptr<gpu::GPUTexture> emissive_texture;
+    // Non-owning: owned by the ModelManager's TextureCache, which uploads one
+    // copy per distinct image and outlives every model borrowing from it.
+    gpu::GPUTexture* metallic_roughness_texture = nullptr;
+    gpu::GPUTexture* normal_texture = nullptr;
+    gpu::GPUTexture* emissive_texture = nullptr;
 };
 
 struct Mesh {
@@ -90,31 +93,23 @@ struct Mesh {
     // SDL3 GPU resources
     std::unique_ptr<gpu::GPUBuffer> vertex_buffer;
     std::unique_ptr<gpu::GPUBuffer> index_buffer;
-    std::unique_ptr<gpu::GPUTexture> texture;
+    // Non-owning, like the material maps above — see texture_cache.hpp.
+    gpu::GPUTexture* texture = nullptr;
     PBRMaterial material;
     bool uploaded = false;
 
     bool has_texture = false;
     bool is_skinned = false; // True if using skinned vertices
 
-    /**
-     * Non-owning albedo, used when `texture` is null.
+    /** The albedo to bind; null when there is none.
      *
-     * A generated LOD level is the same surface at fewer triangles, so it
-     * needs the same images. Owning its own copy would multiply texture
-     * memory by the number of levels for zero visual gain — and textures, not
-     * vertices, are what fills VRAM. The base model outlives its LOD levels
-     * (they are registered after it and released together in unload_all), so
-     * borrowing is safe.
-     */
-    gpu::GPUTexture* shared_texture = nullptr;
-
-    /** The albedo to bind, owned or borrowed; null when there is none. */
+     *  There is no longer a separate `shared_texture` slot. It existed so a
+     *  generated LOD level could borrow its base level's albedo instead of
+     *  uploading a second copy; now that every texture comes from the
+     *  content-addressed TextureCache, an LOD level asking for the same pixels
+     *  is simply a cache hit and needs no special case. */
     [[nodiscard]] SDL_GPUTexture* albedo_handle() const {
-        if (texture) {
-            return texture->handle();
-        }
-        return shared_texture != nullptr ? shared_texture->handle() : nullptr;
+        return texture != nullptr ? texture->handle() : nullptr;
     }
 
     /** Should this mesh sample an albedo texture at all? Collapses the
@@ -136,6 +131,19 @@ struct Mesh {
     std::vector<uint8_t> texture_pixels;
     int texture_width = 0;
     int texture_height = 0;
+
+    /**
+     * Compact base-colour proxy for software RT closest-hit shading.
+     *
+     * Base-colour pixels are released after GPU upload, long before the RT
+     * BLAS is built. When CPU geometry retention is enabled, upload_to_gpu()
+     * samples the authored sRGB texture at each triangle centroid, multiplies
+     * vertex colour + baseColorFactor in linear space, and keeps only this
+     * 16-byte-per-triangle result. Reflection hits therefore preserve material
+     * colour without retaining every source texture or requiring a bindless
+     * texture array. Empty means the RT builder uses the untextured factors.
+     */
+    std::vector<glm::vec4> rt_triangle_base_colors;
 
     // Cached index count (valid after GPU upload, when CPU-side data is freed)
     uint32_t cached_index_count = 0;
@@ -295,7 +303,9 @@ public:
      *        data is usually the largest CPU allocation in the process — hence
      *        opt-in rather than default.
      */
-    static void upload_to_gpu(gpu::GPUDevice& device, Model& model,
+    /// @param textures owns the uploaded images; one upload per distinct
+    ///        image across every model that shares it (texture_cache.hpp).
+    static void upload_to_gpu(gpu::GPUDevice& device, TextureCache& textures, Model& model,
                               bool retain_cpu_geometry = false);
     /// Release the model's GPU resources. Main-thread tier (asserted).
     static void free_gpu_resources(Model& model);
@@ -358,6 +368,10 @@ public:
     ModelManager& operator=(ModelManager&&) = delete;
 
     void set_device(gpu::GPUDevice* device) { device_ = device; }
+
+    /// The cache backing every model texture. Exposed so code that uploads a
+    /// model directly (EffectRenderer) shares the same images as everyone else.
+    [[nodiscard]] TextureCache& texture_cache() noexcept { return textures_; }
 
     /// Load a model and return its handle (INVALID_MODEL_HANDLE on failure).
     /// Main-thread (asserted).
@@ -458,6 +472,9 @@ public:
 private:
     gpu::GPUDevice* device_ = nullptr;
     bool retain_cpu_geometry_ = false;
+    // Owns every model texture. Declared BEFORE models_ so it is destroyed
+    // after them: meshes hold non-owning pointers into it.
+    TextureCache textures_;
     // Slot 0 is reserved (INVALID_MODEL_HANDLE), models start at index 1
     std::vector<std::unique_ptr<Model>> models_;
     std::vector<std::string> model_paths_; // parallel to models_; "" for procedural

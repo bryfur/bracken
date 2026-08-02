@@ -472,6 +472,7 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
                              const SDL_GPUTextureSamplerBinding* ao_binding, glm::vec2 ao_texel,
                              const scene::Frustum* frustum, bool depth_equal,
                              const SDL_GPUTextureSamplerBinding* ibl_bindings, bool ibl_enabled,
+                             const SDL_GPUTextureSamplerBinding* rt_shadow_binding, bool rt_shadows_enabled,
                              const SDL_GPUTextureSamplerBinding* local_shadow_binding) {
     BRACKEN_PROFILE_ZONE_COLOR("TerrainRenderer::render", 0xC0392B);
     // Skip rendering if required resources aren't available
@@ -526,6 +527,8 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
     lighting_uniforms.splat_params =
         glm::vec4(0.0f, 0.0f, std::max(world_width_, 1.0f), std::max(world_height_, 1.0f));
     lighting_uniforms.iblEnabled = (ibl_enabled && ibl_bindings) ? 1.0f : 0.0f;
+    lighting_uniforms.rtShadowEnabled =
+        (rt_shadows_enabled && rt_shadow_binding) ? 1.0f : 0.0f;
 
     SDL_PushGPUFragmentUniformData(cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));
 
@@ -553,9 +556,15 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
         SDL_BindGPUFragmentSamplers(pass, 5, ibl_bindings, 3);
     }
 
-    // Local (point/spot) shadow atlas + comparison sampler at slot 8.
+    // Ray-traced sun visibility at slot 8. A white dummy is passed while RT
+    // is disabled so the descriptor remains valid on every backend.
+    if (rt_shadow_binding) {
+        SDL_BindGPUFragmentSamplers(pass, 8, rt_shadow_binding, 1);
+    }
+
+    // Local (point/spot) shadow atlas + comparison sampler at slot 9.
     if (local_shadow_binding) {
-        SDL_BindGPUFragmentSamplers(pass, 8, local_shadow_binding, 1);
+        SDL_BindGPUFragmentSamplers(pass, 9, local_shadow_binding, 1);
     }
 
     if (cluster_light_data_ && cluster_offsets_ && cluster_indices_ && cluster_params_) {

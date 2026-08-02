@@ -25,6 +25,10 @@ struct VSInput {
     [[vk::location(2)]] float4 weights : BLENDWEIGHT;
 #ifdef BRACKEN_PREPASS_GBUFFER
     [[vk::location(3)]] float3 normal : NORMAL;
+    // The G-buffer samples the metallicRoughness map, because in real content
+    // the material's roughness factor carries almost no information (see
+    // prepass_gbuffer.frag.hlsl).
+    [[vk::location(4)]] float2 texcoord : TEXCOORD0;
 #endif
 };
 
@@ -34,6 +38,7 @@ struct VSOutput {
     float4 prevClip : TEXCOORD1;
 #ifdef BRACKEN_PREPASS_GBUFFER
     float3 worldNormal : TEXCOORD2;
+    float2 uv : TEXCOORD3;
 #endif
 };
 
@@ -100,6 +105,7 @@ VSOutput VSMain(VSInput input) {
     // inverse-transpose the forward pass uses.
     float3 localNormal = mul((float3x3)skinMatrix, input.normal);
     output.worldNormal = normalize(mul((float3x3)normalMatrix, localNormal));
+    output.uv = input.texcoord;
 #endif
     return output;
 }

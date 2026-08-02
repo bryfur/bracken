@@ -14,7 +14,6 @@
 #include "bracken/render/render_context.hpp"
 #include "bracken/scene/frame_packet_ring.hpp"
 #include "bracken/audio/audio_engine.hpp"
-#include "bracken/scene/packet_digest.hpp"
 #include "bracken/scene/scene_renderer.hpp"
 #include "bracken/sim_frame.hpp"
 #include "bracken/systems/camera_system.hpp"
@@ -381,13 +380,6 @@ void Application::run() {
             break; // defensive: nothing in flight
         }
         const uint64_t frame_index = frame->frame_index();
-
-        // Digest the packet here: it is sealed, and the renderer has not yet
-        // written the engine-owned fields (light shadow slots) that would make
-        // the value depend on whether the frame had been drawn.
-        if (packet_digest_enabled_) {
-            packet_digest_accum_ = packet_digest_accum_ * 1099511628211ULL ^ scene::packet_digest(*frame);
-        }
 
         frame_fence(frame_index); // (2)
 

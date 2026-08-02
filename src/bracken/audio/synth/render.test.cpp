@@ -1,4 +1,3 @@
-#if BRACKEN_SYNTH
 
 #include <gtest/gtest.h>
 
@@ -80,4 +79,3 @@ TEST(RenderNote, ZeroTailStillProducesSamples) {
     EXPECT_EQ(c.frame_count(), static_cast<std::size_t>(frames_from_seconds(0.05f)));
 }
 
-#endif // BRACKEN_SYNTH

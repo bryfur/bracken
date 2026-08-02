@@ -87,6 +87,12 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
     const glm::vec2 ao_texel(1.0f / static_cast<float>(std::max(context_->width(), 1)),
                              1.0f / static_cast<float>(std::max(context_->height(), 1)));
 
+    SDL_GPUTexture* rt_shadow_tex = frame_rt_shadow_texture_
+                                        ? frame_rt_shadow_texture_
+                                        : (dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr);
+    SDL_GPUTextureSamplerBinding rt_shadow_binding = {rt_shadow_tex, default_sampler_};
+    const bool have_rt_shadow_binding = rt_shadow_tex && default_sampler_;
+
     // Sky IBL bindings for terrain/grass (real chain or typed dummies) — the
     // model-family paths bind the same set via bind_ibl().
     SDL_GPUTextureSamplerBinding ibl_bindings[3];
@@ -112,6 +118,7 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
                          shadow_binding_count > 0 ? shadow_bindings : nullptr, shadow_binding_count,
                          have_ao_binding ? &ao_binding : nullptr, ao_texel, &frame_frustum_, frame_prepass_active_,
                          have_ibl_bindings ? ibl_bindings : nullptr, frame_ibl_active_,
+                         have_rt_shadow_binding ? &rt_shadow_binding : nullptr, frame_rt_shadows_active_,
                          have_local_shadow_binding ? &local_shadow_binding : nullptr);
     }
 
@@ -122,6 +129,7 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
                                 shadow_binding_count > 0 ? shadow_bindings : nullptr, shadow_binding_count,
                                 have_ao_binding ? &ao_binding : nullptr, ao_texel, frame_prepass_active_,
                                 have_ibl_bindings ? ibl_bindings : nullptr, frame_ibl_active_,
+                                have_rt_shadow_binding ? &rt_shadow_binding : nullptr, frame_rt_shadows_active_,
                                 have_local_shadow_binding ? &local_shadow_binding : nullptr);
     }
 
@@ -371,6 +379,7 @@ gpu::ModelLightingUniforms SceneRenderer::make_model_lighting(const CameraState&
     // magnification; screenAOTexel* only converts SV_Position to [0,1].
     u.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
     u.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
+    u.rtReflectionFadeStart = frame_rt_reflection_fade_start_;
 
     return u;
 }
@@ -449,7 +458,8 @@ void SceneRenderer::render_model_command_inner(const ModelDrawCommand& cmd, cons
             continue;
         }
 
-        apply_mesh_material(lighting_uniforms, mesh);
+        apply_mesh_material(lighting_uniforms, mesh, frame_rt_reflection_max_roughness_,
+                            frame_rt_reflection_fade_start_);
         if (!model_lighting_valid_ ||
             std::memcmp(&last_model_lighting_, &lighting_uniforms, sizeof(lighting_uniforms)) != 0) {
             SDL_PushGPUFragmentUniformData(gpu_cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));
@@ -512,6 +522,7 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
     lighting_uniforms.iblEnabled = frame_ibl_active_ ? 1.0f : 0.0f;
     lighting_uniforms.rtShadowEnabled = frame_rt_shadows_active_ ? 1.0f : 0.0f;
     lighting_uniforms.rtReflectionMaxRoughness = frame_rt_reflection_max_roughness_;
+    lighting_uniforms.rtReflectionFadeStart = frame_rt_reflection_fade_start_;
 
     SDL_GPUBuffer* storage_buf = instance_storage_buffer_->handle();
 
@@ -592,7 +603,8 @@ void SceneRenderer::render_instanced_models(const CameraState& camera) {
                     continue;
                 }
 
-                apply_mesh_material(lighting_uniforms, mesh);
+                apply_mesh_material(lighting_uniforms, mesh, frame_rt_reflection_max_roughness_,
+                                    frame_rt_reflection_fade_start_);
                 if (!lighting_pushed ||
                     std::memcmp(&last_pushed, &lighting_uniforms, sizeof(lighting_uniforms)) != 0) {
                     SDL_PushGPUFragmentUniformData(gpu_cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));
@@ -686,7 +698,8 @@ void SceneRenderer::render_skinned_model_command_inner(const SkinnedDrawCommand&
             continue;
         }
 
-        apply_mesh_material(lighting_uniforms, mesh);
+        apply_mesh_material(lighting_uniforms, mesh, frame_rt_reflection_max_roughness_,
+                            frame_rt_reflection_fade_start_);
         if (!model_lighting_valid_ ||
             std::memcmp(&last_model_lighting_, &lighting_uniforms, sizeof(lighting_uniforms)) != 0) {
             SDL_PushGPUFragmentUniformData(gpu_cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));
@@ -785,7 +798,8 @@ void SceneRenderer::render_transparent_models(const CameraState& camera) {
         gpu::ModelLightingUniforms lighting_uniforms =
             make_model_lighting(camera, !draw.no_fog && frame_fog_active_);
         lighting_uniforms.tintColor = draw.tint;
-        apply_mesh_material(lighting_uniforms, mesh);
+        apply_mesh_material(lighting_uniforms, mesh, frame_rt_reflection_max_roughness_,
+                            frame_rt_reflection_fade_start_);
         if (!model_lighting_valid_ ||
             std::memcmp(&last_model_lighting_, &lighting_uniforms, sizeof(lighting_uniforms)) != 0) {
             SDL_PushGPUFragmentUniformData(gpu_cmd, 0, &lighting_uniforms, sizeof(lighting_uniforms));

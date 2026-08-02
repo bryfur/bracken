@@ -88,11 +88,14 @@ struct alignas(16) ModelLightingUniforms {
     // 1 = take the sun shadow from the ray-traced mask instead of the cascades
     // (render/rt_renderer.hpp). Off by default; the CSM path is unchanged.
     float rtShadowEnabled = 0.0f;
-    /// Roughness at or below which a ray-traced reflection will be composited
-    /// for this pixel, so the IBL probe must not also contribute a specular
-    /// lobe. 0 = reflections off. See render/rt_renderer.hpp.
+    /// The traced-reflection handover window, matching
+    /// render::RtReflectionSettings::fade_start / max_roughness. The forward
+    /// pass scales its IBL specular lobe by 1 - rtReflectionWeight(...) and
+    /// the compute pass writes that same weight into the traced target's
+    /// alpha, so the two always sum to one (shaders/reflection_gate.hlsli).
+    /// rtReflectionMaxRoughness == 0 is the "reflections off" encoding.
     float rtReflectionMaxRoughness = 0.0f;
-    float _rtPad1 = 0.0f;
+    float rtReflectionFadeStart = 0.0f;
     float _rtPad2 = 0.0f;
 };
 BRACKEN_HLSL_CBUFFER(ModelLightingUniforms, 240);
@@ -132,6 +135,7 @@ BRACKEN_HLSL_FIELD(ModelLightingUniforms, iblEnabled, 216);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, screenAOEnabled, 220);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtShadowEnabled, 224);
 BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionMaxRoughness, 228);
+BRACKEN_HLSL_FIELD(ModelLightingUniforms, rtReflectionFadeStart, 232);
 
 /**
  * Skybox fragment shader uniforms - matches skybox.frag.hlsl SkyUniforms (set 3, b0)
@@ -367,11 +371,10 @@ struct alignas(16) InstancedLightingUniforms {
     // is an instanced draw) keeps its cascade shadows while the character
     // alone gets traced ones, which reads as "ray tracing does nothing".
     float rtShadowEnabled = 0.0f;
-    /// Roughness at or below which a ray-traced reflection will be composited
-    /// for this pixel, so the IBL probe must not also contribute a specular
-    /// lobe. 0 = reflections off. See render/rt_renderer.hpp.
+    /// Traced-reflection handover window — see
+    /// ModelLightingUniforms::rtReflectionMaxRoughness.
     float rtReflectionMaxRoughness = 0.0f;
-    float _rtPad1 = 0.0f;
+    float rtReflectionFadeStart = 0.0f;
     float _rtPad2 = 0.0f;
 };
 BRACKEN_HLSL_CBUFFER(InstancedLightingUniforms, 224);
@@ -410,6 +413,7 @@ BRACKEN_HLSL_FIELD(InstancedLightingUniforms, iblEnabled, 200);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, screenAOEnabled, 204);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtShadowEnabled, 208);
 BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionMaxRoughness, 212);
+BRACKEN_HLSL_FIELD(InstancedLightingUniforms, rtReflectionFadeStart, 216);
 
 /**
  * Per-instance data for instanced model rendering (storage buffer).
@@ -517,14 +521,29 @@ BRACKEN_HLSL_FIELD(PrepassModelUniforms, normalMatrix, 400);
  * a metallic-roughness texture fetch per pixel in the prepass to refine.
  */
 struct alignas(16) PrepassGBufferUniforms {
+    /// The material's roughness/metallic FACTORS. The shader multiplies them
+    /// by the metallicRoughness texture exactly as the forward pass does
+    /// (glTF: G = roughness, B = metallic), because in real content the
+    /// factors carry almost no information: of the 79 materials in the staged
+    /// medieval/nature packs, 77 have roughnessFactor == 1.0 and all 79 have
+    /// metallicFactor == 0.0. Classifying on the factor alone marked every
+    /// piece of pack art "fully rough", so no stone, brick, plaster, tile or
+    /// wood pixel could ever receive a traced reflection.
     float roughness = 1.0f;
-    float _pad0 = 0.0f;
-    float _pad1 = 0.0f;
+    /// Needed by the reflection pass to build F0: a dielectric reflects ~4% of
+    /// the environment, a metal reflects nearly all of it. Without this every
+    /// traced surface is weighted as a mirror and grass looks like glass.
+    float metallic = 0.0f;
+    /// 1 = a metallicRoughness texture is bound at fragment sampler 0 and the
+    /// factors above are modulated by it; 0 = the 1x1 white dummy is bound and
+    /// the factors stand alone. Mirrors ModelLightingUniforms::hasMRMap.
+    float hasMRMap = 0.0f;
     float _pad2 = 0.0f;
 };
 BRACKEN_HLSL_CBUFFER(PrepassGBufferUniforms, 16);
 BRACKEN_HLSL_FIELD(PrepassGBufferUniforms, roughness, 0);
-BRACKEN_HLSL_FIELD(PrepassGBufferUniforms, _pad0, 4);
+BRACKEN_HLSL_FIELD(PrepassGBufferUniforms, metallic, 4);
+BRACKEN_HLSL_FIELD(PrepassGBufferUniforms, hasMRMap, 8);
 
 /**
  * Depth-prepass vertex uniforms shared by the instanced-model and terrain
@@ -819,11 +838,7 @@ struct alignas(16) CompositeUniforms {
     glm::vec3 cdlOffset{0.0f, 0.0f, 0.0f};
     float _pad1 = 0.0f;
     glm::vec3 cdlPower{1.0f, 1.0f, 1.0f};
-    /// 1 = add the traced specular from the RT reflection texture. Gated by a
-    /// flag rather than by the texture's alpha because the slot is bound to
-    /// the scene colour when ray tracing is off (SDL3 GPU requires every
-    /// declared sampler bound), and that texture's alpha is NOT zero.
-    float rtReflectionEnabled = 0.0f;
+    float _pad2 = 0.0f;
 };
 BRACKEN_HLSL_CBUFFER(CompositeUniforms, 112);
 BRACKEN_HLSL_FIELD(CompositeUniforms, bloomStrength, 0);
@@ -844,7 +859,7 @@ BRACKEN_HLSL_FIELD(CompositeUniforms, _pad0, 76);
 BRACKEN_HLSL_FIELD(CompositeUniforms, cdlOffset, 80);
 BRACKEN_HLSL_FIELD(CompositeUniforms, _pad1, 92);
 BRACKEN_HLSL_FIELD(CompositeUniforms, cdlPower, 96);
-BRACKEN_HLSL_FIELD(CompositeUniforms, rtReflectionEnabled, 108);
+BRACKEN_HLSL_FIELD(CompositeUniforms, _pad2, 108);
 
 /**
  * FXAA pass fragment uniforms (set 3, b0)
@@ -1141,13 +1156,24 @@ struct alignas(16) RtReflectionUniforms {
     glm::vec3 sunColor;
     float normalBias;
     glm::vec3 skyColor;
-    float intensity;
+    float _pad0 = 0.0f;
     glm::uvec2 outputSize;
     uint32_t tlasNodeCount;
-    float pad;
+    /// Roughness at which the traced contribution starts fading out; it
+    /// reaches zero at maxRoughness. Shared with the forward shaders through
+    /// shaders/reflection_gate.hlsli so traced + IBL specular sum to one.
+    float fadeStart;
+    /// Optional analytic water receiver. receiverMode == 0 reads the regular
+    /// depth/G-buffer pair; == 1 intersects the camera ray with this displaced
+    /// water surface and reads the simulation state from sceneNormal.
+    glm::vec4 waterBounds{0.0f};    // minX, minZ, maxX, maxZ
+    glm::vec4 waterSurface{0.0f};   // height, roughness, displacement, normal strength
+    glm::vec4 waterSimWindow{0.0f}; // minX, minZ, inverse extent, edge fade width
+    glm::vec4 waterFlowTime{0.0f};  // flow XZ, speed, absolute time
+    glm::vec4 waterDetail{0.0f};    // detail strength, receiver mode, visibility bias, unused
 };
 
-BRACKEN_HLSL_CBUFFER(RtReflectionUniforms, 144);
+BRACKEN_HLSL_CBUFFER(RtReflectionUniforms, 224);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, invViewProj, 0);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, cameraPosition, 64);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, rayMaxDistance, 76);
@@ -1156,9 +1182,41 @@ BRACKEN_HLSL_FIELD(RtReflectionUniforms, maxRoughness, 92);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, sunColor, 96);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, normalBias, 108);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, skyColor, 112);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, intensity, 124);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, _pad0, 124);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, outputSize, 128);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, tlasNodeCount, 136);
-BRACKEN_HLSL_FIELD(RtReflectionUniforms, pad, 140);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, fadeStart, 140);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterBounds, 144);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterSurface, 160);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterSimWindow, 176);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterFlowTime, 192);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterDetail, 208);
+
+/**
+ * Full-resolution material/depth/normal-guided resolve of the sparse traced
+ * reflection signal into the HDR scene. It runs before TAA/bloom/exposure, so
+ * all later image processing sees one coherent lighting result.
+ */
+struct alignas(16) RtReflectionResolveUniforms {
+    glm::mat4 invViewProj{1.0f};
+    glm::vec3 cameraPosition{0.0f};
+    float maxRoughness = 0.0f;
+    glm::vec2 outputSize{1.0f};
+    glm::vec2 reflectionSize{1.0f};
+    float depthA = 0.0f;
+    float depthB = 0.0f;
+    float fadeStart = 0.0f;
+    float intensity = 1.0f;
+};
+BRACKEN_HLSL_CBUFFER(RtReflectionResolveUniforms, 112);
+BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, invViewProj, 0);
+BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, cameraPosition, 64);
+BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, maxRoughness, 76);
+BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, outputSize, 80);
+BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, reflectionSize, 88);
+BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, depthA, 96);
+BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, depthB, 100);
+BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, fadeStart, 104);
+BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, intensity, 108);
 
 } // namespace bracken::gpu

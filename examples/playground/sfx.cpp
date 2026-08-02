@@ -1,6 +1,5 @@
 #include "sfx.hpp"
 
-#if BRACKEN_SYNTH
 
 #include "bracken/audio/synth/render.hpp"
 
@@ -88,4 +87,3 @@ void SfxBank::build(AudioEngine& audio) {
 
 } // namespace playground
 
-#endif // BRACKEN_SYNTH

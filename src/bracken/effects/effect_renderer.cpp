@@ -139,7 +139,7 @@ void EffectRenderer::ensure_models_uploaded(std::span<const bracken::scene::Effe
         }
         Model* model = model_manager_->get_model(handle);
         if (model && !model->meshes.empty() && !model->meshes[0].uploaded) {
-            ModelLoader::upload_to_gpu(*device_, *model);
+            ModelLoader::upload_to_gpu(*device_, model_manager_->texture_cache(), *model);
         }
     }
 }

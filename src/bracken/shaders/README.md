@@ -121,11 +121,11 @@ valid and the shaders branch to the hemisphere `ambientPBR` fallback.
 The very LAST sampler slot of every scene fragment shader is the LOCAL
 (point/spot) shadow atlas + `LESS_OR_EQUAL` comparison sampler, declared by
 `cluster_lighting.hlsli` at `CLUSTER_SSBO_BINDING_BASE - 1` (fragment sampler
-counts: model/instanced 12, terrain 9, grass 7). In `model.frag` /
-`model_instanced.frag` the slot below it (10) is `rtShadowTexture`, the R8
-ray-traced sun-visibility mask — sampled with a NORMALIZED UV because it lives
-at the traced pass's own resolution, and bound to the 1x1 white dummy (= fully
-lit) when ray tracing is off. It used to be multiplexed into `screenAOTexture`'s
+counts: model/instanced 12, terrain 10, grass 8). The slot below it is
+`rtShadowTexture` (model/instanced 10, terrain 8, grass 6), the R8 ray-traced
+sun-visibility mask — sampled with a NORMALIZED UV because it lives at the
+traced pass's own resolution, and bound to the 1x1 white dummy (= fully lit)
+when ray tracing is off. It used to be multiplexed into `screenAOTexture`'s
 G channel on the belief that a 12th sampler failed DXC legalization; it does
 not (12 compiles, verified to 17), and the packing zeroed the ambient term
 scene-wide whenever AO was off. Cluster lights whose
@@ -195,8 +195,22 @@ arc integral: `render/gtao.hpp`), `gtao_temporal` (velocity-reprojected
 accumulation into an RG16F history of AO + linear depth, relative-depth
 disocclusion rejection), `blur_ao` (bilateral, ×2 separable),
 `gtao_upsample` (joint-bilateral upsample to the full-res R8 texture the
-forward pass samples; applies `ao_strength`). The rest sample the HDR
-offscreen scene target: `bloom_downsample` (13-tap, threshold in
+forward pass samples; applies `ao_strength`). Ray-traced reflections are
+resolved after forward lighting by `rt_reflection_resolve`: it rejects
+ineligible centre materials, performs a depth/normal/roughness/metallic-guided
+4-tap gather from the reduced-resolution raw-radiance texture, evaluates the
+full-resolution receiver BRDF, and adds RGB while preserving HDR alpha. This
+placement is before water/TAA, so the signal cannot bleed from stone onto
+grass or bypass temporal stabilization. The RT compute shaders bind D32 depth
+and the G-buffer as sampled textures with a point-clamp sampler, never as
+compute storage. When water is active, that resolved quarter-resolution target
+is recycled for a second analytic water-receiver dispatch: camera-ray/plane
+intersection is refined against the live wave field and the trace uses the
+same finite-difference + analytic-detail normal as `water.frag`. The water
+shader keeps confident full-detail SSR, uses RT for off-screen/occluded/edge
+gaps, and leaves true misses to IBL. The remaining passes sample the HDR
+offscreen scene target:
+`bloom_downsample` (13-tap, threshold in
 post-exposure luminance) / `bloom_upsample` (9-tap tent, additive),
 `volumetric_fog` (ray march with god rays from the shadow atlas — cascade
 picked per sample by camera distance; sky pixels march too), `composite`

@@ -22,7 +22,7 @@ namespace {
 // on every run and interleaved differently at different worker counts, which
 // put particle positions — and therefore the sealed packet — outside any
 // regression gate. core::Rng is the same SplitMix64 this used to spell out
-// inline; the packet digest is what proves the extraction changed nothing.
+// inline, sequence for sequence.
 float random_float(uint64_t& rng, float min, float max) {
     core::Rng r(rng);
     const float v = r.next_range(min, max);

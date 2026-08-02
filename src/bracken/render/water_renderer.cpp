@@ -227,7 +227,9 @@ void WaterRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
                            const glm::mat4& projection, const glm::vec3& camera_pos, float time_s,
                            int screen_width, int screen_height, SDL_GPUTexture* scene_color_copy,
                            SDL_GPUTexture* scene_depth_copy, const SDL_GPUTextureSamplerBinding& ibl_specular,
-                           bool ibl_enabled, float sun_intensity) {
+                           bool ibl_enabled, SDL_GPUTexture* rt_reflection,
+                           bool rt_reflection_enabled, float rt_reflection_intensity,
+                           float sun_intensity) {
     if (!active() || pass == nullptr || index_count_ == 0 || scene_color_copy == nullptr ||
         scene_depth_copy == nullptr) {
         return;
@@ -266,20 +268,23 @@ void WaterRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
                region_.reflection_strength};
     fu.viewProjSSR = view_proj;
     fu.ssrParams = {region_.ssr_strength, region_.ssr_max_distance, region_.ssr_thickness, 0.0f};
+    fu.rtParams = {rt_reflection_enabled ? 1.0f : 0.0f, rt_reflection_intensity, 0.0f, 0.0f};
     SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
 
     // Vertex stage: the sim state displaces the grid.
     SDL_GPUTextureSamplerBinding sim_binding = {sim_state_[sim_read_]->handle(), linear_clamp_sampler_->handle()};
     SDL_BindGPUVertexSamplers(pass, 0, &sim_binding, 1);
 
-    // Fragment stage: scene copies + sim + IBL specular cube.
-    SDL_GPUTextureSamplerBinding frag_bindings[4] = {
+    // Fragment stage: scene copies + sim + IBL specular cube + the raw
+    // wave-aware traced reflection (black dummy while disabled).
+    SDL_GPUTextureSamplerBinding frag_bindings[5] = {
         {scene_color_copy, linear_clamp_sampler_->handle()},
         {scene_depth_copy, linear_clamp_sampler_->handle()},
         {sim_state_[sim_read_]->handle(), linear_clamp_sampler_->handle()},
         ibl_specular,
+        {rt_reflection, linear_clamp_sampler_->handle()},
     };
-    SDL_BindGPUFragmentSamplers(pass, 0, frag_bindings, 4);
+    SDL_BindGPUFragmentSamplers(pass, 0, frag_bindings, 5);
 
     SDL_GPUBufferBinding vb = {vertex_buffer_->handle(), 0};
     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);

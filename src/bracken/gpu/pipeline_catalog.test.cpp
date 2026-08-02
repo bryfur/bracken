@@ -7,11 +7,9 @@
 // field of the resulting PipelineConfig.
 //
 // This test rebuilds all of that from the catalogue and demands a byte-for-byte
-// match. It is the only mechanical check in the tree that sees GPU *state*: the
-// smoke test's packet digest hashes what the host described, not what the GPU
-// was told to do, so a row with the wrong depth compare or a prepass variant
-// that writes depth would sail straight past it and show up only as a subtly
-// wrong image.
+// match. It is the only mechanical check in the tree that sees GPU *state*: a
+// row with the wrong depth compare, or a prepass variant that writes depth,
+// shows up nowhere else until it surfaces as a subtly wrong image.
 //
 // If you deliberately change a pipeline, the golden has to be updated in the
 // same change and the new block reviewed by eye — especially the `depth`
@@ -122,6 +120,7 @@ const char* blend_name(BlendMode v) {
         case BlendMode::None: return "None";
         case BlendMode::Alpha: return "Alpha";
         case BlendMode::Additive: return "Additive";
+        case BlendMode::AdditivePreserveAlpha: return "AdditivePreserveAlpha";
         case BlendMode::Multiply: return "Multiply";
     }
     return "?";

@@ -328,6 +328,7 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
                            const SDL_GPUTextureSamplerBinding* shadow_bindings, int shadow_binding_count,
                            const SDL_GPUTextureSamplerBinding* ao_binding, glm::vec2 ao_texel, bool depth_equal,
                            const SDL_GPUTextureSamplerBinding* ibl_bindings, bool ibl_enabled,
+                           const SDL_GPUTextureSamplerBinding* rt_shadow_binding, bool rt_shadows_enabled,
                            const SDL_GPUTextureSamplerBinding* local_shadow_binding) {
     BRACKEN_PROFILE_ZONE_COLOR("GrassRenderer::render", 0xC0392B);
     if (!initialized_ || !pipeline_registry_ || !pass || !cmd) {
@@ -380,6 +381,8 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
     fu.screen_ao_texel_x = ao_texel.x;
     fu.screen_ao_texel_y = ao_texel.y;
     fu.ibl_enabled = (ibl_enabled && ibl_bindings) ? 1.0f : 0.0f;
+    fu.rt_shadow_enabled =
+        (rt_shadows_enabled && rt_shadow_binding) ? 1.0f : 0.0f;
     SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
 
     // Vertex samplers: slot 0 = heightmap, slot 1 = splatmap (both CLAMP).
@@ -414,10 +417,16 @@ void GrassRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
         SDL_BindGPUFragmentSamplers(pass, 3, ibl_bindings, 3);
     }
 
-    // Fragment sampler slot 6: local (point/spot) shadow atlas + comparison
+    // Fragment sampler slot 6: ray-traced sun visibility. A white dummy is
+    // bound while RT is disabled so every backend sees a valid descriptor.
+    if (rt_shadow_binding) {
+        SDL_BindGPUFragmentSamplers(pass, 6, rt_shadow_binding, 1);
+    }
+
+    // Fragment sampler slot 7: local (point/spot) shadow atlas + comparison
     // sampler.
     if (local_shadow_binding) {
-        SDL_BindGPUFragmentSamplers(pass, 6, local_shadow_binding, 1);
+        SDL_BindGPUFragmentSamplers(pass, 7, local_shadow_binding, 1);
     }
 
     if (cluster_light_data_ && cluster_offsets_ && cluster_indices_ && cluster_params_) {

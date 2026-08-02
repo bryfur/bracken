@@ -250,27 +250,25 @@ void FrameBuilder::seal() {
 // Lane
 // ============================================================================
 
-#ifndef NDEBUG
 FrameBuilder::Lane::EmitGuard::EmitGuard(const Lane& lane) noexcept : lane_(&lane) {
     const std::thread::id self = std::this_thread::get_id();
     std::thread::id expected{};
     if (lane.emitting_.compare_exchange_strong(expected, self, std::memory_order_relaxed)) {
         return;
     }
-    BRACKEN_ASSERT(false,
-                   "FrameBuilder::lane({}) is being emitted into by two threads AT ONCE (holder {:#x}, caller "
-                   "{:#x}). A lane is thread-safety tier `owned`: key lanes by JOB index so each has one "
-                   "emitter, or join between emitters",
-                   lane.index_, std::hash<std::thread::id>{}(expected), std::hash<std::thread::id>{}(self));
+    BRACKEN_CONTRACT(false,
+                     "FrameBuilder::lane({}) is being emitted into by two threads AT ONCE (holder {:#x}, caller "
+                     "{:#x}). A lane is thread-safety tier `owned`: key lanes by JOB index so each has one "
+                     "emitter, or join between emitters",
+                     lane.index_, std::hash<std::thread::id>{}(expected), std::hash<std::thread::id>{}(self));
 }
 
 FrameBuilder::Lane::EmitGuard::~EmitGuard() noexcept {
     lane_->emitting_.store(std::thread::id{}, std::memory_order_relaxed);
 }
-#endif
 
 template<typename T> void* FrameBuilder::Lane::push_slot(Chain<T>& chain) {
-    const EmitGuard guard(*this); // debug: concurrent-emitter detector
+    const EmitGuard guard(*this); // concurrent-emitter detector
     if (chain.tail == nullptr || chain.tail->count == chunk_capacity<T>()) {
         const std::size_t bytes = chunk_payload_offset<T>() + std::size_t{chunk_capacity<T>()} * sizeof(T);
         const std::size_t align = alignof(T) > alignof(ChunkHeader) ? alignof(T) : alignof(ChunkHeader);

@@ -180,6 +180,15 @@ TEST(BlendState, AdditiveConfiguredFactorsAreSrcAlphaOne) {
     EXPECT_EQ(state.color_blend_op, SDL_GPU_BLENDOP_ADD);
 }
 
+TEST(BlendState, AdditivePreserveAlphaAddsRgbWithoutChangingAlpha) {
+    SDL_GPUColorTargetBlendState state = get_blend_state(BlendMode::AdditivePreserveAlpha);
+    EXPECT_TRUE(state.enable_blend);
+    EXPECT_EQ(state.src_color_blendfactor, SDL_GPU_BLENDFACTOR_ONE);
+    EXPECT_EQ(state.dst_color_blendfactor, SDL_GPU_BLENDFACTOR_ONE);
+    EXPECT_EQ(state.src_alpha_blendfactor, SDL_GPU_BLENDFACTOR_ZERO);
+    EXPECT_EQ(state.dst_alpha_blendfactor, SDL_GPU_BLENDFACTOR_ONE);
+}
+
 TEST(VertexAttributes, AllAttributesBoundToSlot0) {
     for (const auto& attr : get_vertex3d_attributes()) {
         EXPECT_EQ(attr.buffer_slot, 0u);

@@ -78,21 +78,16 @@ private:
 
 } // namespace bracken::core::jobs
 
-// Enforces the documented sim-stage tier. Zero cost in release builds, like
-// BRACKEN_ASSERT_MAIN_THREAD.
-#ifdef NDEBUG
-#define BRACKEN_ASSERT_SIM_STAGE() ((void)0)
-#define BRACKEN_ASSERT_NOT_SIM_STAGE() ((void)0)
-#else
+// Enforces the documented sim-stage tier. Debug-only, via BRACKEN_ASSERT —
+// there is no second NDEBUG test here.
 #define BRACKEN_ASSERT_SIM_STAGE()                                                              \
-    BRACKEN_VERIFY(::bracken::core::jobs::current_stage() == ::bracken::core::jobs::Stage::Sim, \
+    BRACKEN_ASSERT(::bracken::core::jobs::current_stage() == ::bracken::core::jobs::Stage::Sim, \
                    "must be called from the sim stage (on_simulate or a job it submitted)")
 // Uses __func__ at the CALL site, so the abort names the API that was called
 // rather than the macro.
 #define BRACKEN_ASSERT_NOT_SIM_STAGE()                                                          \
-    BRACKEN_VERIFY(::bracken::core::jobs::current_stage() != ::bracken::core::jobs::Stage::Sim, \
+    BRACKEN_ASSERT(::bracken::core::jobs::current_stage() != ::bracken::core::jobs::Stage::Sim, \
                    "{}() is not reachable from the sim stage: on_simulate runs on a pool "      \
                    "thread and may not touch GPU/SDL/main-thread-tier APIs (see "               \
                    "docs/architecture.md, \"Threading & lifetime contracts\")",                 \
                    __func__)
-#endif

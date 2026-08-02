@@ -19,6 +19,10 @@ struct VSInput {
     [[vk::location(0)]] float3 position : POSITION;
 #ifdef BRACKEN_PREPASS_GBUFFER
     [[vk::location(1)]] float3 normal : NORMAL;
+    // The G-buffer samples the metallicRoughness map, because in real content
+    // the material's roughness factor carries almost no information (see
+    // prepass_gbuffer.frag.hlsl).
+    [[vk::location(2)]] float2 texcoord : TEXCOORD0;
 #endif
 };
 
@@ -28,6 +32,7 @@ struct VSOutput {
     float4 prevClip : TEXCOORD1;
 #ifdef BRACKEN_PREPASS_GBUFFER
     float3 worldNormal : TEXCOORD2;
+    float2 uv : TEXCOORD3;
 #endif
 };
 
@@ -73,6 +78,7 @@ VSOutput VSMain(VSInput input, uint instanceID : SV_InstanceID) {
 #ifdef BRACKEN_PREPASS_GBUFFER
     // Per-instance inverse-transpose, exactly as model_instanced.vert.hlsl.
     output.worldNormal = normalize(mul((float3x3)inst.normalMatrix, input.normal));
+    output.uv = input.texcoord;
 #endif
     return output;
 }

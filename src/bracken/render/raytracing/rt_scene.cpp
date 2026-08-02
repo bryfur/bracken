@@ -15,7 +15,7 @@ struct ModelGeometry {
     std::vector<glm::vec3> positions;
     std::vector<uint32_t> indices;
     std::vector<glm::vec3> normals;
-    std::vector<glm::vec4> colors;
+    std::vector<glm::vec4> triangle_colors;
     bool has_cpu_geometry = false;
 };
 
@@ -31,11 +31,29 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
             g.positions.push_back(v.position);
             if (want_attributes) {
                 g.normals.push_back(v.normal);
-                g.colors.push_back(v.color * mesh.material.base_color_factor);
             }
         }
-        for (uint32_t i : mesh.indices) {
-            g.indices.push_back(base + i);
+        const std::size_t triangle_count = mesh.indices.size() / 3;
+        for (std::size_t tri = 0; tri < triangle_count; ++tri) {
+            const uint32_t i0 = mesh.indices[tri * 3 + 0];
+            const uint32_t i1 = mesh.indices[tri * 3 + 1];
+            const uint32_t i2 = mesh.indices[tri * 3 + 2];
+            g.indices.push_back(base + i0);
+            g.indices.push_back(base + i1);
+            g.indices.push_back(base + i2);
+            if (want_attributes) {
+                if (tri < mesh.rt_triangle_base_colors.size()) {
+                    g.triangle_colors.push_back(mesh.rt_triangle_base_colors[tri]);
+                } else if (i0 < mesh.vertices.size() && i1 < mesh.vertices.size() &&
+                           i2 < mesh.vertices.size()) {
+                    g.triangle_colors.push_back(
+                        (mesh.vertices[i0].color + mesh.vertices[i1].color +
+                         mesh.vertices[i2].color) /
+                        3.0f * mesh.material.base_color_factor);
+                } else {
+                    g.triangle_colors.push_back(mesh.material.base_color_factor);
+                }
+            }
         }
     }
     return g;
@@ -129,7 +147,10 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
                         a.n0 = p.geometry.normals[v0];
                         a.n1 = p.geometry.normals[v1];
                         a.n2 = p.geometry.normals[v2];
-                        a.base_color = p.geometry.colors[v0];
+                        const std::size_t tri_index = static_cast<std::size_t>(tri.prim_id);
+                        if (tri_index < p.geometry.triangle_colors.size()) {
+                            a.base_color = p.geometry.triangle_colors[tri_index];
+                        }
                     }
                 }
                 attributes_.push_back(a);

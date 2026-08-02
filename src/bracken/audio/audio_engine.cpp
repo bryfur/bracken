@@ -71,7 +71,6 @@ struct AudioEngine::Mixer {
     std::atomic<float> music_gain{1.0f};
     std::atomic<float> sound_gain{1.0f};
 
-#if BRACKEN_SYNTH
     // Song handoff. The mutex is taken with try_lock on the audio side, so
     // the callback is never blocked by a host building a song.
     std::mutex song_mutex;
@@ -79,7 +78,6 @@ struct AudioEngine::Mixer {
     std::optional<music::Song> retired_song; // freed by the game thread
     bool pending_song_valid = false;
     music::Sequencer sequencer;
-#endif
 
     // --- audio-thread-only -------------------------------------------------
     std::array<SoundVoice, k_max_sound_voices> voices{};
@@ -224,7 +222,6 @@ void AudioEngine::set_sound_gain(float gain) {
     mixer_->sound_gain.store(std::max(0.0f, gain), std::memory_order_relaxed);
 }
 
-#if BRACKEN_SYNTH
 void AudioEngine::play_music(music::Song song) {
     {
         std::lock_guard lock(mixer_->song_mutex);
@@ -241,7 +238,6 @@ void AudioEngine::play_music(music::Song song) {
     (void)mixer_->commands.push(c);
 }
 
-#endif // BRACKEN_SYNTH
 
 void AudioEngine::stop_music() {
     set_music_playing(false);
@@ -349,15 +345,12 @@ void AudioEngine::mix(std::span<StereoFrame> out) {
             break;
         }
         case CommandType::SetMusicPlaying:
-#if BRACKEN_SYNTH
             m.sequencer.set_playing(c.flag);
-#endif
             break;
         }
     }
 
     // --- adopt a pending song without ever freeing on this thread ---------
-#if BRACKEN_SYNTH
     if (m.pending_song_valid && m.song_mutex.try_lock()) {
         if (m.pending_song_valid && m.pending_song.has_value()) {
             // swap_song moves the old song out; the game thread frees it.
@@ -368,7 +361,6 @@ void AudioEngine::mix(std::span<StereoFrame> out) {
         }
         m.song_mutex.unlock();
     }
-#endif
 
     // --- clear, then sum --------------------------------------------------
     for (StereoFrame& f : out) {
@@ -376,7 +368,6 @@ void AudioEngine::mix(std::span<StereoFrame> out) {
     }
 
     const float music_gain = m.music_gain.load(std::memory_order_relaxed);
-#if BRACKEN_SYNTH
     if (music_gain > 0.0f) {
         // The sequencer adds into the bus; scale afterwards so its own
         // internal mix stays in range.
@@ -388,9 +379,6 @@ void AudioEngine::mix(std::span<StereoFrame> out) {
         }
     }
     m.active_music_voices.store(m.sequencer.active_voices(), std::memory_order_relaxed);
-#else
-    (void)music_gain;
-#endif
 
     const float sound_gain = m.sound_gain.load(std::memory_order_relaxed);
     int active = 0;

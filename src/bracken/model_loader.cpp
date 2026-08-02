@@ -3,6 +3,7 @@
 #include "bracken/mesh_simplify.hpp"
 #include "bracken/gpu/gpu_types.hpp"
 #include "bracken/model_utils.hpp"
+#include "bracken/internal/model_material_proxy.hpp"
 #include "glm/ext/matrix_float4x4.hpp"
 #include "glm/ext/matrix_transform.hpp"
 #include "glm/ext/vector_float3.hpp"
@@ -889,7 +890,7 @@ bool ModelLoader::load_glb_impl(const std::string& path, std::span<const std::by
     return true;
 }
 
-void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model,
+void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, TextureCache& textures, Model& model,
                                 bool retain_cpu_geometry) {
     BRACKEN_PROFILE_ZONE("ModelLoader::upload_to_gpu");
     // GPU resource creation is main-thread tier (buffers + textures).
@@ -918,6 +919,13 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model,
             continue;
         }
 
+        // The source pixels are about to be released. Preserve only a compact
+        // per-triangle linear-colour proxy when the caller retained geometry
+        // for a later software-RT build; the normal raster path pays nothing.
+        if (retain_cpu_geometry) {
+            internal::bake_rt_triangle_base_colors(mesh);
+        }
+
         // Create index buffer
         if (!mesh.indices.empty()) {
             mesh.index_buffer = gpu::GPUBuffer::create_static(device, gpu::GPUBuffer::Type::Index, mesh.indices.data(),
@@ -931,9 +939,9 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model,
         // Create texture if available. Base-color textures are sRGB-encoded per
         // glTF; sampler linearizes on read so lighting math stays in linear.
         if (mesh.has_texture && !mesh.texture_pixels.empty()) {
-            mesh.texture = gpu::GPUTexture::create_2d(device, mesh.texture_width, mesh.texture_height,
-                                                      gpu::TextureFormat::RGBA8_SRGB, mesh.texture_pixels.data(),
-                                                      true); // Generate mipmaps
+            mesh.texture = textures.acquire(device, mesh.texture_width, mesh.texture_height,
+                                            gpu::TextureFormat::RGBA8_SRGB, mesh.texture_pixels,
+                                            true); // Generate mipmaps
 
             if (!mesh.texture) {
                 BRACKEN_LOG_ERROR("model", "Failed to create texture for mesh");
@@ -949,8 +957,8 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model,
         // distant fragments don't sample raw aliased high-frequency detail.
         if (!mesh.material.normal_pixels.empty()) {
             mesh.material.normal_texture =
-                gpu::GPUTexture::create_2d(device, mesh.material.normal_width, mesh.material.normal_height,
-                                           gpu::TextureFormat::RGBA8, mesh.material.normal_pixels.data(), true);
+                textures.acquire(device, mesh.material.normal_width, mesh.material.normal_height,
+                                 gpu::TextureFormat::RGBA8, mesh.material.normal_pixels, true);
             if (mesh.material.normal_texture) {
                 mesh.material.normal_pixels.clear();
                 mesh.material.normal_pixels.shrink_to_fit();
@@ -960,9 +968,9 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model,
         // Metallic-roughness: linear UNORM per glTF (G = roughness, B = metallic;
         // R carries AO when has_packed_occlusion).
         if (!mesh.material.metallic_roughness_pixels.empty()) {
-            mesh.material.metallic_roughness_texture = gpu::GPUTexture::create_2d(
+            mesh.material.metallic_roughness_texture = textures.acquire(
                 device, mesh.material.metallic_roughness_width, mesh.material.metallic_roughness_height,
-                gpu::TextureFormat::RGBA8, mesh.material.metallic_roughness_pixels.data(), true);
+                gpu::TextureFormat::RGBA8, mesh.material.metallic_roughness_pixels, true);
             if (mesh.material.metallic_roughness_texture) {
                 mesh.material.metallic_roughness_pixels.clear();
                 mesh.material.metallic_roughness_pixels.shrink_to_fit();
@@ -972,8 +980,8 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, Model& model,
         // Emissive: sRGB-encoded like base color.
         if (!mesh.material.emissive_pixels.empty()) {
             mesh.material.emissive_texture =
-                gpu::GPUTexture::create_2d(device, mesh.material.emissive_width, mesh.material.emissive_height,
-                                           gpu::TextureFormat::RGBA8_SRGB, mesh.material.emissive_pixels.data(), true);
+                textures.acquire(device, mesh.material.emissive_width, mesh.material.emissive_height,
+                                 gpu::TextureFormat::RGBA8_SRGB, mesh.material.emissive_pixels, true);
             if (mesh.material.emissive_texture) {
                 mesh.material.emissive_pixels.clear();
                 mesh.material.emissive_pixels.shrink_to_fit();
@@ -1010,10 +1018,12 @@ void ModelLoader::free_gpu_resources(Model& model) {
         // Free SDL3 GPU resources
         mesh.vertex_buffer.reset();
         mesh.index_buffer.reset();
-        mesh.texture.reset();
-        mesh.material.normal_texture.reset();
-        mesh.material.metallic_roughness_texture.reset();
-        mesh.material.emissive_texture.reset();
+        // Textures are owned by the ModelManager's TextureCache and may still
+        // be referenced by another model; only drop the borrow here.
+        mesh.texture = nullptr;
+        mesh.material.normal_texture = nullptr;
+        mesh.material.metallic_roughness_texture = nullptr;
+        mesh.material.emissive_texture = nullptr;
         mesh.uploaded = false;
         mesh.has_texture = false;
     }
@@ -1051,22 +1061,16 @@ ModelHandle ModelManager::load_model_with_lods(const std::string& name, const st
     (void)build_lods(handle, ratios, thresholds);
 
     if (device_) {
-        ModelLoader::upload_to_gpu(*device_, *get_model(handle), retain_cpu_geometry_);
+        ModelLoader::upload_to_gpu(*device_, textures_, *get_model(handle), retain_cpu_geometry_);
         // Levels were appended after the base, so uploading them here keeps
         // the "CPU geometry is freed at upload" rule uniform across all of them.
         for (ModelHandle lod : get_model(handle)->lod_handles) {
             if (Model* m = get_model(lod)) {
-                ModelLoader::upload_to_gpu(*device_, *m, retain_cpu_geometry_);
+                ModelLoader::upload_to_gpu(*device_, textures_, *m, retain_cpu_geometry_);
             }
         }
-        // Share the base's albedo with every level, now that it exists.
-        Model* b = get_model(handle);
-        for (ModelHandle lod : b->lod_handles) {
-            Model* m = get_model(lod);
-            for (std::size_t i = 0; i < m->meshes.size() && i < b->meshes.size(); ++i) {
-                m->meshes[i].shared_texture = b->meshes[i].texture.get();
-            }
-        }
+        // No albedo sharing step: every level asked the cache for the same
+        // pixels as the base and got the same texture back.
     }
     return handle;
 }
@@ -1079,7 +1083,7 @@ ModelHandle ModelManager::load_model(const std::string& name, const std::string&
     if (ModelLoader::load_glb(path, *model)) {
         // Upload to GPU if device is available
         if (device_) {
-            ModelLoader::upload_to_gpu(*device_, *model, retain_cpu_geometry_);
+            ModelLoader::upload_to_gpu(*device_, textures_, *model, retain_cpu_geometry_);
         }
 
         ModelHandle handle = static_cast<ModelHandle>(models_.size());
@@ -1297,7 +1301,7 @@ core::Result<ModelHandle, ModelRegisterError> ModelManager::register_model(const
     model->loaded = true;
 
     if (device_) {
-        ModelLoader::upload_to_gpu(*device_, *model, retain_cpu_geometry_);
+        ModelLoader::upload_to_gpu(*device_, textures_, *model, retain_cpu_geometry_);
         for (const auto& mesh : model->meshes) {
             if (!mesh.uploaded) {
                 BRACKEN_LOG_ERROR("model", "register_model('{}'): {}", name,
@@ -1335,7 +1339,7 @@ bool ModelManager::reload_model(ModelHandle handle) {
         return false;
     }
     if (device_) {
-        ModelLoader::upload_to_gpu(*device_, *fresh);
+        ModelLoader::upload_to_gpu(*device_, textures_, *fresh);
         if (models_[handle]) {
             ModelLoader::free_gpu_resources(*models_[handle]);
         }
@@ -1382,6 +1386,8 @@ void ModelManager::unload_all() {
         }
     }
     models_.clear();
+    // Every borrow is dead now, so the images can go too.
+    textures_.clear();
     models_.push_back(nullptr); // Re-reserve slot 0
     model_paths_.clear();
     model_paths_.emplace_back();

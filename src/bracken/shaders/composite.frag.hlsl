@@ -46,7 +46,7 @@ cbuffer CompositeUniforms : register(b0, space3) {
     float3 cdlOffset;
     float _pad1;
     float3 cdlPower;
-    float rtReflectionEnabled;
+    float _pad2;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
@@ -73,17 +73,8 @@ SamplerState depthSampler : register(s3, space2);
 // x = adapted EV, y = target EV, z = avg log2 luminance, w = valid.
 // Only read when autoExposureEnabled — the slot binds a zeroed dummy buffer
 // when the auto-exposure system is off/unavailable.
-[[vk::binding(5, 2)]]
-StructuredBuffer<float4> exposureState : register(t5, space2);
-
-// Ray-traced reflections (render/rt_renderer.hpp). alpha 0 means "no traced
-// result here" — either the surface was too rough and keeps the prefiltered
-// IBL probe, or it is sky. Bound to a 1x1 transparent dummy when off, so the
-// blend below is a no-op rather than a branch.
-[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
-Texture2D rtReflectionTexture;
-[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
-SamplerState rtReflectionSampler;
+[[vk::binding(4, 2)]]
+StructuredBuffer<float4> exposureState : register(t4, space2);
 
 #include "lighting.hlsli"
 
@@ -148,17 +139,6 @@ void bilateralTaps(float2 uv, out float2 tapUV[4], out float4 weights) {
 
 float4 PSMain(PSInput input) : SV_Target {
     float3 color = colorTexture.Sample(colorSampler, input.texCoord).rgb;
-
-    // Traced specular, added before tonemapping so it goes through exposure
-    // and grading like every other light. The flag gates the whole read: with
-    // ray tracing off this slot holds the scene colour (something must be
-    // bound), so sampling it and trusting its alpha would DOUBLE the image.
-    // Within the traced texture, alpha still gates per pixel: 0 where the
-    // surface kept the IBL probe or no surface was hit.
-    if (rtReflectionEnabled > 0.5) {
-        float4 rtSpec = rtReflectionTexture.Sample(rtReflectionSampler, input.texCoord);
-        color += rtSpec.rgb * rtSpec.a;
-    }
 
     // Premultiplied fog blend (scene * transmittance + inscattered) stays linear.
     if (volumetricFogEnabled > 0.5) {

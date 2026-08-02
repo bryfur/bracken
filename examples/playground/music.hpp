@@ -4,7 +4,6 @@
 
 #include <string>
 
-#if BRACKEN_SYNTH
 
 namespace playground {
 
@@ -29,4 +28,3 @@ namespace playground {
 [[nodiscard]] bool render_music_to_wav(const std::string& path, float seconds);
 
 } // namespace playground
-#endif // BRACKEN_SYNTH

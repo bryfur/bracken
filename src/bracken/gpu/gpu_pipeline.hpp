@@ -51,7 +51,8 @@ struct PipelineConfig {
     BlendMode blend_mode = BlendMode::None;
     SDL_GPUTextureFormat color_format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
     /// Second colour attachment (MRT), INVALID for the single-target common
-    /// case. Only the depth prepass uses it, to lay down a normal+roughness
+    /// case. Only the depth prepass uses it, to lay down an
+    /// oct-normal/roughness/metallic
     /// G-buffer alongside velocity when ray-traced reflections are on. A
     /// render pass and the pipelines used inside it must agree on the
     /// attachment count, which is why this exists as a pipeline VARIANT

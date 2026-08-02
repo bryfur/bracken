@@ -22,7 +22,7 @@ namespace bracken::gpu {
  * Two consequences worth knowing:
  * - A missing row is a **compile error** (`static_assert` on the table size in
  *   pipeline_catalog.cpp), not a silent "Unknown" at runtime the way two
- *   hand-maintained 56-case switches used to be.
+ *   hand-maintained per-pipeline switches used to be.
  * - The reversed-Z story is one reviewable column. The engine renders the
  *   scene reversed-Z (near -> 1, far -> 0, clear 0.0) and therefore compares
  *   `GREATER_OR_EQUAL`; the exceptions — shadow cascades staying standard-Z
@@ -73,6 +73,7 @@ enum class PipelineType {
     GTAOTemporal,    ///< GTAO temporal accumulation (velocity reprojection + depth reject)
     GTAOUpsample,    ///< GTAO joint-bilateral upsample to the full-res R8 AO texture
     BlurAO,          ///< Bilateral blur for AO
+    RtReflectionResolve, ///< Material/depth/normal-guided RT reflection resolve into HDR, before TAA
     Composite,       ///< Final composite (scene + bloom + fog, tonemap) to swapchain
     BloomDownsample, ///< Bloom brightness extract + downsample
     BloomUpsample,   ///< Bloom tent-filter upsample (additive accumulate)
@@ -181,10 +182,13 @@ enum class VertexLayout : uint8_t {
     Vertex3D,                  ///< gpu::Vertex3D: position, normal, texcoord, color, tangent
     Vertex3DPositionOnly,      ///< Vertex3D stride, position attribute only (depth prepass)
     Vertex3DPositionTexcoord,  ///< Vertex3D stride, position + texcoord (alpha-MASK prepass)
-    Vertex3DPositionNormal,    ///< Vertex3D stride, position + normal (prepass G-buffer)
+    Vertex3DPositionNormal,    ///< Vertex3D stride, position + normal (prepass G-buffer, terrain-style)
+    Vertex3DPositionNormalTexcoord, ///< Vertex3D stride, position + normal + texcoord (prepass G-buffer:
+                                    ///< the texcoord is what lets it sample the metallicRoughness map)
     SkinnedVertex,             ///< gpu::SkinnedVertex: Vertex3D fields + joints + weights
     SkinnedVertexPositionSkin, ///< SkinnedVertex stride, position + joints + weights
     SkinnedVertexPositionSkinNormal, ///< …plus normal (prepass G-buffer)
+    SkinnedVertexPositionSkinNormalTexcoord, ///< …plus normal + texcoord (prepass G-buffer with MR sampling)
     Vertex2D,                  ///< gpu::Vertex2D: position, texcoord, color (UI)
     Terrain,                   ///< 12 floats: position(3), texcoord(2), color(4), normal(3)
     TerrainPositionOnly,       ///< Terrain stride, position attribute only

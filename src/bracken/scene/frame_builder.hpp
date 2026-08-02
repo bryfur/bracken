@@ -216,8 +216,8 @@ public:
         }
 
         /**
-         * Debug-only detector for the one race a lane can have: TWO THREADS
-         * INSIDE AN EMIT AT THE SAME TIME. Concurrent emitters collide on
+         * Detector for the one race a lane can have: TWO THREADS INSIDE AN
+         * EMIT AT THE SAME TIME. Concurrent emitters collide on
          * `chain.tail->count++` and on the chunk-link write, producing a
          * chunk chain whose shape no reader can detect as wrong — the merge
          * at seal then copies garbage, or fewer commands than were emitted,
@@ -232,34 +232,31 @@ public:
          * ownership test cannot see and an overlap test does not need.
          *
          * Held only across the chain mutation itself (push_slot/store_text),
-         * so it costs one uncontended relaxed CAS pair per emitted command in
-         * debug builds and nothing at all in release.
+         * so it costs one uncontended relaxed CAS pair per emitted command.
+         *
+         * Compiled unconditionally, and not only because a lane race is worth
+         * catching in a shipped build. This is a PUBLIC header: when the
+         * member below existed only under !NDEBUG, an engine built one way and
+         * a host TU built the other disagreed about sizeof(Lane) — an ODR
+         * violation that silently corrupts every field after it.
          */
         class EmitGuard {
         public:
-#ifdef NDEBUG
-            explicit EmitGuard(const Lane&) noexcept {}
-#else
             explicit EmitGuard(const Lane& lane) noexcept;
             ~EmitGuard() noexcept;
-#endif
             EmitGuard(const EmitGuard&) = delete;
             EmitGuard& operator=(const EmitGuard&) = delete;
 
         private:
-#ifndef NDEBUG
             const Lane* lane_;
-#endif
         };
 
         FramePacket* packet_ = nullptr;
-#ifndef NDEBUG
         // emitting_ — thread currently inside this lane's chain mutation, or
         // a default-constructed id when nobody is. Relaxed throughout: this is
         // a DETECTOR, not a publish edge; it carries no payload and pairs with
         // nothing. See EmitGuard.
         mutable std::atomic<std::thread::id> emitting_{};
-#endif
         uint32_t index_ = 0;
         uint32_t palette_count_ = 0; // lane-local allocations (low bits of fill-time ids)
         Chain<ModelDrawCommand> models_;

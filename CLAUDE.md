@@ -17,13 +17,16 @@ village orb-collector demo that doubles as the integration test (`--smoke N`
 self-drives for N frames and exits — run it after changes that could affect
 rendering). The village is assembled from a modular building pack, and the
 flora (trees/bushes/rocks/grass tufts/flowers) converted 1:1 from a stylized
-nature pack, by `examples/playground/tools/build_medieval_assets.py` (raw
-packs in `assets/glTF/` and `assets/nature/` — untracked; outputs `.glb`s +
-terrain textures + `village_layout.h` into `assets/generated/`, staged next
-to the exe by CMake).
-Without the generated assets the playground still builds and the smoke test
-still passes — it falls back to a procedural-only scene (generator trees +
-rocks, engine blade grass). In the full scene everything except the
+nature pack. The converted result is what the repo carries and all it carries:
+`examples/playground/assets/` holds 52 `.glb`s, 4 terrain textures and
+`village_layout.h` (50 MB, tracked in git, every file referenced by name from
+`playground.cpp`), staged next to the exe by CMake. The ~2 GB of raw packs and
+the `tools/build_medieval_assets.py` pipeline that converted them were removed
+on 2026-08-01 — the outputs are now hand-maintained, not reproducible from
+inputs in this tree.
+On a sparse checkout without those assets the playground still builds and the
+smoke test still passes — it falls back to a procedural-only scene (generator
+trees + rocks, engine blade grass). In the full scene everything except the
 character/orbs/effect meshes is pack art, and the engine's blade grass is
 replaced by instanced nature-pack grass tufts. All scene dressing (props,
 trees, rocks, flowers — everything with a silhouette) is hand-placed area by
@@ -111,7 +114,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `systems/` | `bracken::systems` | camera controller/system |
 | `effects/` | *(namespaces unchanged)* | the particle-effect triad in one place: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage owned: spawned/updated/snapshotted inside the sim job), `EffectRenderer` (draws the packet snapshot) |
 | `procedural/` | `bracken::procedural` | tree + rock generators |
-| `audio/` | `bracken::audio` (+ `::dsp`, `::synth`, `::music`) | SDL3 playback device, lock-free mixer, 3D positional voices, WAV clips — **plus a software synthesizer**: band-limited oscillators / ADSR / SVF (`dsp/`), patches + polyphonic voices (`synth/`), and a sample-accurate song sequencer (`music/`). `BRACKEN_ENABLE_SYNTH=OFF` compiles the synth half out. The one subsystem with a thread the engine does not own |
+| `audio/` | `bracken::audio` (+ `::dsp`, `::synth`, `::music`) | SDL3 playback device, lock-free mixer, 3D positional voices, WAV clips — **plus a software synthesizer**: band-limited oscillators / ADSR / SVF (`dsp/`), patches + polyphonic voices (`synth/`), and a sample-accurate song sequencer (`music/`). The one subsystem with a thread the engine does not own |
 | `save/` | `bracken::save` | `SaveDocument` — path-addressed typed records, so schema changes never invalidate old saves; unknown keys round-trip; **atomic** write (temp + rename) + checksum, so an interrupted save cannot corrupt the previous one |
 | `navigation/` | `bracken::nav` | `NavGrid` — walkability from a height function + A* with string-pulled paths. A grid, not a polygon navmesh: built from the height function the engine already has, and honest about its limit (one height per cell, so no bridges over roads) |
 | `physics/` | `bracken::physics` | `PhysicsWorld` — rigid-body physics over vendored **Jolt** (pimpl; Jolt never appears in a public header). Fixed-step accumulator `update()` (tier owned/sim-stage), sphere/box/capsule/heightfield bodies, ray casts; Jolt's step jobs run on the engine `JobSystem` via the `JoltJobSystem` bridge in **`physics/internal/`** — one pool owns the cores |
@@ -235,12 +238,13 @@ draws it.
   architecture.md "Threading & lifetime contracts" lists the exact mechanism
   behind each). Host-boundary preconditions are separate and live **in
   release too**: `BRACKEN_CONTRACT` (packet-before-seal, seal-once, lane
-  index, every `Application` facade member that needs `init_renderer()`);
-  `-DBRACKEN_ENABLE_CONTRACTS=OFF` removes them. Engine-internal invariants
+  index, every `Application` facade member that needs `init_renderer()`).
+  There is no switch that compiles them out. Engine-internal invariants
   and per-item hot-loop checks stay on `BRACKEN_ASSERT`. Every `std::atomic`
   documents its protocol (what it publishes, ordering, release/acquire
   pairing partner) at its declaration; bare `seq_cst` in a hot path needs a
-  justifying comment. Run the TSan lane after touching concurrency code.
+  justifying comment. Rebuild `build/` with `-fsanitize=thread` and run the
+  suite after touching concurrency code.
 
 - **Audio threading**: SDL calls back on *its* thread whenever the device
   wants samples. That thread never blocks, allocates or logs, so everything
@@ -249,8 +253,7 @@ draws it.
   under a `try_lock` and the *outgoing* song is handed back for the game
   thread to free (`Sequencer::swap_song`). The payoff for hosts is that
   `play_sound` / `play_music` / `set_listener` are **worker-safe** — call them
-  straight from `on_simulate`. Audio does not touch the `FramePacket`, so it
-  cannot move the packet digest.
+  straight from `on_simulate`. Audio does not touch the `FramePacket` at all.
 
 ### Load-bearing constants
 - `MAX_BONES = 128` — defined **only** in `animation/animation_types.hpp`. It
@@ -290,9 +293,9 @@ draws it.
   never read.)
 - `render_graph/` is not in the frame path — don't route the renderer through
   it without a measured reason (design notes explain why).
-- A number measured in `build/` is not a performance number. That tree has no
-  `CMAKE_BUILD_TYPE`: `-O0`, arena poisoning, live tier assertions. Use
-  `cmake --preset bench`.
+- A number measured in a default `build/` is not a performance number: no
+  `CMAKE_BUILD_TYPE` means `-O0` with live tier assertions. Reconfigure with
+  `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
 - `bracken.hpp` is not a stability contract, and `<module>/internal/` is not a
   suggestion — `public_headers.test.cpp` fails the suite if a public header
   reaches Jolt/ImGui/tinygltf/stb_, or if `application.hpp` starts exporting
@@ -345,13 +348,8 @@ Google Benchmark, `*.bench.cpp` next to units, auto-globbed), `BRACKEN_BUILD_EXA
 (default ON), `BRACKEN_PLAYGROUND_SMOKE_TEST` (default OFF — registers the
 playground smoke run as a ctest; needs GPU + display), `BRACKEN_ENABLE_DEV_UI`
 (default ON — Dear ImGui developer overlay; OFF compiles `bracken::dev::DevUI`
-to a no-op stub and skips fetching ImGui), `BRACKEN_ENABLE_CONTRACTS`
-(default ON — compiles the host-boundary `BRACKEN_CONTRACT` checks into
-release builds; each is one compare and a branch off any per-item loop, so
-turn it OFF only with a measurement), `BRACKEN_ENABLE_TRACY`
-(default OFF), `BRACKEN_ENABLE_SYNTH` (default ON — the software synth +
-sequencer; OFF makes `play_music` a no-op and drops `audio/dsp|synth|music`),
-`BRACKEN_WERROR` (default ON at top level, OFF when consumed via
+to a no-op stub and skips fetching ImGui), `BRACKEN_ENABLE_TRACY`
+(default OFF), `BRACKEN_WERROR` (default ON at top level, OFF when consumed via
 `add_subdirectory` — warnings are applied PRIVATE so a consuming game never
 inherits them; see `cmake/BrackenWarnings.cmake`).
 Env: `BRACKEN_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.
@@ -359,45 +357,29 @@ Env: `BRACKEN_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.
 `hardware_concurrency()-1`, min 1; `=1` is the single-worker debug mode —
 same code path, one worker).
 
-A `CMakePresets.json` (version 6) exists at the repo root. **Five** trees, all
-long-lived and coexisting — the no-clean-rebuild rule applies to each, and no
-tree is ever deleted or reconfigured to "switch" to another:
+A `CMakePresets.json` (version 6) at the repo root defines **one** tree,
+`build/`, configured by the `default` preset. There is no preset zoo and no
+second directory: five parallel trees meant five things that could disagree
+with each other and with the documentation describing them, and four of them
+were stale most of the time.
 
-| Preset | Tree | What it is for |
-|---|---|---|
-| `default` | `build/` | The primary incremental tree. No `CMAKE_BUILD_TYPE` → `-O0`, every `BRACKEN_ASSERT` and thread-tier check live. |
-| `rel` | `build-rel/` | RelWithDebInfo — the **only** lane that compiles the `NDEBUG` path, where `BRACKEN_ASSERT` and the debug-only thread-tier assertions vanish (`BRACKEN_CONTRACT` stays). Run it before relying on an assert for correctness; it also catches UB that `-O0` hides. |
-| `bench` | `build-bench/` | Optimized benchmark lane. `build/` is `-O0` with arena poisoning and live tier asserts, so **any number measured there is meaningless.** Benchmark here or do not quote the figure. |
-| `tsan` | `build-tsan/` | ThreadSanitizer (below). Data races: run it after touching the job system, an atomic, or anything in the multithreading plan. Tests only. |
-| `asan` | `build-asan/` | Address + UB sanitizer. Finds what TSan cannot — use-after-free and out-of-bounds across the arena/frame allocators, the packet ring's retire-and-reuse cycle, the job-system node pools. Tests only. `-fno-sanitize=enum` on purpose: the engine bounds-checks enum parameters at the host boundary, and the only way to test such a guard is to hand it an out-of-range enumerator. |
+Everything the old lanes did is a `-D` flag on the same tree, used when you
+actually need it:
 
-The first configure of `tsan`/`asan`/`rel`/`bench` refetches and rebuilds the
-deps (SDL_shadercross/DXC) from scratch — slow, expected, one-time. After that
-each is incremental like any other tree.
+| Want | Flags |
+|---|---|
+| The `NDEBUG` path (`BRACKEN_ASSERT` and the debug-only tier checks compile out; `BRACKEN_CONTRACT` stays) | `-DCMAKE_BUILD_TYPE=RelWithDebInfo` |
+| A benchmark number worth quoting | `-DCMAKE_BUILD_TYPE=RelWithDebInfo` (CMake warns if you forget) |
+| ThreadSanitizer, after touching the job system, an atomic, or anything in the multithreading plan | `-DCMAKE_{C,CXX}_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread` |
+| Address + UB sanitizer — use-after-free / out-of-bounds across the arena, frame allocator, packet ring and job-system node pools | `-DCMAKE_{C,CXX}_FLAGS="-fsanitize=address,undefined -fno-sanitize=enum -fno-omit-frame-pointer"` |
 
-```bash
-cmake --preset asan     # first time only
-cmake --build build-asan && ctest --test-dir build-asan --output-on-failure
-```
+`-fno-sanitize=enum` is deliberate: the engine bounds-checks enum parameters at
+the host boundary, and the only way to test such a guard is to hand it an
+out-of-range enumerator.
 
-### TSan lane
-
-A **separate** build directory (`build-tsan/`) configured with
-`-fsanitize=thread` — run it whenever you touch concurrency code (job system,
-atomics, anything in the multithreading plan). Its *first* configure
-refetches and rebuilds the deps (SDL_shadercross/DXC) from scratch — slow,
-expected, one-time; after that it is incremental like any other tree. It
-builds tests only (examples/benchmarks OFF), `RelWithDebInfo`.
-
-```bash
-cmake --preset tsan                          # first time only (slow: refetches deps)
-cmake --build build-tsan                     # incremental
-ctest --test-dir build-tsan --output-on-failure
-```
-
-Never delete or reconfigure the primary `build/` to "switch" to TSan — the
-two trees coexist; the no-clean-rebuild rule applies to `build-tsan/` too
-once it exists.
+Reconfiguring `build/` with different flags is a rebuild, not a *clean*
+rebuild — the fetched dependency trees (SDL_shadercross/DXC, Jolt) survive,
+which is the thing the no-clean-rebuild rule exists to protect.
 
 Integration test: `build/examples/playground/playground --smoke` (self-drives
 240 frames, prints `[smoke] OK ...` with render stats, exit code 0). It also
@@ -417,27 +399,9 @@ is not the village establishing shot it was set up to be
 (`playground.cpp`, the `cam_cfg`/`set_pitch`/`set_yaw` block in the smoke
 init). Pre-existing and unrelated to the refactor: `mean_luma=80.5
 stddev=38.8` is unchanged all the way back to the Phase 8 baseline. Judge
-rendering health from the digest and the diagnostics line; treat the PNG as a
-"did anything draw at all" check until the framing is fixed.
-
-**`[smoke] packet_digest=0x...` is the line to diff, not `draw_calls`.** It is
-`scene::packet_digest` over every sealed `FramePacket` of the run — a CPU-side
-hash of exactly what the host described and what the sim tail appended, so it
-is exact, driver-independent, and bit-identical at any `BRACKEN_WORKERS`. The
-other numbers are downstream of the GPU and legitimately wobble run to run
-(`auto_ev` rides a histogram readback; `draw_calls`/`triangles` ride culling
-against a driver-dependent frame). After any change that should not alter what
-is drawn, the digest must come back byte-identical — that is what makes a
-"pure refactor" claim checkable. Current values, both stable across runs and
-worker counts:
-
-| Invocation | Digest |
-|---|---|
-| `--smoke` | `0x0ad9664ddaea3468` |
-| `--smoke --engine-camera=off` | `0x23832a2116250517` |
-| `--smoke 30` | `0x97558825216ed65e` |
-
-If you move any of them, say why in the commit message.
+rendering health from the diagnostics line and the screenshot statistics;
+treat the PNG's framing as a "did anything draw at all" check until it is
+fixed.
 
 **The smoke run is hermetic w.r.t. `settings.cfg`, and only became so on
 2026-08-01.** `Application::init_renderer()` auto-loads `GraphicsSettings` from
@@ -468,12 +432,11 @@ evidence that no RT-series commit moved the RT-off path.
 | `--smoke 30 PLAYGROUND_AO=0` | `87.0 / 44.5` |
 | `--smoke 30 PLAYGROUND_AO=2` | `86.4 / 45.0` |
 
-Benchmarks: `build-bench/src/bracken/bracken_benchmarks` (add
-`--benchmark_filter=<regex>` for a subset). The binary also exists in `build/`,
-and its numbers there are **meaningless** — that tree has no
-`CMAKE_BUILD_TYPE`, so it is `-O0` with arena poisoning and live asserts. Use
-the `bench` preset for anything you intend to quote. Audit reports live in
-`docs/audits/`.
+Benchmarks: `build/src/bracken/bracken_benchmarks` (add
+`--benchmark_filter=<regex>` for a subset). Numbers from a default configure are
+**meaningless** — no `CMAKE_BUILD_TYPE` means `-O0` with live asserts.
+Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` for anything you intend to
+quote. Audit reports live in `docs/audits/`.
 
 ## Consuming the engine
 
@@ -496,8 +459,8 @@ engine's reversed-Z). Jolt is linked **PRIVATE**: you get its symbols, never
 its headers.
 
 For a game's own tests, `#include "bracken/testing/frame_test.hpp"` — build a
-frame through a `FrameSink`, `seal()`, assert on the typed views and the
-packet digest, with no GPU and no window.
+frame through a `FrameSink`, `seal()`, assert on the typed views, with no GPU
+and no window.
 
 ## What you must not do
 - No full clean rebuild — see [.claude/RULES.md](.claude/RULES.md).

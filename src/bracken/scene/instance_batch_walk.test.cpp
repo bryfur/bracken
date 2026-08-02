@@ -8,9 +8,9 @@
 // The failure this guards against is silent and ugly: if a draw walk SKIPS a
 // bin whose handle no longer resolves instead of skipping the draw and
 // advancing past its packed range, every later bin renders with another
-// model's transforms. No packet content can detect it (packet_digest is
-// computed upstream of binning) and no test that only inspects bins can
-// either, so the offsets are asserted here by value.
+// model's transforms. Nothing upstream of binning can detect it, and no test
+// that only inspects bins can either, so the offsets are asserted here by
+// value.
 
 #include <gtest/gtest.h>
 

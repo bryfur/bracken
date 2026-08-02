@@ -673,8 +673,8 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     // frame's traced shadows after ray tracing is switched off.
     frame_rt_shadows_active_ = false;
     frame_rt_shadow_texture_ = nullptr;
-    frame_rt_reflection_texture_ = nullptr;
     frame_rt_reflection_max_roughness_ = 0.0f;
+    frame_rt_reflection_fade_start_ = 0.0f;
     // Sky IBL drives every scene shader's iblEnabled flag (the IBL sampler
     // slots are bound either way — dummies when inactive).
     frame_ibl_active_ = plan.ibl_active;
@@ -969,8 +969,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     normal_rough_texture_->height() != gh) {
                     normal_rough_texture_ = gpu::GPUTexture::create_2d(
                         context_->device(), gw, gh, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-                        SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER |
-                            SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ);
+                        SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
                     if (!normal_rough_texture_) {
                         BRACKEN_LOG_WARN(LOG_TAG,
                                          "render_frame: could not create the reflection G-buffer; "
@@ -1024,6 +1023,9 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // thread read out of bounds, got 0, and the frame rendered fully
             // ambient-occluded. Un-multiplexing also stops full-res GTAO being
             // point-downsampled to the mask's resolution on every traced frame.
+            render::RtRenderer::FrameParams rt_frame_params;
+            render::RtReflectionSettings rt_reflection_settings;
+            bool rt_reflection_resolve_ready = false;
             if ((gfx.rt_shadows || gfx.rt_reflections) && rt_renderer_ &&
                 post_->offscreen_depth() && cmd) {
                 // Own the acceleration structure here rather than asking the
@@ -1034,17 +1036,17 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 refresh_raytracing_instances(frame);
                 BRACKEN_PROFILE_ZONE_COLOR("RT shadows", 0x8E44AD);
                 BRACKEN_GPU_SCOPE(cmd, "RT shadows");
-                render::RtRenderer::FrameParams rp;
-                rp.inv_view_proj = glm::inverse(draw_camera.view_projection);
-                rp.camera_position = draw_camera.position;
-                rp.environment = env_;
-                rp.screen_width = context_->width();
-                rp.screen_height = context_->height();
+                rt_frame_params.inv_view_proj = glm::inverse(draw_camera.view_projection);
+                rt_frame_params.camera_position = draw_camera.position;
+                rt_frame_params.environment = env_;
+                rt_frame_params.screen_width = context_->width();
+                rt_frame_params.screen_height = context_->height();
+                rt_frame_params.depth_a = draw_camera.projection[2][2];
+                rt_frame_params.depth_b = draw_camera.projection[3][2];
 
                 render::RtShadowSettings rs;
                 rs.enabled = gfx.rt_shadows;
-                render::RtReflectionSettings rr;
-                rr.enabled = gfx.rt_reflections;
+                rt_reflection_settings.enabled = gfx.rt_reflections;
 
                 // Reflections need the prepass G-buffer; without it (allocation
                 // failed, or the prepass did not run this frame) the pass has
@@ -1052,16 +1054,20 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 // than run against a texture that means something else.
                 SDL_GPUTexture* normal_rough =
                     (frame_prepass_active_ && normal_rough_texture_) ? normal_rough_texture_->handle() : nullptr;
-                rr.enabled = rr.enabled && normal_rough != nullptr;
-                rt_renderer_->render(cmd, *post_->offscreen_depth(), normal_rough, rp, rs, rr);
+                render::RtReflectionSettings opaque_reflection_settings = rt_reflection_settings;
+                opaque_reflection_settings.enabled =
+                    opaque_reflection_settings.enabled && normal_rough != nullptr;
+                rt_renderer_->render(cmd, *post_->offscreen_depth(), normal_rough,
+                                     rt_frame_params, rs, opaque_reflection_settings);
                 if (rt_renderer_->stats().shadows_traced && rt_renderer_->shadow_mask() != nullptr) {
                     frame_rt_shadow_texture_ = rt_renderer_->shadow_mask()->handle();
                     frame_rt_shadows_active_ = true;
                 }
                 if (rt_renderer_->stats().reflections_traced &&
                     rt_renderer_->reflection_target() != nullptr) {
-                    frame_rt_reflection_texture_ = rt_renderer_->reflection_target()->handle();
-                    frame_rt_reflection_max_roughness_ = rr.max_roughness;
+                    frame_rt_reflection_max_roughness_ = rt_reflection_settings.max_roughness;
+                    frame_rt_reflection_fade_start_ = rt_reflection_settings.fade_start;
+                    rt_reflection_resolve_ready = true;
                 }
             }
 
@@ -1081,9 +1087,27 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 }
             }
 
+            // Resolve sparse reflections into the linear HDR scene BEFORE
+            // water, TAA, auto exposure and bloom. The full-resolution pass is
+            // guided by depth + material normal/roughness/metalness, so a
+            // quarter-res stone texel cannot bleed onto grass or foliage; TAA
+            // then stabilizes the traced signal with all other lighting.
+            if (rt_reflection_resolve_ready && rt_renderer_ && cmd &&
+                post_->offscreen_color() && post_->offscreen_depth() &&
+                normal_rough_texture_) {
+                BRACKEN_PROFILE_ZONE_COLOR("RT reflection resolve", 0x8E44AD);
+                BRACKEN_GPU_SCOPE(cmd, "RT reflection resolve");
+                BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "RTReflectionResolve");
+                (void)rt_renderer_->resolve_reflections(
+                    cmd, *post_->offscreen_color(), *post_->offscreen_depth(),
+                    normal_rough_texture_->handle(), rt_frame_params,
+                    rt_reflection_settings);
+            }
+
             // ===== Water: its own pass after the opaque scene + skybox.
-            // The HDR color/depth are snapshotted first (what refraction and
-            // shoreline softness sample); the live targets are then re-bound
+            // The optional analytic RT receiver runs before the HDR
+            // color/depth snapshot (what refraction and shoreline softness
+            // sample); the live targets are then re-bound
             // with LOAD so the surface depth-tests against — and writes —
             // real scene depth, keeping TAA reprojection and the fog's depth
             // reads consistent. Runs before TAA so the water is temporally
@@ -1096,6 +1120,35 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "Water");
                 const int w = context_->width();
                 const int h = context_->height();
+
+                // Opaque reflections have already been resolved, so the raw
+                // quarter-resolution target can be recycled for a dedicated
+                // water receiver. This avoids a second target and, crucially,
+                // avoids writing water into opaque depth before refraction has
+                // captured the scene behind it.
+                bool water_rt_reflection_ready = false;
+                if (gfx.rt_reflections && rt_renderer_) {
+                    if (gpu::GPUTexture* sim = water_->simulation_state_texture()) {
+                        const auto& region = water_->region();
+                        render::RtWaterReceiver receiver;
+                        receiver.bounds_min = {region.min_x, region.min_z};
+                        receiver.bounds_max = {region.max_x, region.max_z};
+                        receiver.height = region.height;
+                        receiver.roughness = region.reflection_roughness;
+                        receiver.sim_extent = std::max(region.sim_extent, 1.0f);
+                        receiver.sim_min = region.sim_center - glm::vec2(0.5f * receiver.sim_extent);
+                        receiver.sim_displacement = region.sim_displacement;
+                        receiver.sim_normal_strength = region.sim_normal_strength;
+                        receiver.flow = region.flow;
+                        receiver.flow_speed = region.flow_speed;
+                        receiver.detail_wave_strength = region.detail_wave_strength;
+                        receiver.time = scene_time_;
+                        water_rt_reflection_ready = rt_renderer_->render_water_reflections(
+                            cmd, *post_->offscreen_depth(), *sim, rt_frame_params,
+                            rt_reflection_settings, receiver);
+                    }
+                }
+
                 auto ensure_copy = [&](std::unique_ptr<gpu::GPUTexture>& tex, SDL_GPUTextureFormat fmt) {
                     if (!tex || tex->width() != w || tex->height() != h) {
                         tex = gpu::GPUTexture::create_2d(context_->device(), w, h, fmt,
@@ -1135,9 +1188,15 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                         const SDL_GPUTextureSamplerBinding specular =
                             have_ibl ? ibl_bindings[1]
                                      : SDL_GPUTextureSamplerBinding{dummy_black_cube_->handle(), default_sampler_};
+                        SDL_GPUTexture* traced_reflection =
+                            water_rt_reflection_ready && rt_renderer_->reflection_target()
+                                ? rt_renderer_->reflection_target()->handle()
+                                : dummy_black_texture_->handle();
                         water_->render(water_pass, cmd, draw_camera.view_projection, draw_camera.projection,
-                                       camera.position, scene_time_, w, h, water_scene_copy_->handle(),
+                                       draw_camera.position, scene_time_, w, h, water_scene_copy_->handle(),
                                        water_depth_copy_->handle(), specular, frame_ibl_active_,
+                                       traced_reflection, water_rt_reflection_ready,
+                                       rt_reflection_settings.intensity,
                                        gfx.sun_intensity);
                         SDL_EndGPURenderPass(water_pass);
                         if (collect_stats_) {
@@ -1266,9 +1325,8 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     BRACKEN_PROFILE_ZONE_COLOR("Composite", 0x16A085);
                     BRACKEN_GPU_SCOPE(cmd, "Composite");
                     BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "Composite");
-                    post_->render_composite_pass(cmd, *pipeline_registry_, composite_target, bloom_tex, fog_tex,
-                                                 frame_rt_reflection_texture_,
-                                               composite_params);
+                    post_->render_composite_pass(cmd, *pipeline_registry_, composite_target,
+                                                 bloom_tex, fog_tex, composite_params);
                 }
 
                 if (ldr) {

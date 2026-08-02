@@ -96,7 +96,7 @@ bool SceneRenderer::render_depth_prepass(const FramePacket& frame, const CameraS
     color_target.store_op = SDL_GPU_STOREOP_STORE;
     color_target.clear_color = {0.0f, 0.0f, 0.0f, 0.0f}; // zero velocity (sky pixels reproject via depth in TAA)
 
-    // Second attachment: the normal+roughness G-buffer, only when ray-traced
+    // Second attachment: the oct-normal/roughness/metallic G-buffer, only when ray-traced
     // reflections asked for it. Cleared to a fully-rough +Y normal so pixels no
     // draw covers (sky) read as "not worth tracing" rather than as garbage.
     SDL_GPUColorTargetInfo gbuffer_target = {};
@@ -107,7 +107,12 @@ bool SceneRenderer::render_depth_prepass(const FramePacket& frame, const CameraS
         gbuffer_target.texture = normal_rough_texture_->handle();
         gbuffer_target.load_op = SDL_GPU_LOADOP_CLEAR;
         gbuffer_target.store_op = SDL_GPU_STOREOP_STORE;
-        gbuffer_target.clear_color = {0.5f, 1.0f, 0.5f, 1.0f};
+        // oct(+Y) = (0.75, 0.75), fully rough, non-metal. Written for the old
+        // RGB-normal + A-roughness layout it meant roughness 0.5 / metallic 1
+        // under the current one, i.e. "smooth chrome" for every texel no draw
+        // covers — masked today only by the reflection pass's depth <= 0
+        // early-out, which is not a guarantee worth relying on.
+        gbuffer_target.clear_color = {0.75f, 0.75f, 1.0f, 0.0f};
     }
     const SDL_GPUColorTargetInfo color_targets[2] = {color_target, gbuffer_target};
 
@@ -153,6 +158,39 @@ bool SceneRenderer::render_depth_prepass(const FramePacket& frame, const CameraS
 
     SDL_EndGPURenderPass(pass);
     return true;
+}
+
+void SceneRenderer::push_prepass_gbuffer_material(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
+                                                  const Mesh& mesh) {
+    // Bind the SAME metallicRoughness texture the forward pass binds at its
+    // sampler 4, and push the SAME factors, so the prepass classifies the
+    // surface the forward pass actually shades.
+    //
+    // Classifying on `roughness_factor` alone (which is what this used to
+    // push) is worthless on real glTF: of the 79 materials in the staged
+    // medieval/nature packs, 77 have roughnessFactor exactly 1.0 and all 79
+    // have metallicFactor 0.0 — every bit of real roughness lives in the 14
+    // metallicRoughness/ORM textures. So the G-buffer called all of it fully
+    // rough and the reflection gate rejected every stone, brick, plaster,
+    // tile and wood pixel in the village; the only geometry that could ever
+    // reflect was the playground's own procedural chrome sphere.
+    //
+    // The white dummy is bound when the material has no map, matching what the
+    // forward pass does, so the slot is always valid — an unbound fragment
+    // sampler descriptor is UB in SDL3 GPU.
+    const bracken::PBRMaterial& mat = mesh.material;
+    SDL_GPUTexture* mr = mat.metallic_roughness_texture
+                             ? mat.metallic_roughness_texture->handle()
+                             : (dummy_white_texture_ ? dummy_white_texture_->handle() : nullptr);
+    if (mr != nullptr && default_sampler_ != nullptr) {
+        SDL_GPUTextureSamplerBinding binding = {mr, default_sampler_};
+        SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+    }
+    gpu::PrepassGBufferUniforms gb = {};
+    gb.roughness = mat.roughness_factor;
+    gb.metallic = mat.metallic_factor;
+    gb.hasMRMap = mat.metallic_roughness_texture ? 1.0f : 0.0f;
+    SDL_PushGPUFragmentUniformData(cmd, 0, &gb, sizeof(gb));
 }
 
 void SceneRenderer::prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
@@ -220,9 +258,7 @@ void SceneRenderer::prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUComma
                 } else if (!ensure_pipeline(mesh.material.double_sided)) {
                     continue;
                 } else if (frame_prepass_gbuffer_) {
-                    gpu::PrepassGBufferUniforms gb = {};
-                    gb.roughness = mesh.material.roughness_factor;
-                    SDL_PushGPUFragmentUniformData(cmd, 0, &gb, sizeof(gb));
+                    push_prepass_gbuffer_material(pass, cmd, mesh);
                 }
 
                 mesh.bind_buffers(pass);
@@ -305,9 +341,7 @@ void SceneRenderer::prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUC
             } else if (!ensure_pipeline(mesh.material.double_sided)) {
                 continue;
             } else if (frame_prepass_gbuffer_) {
-                gpu::PrepassGBufferUniforms gb = {};
-                gb.roughness = mesh.material.roughness_factor;
-                SDL_PushGPUFragmentUniformData(cmd, 0, &gb, sizeof(gb));
+                push_prepass_gbuffer_material(pass, cmd, mesh);
             }
             if (!uniforms_pushed) {
                 // Pushed uniform data survives pipeline binds within the pass.
@@ -392,9 +426,7 @@ void SceneRenderer::prepass_draw_skinned_models(SDL_GPURenderPass* pass, SDL_GPU
                 continue;
             }
             if (frame_prepass_gbuffer_) {
-                gpu::PrepassGBufferUniforms gb = {};
-                gb.roughness = mesh.material.roughness_factor;
-                SDL_PushGPUFragmentUniformData(cmd, 0, &gb, sizeof(gb));
+                push_prepass_gbuffer_material(pass, cmd, mesh);
             }
             if (!uniforms_pushed) {
                 SDL_PushGPUVertexUniformData(cmd, 0, &u, sizeof(u));

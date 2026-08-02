@@ -49,9 +49,9 @@ namespace playground {
  * screenshots) and the DevUI panel-data exchange happen there, with no sim
  * in flight.
  *
- * The village assets are optional: without assets/generated (see the tool's
- * header comment) the demo falls back to the procedural-only scene so the
- * smoke test still passes on an asset-less checkout.
+ * The village assets live in assets/ and are tracked in git. They are still
+ * optional at build time: on a sparse checkout without them the demo falls
+ * back to the procedural-only scene so the smoke test still passes.
  */
 class PlaygroundGame : public bracken::Application {
 public:
@@ -263,9 +263,7 @@ private:
     std::vector<PendingRipple> pending_ripples_;
     float wade_ripple_timer_ = 0.0f;    // rate-limits wading ripple impulses
 
-#if BRACKEN_SYNTH
     SfxBank sfx_{};                     // synthesized at boot; no audio assets
-#endif
     // Footfalls are driven by distance travelled, not by a timer: that way the
     // step rate follows the animation instead of drifting against it when the
     // player accelerates.
@@ -304,7 +302,6 @@ private:
     float smoke_max_height_ = 0.0f;
     glm::vec3 wanderer_start_{0.0f};
 
-#if BRACKEN_SYNTH
     // Footfalls are driven by distance travelled, not by a timer, so the step
     // rate follows the animation instead of drifting against it as the player
     // accelerates. Only the synth build has footsteps to schedule.
@@ -314,7 +311,6 @@ private:
     // other but a run is reproducible — determinism belongs in the seed, not
     // in deriving the value from game state that may not be varying.
     bracken::core::Rng step_rng_{0x5EED'F007ULL};
-#endif
     // Generated LODs are OFF here by default, and that is a measured decision,
     // not an oversight. A/B on this scene (PLAYGROUND_LOD=1 turns them on):
     //   off: 538 draw calls, 6,243,298 triangles, 86-87 fps

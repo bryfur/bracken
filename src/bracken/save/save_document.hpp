@@ -144,8 +144,7 @@ public:
     /** Number of stored records, including ones this build does not read. */
     [[nodiscard]] std::size_t record_count() const noexcept { return records_.size(); }
 
-    /** Every path present, in write order. For dumping a save to a log — the
-     *  transparency equivalent of being able to read the packet digest. */
+    /** Every path present, in write order. For dumping a save to a log. */
     [[nodiscard]] std::vector<std::string_view> paths() const;
 
 private:

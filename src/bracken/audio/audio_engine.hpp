@@ -3,9 +3,7 @@
 #include "bracken/audio/audio_clip.hpp"
 #include "bracken/audio/audio_format.hpp"
 #include "bracken/audio/command_ring.hpp"
-#if BRACKEN_SYNTH
 #include "bracken/audio/music/sequencer.hpp"
-#endif
 
 #include <atomic>
 #include <cstdint>
@@ -78,9 +76,9 @@ struct AudioDiagnostics {
  * shutdown — the engine never hands the audio thread a pointer whose lifetime
  * the host controls, the same rule FramePacket follows.
  *
- * The synthesizer and the sequencer are compiled in unless
- * BRACKEN_ENABLE_SYNTH=OFF, in which case play_music is a no-op and a game
- * that only plays recorded audio pays nothing for them.
+ * The synthesizer and the sequencer are always compiled in. They cost nothing
+ * until a song is played, so a game that ships only recorded audio simply
+ * never calls play_music().
  */
 class AudioEngine {
 public:
@@ -134,11 +132,9 @@ public:
 
     // ========== Music (the synthesizer) ==================================
 
-#if BRACKEN_SYNTH
     /** Hand the sequencer a song and start it. The song is copied — the
      *  audio thread reads it, so a host must not retain a reference. */
     void play_music(music::Song song);
-#endif
     void stop_music();
     void set_music_playing(bool playing);
     [[nodiscard]] bool music_playing() const noexcept;

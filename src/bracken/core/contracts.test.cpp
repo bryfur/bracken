@@ -1,6 +1,6 @@
-// Phase 4: the host-boundary contracts, proven to abort — IN RELEASE BUILDS
-// TOO, which is the whole point of BRACKEN_CONTRACT existing separately from
-// BRACKEN_ASSERT.
+// The host-boundary contracts, proven to abort — IN RELEASE BUILDS TOO, which
+// is the whole point of BRACKEN_CONTRACT existing separately from
+// BRACKEN_ASSERT. There is no switch that compiles them out.
 //
 // Each case below is a mistake a GAME makes against the engine, not a bug
 // inside the engine. Without the contract, every one of them is a null
@@ -27,7 +27,6 @@ using namespace bracken::scene;
 
 namespace {
 
-#if BRACKEN_CONTRACTS_ENABLED
 
 TEST(ContractsDeathTest, ReadingAPacketBeforeSealAborts) {
     EXPECT_DEATH(
@@ -72,7 +71,6 @@ TEST(ContractsDeathTest, OutOfRangeLaneIndexAborts) {
         "index 4 out of range");
 }
 
-#endif // BRACKEN_CONTRACTS_ENABLED
 
 // The legal counterpart of the lane contract, and the reason the lane guard
 // detects OVERLAP rather than binding an owner: a lane changes threads all the
@@ -93,18 +91,14 @@ TEST(Contracts, LaneMayChangeThreadsAcrossAJoin) {
     EXPECT_EQ(packet.model_commands()[1].model_handle, 8u);
 }
 
-TEST(Contracts, ConditionIsCompiledOrTypeCheckedButNeverEvaluatedTwice) {
+TEST(Contracts, ConditionIsEvaluatedExactlyOnce) {
     int calls = 0;
     auto observed = [&calls]() {
         ++calls;
         return true;
     };
     BRACKEN_CONTRACT(observed(), "never fires");
-#if BRACKEN_CONTRACTS_ENABLED
     EXPECT_EQ(calls, 1);
-#else
-    EXPECT_EQ(calls, 0); // type-checked via sizeof, never evaluated
-#endif
 }
 
 } // namespace

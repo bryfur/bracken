@@ -74,7 +74,6 @@ int main(int argc, char** argv) {
             }
             return playground::build_asset_pack(argv[++i]) ? 0 : 1;
         }
-#if BRACKEN_SYNTH
         if (std::strcmp(argv[i], "--render-music") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "--render-music needs an output path\n";
@@ -91,7 +90,6 @@ int main(int argc, char** argv) {
             }
             return playground::render_music_to_wav(out_path, seconds) ? 0 : 1;
         }
-#endif
         if (std::strcmp(argv[i], "--engine-camera=off") == 0) {
             engine_camera = false;
         } else if (std::strcmp(argv[i], "--engine-camera=on") == 0) {

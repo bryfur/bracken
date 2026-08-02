@@ -99,7 +99,6 @@ From `src/bracken/CMakeLists.txt`:
 - `target_include_directories(bracken PUBLIC ${PROJECT_SOURCE_DIR}/src)` plus `target_include_directories(bracken SYSTEM PUBLIC ${tinygltf_SOURCE_DIR})` (SYSTEM: tinygltf's bundled `json.hpp` trips `-Wdeprecated-literal-operator`, and a vendored header must never be able to fail our `-Werror` build). There is deliberately **no** SDL_shadercross include directory here — `FetchContent` populates `SDL3_shadercross_SOURCE_DIR` (note the "3"), so the old entry expanded to a literal `/include` and put a bogus `-I` on every TU; the real headers arrive through the `SDL3_shadercross::SDL3_shadercross-static` interface include dirs. Headers are included `bracken/`-rooted, e.g. `#include "bracken/render/world_renderer.hpp"`. `${PROJECT_SOURCE_DIR}` resolves to the engine root (where `project(bracken)` is declared) regardless of the top-level project, so `add_subdirectory` consumption works verbatim with no extra include dirs. The same `${PROJECT_SOURCE_DIR}/src` is used for the `bracken_tests` and `bracken_benchmarks` include dirs.
 - `add_library(bracken::bracken ALIAS bracken)` — the namespaced spelling consumers should link. A misspelled namespaced target is a configure-time error; a misspelled plain one silently becomes a `-lbracken` link flag.
 - `target_compile_definitions(bracken PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)` — propagates reversed-Z zero-to-one clip-space to all consumers; host glm math must agree with engine projection math, so this being PUBLIC is load-bearing.
-- `target_compile_definitions(bracken PUBLIC BRACKEN_CONTRACTS_ENABLED=<0|1>)` — PUBLIC because `BRACKEN_CONTRACT` lives in headers a host includes (`frame_packet.hpp`, `frame_builder.hpp`), so engine and host must agree on whether it is compiled.
 - `target_link_libraries(bracken PUBLIC ...)`: SDL3, SDL3_ttf, SDL3_image (each via generator expression `$<IF:$<BOOL:${VENDORED_SDL}>,SDL3::SDL3-static,SDL3::SDL3>` etc.), `SDL3_shadercross::SDL3_shadercross-static` (runtime cross-compile library used by shader hot-reload), `glm::glm`.
 - `target_link_libraries(bracken PRIVATE Jolt)` — **PRIVATE by design**. Jolt's headers and its `JPH_*` definitions are an implementation detail of `src/bracken/physics/`; static archives still propagate the link requirement (`$<LINK_ONLY>`), so an executable linking `bracken` gets Jolt's symbols without its include paths. The include-side half of that invariant is enforced by `public_headers.test.cpp`, not by this line.
 - `BRACKEN_ENABLE_TRACY=ON` additionally links `TracyClient` and defines `BRACKEN_ENABLE_TRACY=1` PUBLIC.
@@ -773,7 +772,7 @@ This layer predates the `core::Result` convention and uses `bool` + `BRACKEN_LOG
 - **No fixed timestep**: variable `dt` clamped at 0.1 s; long stalls silently compress simulated time.
 - `fps()` is a once-per-second integer frame count, `0.0f` for the first second.
 - `on_init`/`on_shutdown` are reached only through `start()`/`stop()` — a host that forgets to call `start()` gets a null-deref in the first facade call, not a diagnostic.
-- Facade methods are guarded by `BRACKEN_CONTRACT` (live in release unless `-DBRACKEN_ENABLE_CONTRACTS=OFF`): calling one before `init_renderer()` aborts with the member's name instead of segfaulting.
+- Facade methods are guarded by `BRACKEN_CONTRACT` (live in every build, no switch): calling one before `init_renderer()` aborts with the member's name instead of segfaulting.
 - `PassTiming::gpu_ms` is always `nullopt` (SDL3 has no timestamp queries); `cpu_ms` measures command recording, not GPU execution.
 - Exclusive fullscreen with an unmatched `resolution_index` warns and falls back to borderless fullscreen (stale exclusive modes are cleared).
 - `set_vsync_mode` silently clamps to the supported maximum.
@@ -1272,7 +1271,7 @@ The plain form services `JobSystem::instance()`; the `parallel_for(JobSystem&, .
 - Job-node lifetime is pool-owned; `TaskHandle`s are (node, generation) references and may outlive the pool safely — a recycled node's generation check makes stale handles report done rather than read a newer job's state.
 - `wait()`/`wait_all()` may execute *other* queued jobs on the calling thread (helping) — reentrancy into arbitrary submitted code from the waiting thread is by design.
 - Teardown order in `Application` apps: pool joined at the top of `shutdown_renderer()` (before GPU teardown); idempotent repeat in `shutdown_engine()` before `SDL_Quit()`; otherwise the static singleton's destructor shuts down at program exit.
-- Concurrency changes to this module must run the TSan lane (`cmake --preset tsan`, `cmake --build build-tsan`, `ctest --test-dir build-tsan`).
+- Concurrency changes to this module must be run under ThreadSanitizer: reconfigure `build/` with `-DCMAKE_CXX_FLAGS=-fsanitize=thread` (and the matching `_C_FLAGS`/`_EXE_LINKER_FLAGS`), rebuild, and run `ctest --test-dir build`.
 
 ### Error handling
 
@@ -2067,7 +2066,7 @@ Semantics: `create_from_spirv` REQUIRES reflection (`SDL_ShaderCross_ReflectComp
 Purpose: cached creation of every engine pipeline — **pre-created at init** as of Phase 1 of `docs/multithreading_plan.md` (the registry knows the full set; `get_pipeline` is a read-only lookup in the steady state, and creation/hot-reload paths are main-thread-asserted — this deletes the old first-touch lazy-creation race instead of locking it); single owner of the `ShaderManager`; shader hot-reload hook. Non-copyable/non-movable. Owned by `scene::SceneRenderer` (`pipeline_registry()` accessor).
 
 `enum class PipelineType` — 56 values + `Count` (declared in `gpu/pipeline_catalog.hpp`):
-`Model`, `SkinnedModel`, `Terrain`, `Skybox`, `Grid`, `UI`, `Text`, `Particle`, `Grass`, `InstancedModel`, `InstancedShadowModel`, `ShadowModel`, `ShadowSkinnedModel`, `ShadowTerrain`, `LocalShadowClear`, `GTAO`, `GTAOTemporal`, `GTAOUpsample`, `BlurAO`, `Composite`, `BloomDownsample`, `BloomUpsample`, `VolumetricFog`, `Fxaa`, `TaaResolve`, `TaaSharpen`, `SkyCapture`, `IblSpecularPrefilter`, `IblIrradiance`, `IblBrdfLut`, `ModelDoubleSided`, `ModelBlend`, `ModelBlendDoubleSided`, `SkinnedModelDoubleSided`, `SkinnedModelBlend`, `SkinnedModelBlendDoubleSided`, `InstancedModelDoubleSided`, the 8 `DepthPrepass*` types, the 8 `*DepthEqual` forward variants, the 2 `DepthPrepass*Masked` types, and `Water`. `pipeline_type_to_string()` returns the type's catalogue row name.
+`Model`, `SkinnedModel`, `Terrain`, `Skybox`, `Grid`, `UI`, `Text`, `Particle`, `Grass`, `InstancedModel`, `InstancedShadowModel`, `ShadowModel`, `ShadowSkinnedModel`, `ShadowTerrain`, `LocalShadowClear`, `GTAO`, `GTAOTemporal`, `GTAOUpsample`, `BlurAO`, `RtReflectionResolve`, `Composite`, `BloomDownsample`, `BloomUpsample`, `VolumetricFog`, `Fxaa`, `TaaResolve`, `TaaSharpen`, `SkyCapture`, `IblSpecularPrefilter`, `IblIrradiance`, `IblBrdfLut`, `ModelDoubleSided`, `ModelBlend`, `ModelBlendDoubleSided`, `SkinnedModelDoubleSided`, `SkinnedModelBlend`, `SkinnedModelBlendDoubleSided`, `InstancedModelDoubleSided`, the 8 `DepthPrepass*` types, the 8 `*DepthEqual` forward variants, the 2 `DepthPrepass*Masked` types, their 10 `*GBuffer` twins, and `Water`. `pipeline_type_to_string()` returns the type's catalogue row name.
 
 `enum class ComputePipelineType` — 3 values + `Count`: `ExposureHistogram`, `ExposureAdapt`, `WaterSim` (`compute_pipeline_type_to_string()` for debug names; like the graphics enum it and its `ComputePipelineDesc` rows live in `gpu/pipeline_catalog.hpp`). Compute pipelines live in a sibling cache (`get_compute_pipeline(type)` → `GPUComputePipeline*`, lazy + cached, uncached failures retried) and share the graphics lifecycle: `preload_all_pipelines()` iterates both enums, `invalidate_all()`/`reload_all_pipelines()`/hot-reload clear both caches, `cached_pipeline_count()` counts both. Declared `ComputeResources` are validated against `SDL_ShaderCross_ReflectComputeSPIRV` at creation (same "declared resource counts do not match SPIR-V" error contract as graphics; see `gpu_compute.hpp` below).
 
@@ -2109,16 +2108,16 @@ Per-pipeline configuration summary (from the catalogue rows in `pipeline_catalog
 
 | Pipeline | Shaders (VS / FS) | VS res | FS res | Vertex input | Key state |
 |---|---|---|---|---|---|
-| Model (+DoubleSided/Blend variants) | `model.vert.spv` / `model.frag.spv` | {1,0,0} | {3,11,4} | Vertex3D | opaque or alpha-blend; blend ⇒ depth write off; double-sided ⇒ no cull; HDR color, D32 |
-| SkinnedModel (+variants) | `skinned_model.vert.spv` / `model.frag.spv` | {1,0,1} | {3,11,4} | SkinnedVertex | as Model; VS storage buffer = packed bone palettes |
-| InstancedModel (+DoubleSided) | `model_instanced.vert.spv` / `model_instanced.frag.spv` | {1,0,1} | {3,11,4} | Vertex3D | opaque; VS storage = `InstanceData` |
-| Terrain | `terrain.vert.spv` / `terrain.frag.spv` | {1,0,0} | {3,9,4} | custom: float3 pos, float2 uv, float4 color, float3 normal, pitch 48 B | opaque |
+| Model (+DoubleSided/Blend variants) | `model.vert.spv` / `model.frag.spv` | {1,0,0} | {3,12,4} | Vertex3D | opaque or alpha-blend; blend ⇒ depth write off; double-sided ⇒ no cull; HDR color, D32 |
+| SkinnedModel (+variants) | `skinned_model.vert.spv` / `model.frag.spv` | {1,0,1} | {3,12,4} | SkinnedVertex | as Model; VS storage buffer = packed bone palettes |
+| InstancedModel (+DoubleSided) | `model_instanced.vert.spv` / `model_instanced.frag.spv` | {1,0,1} | {3,12,4} | Vertex3D | opaque; VS storage = `InstanceData` |
+| Terrain | `terrain.vert.spv` / `terrain.frag.spv` | {1,0,0} | {3,10,4} | custom: float3 pos, float2 uv, float4 color, float3 normal, pitch 48 B | opaque |
 | Skybox | `skybox.vert.spv` / `skybox.frag.spv` | {0,0,0} | {1,0,0} | float3 position only | no cull, depth write off, `GREATER_OR_EQUAL` (draws at z = 0.0 where nothing rendered) |
 | Grid | `grid.vert.spv` / `grid.frag.spv` | {1,0,0} | {0,0,0} | float3 pos + float4 color, pitch 28 B | alpha blend, no cull, `LINELIST` |
 | UI | `ui.vert.spv` / `ui.frag.spv` | {1,0,0} | {1,1,0} | Vertex2D | alpha blend, no depth, no cull, **swapchain format** |
 | Text | `text.vert.spv` / `text.frag.spv` | {1,0,0} | {1,1,0} | float2 pos + float2 uv, pitch 16 B | alpha blend, no depth, no cull, **swapchain format** |
 | Particle | `particle.vert.spv` / `particle.frag.spv` | {2,0,1} | {1,1,0} | Vertex3D | additive (`SRC_ALPHA, ONE`; shader writes alpha 1.0 ⇒ effective `ONE, ONE`), `GREATER_OR_EQUAL`, depth write off, HDR |
-| Grass | `grass.vert.spv` / `grass.frag.spv` | {1,2,1} | {3,7,4} | Vertex3D | opaque, no cull |
+| Grass | `grass.vert.spv` / `grass.frag.spv` | {1,2,1} | {3,8,4} | Vertex3D | opaque, no cull |
 | ShadowModel | `shadow_depth.vert.spv` / `shadow_depth.frag.spv` | {1,0,0} | {1,1,0} | Vertex3D | depth-only (`color_format = INVALID`), cull FRONT, bias (1.25, 1.75), `enable_depth_clip = false` (caster pancaking), **`LESS_OR_EQUAL`** (cascades stay standard-Z) |
 | ShadowSkinnedModel | `shadow_skinned.vert.spv` / `shadow_depth_opaque.frag.spv` | {1,0,1} | {0,0,0} | SkinnedVertex | as ShadowModel |
 | ShadowTerrain | `shadow_terrain.vert.spv` / `shadow_depth_opaque.frag.spv` | {1,0,0} | {0,0,0} | terrain layout | as ShadowModel but **no cull** |
@@ -2128,6 +2127,8 @@ Per-pipeline configuration summary (from the catalogue rows in `pipeline_catalog
 | GTAOTemporal | `fullscreen.vert.spv` / `gtao_temporal.frag.spv` | {0,0,0} | {1,4,0} | none | `R16G16_FLOAT` history (AO + linear depth) |
 | GTAOUpsample | `fullscreen.vert.spv` / `gtao_upsample.frag.spv` | {0,0,0} | {1,2,0} | none | `R8_UNORM` (full-res AO the forward pass samples) |
 | BlurAO | `fullscreen.vert.spv` / `blur_ao.frag.spv` | {0,0,0} | {1,2,0} | none | `R8_UNORM` |
+| RtReflectionResolve | `fullscreen.vert.spv` / `rt_reflection_resolve.frag.spv` | {0,0,0} | {1,3,0} | none | additive RGB with destination alpha preserved; `R16G16B16A16_FLOAT` |
+| Water | `water.vert.spv` / `water.frag.spv` | {1,1,0} | {1,5,0} | float2 world XZ | opaque/no-cull; refraction + SSR/RT/IBL reflection; HDR color, D32 |
 | Composite | `fullscreen.vert.spv` / `composite.frag.spv` | {0,0,0} | {1,4,1} | none | **swapchain format**; the FS storage buffer is the auto-exposure state SSBO (or `PostProcessStack`'s zeroed dummy) |
 | BloomDownsample | `fullscreen.vert.spv` / `bloom_downsample.frag.spv` | {0,0,0} | {1,1,0} | none | `R16G16B16A16_FLOAT` |
 | BloomUpsample | `fullscreen.vert.spv` / `bloom_upsample.frag.spv` | {0,0,0} | {1,1,0} | none | additive onto larger mip (`LOADOP_LOAD` at pass level), `R16G16B16A16_FLOAT` |
@@ -2183,12 +2184,14 @@ Cbuffer mirror inventory (binding as annotated in the header). Every size below 
 | `GtaoTemporalUniforms` | fragment set 3, b0 | 32 | `feedbackMax = 0.9`, `depthRejectScale = 10`; `historyValid` 0 on first frame/resize/mode gaps |
 | `GtaoUpsampleUniforms` | fragment set 3, b0 | 32 | joint-bilateral upsample constants + `strength` (`ao_strength`, applied as a power curve) |
 | `BlurUniforms` | fragment set 3, b0 | 32 | `sharpness = 40`; `depthA = proj[2][2]`, `depthB = proj[3][2]` linearize depth (`viewZ = |B/(depth+A)|`, valid for standard and reversed-Z); `maxDistance` must equal `GTAOUniforms::maxDistance` (asserted in tests) |
+| `RtReflectionResolveUniforms` | fragment set 3, b0 | 112 | inverse view-projection, camera position, full/trace extents, depth linearization constants, roughness gate and intensity for the full-resolution material-guided HDR resolve |
 | `CompositeUniforms` | fragment set 3, b0 | 112 | `bloomStrength = 0.25` (tracks `GraphicsSettings::bloom_strength`, the source of truth), `exposure = 1` (manual bias), `tonemapMode = 0`, `contrast = 1`, `saturation = 1`; `lowResTexelSize`/`depthA`/`depthB` drive the joint-bilateral fog upsample (0 ⇒ plain bilinear); `autoExposureEnabled = 0` gates the exp2(EV) multiply from the exposure-state SSBO; `whiteBalanceEnabled = 0` + `whiteBalance = (1,1,1)` gate the pre-tonemap LMS white balance; `cdlEnabled = 0` + `cdlSlope/Offset/Power = (1,0,1)` gate the post-tonemap ASC-CDL — all-neutral defaults are pixel-identical to the ungraded path; AO is no longer composited here |
 | `FxaaUniforms` | fragment set 3, b0 | 16 | `invScreenSize`; operates on post-tonemap LDR |
 | `ExposureHistogramUniforms` | **compute** set 2, b0 | 16 | `width`/`height` (scene extent), `minLog2Luma = −10`, `invLog2Range = 1/26` — the 256-bin log2-luminance mapping (CPU mirror `render/auto_exposure.hpp::exposure_bin_from_luma`) |
 | `ExposureAdaptUniforms` | **compute** set 2, b0 | 48 | `minLog2Luma = −10`, `log2Range = 26`, `deltaTime`, `firstFrame` (≠0 ⇒ snap), `speedUp = 1.5`/`speedDown = 2.5` EV/s, `minEv = −4`/`maxEv = 4`, `lowPercentile = 0.60`/`highPercentile = 0.05`, `log2TargetGray = −1.80` (`AutoExposure::DEFAULT_LOG2_TARGET_GRAY`) |
 | `ParticleFragmentUniforms` | fragment set 3, b0 | 16 | `emissiveBoost = 1`; pushed once per pass |
 | `ParticleBatchUniforms` | vertex set 1, b1 | 16 | `instanceOffset` into per-frame particle SSBO |
+| `RtReflectionUniforms` | compute set 2, b0 | 224 | opaque receiver fields through offset 143 plus optional analytic-water region/simulation/flow/detail fields at 144–223 |
 | `BloomDownsampleUniforms` | fragment set 3, b0 | 32 | `threshold = 0.8` compared against **post-exposure** luminance; `isFirstPass = 1`, `exposure = 1` |
 | `BloomUpsampleUniforms` | fragment set 3, b0 | 16 | `bloomRadius = 1` |
 | `VolumetricFogUniforms` | fragment set 3, b0 | 448 | per-cascade matrices/bias for god rays; defaults `fogDensity = 0.0015`, `scatterStrength = 0.25`, `fogHeight = 100`, `fogFalloff = 0.005`, `startDist = 100`, `maxDist = 3000`, `godRaysEnabled = 1` |
@@ -2406,7 +2409,7 @@ Custom layouts are named `gpu::VertexLayout` cases applied in `pipeline_catalog.
 
 #### `PipelineType` — 56 values
 
-30 base types (`Model`, `SkinnedModel`, `Terrain`, `Skybox`, `Grid`, `UI`, `Text`, `Particle`, `Grass`, `InstancedModel`, `InstancedShadowModel`, `ShadowModel`, `ShadowSkinnedModel`, `ShadowTerrain`, `LocalShadowClear`, `GTAO`, `GTAOTemporal`, `GTAOUpsample`, `BlurAO`, `Composite`, `BloomDownsample`, `BloomUpsample`, `VolumetricFog`, `Fxaa`, `TaaResolve`, `TaaSharpen`, `SkyCapture`, `IblSpecularPrefilter`, `IblIrradiance`, `IblBrdfLut`) + 7 model-family material variants (`ModelDoubleSided`, `ModelBlend`, `ModelBlendDoubleSided`, `SkinnedModelDoubleSided`, `SkinnedModelBlend`, `SkinnedModelBlendDoubleSided`, `InstancedModelDoubleSided`) + 8 `DepthPrepass*` + 8 `*DepthEqual` variants + `Water`, + `Count`. The enum and its per-type data live in `gpu/pipeline_catalog.hpp`, not in the registry: each value has exactly one `PipelineDesc` row (shader pair, declared `ShaderResources`, `VertexLayout`, `TargetFormat`, cull/blend/depth state), `static_assert`ed to cover `Count`, and `pipeline_type_to_string()` is that row's `name`. Variants share their base row's shader pair and differ only in fixed-function state (`Blend` ⇒ `BlendMode::Alpha` with depth write off, host sorts back-to-front; `DoubleSided` ⇒ `SDL_GPU_CULLMODE_NONE`; `DepthEqual` ⇒ `SDL_GPU_COMPAREOP_EQUAL` with depth write off). glTF alphaMode MASK is *not* a pipeline variant for forward draws: it is the `alphaCutoff` field of the lighting cbuffer (0 disables the discard) — only the prepass has dedicated `*Masked` rows. There are no per-type convenience getters; everything goes through `get_pipeline(PipelineType)`.
+31 base types (`Model`, `SkinnedModel`, `Terrain`, `Skybox`, `Grid`, `UI`, `Text`, `Particle`, `Grass`, `InstancedModel`, `InstancedShadowModel`, `ShadowModel`, `ShadowSkinnedModel`, `ShadowTerrain`, `LocalShadowClear`, `GTAO`, `GTAOTemporal`, `GTAOUpsample`, `BlurAO`, `RtReflectionResolve`, `Composite`, `BloomDownsample`, `BloomUpsample`, `VolumetricFog`, `Fxaa`, `TaaResolve`, `TaaSharpen`, `SkyCapture`, `IblSpecularPrefilter`, `IblIrradiance`, `IblBrdfLut`) + 7 model-family material variants (`ModelDoubleSided`, `ModelBlend`, `ModelBlendDoubleSided`, `SkinnedModelDoubleSided`, `SkinnedModelBlend`, `SkinnedModelBlendDoubleSided`, `InstancedModelDoubleSided`) + 8 `DepthPrepass*` + 8 `*DepthEqual` variants + 2 masked-prepass variants + 10 G-buffer twins + `Water`, + `Count` (67 pipelines). The enum and its per-type data live in `gpu/pipeline_catalog.hpp`, not in the registry: each value has exactly one `PipelineDesc` row (shader pair, declared `ShaderResources`, `VertexLayout`, `TargetFormat`, cull/blend/depth state), `static_assert`ed to cover `Count`, and `pipeline_type_to_string()` is that row's `name`. Variants share their base row's shader pair and differ only in fixed-function state (`Blend` ⇒ `BlendMode::Alpha` with depth write off, host sorts back-to-front; `DoubleSided` ⇒ `SDL_GPU_CULLMODE_NONE`; `DepthEqual` ⇒ `SDL_GPU_COMPAREOP_EQUAL` with depth write off). glTF alphaMode MASK is *not* a pipeline variant for forward draws: it is the `alphaCutoff` field of the lighting cbuffer (0 disables the discard) — only the prepass has dedicated `*Masked` rows. There are no per-type convenience getters; everything goes through `get_pipeline(PipelineType)`.
 
 #### Pipeline table (shaders, declared resources, key state)
 
@@ -2414,11 +2417,11 @@ VS/FS resource counts below are the `ShaderResources` declared in each catalogue
 
 | Pipeline | VS / FS | VS res | FS res | State highlights | Color |
 |---|---|---|---|---|---|
-| Model (+DS/Blend) | `model.vert` / `model.frag` | u1 | u3 s11 b4 | vertex3d; opaque or alpha_blended; no_cull if DS | scene |
-| SkinnedModel (+variants) | `skinned_model.vert` / `model.frag` | u1 b1 | u3 s11 b4 | skinned_vertex | scene |
-| InstancedModel (+DS) | `model_instanced.vert` / `model_instanced.frag` | u1 b1 | u3 s11 b4 | vertex3d, opaque | scene |
-| Terrain | `terrain.vert` / `terrain.frag` | u1 | u3 s9 b4 | custom 48-B layout | scene |
-| Grass | `grass.vert` / `grass.frag` | u1 s2 b1 | u3 s7 b4 | vertex3d, opaque, no_cull | scene |
+| Model (+DS/Blend) | `model.vert` / `model.frag` | u1 | u3 s12 b4 | vertex3d; opaque or alpha_blended; no_cull if DS | scene |
+| SkinnedModel (+variants) | `skinned_model.vert` / `model.frag` | u1 b1 | u3 s12 b4 | skinned_vertex | scene |
+| InstancedModel (+DS) | `model_instanced.vert` / `model_instanced.frag` | u1 b1 | u3 s12 b4 | vertex3d, opaque | scene |
+| Terrain | `terrain.vert` / `terrain.frag` | u1 | u3 s10 b4 | custom 48-B layout | scene |
+| Grass | `grass.vert` / `grass.frag` | u1 s2 b1 | u3 s8 b4 | vertex3d, opaque, no_cull | scene |
 | Skybox | `skybox.vert` / `skybox.frag` | — | u1 | pos-only layout; depth write off; GREATER_OR_EQUAL; z=0 in VS | scene |
 | Grid | `grid.vert` / `grid.frag` | u1 | — | 28-B layout, LINELIST, alpha, no_cull | scene |
 | Particle | `particle.vert` / `particle.frag` | u2 b1 | u1 s1 | vertex3d, additive, depth write off, GREATER_OR_EQUAL | scene |
@@ -2433,6 +2436,8 @@ VS/FS resource counts below are the `ShaderResources` declared in each catalogue
 | GTAOTemporal | `fullscreen.vert` / `gtao_temporal.frag` | — | u1 s4 | no_depth | RG16F |
 | GTAOUpsample | `fullscreen.vert` / `gtao_upsample.frag` | — | u1 s2 | no_depth | R8 |
 | BlurAO | `fullscreen.vert` / `blur_ao.frag` | — | u1 s2 | no_depth | R8 |
+| RtReflectionResolve | `fullscreen.vert` / `rt_reflection_resolve.frag` | — | u1 s3 | no_depth; RGB additive, destination alpha preserved | RGBA16F |
+| Water | `water.vert` / `water.frag` | u1 s1 | u1 s5 | position2; opaque/no-cull, reversed-Z depth write | scene |
 | BloomDownsample | `fullscreen.vert` / `bloom_downsample.frag` | — | u1 s1 | no_depth | RGBA16F |
 | BloomUpsample | `fullscreen.vert` / `bloom_upsample.frag` | — | u1 s1 | **additive** (LOADOP_LOAD accumulate), no_depth | RGBA16F |
 | VolumetricFog | `fullscreen.vert` / `volumetric_fog.frag` | — | u1 s2 | no_depth | RGBA16F |
@@ -2458,7 +2463,7 @@ Within a set, storage-buffer slots begin immediately after the shader's sampled 
 
 CPU-side slot mapping: `SDL_PushGPUVertexUniformData(cmd, i, ...)` → `(i, 1)`; `SDL_PushGPUFragmentUniformData(cmd, i, ...)` → `(i, 3)`; `SDL_BindGPUVertexStorageBuffers` / `SDL_BindGPUFragmentStorageBuffers(pass, first, ...)` → set-0/set-2 storage slots relative to the sampler count; `SDL_BindGPUFragmentSamplers(pass, first, ...)` → `(first.., 2)`.
 
-`cluster_lighting.hlsli` codifies this for clustered lighting: the including fragment shader must `#define CLUSTER_SSBO_BINDING_BASE <its sampler count>` first (compile-time `#error` otherwise); the include then declares `ClusterParamsCB` at `(2, 3)`, the local-shadow atlas + comparison sampler at the shader's LAST sampler slot (`BASE-1`, set 2), and four SSBOs (`lightDataBuf` ByteAddressBuffer, `clusterOffsetsBuf StructuredBuffer<uint2>`, `lightIndicesBuf StructuredBuffer<uint>`, `localShadowSlots StructuredBuffer<LocalShadowSlot>`) at set-2 slots `BASE+0..3`, matched by `SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4)` on the CPU. Slot `(2,3)`, the last sampler, and those four set-2 bindings are reserved in every cluster-lit shader (`model.frag` base 12, `model_instanced.frag` 12, `terrain.frag` 9, `grass.frag` 7).
+`cluster_lighting.hlsli` codifies this for clustered lighting: the including fragment shader must `#define CLUSTER_SSBO_BINDING_BASE <its sampler count>` first (compile-time `#error` otherwise); the include then declares `ClusterParamsCB` at `(2, 3)`, the local-shadow atlas + comparison sampler at the shader's LAST sampler slot (`BASE-1`, set 2), and four SSBOs (`lightDataBuf` ByteAddressBuffer, `clusterOffsetsBuf StructuredBuffer<uint2>`, `lightIndicesBuf StructuredBuffer<uint>`, `localShadowSlots StructuredBuffer<LocalShadowSlot>`) at set-2 slots `BASE+0..3`, matched by `SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4)` on the CPU. Slot `(2,3)`, the last sampler, and those four set-2 bindings are reserved in every cluster-lit shader (`model.frag` base 12, `model_instanced.frag` 12, `terrain.frag` 10, `grass.frag` 8). The preceding slot is the RT sun-visibility mask (10/8/6 respectively), with a white dummy while disabled.
 
 ### CPU↔GPU uniform contract — `src/bracken/gpu/gpu_uniforms.hpp`
 
@@ -2489,6 +2494,8 @@ Every cbuffer has an `alignas(16)` CPU mirror annotated with its `(set, binding)
 | `GtaoTemporalUniforms` | (3, b0) | `gtao_temporal.frag` | 32 |
 | `GtaoUpsampleUniforms` | (3, b0) | `gtao_upsample.frag` | 32 |
 | `BlurUniforms` | (3, b0) | `blur_ao.frag` | 32 |
+| `RtReflectionResolveUniforms` | (3, b0) | `rt_reflection_resolve.frag` | 112 |
+| `RtReflectionUniforms` | compute (2, b0) | `rt_reflection.comp` | 224 |
 | `CompositeUniforms` | (3, b0) | `composite.frag` | 112 |
 | `FxaaUniforms` | (3, b0) | `fxaa.frag` | 16 |
 | `BloomDownsampleUniforms` | (3, b0) | `bloom_downsample.frag` | 32 |
@@ -2504,7 +2511,7 @@ Storage-buffer record mirrors (tight packing, no cbuffer rules): `InstanceData` 
 
 Packing rules the mirrors follow (and any new struct must): every `glm::vec3` is chased by a scalar or named pad so no field straddles a 16-byte register; padding is **named scalars, never arrays** (HLSL cbuffer arrays stride at 16 B — a `float _pad[3]` on the HLSL side would declare a 52-byte block; see the comment in `ui.frag.hlsl` and the `ShadowFragUniformsLayout` test); total size a multiple of 16.
 
-Notable defaults living in these structs (pushed as-is unless the renderer overrides): `GTAOUniforms{radius 4.0, falloffRange 0.615, thinOccluderCompensation 0.2, maxDistance 12000}`, `GtaoTemporalUniforms{feedbackMax 0.9, depthRejectScale 10}`, `BlurUniforms{sharpness 40, maxDistance 12000}` (the two `maxDistance`s must agree — asserted in the tests), `CompositeUniforms{bloomStrength 0.25, exposure 1, tonemapMode 0, all exposure/grading gates neutral}`, `ExposureAdaptUniforms{percentiles 0.60/0.05, speeds 1.5/2.5 EV/s, EV clamp ±4, log2TargetGray −1.80}`, `BloomDownsampleUniforms{threshold 0.8 (post-exposure luminance), exposure 1}`, `VolumetricFogUniforms{fogDensity 0.0015, scatterStrength 0.25, fogHeight 100, fogFalloff 0.005, startDist 100, maxDist 3000, godRaysEnabled 1}`, `ModelLightingUniforms{roughnessFactor 0.85, ambientStrength 0.5, alphaCutoff 0 (=alpha test off)}`.
+Notable defaults living in these structs (pushed as-is unless the renderer overrides): `GTAOUniforms{radius 4.0, falloffRange 0.615, thinOccluderCompensation 0.2, maxDistance 12000}`, `GtaoTemporalUniforms{feedbackMax 0.9, depthRejectScale 10}`, `BlurUniforms{sharpness 40, maxDistance 12000}` (the two `maxDistance`s must agree — asserted in the tests), `CompositeUniforms{bloomStrength 0.25, exposure 1, tonemapMode 0, all exposure/grading gates neutral}`, `ExposureAdaptUniforms{percentiles 0.60/0.05, speeds 1.5/2.5 EV/s, EV clamp ±4, log2TargetGray −1.80}`, `BloomDownsampleUniforms{threshold 0.8 (post-exposure luminance), exposure 1}`, `VolumetricFogUniforms{fogDensity 0.0015, scatterStrength 0.25, fogHeight 100, fogFalloff 0.005, startDist 100, maxDist 3000, godRaysEnabled 1}`, `ModelLightingUniforms{roughnessFactor 0.85, ambientStrength 0.5, alphaCutoff 0 (=alpha test off)}`. Retained-geometry model upload also bakes `Mesh::rt_triangle_base_colors` (one linear RGBA value per triangle, sampled from the sRGB base-colour texture at centroid UV and multiplied by averaged vertex colour plus `baseColorFactor`); RT reflection attributes consume this compact proxy after source pixels have been released.
 
 ### Skinned/instanced storage-buffer contracts
 
@@ -2700,7 +2707,7 @@ Singular frame state (single-writer — call from the frame's root code, not fan
 
 `FramePacket`'s lifecycle and raw allocator are private under the same rule: `begin_fill()`, `begin_consume()`, `reset()`, `reserve_block(size, align)`, `take_palette_slot()`, `palette_slots_taken()` and the three `count_drop_*` counters. Friends are `FrameBuilder`, `PacketRing`, `Application` (abandon-on-throw) and `testing::FrameAccess`.
 
-**`bracken/testing/frame_test.hpp`** (header-only, public) is where the capability is published. `testing::FrameAccess` is a struct of static forwarders for every private member listed above. `testing::TestFrame` is the ergonomic fixture built on it: `TestFrame(lane_count = 1, arena_bytes = k_default_arena_bytes)` owns a packet, `TestFrame(FramePacket&, lane_count = 1)` borrows one; `sink()`, `builder()`, `packet()`, `set_frame_timing`, `seal()`, `sealed()`, typed read-back (`draws()`, `skinned_draws()`, `point_lights()`, `spot_lights()`, `billboards()`, `debug_lines()`, `effect_spawns()`, `ui_commands()`, `ui_text()`), `build_diagnostics()` and `digest()` (== `scene::packet_digest`).
+**`bracken/testing/frame_test.hpp`** (header-only, public) is where the capability is published. `testing::FrameAccess` is a struct of static forwarders for every private member listed above. `testing::TestFrame` is the ergonomic fixture built on it: `TestFrame(lane_count = 1, arena_bytes = k_default_arena_bytes)` owns a packet, `TestFrame(FramePacket&, lane_count = 1)` borrows one; `sink()`, `builder()`, `packet()`, `set_frame_timing`, `seal()`, `sealed()`, typed read-back (`draws()`, `skinned_draws()`, `point_lights()`, `spot_lights()`, `billboards()`, `debug_lines()`, `effect_spawns()`, `ui_commands()`, `ui_text()`), and `build_diagnostics()`.
 
 **Effect snapshot contract** (`frame_packet.hpp`): `EffectEmitterSnapshot { const EmitterDefinition* definition; uint32_t first_particle, particle_count; }` — `definition` is a long-lived host asset pointer (same contract as `EffectSpawnCommand`), and these two pointers are the packet's **only** host-lifetime exceptions: an `EffectDefinition` handed to `spawn_effect` must outlive every instance spawned from it, since the `EffectSystem` retains the emitter definitions across frames. Null is a `BRACKEN_CONTRACT` at emit (`FrameBuilder::Lane::spawn_effect`) and at consume (`Application`'s spawn drain); the particle range indexes `effect_particles()`. `EffectParticleSnapshot { vec3 position; float scale; vec3 rotation; float opacity; vec4 color; }` — exactly the fields the effect renderer's transform build + instance packing consume. The renderer reads the snapshot from the SEALED packet only; the live `EffectSystem` is sim-stage owned and mutates concurrently with rendering.
 
@@ -2791,7 +2798,7 @@ Preconditions: main thread (`BRACKEN_ASSERT_MAIN_THREAD()`); `frame` is a sealed
    e. **`IBL`** (only when `gfx.ibl_enabled` and `render::IBL` is ready) — `ibl_->update(cmd, pipelines, env_, world_->sky_time())`: re-snapshot the sky-relevant environment fields, and when a refresh is in flight record up to `IBL::UNITS_PER_FRAME` prefilter passes (usually records nothing). See the IBL section in the Environment chapter.
    f. **`ShadowPass`** — see below. Then **`LocalShadowPass`** (when local shadows are active this frame; independent of the CSM toggle): `render_local_shadow_passes` re-renders this frame's dirty tiles into the 8×8-tile atlas — see the local-shadow section in the Lighting chapter.
    g. Cache `frame_shadow_uniforms_ = shadow_map_->get_shadow_uniforms(mode)`; hand cluster buffers + params (and the local-shadow slot SSBO) to terrain/grass.
-   h. **HDR path** (whenever `post_->is_ready()`, regardless of `ao_mode`): resize post targets (incl. `gtao_->set_half_res`/`resize` and `taa_->resize`, all of which invalidate their history on change); offscreen clear = `env_.fog_color_horizon`; **`DepthPrepass`** (velocity + opaque scene depth); **`GTAO`** (only when `ao_mode != Off` and the prepass ran: `render::GTAO::render` — raw horizon-based GTAO from the prepass depth, temporal accumulation against the velocity target, bilateral blur, joint-bilateral upsample into the full-res R8 AO texture the forward pass samples; otherwise `gtao_->invalidate_history()` and the forward pass gets the 1×1 white dummy); `HDROffscreen` pass renders `render_3d_scene` into the linear-HDR target (forward shaders min-combine the screen AO with material ORM AO in their ambient term); **`TAA`** (only when `aa_mode == AAMode::TAA` and the depth prepass ran this frame: `render::TAA::render` resolves the jittered offscreen color + velocity + depth into the double-buffered RGBA16F history and writes the sharpened result back over the offscreen color; if TAA is active but the prepass/velocity is unavailable, the history is invalidated instead); **`AutoExposure`** (only when `auto_exposure` and the system is ready: `render::AutoExposure::render` records the histogram + adapt compute dispatches over the TAA-resolved offscreen color, with speeds/clamps from the settings; any frame it cannot record calls `auto_exposure_->invalidate()` so the next run snaps to the metered target); `Bloom` (if enabled + ready — reads the TAA-stabilized color when TAA ran; thresholds against the MANUAL exposure only, the adapted EV is not visible to it); `VolumetricFog` (if `volumetric_fog || god_rays`; god rays force-off when shadows are off — the atlas would be garbage); **late swapchain acquire**; `Composite` (bloom strength, exposure = manual bias with the adapted-EV SSBO + `auto_exposure` flag, tonemap mode, contrast, saturation, white-balance coefficients from `render::white_balance_coefficients(env_.grade_temperature, env_.grade_tint)` + the CDL triple from `env_.grade_slope/offset/power`, `depth_a = proj[2][2]`, `depth_b = proj[3][2]` for the fog upsample — AO is not composited) into the swapchain, or into an LDR intermediate followed by `FXAA` only when `aa_mode == AAMode::FXAA` (TAA and Off composite straight to the swapchain). A failed late acquire sets `swapchain_unavailable` — composite + UI are skipped, the buffer still submits.
+   h. **HDR path** (whenever `post_->is_ready()`, regardless of `ao_mode`): resize post targets (incl. `gtao_->set_half_res`/`resize` and `taa_->resize`, all of which invalidate their history on change); offscreen clear = `env_.fog_color_horizon`; **`DepthPrepass`** (velocity + opaque scene depth, plus the RGBA8 oct-normal/roughness/metallic G-buffer when RT reflections are enabled); **`GTAO`** (only when `ao_mode != Off` and the prepass ran: `render::GTAO::render` — raw horizon-based GTAO from the prepass depth, temporal accumulation against the velocity target, bilateral blur, joint-bilateral upsample into the full-res R8 AO texture the forward pass samples; otherwise `gtao_->invalidate_history()` and the forward pass gets the 1×1 white dummy); **RT compute** records shadows and reduced-resolution raw reflection radiance using sampled depth/G-buffer bindings; `HDROffscreen` renders `render_3d_scene` into the linear-HDR target (forward shaders min-combine the screen AO with material ORM AO in their ambient term, every opaque receiver including terrain/grass uses the traced sun mask when enabled, and eligible opaque model materials smoothly surrender IBL specular to tracing); **`RtReflectionResolve`** adds the depth/normal/material-guided full-resolution receiver-BRDF result to HDR; when water is active, **`RtWaterReflection`** then recycles the raw target for a wave-aware analytic water receiver and the water shader consumes it as the SSR-gap signal; **`TAA`** (only when `aa_mode == AAMode::TAA` and the depth prepass ran this frame: `render::TAA::render` resolves the jittered offscreen color + velocity + depth into the double-buffered RGBA16F history and writes the sharpened result back over the offscreen color; if TAA is active but the prepass/velocity is unavailable, the history is invalidated instead); **`AutoExposure`** (only when `auto_exposure` and the system is ready: `render::AutoExposure::render` records the histogram + adapt compute dispatches over the TAA-resolved offscreen color, with speeds/clamps from the settings; any frame it cannot record calls `auto_exposure_->invalidate()` so the next run snaps to the metered target); `Bloom` (if enabled + ready — reads the TAA-stabilized color when TAA ran; thresholds against the MANUAL exposure only, the adapted EV is not visible to it); `VolumetricFog` (if `volumetric_fog || god_rays`; god rays force-off when shadows are off — the atlas would be garbage); **late swapchain acquire**; `Composite` (bloom strength, exposure = manual bias with the adapted-EV SSBO + `auto_exposure` flag, tonemap mode, contrast, saturation, white-balance coefficients from `render::white_balance_coefficients(env_.grade_temperature, env_.grade_tint)` + the CDL triple from `env_.grade_slope/offset/power`, `depth_a = proj[2][2]`, `depth_b = proj[3][2]` for the fog upsample — neither AO nor RT reflections are composited here) into the swapchain, or into an LDR intermediate followed by `FXAA` only when `aa_mode == AAMode::FXAA` (TAA and Off composite straight to the swapchain). A failed late acquire sets `swapchain_unavailable` — composite + UI are skipped, the buffer still submits.
    i. **Fallback** (post stack not ready): single `MainScene` pass direct to swapchain via `begin_main_pass` (color clear `{0.35, 0.45, 0.6, 1}`, depth clear **0.0** with explicit `LOADOP_CLEAR`); no prepass, no AO (white dummy bound).
 5. **`UI`** — `begin_ui` (acquires swapchain if not yet held), replay of `frame.ui_commands()` (a `std::visit` over each `UiCommand` onto the matching `render::UIRenderer::draw_*` call, in submission order), then `draw_billboard_3d` per `frame.billboards()` entry, `end_ui` (clears the background iff no main pass ran this frame).
 6. **`PostUICallback`** — invoked with `(command_buffer, swapchain_texture)` only when a swapchain image is held.
@@ -3856,7 +3863,7 @@ class TerrainRenderer {                                   // bracken::render
 
 `TerrainTransformUniforms` (vertex uniform slot 0, 144 B, `alignas(16)`): `mat4 view` (0), `mat4 projection` (64), `vec3 cameraPos` (128), `float _padding0`. Pinned against `terrain.vert.hlsl` `TransformUniforms` by static_asserts.
 
-`TerrainLightingUniforms` (fragment uniform slot 0, 144 B, `alignas(16)`, pinned by static_asserts) — each vec3+float pair fills one 16-byte register: `fogColorHorizon/fogStart` (0/12), `fogColorSun/fogEnd` (16/28), `lightDir/fogHeightFalloff` (32/44), `cameraPos/screenAOTexelX` (48/60), `ambientSky/ambientStrength` (64/76), `ambientGround/sunIntensity` (80/92), `sunColor/screenAOTexelY` (96/108), `splat_params` (`glm::vec4`, offset 112) — `xy` = splat region origin (world XZ), `zw` = region X/Z size, so non-square/offset worlds map the splatmap correctly — and `iblEnabled` (offset 128; 1 = sky-IBL ambient, samplers 5–7) + 12-byte pad.
+`TerrainLightingUniforms` (fragment uniform slot 0, 144 B, `alignas(16)`, pinned by static_asserts) — each vec3+float pair fills one 16-byte register: `fogColorHorizon/fogStart` (0/12), `fogColorSun/fogEnd` (16/28), `lightDir/fogHeightFalloff` (32/44), `cameraPos/screenAOTexelX` (48/60), `ambientSky/ambientStrength` (64/76), `ambientGround/sunIntensity` (80/92), `sunColor/screenAOTexelY` (96/108), `splat_params` (`glm::vec4`, offset 112) — `xy` = splat region origin (world XZ), `zw` = region X/Z size, so non-square/offset worlds map the splatmap correctly — `iblEnabled` (offset 128; 1 = sky-IBL ambient, samplers 5–7), `rtShadowEnabled` (132; traced mask at sampler 8 replaces CSM), then 8-byte pad.
 
 `gpu::ShadowTerrainUniforms` (`src/bracken/gpu/gpu_uniforms.hpp`, vertex slot 0 of the shadow pass): a single `alignas(16) glm::mat4 lightViewProjection`.
 
@@ -3921,7 +3928,7 @@ Shared by main and shadow passes. The culling core is the pure static `cull_tile
 
 #### Main-pass binding contract (`render`)
 
-Pipeline: `PipelineType::Terrain` — vertex shader `terrain.vert.spv`, fragment `terrain.frag.spv`; declared resources VS: 1 UBO; FS: 3 UBOs, 9 samplers, 4 storage buffers. Default cull `SDL_GPU_CULLMODE_BACK`, depth write on, `GREATER_OR_EQUAL` reversed-Z, color `RGBA16F` scene format, depth `D32_FLOAT`. (Row in `gpu/pipeline_catalog.cpp`; that table is the source of truth.)
+Pipeline: `PipelineType::Terrain` — vertex shader `terrain.vert.spv`, fragment `terrain.frag.spv`; declared resources VS: 1 UBO; FS: 3 UBOs, 10 samplers, 4 storage buffers. Default cull `SDL_GPU_CULLMODE_BACK`, depth write on, `GREATER_OR_EQUAL` reversed-Z, color `RGBA16F` scene format, depth `D32_FLOAT`. (Row in `gpu/pipeline_catalog.cpp`; that table is the source of truth.)
 
 | Slot | Stage | Content | Pushed/bound by |
 |---|---|---|---|
@@ -4028,7 +4035,7 @@ Runs inside the frame's consolidated `FrameUploads` copy pass, before any render
 
 Early-outs (all silent): not initialized / null pass/cmd; blade buffers missing; **heightmap texture or sampler unset** (grass requires `set_heightmap` first); empty visible-chunk set. Pipeline lookup failure logs.
 
-Pipeline `PipelineType::Grass`: VS `grass.vert.spv` (1 UBO, 2 samplers, 1 storage buffer), FS `grass.frag.spv` (3 UBOs, 7 samplers, 4 storage buffers); `Vertex3D` layout, opaque, `SDL_GPU_CULLMODE_NONE` — grass blades are double-sided; scene `RGBA16F` + `D32_FLOAT` targets. Vertex layout is the shared `gpu::Vertex3D` (position, normal, texcoord, color, tangent) even though the shader consumes only position/normal/texCoord/color.
+Pipeline `PipelineType::Grass`: VS `grass.vert.spv` (1 UBO, 2 samplers, 1 storage buffer), FS `grass.frag.spv` (3 UBOs, 8 samplers, 4 storage buffers); `Vertex3D` layout, opaque, `SDL_GPU_CULLMODE_NONE` — grass blades are double-sided; scene `RGBA16F` + `D32_FLOAT` targets. Vertex layout is the shared `gpu::Vertex3D` (position, normal, texcoord, color, tangent) even though the shader consumes only position/normal/texCoord/color.
 
 Binding contract:
 
@@ -4063,7 +4070,7 @@ HLSL binding spaces: VS set 0 = 2 combined image samplers (bindings 0–1) then 
 | `camera_forward` | 148 | `-vec3(view[0][2], view[1][2], view[2][2])`; packs into the last 12 bytes of the register at 144 — the header warns that inserting any scalar before it silently desynchronizes CPU/GPU (`splat_params` then starts a fresh register at 160 on both sides) |
 | `splat_params` | 160 | `glm::vec4`: xy = splat region origin (world XZ), zw = region X/Z size — non-square worlds handled |
 
-`GrassLightingUniforms` (128 B) mirrors the terrain lighting block with grass field ordering: `camera_pos/fog_start`, `fog_color_horizon/fog_end`, `fog_color_sun/fog_height_falloff`, `light_dir/ambient_strength`, `sun_color/sun_intensity`, `ambient_sky/screen_ao_texel_x`, `ambient_ground/screen_ao_texel_y`, then `ibl_enabled` (offset 112) + 12-byte pad — all pinned by static_asserts.
+`GrassLightingUniforms` (128 B) mirrors the terrain lighting block with grass field ordering: `camera_pos/fog_start`, `fog_color_horizon/fog_end`, `fog_color_sun/fog_height_falloff`, `light_dir/ambient_strength`, `sun_color/sun_intensity`, `ambient_sky/screen_ao_texel_x`, `ambient_ground/screen_ao_texel_y`, then `ibl_enabled` (offset 112), `rt_shadow_enabled` (116; traced mask at sampler 6 replaces CSM), and 8-byte pad — all pinned by static_asserts.
 
 #### Vertex shader algorithm (`grass.vert.hlsl`)
 
@@ -5280,7 +5287,9 @@ ignored outside the sim window); `set_environment(const EnvironmentState&)`;
 `simulate(SDL_GPUCommandBuffer*, float dt)` (compute; must be outside render
 passes); `render(pass, cmd, view_proj, projection, camera_pos, time,
 screen_w, screen_h, scene_color_copy, scene_depth_copy, ibl_specular_binding,
-ibl_enabled, sun_intensity)`.
+ibl_enabled, rt_reflection_texture, rt_reflection_enabled,
+rt_reflection_intensity, sun_intensity)`; `simulation_state_texture()` exposes
+the current wave field read-only for the renderer's analytic RT receiver.
 
 **WaterRegion fields**: rect (`min_x/min_z/max_x/max_z`), `height`, `flow`
 (normalized XZ), `flow_speed` (units/s), colors `deep_color`/`shallow_color`
@@ -5321,16 +5330,25 @@ front-geometry rejection, Beer-Lambert absorption, screen-space
 reflections (24-step geometric-growth march of the reflected ray against the
 depth copy — snapshotted pre-water, so no self-hits — with one midpoint
 refinement, distance-growing thickness, screen-edge/distance confidence
-fade) blended by confidence over the IBL specular cube reflection
-(`R.y = abs(R.y)`, horizon-color fallback when IBL off), Schlick
+fade), plus a wave-aware RT texture when `rt_reflections` is enabled. Before
+the water pass, `RtRenderer` recycles its quarter-resolution raw target after
+the opaque resolve: camera rays intersect the water plane, refine twice
+against simulation displacement, reject the region exterior/opaque cover,
+and trace with the simulation central-difference + analytic detail normal.
+The hybrid hierarchy keeps confident full-detail SSR, uses RT for off-screen,
+occluded and screen-edge gaps, and falls through to the IBL specular cube on
+RT misses or range fade (`R.y = abs(R.y)`, horizon-color fallback when IBL
+is off). Schlick
 fresnel (F0 = 0.02), fresnel(H)-scaled Blinn sun glint (pow 280), shoreline +
 sim-crest foam, 7-unit depth-feathered waterline, shared `fog.hlsli`
 atmospheric fog. Uniforms: `VertexUniforms` (96 B), `FragmentUniforms`
-(176 B).
+(272 B, including `viewProjSSR`, SSR controls and RT enable/intensity).
 
 **Known limitations**: renders after transparents/particles (they are
-overdrawn where water covers them on screen); reflections are screen-space
-(off-screen content falls back to the sky IBL); one region; no graphics-settings toggle (unset region = off); water
+overdrawn where water covers them on screen); without RT reflections,
+off-screen content falls back from SSR to sky IBL; one region; no independent
+water RT toggle (`GraphicsSettings::rt_reflections` controls opaque and water
+tracing together; unset region = water off); water
 draws are absent from the depth prepass (no velocity — TAA treats it via
 camera reprojection); the flat plane floods terrain dips below `height`
 inside the region rect (the host must keep a dry margin, e.g. the
@@ -8408,4 +8426,3 @@ behavior, or Jolt versions.
   compound/mesh/convex-hull shapes yet.
 - `cast_ray` is closest-hit only, no layer filtering.
 - Queries return identity values rather than errors for stale/invalid ids.
-

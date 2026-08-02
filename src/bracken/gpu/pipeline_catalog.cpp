@@ -24,6 +24,7 @@ constexpr ShaderResources k_ubo2_sb1{.num_storage_buffers = 1, .num_uniform_buff
 constexpr ShaderResources k_ubo1_samp1{.num_samplers = 1, .num_uniform_buffers = 1};
 constexpr ShaderResources k_ubo1_samp2{.num_samplers = 2, .num_uniform_buffers = 1};
 constexpr ShaderResources k_ubo1_samp4{.num_samplers = 4, .num_uniform_buffers = 1};
+constexpr ShaderResources k_ubo1_samp5{.num_samplers = 5, .num_uniform_buffers = 1};
 
 /// `model.frag` / `model_instanced.frag`: baseColor + shadow atlas (cmp + raw)
 /// + normal + metallic-roughness + emissive + screen AO + IBL (irradiance /
@@ -41,14 +42,15 @@ constexpr ShaderResources k_fs_lit_model{
     .num_samplers = 12, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `terrain.frag`: material array + splatmap + shadow atlas (cmp + raw) +
-/// screen AO + IBL (irradiance / prefiltered / BRDF LUT) + local-shadow atlas.
+/// screen AO + IBL (irradiance / prefiltered / BRDF LUT) + traced sun mask +
+/// local-shadow atlas.
 constexpr ShaderResources k_fs_lit_terrain{
-    .num_samplers = 9, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 10, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `grass.frag`: shadow atlas (cmp + raw) + screen AO + IBL (irradiance /
-/// prefiltered / BRDF LUT) + local-shadow atlas.
+/// prefiltered / BRDF LUT) + traced sun mask + local-shadow atlas.
 constexpr ShaderResources k_fs_lit_grass{
-    .num_samplers = 7, .num_storage_buffers = 4, .num_uniform_buffers = 3};
+    .num_samplers = 8, .num_storage_buffers = 4, .num_uniform_buffers = 3};
 
 /// `grass.vert` / `prepass_grass.vert`: heightmap + splatmap samplers, plus the
 /// visible-chunk origin buffer for the chunked LOD.
@@ -56,13 +58,14 @@ constexpr ShaderResources k_vs_grass{
     .num_samplers = 2, .num_storage_buffers = 1, .num_uniform_buffers = 1};
 
 /// `composite.frag`: color + bloom + volumetric fog + depth, plus the
-/// auto-exposure state buffer.
-// 5 samplers: scene colour, bloom, fog, depth, and the ray-traced reflection
-// (bound to a dummy when RT is off). This count MUST match the shader — a
+/// auto-exposure state buffer. Reflections have already been resolved into
+/// scene colour before TAA; keeping them out of this final pass is what lets
+/// TAA/bloom/exposure see the traced signal.
+// This count MUST match the shader — a
 // stale value here does not fail loudly, it misbinds the storage buffer that
 // follows the samplers and quietly breaks tonemapping.
 constexpr ShaderResources k_fs_composite{
-    .num_samplers = 5, .num_storage_buffers = 1, .num_uniform_buffers = 1};
+    .num_samplers = 4, .num_storage_buffers = 1, .num_uniform_buffers = 1};
 
 // =============================================================================
 // Shared fixed-function constants
@@ -277,6 +280,16 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .vertex_layout = VertexLayout::None,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::R8,
+     .depth_target = false},
+    {.name = "RtReflectionResolve",
+     .vertex_shader = "fullscreen.vert.spv",
+     .fragment_shader = "rt_reflection_resolve.frag.spv",
+     .vs = k_none,
+     .fs = {.num_samplers = 3, .num_uniform_buffers = 1},
+     .vertex_layout = VertexLayout::None,
+     .cull_mode = SDL_GPU_CULLMODE_NONE,
+     .blend_mode = BlendMode::AdditivePreserveAlpha,
+     .color = TargetFormat::RGBA16F,
      .depth_target = false},
     {.name = "Composite",
      .vertex_shader = "fullscreen.vert.spv",
@@ -610,7 +623,7 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .color = TargetFormat::Velocity},
 
     // --- Depth-prepass G-buffer variants --------------------------------------
-    // Same geometry, same depth, plus a normal+roughness second attachment for
+    // Same geometry, same depth, plus an oct-normal/roughness/metallic attachment for
     // ray-traced reflections (render/rt_renderer.hpp). Only created when a game
     // turns reflections on. Grass and MASK foliage write a constant roughness
     // of 1 -- they are never mirror surfaces, so the reflection pass skips them
@@ -621,16 +634,16 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .vertex_shader = "prepass_model_gbuffer.vert.spv",
      .fragment_shader = "prepass_gbuffer.frag.spv",
      .vs = k_ubo1,
-     .fs = k_ubo1,
-     .vertex_layout = VertexLayout::Vertex3DPositionNormal,
+     .fs = k_ubo1_samp1, // + the metallicRoughness map (see prepass_gbuffer.frag.hlsl)
+     .vertex_layout = VertexLayout::Vertex3DPositionNormalTexcoord,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},
     {.name = "DepthPrepassModelDoubleSidedGBuffer",
      .vertex_shader = "prepass_model_gbuffer.vert.spv",
      .fragment_shader = "prepass_gbuffer.frag.spv",
      .vs = k_ubo1,
-     .fs = k_ubo1,
-     .vertex_layout = VertexLayout::Vertex3DPositionNormal,
+     .fs = k_ubo1_samp1, // + the metallicRoughness map (see prepass_gbuffer.frag.hlsl)
+     .vertex_layout = VertexLayout::Vertex3DPositionNormalTexcoord,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},
@@ -638,16 +651,16 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .vertex_shader = "prepass_skinned_gbuffer.vert.spv",
      .fragment_shader = "prepass_gbuffer.frag.spv",
      .vs = k_ubo1_sb2,
-     .fs = k_ubo1,
-     .vertex_layout = VertexLayout::SkinnedVertexPositionSkinNormal,
+     .fs = k_ubo1_samp1, // + the metallicRoughness map
+     .vertex_layout = VertexLayout::SkinnedVertexPositionSkinNormalTexcoord,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},
     {.name = "DepthPrepassSkinnedModelDoubleSidedGBuffer",
      .vertex_shader = "prepass_skinned_gbuffer.vert.spv",
      .fragment_shader = "prepass_gbuffer.frag.spv",
      .vs = k_ubo1_sb2,
-     .fs = k_ubo1,
-     .vertex_layout = VertexLayout::SkinnedVertexPositionSkinNormal,
+     .fs = k_ubo1_samp1, // + the metallicRoughness map
+     .vertex_layout = VertexLayout::SkinnedVertexPositionSkinNormalTexcoord,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},
@@ -655,24 +668,29 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .vertex_shader = "prepass_instanced_gbuffer.vert.spv",
      .fragment_shader = "prepass_gbuffer.frag.spv",
      .vs = k_ubo1_sb1,
-     .fs = k_ubo1,
-     .vertex_layout = VertexLayout::Vertex3DPositionNormal,
+     .fs = k_ubo1_samp1, // + the metallicRoughness map
+     .vertex_layout = VertexLayout::Vertex3DPositionNormalTexcoord,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},
     {.name = "DepthPrepassInstancedModelDoubleSidedGBuffer",
      .vertex_shader = "prepass_instanced_gbuffer.vert.spv",
      .fragment_shader = "prepass_gbuffer.frag.spv",
      .vs = k_ubo1_sb1,
-     .fs = k_ubo1,
-     .vertex_layout = VertexLayout::Vertex3DPositionNormal,
+     .fs = k_ubo1_samp1, // + the metallicRoughness map
+     .vertex_layout = VertexLayout::Vertex3DPositionNormalTexcoord,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},
+    // .fs = k_none is load-bearing: this row used to share prepass_gbuffer.frag
+    // (which declares a fragment UBO) while TerrainRenderer::render_prepass
+    // only ever pushed the VERTEX uniforms, so the fragment block read
+    // recycled pool memory and classified the whole terrain as a mirror. Its
+    // own uniform-free shader makes that unrepresentable.
     {.name = "DepthPrepassTerrainGBuffer",
      .vertex_shader = "prepass_terrain_gbuffer.vert.spv",
-     .fragment_shader = "prepass_gbuffer.frag.spv",
+     .fragment_shader = "prepass_gbuffer_terrain.frag.spv",
      .vs = k_ubo1,
-     .fs = k_ubo1,
+     .fs = k_none,
      .vertex_layout = VertexLayout::TerrainPositionNormal,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},
@@ -712,7 +730,7 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .vertex_shader = "water.vert.spv",
      .fragment_shader = "water.frag.spv",
      .vs = k_ubo1_samp1, // VertexUniforms + sim height state (displacement)
-     .fs = k_ubo1_samp4, // FragmentUniforms + scene color/depth copies, sim state, IBL specular
+     .fs = k_ubo1_samp5, // + raw wave-aware RT reflection (dummy while disabled)
      .vertex_layout = VertexLayout::Position2,
      .cull_mode = SDL_GPU_CULLMODE_NONE},
 }};
@@ -746,7 +764,7 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // hits, which is why it costs 48 bytes per triangle and reflections cost
      // 112. (It also took the AO texture, to copy through into the mask's
      // second channel — see rt_shadow.comp.hlsl for why that is gone.)
-     .resources = {.num_readonly_storage_textures = 1,
+     .resources = {.num_samplers = 1,
                    .num_readonly_storage_buffers = 4,
                    .num_readwrite_storage_textures = 1,
                    .num_uniform_buffers = 1}},
@@ -754,7 +772,7 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      .shader = "rt_reflection.comp.spv",
      .entry_point = "CSMain",
      // Same, plus per-triangle attributes to shade the hit.
-     .resources = {.num_readonly_storage_textures = 2,
+     .resources = {.num_samplers = 2,
                    .num_readonly_storage_buffers = 5,
                    .num_readwrite_storage_textures = 1,
                    .num_uniform_buffers = 1}},
@@ -798,6 +816,14 @@ void apply_vertex_layout(PipelineConfig& config, VertexLayout layout) {
                 {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, normal)},
             };
             return;
+        case VertexLayout::Vertex3DPositionNormalTexcoord:
+            config.vertex_buffers = {get_vertex3d_buffer_desc()};
+            config.vertex_attributes = {
+                {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, position)},
+                {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex3D, normal)},
+                {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(Vertex3D, texcoord)},
+            };
+            return;
         case VertexLayout::SkinnedVertex:
             config.with_skinned_vertex();
             return;
@@ -816,6 +842,16 @@ void apply_vertex_layout(PipelineConfig& config, VertexLayout layout) {
                 {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4, offsetof(SkinnedVertex, joints)},
                 {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, offsetof(SkinnedVertex, weights)},
                 {3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(SkinnedVertex, normal)},
+            };
+            return;
+        case VertexLayout::SkinnedVertexPositionSkinNormalTexcoord:
+            config.vertex_buffers = {get_skinned_vertex_buffer_desc()};
+            config.vertex_attributes = {
+                {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(SkinnedVertex, position)},
+                {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4, offsetof(SkinnedVertex, joints)},
+                {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, offsetof(SkinnedVertex, weights)},
+                {3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(SkinnedVertex, normal)},
+                {4, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(SkinnedVertex, texcoord)},
             };
             return;
         case VertexLayout::Vertex2D:

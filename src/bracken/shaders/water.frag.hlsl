@@ -28,6 +28,7 @@ cbuffer WaterFragmentUniforms : register(b0, space3) {
                             // z = ripple foam gain, w = reflection strength
     float4x4 viewProjSSR;   // world -> clip for the SSR march (this frame's draw VP)
     float4 ssrParams;       // x = strength (0 = off), y = max distance, z = thickness
+    float4 rtParams;        // x = traced reflection enabled, y = intensity
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]] Texture2D sceneColor : register(t0, space2);
@@ -38,6 +39,8 @@ cbuffer WaterFragmentUniforms : register(b0, space3) {
 [[vk::combinedImageSampler]][[vk::binding(2, 2)]] SamplerState simSampler : register(s2, space2);
 [[vk::combinedImageSampler]][[vk::binding(3, 2)]] TextureCube iblSpecular : register(t3, space2);
 [[vk::combinedImageSampler]][[vk::binding(3, 2)]] SamplerState iblSpecularSampler : register(s3, space2);
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]] Texture2D<float4> rtReflection : register(t4, space2);
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]] SamplerState rtReflectionSampler : register(s4, space2);
 
 #include "fog.hlsli"
 
@@ -198,6 +201,15 @@ float4 PSMain(PSInput input) : SV_Target0 {
     float ssrConfidence;
     float3 ssrColor = marchSSR(input.worldPos + float3(0.0, 2.0, 0.0), R, ssrConfidence);
     float3 reflection = lerp(skyRefl, ssrColor, ssrConfidence);
+    // When RT reflections are active this texture was traced specifically for
+    // the displaced water receiver immediately before this pass. Alpha is the
+    // receiver/roughness validity gate; it fades cleanly at banks. Keep a
+    // confident SSR hit because it carries the full raster material/lighting;
+    // RT fills the off-screen, occluded and screen-edge gaps, while IBL fills
+    // a true ray miss. This is a quality hierarchy, not additive energy.
+    float4 traced = rtReflection.SampleLevel(rtReflectionSampler, screenUV, 0);
+    float tracedWeight = saturate(traced.a * rtParams.x * (1.0 - ssrConfidence));
+    reflection = lerp(reflection, traced.rgb * misc.w * rtParams.y, tracedWeight);
 
     // Sun glint: tight Blinn lobe over the perturbed normal, Fresnel-scaled
     // at the half-vector so a top-down view doesn't sparkle.

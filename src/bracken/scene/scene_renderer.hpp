@@ -358,8 +358,12 @@ private:
     // frame's unjittered matrices.
     [[nodiscard]] bool render_depth_prepass(const FramePacket& frame, const CameraState& draw_camera);
     /// `base` when this frame's prepass writes velocity only, its G-buffer
-    /// twin when the normal+roughness attachment is live.
+    /// twin when the oct-normal/roughness/metallic attachment is live.
     [[nodiscard]] gpu::PipelineType prepass_pipeline(gpu::PipelineType base) const;
+    /// Bind the mesh's metallicRoughness map + push PrepassGBufferUniforms for
+    /// one G-buffer prepass draw. Shared by all three model walks so the
+    /// prepass cannot classify a surface differently from the forward pass.
+    void push_prepass_gbuffer_material(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const Mesh& mesh);
     void prepass_draw_instanced(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
                                 const gpu::PrepassCameraUniforms& camera_uniforms);
     void prepass_draw_static_models(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
@@ -489,7 +493,6 @@ private:
     // off by default and nothing is built unless one is on.
     std::unique_ptr<render::RtRenderer> rt_renderer_; // created in init()
     bool frame_rt_shadows_active_ = false;
-    SDL_GPUTexture* frame_rt_reflection_texture_ = nullptr;
     /// Normal+roughness G-buffer for ray-traced reflections. Allocated only
     /// while reflections are on, and released the moment they go off — a game
     /// that never enables them never pays for a screen-sized target.
@@ -498,10 +501,14 @@ private:
     /// whether the prepass draws must use the *GBuffer pipeline variants: a
     /// pass and its pipelines must agree on the attachment count.
     bool frame_prepass_gbuffer_ = false;
-    /// The roughness cutoff this frame's reflection pass used, or 0 when it
-    /// did not run. The forward shaders read it to drop their IBL specular
-    /// exactly where a traced reflection will replace it.
+    /// The roughness handover window this frame's reflection pass used, or 0
+    /// when it did not run (max_roughness == 0 is the shaders' "reflections
+    /// off" encoding). The forward shaders scale their IBL specular lobe by
+    /// one minus the traced weight computed from these two, using the same
+    /// function the compute pass writes into its alpha
+    /// (shaders/reflection_gate.hlsli), so the two sum to one.
     float frame_rt_reflection_max_roughness_ = 0.0f;
+    float frame_rt_reflection_fade_start_ = 0.0f;
     /// Whether the BLAS set has been built, and whether it was built with the
     /// per-triangle attributes reflections need. Both drive the lazy (re)build
     /// in ensure_raytracing_scene.

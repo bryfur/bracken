@@ -11,7 +11,7 @@ using bracken::scene::has;
 // DrawFlags replaced two adjacent `bool` parameters on draw_model/draw_skinned
 // whose transposition compiled silently and changed the image. These pin the
 // two properties that make the replacement safe: the bits are distinct and
-// stable (they are hashed into the packet digest), and `has()` answers about
+// stable (the word is stored in the frame packet), and `has()` answers about
 // exactly one of them at a time.
 
 TEST(DrawFlags, BitsAreDistinctAndStable) {

@@ -84,10 +84,11 @@ const char* const ROOTS[] = {
 // simply not a fact about a file we ship.
 const char* const EXTERNAL[] = {
     "imgui", "Jolt/", "tiny_gltf", "stb_", "json.hpp", "SDL_gpu.h", "SDL3/", "benchmark/", "gtest/",
-    // Generated at asset-build time by tools/build_medieval_assets.py; the raw
-    // packs and their outputs are untracked (CLAUDE.md says so explicitly).
-    "assets/",
 };
+// NOTE: "assets/" used to be exempted here, because the raw packs and their
+// outputs were untracked. Since 2026-08-01 examples/playground/assets/ is
+// tracked in git and holds only files the playground references by name, so
+// asset citations are checkable like any other and are no longer excused.
 
 // Files the docs name as an EXAMPLE of something the reader would create. They
 // are supposed not to exist; that is the whole point of the passage. Keep this

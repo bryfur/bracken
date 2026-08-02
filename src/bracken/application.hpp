@@ -446,26 +446,6 @@ protected:
     /** The pinned timestep, or `std::nullopt` when timing is wall-clock. */
     [[nodiscard]] std::optional<float> fixed_timestep() const { return fixed_timestep_; }
 
-    /** Accumulate a running fingerprint of every frame this run describes.
-     *
-     *  Each sealed packet is hashed (see scene/packet_digest.hpp) after the
-     *  sim job joins and before it renders, and folded into a running value.
-     *  Two runs that describe the same frames produce the same number, so it
-     *  works as an exact regression gate — unlike render statistics or a
-     *  screenshot, which sit downstream of the GPU and move for driver
-     *  reasons that have nothing to do with a code change.
-     *
-     *  Pair it with set_fixed_timestep(): without a pinned timestep the frames
-     *  themselves differ run-to-run and the digest is expected to differ too.
-     *
-     *  Off by default — it walks every command of every frame, which a
-     *  shipping game should not pay for. Tier: main-thread. */
-    void set_packet_digest_enabled(bool enabled) { packet_digest_enabled_ = enabled; }
-
-    /** The accumulated frame fingerprint, or 0 if digesting was never enabled.
-     *  Tier: main-thread, or sim-stage/fence (never written mid-render). */
-    [[nodiscard]] uint64_t packet_digest() const { return packet_digest_accum_; }
-
     /** Capture the next rendered frame (UI included) to a PNG. The capturing
      *  frame blocks on the GPU — integration tests and debug only. Tier:
      *  sim-stage or main thread — the request is deferred and forwarded to
@@ -557,10 +537,6 @@ private:
     // set_fixed_timestep(). Main-thread only; read at kick.
     std::optional<float> fixed_timestep_;
 
-    // Rolling frame fingerprint. Zero until enabled, then folded once per
-    // joined packet — see set_packet_digest_enabled().
-    bool packet_digest_enabled_ = false;
-    uint64_t packet_digest_accum_ = 0;
     float fps_ = 0.0f;
     // Phase timings (EMA-smoothed, alpha 0.2 — see sim_ms()). Written at the
     // fence on the main thread with no sim in flight; read from anywhere.

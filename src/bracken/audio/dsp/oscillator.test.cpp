@@ -1,4 +1,3 @@
-#if BRACKEN_SYNTH
 
 #include <gtest/gtest.h>
 
@@ -145,4 +144,3 @@ TEST(Oscillator, ResetPhaseMakesRepeatedNotesIdentical) {
     EXPECT_EQ(first, render(o, 256));
 }
 
-#endif // BRACKEN_SYNTH

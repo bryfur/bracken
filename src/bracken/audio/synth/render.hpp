@@ -1,6 +1,5 @@
 #pragma once
 
-#if BRACKEN_SYNTH
 
 #include "bracken/audio/audio_clip.hpp"
 #include "bracken/audio/audio_format.hpp"
@@ -53,4 +52,3 @@ namespace bracken::audio::synth {
 
 } // namespace bracken::audio::synth
 
-#endif // BRACKEN_SYNTH

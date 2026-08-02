@@ -30,7 +30,8 @@ cbuffer GrassLightingUniforms {
     float3 ambientGround;
     float screenAOTexelY;
     float iblEnabled;      // 1 = sky IBL ambient (samplers 3-5), 0 = hemisphere fallback
-    float3 _padIbl;
+    float rtShadowEnabled; // 1 = traced sun visibility replaces the cascades
+    float2 _padIbl;
 };
 
 [[vk::binding(1, 3)]]
@@ -83,13 +84,18 @@ Texture2D<float4> iblBrdfLut;
 [[vk::combinedImageSampler]][[vk::binding(5, 2)]]
 SamplerState iblBrdfLutSampler;
 
+[[vk::combinedImageSampler]][[vk::binding(6, 2)]]
+Texture2D<float> rtShadowTexture;
+[[vk::combinedImageSampler]][[vk::binding(6, 2)]]
+SamplerState rtShadowSampler;
+
 #include "shadow_common.hlsli"
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
-// Cluster SSBOs follow this shader's 7 fragment samplers in set 2 (slots
-// 0-5 above + the local-shadow atlas at 6, declared by the include).
-#define CLUSTER_SSBO_BINDING_BASE 7
+// Cluster SSBOs follow this shader's 8 fragment samplers in set 2 (slots
+// 0-6 above + the local-shadow atlas at 7, declared by the include).
+#define CLUSTER_SSBO_BINDING_BASE 8
 #include "cluster_lighting.hlsli"
 
 static const float GRASS_METALLIC  = 0.0;
@@ -102,6 +108,10 @@ float4 PSMain(PSInput input) : SV_Target {
     float3 L = normalize(-lightDir);
 
     float shadow = calcShadow(input.worldPos, N, L, input.viewDepth, input.position.xy);
+    if (rtShadowEnabled > 0.5) {
+        float2 rtUV = input.position.xy * float2(screenAOTexelX, screenAOTexelY);
+        shadow = rtShadowTexture.SampleLevel(rtShadowSampler, rtUV, 0).r;
+    }
 
     // Half-Lambert wraps soft shading around thin grass surfaces.
     float halfLambert = dot(N, L) * 0.5 + 0.5;

@@ -3,6 +3,14 @@
 Status: proposal, awaiting owner approval of scope.
 Baseline verified 2026-07-30 on branch `refactor/full-scale` at `1b3fcc6`.
 
+> **Historical document — do not follow its commands verbatim.** It is kept as
+> the record of what each phase did and why. Two things it relies on no longer
+> exist (2026-08-01): the packet digest (`scene::packet_digest`, every
+> `packet_digest=0x...` gate below) was deleted, and the `rel`/`bench`/`tsan`/
+> `asan` build trees were collapsed into the single `build/` tree, so every
+> `cmake --preset <x>` / `build-<x>/` invocation here needs to be a `-D` flag on
+> `build/` instead. See README.md and docs/user_guide.md for the current shape.
+
 ---
 
 ## 1. Thesis

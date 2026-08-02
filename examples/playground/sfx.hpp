@@ -1,6 +1,5 @@
 #pragma once
 
-#if BRACKEN_SYNTH
 
 #include "bracken/audio/audio_engine.hpp"
 
@@ -27,4 +26,3 @@ struct SfxBank {
 
 } // namespace playground
 
-#endif // BRACKEN_SYNTH

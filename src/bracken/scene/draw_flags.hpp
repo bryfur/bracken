@@ -18,9 +18,8 @@ namespace bracken::scene {
  * bool or to an integer, so `if (flags)` does not compile. `has(f, None)` is
  * false by construction — asking "is nothing set?" is `f == DrawFlags::None`.
  *
- * The stored word is part of the frame packet's byte-deterministic layout;
- * scene/packet_digest.cpp hashes each named bit separately (see the note
- * there) — a NEW flag must be added to that hash or it will not be gated.
+ * The stored word is part of the frame packet's byte-deterministic layout, so
+ * the bit values are pinned by draw_flags.test.cpp and must not be renumbered.
  */
 enum class DrawFlags : uint32_t {
     /** Default: instanced when the renderer can batch it, fogged with the frame. */

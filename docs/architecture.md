@@ -32,7 +32,7 @@ Root namespace `bracken`, one sub-namespace per module.
 | `systems/` | `systems` | `CameraController` / `CameraSystem` |
 | `effects/` | `bracken` + `systems` + `render` | the particle-effect triad, together at last: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage simulation), `EffectRenderer` + `particle_transform.hpp` (drawing). Namespaces are unchanged — the directory groups the feature, not the namespace |
 | `procedural/` | `procedural` | `tree_generator` (ez-tree algorithm), `rock_generator` (SDF + marching cubes) |
-| `audio/` | `audio` + `audio::dsp` + `audio::synth` + `audio::music` | SDL3 playback device, a lock-free mixer, 3D positional voices and PCM clips (`audio_clip.hpp`), plus a software synthesizer: oscillators / ADSR / state-variable filter (`dsp/`), polyphonic voices and patches (`synth/`), and a sample-accurate song sequencer (`music/`). The synth half is compiled out by `BRACKEN_ENABLE_SYNTH=OFF`. This is the only subsystem with a thread the engine does not own — see "Audio threading" |
+| `audio/` | `audio` + `audio::dsp` + `audio::synth` + `audio::music` | SDL3 playback device, a lock-free mixer, 3D positional voices and PCM clips (`audio_clip.hpp`), plus a software synthesizer: oscillators / ADSR / state-variable filter (`dsp/`), polyphonic voices and patches (`synth/`), and a sample-accurate song sequencer (`music/`). This is the only subsystem with a thread the engine does not own — see "Audio threading" |
 | `audio/dsp/` | `audio::dsp` | the primitives every voice is built from: a band-limited (PolyBLEP) oscillator, an ADSR envelope, and a Chamberlin state-variable filter. Header-only, no device, no allocation — unit-testable on their own |
 | `audio/synth/` | `audio::synth` | `Instrument` (a patch: two oscillators, envelope, filter, pan — plain data like `EffectDefinition`), `Voice` (one sounding note, holding a *copy* of its patch so a live edit cannot race the audio thread) and `Synth` (fixed 32-voice polyphony with release-first voice stealing) |
 | `audio/music/` | `audio::music` | `Song`/`Track`/`Pattern`/`Step` tracker-style data, and `Sequencer` — sample-accurate playback that splits a buffer at a step boundary rather than rounding to it, so output is bit-identical at any device buffer size |
@@ -44,7 +44,7 @@ Root namespace `bracken`, one sub-namespace per module.
 | `navigation/` | `nav` | `NavGrid` — walkability sampled from a height function, plus A* with string-pulled paths. A grid rather than a polygon navmesh: it is built from the height function the engine already has and is trivially inspectable; the limitation (one height per cell, so no bridges over roads) is stated rather than hidden |
 | `physics/` | `physics` | `PhysicsWorld` (glm-only pimpl over vendored **Jolt Physics** — linked PRIVATE, Jolt never in public headers). `physics/internal/` holds the `JoltJobSystem` bridge onto `core::jobs::JobSystem` — the one header in the tree that includes Jolt (see "Physics" below) |
 | `dev/` | `dev` | `DevUI` — the Dear ImGui developer overlay (F10 in the playground) — and `dev_panels` (the built-in Stats / Environment / Graphics / Camera panels). Compiles to a no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`; ImGui appears only in `dev/*.cpp`, never in a header |
-| `testing/` | `testing` | `frame_test.hpp` — `TestFrame` + `FrameAccess`, the headless frame fixture published **for host games**: build a frame, seal it, read back typed views and the packet digest with no GPU, window or SDL. Header-only; nothing in the engine's production path includes it |
+| `testing/` | `testing` | `frame_test.hpp` — `TestFrame` + `FrameAccess`, the headless frame fixture published **for host games**: build a frame, seal it, read back typed views with no GPU, window or SDL. Header-only; nothing in the engine's production path includes it |
 | `shaders/` | — | HLSL sources → SPIR-V at build time; see [shaders/README.md](../src/bracken/shaders/README.md) |
 
 ### Module layering
@@ -476,8 +476,10 @@ members are written mid-frame, after the camera/frustum state is final —
 `frame_ao_texture_` (GTAO publishes its output — **only** GTAO's, or the 1×1
 white dummy) and
 `frame_shadow_uniforms_` — and therefore cannot live in a const struct built
-before those passes run. The ray-tracing passes publish their own
-`frame_rt_shadow_texture_` / `frame_rt_reflection_texture_` alongside them.
+before those passes run. The ray-tracing shadow pass publishes
+`frame_rt_shadow_texture_` alongside them. Reflections do not publish a
+frame-scoped sampler: their reduced-resolution radiance is consumed
+immediately by the full-resolution resolve pass.
 
 ### Pass order inside `SceneRenderer::render_frame`
 
@@ -496,15 +498,19 @@ one linear script in `render_frame`:
 
 The depth prepass writes **one** colour attachment (RG16F velocity) normally,
 and **two** when ray-traced reflections are on: the second is an RGBA8
-normal+roughness G-buffer (RGB = world normal encoded to [0,1], A = linear
-roughness) that `render/rt_renderer.hpp` needs to decide which pixels are
-smooth enough to trace. Because a render pass and every pipeline used inside it
+normal/material G-buffer (RG = octahedral world normal, B = perceptual
+roughness, A = metallic) that `render/rt_renderer.hpp` needs to decide which
+pixels are smooth enough to trace and to evaluate the receiver BRDF. Model
+variants sample the glTF metallic-roughness texture here, so eligibility uses
+the final material rather than merely its scalar factors. Because a render
+pass and every pipeline used inside it
 must agree on the attachment count, this is not a runtime flag — enabling
 reflections swaps the whole prepass onto the `DepthPrepass*GBuffer` rows, and a
 game that leaves reflections off never creates them or allocates the target.
-Grass and alpha-MASK foliage write a constant roughness of 1 into it and no
-normal at all: they are never mirror surfaces, so the reflection pass skips
-those pixels without tracing.
+Grass, terrain and alpha-MASK foliage write roughness 1: they are not eligible
+receivers, so both the trace and full-resolution resolve reject them.
+Alpha-BLEND draws do not participate in the prepass and keep their full IBL
+lobe.
 
 The four G-buffer vertex shaders share one `.hlsli` body with their plain
 counterparts, compiled twice (`BRACKEN_PREPASS_GBUFFER`). Their `SV_Position`
@@ -640,11 +646,12 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    forward pass, outside any render pass (a compute pass requires that).
    * The shadow pass writes an **R8 visibility mask** (1 = lit) at its own
      resolution — half res by default — published as
-     `frame_rt_shadow_texture_` and bound at **fragment sampler slot 10** of
-     `model.frag` / `model_instanced.frag`, which sample it with a NORMALIZED
-     UV. Traced visibility *replaces* the cascade result rather than
-     multiplying with it. Terrain and grass do not read it (they have no such
-     slot), so they keep CSM shadows while models take the traced answer.
+     `frame_rt_shadow_texture_`. Every opaque sun-shadow receiver samples it
+     with a NORMALIZED UV: model/instanced slot **10**, terrain slot **8**, and
+     grass slot **6**. Traced visibility *replaces* the cascade result rather
+     than multiplying with it, so terrain and grass still receive RT shadows
+     when CSM and GTAO are both disabled. A 1x1 white dummy is bound when the
+     feature is off.
    * That mask was formerly **RG8 with GTAO copied through in R**, so the
      forward stage could read both from one sampler. It is not, and must not
      be again: the copy indexed the AO texture with a texel coordinate scaled
@@ -657,7 +664,24 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
      reproduce (12 compiles, verified to 17). `frame_ao_texture_` therefore
      means exactly "GTAO's output, or the 1×1 white dummy" — nothing else.
    * `CLUSTER_SSBO_BINDING_BASE` is **12** for the two model fragment shaders
-     (0–9 material/AO/IBL, 10 the traced mask, 11 the local-shadow atlas).
+     (0–9 material/AO/IBL, 10 traced mask, 11 local-shadow atlas), **10** for
+     terrain (8/9), and **8** for grass (6/7).
+   * Scene depth (and the reflection G-buffer) are compute **sampled**
+     textures, bound with the RT renderer's point-clamp sampler. This is the
+     portable SDL3 GPU path for D32 depth: depth textures cannot legally carry
+     a compute-storage usage flag.
+   * The reflection compute pass traces only eligible quarter-resolution
+     receivers and writes raw incoming radiance plus a validity gate. Opaque
+     forward model draws smoothly hand their IBL specular lobe to tracing over
+     the configured roughness window; MASK/BLEND materials keep the complete
+     IBL result because tracing deliberately excludes them.
+   * Closest-hit attributes include a linear base-colour proxy baked at each
+     triangle centroid before the source sRGB pixels are released at upload.
+     It folds in vertex colour and `baseColorFactor`, so reflected hit shading
+     preserves authored texture colour without retaining all CPU textures or
+     requiring a bindless texture array. The proxy is built only for models
+     whose CPU geometry is retained for RT; shadows-only GPU memory remains 48
+     bytes per triangle and reflection attributes remain 64 bytes per triangle.
 8. **`HDROffscreen`** (the normal path whenever the post stack initialized) —
    the whole 3D scene renders into the linear-HDR offscreen target: terrain,
    grass, static/instanced/skinned models, skybox, sorted transparent
@@ -682,6 +706,16 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    (point lights select a face by the dominant axis of light→fragment; 4
    hardware-PCF taps + world-space normal/slope bias + smooth fade at the
    light radius — `cluster_lighting.hlsli`).
+8b. **`RT reflection resolve`** (only when a reflection trace was recorded) —
+   a full-resolution fullscreen pass adds the reduced-resolution radiance to
+   the HDR target before water and TAA. It re-tests the centre pixel's material
+   gate, then gathers four trace texels using bilinear, relative-linear-depth,
+   normal and roughness/metallic similarity weights. This prevents stone
+   reflections from bleeding across silhouettes or onto grass/foliage, and
+   evaluates the split-sum receiver BRDF at full resolution. Its blend state is
+   RGB `ONE + ONE` while preserving destination alpha. Running here makes the
+   result part of water refraction, TAA history, bloom and auto exposure rather
+   than a late, shimmering composite overlay.
 9. **`Water`** (only when a `render::WaterRenderer` region is configured via
    `SceneRenderer::water()->set_region(...)`) — two parts. **`WaterSim`**
    (recorded earlier, right after `IBL` upkeep, outside every render pass):
@@ -691,7 +725,15 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    `water()->add_ripple(pos, radius, strength)`, semi-Lagrangian advection
    along the region's flow, and an absorbing border band; the field covers a
    square `sim_extent` window around `sim_center`. **`Water` pass** (right
-   after `HDROffscreen`, before TAA): the HDR color + depth are snapshotted
+   after `HDROffscreen`, before TAA): when RT reflections are enabled, the
+   already-resolved quarter-resolution RT target is recycled first for a
+   water-specific trace. Each thread reconstructs the camera ray, intersects
+   the water plane, refines twice against the live simulation displacement,
+   rejects receivers outside the region or hidden behind opaque depth, and
+   traces from the finite-difference simulation + analytic-detail wave normal.
+   A miss or distance fade lowers alpha so the surface keeps its SSR/IBL
+   fallback; no water depth prepass or second RT texture is required. The HDR
+   color + depth are then snapshotted
    via `SDL_CopyGPUTextureToTexture` into screen-sized SAMPLER copies, then
    one render pass re-binds the live HDR color + depth with `LOAD` and draws
    the water surface grid (world-XZ float2 vertices, lifted to the water
@@ -702,9 +744,10 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    depth-proportional offset (samples landing on geometry in front of the
    surface fall back to the undistorted UV), Beer-Lambert absorption toward
    the region's deep color, screen-space reflections ray-marched against the
-   depth copy (on-screen geometry mirrors in the water; confidence-faded into
-   the IBL prefiltered specular cube as fallback — mip by
-   `reflection_roughness`, horizon-fallback when IBL is off),
+   depth copy (on-screen geometry mirrors in the water). Confident SSR hits
+   keep the full raster material/lighting, RT fills off-screen/occluded/edge
+   gaps, and true RT misses fall through to the IBL prefiltered specular cube
+   (mip by `reflection_roughness`, horizon fallback when IBL is off),
    Schlick fresnel, a fresnel-scaled sun glint, shoreline + sim-crest foam,
    a depth-feathered waterline, and the shared `fog.hlsli` atmospheric fog.
    Normals = finite-differenced sim ripples + analytic beat-frequency detail
@@ -808,8 +851,8 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
   `gpu/pipeline_config_golden.inc` — a text golden captured from the
   hand-written creators that preceded the table — and additionally pins those
   depth rules. It is the only mechanical check in the tree that sees GPU
-  *state*; the packet digest hashes what the host described, not what the GPU
-  was told to do.
+  *state*: a row with the wrong depth compare surfaces nowhere else until it
+  shows up as a subtly wrong image.
 - **`PipelineRegistry`** (`gpu/pipeline_registry.hpp`) is the cache and
   lifecycle around that catalogue, and names no pipeline itself. It lazily
   creates and caches one `GPUPipeline` per `PipelineType` (including the
@@ -818,6 +861,7 @@ instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
   `DepthPrepass*GBuffer` twins (below), the 8 `*DepthEqual`
   forward variants used after the prepass, the
   `GTAO`/`GTAOTemporal`/`GTAOUpsample`/`BlurAO` AO pipelines, the
+  `RtReflectionResolve` material-guided HDR additive pass, the
   `TaaResolve`/`TaaSharpen` post pipelines, the 4 IBL prefilter
   pipelines (`SkyCapture`/`IblSpecularPrefilter`/`IblIrradiance`/
   `IblBrdfLut`) that render into cubemap faces, and `LocalShadowClear` —
@@ -1074,10 +1118,13 @@ so here is the mechanism for each claim:
   continues emitting (Application's own sim tail does exactly that, and the
   join is what makes it safe). What it detects instead is genuine **overlap**
   — two threads inside the lane's chain mutation at once, which is the case
-  that corrupts the chunk chain. Debug builds only.
+  that corrupts the chunk chain. Compiled into every build: the detector's
+  `std::atomic<std::thread::id>` member is part of `Lane`'s layout, and making
+  it conditional made `sizeof(Lane)` — and `sizeof(FramePacket)`, via the
+  `Arena` that has the same pattern — depend on the including TU's flags.
 - **Host-boundary preconditions** are a separate mechanism and are **live in
   release**: `BRACKEN_CONTRACT` (`core/assert.hpp`,
-  `-DBRACKEN_ENABLE_CONTRACTS=OFF` to remove). It guards what a *game* does to
+  no switch removes them). It guards what a *game* does to
   the engine — reading a `FramePacket` before seal, sealing twice, emitting
   after seal, an out-of-range lane index, and every `Application` rendering-
   facade member called before `init_renderer()` (those dereferenced
@@ -1335,20 +1382,6 @@ is a review defect, as is a mutex anywhere in the frame hot path (plan §7).
 Things that look functional but aren't, or fail quietly — check here before
 debugging "why is this value zero / where did my draw go":
 
-- **The ray-tracing passes bind the scene depth as a compute STORAGE texture
-  it was not created for.** `SDL_gpu.h` says a texture bound with
-  `SDL_BindGPUComputeStorageTextures` must carry
-  `SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ`; `SDL_gpu.c` separately asserts
-  that a **depth** texture's usage "cannot contain any flags except for
-  `DEPTH_STENCIL_TARGET` and `SAMPLER`" and fails creation outright if it
-  does (measured — the renderer comes up with no depth buffer). The two rules
-  are mutually exclusive for `D32_FLOAT`, so `GPUTexture::create_depth` omits
-  the flag and the binding works only because the Metal backend tolerates it.
-  A Vulkan run with validation will flag it; D3D12 may reject it. The fix is
-  to take depth as a SAMPLED texture in `rt_shadow.comp.hlsl` /
-  `rt_reflection.comp.hlsl` (which the existing `SAMPLER` usage already
-  permits) with a point-clamp sampler, as `exposure_histogram.comp.hlsl`
-  already does for the scene colour.
 - **GPU-side per-pass timings do not exist** — SDL3 has no timestamp query
   API, so `PassTiming::gpu_ms` is `nullopt` (not zero). `PassTiming::cpu_ms`
   IS real: the CPU cost of recording that pass. Do not read it as GPU cost.

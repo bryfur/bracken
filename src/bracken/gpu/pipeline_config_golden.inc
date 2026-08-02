@@ -32,7 +32,7 @@ SkinnedModel
   vattr     location=6 slot=0 format=FLOAT4 offset=68
 Terrain
   vs        terrain.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
-  fs        terrain.frag.spv samplers=9 storage_textures=0 storage_buffers=4 uniform_buffers=3
+  fs        terrain.frag.spv samplers=10 storage_textures=0 storage_buffers=4 uniform_buffers=3
   raster    primitive=TRIANGLELIST fill=FILL cull=BACK front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -97,7 +97,7 @@ Particle
   vattr     location=4 slot=0 format=FLOAT4 offset=48
 Grass
   vs        grass.vert.spv samplers=2 storage_textures=0 storage_buffers=1 uniform_buffers=1
-  fs        grass.frag.spv samplers=7 storage_textures=0 storage_buffers=4 uniform_buffers=3
+  fs        grass.frag.spv samplers=8 storage_textures=0 storage_buffers=4 uniform_buffers=3
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -209,9 +209,16 @@ BlurAO
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=false write=false compare=GREATER_OR_EQUAL stencil=false
   targets   blend=None color=R8_UNORM has_depth=false depth=D32_FLOAT samples=1
+RtReflectionResolve
+  vs        fullscreen.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=0
+  fs        rt_reflection_resolve.frag.spv samplers=3 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
+  bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
+  depth     test=false write=false compare=GREATER_OR_EQUAL stencil=false
+  targets   blend=AdditivePreserveAlpha color=R16G16B16A16_FLOAT has_depth=false depth=D32_FLOAT samples=1
 Composite
   vs        fullscreen.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=0
-  fs        composite.frag.spv samplers=5 storage_textures=0 storage_buffers=1 uniform_buffers=1
+  fs        composite.frag.spv samplers=4 storage_textures=0 storage_buffers=1 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=false write=false compare=GREATER_OR_EQUAL stencil=false
@@ -543,7 +550,7 @@ InstancedModelDoubleSidedDepthEqual
   vattr     location=4 slot=0 format=FLOAT4 offset=48
 TerrainDepthEqual
   vs        terrain.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
-  fs        terrain.frag.spv samplers=9 storage_textures=0 storage_buffers=4 uniform_buffers=3
+  fs        terrain.frag.spv samplers=10 storage_textures=0 storage_buffers=4 uniform_buffers=3
   raster    primitive=TRIANGLELIST fill=FILL cull=BACK front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=false compare=EQUAL stencil=false
@@ -555,7 +562,7 @@ TerrainDepthEqual
   vattr     location=3 slot=0 format=FLOAT3 offset=36
 GrassDepthEqual
   vs        grass.vert.spv samplers=2 storage_textures=0 storage_buffers=1 uniform_buffers=1
-  fs        grass.frag.spv samplers=7 storage_textures=0 storage_buffers=4 uniform_buffers=3
+  fs        grass.frag.spv samplers=8 storage_textures=0 storage_buffers=4 uniform_buffers=3
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=false compare=EQUAL stencil=false
@@ -588,7 +595,7 @@ DepthPrepassInstancedModelMasked
   vattr     location=1 slot=0 format=FLOAT2 offset=24
 DepthPrepassModelGBuffer
   vs        prepass_model_gbuffer.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
-  fs        prepass_gbuffer.frag.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        prepass_gbuffer.frag.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=BACK front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -597,9 +604,10 @@ DepthPrepassModelGBuffer
   vbuffer   slot=0 pitch=64 rate=VERTEX step=0
   vattr     location=0 slot=0 format=FLOAT3 offset=0
   vattr     location=1 slot=0 format=FLOAT3 offset=12
+  vattr     location=2 slot=0 format=FLOAT2 offset=24
 DepthPrepassModelDoubleSidedGBuffer
   vs        prepass_model_gbuffer.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
-  fs        prepass_gbuffer.frag.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        prepass_gbuffer.frag.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -608,9 +616,10 @@ DepthPrepassModelDoubleSidedGBuffer
   vbuffer   slot=0 pitch=64 rate=VERTEX step=0
   vattr     location=0 slot=0 format=FLOAT3 offset=0
   vattr     location=1 slot=0 format=FLOAT3 offset=12
+  vattr     location=2 slot=0 format=FLOAT2 offset=24
 DepthPrepassSkinnedModelGBuffer
   vs        prepass_skinned_gbuffer.vert.spv samplers=0 storage_textures=0 storage_buffers=2 uniform_buffers=1
-  fs        prepass_gbuffer.frag.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        prepass_gbuffer.frag.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=BACK front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -621,9 +630,10 @@ DepthPrepassSkinnedModelGBuffer
   vattr     location=1 slot=0 format=UBYTE4 offset=64
   vattr     location=2 slot=0 format=FLOAT4 offset=68
   vattr     location=3 slot=0 format=FLOAT3 offset=12
+  vattr     location=4 slot=0 format=FLOAT2 offset=24
 DepthPrepassSkinnedModelDoubleSidedGBuffer
   vs        prepass_skinned_gbuffer.vert.spv samplers=0 storage_textures=0 storage_buffers=2 uniform_buffers=1
-  fs        prepass_gbuffer.frag.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        prepass_gbuffer.frag.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -634,9 +644,10 @@ DepthPrepassSkinnedModelDoubleSidedGBuffer
   vattr     location=1 slot=0 format=UBYTE4 offset=64
   vattr     location=2 slot=0 format=FLOAT4 offset=68
   vattr     location=3 slot=0 format=FLOAT3 offset=12
+  vattr     location=4 slot=0 format=FLOAT2 offset=24
 DepthPrepassInstancedModelGBuffer
   vs        prepass_instanced_gbuffer.vert.spv samplers=0 storage_textures=0 storage_buffers=1 uniform_buffers=1
-  fs        prepass_gbuffer.frag.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        prepass_gbuffer.frag.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=BACK front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -645,9 +656,10 @@ DepthPrepassInstancedModelGBuffer
   vbuffer   slot=0 pitch=64 rate=VERTEX step=0
   vattr     location=0 slot=0 format=FLOAT3 offset=0
   vattr     location=1 slot=0 format=FLOAT3 offset=12
+  vattr     location=2 slot=0 format=FLOAT2 offset=24
 DepthPrepassInstancedModelDoubleSidedGBuffer
   vs        prepass_instanced_gbuffer.vert.spv samplers=0 storage_textures=0 storage_buffers=1 uniform_buffers=1
-  fs        prepass_gbuffer.frag.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        prepass_gbuffer.frag.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -656,9 +668,10 @@ DepthPrepassInstancedModelDoubleSidedGBuffer
   vbuffer   slot=0 pitch=64 rate=VERTEX step=0
   vattr     location=0 slot=0 format=FLOAT3 offset=0
   vattr     location=1 slot=0 format=FLOAT3 offset=12
+  vattr     location=2 slot=0 format=FLOAT2 offset=24
 DepthPrepassTerrainGBuffer
   vs        prepass_terrain_gbuffer.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
-  fs        prepass_gbuffer.frag.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        prepass_gbuffer_terrain.frag.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=0
   raster    primitive=TRIANGLELIST fill=FILL cull=BACK front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -701,7 +714,7 @@ DepthPrepassInstancedModelMaskedGBuffer
   vattr     location=1 slot=0 format=FLOAT2 offset=24
 Water
   vs        water.vert.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
-  fs        water.frag.spv samplers=4 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        water.frag.spv samplers=5 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=true write=true compare=GREATER_OR_EQUAL stencil=false
@@ -715,7 +728,7 @@ ExposureAdapt
 WaterSim
   cs        water_sim.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtShadow
-  cs        rt_shadow.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=4 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        rt_shadow.comp.spv entry=CSMain samplers=1 ro_textures=0 ro_buffers=4 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtReflection
-  cs        rt_reflection.comp.spv entry=CSMain samplers=0 ro_textures=2 ro_buffers=5 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        rt_reflection.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=5 rw_textures=1 rw_buffers=0 uniform_buffers=1
 )GOLDEN"

@@ -13,7 +13,7 @@
 //
 //   TestFrame    — the fixture. Owns (or borrows) a packet, hands you a
 //                  FrameSink to give to your own frame code, seals, and reads
-//                  back typed views plus the packet digest.
+//                  back typed views.
 //   FrameAccess  — the raw friend hatch: the engine's sim-stage tail and the
 //                  packet's lifecycle, as free functions. TestFrame is built
 //                  on it. Reach for it directly only when you are testing the
@@ -26,7 +26,6 @@
 //     my_game.describe_frame(frame.sink());     // your code, unchanged
 //     frame.seal();
 //     EXPECT_EQ(frame.draws().size(), 3u);
-//     EXPECT_EQ(frame.digest(), previous_digest);   // regression gate
 //
 // Header-only and GPU-free. Nothing in the engine's production path includes
 // it (checked by core/module_layering.test.cpp: no header outside testing/
@@ -36,7 +35,6 @@
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/frame_sink.hpp"
-#include "bracken/scene/packet_digest.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -104,11 +102,6 @@ struct FrameAccess {
  * binds to one you already have (a PacketRing slot, say). Either way the
  * builder is bound at construction, exactly as `Application` binds one per
  * frame, so the state machine sees the same transitions a real frame does.
- *
- * `digest()` is the same `scene::packet_digest` the smoke run prints: an exact
- * CPU-side hash of every sealed command. Pinning it in a game's test is the
- * cheapest possible regression gate on "does my game still describe the frame
- * it used to" — no GPU, no image comparison, no tolerance to tune.
  */
 class TestFrame {
 public:
@@ -184,9 +177,6 @@ public:
     [[nodiscard]] scene::FramePacket::BuildDiagnostics build_diagnostics() const {
         return packet_->build_diagnostics();
     }
-
-    /** Exact CPU-side hash of every sealed command — the smoke run's gate. */
-    [[nodiscard]] uint64_t digest() const { return scene::packet_digest(*packet_); }
 
 private:
     std::unique_ptr<scene::FramePacket> owned_; // null when borrowing

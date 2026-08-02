@@ -112,30 +112,30 @@ ctest --test-dir build --output-on-failure
 
 Tests live next to their unit as `*.test.cpp` and are auto-discovered.
 
-### Build lanes
+### One build tree
 
-`CMakePresets.json` defines five long-lived, coexisting trees. None is ever
-deleted or reconfigured to "switch" to another.
+`CMakePresets.json` defines exactly one tree, `build/`, and nothing ever
+deletes or reconfigures it. Sanitizers, build types and option overrides are
+`-D` flags you pass when you want them — not parallel trees that drift out of
+sync with each other and with the docs describing them.
 
-| Preset | Tree | Purpose |
-|---|---|---|
-| `default` | `build/` | Primary incremental tree. No build type → `-O0`, all asserts live. |
-| `rel` | `build-rel/` | RelWithDebInfo — the only lane that compiles the `NDEBUG` path. |
-| `bench` | `build-bench/` | Optimized. **Benchmark here**: numbers from `build/` are meaningless. |
-| `tsan` | `build-tsan/` | ThreadSanitizer — data races. Tests only. |
-| `asan` | `build-asan/` | Address + UB sanitizer — use-after-free, out-of-bounds. Tests only (`-fno-sanitize=enum`, see the user guide). |
+```bash
+# a sanitizer run, into the same tree, when you actually need one
+cmake -S . -B build -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread \
+                    -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+```
 
 ### Benchmarks
 
 ```bash
-cmake --preset bench && cmake --build build-bench
-./build-bench/src/bracken/bracken_benchmarks                          # all
-./build-bench/src/bracken/bracken_benchmarks --benchmark_filter=Anim  # subset
+./build/src/bracken/bracken_benchmarks                          # all
+./build/src/bracken/bracken_benchmarks --benchmark_filter=Anim  # subset
 ```
 
-`build/` has no `CMAKE_BUILD_TYPE`, so it compiles at `-O0` with arena
-poisoning and live thread-tier assertions — any timing measured there says
-nothing about the shipped engine. Micro-benchmarks live next to their unit as
+`build/` has no `CMAKE_BUILD_TYPE` by default, so it compiles at `-O0` with
+live thread-tier assertions — any timing measured that way says nothing about
+the shipped engine. Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo`
+before quoting a number (CMake warns if you forget). Micro-benchmarks live next to their unit as
 `*.bench.cpp` (Google Benchmark, auto-discovered) and cover the CPU hot paths: animation sampling/crossfade,
 IK, state machines, frustum culling, clustered light binning, particle
 updates, allocators, hashing, and procedural mesh generation.
@@ -155,10 +155,9 @@ orb-collector game that doubles as the engine's integration test. A simulated
 river runs along the west edge of the map (wade in to push ripples around). The village
 — a cobbled plaza ringed by six modular timber/stone buildings with glowing
 windows, chimney smoke, lanes, fences, and props — is assembled offline from a
-modular glTF asset pack by
-[`tools/build_medieval_assets.py`](examples/playground/tools/build_medieval_assets.py)
-into merged per-material `.glb`s (so the engine uploads each texture set
-exactly once). Only the character, orbs, and effect meshes are built in code —
+modular glTF asset pack into merged per-material `.glb`s (so the engine
+uploads each texture set exactly once), and those converted `.glb`s are what
+`examples/playground/assets/` carries. Only the character, orbs, and effect meshes are built in code —
 the buildings and props come from the building pack, and the forest ring,
 bushes, rocks, flowers, and grass tufts (which replace the engine's blade
 grass in this scene) come from a stylized nature pack, converted 1:1 with
@@ -166,8 +165,9 @@ their own materials. The scene dressing is hand-placed, area by area, in
 [`scene_layout.cpp`](examples/playground/scene_layout.cpp) — market corner,
 farm wheat field, cottage garden, campsite, rock outcrops, flower drifts, and
 a forest ring composed from designed grove stamps; only the grass-tuft ground
-cover is a procedural fill. Without the generated assets the playground falls
-back to a procedural-only scene (generator trees/rocks + engine blade grass). It deliberately touches every major subsystem: terrain
+cover is a procedural fill. On a sparse checkout without those assets the
+playground falls back to a procedural-only scene (generator trees/rocks +
+engine blade grass). It deliberately touches every major subsystem: terrain
 (splatmap-painted dirt lanes) + grass (exclusion zones under the paving) +
 skybox, `.glb` loading with full PBR materials, skinned animation driven by a
 state machine with foot IK and body lean, dynamic point/spot lights, particle
@@ -176,9 +176,6 @@ and runtime graphics-settings toggles (AO / bloom / fog / shadows / AA mode /
 IBL / local shadows on F1–F8).
 
 ```bash
-# one-time: unpack the raw asset pack into examples/playground/assets/, then
-python3 examples/playground/tools/build_medieval_assets.py
-
 ./build/examples/playground/playground            # play it (WASD, mouse)
 ./build/examples/playground/playground --smoke    # self-drive 240 frames, print stats, exit
 ```
@@ -191,15 +188,6 @@ verifies it isn't black or solid-color — a broken renderer that still hits
 60 fps can't pass. In the interactive game, F12 saves a screenshot; the
 underlying API is `Application::request_screenshot(path)` (final swapchain
 image, UI included, saved as PNG).
-
-It also prints `[smoke] packet_digest=0x...`, a 64-bit hash of every sealed
-`FramePacket` the run produced (`scene::packet_digest`). Because it is taken
-on the CPU side of the GPU boundary it is exact and driver-independent, and
-it is bit-identical at any `BRACKEN_WORKERS` — unlike the stat counters and
-the screenshot, which legitimately vary. It is the engine's regression gate:
-a change that should not alter what is drawn must leave it unchanged. The
-same function is public as `TestFrame::digest()` so your own game can pin the
-frames it describes in a unit test, with no GPU and no image comparison.
 
 ### Developer overlay
 

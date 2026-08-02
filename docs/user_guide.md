@@ -87,7 +87,6 @@ All options with their defaults (defined in the root `CMakeLists.txt` except the
 | `BRACKEN_PLAYGROUND_SMOKE_TEST` | `OFF` | Register `playground --smoke 240` as a ctest named `playground_smoke` (label `integration`, 180 s timeout). Needs a GPU + display, so off by default. |
 | `BRACKEN_ENABLE_DEV_UI` | `ON` | Build the Dear ImGui developer overlay (`bracken::dev::DevUI`). `OFF` compiles `DevUI` to a no-op stub and skips fetching/linking ImGui entirely. When `ON`, the engine defines `BRACKEN_DEV_UI=1` publicly (use it to guard panel bodies that call `ImGui::` directly). |
 | `BRACKEN_ENABLE_TRACY` | `OFF` | Fetch Tracy v0.11.1, link `TracyClient`, and define `BRACKEN_ENABLE_TRACY=1` publicly. OFF means zero overhead. |
-| `BRACKEN_ENABLE_SYNTH` | `ON` | Build the software synthesizer and music sequencer (`audio/dsp`, `audio/synth`, `audio/music`). `OFF` makes `AudioEngine::play_music` a no-op and compiles those headers out entirely — for a game shipping only recorded audio. Recorded-audio playback, the mixer and 3D positioning are unaffected. |
 | `BRACKEN_WERROR` | top-level: `ON`<br>as subproject: `OFF` | Treat warnings as errors on the four first-party targets (`bracken`, `bracken_tests`, `bracken_benchmarks`, `playground`). Warning flags are applied **PRIVATE**, so consuming a game via `add_subdirectory` never inherits them — and the default flips to `OFF` off-top-level so a new compiler release can't break your build. |
 
 Example — a lean "shipping-style" configure:
@@ -99,32 +98,30 @@ cmake -S . -B build -G Ninja \
   -DBRACKEN_ENABLE_DEV_UI=OFF
 ```
 
-(Do this in a *new* build directory if you already have one configured — remember the no-reconfigure rule for the existing `build/`.)
-
 Note: `BRACKEN_PLAYGROUND_SMOKE_TEST` is a root-level option, and the root `CMakeLists.txt` calls `enable_testing()` when *either* `BRACKEN_BUILD_TESTS` or `BRACKEN_PLAYGROUND_SMOKE_TEST` is `ON` — so the smoke ctest works even in a tests-off configure (turning it on without `BRACKEN_BUILD_EXAMPLES` gets a configure-time warning instead of a silently missing test).
 
-#### CMake presets: the five build lanes
+#### CMake presets: one build tree
 
-A `CMakePresets.json` (version 6) at the repo root defines five configure presets, one per long-lived build tree. They **coexist**; none is ever deleted or reconfigured to "switch" to another, and the no-clean-rebuild rule applies to each.
+A `CMakePresets.json` (version 6) at the repo root defines exactly one configure preset, `default`, pointing at `build/`. That is the whole story: Ninja, project-default options, **no `CMAKE_BUILD_TYPE`** → `-O0` with `NDEBUG` undefined, so every `BRACKEN_ASSERT` and thread-tier check is live. The preset exists to reproduce the standard configuration; it is *not* an invitation to delete an existing `build/` and start over.
 
-| Preset | Tree | What it is for |
-|---|---|---|
-| `default` | `build/` | The primary incremental tree: Ninja, project-default options, **no `CMAKE_BUILD_TYPE`** → `-O0` with `NDEBUG` undefined, so every `BRACKEN_ASSERT` and thread-tier check is live. It exists to reproduce the standard configuration; it is *not* an invitation to reconfigure an existing `build/` from scratch. |
-| `rel` | `build-rel/` | `RelWithDebInfo` — the **only** lane that compiles the `NDEBUG` path, where `BRACKEN_ASSERT` and the debug-only tier assertions vanish (`BRACKEN_CONTRACT` stays, by design). Run it before relying on an assert for correctness; it also surfaces UB that `-O0` papers over. |
-| `bench` | `build-bench/` | Optimized, benchmarks ON, examples OFF. **Benchmark here.** A timing taken in `build/` is measuring `-O0` with arena poisoning and live tier assertions and says nothing about the shipped engine. |
-| `tsan` | `build-tsan/` | ThreadSanitizer (`-fsanitize=thread` on compile and link), `RelWithDebInfo`, tests only. Run it whenever you touch concurrency code — the job system, an atomic, anything from `docs/multithreading_plan.md`. |
-| `asan` | `build-asan/` | Address + UndefinedBehavior sanitizer, tests only. Finds the class TSan cannot: use-after-free and out-of-bounds across the arena/frame allocators, the packet ring's retire-and-reuse cycle, and the job-system node pools. Built with **`-fno-sanitize=enum`**, deliberately: the engine bounds-checks enum parameters at the host boundary (`InputSnapshot::key_held` rejects a scancode outside `[0, SDL_SCANCODE_COUNT)`), and the only way to *test* such a guard is to hand it an out-of-range enumerator — which the `enum` check reports as UB in the test, not in the engine. Declining that one sub-check keeps the guards testable and costs nothing this lane exists for. |
+There used to be five coexisting trees (`build-rel/`, `build-bench/`, `build-tsan/`, `build-asan/`). They are gone. Five trees meant five configurations that could disagree with each other and with the docs describing them, four of which were stale at any given moment, and ~25 GB of duplicated dependency builds. Everything they did is a `-D` flag on the same tree:
+
+| Want | Flags |
+|---|---|
+| The `NDEBUG` path — `BRACKEN_ASSERT` and the debug-only tier assertions compile out (`BRACKEN_CONTRACT` stays, by design). Also surfaces UB that `-O0` papers over. | `-DCMAKE_BUILD_TYPE=RelWithDebInfo` |
+| A benchmark number worth quoting | `-DCMAKE_BUILD_TYPE=RelWithDebInfo` — CMake emits a configure warning if you build benchmarks without it |
+| ThreadSanitizer. Run it whenever you touch concurrency code — the job system, an atomic, anything from `docs/multithreading_plan.md`. | `-DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread` |
+| Address + UndefinedBehavior sanitizer. Finds the class TSan cannot: use-after-free and out-of-bounds across the arena/frame allocators, the packet ring's retire-and-reuse cycle, and the job-system node pools. | `-DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=enum -fno-omit-frame-pointer"` (plus the matching `_C_FLAGS` / `_EXE_LINKER_FLAGS`) |
 
 ```bash
-cmake --preset tsan                          # first configure only — slow: refetches/builds deps into build-tsan/
-cmake --build build-tsan                     # incremental thereafter
-ctest --test-dir build-tsan --output-on-failure
-
-cmake --preset asan                          # same shape
-cmake --build build-asan && ctest --test-dir build-asan --output-on-failure
+cmake -S . -B build -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread \
+                    -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+cmake --build build && ctest --test-dir build --output-on-failure
 ```
 
-Every non-`default` tree's first configure refetches SDL_shadercross/DXC just like any cold configure — expected, one-time. Keep the tree alive afterwards. Never delete or reconfigure the primary `build/` to "switch" lanes.
+`-fno-sanitize=enum` is deliberate: the engine bounds-checks enum parameters at the host boundary (`InputSnapshot::key_held` rejects a scancode outside `[0, SDL_SCANCODE_COUNT)`), and the only way to *test* such a guard is to hand it an out-of-range enumerator — which the `enum` check reports as UB in the test, not in the engine. Declining that one sub-check keeps the guards testable.
+
+Changing flags on `build/` is a rebuild, not a *clean* rebuild: the fetched dependency trees (SDL_shadercross/DXC, Jolt) survive, which is the expensive thing the no-clean-rebuild rule protects.
 
 ### Environment variables
 
@@ -161,12 +158,11 @@ ctest --test-dir build -L integration --output-on-failure
 ### Running the benchmarks
 
 ```bash
-cmake --preset bench && cmake --build build-bench                     # first time
-./build-bench/src/bracken/bracken_benchmarks                          # all
-./build-bench/src/bracken/bracken_benchmarks --benchmark_filter=Anim  # subset (regex)
+./build/src/bracken/bracken_benchmarks                          # all
+./build/src/bracken/bracken_benchmarks --benchmark_filter=Anim  # subset (regex)
 ```
 
-**Use the `bench` tree.** The binary also builds in `build/`, and its numbers there are meaningless: that tree has no `CMAKE_BUILD_TYPE`, so it is `-O0` with arena poisoning and every thread-tier assertion live. Micro-benchmarks live next to their unit as `*.bench.cpp` (auto-globbed, linked against `benchmark::benchmark_main`) and cover the CPU hot paths: animation sampling/crossfade, IK, state machines, frustum culling, clustered light binning, particle updates, allocators, hashing, and procedural mesh generation. Audit reports referencing benchmark results live in `docs/audits/`.
+**Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting a number.** By default `build/` has no build type, so it is `-O0` with every thread-tier assertion live and the timings are meaningless; CMake warns at configure time if benchmarks are on without a build type. Micro-benchmarks live next to their unit as `*.bench.cpp` (auto-globbed, linked against `benchmark::benchmark_main`) and cover the CPU hot paths: animation sampling/crossfade, IK, state machines, frustum culling, clustered light binning, particle updates, allocators, hashing, and procedural mesh generation. Audit reports referencing benchmark results live in `docs/audits/`.
 
 ### Profiling (Tracy)
 
@@ -199,7 +195,7 @@ Conventions your project inherits: **Y-up** coordinates (x,z ground plane), **re
 
 Headers under `src/bracken/<module>/internal/` are engine-private and may include vendored dependencies. That is where Jolt lives (`physics/internal/jolt_job_system.hpp`), and it is the mechanism — not merely the intention — behind `bracken::physics` being Jolt-free: `public_headers.test.cpp` fails the suite if any header outside an `internal/` directory transitively reaches Jolt, ImGui, tinygltf or stb_, or if `application.hpp` starts dragging the `gpu/` layer into every host TU. Each of the umbrella's headers is also compiled standalone by a generated target, so `#include "bracken/render/water_renderer.hpp"` as the first line of a fresh file always works.
 
-**Testing your frame code.** `#include "bracken/testing/frame_test.hpp"` gives you `bracken::testing::TestFrame`: build a frame through a `FrameSink`, `seal()`, and read back typed views plus the packet digest — no GPU, no window, no SDL. It is not part of the umbrella on purpose; it belongs to your test TUs, not your game.
+**Testing your frame code.** `#include "bracken/testing/frame_test.hpp"` gives you `bracken::testing::TestFrame`: build a frame through a `FrameSink`, `seal()`, and read back typed views — no GPU, no window, no SDL. It is not part of the umbrella on purpose; it belongs to your test TUs, not your game.
 
 The engine's public include directory is declared as `${PROJECT_SOURCE_DIR}/src` (`src/bracken/CMakeLists.txt`), which resolves to the engine's own root regardless of who the top-level project is — the three-line snippet above works verbatim from a consuming super-project, with no extra `target_include_directories` needed.
 
@@ -297,7 +293,7 @@ Render-side data (`SceneRenderer` stats, `graphics_settings()` via the built-in 
 
 ### The playground: canonical integration walkthrough
 
-`examples/playground/` is a complete medieval-village orb-collector demo and the engine's integration test. The village — a cobbled plaza ringed by six modular buildings, lanes, fences, and props — is assembled offline by `examples/playground/tools/build_medieval_assets.py` from a modular glTF asset pack (raw pack untracked under `assets/`): it merges each building/prop set into per-material `.glb`s so the engine uploads every texture set exactly once (the loader does not dedupe textures across meshes), bakes metres→world-units ×100, generates seamless terrain-layer textures, and emits `village_layout.h` (constexpr plaza/building/lane rects, chimney and door anchors) that the playground consumes for splatmap painting, grass exclusion, prop placement, push-out collision, and orb spots. Only the character, orbs, and effect meshes are **built in code**; the buildings/props come from the building pack and all flora — forest trees, bushes, ferns, rocks, flowers, and the grass tufts that replace the engine's blade grass in this scene — from a stylized nature pack (`assets/nature/`), converted 1:1 with their own materials (base color + normal + MASK alpha) as `nature_*.glb`. Placement is hand-authored, area by area, in `examples/playground/scene_layout.cpp` (`layout::build_layout()` returns village-metre placements the playground resolves to world transforms): plaza market corner, tavern/workshop/farm yards, cottage garden, campsite fire ring, lane-shoulder pebbles, meadow rock outcrops and flower drifts, and a forest ring composed from designed grove stamps with an outer sentinel band. Only the grass-tuft ground cover stays procedural (a jittered grid of tufts + clover over the meadow and forest floor). Without `assets/generated/` the playground compiles and runs a procedural-only fallback scene (generator trees/rocks + engine blade grass; the smoke test still passes). It deliberately touches every major subsystem: terrain + splatmap + grass exclusion + skybox, `.glb` loading with full PBR materials (base color / normal / metallic-roughness / ORM occlusion / emissive window glass / alpha-tested vines), skinned animation with a data-driven state machine plus foot IK and body lean, dynamic point/spot lights, particle effects (burst and continuous chimney smoke), 3D billboards, debug lines, UI text, the dev overlay, and runtime graphics-settings toggles. It also runs a **dynamic time-of-day + weather system** (`examples/playground/day_weather.*`): the sun animates around the clock (24-minute day by default) with elevation-keyed sun/ambient/fog colors — the engine sky supplies dusk scattering, stars, moon and night skyglow on its own — and an Auto weather machine drifts between clear/overcast/rain. Rain is a camera-following `spawn_volume` streak effect plus ray-cast impact splashes on terrain/props/roofs (via `physics::cast_ray`) and ripple impulses where drops land on the river. Everything is testable from the "Playground" dev panel (hour/speed/animate sliders, dawn/noon/dusk/midnight presets, weather mode + rain intensity), and two art hooks pin it for screenshots: `PLAYGROUND_TOD_HOUR=<0..24>` and `PLAYGROUND_WEATHER=clear|overcast|rain` (plain `--smoke` runs keep the legacy fixed environment for determinism).
+`examples/playground/` is a complete medieval-village orb-collector demo and the engine's integration test. The village — a cobbled plaza ringed by six modular buildings, lanes, fences, and props — was assembled offline from a modular glTF asset pack: the conversion merged each building/prop set into per-material `.glb`s so the engine uploads every texture set exactly once (the loader does not dedupe textures across meshes), baked metres→world-units ×100, generated seamless terrain-layer textures, and emitted `village_layout.h` (constexpr plaza/building/lane rects, chimney and door anchors) that the playground consumes for splatmap painting, grass exclusion, prop placement, push-out collision, and orb spots. Only the character, orbs, and effect meshes are **built in code**; the buildings/props come from the building pack and all flora — forest trees, bushes, ferns, rocks, flowers, and the grass tufts that replace the engine's blade grass in this scene — from a stylized nature pack, converted 1:1 with their own materials (base color + normal + MASK alpha) as `nature_*.glb`. Placement is hand-authored, area by area, in `examples/playground/scene_layout.cpp` (`layout::build_layout()` returns village-metre placements the playground resolves to world transforms): plaza market corner, tavern/workshop/farm yards, cottage garden, campsite fire ring, lane-shoulder pebbles, meadow rock outcrops and flower drifts, and a forest ring composed from designed grove stamps with an outer sentinel band. Only the grass-tuft ground cover stays procedural (a jittered grid of tufts + clover over the meadow and forest floor). The converted result is what `examples/playground/assets/` carries and all it carries: 52 `.glb`s, 4 terrain textures and `village_layout.h` (50 MB, tracked in git, every file referenced by name from `playground.cpp`). The ~2 GB of raw packs and the conversion script were removed on 2026-08-01, so these outputs are hand-maintained rather than reproducible from inputs in this tree. On a sparse checkout without them the playground compiles and runs a procedural-only fallback scene (generator trees/rocks + engine blade grass; the smoke test still passes). It deliberately touches every major subsystem: terrain + splatmap + grass exclusion + skybox, `.glb` loading with full PBR materials (base color / normal / metallic-roughness / ORM occlusion / emissive window glass / alpha-tested vines), skinned animation with a data-driven state machine plus foot IK and body lean, dynamic point/spot lights, particle effects (burst and continuous chimney smoke), 3D billboards, debug lines, UI text, the dev overlay, and runtime graphics-settings toggles. It also runs a **dynamic time-of-day + weather system** (`examples/playground/day_weather.*`): the sun animates around the clock (24-minute day by default) with elevation-keyed sun/ambient/fog colors — the engine sky supplies dusk scattering, stars, moon and night skyglow on its own — and an Auto weather machine drifts between clear/overcast/rain. Rain is a camera-following `spawn_volume` streak effect plus ray-cast impact splashes on terrain/props/roofs (via `physics::cast_ray`) and ripple impulses where drops land on the river. Everything is testable from the "Playground" dev panel (hour/speed/animate sliders, dawn/noon/dusk/midnight presets, weather mode + rain intensity), and two art hooks pin it for screenshots: `PLAYGROUND_TOD_HOUR=<0..24>` and `PLAYGROUND_WEATHER=clear|overcast|rain` (plain `--smoke` runs keep the legacy fixed environment for determinism).
 
 ```bash
 ./build/examples/playground/playground            # play it
@@ -312,7 +308,6 @@ File-by-file map:
 - `examples/playground/main.cpp` — argument parsing (`--smoke [frames]`, default 240; unknown args and invalid/non-positive frame counts exit 2), the exact `init_engine → start → run → stop → shutdown_engine` sequence shown above, and post-run screenshot verification.
 - `examples/playground/playground.hpp` / `.cpp` — the `PlaygroundGame : public bracken::Application` subclass; everything below.
 - `examples/playground/character.hpp` / `.cpp` — code-built assets: a skinned blocky biped (11 joints named to match the engine's default foot-IK bone names, four clips authored by sampling closures), an emissive orb, a shard mesh, and a smoke-puff mesh for particles.
-- `examples/playground/tools/build_medieval_assets.py` — the offline asset pipeline (see its header comment); re-run it after changing recipes/layout, then rebuild (CMake restages the outputs).
 
 What `on_init` does, in order (`examples/playground/playground.cpp`): `init_renderer(1600, 900, "bracken playground", WORLD, WORLD)` with an 8000×8000 world → `init_dev_ui()` + F10 toggle + a game panel → build a 257×257 procedural `Heightmap` and `set_heightmap(...)` → register models — code-built ones via `models().register_model(name, build_...())` (player, orb, shard, smoke puff) and the pack `.glb`s via `load_model` (village + props + `nature_*`; `TreeGenerator`/`RockGenerator` stand-ins register only in the fallback) → build the animation state machine (Idle/Walk/Run/Attack with `speed`/`attacking` parameters, clip indices bound once via `anim_sm_.bind_clips(...)`, parameter names resolved to indices once via `anim_sm_.param_index(...)` so nothing hashes per frame) → define two `EffectDefinition`s in code (a radial pickup burst and an arc attack slash — note the definitions are *members* because they **must outlive all spawned instances**) → apply the hand-authored scene layout + ground-cover carpet (`scatter_wilds`, backed by `scene_layout.cpp`) → configure the third-person `camera()` (terrain-height callback, distance, target).
 
@@ -2110,7 +2105,7 @@ Depth-only pipelines (shadow passes): set `config.color_format = SDL_GPU_TEXTURE
 
 ### The engine's pipeline cache: `PipelineRegistry`
 
-`PipelineRegistry` (`src/bracken/gpu/pipeline_registry.hpp`) creates and caches one `GPUPipeline` per `PipelineType` — 56 types covering scene, UI, shadow (including the local-shadow tile clear), water, post-processing (including the GTAO/GTAOTemporal/GTAOUpsample/BlurAO chain, the TAA resolve/sharpen pair, and the IBL prefilter passes), glTF material variants, and the depth-prepass/velocity + post-prepass depth-EQUAL variants — plus one `GPUComputePipeline` per `ComputePipelineType` (3: the auto-exposure histogram/adapt pair and the water wave sim) with the same lazy-create/preload/hot-reload lifecycle, via `get_compute_pipeline()`. What each of those pipelines *is* comes from its catalogue row (`gpu/pipeline_catalog.hpp`); the registry is the cache and lifecycle only. `SceneRenderer` owns one; get it via `scene_renderer.pipeline_registry()`.
+`PipelineRegistry` (`src/bracken/gpu/pipeline_registry.hpp`) creates and caches one `GPUPipeline` per `PipelineType` — 67 types covering scene, UI, shadow (including the local-shadow tile clear), water, post-processing (including the GTAO/GTAOTemporal/GTAOUpsample/BlurAO chain, the material-guided RT reflection resolve, the TAA resolve/sharpen pair, and the IBL prefilter passes), glTF material variants, and the depth-prepass/velocity + post-prepass depth-EQUAL variants — plus one `GPUComputePipeline` per `ComputePipelineType` (5: auto-exposure histogram/adapt, water wave sim, RT shadow and RT reflection) with the same lazy-create/preload/hot-reload lifecycle, via `get_compute_pipeline()`. What each of those pipelines *is* comes from its catalogue row (`gpu/pipeline_catalog.hpp`); the registry is the cache and lifecycle only. `SceneRenderer` owns one; get it via `scene_renderer.pipeline_registry()`.
 
 ```cpp
 #include "bracken/gpu/pipeline_registry.hpp"
@@ -2325,14 +2320,14 @@ The CPU-side bind calls map by slot, not by set:
 **Cluster-lighting include:** any scene fragment shader that wants clustered lights must define its sampler count before including `src/bracken/shaders/cluster_lighting.hlsli`, because the cluster SSBOs bind right after the samplers (the include `#error`s if you forget):
 
 ```hlsl
-// model.frag.hlsl has 11 fragment samplers (the last one is the local-shadow
-// atlas the include itself declares), so cluster SSBOs start at slot 11
-#define CLUSTER_SSBO_BINDING_BASE 11
+// model.frag.hlsl has 12 fragment samplers (the last one is the local-shadow
+// atlas the include itself declares), so cluster SSBOs start at slot 12
+#define CLUSTER_SSBO_BINDING_BASE 12
 #include "cluster_lighting.hlsli"
 ```
 
-Current values: `model.frag`/`model_instanced.frag` 11, `terrain.frag` 9,
-`grass.frag` 7. The include declares the local-shadow atlas + comparison
+Current values: `model.frag`/`model_instanced.frag` 12, `terrain.frag` 10,
+`grass.frag` 8. The include declares the local-shadow atlas + comparison
 sampler at `CLUSTER_SSBO_BINDING_BASE - 1` (your shader's LAST sampler slot)
 and a 4th storage buffer for the per-tile shadow slots, so
 `CLUSTER_SSBO_BINDING_BASE` = your in-file sampler count **plus one**.
@@ -2921,12 +2916,9 @@ Write your frame code against `scene::FrameSink&` (which is what `sim.frame()` r
 | `set_frame_timing(dt, time, index)` / `seal()` | what the engine does around `on_simulate` |
 | `draws()`, `skinned_draws()`, `point_lights()`, `spot_lights()`, `billboards()`, `debug_lines()`, `effect_spawns()`, `ui_commands()`, `ui_text()` | typed read-back of the sealed frame |
 | `build_diagnostics()` | what the fill refused (invalid handles, invalid palette ids, palettes over budget) |
-| `digest()` | the exact CPU-side hash of every sealed command |
 | `packet()` | the `FramePacket` itself |
 
 `TestFrame(packet)` binds to a packet you already own (a `PacketRing` slot, say) instead of allocating one; `TestFrame(lane_count)` gives you lanes for fan-out tests.
-
-**`digest()` is the cheapest regression gate you will ever add.** It is the same `scene::packet_digest` the playground's `--smoke` run prints: exact, driver-independent, and unaffected by anything that is not in the frame you described. Pin it in a test and any accidental change to what your game draws — a transposed `DrawFlags` bit, a light that moved, a UI string that picked up a wall-clock value — fails immediately, with no image comparison and no tolerance to tune.
 
 The header also exposes `testing::FrameAccess`, the friend hatch for the engine's sim-stage tail (`seal`, `set_frame_timing`, `alloc_effect_snapshot`, `set_engine_frame`) and for `FramePacket`'s lifecycle (`begin_fill`, `begin_consume`, `reset`, `reserve_block`). Those are private on their own types precisely so game code cannot reach them mid-frame; a test owns the whole lifecycle, so the capability is published here rather than left public everywhere.
 
@@ -4622,9 +4614,9 @@ Contracts worth knowing: `evaluatePBR` returns exactly zero when `NdotL <= 0` (n
 ## Water
 
 `render::WaterRenderer` draws flat water surfaces (rivers, ponds, lakes) with
-screen-space refraction, depth-based color absorption, prefiltered-sky
-reflections, a sun glint, shoreline foam — and an interactive compute-shader
-wave simulation you can push ripples into.
+screen-space refraction, depth-based color absorption, hybrid SSR/ray-traced/
+prefiltered-sky reflections, a sun glint, shoreline foam — and an interactive
+compute-shader wave simulation you can push ripples into.
 
 ### Setting up a water region
 
@@ -4675,20 +4667,23 @@ player's feet and occasional random rings).
 
 The sim is a 512² RG16F ping-pong compute pass at fixed 60 Hz substeps (≤4
 per frame). The surface pass snapshots the HDR color + depth once per frame
-(two texture copies) and draws one indexed grid. Both only run while a
-region is configured. There is no graphics-settings toggle — an unset region
-is the off switch.
+(two texture copies) and draws one indexed grid. With `rt_reflections` on, one
+additional quarter-resolution dispatch analytically intersects/refines water
+receivers against the live wave field; it reuses the opaque RT target after
+that signal has resolved, so it allocates no second reflection texture. Water
+work only runs while a region is configured. An unset region is the water off
+switch; `rt_reflections` independently controls the extra trace.
 
 ### Gotchas
 
 - The water pass runs after transparents/particles: where a particle or
   BLEND mesh overlaps water ON SCREEN and is closer to the camera, the water
   still overdraws it. Keep effects away from water, or accept the artifact.
-- Reflections are screen-space (SSR) over a sky-IBL fallback: geometry that
-  is on screen — banks, trees, buildings, the player — mirrors in the water;
-  rays that leave the screen or start from occluded content fall back to the
-  sky. Tune with `ssr_strength` (0 disables), `ssr_max_distance`,
-  `ssr_thickness`.
+- Reflections use a quality hierarchy: confident SSR keeps the full raster
+  material and lighting; with `rt_reflections` enabled, wave-normal RT fills
+  off-screen, occluded and screen-edge gaps; true RT misses/range fade fall
+  through to sky IBL. Tune SSR with `ssr_strength` (0 disables),
+  `ssr_max_distance`, `ssr_thickness`.
 - The interactive window (`sim_extent` around `sim_center`) should cover the
   stretch the player can actually reach; outside it the surface falls back to
   the analytic detail waves (the sim contribution fades at the window edge).
@@ -7544,18 +7539,48 @@ is on. Take either, both, or neither.
 - **Roughness gate.** Rough surfaces keep the prefiltered IBL probe, which is
   indistinguishable there and far cheaper.
 
+The half-resolution sun-visibility mask is consumed by every opaque receiver:
+models, instanced/skinned models, terrain, and grass. It replaces the CSM
+answer rather than multiplying it, so RT shadows still render on grass/ground
+when `shadow_mode = Off`; GTAO is unrelated and may also be off. Transparent
+BLEND materials remain outside the depth-prepass receiver set.
+
 ### What reflections additionally cost
 
-Reflections need to know each pixel's normal and roughness, which the engine
+Reflections need to know each pixel's normal and material response, which the engine
 does not otherwise store. Turning them on therefore adds a second attachment to
-the depth prepass (an RGBA8 normal+roughness G-buffer) and switches it to a
-parallel set of pipelines. Shadows do not need it and do not pay for it. With
-reflections off, the target is not allocated and those pipelines are never
-created.
+the depth prepass (an RGBA8 G-buffer: octahedral world normal in RG, perceptual
+roughness in B, metallic in A) and switches it to a parallel set of pipelines.
+The model variants sample the glTF metallic-roughness texture in that prepass,
+so a textured material is classified by what is actually visible at the pixel.
+Shadows do not need it and do not pay for it. With reflections off, the target
+is not allocated and those pipelines are never created.
 
-Where a traced reflection lands, the forward pass drops its IBL specular lobe
-for that pixel rather than adding both — otherwise the same specular energy is
-counted twice and metal blows out.
+Opaque model materials smoothly hand their IBL specular lobe to tracing between
+roughness 0.25 and 0.55 rather than adding both — otherwise the same specular
+energy is counted twice and metal blows out. Grass, terrain and alpha-MASK
+foliage write roughness 1 and are rejected by both trace and resolve; alpha-BLEND
+materials are absent from the prepass and keep their complete IBL lobe.
+
+The trace writes raw radiance at reduced resolution. A full-resolution resolve
+runs immediately after forward lighting and before water/TAA. It re-tests the
+centre material and gathers only depth-, normal-, roughness- and
+metallic-compatible trace texels, then evaluates the receiver BRDF at full
+resolution. Consequently a bright stone reflection cannot bilinearly spill onto
+grass or foliage, and the resolved signal participates in TAA, bloom and auto
+exposure instead of shimmering as a late composite overlay.
+
+The RT compute passes bind scene depth and the G-buffer as sampled textures with
+a point-clamp sampler. This is valid on all SDL3 GPU backends; D32 textures are
+never misdeclared as compute-storage resources.
+
+Configured water regions are also reflection receivers. After opaque
+reflections resolve, the same quarter-resolution target is recycled for a
+second dispatch that intersects the water plane, refines it against the live
+simulation displacement, and traces with the same simulation/detail-wave
+normal used by the water surface shader. SSR wins where it has a confident
+full-detail hit, RT fills its visibility gaps, and IBL fills a true RT miss.
+This needs neither a water depth prepass nor a second reflection allocation.
 
 ### The one ordering constraint
 
@@ -7565,6 +7590,14 @@ reflections after building without them logs an error rather than rendering
 black — build with `want_attributes = true` if reflections may be turned on
 during the session. Shadows never need them, so a shadows-only game stores 48
 bytes per triangle instead of 112.
+
+For textured hits, model upload bakes one 16-byte linear base-colour proxy per
+triangle at its UV centroid before releasing the source sRGB pixels. The bake
+includes vertex colour and `baseColorFactor`; the BVH attribute build consumes
+it later. This keeps wood/stone/roof/foliage colours in reflected geometry
+without retaining texture-sized CPU copies or introducing a bindless texture
+array. It is created only when CPU geometry retention is enabled, the same
+prerequisite the software BVH already has.
 
 ### Tuning
 

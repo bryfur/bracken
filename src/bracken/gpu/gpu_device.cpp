@@ -35,22 +35,21 @@ bool GPUDevice::init(SDL_Window* window, bool prefer_low_power) {
 
     window_ = window;
 
-    // GPU validation costs real CPU time per submit. Enable only when explicitly
-    // requested via BRACKEN_GPU_DEBUG (truthy), or by default in Debug builds.
+    // GPU validation costs real CPU time per submit, so it is off unless asked
+    // for: set_validation_enabled() before init(), or BRACKEN_GPU_DEBUG in the
+    // environment (which wins, so it can be flipped without a rebuild). It does
+    // NOT key off NDEBUG — what build you are running is the wrong thing to
+    // hang a per-submit cost on.
     // getenv is single-threaded at device creation, before any worker thread is spawned.
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char* debug_env = std::getenv("BRACKEN_GPU_DEBUG");
-#ifndef NDEBUG
-    bool debug_mode = true;
-#else
-    bool debug_mode = false;
-#endif
+    bool debug_mode = validation_;
     if (debug_env) {
         debug_mode = debug_env[0] != '\0' && SDL_strcmp(debug_env, "0") != 0 &&
                      SDL_strcasecmp(debug_env, "false") != 0 && SDL_strcasecmp(debug_env, "off") != 0;
     }
     BRACKEN_LOG_INFO(LOG_TAG, "GPUDevice::init: GPU validation {} ({})", debug_mode ? "enabled" : "disabled",
-                     debug_env ? "from BRACKEN_GPU_DEBUG" : "build default");
+                     debug_env ? "from BRACKEN_GPU_DEBUG" : "set_validation_enabled");
 
     // Create the GPU device with automatic backend selection
     // SDL3 will choose the best available backend (Metal on macOS, Vulkan/D3D12 on others).

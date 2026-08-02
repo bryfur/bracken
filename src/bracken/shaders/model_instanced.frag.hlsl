@@ -52,11 +52,14 @@ cbuffer LightingUniforms {
     // Ray-traced sun shadow mask (rtShadowTexture, its own sampler slot) —
     // see model.frag.hlsl. screenAOTexel* doubles as its UV scale.
     float rtShadowEnabled;
-    // Roughness at or below this means a ray-traced reflection will be added
-    // for this pixel in the composite, so the IBL probe must NOT also supply a
-    // specular lobe here. 0 = reflections off, probe used as normal.
+    // The traced-reflection handover window. The IBL specular lobe is scaled
+    // by 1 - rtReflectionWeight(roughness, fadeStart, maxRoughness) and the
+    // compute pass writes that same weight into its alpha, so the two sum to
+    // one. 0 = reflections off, probe used as normal.
     float rtReflectionMaxRoughness;
-    float _rtPad1;
+    // Roughness at which the traced contribution starts fading out; it reaches
+    // zero at rtReflectionMaxRoughness. See reflection_gate.hlsli.
+    float rtReflectionFadeStart;
     float _rtPad2;
 };
 
@@ -143,6 +146,7 @@ SamplerState rtShadowSampler;
 #include "fog.hlsli"
 #include "lighting.hlsli"
 #include "pbr.hlsli"
+#include "reflection_gate.hlsli"
 // Cluster SSBOs follow this shader's 12 fragment samplers in set 2 (slots
 // 0-10 above + the local-shadow atlas at 11, declared by the include).
 #define CLUSTER_SSBO_BINDING_BASE 12
@@ -218,8 +222,14 @@ float4 PSMain(PSInput input) : SV_Target {
 
     // See rtReflectionMaxRoughness: hand the specular lobe over to the traced
     // reflection rather than adding both.
+    // ONE function, shared with rt_reflection.comp.hlsl, so traced + probe sum
+    // to exactly 1 at every pixel: the trace writes this weight into its alpha
+    // and the composite adds `rtSpec.rgb * rtSpec.a`. `roughness` here is the
+    // MR-modulated, specular-AA-widened value, which is exactly what the
+    // prepass G-buffer now writes — the two used to disagree because the
+    // G-buffer wrote the raw material factor.
     float iblSpecularScale =
-        (rtReflectionMaxRoughness > 0.0 && roughness <= rtReflectionMaxRoughness) ? 0.0 : 1.0;
+        1.0 - rtReflectionWeight(roughness, rtReflectionFadeStart, rtReflectionMaxRoughness);
 
     float ambientLift = lerp(ambientStrength, 1.0, shadow);
     float3 ambient;

@@ -112,7 +112,8 @@ struct alignas(16) GrassLightingUniforms {
     glm::vec3 ambient_ground;    // offset 96
     float screen_ao_texel_y;     // offset 108
     float ibl_enabled = 0.0f;    // offset 112 — 1 = sky IBL ambient (samplers 3-5), 0 = hemisphere
-    float _pad_ibl[3] = {0.0f, 0.0f, 0.0f};
+    float rt_shadow_enabled = 0.0f; // offset 116 — 1 = traced sun visibility replaces CSM
+    float _pad_ibl[2] = {0.0f, 0.0f};
 };
 
 // Layout pins against grass.frag.hlsl GrassLightingUniforms.
@@ -126,6 +127,7 @@ static_assert(offsetof(GrassLightingUniforms, sun_color) == 64);
 static_assert(offsetof(GrassLightingUniforms, ambient_sky) == 80);
 static_assert(offsetof(GrassLightingUniforms, ambient_ground) == 96);
 static_assert(offsetof(GrassLightingUniforms, ibl_enabled) == 112);
+static_assert(offsetof(GrassLightingUniforms, rt_shadow_enabled) == 116);
 
 /**
  * Axis-aligned world-space XZ rectangle excluded from grass placement
@@ -185,8 +187,9 @@ public:
     /// prefiltered specular cube, BRDF LUT — fragment slots 3-5; the slots
     /// must always be bound, with cube-typed dummies when IBL is off) and
     /// `ibl_enabled` sets the shader's iblEnabled flag.
+    /// `rt_shadow_binding` is the ray-traced sun visibility mask at slot 6;
     /// `local_shadow_binding` is the local (point/spot) shadow atlas +
-    /// comparison sampler at slot 6 (the shader's last sampler; sampled only
+    /// comparison sampler at slot 7 (the shader's last sampler; sampled only
     /// for lights with shadow_slot >= 0).
     void render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view, const glm::mat4& projection,
                 const glm::vec3& camera_pos, const glm::vec3& light_dir,
@@ -194,6 +197,7 @@ public:
                 const SDL_GPUTextureSamplerBinding* ao_binding = nullptr, glm::vec2 ao_texel = glm::vec2(0.0f),
                 bool depth_equal = false,
                 const SDL_GPUTextureSamplerBinding* ibl_bindings = nullptr, bool ibl_enabled = false,
+                const SDL_GPUTextureSamplerBinding* rt_shadow_binding = nullptr, bool rt_shadows_enabled = false,
                 const SDL_GPUTextureSamplerBinding* local_shadow_binding = nullptr);
 
     /// Depth-prepass draw (velocity + depth, DepthPrepassGrass pipeline).

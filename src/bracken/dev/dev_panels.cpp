@@ -458,16 +458,11 @@ void draw_audio_tab(const DevUI::Bindings& bindings) {
         engine.set_sound_gain(sfx);
     }
 
-#if BRACKEN_SYNTH
     ImGui::SeparatorText("Music");
     bool playing = engine.music_playing();
     if (ImGui::Checkbox("Playing", &playing)) {
         engine.set_music_playing(playing);
     }
-#else
-    ImGui::SeparatorText("Music");
-    ImGui::TextDisabled("synthesizer compiled out (BRACKEN_ENABLE_SYNTH=OFF)");
-#endif
 }
 
 } // namespace

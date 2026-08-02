@@ -75,7 +75,8 @@ struct alignas(16) TerrainLightingUniforms {
     float screenAOTexelY;      // offset 108
     glm::vec4 splat_params;    // offset 112 — xy = splat origin (world XZ), zw = splat X/Z size
     float iblEnabled = 0.0f;   // offset 128 — 1 = sky IBL ambient (samplers 5-7), 0 = hemisphere
-    float _padIbl[3] = {0.0f, 0.0f, 0.0f};
+    float rtShadowEnabled = 0.0f; // offset 132 — 1 = traced sun visibility replaces CSM
+    float _padIbl[2] = {0.0f, 0.0f};
 };
 
 // Layout pins against terrain.frag.hlsl LightingUniforms.
@@ -89,6 +90,7 @@ static_assert(offsetof(TerrainLightingUniforms, ambientGround) == 80);
 static_assert(offsetof(TerrainLightingUniforms, sunColor) == 96);
 static_assert(offsetof(TerrainLightingUniforms, splat_params) == 112);
 static_assert(offsetof(TerrainLightingUniforms, iblEnabled) == 128);
+static_assert(offsetof(TerrainLightingUniforms, rtShadowEnabled) == 132);
 
 /**
  * TerrainRenderer handles terrain rendering using server-provided heightmaps.
@@ -154,8 +156,10 @@ public:
      *        always be bound, with cube-typed dummies when IBL is off).
      * @param ibl_enabled Sets the shader's iblEnabled flag: 1 = sample the
      *        IBL chain for ambient, 0 = hemisphere ambient fallback.
+     * @param rt_shadow_binding Ray-traced sun visibility mask (slot 8; a
+     *        white dummy keeps the descriptor valid while disabled).
      * @param local_shadow_binding Local (point/spot) shadow atlas +
-     *        comparison sampler (slot 8 — the shader's last sampler; sampled
+     *        comparison sampler (slot 9 — the shader's last sampler; sampled
      *        only for lights with shadow_slot >= 0, so any D32 depth texture
      *        keeps the slot valid when local shadows are off).
      */
@@ -165,6 +169,7 @@ public:
                 const SDL_GPUTextureSamplerBinding* ao_binding = nullptr, glm::vec2 ao_texel = glm::vec2(0.0f),
                 const scene::Frustum* frustum = nullptr, bool depth_equal = false,
                 const SDL_GPUTextureSamplerBinding* ibl_bindings = nullptr, bool ibl_enabled = false,
+                const SDL_GPUTextureSamplerBinding* rt_shadow_binding = nullptr, bool rt_shadows_enabled = false,
                 const SDL_GPUTextureSamplerBinding* local_shadow_binding = nullptr);
 
     /**

@@ -47,6 +47,8 @@ PSOutput PSMain(PSInput input) {
         float2 prevNdc = input.prevClip.xy / input.prevClip.w;
         output.velocity = (currNdc - prevNdc) * float2(0.5, -0.5);
     }
-    output.normalRough = float4(0.5, 1.0, 0.5, 1.0); // +Y encoded, fully rough
+    // oct(+Y) = (0.75, 0.75); fully rough, non-metal — the reflection pass
+    // rejects these on roughness before the normal is ever used.
+    output.normalRough = float4(0.75, 0.75, 1.0, 0.0);
     return output;
 }

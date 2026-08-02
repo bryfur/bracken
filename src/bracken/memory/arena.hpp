@@ -5,10 +5,8 @@
 #include <utility>
 #include <vector>
 
-#ifndef NDEBUG
 #include <atomic>
 #include <thread>
-#endif
 
 namespace bracken::memory {
 
@@ -49,24 +47,22 @@ public:
 
     void reset();
 
-    // --- Debug-only owner-thread enforcement (thread-safety tier "owned") ---
+    // --- Owner-thread enforcement (thread-safety tier "owned") ---
     // The arena binds to the first thread that calls allocate()/reset() on it
     // (or an explicit bind_owner()/rebind_owner() call); any allocate()/reset()
-    // from a different thread trips BRACKEN_ASSERT. reset() re-opens the
-    // binding, so the next allocating thread becomes the new owner — this is
-    // how per-frame handoff between pipeline stages is expressed. Both calls
-    // compile to nothing in release builds (NDEBUG), matching BRACKEN_ASSERT.
-#ifdef NDEBUG
-    // Bind the calling thread as owner; asserts if already bound to another thread.
-    void bind_owner() noexcept {}
-    // Force-bind the calling thread as owner (explicit cross-thread handoff).
-    void rebind_owner() noexcept {}
-#else
-    // Bind the calling thread as owner; asserts if already bound to another thread.
+    // from a different thread aborts. reset() re-opens the binding, so the next
+    // allocating thread becomes the new owner — this is how per-frame handoff
+    // between pipeline stages is expressed.
+    //
+    // Compiled unconditionally. It used to be !NDEBUG-only, which made
+    // sizeof(Arena) — and therefore sizeof(FramePacket), which embeds one —
+    // depend on the build flags of whichever TU did the including. Two TUs that
+    // disagreed silently corrupted every member after owner_.
+
+    // Bind the calling thread as owner; aborts if already bound to another thread.
     void bind_owner() noexcept;
     // Force-bind the calling thread as owner (explicit cross-thread handoff).
     void rebind_owner() noexcept;
-#endif
 
     std::size_t bytes_used() const noexcept;
     std::size_t bytes_capacity() const noexcept;
@@ -91,11 +87,10 @@ private:
 
     void register_destructor(void* obj, void (*fn)(void*));
 
-#ifndef NDEBUG
-    // Asserts the calling thread owns this arena; a first-toucher CAS makes the
-    // caller the owner when the binding is open. `op` names the entry point in
-    // the failure message. Debug builds only.
-    void assert_owner(const char* op) noexcept;
+    // Verifies the calling thread owns this arena; a first-toucher CAS makes
+    // the caller the owner when the binding is open. `op` names the entry point
+    // in the failure message.
+    void check_owner(const char* op) noexcept;
 
     // Owner-thread id; a default-constructed id means "binding open".
     // Protocol: publishes only the owning thread's id — never data. Ordering is
@@ -106,7 +101,6 @@ private:
     // single-owner contract is violated. No release/acquire pairing partner.
     // Not padded: single-owner by contract, so never legitimately contended.
     std::atomic<std::thread::id> owner_{};
-#endif
 
     std::vector<Chunk> chunks_;
     std::vector<Destructor> destructors_;

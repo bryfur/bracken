@@ -31,7 +31,8 @@ inline constexpr const char* LOG_TAG = "scene";
 // (`static inline` in scene_renderer.cpp) to an inline function with external
 // linkage. That is the price of the split; nothing else about it changed.
 template <typename U>
-inline void apply_mesh_material(U& u, const Mesh& mesh) {
+inline void apply_mesh_material(U& u, const Mesh& mesh, float rt_reflection_max_roughness,
+                                float rt_reflection_fade_start) {
     const PBRMaterial& mat = mesh.material;
     u.hasTexture = (mesh.has_texture && mesh.texture) ? 1 : 0;
     u.hasNormalMap = mat.normal_texture ? 1 : 0;
@@ -56,6 +57,13 @@ inline void apply_mesh_material(U& u, const Mesh& mesh) {
     // gap (no masked skinned prepass variant) — they'd sample the AO of
     // whatever is behind them, which for a moving character is benign.
     u.screenAOEnabled = (mat.alpha_mode != AlphaMode::Blend) ? 1.0f : 0.0f;
+    // The reflection prepass deliberately marks MASK foliage fully rough and
+    // omits BLEND geometry. Their forward draws must therefore keep the full
+    // IBL specular lobe; handing it off to a trace that never ran creates dark
+    // foliage. OPAQUE meshes get the frame's exact handover window.
+    const bool rt_eligible = mat.alpha_mode == AlphaMode::Opaque;
+    u.rtReflectionMaxRoughness = rt_eligible ? rt_reflection_max_roughness : 0.0f;
+    u.rtReflectionFadeStart = rt_eligible ? rt_reflection_fade_start : 0.0f;
 }
 
 } // namespace bracken::scene

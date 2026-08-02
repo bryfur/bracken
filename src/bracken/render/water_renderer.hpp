@@ -97,6 +97,9 @@ public:
     void set_region(const WaterRegion& region);
     [[nodiscard]] bool active() const { return initialized_ && has_region_; }
     const WaterRegion& region() const { return region_; }
+    [[nodiscard]] gpu::GPUTexture* simulation_state_texture() const {
+        return sim_state_[sim_read_].get();
+    }
 
     /** Queue a ripple impulse (world position; radius/strength in world
      *  units). Impulses outside the sim window are ignored. Cheap; call
@@ -116,7 +119,9 @@ public:
                 const glm::mat4& projection, const glm::vec3& camera_pos, float time_s,
                 int screen_width, int screen_height, SDL_GPUTexture* scene_color_copy,
                 SDL_GPUTexture* scene_depth_copy, const SDL_GPUTextureSamplerBinding& ibl_specular,
-                bool ibl_enabled, float sun_intensity);
+                bool ibl_enabled, SDL_GPUTexture* rt_reflection,
+                bool rt_reflection_enabled, float rt_reflection_intensity,
+                float sun_intensity);
 
     // ========== CPU/GPU uniform contracts (match the HLSL byte-for-byte) ==========
 
@@ -153,8 +158,9 @@ public:
         glm::vec4 misc{0.0f};
         glm::mat4 viewProjSSR{1.0f}; // world -> clip for the SSR march (draw VP)
         glm::vec4 ssrParams{0.0f};   // x = strength, y = max distance, z = thickness
+        glm::vec4 rtParams{0.0f};    // x = traced reflection enabled, y = intensity
     };
-    static_assert(sizeof(FragmentUniforms) == 256, "must match water.frag.hlsl cbuffer");
+    static_assert(sizeof(FragmentUniforms) == 272, "must match water.frag.hlsl cbuffer");
 
     /** Grid density: cells along the longer region axis (the shorter axis
      *  scales by aspect, min 1). Exposed for the headless tests. */

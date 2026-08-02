@@ -120,6 +120,7 @@ enum class BlendMode {
     None,     // No blending (opaque)
     Alpha,    // Standard alpha blending
     Additive, // Additive blending (for effects)
+    AdditivePreserveAlpha, // Add RGB while preserving destination alpha
     Multiply, // Multiply blending
 };
 
@@ -151,6 +152,19 @@ inline SDL_GPUColorTargetBlendState get_blend_state(BlendMode mode) {
             state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
             state.color_blend_op = SDL_GPU_BLENDOP_ADD;
             state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+            break;
+
+        case BlendMode::AdditivePreserveAlpha:
+            // Fullscreen lighting resolves add a premultiplied RGB
+            // contribution to an existing HDR target. Destination alpha is
+            // metadata for later passes and must not grow per resolve.
+            state.enable_blend = true;
+            state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            state.color_blend_op = SDL_GPU_BLENDOP_ADD;
+            state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
             state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
             state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
             break;

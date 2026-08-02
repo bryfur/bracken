@@ -34,9 +34,8 @@ struct AsyncModelLoader::Impl {
     // handles sequentially and those handles end up inside draw commands. If
     // the main thread registered whatever finished first, model handles would
     // differ between runs and between worker counts, and the frame's content
-    // would change with them. The smoke run's packet digest caught exactly
-    // that: three runs produced three different values until this became
-    // ordered.
+    // would change with them. The smoke run caught exactly that: three runs
+    // rendered three different frames until this became ordered.
     //
     // So: workers fill slots in place and flag them done; pump() walks
     // forward from the cursor and stops at the first slot still decoding.

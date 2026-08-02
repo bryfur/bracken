@@ -5,103 +5,23 @@
         {
             "name": "default",
             "displayName": "Default (Ninja, build/)",
-            "description": "Matches the long-lived incremental build in build/: Ninja, Homebrew LLVM clang, project-default options. Do NOT delete build/ to 'apply' this preset — it exists so `cmake --preset default` reproduces the same configuration.",
+            "description": "The one build tree. Ninja, Homebrew LLVM clang, project defaults. There is deliberately no second preset: sanitizers, build types and option overrides are -D flags you pass when you want them, not parallel trees that drift out of sync. Do NOT delete build/ to 'apply' this preset — it exists so `cmake --preset default` reproduces the same configuration.",
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/build",
             "cacheVariables": {
                 "CMAKE_C_COMPILER": "/opt/homebrew/opt/llvm/bin/clang",
                 "CMAKE_CXX_COMPILER": "/opt/homebrew/opt/llvm/bin/clang++"
             }
-        },
-        {
-            "name": "tsan",
-            "displayName": "ThreadSanitizer (build-tsan/)",
-            "description": "Separate TSan build tree for concurrency work. First configure refetches/rebuilds deps (SDL_shadercross/DXC) — slow; keep build-tsan/ alive afterwards just like build/. Examples and benchmarks are off: the TSan lane runs bracken_tests.",
-            "inherits": "default",
-            "binaryDir": "${sourceDir}/build-tsan",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-                "CMAKE_C_FLAGS": "-fsanitize=thread",
-                "CMAKE_CXX_FLAGS": "-fsanitize=thread",
-                "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread",
-                "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=thread",
-                "BRACKEN_BUILD_EXAMPLES": "OFF",
-                "BRACKEN_BUILD_BENCHMARKS": "OFF"
-            }
-        },
-        {
-            "name": "asan",
-            "displayName": "Address/UB Sanitizer (build-asan/)",
-            "description": "AddressSanitizer + UndefinedBehaviorSanitizer tree. Finds what TSan cannot: use-after-free and out-of-bounds across the arena/frame allocators, the packet ring's retire-and-reuse cycle, and the job system's node pools. Like tsan/, its first configure refetches and rebuilds the deps (slow, one-time) — keep build-asan/ alive afterwards. Tests only; RelWithDebInfo with frame pointers so reports are readable. -fno-sanitize=enum is deliberate: the engine bounds-checks enum parameters at the host boundary (InputSnapshot::key_held / was_key_just_pressed reject a scancode outside [0, SDL_SCANCODE_COUNT)), and the only way to TEST such a guard is to hand it an out-of-range enumerator — which the enum check calls UB. Declining that one sub-check keeps the guards testable; it costs nothing this lane exists for.",
-            "inherits": "default",
-            "binaryDir": "${sourceDir}/build-asan",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-                "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-sanitize=enum -fno-omit-frame-pointer -fno-sanitize-recover=undefined",
-                "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-sanitize=enum -fno-omit-frame-pointer -fno-sanitize-recover=undefined",
-                "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
-                "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address,undefined",
-                "BRACKEN_BUILD_EXAMPLES": "OFF",
-                "BRACKEN_BUILD_BENCHMARKS": "OFF"
-            }
-        },
-        {
-            "name": "rel",
-            "displayName": "Release-ish (build-rel/)",
-            "description": "RelWithDebInfo tree — the only lane that exercises the NDEBUG path, where BRACKEN_ASSERT and the debug-only thread-tier assertions compile out. Run it before shipping any change that relies on an assert for correctness. Coexists with build/ and build-tsan/.",
-            "inherits": "default",
-            "binaryDir": "${sourceDir}/build-rel",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
-            }
-        },
-        {
-            "name": "bench",
-            "displayName": "Benchmarks (build-bench/)",
-            "description": "Optimized tree for bracken_benchmarks. The default build/ tree has no CMAKE_BUILD_TYPE, so it compiles at -O0 with live asserts — any number measured there is meaningless. Always benchmark here.",
-            "inherits": "default",
-            "binaryDir": "${sourceDir}/build-bench",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-                "BRACKEN_BUILD_BENCHMARKS": "ON",
-                "BRACKEN_BUILD_EXAMPLES": "OFF"
-            }
         }
     ],
     "buildPresets": [
-        { "name": "default", "configurePreset": "default" },
-        { "name": "tsan", "configurePreset": "tsan" },
-        { "name": "asan", "configurePreset": "asan" },
-        { "name": "rel", "configurePreset": "rel" },
-        { "name": "bench", "configurePreset": "bench" }
+        { "name": "default", "configurePreset": "default" }
     ],
     "testPresets": [
         {
             "name": "default",
             "configurePreset": "default",
             "output": { "outputOnFailure": true }
-        },
-        {
-            "name": "tsan",
-            "configurePreset": "tsan",
-            "output": { "outputOnFailure": true },
-            "environment": {
-                "TSAN_OPTIONS": "halt_on_error=0 second_deadlock_stack=1"
-            }
-        },
-        {
-            "name": "rel",
-            "configurePreset": "rel",
-            "output": { "outputOnFailure": true }
-        },
-        {
-            "name": "asan",
-            "configurePreset": "asan",
-            "output": { "outputOnFailure": true },
-            "environment": {
-                "ASAN_OPTIONS": "detect_leaks=0 abort_on_error=1",
-                "UBSAN_OPTIONS": "print_stacktrace=1"
-            }
         }
     ]
 }

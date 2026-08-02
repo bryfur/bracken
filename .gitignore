@@ -63,10 +63,6 @@ _deps/
 *.temp
 shader_cache/
 .claude/worktrees/
-build-tsan/
-build-rel/
-build-bench/
-build-asan/
 
 # Python tooling caches
 __pycache__/

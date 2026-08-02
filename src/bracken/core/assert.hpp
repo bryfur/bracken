@@ -89,28 +89,17 @@ bool is_main_thread() noexcept;
 // per-frame or per-call path, never inside a per-item loop — a contract in a
 // 20,000-iteration instance loop is a BRACKEN_ASSERT, not a contract.
 //
-// BRACKEN_CONTRACTS_ENABLED=0 (cmake -DBRACKEN_ENABLE_CONTRACTS=OFF) compiles
-// them out; the condition stays type-checked, exactly like BRACKEN_ASSERT.
-// Defaults to on when the macro is undefined so headers used outside the
-// engine's own build still behave.
-#ifndef BRACKEN_CONTRACTS_ENABLED
-#define BRACKEN_CONTRACTS_ENABLED 1
-#endif
-
-#if BRACKEN_CONTRACTS_ENABLED
+// There is no switch. A contract that a host can compile out is a contract the
+// host cannot rely on, and the whole point of the category is that it holds in
+// the build that ships.
 #define BRACKEN_CONTRACT(cond, ...) BRACKEN_VERIFY(cond __VA_OPT__(, ) __VA_ARGS__)
-#else
-#define BRACKEN_CONTRACT(cond, ...) ((void)sizeof(!(cond)))
-#endif
 
 // Enforces the documented main-thread-only contracts (FileWatcher entry
-// points, swapchain acquire, render_frame). Zero cost in release builds.
-#ifdef NDEBUG
-#define BRACKEN_ASSERT_MAIN_THREAD() ((void)0)
-#else
+// points, swapchain acquire, render_frame). Debug-only, via BRACKEN_ASSERT —
+// this file has exactly one NDEBUG test and everything else is expressed in
+// terms of it.
 #define BRACKEN_ASSERT_MAIN_THREAD() \
-    BRACKEN_VERIFY(::bracken::core::is_main_thread(), "must be called from the main thread")
-#endif
+    BRACKEN_ASSERT(::bracken::core::is_main_thread(), "must be called from the main thread")
 
 #define BRACKEN_UNREACHABLE(...)                                                                                        \
     do {                                                                                                               \

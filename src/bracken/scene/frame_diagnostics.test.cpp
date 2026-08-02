@@ -5,8 +5,7 @@
 // return in the cluster grid. Each test drives the real production path (no
 // mocks, no test-only branches) and asserts the corresponding counter moved
 // by exactly the expected amount — the counters are what a host reads through
-// Application::frame_diagnostics(), and what the smoke run prints next to the
-// packet digest.
+// Application::frame_diagnostics(), and what the smoke run prints.
 //
 // Everything here is device-free: the prep cores are static on ScenePrep
 // (see scene_prep_parity.test.cpp) and ClusterGrid::begin_frame/add_*/build

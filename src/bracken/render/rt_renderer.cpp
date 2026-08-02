@@ -16,12 +16,24 @@ RtRenderer::~RtRenderer() {
 bool RtRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
     device_ = &device;
     pipelines_ = &pipelines;
-    return true;
+    SDL_GPUSamplerCreateInfo info = {};
+    info.min_filter = SDL_GPU_FILTER_NEAREST;
+    info.mag_filter = SDL_GPU_FILTER_NEAREST;
+    info.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    nearest_clamp_sampler_ = device.create_sampler(info);
+    return nearest_clamp_sampler_ != nullptr;
 }
 
 void RtRenderer::shutdown() {
     shadow_mask_.reset();
     reflection_.reset();
+    if (device_ != nullptr && nearest_clamp_sampler_ != nullptr) {
+        device_->release_sampler(nearest_clamp_sampler_);
+    }
+    nearest_clamp_sampler_ = nullptr;
     device_ = nullptr;
     pipelines_ = nullptr;
 }
@@ -127,8 +139,10 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                 gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
                 if (pass) {
                     pass.bind_pipeline(*pipeline);
-                    const std::array<SDL_GPUTexture*, 1> textures{depth.handle()};
-                    pass.bind_storage_textures(0, textures);
+                    const std::array<SDL_GPUTextureSamplerBinding, 1> textures{{
+                        {depth.handle(), nearest_clamp_sampler_},
+                    }};
+                    pass.bind_samplers(0, textures);
                     const std::array<SDL_GPUBuffer*, 4> buffers{
                         scene_.tlas_nodes(), scene_.tlas_instances(), scene_.blas_nodes(),
                         scene_.blas_triangles()};
@@ -143,75 +157,161 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
         }
     }
 
-    // ---- reflections -----------------------------------------------------
+    // ---- opaque reflections ---------------------------------------------
     if (reflections.enabled) {
-        BRACKEN_PROFILE_ZONE("RtRenderer::reflections");
-        if (normal_rough == nullptr) {
-            return; // no G-buffer this frame; the caller already gated on this
-        }
-        if (!scene_.has_attributes()) {
-            // Attributes are gathered at build time; enabling reflections
-            // afterwards cannot conjure them. Say so once rather than
-            // rendering black reflections forever.
-            if (!warned_missing_attributes_) {
-                BRACKEN_LOG_ERROR("rt",
-                                  "Reflections are enabled but the acceleration structure was "
-                                  "built without triangle attributes. Rebuild with "
-                                  "build_scene(..., want_attributes=true).");
-                warned_missing_attributes_ = true;
-            }
-            return;
-        }
-
-        const int div = rt_resolution_divisor(reflections.resolution);
-        const int w = std::max(1, screen_width_ / div);
-        const int h = std::max(1, screen_height_ / div);
-        if (reflection_res_ != reflections.resolution) {
-            reflection_.reset();
-            reflection_res_ = reflections.resolution;
-        }
-
-        if (!ensure_target(*device_, reflection_, w, h, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
-                           "reflection target")) {
-            return;
-        }
-        const gpu::GPUComputePipeline* pipeline =
-            pipelines_->get_compute_pipeline(gpu::ComputePipelineType::RtReflection);
-        if (pipeline == nullptr) {
-            return;
-        }
-
-        gpu::RtReflectionUniforms u{};
-        u.invViewProj = params.inv_view_proj;
-        u.cameraPosition = params.camera_position;
-        u.rayMaxDistance = reflections.max_distance;
-        u.sunDirection = params.environment.sun_dir;
-        u.maxRoughness = reflections.max_roughness;
-        u.sunColor = params.environment.sun_color;
-        u.normalBias = reflections.normal_bias;
-        u.skyColor = params.environment.sky_horizon;
-        u.intensity = reflections.intensity;
-        u.outputSize = {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
-        u.tlasNodeCount = scene_.tlas_node_count();
-
-        const SDL_GPUStorageTextureReadWriteBinding rw{
-            .texture = reflection_->handle(), .mip_level = 0, .layer = 0, .cycle = true,
-            .padding1 = 0, .padding2 = 0, .padding3 = 0};
-        gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
-        if (pass) {
-            pass.bind_pipeline(*pipeline);
-            const std::array<SDL_GPUTexture*, 2> textures{depth.handle(), normal_rough};
-            pass.bind_storage_textures(0, textures);
-            const std::array<SDL_GPUBuffer*, 5> buffers{
-                scene_.tlas_nodes(), scene_.tlas_instances(), scene_.blas_nodes(),
-                scene_.blas_triangles(), scene_.triangle_attributes()};
-            pass.bind_storage_buffers(0, buffers);
-            pass.push_uniforms(0, &u, sizeof(u));
-            pass.dispatch_for(*pipeline, static_cast<uint32_t>(w), static_cast<uint32_t>(h));
-            stats_.reflections_traced = true;
-            stats_.reflection_rays = static_cast<uint32_t>(w * h);
-        }
+        (void)trace_reflections(cmd, depth, normal_rough, params, reflections, nullptr);
     }
+}
+
+bool RtRenderer::trace_reflections(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
+                                   SDL_GPUTexture* receiver_data, const FrameParams& params,
+                                   const RtReflectionSettings& reflections,
+                                   const RtWaterReceiver* water) {
+    BRACKEN_PROFILE_ZONE("RtRenderer::reflections");
+    if (cmd == nullptr || device_ == nullptr || pipelines_ == nullptr || receiver_data == nullptr ||
+        !scene_.ready()) {
+        return false;
+    }
+    if (!scene_.has_attributes()) {
+        // Attributes are gathered at build time; enabling reflections
+        // afterwards cannot conjure them. Say so once rather than rendering
+        // black reflections forever.
+        if (!warned_missing_attributes_) {
+            BRACKEN_LOG_ERROR("rt",
+                              "Reflections are enabled but the acceleration structure was "
+                              "built without triangle attributes. Rebuild with "
+                              "build_scene(..., want_attributes=true).");
+            warned_missing_attributes_ = true;
+        }
+        return false;
+    }
+
+    const int div = rt_resolution_divisor(reflections.resolution);
+    const int w = std::max(1, screen_width_ / div);
+    const int h = std::max(1, screen_height_ / div);
+    if (reflection_res_ != reflections.resolution) {
+        reflection_.reset();
+        reflection_res_ = reflections.resolution;
+    }
+    if (!ensure_target(*device_, reflection_, w, h, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+                       "reflection target")) {
+        return false;
+    }
+    const gpu::GPUComputePipeline* pipeline =
+        pipelines_->get_compute_pipeline(gpu::ComputePipelineType::RtReflection);
+    if (pipeline == nullptr) {
+        return false;
+    }
+
+    gpu::RtReflectionUniforms u{};
+    u.invViewProj = params.inv_view_proj;
+    u.cameraPosition = params.camera_position;
+    u.rayMaxDistance = reflections.max_distance;
+    u.sunDirection = params.environment.sun_dir;
+    u.maxRoughness = reflections.max_roughness;
+    u.fadeStart = reflections.fade_start;
+    u.sunColor = params.environment.sun_color;
+    u.normalBias = reflections.normal_bias;
+    u.skyColor = params.environment.sky_horizon;
+    u.outputSize = {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
+    u.tlasNodeCount = scene_.tlas_node_count();
+    if (water != nullptr) {
+        const float extent = std::max(water->sim_extent, 1.0f);
+        u.waterBounds = {water->bounds_min.x, water->bounds_min.y,
+                         water->bounds_max.x, water->bounds_max.y};
+        u.waterSurface = {water->height, water->roughness,
+                          water->sim_displacement, water->sim_normal_strength};
+        u.waterSimWindow = {water->sim_min.x, water->sim_min.y, 1.0f / extent, 0.06f};
+        u.waterFlowTime = {water->flow.x, water->flow.y, water->flow_speed, water->time};
+        u.waterDetail = {water->detail_wave_strength, 1.0f, 0.5f, 0.0f};
+    }
+
+    const SDL_GPUStorageTextureReadWriteBinding rw{
+        .texture = reflection_->handle(), .mip_level = 0, .layer = 0, .cycle = true,
+        .padding1 = 0, .padding2 = 0, .padding3 = 0};
+    gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
+    if (!pass) {
+        return false;
+    }
+    pass.bind_pipeline(*pipeline);
+    const std::array<SDL_GPUTextureSamplerBinding, 2> textures{{
+        {depth.handle(), nearest_clamp_sampler_},
+        {receiver_data, nearest_clamp_sampler_},
+    }};
+    pass.bind_samplers(0, textures);
+    const std::array<SDL_GPUBuffer*, 5> buffers{
+        scene_.tlas_nodes(), scene_.tlas_instances(), scene_.blas_nodes(),
+        scene_.blas_triangles(), scene_.triangle_attributes()};
+    pass.bind_storage_buffers(0, buffers);
+    pass.push_uniforms(0, &u, sizeof(u));
+    pass.dispatch_for(*pipeline, static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+    stats_.reflections_traced = true;
+    stats_.reflection_rays += static_cast<uint32_t>(w * h);
+    return true;
+}
+
+bool RtRenderer::render_water_reflections(SDL_GPUCommandBuffer* cmd,
+                                          gpu::GPUTexture& opaque_depth,
+                                          gpu::GPUTexture& simulation_state,
+                                          const FrameParams& params,
+                                          const RtReflectionSettings& reflections,
+                                          const RtWaterReceiver& water) {
+    if (!reflections.enabled) {
+        return false;
+    }
+    return trace_reflections(cmd, opaque_depth, simulation_state.handle(), params,
+                             reflections, &water);
+}
+
+bool RtRenderer::resolve_reflections(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& hdr_scene,
+                                     gpu::GPUTexture& depth, SDL_GPUTexture* normal_rough,
+                                     const FrameParams& params,
+                                     const RtReflectionSettings& reflections) {
+    if (cmd == nullptr || pipelines_ == nullptr || reflection_ == nullptr ||
+        normal_rough == nullptr || nearest_clamp_sampler_ == nullptr ||
+        !stats_.reflections_traced) {
+        return false;
+    }
+    gpu::GPUPipeline* pipeline =
+        pipelines_->get_pipeline(gpu::PipelineType::RtReflectionResolve);
+    if (pipeline == nullptr) {
+        return false;
+    }
+
+    SDL_GPUColorTargetInfo target = {};
+    target.texture = hdr_scene.handle();
+    target.load_op = SDL_GPU_LOADOP_LOAD;
+    target.store_op = SDL_GPU_STOREOP_STORE;
+    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &target, 1, nullptr);
+    if (pass == nullptr) {
+        return false;
+    }
+
+    pipeline->bind(pass);
+    gpu::RtReflectionResolveUniforms u{};
+    u.invViewProj = params.inv_view_proj;
+    u.cameraPosition = params.camera_position;
+    u.maxRoughness = reflections.max_roughness;
+    u.outputSize = {static_cast<float>(std::max(params.screen_width, 1)),
+                    static_cast<float>(std::max(params.screen_height, 1))};
+    u.reflectionSize = {static_cast<float>(reflection_->width()),
+                        static_cast<float>(reflection_->height())};
+    u.depthA = params.depth_a;
+    u.depthB = params.depth_b;
+    u.fadeStart = reflections.fade_start;
+    u.intensity = reflections.intensity;
+    SDL_PushGPUFragmentUniformData(cmd, 0, &u, sizeof(u));
+
+    const std::array<SDL_GPUTextureSamplerBinding, 3> bindings{{
+        {reflection_->handle(), nearest_clamp_sampler_},
+        {depth.handle(), nearest_clamp_sampler_},
+        {normal_rough, nearest_clamp_sampler_},
+    }};
+    SDL_BindGPUFragmentSamplers(pass, 0, bindings.data(),
+                                static_cast<Uint32>(bindings.size()));
+    SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+    SDL_EndGPURenderPass(pass);
+    return true;
 }
 
 gpu::GPUTexture* RtRenderer::shadow_mask() const {

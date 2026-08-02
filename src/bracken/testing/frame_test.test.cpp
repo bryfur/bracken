@@ -2,7 +2,7 @@
 //
 // Two jobs here. The first is to prove the fixture actually works the way a
 // game developer's test suite would use it — build a frame through a
-// FrameSink, seal, read back, digest. The second is the phase-8 gate: that a
+// FrameSink, seal, read back. The second is the phase-8 gate: that a
 // host holding a FrameSink CANNOT reach the engine's sim-stage tail. That used
 // to be a sentence in a doc comment backed by a debug assert; here it is a
 // compile-time fact.
@@ -109,22 +109,6 @@ TEST(TestFrame, DrivesHostFrameCodeAndReadsItBack) {
     EXPECT_TRUE(frame.packet().has_camera());
     EXPECT_FALSE(frame.packet().should_draw_grass());
     EXPECT_TRUE(frame.sealed());
-}
-
-TEST(TestFrame, DigestIsTheGateAGameWouldPin) {
-    TestFrame a;
-    describe_frame(a.sink(), 3);
-    a.seal();
-
-    TestFrame b;
-    describe_frame(b.sink(), 3);
-    b.seal();
-    EXPECT_EQ(a.digest(), b.digest());
-
-    TestFrame c;
-    describe_frame(c.sink(), 4); // one more orb == a different frame
-    c.seal();
-    EXPECT_NE(a.digest(), c.digest());
 }
 
 TEST(TestFrame, BorrowsACallerOwnedPacket) {

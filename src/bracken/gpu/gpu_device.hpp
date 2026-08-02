@@ -52,6 +52,17 @@ public:
     [[nodiscard]] bool init(SDL_Window* window, bool prefer_low_power = false);
 
     /**
+     * @brief Enable the backend's validation layer. Call before init().
+     *
+     * Off by default and a runtime setting, not a build-time one: validation
+     * costs real CPU time per submit, but which build you happen to be running
+     * is the wrong thing to hang that on — a Debug build that never validates
+     * and a release build that cannot are both worse than one switch.
+     */
+    void set_validation_enabled(bool enabled) noexcept { validation_ = enabled; }
+    [[nodiscard]] bool validation_enabled() const noexcept { return validation_; }
+
+    /**
      * @brief Shutdown and release all GPU resources
      */
     void shutdown();
@@ -222,6 +233,7 @@ public:
 
 private:
     SDL_GPUDevice* device_ = nullptr;
+    bool validation_ = false; // see set_validation_enabled()
     SDL_Window* window_ = nullptr;
     // Accumulated CPU-blocked-on-GPU nanoseconds; plain integer, main-thread
     // only (every accumulating call site is main-thread asserted).
