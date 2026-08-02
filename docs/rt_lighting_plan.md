@@ -2,9 +2,10 @@
 
 Status: **in progress — R0 (foundations), R1 (probe-field GI), R2
 (froxel-RIS local-light shadows), R3 (honest hit lighting), R4 (the HZB +
-indirect dispatch in R4a, the screen-probe gather in R4b) and R5a (the SSILVB
-visibility bitmask + bent-cone GI gating) have landed**; the rest of R5 and R6
-are still proposal. Written 2026-08-02 against the working tree at the
+indirect dispatch in R4a, the screen-probe gather in R4b), R5a (the SSILVB
+visibility bitmask + bent-cone GI gating) and R5b (the denoiser core: analytic
+sun gradient, A-SVGF traced gradients, dual fast/slow history, exposure-aware
+clamps) have landed**; the rest of R5 and R6 are still proposal. Written 2026-08-02 against the working tree at the
 RT-denoiser series (post "RT shadows: stop multiplexing ambient occlusion into
 the shadow mask"); R0's landed work packages are marked in §5.0 and R1's three
 packages in §5.2. As of R1c the probe field lights the frame — the first
@@ -162,9 +163,11 @@ enthusiasm:
 - **Determinism is a feature.** The smoke gate depends on it. Every stochastic
   pass seeds from a frame counter (`shadow_frame_index_`,
   `reflection_frame_index_`); every new pass must do the same, and the
-  A-SVGF-style gradient work in §5.7 additionally requires the sampler be
+  A-SVGF-style gradient work in §5.6 additionally requires the sampler be
   *replayable* (same pixel, same frame index → same sample) — which R2+IGN
-  and STBN both are.
+  and STBN both are. **R5b cashed that requirement in**: its gradient traces
+  call `rtSample2D(prevCoord, frameIndex - 1)` and get back exactly the sample
+  the previous frame took, with no per-pixel seed stored anywhere.
 
 ---
 
@@ -397,11 +400,15 @@ include list).
 
 ### 5.1 Sun (existing signal, two upgrades)
 
-Already in good shape. Two changes, both late (R5): dual fast/slow history and
-A-SVGF gradient reset (§5.7) so sunrise/sunset and cloud-shadow sweeps stop
-relying on the σ-clamp alone; and exposure-aware clamp thresholds (the
-day↔night luminance swing is ~10³ — fixed radiance-space thresholds cannot
-serve both ends).
+Already in good shape. Two changes were planned for late in R5 — dual fast/slow
+history plus A-SVGF gradient reset, so sunrise/sunset and cloud-shadow sweeps
+stop relying on the σ-clamp alone, and exposure-aware clamp thresholds (the
+day↔night luminance swing is ~10³, and fixed radiance-space thresholds cannot
+serve both ends). **All three landed in R5b — see §5.6**, and the sun signal
+additionally gained a third mechanism the plan did not anticipate: an ANALYTIC
+sun gradient, measured on the CPU from the previous frame's sun state before any
+ray is cast, which is free, global, and the thing that actually answers a
+time-of-day scrub.
 
 ### 5.2 R1 — Probe-field GI (the base layer, every tier)
 
@@ -1214,6 +1221,180 @@ seam in indirect); tier A/B screenshots.
   history reset for shadow + reflection + probe temporal passes. This is the
   mechanism that makes lightning, cloud shadows, and light toggles clean at
   every tier.
+
+  **Landed (R5b, 2026-08-02) — stochastic visibility history now invalidates on
+  LIGHTING change, not only on motion.** Three new pipelines, three new shaders,
+  one new shared include, and **every one of the four recorded smoke baselines
+  is bit-identical** (`86.3 / 45.5`, `83.7 / 48.4`, `85.0 / 47.9`,
+  `82.2 / 50.5`, each reproduced over three runs). That is not a null result —
+  it is the contract: all three mechanisms below are the identity when nothing
+  changed, and a static smoke run is precisely that case.
+
+  *1. The analytic sun gradient (cheap, global).* `render/rt_denoise_math.hpp`
+  is the CPU source of truth for the whole package;
+  `shaders/rt_denoise.hlsli` is its transliteration and
+  `rt_denoise_math.test.cpp` pins it (+22 tests). `SceneRenderer` keeps the
+  previous frame's `sun_dir` and `sun_color × sun_intensity`, measures the
+  angular delta and the relative radiance delta once per frame, and maps the
+  LARGER of the two (max, not sum — either alone is sufficient reason to
+  distrust history) through a dead-zone→saturation ramp. The saturation is
+  **0.35°, the solar disk's own angular radius**, which is a physical anchor
+  rather than a taste value: once the disk has moved by its own radius in one
+  frame, this frame's jittered samples and the last frame's are drawn from
+  disjoint sets of directions and simply are not estimates of the same integral.
+  The dead zone is 0.05°/frame — 700× a real 24-hour cycle's rate, so a game
+  with a real sun pays nothing, ever. One number goes to BOTH `VisibilityDenoiser`
+  temporal passes and to the probe field's blend, where it enters
+  `giBlendHysteresis` as an upper BOUND rather than a second term (so reset 0 is
+  the pre-R5b curve exactly). The colour channel is what catches a lightning
+  spike, and it saturates at 25%/frame — never at weather drift.
+
+  *2. Traced sparse gradients (A-SVGF-shaped, local).*
+  `rt_shadow_gradient.comp.hlsl` and `rt_local_shadow_gradient.comp.hlsl`, one
+  thread per **3×3 stratum** of the traced resolution — measured at exactly
+  11.1% extra rays per enabled signal (160200 against 1440000 for the sun at
+  Full; 40050 against 360000 for the local signal at Half). The stratum's pixel
+  comes from `rtSeed(stratum, frameIndex) % 9`, so the choice rotates and is a
+  pure function of a counter. Each thread reprojects through velocity and
+  **re-traces this frame's scene with the previous frame's sample** —
+  `rtSample2D(prevCoord, frameIndex - 1)`, which is literally the sample the
+  previous frame took at that pixel, because §2's replayability requirement
+  makes it so. Holding the draw fixed is what cancels the sun-disk jitter inside
+  the comparison. The comparison target is the previous frame's RAW packed bits,
+  retained by a ping-pong on the bits texture — 22 KB at half res, the entire
+  memory cost of the mechanism.
+
+  *Separate dispatches, not a second thread-tier inside the trace, and the
+  reason is the tile.* Both traces are dispatched over the 8×4 TILE grid because
+  their group IS the tile whose 32 bits it packs with a groupshared atomic OR. A
+  3×3 stratum grid does not tile an 8×4 group, so folding the gradient in would
+  have meant either a second, differently-shaped dispatch inside the same shader
+  (which SDL3 GPU has no way to express) or abandoning the packed-bit output
+  that the whole classify/temporal chain is built on. The gradient also needs
+  the previous frame's bits and the previous frame's history — both of which the
+  trace is about to invalidate — so its ordering constraint is real regardless.
+
+  *The local variant differs in the one place that matters*: a replay must also
+  reproduce WHICH LIGHT the previous reservoir picked, resolved through R2a's
+  prev→current remap, or a pixel whose reservoir merely moved would report a
+  full gradient. A light the remap says is gone reports 1 with no ray at all —
+  a torch being extinguished is exactly the event fixed-α accumulation smears.
+  A pixel whose previous reservoir held no light reports 0 and is left to the
+  dual history; inventing a comparison there would report reservoir churn as a
+  lighting change.
+
+  *Reconstruction is a weighted MAXIMUM, not an à-trous average*, over the 5×5
+  stratum window with weights 1.0 / 0.6 / 0.3 by Chebyshev ring
+  (`rt_gradient_reconstruct.comp.hlsl`, one pipeline dispatched once per signal).
+  This section's own bullet says "à-trous", and the deviation is deliberate:
+  A-SVGF's gradient is a continuous luminance ratio, ours is a BINARY visibility
+  comparison, and a b3-spline blur of one fired stratum among 24 quiet ones is
+  0.14 — which resets nothing, at exactly the pixels that needed it. The correct
+  spatial operator for "something here changed" is a soft dilation.
+
+  *One measurement changed the design.* The gradient's depth-continuity test is
+  **two orders of magnitude tighter** than the denoiser's (0.0005 against 0.05),
+  because the two ask different questions: the denoiser's is "is this history
+  reusable?", the gradient's is "is this literally the point I traced last
+  frame?". With TAA on, the jitter moves each pixel's reconstructed world
+  position by up to half a pixel per frame, and in geometry as high-frequency as
+  the playground's canopies that lands the replay on a different leaf. At the
+  denoiser's own tolerance a completely static `--rt-bench` run reported a 3.3%
+  gradient fire rate that was ENTIRELY that effect (TAA off: 0.14%) and dragged
+  the sun's mean accumulation window from 26.6 frames to 10.3 for no signal
+  whatsoever. Tightened, the static rate is 0.9% and the window holds at 17.9.
+
+  *3. Dual fast/slow history*, one `RG16F` ping-pong per signal (fast mean, fast
+  count). A four-frame mean runs beside the main accumulator and is never
+  displayed — it is a change DETECTOR, not an estimator. The main mean is
+  clamped toward it each frame by `fast_history_margin`, derived from the fast
+  mean's OWN sampling error: a region unanimously shadowed for four frames has
+  zero sampling error, so the margin collapses to its 0.05 floor and a stale
+  bright history is dragged down inside the fast window instead of over
+  `max_accum_frames`; a genuine half-penumbra, which four binary samples cannot
+  resolve, opens the margin to 0.55 and is left alone. The second moment is
+  shifted by the same amount as the mean, so the spatial filter downstream never
+  reads a negative variance out of a clamped mean. This is what covers the local
+  signal's reservoir switching light, where the gradient replay deliberately
+  reports nothing.
+
+  *4. Exposure-aware clamps.* `render::AutoExposure::state_buffer()` was already
+  a `ComputeStorage` buffer, so it is bound READ-ONLY into
+  `rt_reflection_denoise_temporal.comp.hlsl` and `gi_screen_probe_filter.comp.hlsl`
+  with no change to it at all. `rtAdaptedEv` ADDS the manual bias
+  (`log2(GraphicsSettings::exposure)`) to the adapted EV, exactly as the
+  composite pass multiplies the two, so the two configurations clamp identically
+  in perceptual terms. Three thresholds: a floor under the reflection σ-clamp
+  (scale-free wherever σ is nonzero — but in a flat region σ collapses, the box
+  closes onto this frame's one sample, and the accumulation is discarded at
+  exactly the pixels that would have converged best); a reflection FIREFLY clamp,
+  which did not exist before R5b, whose ceiling is the max of a relative term
+  (mean + 4σ) and an absolute post-exposure one; and a floor under the
+  screen-probe filter's firefly ceiling, which until now was `fireflyMax × mean`
+  with a `mean > 1e-6` guard and a comment naming this phase.
+
+  *5. The bench is the validation story, because a screenshot cannot be.* A
+  lagging denoiser and a converged one render the same frame whenever nothing
+  has changed for thirty frames, so `RtStats::denoise` carries the two numbers
+  that can distinguish them: per-signal mean accumulation count and gradient fire
+  fraction, from eight uints both temporal dispatches accumulate into with one
+  group-level atomic each. **The counters are never reset** — zeroing them would
+  cost a copy pass every frame to serve a statistic — and the CPU differences two
+  lagged readbacks instead, which is EXACT under unsigned wraparound whenever
+  fewer than 2³² are added between them (~360 k per frame against a readback
+  every ten frames). Measured cost of the atomics: none (the same run with them
+  compiled out is inside the noise).
+
+  `PLAYGROUND_SUN_SWEEP=<deg/s>` pins a continuous sun-azimuth sweep for the
+  duration of an `--rt-bench` run, derived from the FRAME INDEX at the pinned
+  1/60 timestep so the run stays bit-reproducible. Azimuth rather than elevation:
+  it moves every shadow on the ground plane without changing the sun's intensity
+  or the sky's colour, so the numbers answer for the angular half of the gradient
+  alone. `--rt-bench 120 PLAYGROUND_RT=both PLAYGROUND_RT_LOCAL=ratio`,
+  RelWithDebInfo, 1600×900:
+
+  | sweep | sun accum | sun fire | local accum | local fire |
+  |---|---|---|---|---|
+  | 0 (static) | 17.86 | 0.85 % | 25.52 | 1.24 % |
+  | 3 °/s | 17.85 | 0.83 % | 25.49 | 1.24 % |
+  | 10 °/s | 6.27 | 0.79 % | 6.61 | 1.24 % |
+  | 30 °/s | 1.15 | 0.96 % | 1.07 | 1.24 % |
+  | 300 °/s | 1.00 | 1.72 % | 1.00 | 1.24 % |
+  | 0, TAA off | 27.76 | 0.05 % | 10.55 | 6.66 % |
+  | 300 °/s, TAA off | 1.00 | 3.07 % | 1.00 | 6.66 % |
+
+  Read it as three claims. **The analytic gradient works and is proportional**:
+  3 °/s is 0.05°/frame, exactly the dead zone, and changes nothing; 10 °/s is a
+  third of the way up the ramp and cuts the window by two thirds; 30 °/s is
+  0.5°/frame, past the solar-radius saturation, and collapses it outright.
+  **The local signal is independent of the sun**, as it must be — its fire
+  fraction is identical to four decimal places across every sweep, and its
+  accumulation moves only because the sun's reset floor is global by design.
+  **The traced gradient responds where the analytic one is inert**: with TAA off
+  its fire fraction goes 0.05 % → 3.07 %, a 60× response on a signal whose
+  static floor is essentially zero. With TAA on the jitter puts a 0.85 % floor
+  under it and halves the response — the honest characterisation of this
+  mechanism in this engine, and the reason the depth tolerance above is what it
+  is.
+
+  *Cost.* `--rt-bench 120 PLAYGROUND_RT=both`, RelWithDebInfo, three runs:
+  `RTShadows` CPU record 0.0103 → 0.0157 ms mean (two more dispatches inside the
+  scope), `RTReflectionTrace` 0.0059 → 0.0067 (one more storage-buffer bind),
+  frame render 2.174 → 2.83 ms and `present_wait` 1.699 → 2.33 ms. So **~0.63 ms
+  on the device** for the sun signal at FULL traced resolution — 160 k gradient
+  rays plus a temporal pass that now writes two targets and reads three. That is
+  the price of the package and it is paid per enabled signal; the traced
+  resolution dial moves it quadratically.
+
+  *Deliberately out of R5b, and documented rather than deferred silently:*
+  **reflection-signal gradients**. A reflection replay has to interact with the
+  virtual-hit-point reprojection of §5.4, whose motion vector is itself a
+  function of a one-sample hit distance — reproducing "the previous frame's
+  sample" for a signal whose reprojection is stochastic is a package's worth of
+  argument on its own. The exposure-aware clamp is reflections' share here.
+  Also still open from this bullet: hit-distance MOMENTS driving a
+  penumbra-width filter radius (SIGMA's idea) on the two shadow signals, and the
+  Full-DI tier below.
 - **Full-DI tier** of local lights lands here (§5.3's second fold), reusing
   the matured denoiser core.
 

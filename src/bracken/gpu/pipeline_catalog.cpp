@@ -805,9 +805,55 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
     {.name = "RtShadowTemporal",
      .shader = "rt_shadow_denoise_temporal.comp.spv",
      .entry_point = "CSMain",
-     .resources = {.num_samplers = 3,                   // depth, velocity, history
-                   .num_readonly_storage_textures = 2,  // packed bits, tile verdicts
-                   .num_readwrite_storage_textures = 1, // accumulated history out
+     // Widened by R5b (docs/rt_lighting_plan.md §5.6): the fourth sampler is
+     // the FAST history's reprojected read, the third read-only storage texture
+     // is the reconstructed A-SVGF gradient, the second read-write target is the
+     // fast history out, and the read-write BUFFER is the never-reset
+     // diagnostics counter block the --rt-bench harness differences.
+     .resources = {.num_samplers = 4,                   // depth, velocity, history, fast history
+                   .num_readonly_storage_textures = 3,  // packed bits, tile verdicts, gradient
+                   .num_readwrite_storage_textures = 2, // main history out, fast history out
+                   .num_readwrite_storage_buffers = 1,  // accumulation/gradient counters
+                   .num_uniform_buffers = 1}},
+    {.name = "RtShadowGradient",
+     .shader = "rt_shadow_gradient.comp.spv",
+     .entry_point = "CSMain",
+     // One thread per 3x3 stratum. Sampled: depth, the prepass G-buffer,
+     // velocity, and the denoiser history — the last for its ALPHA alone, the
+     // linear depth the previous frame recorded, which is what separates "the
+     // lighting changed" from "a different surface is here now". Read-only
+     // storage texture: the PREVIOUS frame's packed bits, the thing being
+     // compared against. Then the four acceleration buffers, because this pass
+     // genuinely re-traces.
+     .resources = {.num_samplers = 4,
+                   .num_readonly_storage_textures = 1,
+                   .num_readonly_storage_buffers = 4,
+                   .num_readwrite_storage_textures = 1,
+                   .num_uniform_buffers = 1}},
+    {.name = "RtLocalShadowGradient",
+     .shader = "rt_local_shadow_gradient.comp.spv",
+     .entry_point = "CSMain",
+     // The local signal's replay. No history sampler — the previous reservoir
+     // carries its own view depth, so the disocclusion test needs no texture —
+     // but EIGHT read-only storage buffers, the same ceiling-exact split
+     // RtLocalShadow spends (four acceleration + four cluster), and the same
+     // consequence: the previous frame's reservoirs ride a read-write slot they
+     // are only ever read through. Two uniform buffers, b1 being ClusterGrid's
+     // own ClusterParams pushed verbatim.
+     .resources = {.num_samplers = 3,
+                   .num_readonly_storage_textures = 1,
+                   .num_readonly_storage_buffers = 8,
+                   .num_readwrite_storage_textures = 1,
+                   .num_readwrite_storage_buffers = 1,
+                   .num_uniform_buffers = 2}},
+    {.name = "RtGradientReconstruct",
+     .shader = "rt_gradient_reconstruct.comp.spv",
+     .entry_point = "CSMain",
+     // Raw stratum verdicts in, dilated verdicts out. Both visibility signals
+     // dispatch this one pipeline against their own pair of targets, exactly as
+     // they share the classify/temporal/filter three.
+     .resources = {.num_readonly_storage_textures = 1,
+                   .num_readwrite_storage_textures = 1,
                    .num_uniform_buffers = 1}},
     {.name = "RtShadowFilter",
      .shader = "rt_shadow_denoise_filter.comp.spv",
@@ -842,7 +888,12 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // The last three arrived with R3's virtual-hit-point reprojection: the
      // trace's R16F hit distance, plus the receiver's depth and G-buffer, which
      // together place the virtual point and say how much to trust it.
+     // The read-only storage buffer arrived with R5b: render::AutoExposure's own
+     // persistent state block, so the sigma floor and the new firefly ceiling
+     // can be expressed in POST-EXPOSURE luminance and mean the same thing at
+     // both ends of a day/night cycle.
      .resources = {.num_samplers = 6, // raw trace, velocity, history, hitT, depth, G-buffer
+                   .num_readonly_storage_buffers = 1,   // exposure state
                    .num_readwrite_storage_textures = 1, // accumulated history out
                    .num_uniform_buffers = 1}},
     {.name = "RtLocalShadow",
@@ -986,9 +1037,12 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      .entry_point = "CSMain",
      // Raw atlas + previous filtered atlas + velocity in, both frames' probe
      // headers alongside (the temporal test asks whether the PREVIOUS frame's
-     // probe described a compatible surface); the filtered atlas out.
+     // probe described a compatible surface); the filtered atlas out. The third
+     // read-only storage buffer is R5b's exposure state, which gives the
+     // firefly ceiling the absolute floor its own comment had been promising
+     // since R4b.
      .resources = {.num_samplers = 3,
-                   .num_readonly_storage_buffers = 2,
+                   .num_readonly_storage_buffers = 3,
                    .num_readwrite_storage_textures = 1,
                    .num_uniform_buffers = 1}},
     {.name = "GiScreenProbeProject",

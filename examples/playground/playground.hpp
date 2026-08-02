@@ -430,6 +430,33 @@ private:
     std::vector<float> rt_bench_render_ms_;
     std::vector<float> rt_bench_fence_ms_;
     std::vector<float> rt_bench_present_wait_ms_;
+    /// R5b denoiser diagnostics, sampled from RtStats::denoise whenever a
+    /// lagged readback has landed. These are the ONLY evidence a static
+    /// screenshot cannot supply: a denoiser lagging behind a moving sun and one
+    /// tracking it perfectly produce identical frames whenever nothing has
+    /// changed for thirty frames, so the accumulation window and the gradient
+    /// fire rate are what have to be reported instead.
+    std::vector<float> rt_bench_shadow_accum_;
+    std::vector<float> rt_bench_shadow_fire_;
+    std::vector<float> rt_bench_local_accum_;
+    std::vector<float> rt_bench_local_fire_;
+    /**
+     * PLAYGROUND_SUN_SWEEP=<deg/s> — a continuous sun-azimuth sweep for the
+     * duration of an --rt-bench run.
+     *
+     * Without it there is nothing to measure. Every smoke and bench run in this
+     * repo pins a static environment on purpose (that is what makes the luma
+     * figures comparable), and a static sun is exactly the case R5b's
+     * lighting-change invalidation is inert in. The sweep is derived from the
+     * FRAME INDEX at the pinned 1/60 timestep, never from wall clock, so the
+     * run remains bit-reproducible.
+     *
+     * Azimuth rather than elevation: it moves every shadow on the ground plane
+     * without changing the sun's intensity or the sky's colour, so the
+     * accumulation counts below answer for the ANGULAR half of the gradient
+     * alone rather than for a confounded mixture of the two.
+     */
+    float sun_sweep_deg_per_s_ = 0.0f;
     int rt_bench_sampled_frames_ = 0;
     int screenshot_counter_ = 0;
 };

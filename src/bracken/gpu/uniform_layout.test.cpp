@@ -485,6 +485,10 @@ const UniformRow UNIFORM_TABLE[] = {
     // its first and only real consumer; the R2a placeholder that existed purely
     // to make the include a compiled artifact is gone with it.
     ROW("rt_local_shadow.comp.spv", 2, 1, render::lighting::ClusterParams),
+    // R5b's local gradient replay takes the same include and therefore the same
+    // b1: it needs `clusterParams.view` for a view depth that agrees with the
+    // CPU binner's, exactly as the trace does.
+    ROW("rt_local_shadow_gradient.comp.spv", 2, 1, render::lighting::ClusterParams),
     ROW("terrain.vert.spv", 1, 0, render::TerrainTransformUniforms),
     ROW("terrain.frag.spv", 3, 0, render::TerrainLightingUniforms),
     ROW("grass.vert.spv", 1, 0, render::GrassVertexUniforms),
@@ -501,6 +505,11 @@ const UniformRow UNIFORM_TABLE[] = {
     // from ClusterGrid::params() — its row is with the renderer-owned mirrors
     // above.
     ROW("rt_local_shadow.comp.spv", 2, 0, gpu::RtLocalShadowUniforms),
+    // R5b's A-SVGF gradient chain. The reconstruct pass is dispatched once per
+    // enabled signal against that signal's own targets, so it has one row.
+    ROW("rt_shadow_gradient.comp.spv", 2, 0, gpu::RtShadowGradientUniforms),
+    ROW("rt_local_shadow_gradient.comp.spv", 2, 0, gpu::RtLocalShadowGradientUniforms),
+    ROW("rt_gradient_reconstruct.comp.spv", 2, 0, gpu::RtGradientReconstructUniforms),
     ROW("rt_reflection_resolve.frag.spv", 3, 0, gpu::RtReflectionResolveUniforms),
     ROW("water.vert.spv", 1, 0, render::WaterRenderer::VertexUniforms),
     ROW("water.frag.spv", 3, 0, render::WaterRenderer::FragmentUniforms),

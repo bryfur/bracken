@@ -5,6 +5,7 @@
 #include "bracken/gpu/gpu_compute.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/render/raytracing/rt_scene.hpp"
+#include "bracken/render/rt_denoise_math.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -479,6 +480,10 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
     blend.rayMaxDistance = params.ray_max_distance;
     blend.frameIndex = static_cast<std::uint32_t>(frame_counter_);
     blend.cascadeIndex = static_cast<std::uint32_t>(cascade_index);
+    // R5b's analytic sun gradient. Read by the IRRADIANCE blend only — see the
+    // field's comment in gi_probe_blend_visibility.comp.hlsl for why the
+    // visibility moments pass 0 regardless of what is in the struct.
+    blend.lightingReset = lighting_reset_floor(params.lighting_reset);
 
     // ---- 2. irradiance blend + border -----------------------------------
     {

@@ -291,6 +291,23 @@ vectors are UV deltas in the velocity buffer's own convention, so the TAA jitter
 cancels inside each difference. A static camera makes both identically zero and
 the mechanism exactly neutral.
 
+R5b gave it one read-only storage buffer: `render::AutoExposure`'s persistent
+state block (a `float4` {current EV, target EV, avg log2 luma, valid}), which
+was already a `ComputeStorage` buffer and so needed no change to be bound
+read-only here. `rtAdaptedEv` adds the manual bias to it exactly as the
+composite pass multiplies the two, so the clamps mean the same thing with auto
+exposure on and off. It buys two things a scale-free σ-clamp could not: a FLOOR
+under the neighbourhood σ, so a flat region's clamp box cannot collapse onto
+this frame's single stochastic sample and throw away the accumulation at exactly
+the pixels that would have converged best; and a FIREFLY clamp, new in R5b,
+whose ceiling is the max of a relative term and an absolute post-exposure one so
+that neither a bright neighbourhood nor a dark one can make the other stricter.
+Reflection *gradients* are deliberately out of R5b — the replay would have to
+interact with the virtual-point reprojection above, whose motion vector is
+itself a function of a stochastic hit distance. `gi_screen_probe_filter.comp`
+binds the same buffer for the same reason, giving its firefly ceiling the
+absolute floor its own comment had been promising since R4b.
+
 `rt_local_shadow.comp` (R2b) is the third traced signal and the only one that
 reads the cluster grid: per pixel it draws six candidates from the pixel's
 froxel through `cluster_compute.hlsli`, weights them by `clusterLightTarget`,
@@ -303,6 +320,53 @@ a second time against a second set of targets. Its two set-1 read-write storage
 buffers are the reservoir ping-pong, of which the second is only ever READ:
 SDL3 GPU allows a compute pipeline eight read-only storage buffers and the four
 acceleration-structure buffers plus four cluster buffers spend them exactly.
+
+`rt_shadow_gradient.comp` and `rt_local_shadow_gradient.comp` (R5b) are the
+**A-SVGF temporal gradient** for the two visibility signals — the only thing in
+the frame that can tell a denoiser its history is stale because the LIGHTING
+changed rather than because something moved. One thread per 3×3 stratum of the
+traced resolution (the 1-in-9 ray budget), a stratum pixel chosen by
+`rtGradientPixelInStratum` (a hash of the stratum and the frame counter, so it
+rotates and stays deterministic), reprojected through velocity, then **re-traced
+against THIS frame's scene with the PREVIOUS frame's sample** —
+`rtSample2D(prevCoord, frameIndex - 1)`, which is literally the sample the
+previous frame took there. Holding the random draw fixed is what cancels the
+sun-disk jitter in the comparison; without it every stratum would report its own
+sampling variance as a lighting change. The comparison target is the previous
+frame's raw packed bits, retained by a ping-pong on the bits texture.
+
+The local variant differs in one place that matters: it must also reproduce
+WHICH LIGHT the previous frame's reservoir picked, resolved through R2a's
+prev→current remap, or it would report a full gradient on every pixel whose
+reservoir merely moved. A light the remap says is gone gives a gradient of 1
+with no ray at all. It takes the same eight-read-only-storage-buffer split
+`rt_local_shadow.comp` does, and for the same ceiling; `clusterParams` at
+set 2 b1 is why it includes `cluster_compute.hlsli` whole despite drawing no
+new candidates — that view matrix is the only source of a view depth that agrees
+with the CPU binner's. Both use a depth-continuity tolerance **two orders of
+magnitude tighter** than the denoiser's, because they ask a strictly stronger
+question ("is this the same POINT?" rather than "is this history reusable?") and
+because at the loose one the TAA jitter alone reports a 3.3% fire rate on a
+completely static scene.
+
+`rt_gradient_reconstruct.comp` turns the sparse verdicts dense: the **weighted
+maximum** over the 5×5 stratum window, weights falling off by Chebyshev ring.
+Not an à-trous average, deliberately — the verdict is binary, and a b3-spline
+blur of one fired stratum among 24 quiet ones is 0.14, which resets nothing. One
+pipeline, dispatched once per enabled signal against that signal's own pair of
+targets, exactly as the `rt_shadow_denoise_*` three are.
+
+`rt_shadow_denoise_temporal.comp` consumes all of it. It gained a fourth sampler
+(the FAST history — a four-frame mean in `RG16F` that is never displayed and
+exists only to clamp the main mean back when it drifts outside that mean's own
+sampling error), a third read-only storage texture (the reconstructed gradient),
+a second read-write target (the fast history out) and one read-write buffer: the
+never-reset diagnostics counters whose differences the `--rt-bench` harness
+reports as the mean accumulation window and the gradient fire fraction. The
+`lightingReset` uniform is the analytic sun gradient, computed on the CPU before
+any ray was cast and shared with the probe field's blend; at 0 — every frame
+whose sun held still — the whole chain reduces to its pre-R5b arithmetic bit for
+bit.
 
 When water is active, that resolved quarter-resolution target
 is recycled for a second analytic water-receiver dispatch: camera-ray/plane
@@ -543,7 +607,16 @@ GGX-VNDF sampling, the packed visibility-tile helpers, and `rtSeed`/`rtNextFloat
 — a per-pixel per-frame random STREAM for passes like the froxel-RIS reservoir
 that make a dozen independent decisions per pixel, where feeding them all from
 one low-discrepancy sequence would correlate the candidate choice with the
-acceptance test), `rt_hit_shade.hlsli` (**the one
+acceptance test — and, because both are seeded from `(pixel, frameIndex)` alone,
+both are REPLAYABLE, which is the property R5b's A-SVGF gradient is built on),
+`rt_denoise.hlsli` (the R5b denoiser core: the analytic sun gradient's ramp, the
+gradient stratum picker and its dilation weights, the dual fast/slow history's
+margin, and the exposure-aware clamp thresholds — a transliteration of
+`render/rt_denoise_math.hpp`, which is the tested source of truth for every
+constant in it. It declares no resource and reads no uniform, so the two
+visibility temporal passes, the reflection temporal pass and the screen-probe
+filter all include it; it takes `rt_sampling.hlsli` itself for `rtSeed` and
+`luminance`), `rt_hit_shade.hlsli` (**the one
 hit-shading model** every traced signal uses, R3: `TriangleAttributes` in phase
 1, then `rtHitSkyRadiance` for a miss and `rtShadeHit` for a hit —
 `albedo_flat × (CSM-shadowed sun N·L + range-windowed point/spot lights + π ×

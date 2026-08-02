@@ -103,6 +103,14 @@ struct ScreenProbeParams {
     std::uint32_t light_count = 0;
     std::uint32_t light_capacity = 0;
 
+    /// render::AutoExposure::state_buffer(), read-only, for R5b's exposure-aware
+    /// firefly ceiling in the probe-space temporal filter. Null is valid and
+    /// means "no auto exposure": the filter borrows a valid buffer for the slot
+    /// and takes `manual_exposure_ev` instead.
+    SDL_GPUBuffer* exposure_state = nullptr;
+    /// log2 of GraphicsSettings::exposure, the manual bias.
+    float manual_exposure_ev = 0.0f;
+
     /// The world probe field, for the handed-off rays' hit shading and for the
     /// escaped-ray fallback. Null disables both (the fallback becomes pure sky).
     SDL_GPUTexture* gi_irradiance = nullptr;

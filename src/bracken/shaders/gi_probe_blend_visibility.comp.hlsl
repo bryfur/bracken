@@ -41,8 +41,15 @@ cbuffer GiProbeBlendUniforms : register(b0, space2) {
     float giRayMaxDistance;
     uint giFrameIndex;
     uint giCascadeIndex; // which BAND of the shared atlas this dispatch writes
+    /// R5b: the analytic sun gradient's global hysteresis floor, [0, 1]. The
+    /// renderer knows on the CPU how far the sun moved this frame, so a
+    /// time-of-day scrub or a lightning spike collapses the field's
+    /// accumulation window BEFORE any probe ray reports the change. Used by the
+    /// IRRADIANCE blend only — the visibility moments describe geometry, which
+    /// the sun moving does not alter — but the struct is shared by both passes,
+    /// so the field is declared in both. 0 is the identity.
+    float giLightingReset;
     uint _giPad0;
-    uint _giPad1;
 };
 
 // SET 0 ORDER: READ-ONLY storage textures, then READ-ONLY storage buffers.
@@ -112,7 +119,10 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
             float2 estimate = sum / wsum;
             // The same change-adaptive EMA as the irradiance blend, so the two
             // halves of a probe never describe different moments in time.
-            result = fresh ? estimate : giBlend(float3(previous, 0.0), float3(estimate, 0.0)).xy;
+            // Reset floor 0.0, deliberately: these moments describe GEOMETRY, and
+            // the sun moving does not move a wall. The floor is declared in this
+            // pass's cbuffer only because the two blends share one struct.
+            result = fresh ? estimate : giBlend(float3(previous, 0.0), float3(estimate, 0.0), 0.0).xy;
         }
 
         giVisibility[tileOrigin + tileLocal] = result;

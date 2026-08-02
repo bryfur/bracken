@@ -545,17 +545,29 @@ inline constexpr float PROBE_CHANGE_SATURATION = 1.0f;
 /// Hysteresis for a normalized new-vs-old delta. `delta` is
 /// |new - old| / max(|old|, epsilon), so it is scale-free: a courtyard at 0.02
 /// and a sunlit wall at 20.0 respond to a doubling at the same rate.
-[[nodiscard]] inline float probe_blend_hysteresis(float delta) {
+///
+/// `reset` is R5b's global hysteresis floor — the analytic sun gradient
+/// (`render/rt_denoise_math.hpp`'s `lighting_reset_floor`), which the renderer
+/// computes on the CPU before any probe ray is cast. It enters as an upper
+/// BOUND on hysteresis rather than as a second term, so `reset == 0` is exactly
+/// the pre-R5b curve and a static sun leaves the field bit-identical. Its whole
+/// purpose is the probe that has not yet re-traced under the new sun and so
+/// cannot observe a delta of its own to react to.
+[[nodiscard]] inline float probe_blend_hysteresis(float delta, float reset = 0.0f) {
     const float t = std::clamp(delta / PROBE_CHANGE_SATURATION, 0.0f, 1.0f);
-    return PROBE_HYSTERESIS_MAX + (PROBE_HYSTERESIS_MIN - PROBE_HYSTERESIS_MAX) * t;
+    const float adaptive = PROBE_HYSTERESIS_MAX + (PROBE_HYSTERESIS_MIN - PROBE_HYSTERESIS_MAX) * t;
+    const float r = std::clamp(reset, 0.0f, 1.0f);
+    const float ceiling = PROBE_HYSTERESIS_MAX + (PROBE_HYSTERESIS_MIN - PROBE_HYSTERESIS_MAX) * r;
+    return std::min(adaptive, ceiling);
 }
 
 /// One EMA step of the adaptive blend, per colour channel set. Mirrors
-/// `giBlend()` in `shaders/gi_probe_blend.comp.hlsl`.
-[[nodiscard]] inline glm::vec3 probe_blend(const glm::vec3& old_value, const glm::vec3& new_value) {
+/// `giBlend()` in `shaders/gi_probe.hlsli`.
+[[nodiscard]] inline glm::vec3 probe_blend(const glm::vec3& old_value, const glm::vec3& new_value,
+                                           float reset = 0.0f) {
     const float old_mag = glm::length(old_value);
     const float delta = glm::length(new_value - old_value) / std::max(old_mag, 1e-4f);
-    const float hysteresis = probe_blend_hysteresis(delta);
+    const float hysteresis = probe_blend_hysteresis(delta, reset);
     return new_value + (old_value - new_value) * hysteresis;
 }
 

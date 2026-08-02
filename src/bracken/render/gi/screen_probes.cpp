@@ -459,6 +459,10 @@ void ScreenProbeGather::render(SDL_GPUCommandBuffer* cmd, const ScreenProbeParam
         u.historyValid = history_valid_ ? 1.0f : 0.0f;
         u.fireflyMax = SCREEN_PROBE_FIREFLY_MAX;
         u.frameIndex = frame_index;
+        // R5b: the firefly ceiling gained an absolute floor, and an absolute
+        // luminance has to be told which exposure it is absolute in.
+        u.exposureEnabled = params.exposure_state != nullptr ? 1u : 0u;
+        u.manualExposureEv = params.manual_exposure_ev;
 
         const auto rw = rw_texture(filtered_write->handle(), false);
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
@@ -471,7 +475,14 @@ void ScreenProbeGather::render(SDL_GPUCommandBuffer* cmd, const ScreenProbeParam
              {filtered_read->handle(), point_clamp_sampler_},
              {params.velocity, point_clamp_sampler_}}};
         pass.bind_samplers(0, textures);
-        const std::array<SDL_GPUBuffer*, 2> buffers{probes_write->handle(), probes_read->handle()};
+        // The exposure slot must hold a VALID buffer even when there is no
+        // exposure state to offer — an unbound descriptor is undefined, not
+        // empty — so it borrows the probe header buffer, which is bound here
+        // anyway and is comfortably larger than the one float4 the shader
+        // loads. `exposureEnabled` is what decides whether it is read.
+        const std::array<SDL_GPUBuffer*, 3> buffers{
+            probes_write->handle(), probes_read->handle(),
+            params.exposure_state != nullptr ? params.exposure_state : probes_read->handle()};
         pass.bind_storage_buffers(0, buffers);
         pass.push_uniforms(0, &u, sizeof(u));
         pass.dispatch(probe_count, 1, 1);

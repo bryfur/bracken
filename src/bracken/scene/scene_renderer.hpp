@@ -794,6 +794,24 @@ private:
     };
     FrameCameraMatrices frame_cam_{};
     glm::mat4 prev_view_proj_unjittered_{1.0f}; // last rendered frame's unjittered VP
+
+    // ---- R5b: the analytic sun gradient (docs/rt_lighting_plan.md §5.6) ----
+    //
+    // The renderer knows the sun moved before any ray is cast, and it is the
+    // ONLY place that knows it once: `EnvironmentState` is rebuilt from the
+    // packet every frame and carries no history. Measuring the delta here and
+    // handing one number to every temporal accumulator is what makes a
+    // time-of-day scrub collapse the shadow denoisers, the local-light
+    // denoiser and the probe field's blend on the same frame, rather than each
+    // discovering it separately and at a different lag.
+    glm::vec3 prev_sun_dir_{0.0f};
+    /// sun_color * sun_intensity — the product, because dimming by scaling the
+    /// intensity and dimming by darkening the colour are the same event.
+    glm::vec3 prev_sun_radiance_{0.0f};
+    bool sun_state_valid_ = false;
+    /// This frame's reset floor in [0, 1]. 0 on every frame the sun held still,
+    /// which is what keeps the pre-R5b path bit-identical.
+    float lighting_reset_ = 0.0f;
     bool have_prev_view_proj_ = false;          // first frame: prev == current (zero camera velocity)
     uint64_t frame_index_ = 0;                  // rendered-frame counter (drives the jitter sequence)
     bool taa_jitter_enabled_ = false;           // derived per frame: aa_mode == TAA && resolve can run

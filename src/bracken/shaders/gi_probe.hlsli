@@ -226,17 +226,28 @@ float3 giRayDirection(uint index, uint count, uint frameIndex) {
 #define GI_HYSTERESIS_MIN 0.70
 #define GI_CHANGE_SATURATION 1.0
 
-/// Hysteresis for a normalized (scale-free) new-vs-old delta.
+/// Hysteresis for a normalized (scale-free) new-vs-old delta, and R5b's global
+/// reset floor from the analytic sun gradient.
+///
+/// The floor enters as an upper BOUND on hysteresis, never as a second term:
+/// `reset` of 0 leaves the adaptive value exactly as it was, which is what
+/// makes a static sun bit-identical to the pre-R5b field rather than merely
+/// close. A reset of 1 pins hysteresis at GI_HYSTERESIS_MIN however small the
+/// probe's own observed delta is — which is the case the floor exists for, a
+/// probe whose rays have not yet been re-cast under the new sun and therefore
+/// cannot report the change themselves.
+///
 /// CPU mirror: `probe_blend_hysteresis`.
-float giBlendHysteresis(float delta) {
-    float t = saturate(delta / GI_CHANGE_SATURATION);
-    return lerp(GI_HYSTERESIS_MAX, GI_HYSTERESIS_MIN, t);
+float giBlendHysteresis(float delta, float reset) {
+    float adaptive = lerp(GI_HYSTERESIS_MAX, GI_HYSTERESIS_MIN, saturate(delta / GI_CHANGE_SATURATION));
+    float ceiling = lerp(GI_HYSTERESIS_MAX, GI_HYSTERESIS_MIN, saturate(reset));
+    return min(adaptive, ceiling);
 }
 
 /// One EMA step. CPU mirror: `probe_blend`.
-float3 giBlend(float3 oldValue, float3 newValue) {
+float3 giBlend(float3 oldValue, float3 newValue, float reset) {
     float delta = length(newValue - oldValue) / max(length(oldValue), 1e-4);
-    return lerp(newValue, oldValue, giBlendHysteresis(delta));
+    return lerp(newValue, oldValue, giBlendHysteresis(delta, reset));
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,7 @@
 #include "bracken/render/ibl.hpp"
 #include "bracken/render/post_process_stack.hpp"
 #include "bracken/render/render_context.hpp"
+#include "bracken/render/rt_denoise_math.hpp"
 #include "bracken/render/shadow_map.hpp"
 #include "bracken/render/taa.hpp"
 #include "bracken/render/terrain_renderer.hpp"
@@ -628,6 +629,28 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     frame_effect_count_ = frame.effect_instance_count();
     frame_particle_count_ = static_cast<uint32_t>(frame.effect_particles().size());
 
+    // ---- R5b: the analytic sun gradient (docs/rt_lighting_plan.md §5.6) ----
+    //
+    // Measured HERE, once, on the frame's final environment, and handed to
+    // every temporal accumulator later in this function. Two dot products and
+    // an acos on the main thread — free next to a single ray — and exactly zero
+    // for a sun that did not move, so nothing downstream changes on a frame
+    // where nothing changed.
+    //
+    // The first frame reports 0 rather than a full reset: there is no previous
+    // sun to have moved from, and every history it would reset is invalid for
+    // its own reasons already.
+    {
+        const glm::vec3 sun_radiance = env_.sun_color * gfx.sun_intensity;
+        lighting_reset_ = sun_state_valid_
+                              ? render::lighting_reset_floor(render::sun_change_signal(
+                                    prev_sun_dir_, env_.sun_dir, prev_sun_radiance_, sun_radiance))
+                              : 0.0f;
+        prev_sun_dir_ = env_.sun_dir;
+        prev_sun_radiance_ = sun_radiance;
+        sun_state_valid_ = true;
+    }
+
     // Propagate the environment to every renderer that builds its own lighting
     // uniforms; env_ is the single source of truth for sun/sky/fog this frame.
     light_dir_ = env_.sun_dir;
@@ -1210,6 +1233,10 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                                                           draw_camera.view[2][2]);
                     gi_params.environment = env_;
                     gi_params.sun_intensity = gfx.sun_intensity;
+                    // R5b: the same number the visibility denoisers get, so a
+                    // sun jump collapses the field's blend window on the frame
+                    // it happened rather than several probe rotas later.
+                    gi_params.lighting_reset = lighting_reset_;
                     gi_params.shadow = frame_shadow_uniforms_;
                     gi_params.shadow_atlas = shadow_map_->atlas_texture();
                     gi_params.shadow_compare_sampler = shadow_map_->shadow_compare_sampler();
@@ -1303,6 +1330,12 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     sp.depth_a = draw_camera.projection[2][2];
                     sp.depth_b = draw_camera.projection[3][2];
                     sp.environment = env_;
+                    // R5b: the probe-space firefly ceiling's absolute floor.
+                    sp.exposure_state =
+                        (gfx.auto_exposure && auto_exposure_ && auto_exposure_->is_ready())
+                            ? auto_exposure_->state_buffer()
+                            : nullptr;
+                    sp.manual_exposure_ev = std::log2(std::max(gfx.exposure, 1e-6f));
                     sp.sun_intensity = gfx.sun_intensity;
                     sp.shadow = frame_shadow_uniforms_;
                     sp.shadow_atlas = shadow_map_->atlas_texture();
@@ -1373,6 +1406,18 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     draw_camera.view[0][2], draw_camera.view[1][2], draw_camera.view[2][2]);
                 rt_frame_params.environment = env_;
                 rt_frame_params.sun_intensity = gfx.sun_intensity;
+                rt_frame_params.lighting_reset = lighting_reset_;
+                // R5b's exposure-aware clamps. The state buffer exists whenever
+                // AutoExposure initialized, but it only holds a LIVE adapted EV
+                // when the setting is on — so the flag the pass reads is the
+                // pointer being non-null, and the pointer is null whenever the
+                // setting is off. The manual bias rides alongside in both cases
+                // because the composite multiplies it in both cases.
+                rt_frame_params.exposure_state =
+                    (gfx.auto_exposure && auto_exposure_ && auto_exposure_->is_ready())
+                        ? auto_exposure_->state_buffer()
+                        : nullptr;
+                rt_frame_params.manual_exposure_ev = std::log2(std::max(gfx.exposure, 1e-6f));
                 rt_frame_params.screen_width = context_->width();
                 rt_frame_params.screen_height = context_->height();
                 rt_frame_params.depth_a = draw_camera.projection[2][2];

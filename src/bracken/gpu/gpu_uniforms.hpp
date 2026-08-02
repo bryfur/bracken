@@ -1306,27 +1306,148 @@ BRACKEN_HLSL_FIELD(RtShadowClassifyUniforms, _pad0, 8);
 /**
  * Shadow-denoiser temporal accumulation — matches
  * rt_shadow_denoise_temporal.comp.hlsl (set 2, b0).
+ *
+ * Shared by BOTH stochastic visibility signals (sun and froxel-RIS local
+ * lights), which go through the same three denoiser pipelines — see
+ * RtRenderer::VisibilityDenoiser.
  */
 struct alignas(16) RtShadowTemporalUniforms {
     glm::uvec2 tracedSize;
     glm::uvec2 tileCount;
+    /// Dimensions of the reconstructed A-SVGF gradient (traced / 3, rounded up).
+    glm::uvec2 stratumCount{0, 0};
     float depthA = 0.0f;
     float depthB = 0.0f;
     float maxAccumFrames = 32.0f;
     float depthRejectRelative = 0.05f;
+    /// R5b: the analytic sun gradient's global hysteresis floor, [0, 1]
+    /// (render/rt_denoise_math.hpp's `lighting_reset_floor`). 0 is the identity
+    /// and the value for every frame whose sun did not move.
+    float lightingReset = 0.0f;
     uint32_t historyValid = 0;
-    glm::uvec3 _pad0{0, 0, 0};
+    /// 0 when no traced gradient was produced this frame, in which case the
+    /// bound gradient texture is a valid stand-in that must not be read.
+    uint32_t gradientValid = 0;
+    /// First of this signal's four uint slots in the shared, never-reset
+    /// diagnostics buffer (sun 0..3, local 4..7).
+    uint32_t counterBase = 0;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
 };
 
-BRACKEN_HLSL_CBUFFER(RtShadowTemporalUniforms, 48);
+BRACKEN_HLSL_CBUFFER(RtShadowTemporalUniforms, 64);
 BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, tracedSize, 0);
 BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, tileCount, 8);
-BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, depthA, 16);
-BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, depthB, 20);
-BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, maxAccumFrames, 24);
-BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, depthRejectRelative, 28);
-BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, historyValid, 32);
-BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, _pad0, 36);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, stratumCount, 16);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, depthA, 24);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, depthB, 28);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, maxAccumFrames, 32);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, depthRejectRelative, 36);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, lightingReset, 40);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, historyValid, 44);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, gradientValid, 48);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, counterBase, 52);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, _pad0, 56);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, _pad1, 60);
+
+/**
+ * A-SVGF gradient trace for the SUN visibility signal — matches
+ * rt_shadow_gradient.comp.hlsl (set 2, b0). Phase R5b, §5.6.
+ *
+ * One thread per 3x3 stratum of the traced resolution; each re-traces this
+ * frame's scene with the PREVIOUS frame's sample (`frameIndex - 1` through the
+ * same replayable `rtSample2D`) and compares against the previous frame's raw
+ * bit. The difference is "the lighting at this surface changed", with motion
+ * and sampling noise both factored out.
+ */
+struct alignas(16) RtShadowGradientUniforms {
+    glm::mat4 invViewProj{1.0f};
+    glm::vec3 sunDirection{0.0f, -1.0f, 0.0f};
+    float rayMaxDistance = 6000.0f;
+    glm::uvec2 tracedSize{0, 0};
+    glm::uvec2 stratumCount{0, 0};
+    float normalBias = 1.5f;
+    float depthBias = 0.5f;
+    float sunCosThetaMax = 1.0f;
+    /// THIS frame's counter — the replay uses frameIndex - 1.
+    uint32_t frameIndex = 0;
+    uint32_t tlasNodeCount = 0;
+    uint32_t hasGBuffer = 0;
+    uint32_t historyValid = 0;
+    float depthA = 0.0f;
+    float depthB = 0.0f;
+    float depthRejectRelative = 0.05f;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+};
+
+BRACKEN_HLSL_CBUFFER(RtShadowGradientUniforms, 144);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, invViewProj, 0);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, sunDirection, 64);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, rayMaxDistance, 76);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, tracedSize, 80);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, stratumCount, 88);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, normalBias, 96);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, depthBias, 100);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, sunCosThetaMax, 104);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, frameIndex, 108);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, tlasNodeCount, 112);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, hasGBuffer, 116);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, historyValid, 120);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, depthA, 124);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, depthB, 128);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, depthRejectRelative, 132);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, _pad0, 136);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, _pad1, 140);
+
+/**
+ * A-SVGF gradient trace for the LOCAL visibility signal — matches
+ * rt_local_shadow_gradient.comp.hlsl (set 2, b0). Phase R5b, §5.6.
+ *
+ * Same shape as the sun's, plus the emitter radius: the replay has to reproduce
+ * WHICH LIGHT the previous frame's reservoir picked (resolved through R2a's
+ * prev->current remap), not merely which direction it sampled.
+ */
+struct alignas(16) RtLocalShadowGradientUniforms {
+    glm::mat4 invViewProj{1.0f};
+    glm::uvec2 tracedSize{0, 0};
+    glm::uvec2 stratumCount{0, 0};
+    float normalBias = 1.5f;
+    float depthBias = 0.5f;
+    float lightSourceRadius = 10.0f;
+    uint32_t frameIndex = 0;
+    uint32_t tlasNodeCount = 0;
+    uint32_t hasGBuffer = 0;
+    uint32_t historyValid = 0;
+    uint32_t _pad0 = 0;
+};
+
+BRACKEN_HLSL_CBUFFER(RtLocalShadowGradientUniforms, 112);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, invViewProj, 0);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, tracedSize, 64);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, stratumCount, 72);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, normalBias, 80);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, depthBias, 84);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, lightSourceRadius, 88);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, frameIndex, 92);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, tlasNodeCount, 96);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, hasGBuffer, 100);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, historyValid, 104);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad0, 108);
+
+/**
+ * Dense reconstruction of the sparse gradient — matches
+ * rt_gradient_reconstruct.comp.hlsl (set 2, b0). Both visibility signals run
+ * this one pipeline against their own pair of stratum-resolution targets.
+ */
+struct alignas(16) RtGradientReconstructUniforms {
+    glm::uvec2 stratumCount{0, 0};
+    glm::uvec2 _pad0{0, 0};
+};
+
+BRACKEN_HLSL_CBUFFER(RtGradientReconstructUniforms, 16);
+BRACKEN_HLSL_FIELD(RtGradientReconstructUniforms, stratumCount, 0);
+BRACKEN_HLSL_FIELD(RtGradientReconstructUniforms, _pad0, 8);
 
 /**
  * Shadow-denoiser filter + upsample — matches
@@ -1486,8 +1607,12 @@ struct alignas(16) RtReflectionTemporalUniforms {
     /// binds valid-but-meaningless stand-ins and takes the pure surface-motion
     /// path, which is exactly the pre-R3 behaviour.
     uint32_t virtualValid = 0;
-    uint32_t _pad0 = 0;
-    uint32_t _pad1 = 0;
+    /// R5b: 1 when `exposureState` holds a live adapted EV. 0 binds the buffer
+    /// anyway (a descriptor may not be empty) and takes `manualExposureEv`.
+    uint32_t exposureEnabled = 0;
+    /// GraphicsSettings::exposure as an EV (log2 of the multiplier), so the
+    /// clamps mean the same thing with auto exposure off as with it on.
+    float manualExposureEv = 0.0f;
 };
 
 BRACKEN_HLSL_CBUFFER(RtReflectionTemporalUniforms, 240);
@@ -1501,8 +1626,8 @@ BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, maxAccumFrames, 216);
 BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, clampSigma, 220);
 BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, historyValid, 224);
 BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, virtualValid, 228);
-BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, _pad0, 232);
-BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, _pad1, 236);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, exposureEnabled, 232);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, manualExposureEv, 236);
 
 /**
  * Full-resolution material/depth/normal-guided resolve of the sparse traced
@@ -1697,8 +1822,12 @@ struct alignas(16) GiProbeBlendUniforms {
     /// R1c every cascade lives in one texture (gi_math.hpp,
     /// ATLAS_ROWS_ALL_CASCADES), so the tile origin needs it.
     uint32_t cascadeIndex = 0;
+    /// R5b: the analytic sun gradient's global hysteresis floor, [0, 1]. Read
+    /// by the IRRADIANCE blend only — the visibility moments describe geometry
+    /// — but declared in both shaders because they share this struct. 0 is the
+    /// identity, so a static sun leaves the field bit-identical.
+    float lightingReset = 0.0f;
     uint32_t _pad0 = 0;
-    uint32_t _pad1 = 0;
 };
 BRACKEN_HLSL_CBUFFER(GiProbeBlendUniforms, 32);
 BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, probeCount, 0);
@@ -1707,8 +1836,8 @@ BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, distanceClamp, 8);
 BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, rayMaxDistance, 12);
 BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, frameIndex, 16);
 BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, cascadeIndex, 20);
-BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad0, 24);
-BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad1, 28);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, lightingReset, 24);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad0, 28);
 
 /** GiProbeClassifyUniforms (set 2, b0) — gi_probe_classify.comp.hlsl. */
 struct alignas(16) GiProbeClassifyUniforms {
@@ -2054,14 +2183,25 @@ struct alignas(16) GiScreenProbeFilterUniforms {
     float historyValid = 0.0f;
     float fireflyMax = 8.0f;
     uint32_t frameIndex = 0;
+    /// R5b: 1 when `exposureState` holds a live adapted EV, 0 to take
+    /// `manualExposureEv`. The firefly ceiling's absolute floor is a
+    /// POST-EXPOSURE luminance, so it has to be told which exposure.
+    uint32_t exposureEnabled = 0;
+    float manualExposureEv = 0.0f;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
 };
-BRACKEN_HLSL_CBUFFER(GiScreenProbeFilterUniforms, 32);
+BRACKEN_HLSL_CBUFFER(GiScreenProbeFilterUniforms, 48);
 BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, probeGrid, 0);
 BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, screenSize, 8);
 BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, alpha, 16);
 BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, historyValid, 20);
 BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, fireflyMax, 24);
 BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, frameIndex, 28);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, exposureEnabled, 32);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, manualExposureEv, 36);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, _pad0, 40);
+BRACKEN_HLSL_FIELD(GiScreenProbeFilterUniforms, _pad1, 44);
 
 /** GiScreenProbeProjectUniforms (set 2, b0) — gi_screen_probe_project.comp.hlsl. */
 struct alignas(16) GiScreenProbeProjectUniforms {

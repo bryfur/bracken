@@ -733,13 +733,19 @@ RtShadow
 RtShadowClassify
   cs        rt_shadow_denoise_classify.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtShadowTemporal
-  cs        rt_shadow_denoise_temporal.comp.spv entry=CSMain samplers=3 ro_textures=2 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        rt_shadow_denoise_temporal.comp.spv entry=CSMain samplers=4 ro_textures=3 ro_buffers=0 rw_textures=2 rw_buffers=1 uniform_buffers=1
+RtShadowGradient
+  cs        rt_shadow_gradient.comp.spv entry=CSMain samplers=4 ro_textures=1 ro_buffers=4 rw_textures=1 rw_buffers=0 uniform_buffers=1
+RtLocalShadowGradient
+  cs        rt_local_shadow_gradient.comp.spv entry=CSMain samplers=3 ro_textures=1 ro_buffers=8 rw_textures=1 rw_buffers=1 uniform_buffers=2
+RtGradientReconstruct
+  cs        rt_gradient_reconstruct.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtShadowFilter
   cs        rt_shadow_denoise_filter.comp.spv entry=CSMain samplers=2 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtReflection
   cs        rt_reflection.comp.spv entry=CSMain samplers=6 ro_textures=1 ro_buffers=6 rw_textures=2 rw_buffers=0 uniform_buffers=1
 RtReflectionTemporal
-  cs        rt_reflection_denoise_temporal.comp.spv entry=CSMain samplers=6 ro_textures=0 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        rt_reflection_denoise_temporal.comp.spv entry=CSMain samplers=6 ro_textures=0 ro_buffers=1 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtLocalShadow
   cs        rt_local_shadow.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=8 rw_textures=1 rw_buffers=2 uniform_buffers=2
 GiProbeTrace
@@ -763,7 +769,7 @@ GiScreenProbeArgs
 GiScreenProbeTrace
   cs        gi_screen_probe_trace.comp.spv entry=CSMain samplers=4 ro_textures=1 ro_buffers=8 rw_textures=1 rw_buffers=1 uniform_buffers=1
 GiScreenProbeFilter
-  cs        gi_screen_probe_filter.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=2 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        gi_screen_probe_filter.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=3 rw_textures=1 rw_buffers=0 uniform_buffers=1
 GiScreenProbeProject
   cs        gi_screen_probe_project.comp.spv entry=CSMain samplers=1 ro_textures=0 ro_buffers=1 rw_textures=0 rw_buffers=1 uniform_buffers=1
 )GOLDEN"

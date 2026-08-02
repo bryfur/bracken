@@ -130,6 +130,22 @@ struct ProbeUpdateParams {
     /// How far a probe ray may see. Longer catches distant sky occlusion and
     /// costs traversal; the default is the reflection trace's range.
     float ray_max_distance = 4000.0f;
+
+    /**
+     * R5b's analytic sun gradient, already reduced to a hysteresis floor in
+     * [0, 1] by `render::lighting_reset_floor`.
+     *
+     * The blend's own change-adaptive hysteresis can only react to a delta a
+     * probe has already OBSERVED, and a probe on a coarse cascade traces once
+     * every four frames — so a sun jump reaches the field several frames after
+     * it reaches the shadow denoisers, and reaches it as a large delta that
+     * then takes tens of updates to work through a 0.97 EMA. This floor is what
+     * lets the field collapse its window on the frame the sun moved, from the
+     * same number the visibility denoisers get.
+     *
+     * 0 is the identity — a static sun leaves the field bit-identical.
+     */
+    float lighting_reset = 0.0f;
 };
 
 /**

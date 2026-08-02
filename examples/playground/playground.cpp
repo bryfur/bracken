@@ -1615,6 +1615,15 @@ void PlaygroundGame::setup_smoke_run() {
         smoke_cam_yaw_ = 310.0f;
         smoke_cam_pitch_ = 20.0f;
         smoke_cam_dist_ = 1400.0f; // world units (14 m at VILLAGE_SCALE)
+
+        // PLAYGROUND_SUN_SWEEP=<deg/s>: the only way to measure R5b's
+        // lighting-change invalidation, since every other run in this repo pins
+        // the environment and a static sun is precisely the case the mechanism
+        // is inert in. Bench-only: a --smoke run's screenshot baseline is a
+        // function of its sun, and a sweeping one would have no baseline.
+        if (const char* sweep = SDL_getenv("PLAYGROUND_SUN_SWEEP"); sweep != nullptr && sweep[0]) {
+            sun_sweep_deg_per_s_ = std::max(0.0f, static_cast<float>(SDL_atof(sweep)));
+        }
     }
     // PLAYGROUND_CAMERA="vx,vz,yaw,pitch,dist_m" pins the camera at a
     // village-space position for the whole run (art close-up hook).
@@ -2517,6 +2526,22 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
     // DevUI Environment tab's live edits working between host changes.
     // env_dirty_ is set at init/fence and cleared here (sim); the phases
     // never overlap, ordering rides the sim kick/join edges.
+    // PLAYGROUND_SUN_SWEEP (--rt-bench only). A pure function of the frame
+    // index at the pinned 1/60 timestep — never of wall clock — so two runs of
+    // the same command produce the same sun on the same frame. Rotating the
+    // direction TO the sun about world +Y keeps the elevation, and therefore
+    // the intensity and the sky, exactly where the static run put them.
+    if (sun_sweep_deg_per_s_ > 0.0f) {
+        const float angle =
+            glm::radians(sun_sweep_deg_per_s_ * static_cast<float>(frame_) / 60.0f);
+        const glm::vec3 to_sun = -scene_sun_dir_;
+        const float c = std::cos(angle);
+        const float sn = std::sin(angle);
+        const glm::vec3 rotated{to_sun.x * c + to_sun.z * sn, to_sun.y,
+                                -to_sun.x * sn + to_sun.z * c};
+        env_.sun_dir = -glm::normalize(rotated);
+        env_dirty_ = true;
+    }
     if (env_dirty_) {
         fb.set_environment(env_);
         env_dirty_ = false;
@@ -2756,6 +2781,18 @@ void PlaygroundGame::update_rt_bench_fence() {
         rt_bench_render_ms_.push_back(render_ms());
         rt_bench_fence_ms_.push_back(fence_ms());
         rt_bench_present_wait_ms_.push_back(present_wait_ms());
+        // Only when a readback has landed for that signal: an invalid entry is
+        // absence of evidence, and averaging a zero into the window would
+        // report a collapse the run never had.
+        const auto& denoise = scene_renderer().raytracing_stats().denoise;
+        if (denoise.shadow_valid) {
+            rt_bench_shadow_accum_.push_back(denoise.shadow_mean_accum);
+            rt_bench_shadow_fire_.push_back(denoise.shadow_gradient_fire);
+        }
+        if (denoise.local_valid) {
+            rt_bench_local_accum_.push_back(denoise.local_mean_accum);
+            rt_bench_local_fire_.push_back(denoise.local_gradient_fire);
+        }
         ++rt_bench_sampled_frames_;
     }
 
@@ -2835,6 +2872,24 @@ void PlaygroundGame::print_rt_bench_report() {
                                  row.samples->size());
     }
     const auto& rt = scene_renderer().raytracing_stats();
+    // R5b: what the two visibility denoisers actually did, averaged over the
+    // run. `sun_sweep` is echoed because the whole table means the opposite
+    // thing at 0 — there, a fire fraction near zero and a full accumulation
+    // window are the PASS condition, and anything else is a regression.
+    {
+        const BenchSummary sa = summarize(rt_bench_shadow_accum_);
+        const BenchSummary sf = summarize(rt_bench_shadow_fire_);
+        const BenchSummary la = summarize(rt_bench_local_accum_);
+        const BenchSummary lf = summarize(rt_bench_local_fire_);
+        std::cout << std::format(
+            "[rtbench] denoise sun_sweep_deg_s={:.2f} "
+            "sun_accum={:.2f} sun_grad_fire={:.4f} sun_samples={} "
+            "local_accum={:.2f} local_grad_fire={:.4f} local_samples={} "
+            "sun_grad_rays={} local_grad_rays={}\n",
+            sun_sweep_deg_per_s_, sa.mean, sf.mean, rt_bench_shadow_accum_.size(), la.mean,
+            lf.mean, rt_bench_local_accum_.size(), rt.shadow_gradient_rays,
+            rt.local_shadow_gradient_rays);
+    }
     std::cout << std::format("[rtbench] rt shadows_traced={} reflections_traced={} "
                              "local_shadows_traced={} shadow_rays={} "
                              "reflection_rays={} local_shadow_rays={} "

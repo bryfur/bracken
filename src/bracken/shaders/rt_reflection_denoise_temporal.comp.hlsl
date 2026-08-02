@@ -49,6 +49,43 @@
 // A STATIC CAMERA MAKES THIS EXACTLY NEUTRAL: prev == current, so both vectors
 // are identically zero and every texel reads its own history, bit for bit.
 //
+// ---------------------------------------------------------------------------
+// EXPOSURE-AWARE CLAMPS (R5b, docs/rt_lighting_plan.md §5.6)
+// ---------------------------------------------------------------------------
+//
+// Reflections' share of the R5b denoiser-core package. The traced gradient work
+// deliberately stops at the two VISIBILITY signals: a gradient replay for
+// reflections has to interact with the virtual-hit-point reprojection above
+// (whose motion vector is itself a function of a stochastic hit distance), and
+// that interplay deserves its own package rather than a rider on this one.
+//
+// What DOES land here is the half that has nothing to do with reprojection: no
+// absolute radiance threshold in this pass meant the same thing at noon and at
+// midnight. Scene luminance swings by ~10^3 over the day/night cycle and the
+// composite pass divides that back out with exp2(adapted EV), so a threshold
+// intended to be constant TO A VIEWER has to be scaled by exp2(-EV) here. The
+// adapted EV comes from render::AutoExposure's own persistent state buffer,
+// bound read-only — it is already a ComputeStorage buffer, so nothing about it
+// had to change — and falls back to the manual exposure bias when auto exposure
+// is off, so the two configurations clamp identically in perceptual terms.
+//
+// Two thresholds use it:
+//
+//  * a FLOOR under the neighbourhood sigma. The sigma-clamp is scale-free and
+//    therefore already exposure-invariant wherever sigma is nonzero — but in a
+//    flat region (a smooth wall reflecting an even sky) sigma collapses, the
+//    clamp box closes onto this frame's single stochastic sample, and the
+//    accumulation is discarded every frame at exactly the pixels where it would
+//    have converged best.
+//  * a FIREFLY clamp, which did not exist before R5b. One GGX sample per pixel
+//    occasionally lands on a specular highlight two or three orders of
+//    magnitude above the rest of its lobe, and the accumulator then spends
+//    `maxAccumFrames` bleeding it out. The ceiling is the max of a relative
+//    term (neighbourhood mean + 4 sigma) and an absolute exposure-aware one, so
+//    neither a bright neighbourhood nor a dark one can make the other stricter.
+//
+// Both live in render/rt_denoise_math.hpp with their derivations.
+//
 // Output (RGBA16F): rgb = accumulated radiance, a = accumulated sample count.
 // The count sits in alpha deliberately: rt_reflection_resolve.frag tests
 // `traced.a <= 0.0` purely as a validity check and never uses it as a weight,
@@ -56,6 +93,7 @@
 // no change.
 
 #include "rt_sampling.hlsli"
+#include "rt_denoise.hlsli"
 
 // For `octDecode` alone — the G-buffer normal is octahedrally packed and
 // rt_trace.hlsli's type phase is where that decode lives for the RT passes.
@@ -90,8 +128,12 @@ cbuffer RtReflectionTemporalUniforms : register(b0, space2) {
     /// binds valid-but-meaningless stand-ins and takes the pure surface-motion
     /// path — exactly the pre-R3 behaviour.
     uint virtualValid;
-    uint _pad0;
-    uint _pad1;
+    /// 1 when the exposure state buffer holds a live adapted EV. 0 binds it
+    /// anyway (a descriptor may not be empty) and takes `manualExposureEv`.
+    uint exposureEnabled;
+    /// GraphicsSettings::exposure expressed as an EV, used when auto exposure
+    /// is off so the clamps below mean the same thing either way.
+    float manualExposureEv;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
@@ -126,6 +168,11 @@ SamplerState sceneDepthSampler : register(s4, space0);
 Texture2D<float4> sceneNormal : register(t5, space0);
 [[vk::combinedImageSampler]][[vk::binding(5, 0)]]
 SamplerState sceneNormalSampler : register(s5, space0);
+
+/// render::AutoExposure::state_buffer(): float4 {current EV, target EV, avg
+/// log2 luma, valid}. A read-only storage buffer — the first and only one this
+/// pass declares, so it sits immediately after the six sampled textures.
+[[vk::binding(6, 0)]] StructuredBuffer<float4> exposureState : register(t6, space0);
 
 [[vk::binding(0, 1)]] RWTexture2D<float4> historyOut : register(u0, space1);
 
@@ -218,13 +265,61 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         return;
     }
     const int2 coord = int2(tid.xy);
-    const float4 current = tracedIn.Load(int3(coord, 0));
+    float4 current = tracedIn.Load(int3(coord, 0));
 
     // alpha <= 0 is the trace's "this pixel is not reflective" encoding. Pass
     // it straight through so the resolve keeps skipping it.
     if (current.a <= 0.0) {
         historyOut[coord] = float4(0.0, 0.0, 0.0, 0.0);
         return;
+    }
+
+    const float adaptedEv = rtAdaptedEv(exposureState[0], exposureEnabled, manualExposureEv);
+
+    // ---- neighbourhood statistics ----------------------------------------
+    //
+    // Hoisted out of the history branch by R5b: they now serve the firefly
+    // clamp as well as the history clamp, and the firefly clamp has to run on
+    // the very first frame of a pixel's life — that is when a single outlier
+    // sample would otherwise be adopted whole and then bled out over
+    // `maxAccumFrames`.
+    float3 m1 = 0.0;
+    float3 m2 = 0.0;
+    float valid = 0.0;
+    [unroll]
+    for (int dy = -1; dy <= 1; ++dy) {
+        [unroll]
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int2 s = clamp(coord + int2(dx, dy), int2(0, 0), int2(tracedSize) - 1);
+            const float4 n = tracedIn.Load(int3(s, 0));
+            if (n.a <= 0.0) {
+                continue; // a non-reflective neighbour says nothing about this lobe
+            }
+            m1 += n.rgb;
+            m2 += n.rgb * n.rgb;
+            valid += 1.0;
+        }
+    }
+
+    float3 mean = 0.0;
+    float3 sigma = 0.0;
+    if (valid > 0.0) {
+        mean = m1 / valid;
+        sigma = sqrt(max(m2 / valid - mean * mean, 0.0));
+        // The one absolute term in an otherwise scale-free clamp, and therefore
+        // the one that has to know the exposure.
+        const float sigmaFloor = rtClampSigmaFloor(adaptedEv);
+        sigma = max(sigma, float3(sigmaFloor, sigmaFloor, sigmaFloor));
+
+        // ---- firefly clamp -----------------------------------------------
+        // Rescales the whole colour rather than clamping per channel, so a
+        // clamped sample keeps its hue instead of drifting toward white.
+        const float currentLuma = luminance(current.rgb);
+        const float ceiling =
+            rtReflectionFireflyCeiling(luminance(mean), luminance(sigma), adaptedEv);
+        if (currentLuma > ceiling && currentLuma > 1e-6) {
+            current.rgb *= ceiling / currentLuma;
+        }
     }
 
     float3 accumulated = current.rgb;
@@ -239,30 +334,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         const float2 prevUv = uv - motion;
 
         if (all(prevUv >= 0.0) && all(prevUv <= 1.0)) {
-            // Colour statistics of the 3x3 neighbourhood, used to bound how far
-            // the history is allowed to be from what this frame actually saw.
-            float3 m1 = 0.0;
-            float3 m2 = 0.0;
-            float valid = 0.0;
-            [unroll]
-            for (int dy = -1; dy <= 1; ++dy) {
-                [unroll]
-                for (int dx = -1; dx <= 1; ++dx) {
-                    const int2 s = clamp(coord + int2(dx, dy), int2(0, 0), int2(tracedSize) - 1);
-                    const float4 n = tracedIn.Load(int3(s, 0));
-                    if (n.a <= 0.0) {
-                        continue; // a non-reflective neighbour says nothing about this lobe
-                    }
-                    m1 += n.rgb;
-                    m2 += n.rgb * n.rgb;
-                    valid += 1.0;
-                }
-            }
-
             const float4 hist = historyIn.SampleLevel(historySampler, prevUv, 0);
             if (hist.a > 0.0 && valid > 0.0) {
-                const float3 mean = m1 / valid;
-                const float3 sigma = sqrt(max(m2 / valid - mean * mean, 0.0));
                 const float3 lo = mean - sigma * clampSigma;
                 const float3 hi = mean + sigma * clampSigma;
                 const float3 clamped = clamp(hist.rgb, lo, hi);

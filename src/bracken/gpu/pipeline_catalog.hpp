@@ -166,6 +166,19 @@ enum class ComputePipelineType {
     RtShadow,          ///< Ray-traced sun shadows over the software BVH (any-hit, 1 jittered ray/px, packed bits)
     RtShadowClassify,  ///< Shadow denoiser 1/3: 8x4 tile classification (uniform vs mixed)
     RtShadowTemporal,  ///< Shadow denoiser 2/3: velocity reprojection + moment accumulation
+    /// A-SVGF temporal gradient for the SUN visibility signal (R5b, §5.6): one
+    /// replayed ray per 3x3 stratum, this frame's scene against the previous
+    /// frame's sample, compared with the previous frame's raw bit. Detects
+    /// LIGHTING change, which a velocity buffer structurally cannot.
+    RtShadowGradient,
+    /// The same, for the froxel-RIS LOCAL visibility signal — plus resolving
+    /// the previous reservoir's light through R2a's prev->current remap, which
+    /// is what makes the replay a replay rather than a different question.
+    RtLocalShadowGradient,
+    /// Sparse gradient -> dense: a weighted-max soft dilation over the 5x5
+    /// stratum window. One pipeline, dispatched once per enabled signal against
+    /// that signal's own targets — the RtShadow* sharing argument again.
+    RtGradientReconstruct,
     RtShadowFilter,    ///< Shadow denoiser 3/3: variance-guided filter fused with the upsample to full res
     RtReflection,      ///< Ray-traced specular reflections over the same BVH (closest-hit, GGX-sampled)
     RtReflectionTemporal, ///< Reflection denoiser: velocity reprojection + neighbourhood-clamped accumulation

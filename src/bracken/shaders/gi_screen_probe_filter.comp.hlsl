@@ -21,6 +21,9 @@
 // same atlas to write a third one.
 
 #include "gi_screen_probe.hlsli"
+// R5b: the firefly ceiling's absolute floor, and the exposure the floor is
+// expressed against (render/rt_denoise_math.hpp).
+#include "rt_denoise.hlsli"
 
 // ---------------------------------------------------------------------------
 // Uniforms (set 2, b0) — mirrors gpu::GiScreenProbeFilterUniforms.
@@ -33,6 +36,13 @@ cbuffer GiScreenProbeFilterUniforms : register(b0, space2) {
     float historyValid;
     float fireflyMax;
     uint frameIndex;
+    /// 1 when the exposure state buffer holds a live adapted EV. 0 binds it
+    /// anyway (a descriptor may not be empty) and takes `manualExposureEv`.
+    uint exposureEnabled;
+    /// GraphicsSettings::exposure as an EV, for the auto-exposure-off case.
+    float manualExposureEv;
+    uint _pad0;
+    uint _pad1;
 };
 
 // --- sampled (3) ---
@@ -50,9 +60,12 @@ Texture2D<float2> velocity : register(t2, space0);
 [[vk::combinedImageSampler]][[vk::binding(2, 0)]]
 SamplerState velocitySampler : register(s2, space0);
 
-// --- read-only storage buffers (2) ---
+// --- read-only storage buffers (3) ---
 [[vk::binding(3, 0)]] StructuredBuffer<GiScreenProbe> probes : register(t3, space0);
 [[vk::binding(4, 0)]] StructuredBuffer<GiScreenProbe> prevProbes : register(t4, space0);
+/// render::AutoExposure::state_buffer(): float4 {current EV, target EV, avg
+/// log2 luma, valid}. R5b — see the firefly clamp below.
+[[vk::binding(5, 0)]] StructuredBuffer<float4> exposureState : register(t5, space0);
 
 // --- read-write (set 1) ---
 [[vk::binding(0, 1)]] RWTexture2D<float4> filteredAtlas : register(u0, space1);
@@ -79,10 +92,19 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
     // ---- firefly clamp, against THIS probe's own mean --------------------
     //
     // Scale-free on purpose: the day/night cycle moves scene luminance by ~10^3
-    // and a fixed radiance threshold cannot serve both ends. R5's
-    // exposure-aware clamp (§5.6) is where this gets the adapted EV; dividing
-    // by the probe's own mean is the honest approximation until then, and the
-    // reduction is one barrier the pass can afford.
+    // and a fixed radiance threshold cannot serve both ends. Dividing by the
+    // probe's own mean is what makes it scale-free, and the reduction is one
+    // barrier the pass can afford.
+    //
+    // R5b SUPPLIES THE MISSING HALF, exactly as the comment that stood here
+    // promised. A purely relative ceiling has no answer at a mean near zero: a
+    // probe in a dark interior would rescale the one ray that found the doorway
+    // down to the darkness around it, and `mean > 1e-6` was a guard against
+    // that failure rather than a fix for it. The ceiling is now the MAX of the
+    // relative term and an absolute one expressed in post-exposure luminance
+    // and converted to scene radiance with the adapted EV — so the clamp
+    // rejects the same FRACTION of rays at noon and at midnight, which is what
+    // "scale-free" was always supposed to mean.
     gsLuma[groupIndex] = resolved ? lumaOf(raw.rgb) : 0.0;
     GroupMemoryBarrierWithGroupSync();
     float mean = 0.0;
@@ -97,10 +119,11 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
         }
         mean = gsLuma[0] / float(GI_SP_RAYS);
     }
-    if (resolved && mean > 1e-6) {
+    if (resolved) {
+        float adaptedEv = rtAdaptedEv(exposureState[0], exposureEnabled, manualExposureEv);
         float luma = lumaOf(raw.rgb);
-        float ceiling = fireflyMax * mean;
-        if (luma > ceiling) {
+        float ceiling = rtScreenProbeFireflyCeiling(mean, fireflyMax, adaptedEv);
+        if (luma > ceiling && luma > 1e-6) {
             raw.rgb *= ceiling / luma;
         }
     }

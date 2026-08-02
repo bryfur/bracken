@@ -299,6 +299,44 @@ struct RtStats {
     std::size_t attribute_bytes = 0;  ///< per-triangle shading attributes; 0 without reflections
     /// blas_bytes + tlas_bytes + attribute_bytes.
     std::size_t acceleration_bytes = 0;
+
+    /// A-SVGF gradient rays dispatched this frame, per signal — one thread per
+    /// 3x3 stratum of the traced resolution, so exactly ceil(w/3)*ceil(h/3).
+    /// The same honest over-estimate `shadow_rays` is: a stratum whose
+    /// reprojection failed, whose surface changed, or whose reservoir held no
+    /// light returns without casting.
+    uint32_t shadow_gradient_rays = 0;
+    uint32_t local_shadow_gradient_rays = 0;
+
+    /**
+     * What the two visibility denoisers actually did, from a LAGGED readback of
+     * the GPU-side counters (`RtRenderer::set_stats_readback_interval`).
+     *
+     * These are the only numbers that can show a denoiser lagging: a static
+     * screenshot cannot, because a lagging denoiser and a converged one look
+     * identical on a frame where nothing has changed for thirty frames. Under a
+     * sun sweep the accumulation counts collapse and the fire fraction climbs;
+     * with a static sun they must not move at all, which is the regression
+     * test.
+     *
+     * `*_valid` is false until the first readback has landed (a second or so
+     * after the signal is first enabled) and whenever the interval between two
+     * readbacks contained no dispatch of that signal.
+     */
+    struct DenoiseStats {
+        /// Mean accumulated sample count over pixels in MIXED tiles — the only
+        /// pixels that accumulate at all, since a uniform tile writes the
+        /// converged answer directly.
+        float shadow_mean_accum = 0.0f;
+        float local_mean_accum = 0.0f;
+        /// Fraction of traced pixels whose reconstructed gradient cleared
+        /// `render::GRADIENT_FIRE_THRESHOLD`, i.e. whose accumulation was cut.
+        float shadow_gradient_fire = 0.0f;
+        float local_gradient_fire = 0.0f;
+        bool shadow_valid = false;
+        bool local_valid = false;
+    };
+    DenoiseStats denoise{};
 };
 
 /**
@@ -384,6 +422,35 @@ public:
         /// What the reflection trace shades its hits with. Ignored by the
         /// shadow and local-shadow passes, which never shade anything.
         RtHitShadeBindings hit_shade{};
+
+        // ---- R5b: lighting-change invalidation (§5.6) ---------------------
+
+        /**
+         * The ANALYTIC sun gradient, already reduced to a global hysteresis
+         * floor in [0, 1] by `render::lighting_reset_floor`.
+         *
+         * The caller owns the previous frame's sun state, so it — not this
+         * renderer — is where the delta is measured; the probe-field blend
+         * takes the same number from the same place, which is what makes one
+         * sun jump collapse every accumulation window in the frame at once
+         * rather than each subsystem discovering it separately.
+         *
+         * 0 is the identity: every temporal pass reduces to its pre-R5b
+         * arithmetic, bit for bit.
+         */
+        float lighting_reset = 0.0f;
+
+        /**
+         * `render::AutoExposure::state_buffer()` — a float4 {current EV, target
+         * EV, avg log2 luma, valid}, bound READ-ONLY so the reflection
+         * denoiser's absolute thresholds can be expressed in post-exposure
+         * luminance. Null is valid and means "no auto exposure": the pass binds
+         * a stand-in and reads `manual_exposure_ev` instead.
+         */
+        SDL_GPUBuffer* exposure_state = nullptr;
+        /// log2 of `GraphicsSettings::exposure`, the manual bias, used whenever
+        /// `exposure_state` is null or auto exposure is off.
+        float manual_exposure_ev = 0.0f;
     };
 
     /** Record the traced passes. Each is skipped entirely when its feature is
@@ -494,26 +561,55 @@ private:
     struct VisibilityDenoiser {
         /// One bit of raw traced visibility per pixel, 8x4 per uint (R32_UINT),
         /// so the classifier reads 32 pixels' verdicts in one fetch.
-        std::unique_ptr<gpu::GPUTexture> bits;
+        ///
+        /// PING-PONGED since R5b: the A-SVGF gradient pass compares this
+        /// frame's replayed trace against the PREVIOUS frame's raw bit, so the
+        /// bits have to survive one extra frame. That is the whole memory cost
+        /// of the gradient mechanism — 22 KB at half res — and it is why the
+        /// bits were worth packing to one bit per pixel in the first place.
+        std::array<std::unique_ptr<gpu::GPUTexture>, 2> bits;
         /// Per-tile verdict: 0 uniformly lit, 1 uniformly shadowed, 2 mixed.
         std::unique_ptr<gpu::GPUTexture> tile_class;
         /// Ping-ponged accumulation (RGBA16F): mean, second moment, sample
         /// count, linear depth. Two because a temporal filter cannot read and
         /// write the same texture in one dispatch.
         std::array<std::unique_ptr<gpu::GPUTexture>, 2> history;
+        /// The R5b FAST history (RG16F: mean, count) — a four-frame mean of the
+        /// same samples, far too noisy to display and never displayed. It is a
+        /// change DETECTOR: the main mean is clamped toward it every frame by a
+        /// margin derived from its own sampling error
+        /// (`render::fast_history_margin`), which catches the changes the
+        /// sparse gradient cannot see because no ray landed there.
+        std::array<std::unique_ptr<gpu::GPUTexture>, 2> fast_history;
+        /// The A-SVGF gradient at STRATUM resolution (traced / 3), R16F.
+        /// [0] is the sparse trace's raw output, [1] the dilated reconstruction
+        /// the temporal pass reads. Not a ping-pong: the two have different
+        /// meanings and the pass between them is not iterated.
+        std::array<std::unique_ptr<gpu::GPUTexture>, 2> gradient;
         /// Full-res R8 output — the denoiser's last pass fuses the upsample into
         /// the filter, so the forward shaders sample it 1:1.
         std::unique_ptr<gpu::GPUTexture> mask;
         int history_index = 0;
+        /// Which half of `bits` THIS frame's trace wrote. The other half is the
+        /// previous frame's, which is what the gradient compares against.
+        int bits_index = 0;
         /// False until a history has been written at this size. Cleared on
         /// resize, on a resolution change, and whenever the signal was off last
         /// frame — in all three cases the history describes a different image.
         bool history_valid = false;
+        /// False until a gradient has been reconstructed at this size. Tracked
+        /// separately from `history_valid` because the gradient chain can be
+        /// unavailable (a missing pipeline) on a frame whose history is fine,
+        /// and the temporal pass must then read a bound-but-meaningless texture
+        /// rather than a stale one.
+        bool gradient_valid = false;
         RtResolution resolution = RtResolution::Half;
         /// Advances the sample sequence. Wraps freely; only its low bits matter
         /// to the R2 sequence, and wrapping is what keeps it exact in a float.
         /// PER SIGNAL, so the two never sample in lockstep.
         uint32_t frame_index = 0;
+        /// First of this signal's four slots in `denoise_counters_`.
+        uint32_t counter_base = 0;
 
         void release_targets();
         void release();
@@ -525,6 +621,33 @@ private:
     void denoise_visibility(SDL_GPUCommandBuffer* cmd, VisibilityDenoiser& d, gpu::GPUTexture& depth,
                             SDL_GPUTexture* velocity, const FrameParams& params, float max_accum_frames,
                             float filter_radius, int traced_w, int traced_h);
+    /// Stratum grid for a traced resolution (ceil / GRADIENT_STRATUM).
+    [[nodiscard]] static int gradient_stratum_count(int traced);
+    /// Allocate/keep this signal's gradient pair and the fast-history pair.
+    [[nodiscard]] bool ensure_gradient_targets(VisibilityDenoiser& d, int traced_w, int traced_h,
+                                               const char* label);
+    /// The sun's sparse gradient trace, into `d.gradient[0]`.
+    [[nodiscard]] bool trace_sun_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoiser& d,
+                                          gpu::GPUTexture& depth, SDL_GPUTexture* normal_rough,
+                                          SDL_GPUTexture* velocity, const FrameParams& params,
+                                          const RtShadowSettings& shadows, int traced_w, int traced_h);
+    /// The local signal's sparse gradient trace, into `d.gradient[0]`.
+    [[nodiscard]] bool trace_local_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoiser& d,
+                                            gpu::GPUTexture& depth, SDL_GPUTexture* normal_rough,
+                                            SDL_GPUTexture* velocity, const FrameParams& params,
+                                            const RtLocalShadowSettings& settings,
+                                            const RtClusterBindings& clusters, int prev_reservoir,
+                                            int traced_w, int traced_h);
+    /// gradient[0] -> gradient[1], the weighted-max soft dilation.
+    [[nodiscard]] bool reconstruct_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoiser& d,
+                                            int traced_w, int traced_h);
+    /// Create (once) the 8-uint diagnostics buffer both temporal dispatches
+    /// accumulate into, and the 1x1 stand-in bound where an exposure state
+    /// buffer is wanted and none exists.
+    [[nodiscard]] bool ensure_denoise_diagnostics();
+    /// Poll the lagged counter readback and, when one lands, difference it
+    /// against the previous to fill `stats_.denoise`. Called once per render().
+    void update_denoise_stats();
     /// Trace + denoise the froxel-RIS local-light signal. Returns whether the
     /// trace ran.
     [[nodiscard]] bool render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
@@ -586,6 +709,39 @@ private:
     /// the resolve must fall back to the raw target for it.
     bool reflection_denoised_this_frame_ = false;
     uint32_t reflection_frame_index_ = 0;
+
+    // ---- R5b diagnostics ----
+    /**
+     * Eight uints, four per visibility signal: {accumulated-count sum, pixels
+     * counted, gradient-fired pixels, in-bounds pixels}.
+     *
+     * NEVER RESET, and that is the design rather than an omission. Zeroing them
+     * would cost a copy pass in every frame to serve a statistic nobody reads
+     * most frames. Instead both temporal dispatches accumulate monotonically
+     * and the CPU DIFFERENCES two lagged readbacks — which is exact under
+     * unsigned wraparound, since the difference of two uint32s is correct
+     * whenever fewer than 2^32 were added between them (here: ~360 k per frame,
+     * so ~12000 frames of headroom against a readback interval of well under a
+     * second).
+     */
+    std::unique_ptr<gpu::GPUBuffer> denoise_counters_;
+    /// 1x1 float4 {0,0,0,0} bound where a pass wants the exposure state and the
+    /// caller has none. The `w` lane is the adapt pass's validity flag, so a
+    /// shader that ignored `exposureEnabled` would read "not adapted yet" and
+    /// fall back rather than read undefined memory.
+    std::unique_ptr<gpu::GPUBuffer> exposure_dummy_;
+
+    SDL_GPUTransferBuffer* counter_transfer_ = nullptr;
+    SDL_GPUFence* counter_fence_ = nullptr;
+    /// Frames between readback REQUESTS. Ten rather than one: the download is
+    /// 32 bytes but it rides its own command-buffer submit, and the statistic
+    /// it serves is an average over a window anyway. Ten also gives a
+    /// 90-frame --rt-bench sample window nine independent measurements, which
+    /// is what the harness averages.
+    static constexpr int COUNTER_READBACK_FRAMES = 10;
+    int frames_since_counter_readback_ = COUNTER_READBACK_FRAMES;
+    std::array<uint32_t, 8> counter_previous_{};
+    bool counter_previous_valid_ = false;
 
     int screen_width_ = 0;
     int screen_height_ = 0;
