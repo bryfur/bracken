@@ -447,7 +447,13 @@ plus `giSampleVolume` for participating media — a transliteration of the
 `gi_probe.hlsli` it NAMES resources — `giIrradianceAtlas`, `giVisibilityAtlas`,
 `giProbeMeta` and their samplers, plus the `giCascadeBase[]`/`giEnabled`
 cbuffer members — so the including shader owns their slots and must declare
-them first, exactly like `cluster_lighting.hlsli`), `rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
+them first, exactly like `cluster_lighting.hlsli`. A shader that wants only
+`giSampleVolume` `#define`s **`GI_SAMPLE_VOLUME_ONLY`** first: everything that
+reads `giVisibilityAtlas` is compiled out and that pair must NOT be declared,
+because an unread `Texture2D`/`SamplerState` pair does not survive DXC's
+combined-image-sampler legalization and reflects as a storage texture instead
+of a sampler — see "Declared resource counts" below. `volumetric_fog.frag` is
+the one shader that takes the opt-out), `rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
 GGX-VNDF sampling, the packed visibility-tile helpers, and `rtSeed`/`rtNextFloat`
 — a per-pixel per-frame random STREAM for passes like the froxel-RIS reservoir
 that make a dozen independent decisions per pixel, where feeding them all from
@@ -522,6 +528,25 @@ compute: `SDL_ShaderCross_ReflectComputeSPIRV`, which also supplies the
 `declared resource counts do not match SPIR-V` and the reflected counts win.
 Compute creation fails outright if reflection fails (there is no
 caller-side fallback for the threadgroup size).
+
+A mismatch is not always a stale count. **Declaring a texture the shader never
+reads changes the reflected layout**: DXC merges a `Texture2D` and its
+`[[vk::combinedImageSampler]]` partner into one SPIR-V sampled image only where
+executed code pairs them, so an unread pair stays two separate variables and
+shadercross counts the orphaned image as a *storage texture* — which lands a
+storage texture in the middle of the `space2` sampler run and breaks the packed
+order above. Delete the declaration (see `GI_SAMPLE_VOLUME_ONLY` in
+`gi_sample.hlsli`); do not "fix" the catalogue row to match.
+
+**Integer-format textures may not carry `SDL_GPU_TEXTUREUSAGE_SAMPLER`.** There
+is no filtering defined for a `_UINT`/`_INT` texel, so `SDL_CreateGPUTexture`
+asserts — and under `BRACKEN_GPU_DEBUG=1` that assertion poisons the device,
+failing every texture creation after it. The engine's integer textures (the GI
+probe-state plane, the RT denoisers' packed visibility bits and tile classes)
+are storage-only for that reason: bind them with
+`bind_storage_textures`/a read-write binding and `Load()` them.
+`GPUTexture::is_integer_format()` is the predicate, and `GPUTexture::create_2d`
+asserts on the combination.
 
 ## CPU↔GPU uniform contract
 

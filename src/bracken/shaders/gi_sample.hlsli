@@ -44,6 +44,24 @@
 // the CPU right up until the two were handed different camera positions — at
 // which point every probe in the field would answer for the wrong point in the
 // world and the failure would look like a shading bug.
+//
+// ---------------------------------------------------------------------------
+// GI_SAMPLE_VOLUME_ONLY — for shaders that want giSampleVolume and nothing else
+// ---------------------------------------------------------------------------
+// `#define GI_SAMPLE_VOLUME_ONLY` before including this file to compile out
+// everything that reads `giVisibilityAtlas` (giTapVisibility, giChebyshev,
+// giSampleCascade, giSampleDiffuse). Such a shader then declares only TWO GI
+// samplers — giIrradianceAtlas and giProbeMeta — and must not declare the
+// visibility pair.
+//
+// This is not a convenience. A `Texture2D`/`SamplerState` pair that no
+// executed code ever pairs up does NOT survive DXC's combined-image-sampler
+// legalization: the two stay separate SPIR-V variables, SDL_shadercross
+// reflects the orphaned image as a STORAGE texture rather than as a sampler,
+// and the resulting descriptor layout no longer matches the packed
+// samplers-then-storage-textures order SDL3 GPU assumes (shaders/README.md).
+// volumetric_fog.frag is the one shader in that position — it needs the media
+// variant only — and it declares the opt-out for exactly this reason.
 
 #ifndef BRACKEN_GI_SAMPLE_HLSLI
 #define BRACKEN_GI_SAMPLE_HLSLI
@@ -111,6 +129,17 @@ float3 giTapIrradiance(int cascade, int slot, float3 dir) {
         .rgb;
 }
 
+/// xyz = relocation offset in world units, w = GI_CLASS_OK or
+/// GI_CLASS_INSIDE_GEOMETRY. Load, never Sample — see the header note.
+float4 giTapMeta(int cascade, int slot) {
+    return giProbeMeta.Load(int3(giProbeStateTexel(slot, cascade), 0));
+}
+
+// Everything below to the matching #endif reads `giVisibilityAtlas`, directly
+// or through giSampleCascade. A GI_SAMPLE_VOLUME_ONLY shader does not declare
+// that pair and must not compile these — see the header note.
+#ifndef GI_SAMPLE_VOLUME_ONLY
+
 /// The probe's depth moments (mean, mean^2) along `dir`.
 float2 giTapVisibility(int cascade, int slot, float3 dir) {
     float2 texel = float2(giProbeAtlasOrigin(slot, GI_VISIBILITY_TILE, cascade)) + float(GI_BORDER) +
@@ -118,12 +147,6 @@ float2 giTapVisibility(int cascade, int slot, float3 dir) {
     return giVisibilityAtlas
         .SampleLevel(giVisibilityAtlasSampler, texel / giAtlasSize(GI_VISIBILITY_TILE), 0)
         .rg;
-}
-
-/// xyz = relocation offset in world units, w = GI_CLASS_OK or
-/// GI_CLASS_INSIDE_GEOMETRY. Load, never Sample — see the header note.
-float4 giTapMeta(int cascade, int slot) {
-    return giProbeMeta.Load(int3(giProbeStateTexel(slot, cascade), 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +288,8 @@ float3 giSampleDiffuse(float3 P, float3 N, float3 V, float3 ambientSkyColor,
     float3 hemisphere = lerp(ambientGroundColor, ambientSkyColor, saturate(N.y * 0.5 + 0.5));
     return accum + hemisphere * remaining;
 }
+
+#endif // GI_SAMPLE_VOLUME_ONLY
 
 // ---------------------------------------------------------------------------
 // The media variant

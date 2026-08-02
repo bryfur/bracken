@@ -2147,7 +2147,7 @@ Per-pipeline configuration summary (from the catalogue rows in `pipeline_catalog
 | Composite | `fullscreen.vert.spv` / `composite.frag.spv` | {0,0,0} | {1,4,1} | none | **swapchain format**; the FS storage buffer is the auto-exposure state SSBO (or `PostProcessStack`'s zeroed dummy) |
 | BloomDownsample | `fullscreen.vert.spv` / `bloom_downsample.frag.spv` | {0,0,0} | {1,1,0} | none | `R16G16B16A16_FLOAT` |
 | BloomUpsample | `fullscreen.vert.spv` / `bloom_upsample.frag.spv` | {0,0,0} | {1,1,0} | none | additive onto larger mip (`LOADOP_LOAD` at pass level), `R16G16B16A16_FLOAT` |
-| VolumetricFog | `fullscreen.vert.spv` / `volumetric_fog.frag.spv` | {0,0,0} | {1,2,0} | none | `R16G16B16A16_FLOAT` |
+| VolumetricFog | `fullscreen.vert.spv` / `volumetric_fog.frag.spv` | {0,0,0} | {1,4,0} | none | `R16G16B16A16_FLOAT`; depth + shadow atlas + GI irradiance/probe-metadata (no visibility atlas — `GI_SAMPLE_VOLUME_ONLY`) |
 | Fxaa | `fullscreen.vert.spv` / `fxaa.frag.spv` | {0,0,0} | {1,1,0} | none | **swapchain format** |
 | SkyCapture | `fullscreen.vert.spv` / `sky_capture.frag.spv` | {0,0,0} | {1,0,0} | none | `R16G16B16A16_FLOAT`, targets one capture-cube face |
 | IblSpecularPrefilter | `fullscreen.vert.spv` / `ibl_prefilter.frag.spv` | {0,0,0} | {1,1,0} | none | `R16G16B16A16_FLOAT`, targets one specular-cube (face, mip) |
@@ -2467,7 +2467,7 @@ VS/FS resource counts below are the `ShaderResources` declared in each catalogue
 | Water | `water.vert` / `water.frag` | u1 s1 | u1 s5 | position2; opaque/no-cull, reversed-Z depth write | scene |
 | BloomDownsample | `fullscreen.vert` / `bloom_downsample.frag` | — | u1 s1 | no_depth | RGBA16F |
 | BloomUpsample | `fullscreen.vert` / `bloom_upsample.frag` | — | u1 s1 | **additive** (LOADOP_LOAD accumulate), no_depth | RGBA16F |
-| VolumetricFog | `fullscreen.vert` / `volumetric_fog.frag` | — | u1 s2 | no_depth | RGBA16F |
+| VolumetricFog | `fullscreen.vert` / `volumetric_fog.frag` | — | u1 s4 | no_depth | RGBA16F |
 | Composite | `fullscreen.vert` / `composite.frag` | — | u1 s4 | no_depth | swap |
 | Fxaa | `fullscreen.vert` / `fxaa.frag` | — | u1 s1 | no_depth | swap |
 | SkyCapture | `fullscreen.vert` / `sky_capture.frag` | — | u1 | no_depth; targets one capture-cube face | RGBA16F |

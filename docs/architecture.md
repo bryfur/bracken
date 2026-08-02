@@ -1123,7 +1123,13 @@ would mean paying for both. `Off` is the atlas path byte for byte.
 *same* three pipelines (`RtShadowClassify` / `RtShadowTemporal` /
 `RtShadowFilter`), dispatched twice against two instances of
 `RtRenderer::VisibilityDenoiser` — bits, tile classes, a history ping-pong, a
-full-res R8 mask, a validity flag and a per-signal frame counter. Nothing in
+full-res R8 mask, a validity flag and a per-signal frame counter. The bits
+(`R32_UINT`) and tile classes (`R8_UINT`) are created **without**
+`TEXTUREUSAGE_SAMPLER`: SDL3 GPU forbids it on an integer format, and every pass
+that reads them binds them as storage textures and `Load()`s them.
+`RtRenderer::ensure_target` keys the flag off `GPUTexture::is_integer_format()`
+rather than off the call site, so only the float history/mask targets get it.
+Nothing in
 those passes is sun-specific, so forking them would have bought three more
 shaders to keep in step and nothing else. If something ever has to differ, it
 becomes a uniform.
@@ -1167,8 +1173,9 @@ forget it and silently get an unshadowed sun back.
 
 Two flags separate the callers, and they are not knobs. `giEnabled` is 0 when
 `gi_mode` is Off, where `RtRenderer` binds its own 1×1 probe stand-ins (the
-probe-state plane is a read-only STORAGE texture, and the engine's shared
-dummies carry sampler usage only). `giAmbientFallback` is 1 for reflection rays
+probe-state plane is a read-only STORAGE texture — R8_UINT, so it cannot carry
+sampler usage at all — and the engine's shared dummies carry sampler usage
+only). `giAmbientFallback` is 1 for reflection rays
 and **0 for probe rays**: a probe already collects sky through its ray misses,
 so a hemisphere added where the field has no answer would double-count it and
 break the bounce series' convergence argument — while a reflected rooftop three
@@ -1420,6 +1427,14 @@ texel replicates the payload texel mirrored across that edge and each corner
 takes the opposite corner (`probe_border_source`, mirrored by `giBorderSource`
 in `shaders/gi_probe.hlsli`). The blend passes fill it from groupshared memory
 in the same dispatch that computes the payload — see below.
+
+`probe state` is the one field texture created **without**
+`TEXTUREUSAGE_SAMPLER` (storage-read only). Two independent reasons: it is
+`R8_UINT` and SDL3 GPU forbids SAMPLER on an integer format outright — under
+`BRACKEN_GPU_DEBUG=1` the resulting assertion poisons the device and every
+later texture creation fails with it — and nothing wants to sample it anyway.
+The trace pass binds it as a read-only storage texture and `Load()`s it, and
+the forward/fog shaders read `probe offset`'s W, never this plane.
 
 **Two writers, two textures, no overlap.** `probe state` is CPU-owned:
 `ProbeCascade` writes it as the scroll invalidates probes and as the updater
@@ -1703,6 +1718,17 @@ neither), plus the `giCascadeBase[3]` / `giEnabled` cbuffer members. Its CPU
 mirror is the `SAMPLE_*` block and `sample_field()` in `render/gi/gi_math.hpp`,
 tested with no device.
 
+A shader that wants only the media variant `#define`s **`GI_SAMPLE_VOLUME_ONLY`**
+before the include; everything that reads `giVisibilityAtlas`
+(`giTapVisibility`, `giChebyshev`, `giSampleCascade`, `giSampleDiffuse`) is then
+compiled out and the shader declares **two** GI samplers, not three. That is not
+a convenience, it is a correctness requirement: a `Texture2D`/`SamplerState`
+pair that no executed code ever pairs up does not survive DXC's
+combined-image-sampler legalization, SDL_shadercross reflects the orphaned image
+as a **storage texture** rather than as a sampler, and the pipeline's reflected
+layout stops matching the packed samplers-then-storage-textures order SDL3 GPU
+assumes. `volumetric_fog.frag` is the one shader in that position.
+
 `giCascadeBase` is **sent, not re-derived**. A shader could snap
 `cameraPos / spacing` itself, and it would agree with `ProbeVolume` right up
 until the two were handed different camera positions — at which point every
@@ -1785,7 +1811,9 @@ to everything at the end). The unit is the same on both sides:
 cosine-weighted mean incoming radiance, irradiance/π, the IBL irradiance cube's
 own convention — which is why no scale factor appears anywhere.
 
-**Fog** (`shaders/volumetric_fog.frag.hlsl`, slots 2–4). The march used a flat
+**Fog** (`shaders/volumetric_fog.frag.hlsl`, slots 2–3 — irradiance and the
+metadata plane; it compiles `gi_sample.hlsli` with `GI_SAMPLE_VOLUME_ONLY` and
+never declares the visibility atlas). The march used a flat
 `fogColor * 0.2` as its ambient in-scatter. GI does **not** replace that colour;
 it becomes a per-channel **gain around 1**, measured against the very hemisphere
 ambient the probe sampler falls back to:

@@ -2360,6 +2360,15 @@ and pass the result into `ambientIBL`/`ambientPBR`'s trailing
 `giIrradiance`/`giWeight` pair. All three cascades live in one texture each, so
 the field costs three slots rather than nine.
 
+If your shader only wants the participating-media variant `giSampleVolume`,
+`#define GI_SAMPLE_VOLUME_ONLY` before the include: the visibility-dependent
+half is compiled out, the field costs **two** slots, and you must *not* declare
+`giVisibilityAtlas`/`giVisibilityAtlasSampler`. Declaring a texture/sampler pair
+nothing reads is not free — DXC leaves them unmerged and shadercross then
+reflects the texture as a storage texture, which desynchronizes the pipeline's
+declared and actual resource layout (`volumetric_fog.frag` is the engine's own
+example).
+
 The include also reserves fragment cbuffer `(2, 3)` for `ClusterParams` — don’t declare your own `b2` alongside it.
 
 ### The CPU↔GPU uniform contract

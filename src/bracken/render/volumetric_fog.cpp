@@ -180,11 +180,16 @@ void VolumetricFog::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& reg
     pipeline->bind(pass);
     SDL_PushGPUFragmentUniformData(cmd, 0, &uniforms, sizeof(uniforms));
 
-    // Depth (slot 0), shadow atlas with the raw sampler (slot 1), and the
-    // probe field's three atlases (slots 2-4). The GI slots are declared
-    // unconditionally by the shader, so they are bound even with GI off —
-    // giEnabled is what decides whether they are read.
-    SDL_GPUTextureSamplerBinding bindings[5] = {};
+    // Depth (slot 0), shadow atlas with the raw sampler (slot 1), and TWO of
+    // the probe field's three atlases: irradiance (slot 2) and the probe
+    // metadata plane (slot 3). The visibility atlas is deliberately absent —
+    // this pass compiles gi_sample.hlsli with GI_SAMPLE_VOLUME_ONLY and never
+    // reads it, and declaring a resource no executed code pairs with a sampler
+    // is what made this pipeline's reflected layout disagree with the
+    // catalogue row. The GI slots are declared unconditionally by the shader,
+    // so they are bound even with GI off — giEnabled is what decides whether
+    // they are read.
+    SDL_GPUTextureSamplerBinding bindings[4] = {};
     bindings[0].texture = depth_texture;
     bindings[0].sampler = linear_sampler_;
     bindings[1].texture = shadow_map.atlas_texture();
@@ -192,9 +197,8 @@ void VolumetricFog::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& reg
     int binding_count = 2;
     if (gi != nullptr && gi->textures[0].texture != nullptr) {
         bindings[2] = gi->textures[0];
-        bindings[3] = gi->textures[1];
-        bindings[4] = gi->textures[2];
-        binding_count = 5;
+        bindings[3] = gi->textures[2];
+        binding_count = 4;
     }
     SDL_BindGPUFragmentSamplers(pass, 0, bindings, static_cast<Uint32>(binding_count));
 

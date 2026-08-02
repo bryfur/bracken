@@ -335,7 +335,12 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .vertex_shader = "fullscreen.vert.spv",
      .fragment_shader = "volumetric_fog.frag.spv",
      .vs = k_none,
-     .fs = k_ubo1_samp5, // depth + shadow atlas + the GI field's three atlases
+     // depth + shadow atlas + TWO GI atlases (irradiance + probe metadata).
+     // Not three: the pass uses giSampleVolume only, so it compiles
+     // gi_sample.hlsli with GI_SAMPLE_VOLUME_ONLY and never declares the
+     // visibility atlas — see volumetric_fog.frag.hlsl for why an unread
+     // declaration is not free here.
+     .fs = k_ubo1_samp4,
      .vertex_layout = VertexLayout::None,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::RGBA16F,

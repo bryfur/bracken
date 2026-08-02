@@ -108,6 +108,35 @@ size_t GPUTexture::get_bytes_per_pixel(SDL_GPUTextureFormat format) {
     }
 }
 
+bool GPUTexture::is_integer_format(SDL_GPUTextureFormat format) {
+    // Every unnormalized-integer colour format SDL3 GPU knows. Listed by hand
+    // rather than by range test: SDL's enum is not contiguous over them, and a
+    // range test would quietly start including whatever is appended next.
+    switch (format) {
+        case SDL_GPU_TEXTUREFORMAT_R8_UINT:
+        case SDL_GPU_TEXTUREFORMAT_R8G8_UINT:
+        case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UINT:
+        case SDL_GPU_TEXTUREFORMAT_R16_UINT:
+        case SDL_GPU_TEXTUREFORMAT_R16G16_UINT:
+        case SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UINT:
+        case SDL_GPU_TEXTUREFORMAT_R32_UINT:
+        case SDL_GPU_TEXTUREFORMAT_R32G32_UINT:
+        case SDL_GPU_TEXTUREFORMAT_R32G32B32A32_UINT:
+        case SDL_GPU_TEXTUREFORMAT_R8_INT:
+        case SDL_GPU_TEXTUREFORMAT_R8G8_INT:
+        case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_INT:
+        case SDL_GPU_TEXTUREFORMAT_R16_INT:
+        case SDL_GPU_TEXTUREFORMAT_R16G16_INT:
+        case SDL_GPU_TEXTUREFORMAT_R16G16B16A16_INT:
+        case SDL_GPU_TEXTUREFORMAT_R32_INT:
+        case SDL_GPU_TEXTUREFORMAT_R32G32_INT:
+        case SDL_GPU_TEXTUREFORMAT_R32G32B32A32_INT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool GPUTexture::reload_from_file(const std::string& path, bool generate_mipmaps) {
     // Hot-reload swap: creates the fresh texture and releases the old one.
     BRACKEN_ASSERT_MAIN_THREAD();
@@ -284,6 +313,13 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
     // A level beyond the chain is not a warning case in SDL, it is a create
     // failure — clamp so the caller's arithmetic and SDL's cannot disagree.
     mip_levels = std::min(mip_levels, calculate_mip_levels(width, height));
+    // SAMPLER on an integer format is an SDL assertion, and an SDL assertion
+    // under BRACKEN_GPU_DEBUG=1 poisons the device — every later texture
+    // creation fails too, so the first honest diagnostic is buried under
+    // dozens of unrelated ones. Catch it here, at the site that asked for it.
+    BRACKEN_ASSERT(!(is_integer_format(format) && (usage & SDL_GPU_TEXTUREUSAGE_SAMPLER) != 0),
+                   "integer-format textures cannot carry SAMPLER usage; bind it as a storage "
+                   "texture and Load() it instead");
     auto texture = std::unique_ptr<GPUTexture>(new GPUTexture());
     texture->device_ = &device;
     texture->width_ = width;

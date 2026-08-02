@@ -87,10 +87,19 @@ bool RtRenderer::ensure_target(gpu::GPUDevice& device, std::unique_ptr<gpu::GPUT
     if (tex && tex->width() == width && tex->height() == height) {
         return true;
     }
-    tex = gpu::GPUTexture::create_2d(device, width, height, format,
-                                     SDL_GPU_TEXTUREUSAGE_SAMPLER |
-                                         SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ |
-                                         SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE);
+    // The packed-bits and tile-class targets are R32_UINT / R8_UINT, and SDL3
+    // GPU forbids SAMPLER on an integer format — filtering an integer texel is
+    // undefined, so `SDL_CreateGPUTexture` asserts and, under
+    // BRACKEN_GPU_DEBUG=1, poisons the device for every creation after it.
+    // Neither is ever sampled: the denoiser passes bind both as storage
+    // textures and `Load()` them. Only the float history/mask targets are
+    // sampled, so the flag follows the format rather than the call site.
+    SDL_GPUTextureUsageFlags usage = SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ |
+                                     SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE;
+    if (!gpu::GPUTexture::is_integer_format(format)) {
+        usage |= SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    }
+    tex = gpu::GPUTexture::create_2d(device, width, height, format, usage);
     if (!tex) {
         BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create {} ({}x{})", label, width, height);
         return false;
@@ -117,9 +126,12 @@ bool RtRenderer::ensure_gi_dummies(SDL_GPUCommandBuffer* cmd) {
     }
     gi_dummy_irradiance_ = gpu::GPUTexture::create_2d(
         *device_, 1, 1, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+    // Storage-read only, no SAMPLER: it stands in for ProbeVolume's state
+    // plane, which the reflection pass binds as a read-only storage texture and
+    // `Load()`s — and R8_UINT with SAMPLER is an SDL assertion that poisons the
+    // device for every later texture creation (gpu_texture.hpp).
     gi_dummy_probe_state_ = gpu::GPUTexture::create_2d(
-        *device_, 1, 1, SDL_GPU_TEXTUREFORMAT_R8_UINT,
-        SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ);
+        *device_, 1, 1, SDL_GPU_TEXTUREFORMAT_R8_UINT, SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ);
     if (!gi_dummy_irradiance_ || !gi_dummy_probe_state_) {
         BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the GI dummy textures");
         gi_dummy_irradiance_.reset();

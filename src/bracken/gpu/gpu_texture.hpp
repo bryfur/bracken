@@ -238,6 +238,22 @@ public:
      */
     bool is_depth() const { return is_depth_; }
 
+    /**
+     * @brief True for the UINT/SINT (unnormalized integer) colour formats.
+     *
+     * SDL3 GPU forbids `SDL_GPU_TEXTUREUSAGE_SAMPLER` on these: there is no
+     * filtering defined for an integer texel, so `SDL_CreateGPUTexture`
+     * asserts and returns null. A failed create under `BRACKEN_GPU_DEBUG=1`
+     * is not local damage — the assertion poisons the device and every
+     * subsequent texture creation fails too. Creation sites that only ever
+     * `Load()` an integer texture as a storage texture must therefore ask
+     * this before adding SAMPLER; `create_2d` asserts on the combination.
+     *
+     * Depth formats with a stencil aspect (D24_UNORM_S8_UINT) are NOT integer
+     * formats in this sense and are excluded.
+     */
+    [[nodiscard]] static bool is_integer_format(SDL_GPUTextureFormat format);
+
 private:
     GPUTexture() = default;
 

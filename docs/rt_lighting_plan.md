@@ -1028,6 +1028,17 @@ adding an `HZB` timer row and an `hzb=1600x900 mips=11` field to the
 marches this pyramid, probe-space filtering, and the mid-roughness specular
 hand-off — all R4b.
 
+*Follow-up (2026-08-02): a validated run is clean again.* Two defects the R1b/R1c
+and R4a work left behind are fixed with no pixel moving: the integer-format
+textures (GI probe state, RT visibility bits + tile classes) no longer request
+`TEXTUREUSAGE_SAMPLER`, so `BRACKEN_GPU_DEBUG=1` no longer trips SDL's assertion
+and poisons the device; and `volumetric_fog.frag` no longer declares the
+visibility atlas it never reads, so its reflected layout matches the catalogue
+row. `SDL_ASSERT=always_ignore BRACKEN_GPU_DEBUG=1 PLAYGROUND_RT=both
+PLAYGROUND_GI=probes_screen ./playground --smoke 30` now runs with zero SDL
+assertions and zero `declared resource counts` warnings, at the same
+81.7/49.8 the un-validated run produces.
+
 GI-1.0's shape over our tracer, `GiMode::ProbesScreen`, mid/high GPUs only:
 
 - ~~**HZB.** New min-depth pyramid pass after the prepass (the engine's first —

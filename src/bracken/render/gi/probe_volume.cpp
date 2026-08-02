@@ -21,6 +21,15 @@ constexpr SDL_GPUTextureUsageFlags ATLAS_USAGE = SDL_GPU_TEXTUREUSAGE_SAMPLER |
                                                  SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ |
                                                  SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE;
 
+/// The state plane is the one exception, and for two independent reasons.
+/// It is R8_UINT, and SDL3 GPU forbids SAMPLER on an integer format outright
+/// (`SDL_CreateGPUTexture` asserts and the assertion poisons the device under
+/// `BRACKEN_GPU_DEBUG=1`); and nothing wants to sample it anyway — the trace
+/// pass binds it as a read-only storage texture and `Load()`s it, and the
+/// forward/fog shaders read the OFFSET plane's w, never this one. It has no
+/// GPU writer either: the CPU rota owns it and re-uploads on scroll.
+constexpr SDL_GPUTextureUsageFlags STATE_USAGE = SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ;
+
 /// How often the diagnostic counter download is requested, in frames. It is
 /// fenced and polled, so the only cost of doing it more often is a command
 /// buffer; the only cost of doing it less often is a staler number.
@@ -66,7 +75,7 @@ bool ProbeVolume::init(gpu::GPUDevice& device) {
                                              SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, ATLAS_USAGE);
     visibility_ =
         gpu::GPUTexture::create_2d(device, vis_w, vis_h, SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, ATLAS_USAGE);
-    state_ = gpu::GPUTexture::create_2d(device, plane_w, plane_h, SDL_GPU_TEXTUREFORMAT_R8_UINT, ATLAS_USAGE);
+    state_ = gpu::GPUTexture::create_2d(device, plane_w, plane_h, SDL_GPU_TEXTUREFORMAT_R8_UINT, STATE_USAGE);
     // One texel per probe: xyz = relocation offset in world units,
     // w = classification verdict. Half floats are ample for an offset
     // bounded at 0.45 * 600 = 270 units.

@@ -69,22 +69,27 @@ Texture2D shadowMap : register(t1, space2);
 [[vk::combinedImageSampler]][[vk::binding(1, 2)]]
 SamplerState shadowSampler : register(s1, space2);
 
-// Probe-field GI (render/gi/): the three atlases gi_sample.hlsli reads, at
-// this pass's slots 2-4. Bound to dummies when GI is off; giEnabled gates them.
+// Probe-field GI (render/gi/), at this pass's slots 2-3. Bound to dummies when
+// GI is off; giEnabled gates them.
+//
+// TWO atlases, not the three the forward shaders declare: this pass calls
+// giSampleVolume and nothing else, so `giVisibilityAtlas` would be a resource
+// no executed code reads. That is not free — an unpaired Texture2D/SamplerState
+// does not survive DXC's combined-image-sampler legalization, and shadercross
+// then reflects the orphaned image as a storage texture, which puts a storage
+// texture BEFORE a sampler in the space2 run and breaks the packed order SDL3
+// GPU assumes. GI_SAMPLE_VOLUME_ONLY compiles out everything that reads it.
+#define GI_SAMPLE_VOLUME_ONLY
+
 [[vk::combinedImageSampler]][[vk::binding(2, 2)]]
 Texture2D<float4> giIrradianceAtlas : register(t2, space2);
 [[vk::combinedImageSampler]][[vk::binding(2, 2)]]
 SamplerState giIrradianceAtlasSampler : register(s2, space2);
 
 [[vk::combinedImageSampler]][[vk::binding(3, 2)]]
-Texture2D<float2> giVisibilityAtlas : register(t3, space2);
+Texture2D<float4> giProbeMeta : register(t3, space2);
 [[vk::combinedImageSampler]][[vk::binding(3, 2)]]
-SamplerState giVisibilityAtlasSampler : register(s3, space2);
-
-[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
-Texture2D<float4> giProbeMeta : register(t4, space2);
-[[vk::combinedImageSampler]][[vk::binding(4, 2)]]
-SamplerState giProbeMetaSampler : register(s4, space2);
+SamplerState giProbeMetaSampler : register(s3, space2);
 
 // worldPosFromDepth + interleavedGradientNoise
 #include "lighting.hlsli"

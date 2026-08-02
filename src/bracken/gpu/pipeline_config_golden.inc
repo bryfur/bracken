@@ -239,7 +239,7 @@ BloomUpsample
   targets   blend=Additive color=R16G16B16A16_FLOAT has_depth=false depth=D32_FLOAT samples=1
 VolumetricFog
   vs        fullscreen.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=0
-  fs        volumetric_fog.frag.spv samplers=5 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        volumetric_fog.frag.spv samplers=4 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=false write=false compare=GREATER_OR_EQUAL stencil=false
