@@ -22,6 +22,14 @@ void GraphicsSettings::clamp_to_valid_ranges() {
     shadow_mode = clamp_enum(shadow_mode, ShadowMode::Off, ShadowMode::PCSS);
     shadow_cascades = clamp_enum(shadow_cascades, ShadowCascades::One, ShadowCascades::Four);
     shadow_resolution = clamp_enum(shadow_resolution, ShadowResolution::R512, ShadowResolution::R4096);
+    rt_shadow_resolution = clamp_enum(rt_shadow_resolution, RtResolution::Full, RtResolution::Quarter);
+    rt_reflection_resolution =
+        clamp_enum(rt_reflection_resolution, RtResolution::Full, RtResolution::Quarter);
+    // 0 is meaningful (a hard shadow); the upper bound stops a typo turning the
+    // sun into a dome light and the denoiser into a blur.
+    rt_sun_softness_deg = std::clamp(rt_sun_softness_deg, 0.0f, 10.0f);
+    rt_reflection_max_roughness = std::clamp(rt_reflection_max_roughness, 0.0f, 1.0f);
+    rt_max_instance_range = clamp_enum(rt_max_instance_range, RtRange::Near, RtRange::Unlimited);
     shadow_distance = std::clamp(shadow_distance, 200.0f, 20000.0f);
     // Budget bounds mirror render::lighting::LOCAL_SHADOW_MAX_{POINT,SPOT}_BUDGET
     // (the 8x8 atlas holds 8*6 point-face tiles + 16 spot tiles exactly).
@@ -80,6 +88,11 @@ bool GraphicsSettings::save(const std::string& path) const {
     out << "bloom_strength=" << bloom_strength << "\n";
     out << "rt_shadows=" << rt_shadows << "\n";
     out << "rt_reflections=" << rt_reflections << "\n";
+    out << "rt_shadow_resolution=" << static_cast<int>(rt_shadow_resolution) << "\n";
+    out << "rt_reflection_resolution=" << static_cast<int>(rt_reflection_resolution) << "\n";
+    out << "rt_sun_softness_deg=" << rt_sun_softness_deg << "\n";
+    out << "rt_reflection_max_roughness=" << rt_reflection_max_roughness << "\n";
+    out << "rt_max_instance_range=" << static_cast<int>(rt_max_instance_range) << "\n";
     out << "volumetric_fog=" << volumetric_fog << "\n";
     out << "god_rays=" << god_rays << "\n";
     out << "window_mode=" << static_cast<int>(window_mode) << "\n";
@@ -178,6 +191,11 @@ bool GraphicsSettings::load(const std::string& path) {
     read_bool("bloom_enabled", bloom_enabled);
     read_float("bloom_strength", bloom_strength);
     read_bool("rt_shadows", rt_shadows);
+    read_enum("rt_shadow_resolution", rt_shadow_resolution);
+    read_enum("rt_reflection_resolution", rt_reflection_resolution);
+    read_float("rt_sun_softness_deg", rt_sun_softness_deg);
+    read_float("rt_reflection_max_roughness", rt_reflection_max_roughness);
+    read_enum("rt_max_instance_range", rt_max_instance_range);
     read_bool("rt_reflections", rt_reflections);
     read_bool("volumetric_fog", volumetric_fog);
     read_bool("god_rays", god_rays);

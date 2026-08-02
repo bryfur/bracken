@@ -665,6 +665,8 @@ enum class ShadowMode  : int { Off = 0, PCF = 1, PCSS = 2 };
 enum class AOMode      : int { Off = 0, GTAO_Half = 1, GTAO_Full = 2 };
 enum class AAMode      : int { Off = 0, FXAA = 1, TAA = 2 };
 enum class TonemapMode : int { ACESFitted = 0, ACESNarkowicz = 1, Reinhard = 2, None = 3 };
+enum class RtResolution: int { Full = 0, Half = 1, Quarter = 2 };
+enum class RtRange     : int { Near = 0, Medium = 1, Far = 2, Unlimited = 3 };
 ```
 
 #### Field table (name = file key; defaults verified by `graphics_settings.test.cpp::DefaultValues`/`LoadEmptyFileKeepsDefaults`)
@@ -696,6 +698,13 @@ enum class TonemapMode : int { ACESFitted = 0, ACESNarkowicz = 1, Reinhard = 2, 
 | `ibl_enabled` | bool | true | — (sky image-based lighting; OFF = hemisphere ambient fallback; serialized 0/1, pinned by `IblEnabledSerializesNumerically`) |
 | `bloom_enabled` | bool | true | — |
 | `bloom_strength` | float | 0.25 | **not clamped** (doc range 0.0–1.0) |
+| `rt_shadows` | bool | **false** | — (compute-shader traced sun shadows; the mask REPLACES the CSM term where it applies. Off by default and pinned so by `DefaultValues`; round trip pinned by `RayTracingFlagsRoundTrip`) |
+| `rt_reflections` | bool | **false** | — (traced specular; additionally needs per-triangle attributes, so enabling it after the structure was built for shadows alone forces a rebuild) |
+| `rt_shadow_resolution` | RtResolution | Full | [Full, Quarter] (full/half/quarter screen res → the shadow ray count; the denoiser upsamples either way) |
+| `rt_reflection_resolution` | RtResolution | Full | [Full, Quarter] (same dial for the reflection trace) |
+| `rt_sun_softness_deg` | float | 0.35 | [0, 10] (angular RADIUS of the sun disk in degrees; the real sun is ~0.265. 0 collapses the cone to a hard shadow. Free to trace — same ray count, the denoiser works harder) |
+| `rt_reflection_max_roughness` | float | 0.75 | [0, 1] (roughness at which traced specular hands over entirely to the prefiltered IBL probe; the two weights always sum to 1) |
+| `rt_max_instance_range` | RtRange | **Unlimited** | [Near, Unlimited] → {1000, 2000, 4000, ∞} world units via `rt_range_units` (instances whose bounds lie entirely beyond it are dropped before the TLAS hash; distant sun shadows fall back to the cascades. A finite value makes camera motion re-trigger TLAS rebuilds — see architecture.md "Ray tracing") |
 | `volumetric_fog` | bool | false | — |
 | `god_rays` | bool | false | requires `volumetric_fog` (not enforced here) |
 | `window_mode` | int | 0 | [0, 2] |
@@ -2191,7 +2200,12 @@ Cbuffer mirror inventory (binding as annotated in the header). Every size below 
 | `ExposureAdaptUniforms` | **compute** set 2, b0 | 48 | `minLog2Luma = −10`, `log2Range = 26`, `deltaTime`, `firstFrame` (≠0 ⇒ snap), `speedUp = 1.5`/`speedDown = 2.5` EV/s, `minEv = −4`/`maxEv = 4`, `lowPercentile = 0.60`/`highPercentile = 0.05`, `log2TargetGray = −1.80` (`AutoExposure::DEFAULT_LOG2_TARGET_GRAY`) |
 | `ParticleFragmentUniforms` | fragment set 3, b0 | 16 | `emissiveBoost = 1`; pushed once per pass |
 | `ParticleBatchUniforms` | vertex set 1, b1 | 16 | `instanceOffset` into per-frame particle SSBO |
-| `RtReflectionUniforms` | compute set 2, b0 | 224 | opaque receiver fields through offset 143 plus optional analytic-water region/simulation/flow/detail fields at 144–223 |
+| `RtReflectionUniforms` | compute set 2, b0 | 240 | opaque receiver fields through offset 143, optional analytic-water region/simulation/flow/detail fields at 144–223, `frameIndex` at 224 (advances the GGX sample sequence) |
+| `RtShadowUniforms` | compute set 2, b0 | 128 | trace fields through offset 111, then `sunCosThetaMax` (cos of the sun's angular radius; 1.0 = a point light, i.e. the old hard shadow), `frameIndex`, `hasGBuffer` |
+| `RtShadowClassifyUniforms` | compute set 2, b0 | 16 | `tileCount` of the packed-bit texture |
+| `RtShadowTemporalUniforms` | compute set 2, b0 | 48 | `tracedSize`/`tileCount`, `depthA`/`depthB` (reversed-Z linearization), `maxAccumFrames = 32`, `depthRejectRelative = 0.05`, `historyValid` |
+| `RtShadowFilterUniforms` | compute set 2, b0 | 48 | `outputSize` (full res) / `tracedSize` / `tileCount`, `depthA`/`depthB`, `maxRadius = 3` traced texels at maximum variance, `depthSigma = 0.05` |
+| `RtReflectionTemporalUniforms` | compute set 2, b0 | 32 | `tracedSize`, `maxAccumFrames = 16`, `clampSigma = 1.5` (neighbourhood clamp width), `historyValid` |
 | `BloomDownsampleUniforms` | fragment set 3, b0 | 32 | `threshold = 0.8` compared against **post-exposure** luminance; `isFirstPass = 1`, `exposure = 1` |
 | `BloomUpsampleUniforms` | fragment set 3, b0 | 16 | `bloomRadius = 1` |
 | `VolumetricFogUniforms` | fragment set 3, b0 | 448 | per-cascade matrices/bias for god rays; defaults `fogDensity = 0.0015`, `scatterStrength = 0.25`, `fogHeight = 100`, `fogFalloff = 0.005`, `startDist = 100`, `maxDist = 3000`, `godRaysEnabled = 1` |
@@ -2495,7 +2509,12 @@ Every cbuffer has an `alignas(16)` CPU mirror annotated with its `(set, binding)
 | `GtaoUpsampleUniforms` | (3, b0) | `gtao_upsample.frag` | 32 |
 | `BlurUniforms` | (3, b0) | `blur_ao.frag` | 32 |
 | `RtReflectionResolveUniforms` | (3, b0) | `rt_reflection_resolve.frag` | 112 |
-| `RtReflectionUniforms` | compute (2, b0) | `rt_reflection.comp` | 224 |
+| `RtReflectionUniforms` | compute (2, b0) | `rt_reflection.comp` | 240 |
+| `RtShadowUniforms` | compute (2, b0) | `rt_shadow.comp` | 128 |
+| `RtShadowClassifyUniforms` | compute (2, b0) | `rt_shadow_denoise_classify.comp` | 16 |
+| `RtShadowTemporalUniforms` | compute (2, b0) | `rt_shadow_denoise_temporal.comp` | 48 |
+| `RtShadowFilterUniforms` | compute (2, b0) | `rt_shadow_denoise_filter.comp` | 48 |
+| `RtReflectionTemporalUniforms` | compute (2, b0) | `rt_reflection_denoise_temporal.comp` | 32 |
 | `CompositeUniforms` | (3, b0) | `composite.frag` | 112 |
 | `FxaaUniforms` | (3, b0) | `fxaa.frag` | 16 |
 | `BloomDownsampleUniforms` | (3, b0) | `bloom_downsample.frag` | 32 |

@@ -32,6 +32,7 @@
 #include "SDL3/SDL_gpu.h"
 #include "SDL3/SDL_video.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -186,6 +187,11 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
         rt_renderer_.reset();
     } else {
         rt_renderer_->resize(context_->device(), w, h);
+        // Lend it this renderer's pass timeline so the traced passes show up in
+        // RenderStats::pass_times_ms (and the dev Stats panel) next to every
+        // other pass. Pointer to a member of this object, so the lifetime
+        // requirement is met by construction.
+        rt_renderer_->set_timer_pool(&gpu_timer_pool_);
     }
 
     if (!gtao_->init(context_->device(), w, h, gfx.ao_mode != AOMode::GTAO_Full)) {
@@ -958,11 +964,19 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 }
             }
 
-            // Normal+roughness G-buffer: allocated only while ray-traced
-            // reflections are on and released the moment they go off, so a game
-            // that never enables them never holds a screen-sized target. It
-            // shares the prepass with velocity, hence the identical size.
-            if (gfx.rt_reflections) {
+            // Normal+roughness G-buffer: allocated while EITHER ray-traced
+            // feature is on and released the moment both go off, so a game that
+            // never enables them never holds a screen-sized target. It shares
+            // the prepass with velocity, hence the identical size.
+            //
+            // Shadows need it as much as reflections do, and used not to get it.
+            // The shadow pass reconstructed its normal from four depth taps
+            // instead; on foliage and any high-frequency silhouette that
+            // reconstruction flips between neighbouring pixels and between
+            // frames, and since the pass hard-cuts to "shadowed" at N.L <= 0,
+            // the flip is full-amplitude. That was the speckle, and no denoiser
+            // can undo it — the signal is wrong before it is noisy.
+            if (gfx.rt_reflections || gfx.rt_shadows) {
                 const int gw = context_->width();
                 const int gh = context_->height();
                 if (!normal_rough_texture_ || normal_rough_texture_->width() != gw ||
@@ -1033,7 +1047,15 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 // structure unbuilt, RtRenderer::render() returns immediately,
                 // and the setting silently does nothing.
                 ensure_raytracing_scene(gfx.rt_reflections);
-                refresh_raytracing_instances(frame);
+                {
+                    // Timed separately from the traces: this is the CPU-side
+                    // TLAS work (range filter, content hash, and the rebuild
+                    // when the hash moved), which is exactly the number
+                    // rt_max_instance_range trades against.
+                    BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "RTInstances");
+                    refresh_raytracing_instances(frame, cmd, draw_camera.position,
+                                                 rt_range_units(gfx.rt_max_instance_range));
+                }
                 BRACKEN_PROFILE_ZONE_COLOR("RT shadows", 0x8E44AD);
                 BRACKEN_GPU_SCOPE(cmd, "RT shadows");
                 rt_frame_params.inv_view_proj = glm::inverse(draw_camera.view_projection);
@@ -1046,7 +1068,15 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
 
                 render::RtShadowSettings rs;
                 rs.enabled = gfx.rt_shadows;
+                rs.resolution = gfx.rt_shadow_resolution;
+                rs.sun_angular_radius_degrees = gfx.rt_sun_softness_deg;
                 rt_reflection_settings.enabled = gfx.rt_reflections;
+                rt_reflection_settings.resolution = gfx.rt_reflection_resolution;
+                rt_reflection_settings.max_roughness = gfx.rt_reflection_max_roughness;
+                // fade_start is the START of the same handover; keep it below
+                // the ceiling or rtReflectionWeight's smoothstep is undefined.
+                rt_reflection_settings.fade_start =
+                    std::min(rt_reflection_settings.fade_start, gfx.rt_reflection_max_roughness * 0.5f);
 
                 // Reflections need the prepass G-buffer; without it (allocation
                 // failed, or the prepass did not run this frame) the pass has
@@ -1058,6 +1088,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 opaque_reflection_settings.enabled =
                     opaque_reflection_settings.enabled && normal_rough != nullptr;
                 rt_renderer_->render(cmd, *post_->offscreen_depth(), normal_rough,
+                                     velocity_texture_ ? velocity_texture_->handle() : nullptr,
                                      rt_frame_params, rs, opaque_reflection_settings);
                 if (rt_renderer_->stats().shadows_traced && rt_renderer_->shadow_mask() != nullptr) {
                     frame_rt_shadow_texture_ = rt_renderer_->shadow_mask()->handle();
@@ -1542,21 +1573,83 @@ void SceneRenderer::ensure_raytracing_scene(bool want_attributes) {
     build_raytracing_scene(*model_manager_, want_attributes);
 }
 
-void SceneRenderer::refresh_raytracing_instances(const FramePacket& frame) {
+void SceneRenderer::refresh_raytracing_instances(const FramePacket& frame,
+                                                 SDL_GPUCommandBuffer* cmd,
+                                                 const glm::vec3& camera_pos, float max_range) {
     if (!rt_renderer_) {
         return;
     }
+
+    // GraphicsSettings::rt_max_instance_range, in world units. Unlimited maps
+    // to infinity precisely so this is a single test rather than a comparison
+    // against a sentinel on every instance of every frame.
+    const bool range_limited = std::isfinite(max_range) && model_manager_ != nullptr;
+
+    // Distance is measured to the instance's world-space BOUNDS, not its
+    // origin, from the same Model::bounding_* pair the main-view cull uses
+    // (scene_prep.cpp's bin_main_chunk) — so a cathedral whose origin sits
+    // 30 m past the cutoff but whose wall is 2 m in front of the camera is
+    // still traced, and nothing pops as the camera creeps up on it. A model
+    // the manager cannot resolve has no bounds and is KEPT, matching the
+    // culling path's "no bounds, stays visible" rule: a missing handle is a
+    // diagnostic elsewhere, not a licence to silently drop a caster here.
+    //
+    // COST TRADE, stated because it is the knob's whole price: with a finite
+    // range the instance list becomes a function of camera position, so a
+    // camera crossing the threshold changes the list, changes the content
+    // hash, and correctly re-triggers a TLAS rebuild that Unlimited (the
+    // default) never pays on a static scene. That is the deal — traversal and
+    // per-frame TLAS size traded against rebuild frequency.
+    auto within_range = [&](ModelHandle handle, const glm::mat4& t) {
+        if (!range_limited) {
+            return true;
+        }
+        const Model* model = model_manager_->get_model(handle);
+        if (model == nullptr) {
+            return true;
+        }
+        const glm::vec3 world_center = glm::vec3(t * glm::vec4(model->bounding_center, 1.0f));
+        const float world_radius = model->bounding_half_diag * max_scale_factor(t);
+        // Squared compare against (range + radius): exactly "are the bounds
+        // entirely beyond the cutoff", with no square root per instance.
+        const glm::vec3 to_camera = world_center - camera_pos;
+        const float reach = max_range + world_radius;
+        return glm::dot(to_camera, to_camera) <= reach * reach;
+    };
+
     // Straight off the packet: whatever the host described this frame is what
     // the rays see. There is no second list for a host to forget to update.
     rt_instances_scratch_.clear();
     const auto models = frame.model_commands();
     rt_instances_scratch_.reserve(models.size());
-    for (const ModelDrawCommand& cmd : models) {
-        if (cmd.model_handle != INVALID_MODEL_HANDLE) {
-            rt_instances_scratch_.emplace_back(cmd.model_handle, cmd.transform);
+    for (const ModelDrawCommand& draw : models) {
+        if (draw.model_handle != INVALID_MODEL_HANDLE && within_range(draw.model_handle, draw.transform)) {
+            rt_instances_scratch_.emplace_back(draw.model_handle, draw.transform);
         }
     }
-    rt_renderer_->set_instances(rt_instances_scratch_);
+
+    // SKINNED DRAWS CAST TOO. They were absent from this list entirely, which
+    // meant every animated character was invisible to the rays — and because
+    // traced visibility REPLACES the cascade result rather than combining with
+    // it, the effect was not "falls back to CSM" but "has no sun shadow at
+    // all". The player character in the playground was the obvious victim.
+    //
+    // LIMITATION, stated here because it is visible: the BLAS is built from
+    // the model's bind-pose CPU geometry, so the shadow a skinned instance
+    // casts is its BIND POSE, translated and rotated to the right place. It
+    // tracks the character around the world and does not animate with it.
+    // Fixing that properly means re-skinning the vertices and refitting the
+    // BVH every frame (a refit is O(n) and would fit in the Prepare-stage
+    // fan-out) — worth doing, but a bigger change than restoring the shadow.
+    for (const SkinnedDrawCommand& draw : frame.skinned_commands()) {
+        if (draw.model_handle != INVALID_MODEL_HANDLE && within_range(draw.model_handle, draw.transform)) {
+            rt_instances_scratch_.emplace_back(draw.model_handle, draw.transform);
+        }
+    }
+
+    // The filter runs BEFORE this, deliberately: set_instances hashes the list
+    // it is given, so what the TLAS skip-check sees is the filtered content.
+    rt_renderer_->set_instances(rt_instances_scratch_, cmd);
 }
 
 void SceneRenderer::set_raytracing_instances(

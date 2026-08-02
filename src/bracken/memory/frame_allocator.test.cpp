@@ -141,12 +141,18 @@ TEST(FrameAllocator, SwapCycleReleasesGrowthChunks) {
     EXPECT_EQ(fa.this_frame().bytes_capacity(), 64u);
 }
 
-// --- Owner-thread enforcement (debug builds; no-op in release) ---
+// --- Owner-thread enforcement ---
+//
+// The owner check is BRACKEN_CONTRACT (arena.cpp), which is live in release
+// too, so this is a plain EXPECT_DEATH exactly like the equivalent cases in
+// arena.test.cpp. It was EXPECT_DEBUG_DEATH — which under NDEBUG expects the
+// statement NOT to die — and so failed the moment the tree was first built
+// with optimization flags that actually define NDEBUG.
 
 TEST(FrameAllocatorOwnerDeathTest, ForeignThreadAllocateAsserts) {
     FrameAllocator fa(1024);
     ASSERT_NE(fa.this_frame().allocate(8, 8), nullptr); // binds to this thread
-    EXPECT_DEBUG_DEATH(
+    EXPECT_DEATH(
         {
             std::thread t([&] { (void)fa.this_frame().allocate(8, 8); });
             t.join();

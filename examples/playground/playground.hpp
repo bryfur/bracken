@@ -19,6 +19,7 @@
 #include "bracken/navigation/nav_grid.hpp"
 #include "bracken/physics/character_controller.hpp"
 #include <glm/glm.hpp>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -58,9 +59,13 @@ public:
     /** @param smoke_frames  >0: self-drive for N frames and exit.
      *  @param engine_camera false (--engine-camera=off) makes the demo drive
      *         the camera rig by hand instead of letting the engine do it —
-     *         the coverage that keeps Application's escape hatch honest. */
-    explicit PlaygroundGame(int smoke_frames = -1, bool engine_camera = true)
-        : engine_camera_(engine_camera), smoke_frames_(smoke_frames) {}
+     *         the coverage that keeps Application's escape hatch honest.
+     *  @param rt_bench (--rt-bench N) turns the same self-driven run into a
+     *         MEASUREMENT JIG: pinned camera, no screenshot, none of the
+     *         scripted mid-run settings flips, and a machine-readable per-pass
+     *         timing table at exit instead of the [smoke] lines. */
+    explicit PlaygroundGame(int smoke_frames = -1, bool engine_camera = true, bool rt_bench = false)
+        : engine_camera_(engine_camera), smoke_frames_(smoke_frames), rt_bench_(rt_bench) {}
 
     /** Where the smoke run saves its screenshot (main() verifies it after). */
     static constexpr const char* SMOKE_SCREENSHOT_PATH = "playground_smoke.png";
@@ -176,6 +181,11 @@ private:
     void sync_dev_panel(); // apply panel edits + refresh the panel snapshot
     void update_smoke_fence(bracken::MainFrame& mf); // settings flips, probe,
                                                      // screenshot, exit + stats
+    /// --rt-bench: sample this frame's pass times, and at the end of the run
+    /// print the table + exit. Replaces update_smoke_fence entirely — the
+    /// scripted flips it runs would change what is being measured mid-run.
+    void update_rt_bench_fence();
+    void print_rt_bench_report();
 
     float rand01();
     glm::vec3 random_ground_pos(float margin);
@@ -393,6 +403,25 @@ private:
     float smoke_cam_pitch_ = 10.0f;
     float smoke_cam_dist_ = 500.0f;
     glm::vec3 smoke_forced_sun_dir_{0.0f}; // the pinned sun_dir (direction light travels)
+
+    // ---- --rt-bench: the traversal A/B jig ------------------------------
+    // The plan of record (docs/rt_lighting_plan.md §5.0) makes this the gate
+    // for every traversal performance claim, so it is deliberately dumb: fixed
+    // timestep, pinned camera, no scripted flips, no screenshot, and the raw
+    // per-frame samples kept so the report can quote a p95 rather than only a
+    // mean (a mean hides exactly the rebuild spikes this measures).
+    bool rt_bench_ = false;
+    static constexpr int RT_BENCH_WARMUP_FRAMES = 30; // pipeline/PSO/history warm-up, discarded
+    /// Per-pass CPU record times, keyed by the pass name. The key is a
+    /// std::string copy, not the PassTiming string_view: the view points at a
+    /// literal in engine code, which is stable, but a map keyed on an owned
+    /// string is the honest thing to hand to a report that outlives the frame.
+    std::map<std::string, std::vector<float>> rt_bench_pass_ms_;
+    std::vector<float> rt_bench_sim_ms_;
+    std::vector<float> rt_bench_render_ms_;
+    std::vector<float> rt_bench_fence_ms_;
+    std::vector<float> rt_bench_present_wait_ms_;
+    int rt_bench_sampled_frames_ = 0;
     int screenshot_counter_ = 0;
 };
 

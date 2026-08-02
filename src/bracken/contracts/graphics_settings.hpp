@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <limits>
 #include <string>
 
 namespace bracken {
@@ -82,6 +83,37 @@ enum class ShadowCascades : int {
     Four = 3,
 };
 
+/**
+ * Resolution the traced ray signals are produced at, relative to the screen.
+ *
+ * The dominant cost dial for both RT features, because it sets how many rays
+ * are cast. The denoisers upsample back to full resolution, so dropping a step
+ * costs sharpness at silhouettes rather than producing a visibly blocky image.
+ */
+enum class RtResolution : int {
+    Full = 0,
+    Half = 1,
+    Quarter = 2,
+};
+
+/**
+ * How far from the camera an instance may sit and still be traced.
+ *
+ * The traversal/TLAS lever: instances whose bounds lie ENTIRELY beyond the
+ * cutoff never enter the TLAS, so they cost neither a rebuild nor a node
+ * visit. Distant sun shadows keep coming from the cascade maps, which already
+ * outrange the traced mask.
+ *
+ * `Unlimited` is the default and means "trace everything the frame drew" —
+ * the behaviour every release before this enum had.
+ */
+enum class RtRange : int {
+    Near = 0,
+    Medium = 1,
+    Far = 2,
+    Unlimited = 3,
+};
+
 /** Per-cascade shadow map edge length in texels. */
 enum class ShadowResolution : int {
     R512 = 0,
@@ -129,6 +161,28 @@ enum class WindowMode : int {
 [[nodiscard]] constexpr float draw_distance_units(DrawDistance d) {
     constexpr float table[] = {500.0f, 1000.0f, 2000.0f, 4000.0f, 8000.0f, 16000.0f, 32000.0f};
     return table[std::clamp(static_cast<int>(d), 0, 6)];
+}
+
+/**
+ * Ray-tracing instance cutoff in WORLD UNITS — the same scale as
+ * draw_distance_units(), not a second one.
+ *
+ * The three finite steps are DrawDistance table entries on purpose, so the two
+ * knobs can be read against each other: the traced range is always a subset of
+ * what is drawn, and `Far` is exactly the D4000 default draw distance, i.e.
+ * "trace everything a default frame draws". `Medium` (2000) brackets the
+ * playground village's flat plateau (PLATEAU_RADIUS = 2400 units) — the whole
+ * settlement, none of the outlying hills — and `Near` (1000) keeps roughly the
+ * buildings fronting the plaza. At the playground's 100 units/metre
+ * (`VILLAGE_SCALE`) that reads as 10 m / 20 m / 40 m across a ~200 m map.
+ *
+ * `Unlimited` returns infinity rather than a large number, so the use site
+ * tests `std::isfinite` and skips the filter entirely instead of comparing
+ * every instance against a sentinel.
+ */
+[[nodiscard]] constexpr float rt_range_units(RtRange r) {
+    constexpr float table[] = {1000.0f, 2000.0f, 4000.0f, std::numeric_limits<float>::infinity()};
+    return table[std::clamp(static_cast<int>(r), 0, 3)];
 }
 
 /** Anisotropy as a sample-count multiplier (1, 2, 4, 8, 16). */
@@ -192,6 +246,40 @@ struct GraphicsSettings {
     // built without them logs an error rather than rendering black.
     bool rt_shadows = false;     ///< traced sun shadows instead of / alongside CSM
     bool rt_reflections = false; ///< traced specular for smooth surfaces
+    /// Rays cast per frame, relative to the screen. The main perf dial for
+    /// each feature; the denoiser upsamples whatever it is given.
+    /// Both default to FULL. The half/quarter defaults were inherited from
+    /// when these signals were a raw binary mask and a raw mirror ray, where
+    /// tracing sparsely was the only thing that made them affordable. Now that
+    /// both are denoised, the reduced settings mainly cost silhouette
+    /// sharpness — and on the hardware this was developed against, Full is
+    /// visibly better for no framerate the eye can find. Weaker GPUs have the
+    /// dial; it is no longer the default position.
+    RtResolution rt_shadow_resolution = RtResolution::Full;
+    RtResolution rt_reflection_resolution = RtResolution::Full;
+    /// Angular RADIUS of the sun disk in degrees — the shadow softness knob.
+    /// The real sun is ~0.265; larger is softer. 0 collapses the cone to a
+    /// point and reproduces a hard shadow exactly, which is the honest way to
+    /// A/B the soft-shadow path. Costs nothing to trace: the ray count is the
+    /// same either way, only the denoiser works harder.
+    float rt_sun_softness_deg = 0.35f;
+    /// Roughness at which traced specular hands over completely to the IBL
+    /// probe. Raising it makes more of the frame reflect; because the pass is
+    /// bound by wave divergence rather than by traced-pixel count, that is
+    /// nearly free once anything is tracing at all (measured 0.45 -> 0.75 for
+    /// ~2 fps on the playground village).
+    float rt_reflection_max_roughness = 0.75f;
+    /// How far an instance may be from the camera and still be traced. This is
+    /// the only RT dial that cuts the ACCELERATION STRUCTURE rather than the
+    /// ray count: instances entirely beyond it are dropped before the TLAS is
+    /// hashed, so they cost neither traversal nor a rebuild.
+    ///
+    /// Default `Unlimited` — behaviour is exactly what it was before the knob
+    /// existed until someone dials it. The price of a finite setting is stated
+    /// where it is consumed (SceneRenderer::refresh_raytracing_instances):
+    /// crossing the threshold changes the instance list, so a moving camera can
+    /// re-trigger TLAS rebuilds that a static scene otherwise never pays.
+    RtRange rt_max_instance_range = RtRange::Unlimited;
     bool volumetric_fog = false;              // Atmospheric fog haze (expensive, off by default)
     bool god_rays = false;                    // Light shafts through shadows (requires volumetric_fog)
     WindowMode window_mode = WindowMode::Windowed;

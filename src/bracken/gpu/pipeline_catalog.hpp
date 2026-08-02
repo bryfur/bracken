@@ -163,8 +163,12 @@ enum class ComputePipelineType {
     ExposureHistogram, ///< 256-bin log2-luminance histogram of the HDR scene (16x16 tiles, LDS-merged)
     ExposureAdapt,     ///< Histogram reduce -> target EV -> temporal adaptation (single workgroup)
     WaterSim,          ///< Wave-equation water simulation substep (ping-pong RG16F state)
-    RtShadow,          ///< Ray-traced sun shadows over the software BVH (any-hit, half-res mask)
-    RtReflection,      ///< Ray-traced specular reflections over the same BVH (closest-hit)
+    RtShadow,          ///< Ray-traced sun shadows over the software BVH (any-hit, 1 jittered ray/px, packed bits)
+    RtShadowClassify,  ///< Shadow denoiser 1/3: 8x4 tile classification (uniform vs mixed)
+    RtShadowTemporal,  ///< Shadow denoiser 2/3: velocity reprojection + moment accumulation
+    RtShadowFilter,    ///< Shadow denoiser 3/3: variance-guided filter fused with the upsample to full res
+    RtReflection,      ///< Ray-traced specular reflections over the same BVH (closest-hit, GGX-sampled)
+    RtReflectionTemporal, ///< Reflection denoiser: velocity reprojection + neighbourhood-clamped accumulation
 
     // Count for iteration
     Count

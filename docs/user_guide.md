@@ -100,9 +100,9 @@ cmake -S . -B build -G Ninja \
 
 Note: `BRACKEN_PLAYGROUND_SMOKE_TEST` is a root-level option, and the root `CMakeLists.txt` calls `enable_testing()` when *either* `BRACKEN_BUILD_TESTS` or `BRACKEN_PLAYGROUND_SMOKE_TEST` is `ON` — so the smoke ctest works even in a tests-off configure (turning it on without `BRACKEN_BUILD_EXAMPLES` gets a configure-time warning instead of a silently missing test).
 
-#### CMake presets: one build tree
+#### One build tree
 
-A `CMakePresets.json` (version 6) at the repo root defines exactly one configure preset, `default`, pointing at `build/`. That is the whole story: Ninja, project-default options, **no `CMAKE_BUILD_TYPE`** → `-O0` with `NDEBUG` undefined, so every `BRACKEN_ASSERT` and thread-tier check is live. The preset exists to reproduce the standard configuration; it is *not* an invitation to delete an existing `build/` and start over.
+There is exactly one configuration, `cmake -S . -B build -G Ninja`, pointing at `build/`. That is the whole story: Ninja, project-default options, **no `CMAKE_BUILD_TYPE`** → `-O0` with `NDEBUG` undefined, so every `BRACKEN_ASSERT` and thread-tier check is live. Re-running that line reproduces the standard configuration in place; it is *not* an invitation to delete an existing `build/` and start over.
 
 There used to be five coexisting trees (`build-rel/`, `build-bench/`, `build-tsan/`, `build-asan/`). They are gone. Five trees meant five configurations that could disagree with each other and with the docs describing them, four of which were stale at any given moment, and ~25 GB of duplicated dependency builds. Everything they did is a `-D` flag on the same tree:
 
@@ -299,13 +299,14 @@ Render-side data (`SceneRenderer` stats, `graphics_settings()` via the built-in 
 ./build/examples/playground/playground            # play it
 ./build/examples/playground/playground --smoke    # integration test: 240 frames, stats, exit
 ./build/examples/playground/playground --smoke 600  # custom frame count
+./build/examples/playground/playground --rt-bench 240  # measurement jig, prints a timing table
 ```
 
 Interactive controls (from the in-game help text): WASD move, Shift run, mouse-drag orbit, wheel zoom, LMB attack, F flashlight, F3 debug draw, F12 screenshot, Esc quit, F10 dev overlay, and graphics toggles F1 (AO cycles Off/GTAO Half/GTAO Full), F2 (bloom), F4 (volumetric fog + god rays), F5 (shadows cycles Off/PCF/PCSS), F6 (AA cycles Off/FXAA/TAA), F7 (image-based lighting on/off), F8 (local point/spot light shadows on/off).
 
 File-by-file map:
 
-- `examples/playground/main.cpp` — argument parsing (`--smoke [frames]`, default 240; unknown args and invalid/non-positive frame counts exit 2), the exact `init_engine → start → run → stop → shutdown_engine` sequence shown above, and post-run screenshot verification.
+- `examples/playground/main.cpp` — argument parsing (`--smoke [frames]`, default 240; `--rt-bench <frames>`, count required; unknown args and invalid/non-positive frame counts exit 2), the exact `init_engine → start → run → stop → shutdown_engine` sequence shown above, and post-run screenshot verification.
 - `examples/playground/playground.hpp` / `.cpp` — the `PlaygroundGame : public bracken::Application` subclass; everything below.
 - `examples/playground/character.hpp` / `.cpp` — code-built assets: a skinned blocky biped (11 joints named to match the engine's default foot-IK bone names, four clips authored by sampling closures), an emissive orb, a shard mesh, and a smoke-puff mesh for particles.
 
@@ -330,6 +331,19 @@ After the run, `main.cpp::verify_smoke_screenshot` loads the PNG and rejects a m
 
 Run it after any change that could affect rendering. You can also open `playground_smoke.png` (written to the working directory) to visually inspect exactly what the renderer produced.
 
+#### `--rt-bench N`: the measurement jig
+
+`--rt-bench <frames>` reuses the same self-driven run — fixed timestep, deterministic environment, settings persistence off — and turns it into a benchmark. The differences from `--smoke` are all in service of measuring one thing at a time: the camera is **pinned** at a raised vantage over the plaza (the orbit would measure a different scene every frame), **none** of the scripted mid-run settings flips run (each would change what is being timed halfway through), and no screenshot is taken (the capture blocks the frame on a GPU fence). The frame count is required.
+
+It prints one `[rtbench] ...` record per line, fixed field order, so two builds diff as two files: a `run` header, one `pass` row per entry in `RenderStats::pass_times_ms` with the mean and p95 CPU record time (the first 30 frames are discarded as warm-up — pipeline creation, denoiser history, the initial BVH build), four `frame` rows for sim/render/fence/present_wait, and the `rt` line with ray counts, live instance count, TLAS rebuild count and the acceleration-structure byte split. Exit code 0.
+
+```bash
+PLAYGROUND_RT=both ./playground --rt-bench 240        # trace both signals
+PLAYGROUND_RT=both PLAYGROUND_RT_RANGE=1 ./playground --rt-bench 240   # ...with a Medium instance range
+```
+
+`PLAYGROUND_RT=shadows|reflections|both` selects which traced effects run and `PLAYGROUND_RT_RANGE=0..3` pins `rt_max_instance_range` (Near/Medium/Far/Unlimited); both also work with `--smoke`. Two standing caveats: the reported times are **CPU record times** (SDL3 has no GPU timestamp API — `present_wait` is the CPU-bound-vs-GPU-bound signal), and a number from a default `build/` is not a performance number, because no `CMAKE_BUILD_TYPE` means `-O0` with live assertions. Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
+
 ### Gotchas checklist
 
 - **Never clean-rebuild** — the SDL_shadercross/DXC build is the expensive part and lives in `build/`.
@@ -340,7 +354,7 @@ Run it after any change that could affect rendering. You can also open `playgrou
 - You **cannot** call `fb.seal()` or `fb.set_frame_timing(...)` from `on_simulate`: `sim.frame()` returns a `scene::FrameSink`, which carries the host surface and nothing else. The engine stamps timing at kick and seals after its own sim-stage tail. (This used to be a rule in prose backed by a debug assert; a release build that sealed early republished a packet the renderer was already consuming, silently.)
 - Never read live game state from a DevUI panel body — panels draw while the next `on_simulate` runs; snapshot in `on_main_frame` instead.
 - The smoke screenshot and interactive F12 screenshots stall the GPU for that frame — debug/test only.
-- `--smoke` frame counts must be positive integers; an invalid or non-positive value after `--smoke` is rejected with an error and exit code 2.
+- `--smoke` frame counts must be positive integers; an invalid or non-positive value after `--smoke` is rejected with an error and exit code 2. `--rt-bench` takes the same frame count but **requires** it — there is no defensible default sample size for a benchmark.
 - Don't feed Draco-compressed `.glb` to the engine — the vendored tinygltf has no Draco support.
 
 ---
@@ -4395,6 +4409,71 @@ Contracts you must respect:
   `CompositeParams::exposure_buffer` null and the composite binds a zeroed
   dummy with the flag off.
 
+### Ray-traced shadows and reflections
+
+Two optional traced signals, both **off by default and independently
+switchable**. There is no hardware ray tracing in SDL3 GPU on any backend, so
+these traverse a software BVH the engine builds and walks in compute shaders.
+That is a large cost for a taste-dependent gain, which is why nothing —
+not a byte of the acceleration structure — is built until you turn one on.
+
+#### Enabling them
+
+```cpp
+bool MyGame::on_init() {
+    // BEFORE any load_model call. The BVH is built from the model's CPU-side
+    // triangles, which are freed at GPU upload by default; without this the
+    // builder finds nothing and warns rather than producing an empty structure.
+    model_manager().set_retain_cpu_geometry(true);
+    // ... load models ...
+
+    auto gs = edit_graphics_settings();
+    gs->rt_shadows = true;
+    gs->rt_reflections = true;
+    return true;
+}
+```
+
+That is the whole integration. The engine owns the rest: the acceleration
+structure is built lazily the first frame something needs it (so a runtime
+toggle from your options menu works with no host cooperation), and the instance
+list is rebuilt from the sealed frame packet every traced frame, so what the
+rays see cannot desync from what you drew.
+
+**Traced sun shadows REPLACE the cascade term** where the mask applies — they
+do not blend with it. The practical consequence: anything that is not in the
+traced instance list gets no sun shadow there rather than falling back to CSM.
+
+#### What each setting costs
+
+| Setting | Default | What it buys / costs |
+|---|---|---|
+| `rt_shadows` | `false` | Soft sun shadows with real distance-growing penumbrae. One any-hit ray per pixel; the cheaper of the two, because an occlusion ray can stop at the first hit. |
+| `rt_reflections` | `false` | Traced specular on smooth surfaces. Costs **more** than shadows: closest-hit cannot stop early, and it additionally needs per-triangle shading attributes, which more than doubles the structure's triangle memory. Enabling it after the structure was built for shadows alone forces a rebuild — a visible hitch, logged. |
+| `rt_shadow_resolution`, `rt_reflection_resolution` | `Full`, `Full` | The dominant ray-count dial (`RtResolution::Full`/`Half`/`Quarter` of screen resolution). The denoisers upsample back to full res either way, so a lower setting costs silhouette sharpness rather than producing a blocky image. This is the knob to give weaker GPUs. |
+| `rt_sun_softness_deg` | `0.35` | Angular *radius* of the sun disk in degrees (the real sun is ~0.265). **Free to trace** — the ray count is identical, only the denoiser works harder. `0` collapses the cone to a hard shadow, which is the honest way to A/B the soft path. |
+| `rt_reflection_max_roughness` | `0.75` | Roughness at which traced specular hands over entirely to the prefiltered IBL probe. Higher = more of the frame reflects. Nearly free, because the pass is bound by wave divergence rather than by traced-pixel count. `0` stops tracing without tearing the structure down. |
+| `rt_max_instance_range` | `Unlimited` | How far an instance may be and still be traced (`RtRange::Near`/`Medium`/`Far`/`Unlimited` → 1000 / 2000 / 4000 world units / ∞, the same scale as `draw_distance`). The only RT dial that cuts the **acceleration structure** rather than the ray count. Its price: with a finite range the instance list depends on camera position, so a camera crossing the threshold re-triggers TLAS rebuilds a static scene otherwise never pays. Distant sun shadows keep coming from the cascades. |
+
+#### Things to know before you ship it
+
+- **Skinned meshes trace their bind pose.** An animated character's traced
+  shadow tracks it around the world but does not animate with it. Since the
+  traced mask replaces CSM, that *is* the shadow, not a fallback.
+- **A ray hit cannot sample textures** — no bindless, no UVs at the hit. Hit
+  shading is an interpolated normal plus one flat colour per triangle, and the
+  sun term at a reflection hit is unshadowed. Reflections therefore show no
+  cast shadows and no bounced light.
+- **Both signals are one sample per pixel and stochastic**, so the denoisers
+  are load-bearing. Expect temporal lag behind fast-moving occluders; that is
+  the accumulation window doing its job, not a bug.
+- **Budget with the numbers, not with vibes.** `Application::render_stats()`
+  reports `RTInstances`, `RTShadows`, `RTReflectionTrace` and
+  `RTReflectionResolve` in `pass_times_ms` (CPU record time — there is no GPU
+  timestamp API), and `SceneRenderer::raytracing_stats()` returns an `RtStats`
+  with the dispatched ray counts, the live instance count, the TLAS rebuild
+  count and the BLAS/attribute/TLAS byte split.
+
 ### Quick reference: which knob lives where
 
 | What | Where | Default |
@@ -4408,6 +4487,8 @@ Contracts you must respect:
 | Local (point/spot) shadows | `PointLight`/`SpotLight::casts_shadows` + `GraphicsSettings::local_shadows` / `local_shadow_point_budget` / `_spot_budget` / `local_shadow_resolution` | opt-in / on / 4 / 2 / 2048 atlas |
 | Ambient source (sky IBL vs hemisphere) | `GraphicsSettings::ibl_enabled` | `true` (IBL) |
 | AO mode / strength / radius | `GraphicsSettings::ao_mode` / `ao_strength` / `ao_radius` | `GTAO_Half` / 1.0 / 1.0 |
+| Ray-traced shadows / reflections | `GraphicsSettings::rt_shadows` / `rt_reflections` (+ `ModelManager::set_retain_cpu_geometry` before loading) | both `false` |
+| Traced ray count / softness / roughness gate / instance range | `GraphicsSettings::rt_shadow_resolution` / `rt_reflection_resolution` / `rt_sun_softness_deg` / `rt_reflection_max_roughness` / `rt_max_instance_range` | Full / Full / 0.35 / 0.75 / `Unlimited` |
 
 ---
 
@@ -7515,14 +7596,38 @@ Compute-shader ray tracing for **shadows** and **reflections**. They are
 independent toggles and **both default off**:
 
 ```cpp
-gs.rt_shadows = true;      // traced sun shadows
-gs.rt_reflections = true;  // traced specular on smooth surfaces
+gs.rt_shadows = true;      // soft, sun-disk-sampled shadows
+gs.rt_reflections = true;  // GGX-sampled specular
 ```
 
 There is no hardware ray tracing in SDL3 GPU, so these traverse a BVH the
 engine builds itself. That is a real cost for a taste-dependent gain, which is
 why nothing — not even the acceleration structure — is built unless one of them
 is on. Take either, both, or neither.
+
+**Both signals are stochastic, and denoised.** Each casts exactly one ray per
+pixel per frame — the shadow ray jittered across the sun's disk, the reflection
+ray importance-sampled from the GGX lobe — and the result is temporally
+accumulated and spatially filtered before anything sees it. That is what buys
+real penumbrae (contact-sharp under a foot, wide under a distant roofline) and
+correct rough reflections at the same ray budget a single hard/mirror ray used
+to cost. The practical consequences for a host:
+
+- **Motion vectors matter.** The denoisers reproject their history through the
+  prepass velocity buffer. Without a depth prepass they still run, but cannot
+  accumulate across frames, and the result is markedly noisier.
+- **A few frames of convergence.** After a camera cut or a teleport the
+  estimate is rebuilt from scratch. This is invisible at normal camera speeds
+  and obvious if you screenshot frame 1.
+- **`sun_angular_radius_degrees`** (`RtShadowSettings`, default 0.35; the real
+  sun is ~0.265) is the softness knob. Widening it costs nothing to trace and
+  only makes the denoiser work harder. Setting it to 0 collapses the cone and
+  reproduces the old hard shadow exactly, which is the honest way to A/B it.
+- **The roughness gate opens further than it used to.** `fade_start` / 
+  `max_roughness` default to 0.35 / 0.75, up from 0.25 / 0.55. The old ceiling
+  existed because a single mirror ray is only the right answer for a mirror;
+  importance sampling the lobe is what makes semi-glossy surfaces correct
+  rather than merely brighter.
 
 ### What makes it affordable
 

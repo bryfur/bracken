@@ -61,6 +61,43 @@ file(GLOB_RECURSE SHADER_INCLUDES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/*.hlsli"
 )
 
+# ---------------------------------------------------------------------------
+# Shaders that need SM6 wave (subgroup) intrinsics.
+#
+# The shadercross CLI never passes -fspv-target-env, so DXC defaults to
+# vulkan1.0, under which every Wave* intrinsic is a hard compile error
+# ("Vulkan 1.1 is required for Wave Operation but not permitted to use").
+# There is no CLI flag or SDL_ShaderCross property to raise it.
+#
+# So these shaders go through the DXC CLI directly — the same DXC, already
+# built as part of the vendored SDL_shadercross tree, just its `dxc` target
+# rather than the library — with -fspv-target-env=vulkan1.1 and otherwise
+# byte-identical flags to what shadercross passes, so the binding model the
+# runtime reflection sees is unchanged.
+#
+# THIS IS AN EXPLICIT LIST, NOT A CONVENTION, because adding a file to it
+# raises the Vulkan floor for the pipelines that use it from 1.0 to 1.1. That
+# is a hardware-support decision and it should be visible in a diff, not the
+# silent consequence of typing WaveActiveBallot in a new shader.
+#
+# The Metal path needs nothing here: SPIRV-Cross maps these to simd_* and the
+# runtime already asks for MSL 2.2.0 (gpu_compute.cpp / gpu_shader.cpp), above
+# the 2.1 floor Metal requires for subgroup ops beyond broadcast/shuffle.
+# Keep this list to shaders that ACTUALLY use a Wave* intrinsic. It is the
+# record of which pipelines require Vulkan 1.1, so a speculative entry is a
+# false claim about the engine's hardware requirements.
+set(SHADER_WAVE_OPS
+    rt_shadow_denoise_filter.comp.hlsl
+)
+
+if(SHADER_WAVE_OPS AND NOT TARGET dxc)
+    message(FATAL_ERROR
+        "SHADER_WAVE_OPS is non-empty but the vendored DXC CLI target `dxc` does not "
+        "exist. It comes from SDL_shadercross's DirectXShaderCompiler subtree and "
+        "requires SDLSHADERCROSS_DXC=ON. Without it, wave-intrinsic shaders cannot be "
+        "compiled: the shadercross CLI targets vulkan1.0, where Wave* is rejected.")
+endif()
+
 set(COMPILED_SHADERS "")
 
 foreach(SHADER_SOURCE IN LISTS SHADER_SOURCES)
@@ -89,20 +126,51 @@ foreach(SHADER_SOURCE IN LISTS SHADER_SOURCES)
 
     set(OUTPUT_PATH "${SHADER_OUTPUT_DIR}/${OUTPUT_NAME}")
 
-    add_custom_command(
-        OUTPUT "${OUTPUT_PATH}"
-        COMMAND ${SHADERCROSS_COMMAND}
-            "${SHADER_SOURCE}"
-            -s HLSL
-            -d SPIRV
-            -t ${SHADER_STAGE}
-            -e ${ENTRY_POINT}
-            -I "${CMAKE_CURRENT_SOURCE_DIR}"
-            -o "${OUTPUT_PATH}"
-        DEPENDS "${SHADER_SOURCE}" ${SHADER_INCLUDES} shadercross
-        COMMENT "Compiling ${SHADER_NAME}"
-        VERBATIM
-    )
+    if(SHADER_NAME IN_LIST SHADER_WAVE_OPS)
+        # DXC directly, at vulkan1.1. The -fspv-* flags below are exactly the
+        # ones SDL_shadercross passes (SDL_shadercross.c), so these blobs are
+        # indistinguishable from the rest to the runtime reflection; only the
+        # target environment differs.
+        if(SHADER_STAGE STREQUAL "vertex")
+            set(DXC_PROFILE "vs_6_0")
+        elseif(SHADER_STAGE STREQUAL "fragment")
+            set(DXC_PROFILE "ps_6_0")
+        else()
+            set(DXC_PROFILE "cs_6_0")
+        endif()
+        add_custom_command(
+            OUTPUT "${OUTPUT_PATH}"
+            COMMAND "$<TARGET_FILE:dxc>"
+                -T ${DXC_PROFILE}
+                -E ${ENTRY_POINT}
+                -spirv
+                -fspv-target-env=vulkan1.1
+                -fspv-flatten-resource-arrays
+                -fspv-preserve-bindings
+                -fspv-preserve-interface
+                -I "${CMAKE_CURRENT_SOURCE_DIR}"
+                "${SHADER_SOURCE}"
+                -Fo "${OUTPUT_PATH}"
+            DEPENDS "${SHADER_SOURCE}" ${SHADER_INCLUDES} dxc
+            COMMENT "Compiling ${SHADER_NAME} (wave ops, vulkan1.1)"
+            VERBATIM
+        )
+    else()
+        add_custom_command(
+            OUTPUT "${OUTPUT_PATH}"
+            COMMAND ${SHADERCROSS_COMMAND}
+                "${SHADER_SOURCE}"
+                -s HLSL
+                -d SPIRV
+                -t ${SHADER_STAGE}
+                -e ${ENTRY_POINT}
+                -I "${CMAKE_CURRENT_SOURCE_DIR}"
+                -o "${OUTPUT_PATH}"
+            DEPENDS "${SHADER_SOURCE}" ${SHADER_INCLUDES} shadercross
+            COMMENT "Compiling ${SHADER_NAME}"
+            VERBATIM
+        )
+    endif()
 
     list(APPEND COMPILED_SHADERS "${OUTPUT_PATH}")
 endforeach()

@@ -759,22 +759,50 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
     {.name = "RtShadow",
      .shader = "rt_shadow.comp.spv",
      .entry_point = "CSMain",
-     // Depth only, then the four acceleration-structure buffers. No attribute
-     // buffer: a shadow ray asks a yes/no question and never shades what it
-     // hits, which is why it costs 48 bytes per triangle and reflections cost
-     // 112. (It also took the AO texture, to copy through into the mask's
-     // second channel — see rt_shadow.comp.hlsl for why that is gone.)
-     .resources = {.num_samplers = 1,
+     // Depth + the prepass normal G-buffer, then the four acceleration-
+     // structure buffers. No attribute buffer: a shadow ray asks a yes/no
+     // question and never shades what it hits, which is why it costs 48 bytes
+     // per triangle and reflections cost 112. The output is one BIT per pixel
+     // packed into 8x4 tiles, not an R8 mask — the denoiser's classifier reads
+     // 32 pixels per fetch off the back of that.
+     .resources = {.num_samplers = 2,
                    .num_readonly_storage_buffers = 4,
                    .num_readwrite_storage_textures = 1,
+                   .num_uniform_buffers = 1}},
+    {.name = "RtShadowClassify",
+     .shader = "rt_shadow_denoise_classify.comp.spv",
+     .entry_point = "CSMain",
+     .resources = {.num_readonly_storage_textures = 1,  // packed visibility bits
+                   .num_readwrite_storage_textures = 1, // per-tile verdict
+                   .num_uniform_buffers = 1}},
+    {.name = "RtShadowTemporal",
+     .shader = "rt_shadow_denoise_temporal.comp.spv",
+     .entry_point = "CSMain",
+     .resources = {.num_samplers = 3,                   // depth, velocity, history
+                   .num_readonly_storage_textures = 2,  // packed bits, tile verdicts
+                   .num_readwrite_storage_textures = 1, // accumulated history out
+                   .num_uniform_buffers = 1}},
+    {.name = "RtShadowFilter",
+     .shader = "rt_shadow_denoise_filter.comp.spv",
+     .entry_point = "CSMain",
+     .resources = {.num_samplers = 2,                   // history, depth
+                   .num_readonly_storage_textures = 1,  // tile verdicts
+                   .num_readwrite_storage_textures = 1, // full-res R8 mask
                    .num_uniform_buffers = 1}},
     {.name = "RtReflection",
      .shader = "rt_reflection.comp.spv",
      .entry_point = "CSMain",
-     // Same, plus per-triangle attributes to shade the hit.
+     // Same, plus per-triangle attributes to shade the hit. Two RW targets:
+     // raw radiance, and the normalized hit distance R3's reprojection wants.
      .resources = {.num_samplers = 2,
                    .num_readonly_storage_buffers = 5,
-                   .num_readwrite_storage_textures = 1,
+                   .num_readwrite_storage_textures = 2,
+                   .num_uniform_buffers = 1}},
+    {.name = "RtReflectionTemporal",
+     .shader = "rt_reflection_denoise_temporal.comp.spv",
+     .entry_point = "CSMain",
+     .resources = {.num_samplers = 3,                   // raw trace, velocity, history
+                   .num_readwrite_storage_textures = 1, // accumulated history out
                    .num_uniform_buffers = 1}},
 }};
 

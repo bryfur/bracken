@@ -1551,12 +1551,35 @@ void PlaygroundGame::setup_smoke_run() {
         gs->aa_mode = static_cast<AAMode>(aa_env[0] - '0');
         smoke_aa_forced_ = true;
     }
+    // PLAYGROUND_RT_RANGE=0/1/2/3 pins rt_max_instance_range
+    // (Near/Medium/Far/Unlimited) for the whole run. Unset leaves the engine
+    // default (Unlimited), so a plain run traces everything it draws exactly as
+    // it did before the knob existed. This is the A/B hook the --rt-bench
+    // harness needs to measure what the knob actually buys.
+    const char* rt_range_env = SDL_getenv("PLAYGROUND_RT_RANGE");
+    if (rt_range_env && rt_range_env[0] >= '0' && rt_range_env[0] <= '3') {
+        gs->rt_max_instance_range = static_cast<RtRange>(rt_range_env[0] - '0');
+    }
     // PLAYGROUND_AO=0/1/2 pins the AO mode (Off/Half/Full) for the whole
     // run (A/B hook; the frame-140 GTAO_Full flip is skipped while pinned).
     const char* ao_env = SDL_getenv("PLAYGROUND_AO");
     if (ao_env && ao_env[0] >= '0' && ao_env[0] <= '2') {
         gs->ao_mode = static_cast<AOMode>(ao_env[0] - '0');
         smoke_ao_forced_ = true;
+    }
+    // --rt-bench: pin the camera before anything else can move it. A benchmark
+    // whose camera orbits measures a different scene on every frame, and the
+    // orbit is what the default smoke run does. This vantage is a raised view
+    // across the plaza from the village centre — enough of the settlement in
+    // frame that traversal has real work to do, and identical on every run
+    // because the forced-camera path pre-settles the rig's springs.
+    // PLAYGROUND_CAMERA below still wins, so an A/B can pick its own vantage.
+    if (rt_bench_) {
+        smoke_cam_forced_ = true;
+        smoke_cam_target_ = village_pos(0.0f, 0.0f, 2.0f);
+        smoke_cam_yaw_ = 310.0f;
+        smoke_cam_pitch_ = 20.0f;
+        smoke_cam_dist_ = 1400.0f; // world units (14 m at VILLAGE_SCALE)
     }
     // PLAYGROUND_CAMERA="vx,vz,yaw,pitch,dist_m" pins the camera at a
     // village-space position for the whole run (art close-up hook).
@@ -1862,10 +1885,11 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
             const auto& g = graphics_settings();
             std::cout << std::format(
                 "[smoke] settings persist={} shadow_mode={} ao_mode={} aa_mode={} draw_distance={} "
-                "rt_shadows={} rt_reflections={} sun={:.2f} local_shadows={}\n",
+                "rt_shadows={} rt_reflections={} rt_range={} sun={:.2f} local_shadows={}\n",
                 settings_persistence() ? 1 : 0, static_cast<int>(g.shadow_mode), static_cast<int>(g.ao_mode),
                 static_cast<int>(g.aa_mode), static_cast<int>(g.draw_distance), g.rt_shadows ? 1 : 0,
-                g.rt_reflections ? 1 : 0, g.sun_intensity, g.local_shadows ? 1 : 0);
+                g.rt_reflections ? 1 : 0, static_cast<int>(g.rt_max_instance_range), g.sun_intensity,
+                g.local_shadows ? 1 : 0);
         }
         {   // Ray-tracing evidence: whether the passes actually ran, not just
             // whether the frame survived them.
@@ -1875,6 +1899,16 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
                 "reflection_rays={} accel={:.1f}MB\n",
                 rt.shadows_traced, rt.reflections_traced, rt.shadow_rays, rt.reflection_rays,
                 static_cast<double>(rt.acceleration_bytes) / (1024.0 * 1024.0));
+            // The structure, itemized. `instances` is post-range-filter, so it
+            // is what the rays actually see; `tlas_builds` should read 1 on a
+            // static scene and is the number a finite rt_max_instance_range
+            // trades traversal against.
+            std::cout << std::format(
+                "[smoke] rt accel instances={} tlas_builds={} blas={:.1f}MB attrs={:.1f}MB "
+                "tlas={:.3f}MB\n",
+                rt.instances, rt.tlas_builds, static_cast<double>(rt.blas_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(rt.attribute_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(rt.tlas_bytes) / (1024.0 * 1024.0));
         }
         // Tier-3 evidence: that the controller left the ground, that the nav
         // grid built, and that the villager actually pathed somewhere.
@@ -2590,9 +2624,121 @@ void PlaygroundGame::on_main_frame(bracken::MainFrame& mf) {
         pending_ripples_.clear();
     }
 
-    if (smoke_frames_ > 0) {
+    if (rt_bench_) {
+        // Deliberately INSTEAD of update_smoke_fence: its scripted flips
+        // (volumetric fog on at 80, AA at 110/160, AO at 140, the sun swings)
+        // would each change what the passes below are timing, halfway through
+        // the measurement.
+        update_rt_bench_fence();
+    } else if (smoke_frames_ > 0) {
         update_smoke_fence(mf);
     }
+}
+
+// --rt-bench, fence side. One sample per frame; the report is printed once.
+void PlaygroundGame::update_rt_bench_fence() {
+    if (smoke_start_ns_ == 0) {
+        smoke_start_ns_ = SDL_GetTicksNS();
+    }
+    // Discard the warm-up: the first frames pay pipeline creation, denoiser
+    // history invalidation and the initial TLAS build, none of which recur.
+    if (frame_ > RT_BENCH_WARMUP_FRAMES) {
+        if (const std::optional<bracken::RenderStats> stats = render_stats()) {
+            for (const auto& pass : stats->pass_times_ms) {
+                if (pass.cpu_ms) {
+                    rt_bench_pass_ms_[std::string(pass.name)].push_back(*pass.cpu_ms);
+                }
+            }
+        }
+        rt_bench_sim_ms_.push_back(sim_ms());
+        rt_bench_render_ms_.push_back(render_ms());
+        rt_bench_fence_ms_.push_back(fence_ms());
+        rt_bench_present_wait_ms_.push_back(present_wait_ms());
+        ++rt_bench_sampled_frames_;
+    }
+
+    if (frame_ >= smoke_frames_) {
+        print_rt_bench_report();
+        quit();
+    }
+}
+
+namespace {
+
+/** Mean and p95 of a sample set. p95 is nearest-rank on the sorted copy —
+ *  no interpolation, so the number printed is one the run actually produced. */
+struct BenchSummary {
+    float mean = 0.0f;
+    float p95 = 0.0f;
+};
+
+BenchSummary summarize(std::vector<float> samples) {
+    BenchSummary out;
+    if (samples.empty()) {
+        return out;
+    }
+    double sum = 0.0;
+    for (float v : samples) {
+        sum += v;
+    }
+    out.mean = static_cast<float>(sum / static_cast<double>(samples.size()));
+    std::sort(samples.begin(), samples.end());
+    const std::size_t rank =
+        std::min(samples.size() - 1, static_cast<std::size_t>(std::ceil(0.95 * static_cast<double>(samples.size()))) - 1);
+    out.p95 = samples[rank];
+    return out;
+}
+
+} // namespace
+
+// Machine-readable on purpose: one `[rtbench] <kind> <name> ...` record per
+// line, fixed field order, so a diff between two builds is a diff between two
+// files. This is the gate docs/rt_lighting_plan.md §5.0 asks for before any
+// traversal change may claim a win.
+void PlaygroundGame::print_rt_bench_report() {
+    const double elapsed_s =
+        static_cast<double>(SDL_GetTicksNS() - smoke_start_ns_) / static_cast<double>(SDL_NS_PER_SECOND);
+    const auto& g = graphics_settings();
+    std::cout << std::format("[rtbench] run frames={} sampled={} warmup={} fps={:.1f} "
+                             "rt_shadows={} rt_reflections={} rt_shadow_res={} rt_reflection_res={} "
+                             "rt_range={} driver={}\n",
+                             frame_, rt_bench_sampled_frames_, RT_BENCH_WARMUP_FRAMES,
+                             elapsed_s > 0.0 ? frame_ / elapsed_s : 0.0, g.rt_shadows ? 1 : 0,
+                             g.rt_reflections ? 1 : 0, static_cast<int>(g.rt_shadow_resolution),
+                             static_cast<int>(g.rt_reflection_resolution),
+                             static_cast<int>(g.rt_max_instance_range), gpu_driver_name());
+    // CPU RECORD time, not GPU time — SDL3 has no timestamp API, so a pass can
+    // record in 40 us and cost 4 ms on the device. present_wait below is the
+    // CPU-bound-vs-GPU-bound signal.
+    std::cout << "[rtbench] pass name mean_ms p95_ms samples\n";
+    for (const auto& [name, samples] : rt_bench_pass_ms_) {
+        const BenchSummary s = summarize(samples);
+        std::cout << std::format("[rtbench] pass {} {:.4f} {:.4f} {}\n", name, s.mean, s.p95,
+                                 samples.size());
+    }
+    struct Row {
+        const char* name;
+        const std::vector<float>* samples;
+    };
+    const Row rows[] = {{"sim", &rt_bench_sim_ms_},
+                        {"render", &rt_bench_render_ms_},
+                        {"fence", &rt_bench_fence_ms_},
+                        {"present_wait", &rt_bench_present_wait_ms_}};
+    for (const Row& row : rows) {
+        const BenchSummary s = summarize(*row.samples);
+        std::cout << std::format("[rtbench] frame {} {:.4f} {:.4f} {}\n", row.name, s.mean, s.p95,
+                                 row.samples->size());
+    }
+    const auto& rt = scene_renderer().raytracing_stats();
+    std::cout << std::format("[rtbench] rt shadows_traced={} reflections_traced={} shadow_rays={} "
+                             "reflection_rays={} instances={} tlas_builds={} blas_mb={:.2f} "
+                             "attrs_mb={:.2f} tlas_mb={:.3f} accel_mb={:.2f}\n",
+                             rt.shadows_traced, rt.reflections_traced, rt.shadow_rays,
+                             rt.reflection_rays, rt.instances, rt.tlas_builds,
+                             static_cast<double>(rt.blas_bytes) / (1024.0 * 1024.0),
+                             static_cast<double>(rt.attribute_bytes) / (1024.0 * 1024.0),
+                             static_cast<double>(rt.tlas_bytes) / (1024.0 * 1024.0),
+                             static_cast<double>(rt.acceleration_bytes) / (1024.0 * 1024.0));
 }
 
 void PlaygroundGame::sync_dev_panel() {

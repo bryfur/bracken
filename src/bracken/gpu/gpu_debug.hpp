@@ -72,6 +72,11 @@ private:
 class GPUTimerScope {
 public:
     GPUTimerScope(GPUTimestampPool& pool, SDL_GPUCommandBuffer* cb, const char* pass_name) noexcept;
+    /// Nullable overload, for a subsystem that holds an OPTIONAL pool pointer
+    /// rather than owning one (render::RtRenderer, whose passes belong to the
+    /// scene renderer's timeline but which is constructible without it). A null
+    /// pool times nothing and reserves nothing.
+    GPUTimerScope(GPUTimestampPool* pool, SDL_GPUCommandBuffer* cb, const char* pass_name) noexcept;
     ~GPUTimerScope() noexcept;
     GPUTimerScope(const GPUTimerScope&) = delete;
     GPUTimerScope& operator=(const GPUTimerScope&) = delete;

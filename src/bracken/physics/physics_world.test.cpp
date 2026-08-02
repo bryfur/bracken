@@ -227,6 +227,36 @@ TEST_F(PhysicsWorldTest, KinematicCapsulePushesRestingSphere) {
     EXPECT_GT(world_.position(sphere).x, 0.5f) << "sphere was not pushed";
 }
 
+TEST_F(PhysicsWorldTest, MoveKinematicOutrunningFixedStepDoesNotDiverge) {
+    // Regression: Jolt turns move_kinematic into an UNCLAMPED velocity of
+    // (target - position) / dt, consumed in fixed_dt-sized steps. A host
+    // whose frame rate outruns the fixed step (frame dt of 1 ms against the
+    // 60 Hz step) used to make every step overshoot the target by
+    // fixed_dt/dt, oscillating to inf/NaN within a second of sim time. The
+    // window is now clamped up to the fixed step, so the body reaches the
+    // target and stays there.
+    BodyDesc desc;
+    desc.type = BodyType::Kinematic;
+    desc.position = {0.0f, 5.0f, 0.0f};
+    const BodyId id = world_.add_capsule(desc, 0.5f, 0.5f);
+    ASSERT_NE(id, INVALID_BODY_ID);
+
+    const glm::vec3 target{1.0f, 5.0f, -2.0f};
+    const glm::quat rot{1.0f, 0.0f, 0.0f, 0.0f};
+    constexpr float k_frame_dt = 1.0f / 1000.0f;
+    for (int i = 0; i < 1200; ++i) { // 1.2 s of sim, ~72 fixed steps
+        world_.move_kinematic(id, target, rot, k_frame_dt);
+        world_.update(k_frame_dt);
+    }
+
+    const glm::vec3 pos = world_.position(id);
+    ASSERT_TRUE(std::isfinite(pos.x) && std::isfinite(pos.y) && std::isfinite(pos.z))
+        << "kinematic position diverged: " << pos.x << ", " << pos.y << ", " << pos.z;
+    EXPECT_NEAR(pos.x, target.x, 0.01f);
+    EXPECT_NEAR(pos.y, target.y, 0.01f);
+    EXPECT_NEAR(pos.z, target.z, 0.01f);
+}
+
 TEST_F(PhysicsWorldTest, ImpulseAndVelocityWakeAndMoveBody) {
     ASSERT_NE(add_floor(), INVALID_BODY_ID);
 

@@ -90,6 +90,19 @@ GPUTimerScope::GPUTimerScope(GPUTimestampPool& pool, SDL_GPUCommandBuffer* cb, c
     }
 }
 
+GPUTimerScope::GPUTimerScope(GPUTimestampPool* pool, SDL_GPUCommandBuffer* cb,
+                             const char* pass_name) noexcept
+    : pool_(pool),
+      cb_(cb) {
+    if (pool_ == nullptr) {
+        return; // pair_idx_ stays -1: the destructor is a no-op too
+    }
+    pair_idx_ = pool_->reserve_pair(pass_name);
+    if (pair_idx_ >= 0) {
+        pool_->write_begin(cb_, pair_idx_);
+    }
+}
+
 GPUTimerScope::~GPUTimerScope() noexcept {
     if (pool_ && pair_idx_ >= 0) {
         pool_->write_end(cb_, pair_idx_);

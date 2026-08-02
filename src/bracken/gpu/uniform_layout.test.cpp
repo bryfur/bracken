@@ -153,7 +153,11 @@ private:
             if (word_count == 0 || i + word_count > words_.size()) {
                 break; // malformed; stop rather than read past the end
             }
-            const uint32_t* ops = &words_[i + 1];
+            // data() + arithmetic, not &words_[i + 1]: a trailing 1-word
+            // instruction makes i + 1 == size(), and forming that reference
+            // trips hardened-libstdc++ operator[] even though a 1-word op
+            // never dereferences ops (n == 0).
+            const uint32_t* ops = words_.data() + i + 1;
             const uint32_t n = word_count - 1;
             switch (op) {
                 case OpName:
@@ -460,6 +464,10 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("grass.frag.spv", 3, 0, render::GrassLightingUniforms),
     ROW("water_sim.comp.spv", 2, 0, render::WaterRenderer::SimUniforms),
     ROW("rt_shadow.comp.spv", 2, 0, gpu::RtShadowUniforms),
+    ROW("rt_shadow_denoise_classify.comp.spv", 2, 0, gpu::RtShadowClassifyUniforms),
+    ROW("rt_shadow_denoise_temporal.comp.spv", 2, 0, gpu::RtShadowTemporalUniforms),
+    ROW("rt_shadow_denoise_filter.comp.spv", 2, 0, gpu::RtShadowFilterUniforms),
+    ROW("rt_reflection_denoise_temporal.comp.spv", 2, 0, gpu::RtReflectionTemporalUniforms),
     ROW("rt_reflection.comp.spv", 2, 0, gpu::RtReflectionUniforms),
     ROW("rt_reflection_resolve.frag.spv", 3, 0, gpu::RtReflectionResolveUniforms),
     ROW("water.vert.spv", 1, 0, render::WaterRenderer::VertexUniforms),

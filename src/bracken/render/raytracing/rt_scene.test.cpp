@@ -172,3 +172,43 @@ TEST(RtScene, RebuildIsDeterministic) {
     EXPECT_EQ(first.stats().unique_triangles, second.stats().unique_triangles);
     EXPECT_EQ(first.stats().blas_nodes, second.stats().blas_nodes);
 }
+
+// The TLAS dirty check is a performance contract with teeth: the renderer
+// hands set_instances() the whole model-command list every traced frame, so
+// without it a village that never moves paid a full binned-SAH build on the
+// main thread forever. Both docs claimed this skip existed long before it did.
+TEST(RtScene, UnchangedInstancesDoNotRebuildTheTlas) {
+    Fixture f;
+    auto a = f.models.register_model("a", make_cube());
+    ASSERT_TRUE(a);
+    RtScene scene;
+    scene.build_blas_for_models(f.models, false);
+
+    std::vector<std::pair<bracken::ModelHandle, glm::mat4>> instances{
+        {a.value(), glm::translate(glm::mat4(1.0f), glm::vec3(3.0f, 0.0f, 0.0f))},
+        {a.value(), glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 7.0f))},
+    };
+
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.stats().tlas_builds, 1u);
+
+    // The same content, submitted from a different vector — the check must be
+    // on what the instances ARE, not on the address they arrived at.
+    for (int i = 0; i < 8; ++i) {
+        std::vector<std::pair<bracken::ModelHandle, glm::mat4>> resubmitted = instances;
+        scene.set_instances(resubmitted);
+    }
+    EXPECT_EQ(scene.stats().tlas_builds, 1u) << "a static instance list rebuilt the TLAS";
+
+    // Moving anything at all must rebuild.
+    instances[1].second = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 7.5f));
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.stats().tlas_builds, 2u) << "a moved instance did NOT rebuild the TLAS";
+
+    // Dropping one is a change too: the count participates in the hash so a
+    // truncated list cannot collide with the longer one it is a prefix of.
+    instances.pop_back();
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.stats().tlas_builds, 3u);
+    EXPECT_EQ(scene.stats().instances, 1u);
+}

@@ -1128,12 +1128,17 @@ struct alignas(16) RtShadowUniforms {
     float rayMaxDistance;     // ray length; shorter is cheaper and misses less
     glm::vec3 cameraPosition;
     float normalBias;         // offset along the normal against self-shadowing
-    glm::uvec2 outputSize;    // mask resolution (may be half the screen)
+    glm::uvec2 outputSize;    // traced resolution (may be half the screen)
     uint32_t tlasNodeCount;   // 0 = no acceleration structure this frame
     float depthBias;
+    /// cos of the sun's angular radius; 1.0 is a point light (hard shadow).
+    float sunCosThetaMax;
+    uint32_t frameIndex;      // advances the sample sequence
+    uint32_t hasGBuffer;      // 0 = reconstruct the normal from depth taps
+    float _pad0 = 0.0f;
 };
 
-BRACKEN_HLSL_CBUFFER(RtShadowUniforms, 112);
+BRACKEN_HLSL_CBUFFER(RtShadowUniforms, 128);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, invViewProj, 0);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, sunDirection, 64);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, rayMaxDistance, 76);
@@ -1142,6 +1147,73 @@ BRACKEN_HLSL_FIELD(RtShadowUniforms, normalBias, 92);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, outputSize, 96);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, tlasNodeCount, 104);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, depthBias, 108);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, sunCosThetaMax, 112);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, frameIndex, 116);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, hasGBuffer, 120);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, _pad0, 124);
+
+/**
+ * Shadow-denoiser tile classification — matches
+ * rt_shadow_denoise_classify.comp.hlsl (set 2, b0).
+ */
+struct alignas(16) RtShadowClassifyUniforms {
+    glm::uvec2 tileCount;
+    glm::uvec2 _pad0{0, 0};
+};
+
+BRACKEN_HLSL_CBUFFER(RtShadowClassifyUniforms, 16);
+BRACKEN_HLSL_FIELD(RtShadowClassifyUniforms, tileCount, 0);
+BRACKEN_HLSL_FIELD(RtShadowClassifyUniforms, _pad0, 8);
+
+/**
+ * Shadow-denoiser temporal accumulation — matches
+ * rt_shadow_denoise_temporal.comp.hlsl (set 2, b0).
+ */
+struct alignas(16) RtShadowTemporalUniforms {
+    glm::uvec2 tracedSize;
+    glm::uvec2 tileCount;
+    float depthA = 0.0f;
+    float depthB = 0.0f;
+    float maxAccumFrames = 32.0f;
+    float depthRejectRelative = 0.05f;
+    uint32_t historyValid = 0;
+    glm::uvec3 _pad0{0, 0, 0};
+};
+
+BRACKEN_HLSL_CBUFFER(RtShadowTemporalUniforms, 48);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, tracedSize, 0);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, tileCount, 8);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, depthA, 16);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, depthB, 20);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, maxAccumFrames, 24);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, depthRejectRelative, 28);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, historyValid, 32);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, _pad0, 36);
+
+/**
+ * Shadow-denoiser filter + upsample — matches
+ * rt_shadow_denoise_filter.comp.hlsl (set 2, b0).
+ */
+struct alignas(16) RtShadowFilterUniforms {
+    glm::uvec2 outputSize;
+    glm::uvec2 tracedSize;
+    glm::uvec2 tileCount;
+    float depthA = 0.0f;
+    float depthB = 0.0f;
+    float maxRadius = 3.0f;
+    float depthSigma = 0.05f;
+    glm::uvec2 _pad0{0, 0};
+};
+
+BRACKEN_HLSL_CBUFFER(RtShadowFilterUniforms, 48);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, outputSize, 0);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, tracedSize, 8);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, tileCount, 16);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, depthA, 24);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, depthB, 28);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, maxRadius, 32);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, depthSigma, 36);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, _pad0, 40);
 
 /**
  * Ray-traced reflection compute uniforms — matches rt_reflection.comp.hlsl
@@ -1171,9 +1243,13 @@ struct alignas(16) RtReflectionUniforms {
     glm::vec4 waterSimWindow{0.0f}; // minX, minZ, inverse extent, edge fade width
     glm::vec4 waterFlowTime{0.0f};  // flow XZ, speed, absolute time
     glm::vec4 waterDetail{0.0f};    // detail strength, receiver mode, visibility bias, unused
+    /// Advances the GGX sample sequence. Must change every frame or the
+    /// temporal pass averages the same lobe sample forever.
+    uint32_t frameIndex = 0;
+    glm::vec3 _pad1{0.0f};
 };
 
-BRACKEN_HLSL_CBUFFER(RtReflectionUniforms, 224);
+BRACKEN_HLSL_CBUFFER(RtReflectionUniforms, 240);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, invViewProj, 0);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, cameraPosition, 64);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, rayMaxDistance, 76);
@@ -1191,6 +1267,27 @@ BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterSurface, 160);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterSimWindow, 176);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterFlowTime, 192);
 BRACKEN_HLSL_FIELD(RtReflectionUniforms, waterDetail, 208);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, frameIndex, 224);
+BRACKEN_HLSL_FIELD(RtReflectionUniforms, _pad1, 228);
+
+/**
+ * Reflection-denoiser temporal accumulation — matches
+ * rt_reflection_denoise_temporal.comp.hlsl (set 2, b0).
+ */
+struct alignas(16) RtReflectionTemporalUniforms {
+    glm::uvec2 tracedSize;
+    float maxAccumFrames = 16.0f;
+    float clampSigma = 1.5f;
+    uint32_t historyValid = 0;
+    glm::uvec3 _pad0{0, 0, 0};
+};
+
+BRACKEN_HLSL_CBUFFER(RtReflectionTemporalUniforms, 32);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, tracedSize, 0);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, maxAccumFrames, 8);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, clampSigma, 12);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, historyValid, 16);
+BRACKEN_HLSL_FIELD(RtReflectionTemporalUniforms, _pad0, 20);
 
 /**
  * Full-resolution material/depth/normal-guided resolve of the sparse traced

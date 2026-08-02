@@ -114,8 +114,8 @@ Tests live next to their unit as `*.test.cpp` and are auto-discovered.
 
 ### One build tree
 
-`CMakePresets.json` defines exactly one tree, `build/`, and nothing ever
-deletes or reconfigures it. Sanitizers, build types and option overrides are
+There is exactly one tree, `build/`, and nothing ever deletes or
+reconfigures it from scratch. Sanitizers, build types and option overrides are
 `-D` flags you pass when you want them — not parallel trees that drift out of
 sync with each other and with the docs describing them.
 
@@ -178,6 +178,7 @@ IBL / local shadows on F1–F8).
 ```bash
 ./build/examples/playground/playground            # play it (WASD, mouse)
 ./build/examples/playground/playground --smoke    # self-drive 240 frames, print stats, exit
+./build/examples/playground/playground --rt-bench 240  # same run as a timing jig, prints a table
 ```
 
 `--smoke [N]` is the integration-test mode: the player auto-runs to orbs,
@@ -188,6 +189,14 @@ verifies it isn't black or solid-color — a broken renderer that still hits
 60 fps can't pass. In the interactive game, F12 saves a screenshot; the
 underlying API is `Application::request_screenshot(path)` (final swapchain
 image, UI included, saved as PNG).
+
+`--rt-bench N` is the same self-driven run turned into a measurement jig:
+pinned camera, no screenshot, none of the mid-run settings flips, and a
+machine-readable `[rtbench] ...` table of per-pass CPU record times (mean and
+p95 over the run) plus the ray-tracing stats. It is the gate for any traversal
+performance claim. `PLAYGROUND_RT=shadows|reflections|both` picks which traced
+effects run; numbers are only worth quoting from a
+`-DCMAKE_BUILD_TYPE=RelWithDebInfo` tree.
 
 ### Developer overlay
 

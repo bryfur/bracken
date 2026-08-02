@@ -1,11 +1,15 @@
 #include "bracken/render/raytracing/rt_scene.hpp"
 
+#include "bracken/core/hash.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 
+#include <glm/gtc/type_ptr.hpp>
+
 #include <chrono>
+#include <cstring>
 
 namespace bracken::render::rt {
 namespace {
@@ -22,12 +26,30 @@ struct ModelGeometry {
 ModelGeometry gather(const Model& model, bool want_attributes) {
     ModelGeometry g;
     for (const Mesh& mesh : model.meshes) {
-        if (mesh.indices.empty() || mesh.vertices.empty()) {
+        // A skinned mesh keeps its geometry in `skinned_vertices`; `vertices`
+        // is empty for it. Reading only the latter meant every skinned model —
+        // i.e. every animated character — silently got no BLAS, so it cast no
+        // ray-traced shadow at all. The instance list is not the place that
+        // dropped it; it never had anything to reference.
+        //
+        // The positions taken here are the BIND POSE. A skinned instance
+        // therefore casts a bind-pose shadow that follows it around the world
+        // without animating. Doing better means re-skinning and refitting the
+        // BVH per frame; this at least gives the character a shadow.
+        const std::size_t vertex_count =
+            mesh.vertices.empty() ? mesh.skinned_vertices.size() : mesh.vertices.size();
+        if (mesh.indices.empty() || vertex_count == 0) {
             continue; // uploaded models have had their CPU geometry released
         }
         g.has_cpu_geometry = true;
         const auto base = static_cast<uint32_t>(g.positions.size());
         for (const gpu::Vertex3D& v : mesh.vertices) {
+            g.positions.push_back(v.position);
+            if (want_attributes) {
+                g.normals.push_back(v.normal);
+            }
+        }
+        for (const gpu::SkinnedVertex& v : mesh.skinned_vertices) {
             g.positions.push_back(v.position);
             if (want_attributes) {
                 g.normals.push_back(v.normal);
@@ -57,6 +79,38 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
         }
     }
     return g;
+}
+
+/**
+ * Content hash of an instance list, for "did anything actually move".
+ *
+ * Fields are hashed explicitly rather than as a byte blob over the pair: the
+ * pair has padding between the handle and the matrix, and hashing
+ * uninitialized padding makes the answer depend on allocator history rather
+ * than on the scene.
+ *
+ * FNV-1a over 4-byte words, not bytes. At 2569 instances this walks ~44k
+ * words; a byte-at-a-time walk of the same data is the difference between
+ * ~10 us and ~40 us, and the whole point of this hash is to be much cheaper
+ * than the ~490 us build it guards.
+ */
+uint64_t hash_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
+    uint64_t h = core::k_fnv1a_offset_basis_64;
+    const auto mix = [&h](uint32_t word) {
+        h ^= static_cast<uint64_t>(word);
+        h *= core::k_fnv1a_prime_64;
+    };
+    // The count participates so that a truncated list cannot collide with the
+    // longer one it is a prefix of.
+    mix(static_cast<uint32_t>(instances.size()));
+    for (const auto& [handle, transform] : instances) {
+        mix(static_cast<uint32_t>(handle));
+        const auto* m = reinterpret_cast<const uint32_t*>(glm::value_ptr(transform));
+        for (int i = 0; i < 16; ++i) {
+            mix(m[i]);
+        }
+    }
+    return h;
 }
 
 } // namespace
@@ -114,20 +168,29 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
                              });
 
     // Concatenate serially, in a deterministic order, so offsets are stable
-    // between runs and the structure is reproducible.
+    // between runs and the structure is reproducible. Each BLAS is converted
+    // to the 64-byte traversal layout on the way in — the GPU never sees a
+    // build node, and a BLAS's node links are relative to its own root, so the
+    // conversion is per-model and the offsets stay a simple running total.
+    std::vector<BvhNodeGpu> converted;
     for (Pending& p : pending) {
         if (p.blas.empty()) {
+            continue;
+        }
+        convert_to_gpu_nodes(p.blas.nodes, converted, convert_scratch_);
+        if (converted.empty()) {
             continue;
         }
         ModelEntry entry;
         entry.node_offset = static_cast<uint32_t>(blas_nodes_.size());
         entry.triangle_offset = static_cast<uint32_t>(blas_triangles_.size());
-        entry.node_count = static_cast<uint32_t>(p.blas.nodes.size());
+        entry.node_count = static_cast<uint32_t>(converted.size());
+        entry.triangle_count = static_cast<uint32_t>(p.blas.triangles.size());
         entry.bounds_min = p.blas.bounds_min;
         entry.bounds_max = p.blas.bounds_max;
         entry.valid = true;
 
-        blas_nodes_.insert(blas_nodes_.end(), p.blas.nodes.begin(), p.blas.nodes.end());
+        blas_nodes_.insert(blas_nodes_.end(), converted.begin(), converted.end());
         blas_triangles_.insert(blas_triangles_.end(), p.blas.triangles.begin(),
                                p.blas.triangles.end());
 
@@ -172,7 +235,7 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
     BRACKEN_LOG_INFO("rt",
                      "RtScene: {} models, {} unique triangles, {} BLAS nodes, {:.1f} MB, {:.1f} ms",
                      stats_.models, stats_.unique_triangles, stats_.blas_nodes,
-                     static_cast<double>(blas_nodes_.size() * sizeof(BvhNode) +
+                     static_cast<double>(blas_nodes_.size() * sizeof(BvhNodeGpu) +
                                          blas_triangles_.size() * sizeof(BvhTriangle) +
                                          attributes_.size() * sizeof(TriangleAttributes)) /
                          (1024.0 * 1024.0),
@@ -184,6 +247,16 @@ void RtScene::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> i
     if (entries_.empty()) {
         return;
     }
+
+    // Nothing moved: keep the TLAS, keep the buffers, do no work. The village
+    // is static, so in the playground this is the path taken every frame after
+    // the first — see the header for why this is not merely an optimization.
+    const uint64_t hash = hash_instances(instances);
+    if (has_instance_hash_ && hash == instance_hash_) {
+        return;
+    }
+    instance_hash_ = hash;
+    has_instance_hash_ = true;
 
     std::vector<TlasInstance> list;
     list.reserve(instances.size());
@@ -218,23 +291,28 @@ void RtScene::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> i
         inst.blas_node_offset = e.node_offset;
         inst.blas_triangle_offset = e.triangle_offset;
         list.push_back(inst);
-        drawn += e.node_count;
+        drawn += e.triangle_count;
     }
 
     tlas_ = build_tlas(list);
+    // Convert to the traversal layout. Two linear passes over ~2N nodes for N
+    // instances, against a binned-SAH build of the same list — a few percent
+    // of a path that already runs only when something moved.
+    convert_to_gpu_nodes(tlas_.nodes, tlas_gpu_nodes_, convert_scratch_);
+    stats_.tlas_builds++;
     stats_.instances = static_cast<uint32_t>(list.size());
-    stats_.tlas_nodes = static_cast<uint32_t>(tlas_.nodes.size());
+    stats_.tlas_nodes = static_cast<uint32_t>(tlas_gpu_nodes_.size());
     stats_.drawn_triangles = drawn;
     tlas_dirty_ = true;
 }
 
-void RtScene::upload(gpu::GPUDevice& device) {
+void RtScene::upload(gpu::GPUDevice& device, SDL_GPUCommandBuffer* cmd) {
     BRACKEN_PROFILE_ZONE("RtScene::upload");
 
     if (blas_dirty_ && !blas_nodes_.empty()) {
         blas_node_buffer_ = gpu::GPUBuffer::create_static(
             device, gpu::GPUBuffer::Type::Storage, blas_nodes_.data(),
-            blas_nodes_.size() * sizeof(BvhNode));
+            blas_nodes_.size() * sizeof(BvhNodeGpu));
         blas_triangle_buffer_ = gpu::GPUBuffer::create_static(
             device, gpu::GPUBuffer::Type::Storage, blas_triangles_.data(),
             blas_triangles_.size() * sizeof(BvhTriangle));
@@ -246,23 +324,50 @@ void RtScene::upload(gpu::GPUDevice& device) {
         blas_dirty_ = false;
     }
 
-    if (tlas_dirty_ && !tlas_.nodes.empty()) {
-        // Recreated rather than updated: the TLAS changes size whenever the
-        // instance set does, and a static scene uploads it exactly once.
-        tlas_node_buffer_ = gpu::GPUBuffer::create_static(
-            device, gpu::GPUBuffer::Type::Storage, tlas_.nodes.data(),
-            tlas_.nodes.size() * sizeof(BvhNode));
-        tlas_instance_buffer_ = gpu::GPUBuffer::create_static(
-            device, gpu::GPUBuffer::Type::Storage, tlas_.instances.data(),
-            tlas_.instances.size() * sizeof(TlasInstance));
-        tlas_dirty_ = false;
+    if (tlas_dirty_ && !tlas_gpu_nodes_.empty()) {
+        const std::size_t node_bytes = tlas_gpu_nodes_.size() * sizeof(BvhNodeGpu);
+        const std::size_t instance_bytes = tlas_.instances.size() * sizeof(TlasInstance);
+
+        if (cmd != nullptr) {
+            // Persistent buffers, grown only when the instance count outgrows
+            // them and otherwise written in place on the frame's command
+            // buffer. The previous code created two buffers and submitted its
+            // OWN command buffer here, in the middle of frame recording, every
+            // time any instance moved.
+            if (tlas_node_buffer_ == nullptr || tlas_node_capacity_ < node_bytes) {
+                tlas_node_capacity_ = node_bytes + node_bytes / 2; // headroom
+                tlas_node_buffer_ = gpu::GPUBuffer::create_dynamic(
+                    device, gpu::GPUBuffer::Type::Storage, tlas_node_capacity_);
+            }
+            if (tlas_instance_buffer_ == nullptr || tlas_instance_capacity_ < instance_bytes) {
+                tlas_instance_capacity_ = instance_bytes + instance_bytes / 2;
+                tlas_instance_buffer_ = gpu::GPUBuffer::create_dynamic(
+                    device, gpu::GPUBuffer::Type::Storage, tlas_instance_capacity_);
+            }
+            if (tlas_node_buffer_ && tlas_instance_buffer_) {
+                tlas_node_buffer_->update(cmd, tlas_gpu_nodes_.data(), node_bytes);
+                tlas_instance_buffer_->update(cmd, tlas_.instances.data(), instance_bytes);
+                tlas_dirty_ = false;
+            }
+        } else {
+            // No frame command buffer (a host calling set_instances outside a
+            // frame). Immediate create-and-submit, as before.
+            tlas_node_buffer_ = gpu::GPUBuffer::create_static(
+                device, gpu::GPUBuffer::Type::Storage, tlas_gpu_nodes_.data(), node_bytes);
+            tlas_instance_buffer_ = gpu::GPUBuffer::create_static(
+                device, gpu::GPUBuffer::Type::Storage, tlas_.instances.data(), instance_bytes);
+            tlas_node_capacity_ = node_bytes;
+            tlas_instance_capacity_ = instance_bytes;
+            tlas_dirty_ = false;
+        }
     }
 
-    stats_.gpu_bytes = blas_nodes_.size() * sizeof(BvhNode) +
-                       blas_triangles_.size() * sizeof(BvhTriangle) +
-                       attributes_.size() * sizeof(TriangleAttributes) +
-                       tlas_.nodes.size() * sizeof(BvhNode) +
-                       tlas_.instances.size() * sizeof(TlasInstance);
+    stats_.blas_bytes = blas_nodes_.size() * sizeof(BvhNodeGpu) +
+                        blas_triangles_.size() * sizeof(BvhTriangle);
+    stats_.attribute_bytes = attributes_.size() * sizeof(TriangleAttributes);
+    stats_.tlas_bytes = tlas_gpu_nodes_.size() * sizeof(BvhNodeGpu) +
+                        tlas_.instances.size() * sizeof(TlasInstance);
+    stats_.gpu_bytes = stats_.blas_bytes + stats_.attribute_bytes + stats_.tlas_bytes;
 }
 
 SDL_GPUBuffer* RtScene::tlas_nodes() const {

@@ -48,6 +48,24 @@ its threadgroup size is never written down on the C++ side: it comes from the
 module's `[numthreads]` via SPIR-V reflection, which is why compute pipeline
 creation *requires* reflection to succeed.
 
+**Binding order inside set 0 is not free.** SDL3 GPU assigns sampled textures
+first, then read-only storage textures, then read-only storage buffers, all
+numbered contiguously (see `gpu/gpu_compute.hpp`). Declaring them in any other
+order compiles, reflects and validates cleanly, and then silently binds the
+wrong resource to each slot — `rt_shadow_denoise_temporal` was written with its
+storage textures first and produced full-screen noise that looked for all the
+world like a broken denoiser.
+
+**Wave (subgroup) intrinsics need an opt-in.** The shadercross CLI never passes
+`-fspv-target-env`, so DXC defaults to `vulkan1.0`, under which every `Wave*`
+intrinsic is a hard compile error. A shader that needs them must be listed in
+`SHADER_WAVE_OPS` in `CMakeLists.txt`, which routes it through the vendored
+DXC CLI at `vulkan1.1` with otherwise identical flags. That list is explicit
+rather than a filename convention on purpose: adding to it raises the Vulkan
+floor for the pipelines involved, which should be visible in a diff. The Metal
+path needs nothing — SPIRV-Cross maps these to `simd_*` and the runtime already
+requests MSL 2.2.0, above the 2.1 floor Metal requires for them.
+
 The model-family material variants (`ModelDoubleSided`, `ModelBlend`,
 `ModelBlendDoubleSided`, `SkinnedModel*`, `InstancedModelDoubleSided`) load
 the same shader pair as their base pipeline and differ only in fixed-function
@@ -203,7 +221,13 @@ full-resolution receiver BRDF, and adds RGB while preserving HDR alpha. This
 placement is before water/TAA, so the signal cannot bleed from stone onto
 grass or bypass temporal stabilization. The RT compute shaders bind D32 depth
 and the G-buffer as sampled textures with a point-clamp sampler, never as
-compute storage. When water is active, that resolved quarter-resolution target
+compute storage. `rt_reflection.comp` writes TWO read-write storage textures:
+`u0` the RGBA16F raw radiance, and `u1` an R16F `hitT` — the hit distance
+normalized by `rayMaxDistance`, 1.0 on a miss or any early-out (sky, roughness
+gate, water-receiver rejection), written by every in-bounds thread. Nothing
+reads `hitT` yet; it exists because the virtual-hit-point reprojection planned
+for the reflection denoiser needs the reflected point's distance, and the trace
+is the only place that number is free. When water is active, that resolved quarter-resolution target
 is recycled for a second analytic water-receiver dispatch: camera-ray/plane
 intersection is refined against the live wave field and the trace uses the
 same finite-difference + analytic-detail normal as `water.frag`. The water
@@ -267,7 +291,29 @@ define `CLUSTER_SSBO_BINDING_BASE` to the including shader's fragment sampler
 count first), `shadow_common.hlsli` (cascade selection, PCF/PCSS),
 `fog.hlsli` (distance-fog factors + `hazeSunColor`, the sun-scatter /
 day-dimmed haze color shared by surface fog AND the sky's horizon haze —
-they must stay one function so fog melts into the sky at the horizon).
+they must stay one function so fog melts into the sky at the horizon),
+`rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
+GGX-VNDF sampling, the packed visibility-tile helpers), `rt_trace.hlsli` (the
+software two-level BVH: `BvhNodeGpu`/`BvhTriangle`/`TlasInstance`, `slabTest`,
+`octDecode`, the any-hit `blasOccluded`/`sceneOccluded` walk and the
+closest-hit `Hit`/`blasClosest`/`sceneClosest` walk — shared by
+`rt_shadow.comp` and `rt_reflection.comp`). The traversal node is **64 bytes
+and holds BOTH children** (Aila–Laine): two AABBs and two links, so one fetch
+resolves a binary decision and a leaf never needs a node of its own. The CPU
+build format is still the 32-byte one-AABB `BvhNode` (`bvh.hpp`); the
+conversion happens on the upload side (`bvh_gpu.hpp`), which is also why only
+interior nodes become nodes and the buffers do not grow. Traversal stacks are
+64 entries, the depth bound the builder's `max_depth` implies now that a visit
+defers at most one side. `rt_trace.hlsli` is a **two-phase**
+include: `#define RT_TRACE_TYPES` before the first include to get the structs
+(the including shader needs them to declare its own `StructuredBuffer`s), then
+`#define RT_TRACE_TRAVERSAL` and include it again *after* the binding block and
+cbuffer, because the walks read `tlasNodes`/`tlasInstances`/`blasNodes`/
+`blasTriangles` and the `tlasNodeCount` uniform by name. Missing both macros is
+an `#error`, the same shape as `cluster_lighting.hlsli`'s required
+`CLUSTER_SSBO_BINDING_BASE`. Bindings deliberately stay in the entry shaders —
+the two passes have different sampled-texture counts and only reflections bind
+the per-triangle attribute buffer.
 
 ## SDL3 GPU resource binding order
 

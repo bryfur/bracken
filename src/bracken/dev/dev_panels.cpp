@@ -304,8 +304,79 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
     }
     changed |= ImGui::Checkbox("RT reflections", &settings.rt_reflections);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Traced specular for smooth surfaces; rough ones keep the IBL probe.\n"
+        ImGui::SetTooltip("Traced specular, GGX-importance-sampled and denoised.\n"
                           "Costs more than RT shadows: closest-hit cannot stop early.");
+    }
+
+    // Quality dials, shown only when something is actually tracing — they are
+    // meaningless otherwise and the panel is long enough already.
+    if (settings.rt_shadows || settings.rt_reflections) {
+        ImGui::Indent();
+        constexpr const char* k_rt_res[] = {"Full", "Half", "Quarter"};
+
+        if (settings.rt_shadows) {
+            int res = static_cast<int>(settings.rt_shadow_resolution);
+            if (ImGui::Combo("Shadow rays", &res, k_rt_res, IM_ARRAYSIZE(k_rt_res))) {
+                settings.rt_shadow_resolution = static_cast<RtResolution>(res);
+                changed = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Rays cast per frame, relative to the screen.\n"
+                                  "The main shadow perf dial. The denoiser upsamples back to\n"
+                                  "full resolution either way, so a lower setting costs\n"
+                                  "silhouette sharpness rather than making it blocky.");
+            }
+
+            changed |= ImGui::SliderFloat("Sun softness", &settings.rt_sun_softness_deg, 0.0f, 3.0f,
+                                          "%.2f deg");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Angular RADIUS of the sun disk. The real sun is ~0.265.\n"
+                                  "Wider = softer penumbrae that grow with occluder distance.\n"
+                                  "FREE to trace — the ray count is identical; only the\n"
+                                  "denoiser works harder. 0 = a hard shadow, for A/B.");
+            }
+        }
+
+        if (settings.rt_reflections) {
+            int res = static_cast<int>(settings.rt_reflection_resolution);
+            if (ImGui::Combo("Reflection rays", &res, k_rt_res, IM_ARRAYSIZE(k_rt_res))) {
+                settings.rt_reflection_resolution = static_cast<RtResolution>(res);
+                changed = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Rays cast per frame, relative to the screen.\n"
+                                  "Reflections are bound by wave divergence rather than by\n"
+                                  "traced-pixel count, so this dial moves the cost more than\n"
+                                  "the roughness gate below does.");
+            }
+
+            changed |= ImGui::SliderFloat("Reflective up to", &settings.rt_reflection_max_roughness,
+                                          0.0f, 1.0f, "roughness %.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Roughness at which traced specular hands over entirely to\n"
+                                  "the IBL probe. Higher = more of the frame reflects.\n"
+                                  "Nearly free once anything is tracing at all: measured\n"
+                                  "0.45 -> 0.75 for about 2 fps on the village scene.\n"
+                                  "0 disables tracing without tearing down the structure.");
+            }
+        }
+
+        // Shared by both effects — it cuts the acceleration structure, not
+        // either signal's ray count, so it sits outside the two blocks above.
+        static const char* const RT_RANGES[] = {"Near (1000)", "Medium (2000)", "Far (4000)",
+                                                "Unlimited"};
+        changed |= combo_enum("Instance range", settings.rt_max_instance_range, RT_RANGES, 4);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("How far an instance may be and still be traced, in world\n"
+                              "units (the draw-distance scale; Far == the D4000 default).\n"
+                              "Instances entirely beyond it never enter the TLAS, so they\n"
+                              "cost neither traversal nor a rebuild. Distant sun shadows\n"
+                              "keep coming from the cascade maps.\n"
+                              "The price: a finite range means camera movement across the\n"
+                              "threshold changes the instance list and re-triggers TLAS\n"
+                              "rebuilds a static scene would never pay.");
+        }
+        ImGui::Unindent();
     }
     changed |= ImGui::Checkbox("Bloom", &settings.bloom_enabled);
     changed |= ImGui::Checkbox("Volumetric fog", &settings.volumetric_fog);

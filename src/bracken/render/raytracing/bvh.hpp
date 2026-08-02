@@ -8,11 +8,18 @@
 namespace bracken::render::rt {
 
 /**
- * One BVH node, laid out for GPU traversal.
+ * One BVH node in the BUILD format — what the builder emits and what every
+ * CPU-side consumer here (`sah_cost`, the tests, the conversion below) reads.
  *
- * 32 bytes exactly, so two nodes share a cache line and a traversal step
- * touching a node and its sibling costs one fetch. Every field placement here
- * is a bandwidth decision, not a style one:
+ * NOT what the GPU traverses. Nodes are converted to the 64-byte two-children
+ * `BvhNodeGpu` (`bvh_gpu.hpp`) on the upload side, so a traversal step fetches
+ * one node instead of a node and both its children. This format stays 32 bytes
+ * because it is the format the RECURSIVE BUILD writes, where a node is touched
+ * once and its sibling may not exist yet.
+ *
+ * 32 bytes exactly, so two nodes share a cache line and a build step touching
+ * a node and its sibling costs one fetch. Every field placement here is a
+ * bandwidth decision, not a style one:
  *
  *  - The right child is NOT stored. Siblings are emitted adjacently, so
  *    `right == left_first + 1`. That is 4 bytes saved per node, and 4 bytes is
@@ -127,6 +134,9 @@ struct BvhBuildOptions {
 struct TlasInstance {
     glm::mat4 world_to_model{1.0f};
     glm::vec3 bounds_min{0.0f}; ///< world-space AABB of this instance
+    /// Where this instance's BLAS starts in the CONVERTED (64-byte) node
+    /// array the shaders index — see `bvh_gpu.hpp`. `RtScene` assigns it; the
+    /// builder only copies it around.
     uint32_t blas_node_offset = 0;
     glm::vec3 bounds_max{0.0f};
     uint32_t blas_triangle_offset = 0;

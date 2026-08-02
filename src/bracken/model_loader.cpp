@@ -10,6 +10,7 @@
 #include "glm/fwd.hpp"
 #include "glm/geometric.hpp"
 #include "glm/gtc/quaternion.hpp"
+#include "glm/gtc/type_ptr.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
@@ -598,9 +599,7 @@ bool ModelLoader::load_glb_impl(const std::string& path, std::span<const std::by
             data != nullptr) {
             const auto& accessor = gltf.accessors[skin.inverseBindMatrices];
             for (size_t i = 0; i < accessor.count; i++) {
-                glm::mat4 mat;
-                std::memcpy(&mat, data + i * 16, sizeof(glm::mat4));
-                inverse_bind_matrices.push_back(mat);
+                inverse_bind_matrices.push_back(glm::make_mat4(data + i * 16));
             }
         }
 

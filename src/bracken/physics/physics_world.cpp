@@ -486,8 +486,17 @@ void PhysicsWorld::move_kinematic(BodyId id, const glm::vec3& target_pos,
     if (!impl_ || id == INVALID_BODY_ID || dt <= 0.0f) {
         return;
     }
+    // Never compute the velocity over a window smaller than the step that
+    // consumes it. Jolt's MoveKinematic sets an UNCLAMPED velocity of
+    // (target - position) / dt, integrated in fixed_dt-sized steps: with
+    // dt < fixed_dt each step overshoots the target by fixed_dt/dt, the
+    // next correction overshoots back the other way, and the oscillation
+    // compounds to inf/NaN within seconds on a host whose frame rate
+    // outruns the physics rate. Clamping to the fixed step means the body
+    // arrives at the target by the next step and never passes it.
+    const float window = std::max(dt, impl_->config.fixed_dt);
     impl_->physics.GetBodyInterface().MoveKinematic(
-        jolt_id(id), to_jolt(target_pos), to_jolt(glm::normalize(target_rot)), dt);
+        jolt_id(id), to_jolt(target_pos), to_jolt(glm::normalize(target_rot)), window);
 }
 
 bool PhysicsWorld::is_active(BodyId id) const {

@@ -246,8 +246,7 @@ Golden parse_golden() {
 // deliberately not automatic: set the variable, run the suite, diff what it
 // wrote, and check in only the changes you meant to make.
 //
-//   BRACKEN_REGEN_PIPELINE_GOLDEN=src/bracken/gpu/pipeline_config_golden.inc \
-//       ./build/src/bracken/bracken_tests --gtest_filter='PipelineCatalog.*'
+//   BRACKEN_REGEN_PIPELINE_GOLDEN=src/bracken/gpu/pipeline_config_golden.inc ./build/src/bracken/bracken_tests --gtest_filter='PipelineCatalog.*'
 //
 // A diff bigger than the row you touched means the change was not local.
 TEST(PipelineCatalog, RegenerateGoldenOnRequest) {

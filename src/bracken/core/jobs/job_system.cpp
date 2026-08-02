@@ -141,9 +141,12 @@ bool node_try_add_ref(JobNode* n, std::uint32_t generation) noexcept {
         if (JobNode::state_gen(s) != generation || JobNode::state_count(s) == 0) {
             return false;
         }
-        // Success relaxed: acquiring a reference publishes nothing. Failure
-        // acquire: re-derive the done-inference above from the fresh value.
-        if (n->state.compare_exchange_weak(s, s + 1, std::memory_order_relaxed,
+        // Failure acquire: re-derive the done-inference above from the fresh
+        // value. Success acquire only because GCC's __atomic builtin still
+        // enforces the pre-C++17 failure<=success rule (-Winvalid-memory-model);
+        // the success path itself needs nothing — acquiring a reference
+        // publishes nothing.
+        if (n->state.compare_exchange_weak(s, s + 1, std::memory_order_acquire,
                                            std::memory_order_acquire)) {
             return true;
         }

@@ -136,6 +136,10 @@ public:
 
     // Kinematic bodies: velocity-drives the body so it reaches the target
     // transform in `dt` seconds (pushing dynamic bodies along the way).
+    // `dt` is clamped up to the fixed step internally: the implied velocity
+    // is consumed in fixed_dt-sized steps, so a smaller window would
+    // overshoot the target every step and diverge (pass the frame dt; a
+    // host running faster than the physics rate is safe).
     void move_kinematic(BodyId id, const glm::vec3& target_pos, const glm::quat& target_rot,
                         float dt);
 

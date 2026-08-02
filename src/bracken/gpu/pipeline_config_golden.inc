@@ -728,7 +728,15 @@ ExposureAdapt
 WaterSim
   cs        water_sim.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtShadow
-  cs        rt_shadow.comp.spv entry=CSMain samplers=1 ro_textures=0 ro_buffers=4 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        rt_shadow.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=4 rw_textures=1 rw_buffers=0 uniform_buffers=1
+RtShadowClassify
+  cs        rt_shadow_denoise_classify.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
+RtShadowTemporal
+  cs        rt_shadow_denoise_temporal.comp.spv entry=CSMain samplers=3 ro_textures=2 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
+RtShadowFilter
+  cs        rt_shadow_denoise_filter.comp.spv entry=CSMain samplers=2 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtReflection
-  cs        rt_reflection.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=5 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        rt_reflection.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=5 rw_textures=2 rw_buffers=0 uniform_buffers=1
+RtReflectionTemporal
+  cs        rt_reflection_denoise_temporal.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 )GOLDEN"

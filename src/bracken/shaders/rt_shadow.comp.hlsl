@@ -22,9 +22,18 @@
 //    registers, and register pressure caps occupancy, which caps latency
 //    hiding, which is the whole game in a memory-bound traversal.
 //
-// Output is a single-channel visibility mask (1 = lit, 0 = shadowed), which
-// the lighting pass multiplies in. Half-resolution by default, sampled with a
-// normalized UV so its resolution is a free parameter.
+// SOFT, NOT HARD. The ray is jittered across the sun's disk (about half a
+// degree), one sample per pixel per frame, so the output is a stochastic
+// estimate of sun visibility rather than a binary answer. That is what
+// produces real penumbrae — contact-sharp under a foot, wide under a distant
+// roofline — and it costs exactly the same one ray as the hard version did.
+// A single sample is of course pure noise on its own; rt_shadow_denoise_*.comp
+// turns it back into an image, and NOTHING here is usable without them.
+//
+// Output is one BIT per pixel, packed 8x4 into a uint tile (rt_sampling.hlsli).
+// The tile classifier downstream reads 32 pixels of visibility per fetch,
+// which is what lets it skip filtering entirely over the large uniform regions
+// that dominate a sunlit frame.
 //
 // THIS PASS DELIBERATELY OWNS NOTHING BUT VISIBILITY. It used to also read the
 // GTAO texture and copy it into R of an RG8 mask, so the lighting pass could
@@ -39,35 +48,12 @@
 // sampler slot (the "11-sampler DXC ceiling" that motivated the packing does
 // not reproduce: model.frag compiles clean at 12).
 
-static const uint TLAS_STACK = 32;
-static const uint BLAS_STACK = 32;
-// Matches BvhBuildOptions::max_depth. A deeper tree cannot be built, so a
-// deeper stack would only cost registers.
-static const float RAY_EPSILON = 0.02;
+#include "rt_sampling.hlsli"
 
-struct BvhNode {
-    float3 boundsMin;
-    uint leftFirst; // interior: left child index (right is +1); leaf: first prim
-    float3 boundsMax;
-    uint count;     // 0 = interior
-};
-
-struct BvhTriangle {
-    float3 v0;
-    float pad0;
-    float3 e1;
-    uint primId;
-    float3 e2;
-    float pad2;
-};
-
-struct TlasInstance {
-    float4x4 worldToModel;
-    float3 boundsMin;
-    uint blasNodeOffset;
-    float3 boundsMax;
-    uint blasTriangleOffset;
-};
+// The BVH structs and the traversal walks are shared with every other traced
+// pass — see rt_trace.hlsli for why it is included in two phases.
+#define RT_TRACE_TYPES
+#include "rt_trace.hlsli"
 
 [[vk::binding(0, 2)]]
 cbuffer RtShadowUniforms : register(b0, space2) {
@@ -76,153 +62,47 @@ cbuffer RtShadowUniforms : register(b0, space2) {
     float rayMaxDistance;   // ray length; shorter = cheaper and misses less
     float3 cameraPosition;
     float normalBias;       // push along the normal to stop self-shadowing
-    uint2 outputSize;       // shadow mask resolution (may be half the screen)
+    uint2 outputSize;       // traced resolution (may be half the screen)
     uint tlasNodeCount;     // 0 = no acceleration structure this frame
     float depthBias;
+    /// cos of the sun's angular RADIUS. 1.0 collapses the cone to a point and
+    /// reproduces the old hard shadow exactly, which is what the deterministic
+    /// smoke run pins so its output stays comparable frame to frame.
+    float sunCosThetaMax;
+    /// Advances the sample sequence. Must change every frame or the temporal
+    /// filter accumulates the same sample forever and never converges.
+    uint frameIndex;
+    /// 0 when no prepass G-buffer exists this frame, in which case the normal
+    /// is reconstructed from depth taps as it used to be — worse, but better
+    /// than not running.
+    uint hasGBuffer;
+    float _pad0;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
 Texture2D<float> sceneDepth : register(t0, space0);
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
 SamplerState sceneDepthSampler : register(s0, space0);
-[[vk::binding(1, 0)]] StructuredBuffer<BvhNode> tlasNodes : register(t1, space0);
-[[vk::binding(2, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t2, space0);
-[[vk::binding(3, 0)]] StructuredBuffer<BvhNode> blasNodes : register(t3, space0);
-[[vk::binding(4, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t4, space0);
+// Prepass G-buffer: RG = octahedral world normal, B = roughness, A = metallic.
+// Reading the REAL normal here rather than reconstructing one from four depth
+// taps is the single biggest quality fix in this pass — see the allocation
+// comment in scene_renderer.cpp for what the reconstruction did to foliage.
+[[vk::combinedImageSampler]][[vk::binding(1, 0)]]
+Texture2D<float4> sceneNormal : register(t1, space0);
+[[vk::combinedImageSampler]][[vk::binding(1, 0)]]
+SamplerState sceneNormalSampler : register(s1, space0);
 
-// R8: sun visibility only, 1 = lit, 0 = shadowed. See the header comment for
-// why this is no longer RG8 with ambient occlusion multiplexed into R.
-[[vk::binding(0, 1)]] RWTexture2D<float> shadowMask : register(u0, space1);
+[[vk::binding(2, 0)]] StructuredBuffer<BvhNodeGpu> tlasNodes : register(t2, space0);
+[[vk::binding(3, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t3, space0);
+[[vk::binding(4, 0)]] StructuredBuffer<BvhNodeGpu> blasNodes : register(t4, space0);
+[[vk::binding(5, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t5, space0);
 
-// Slab test. Returns the near hit distance, or a miss as tNear > tFar.
-// Branchless min/max: a per-lane branch here would serialize the warp on the
-// most-executed instruction in the whole shader.
-bool slabTest(float3 boundsMin, float3 boundsMax, float3 origin, float3 invDir, float tMax,
-              out float tNear) {
-    float3 t0 = (boundsMin - origin) * invDir;
-    float3 t1 = (boundsMax - origin) * invDir;
-    float3 tsmall = min(t0, t1);
-    float3 tbig = max(t0, t1);
-    tNear = max(max(tsmall.x, tsmall.y), max(tsmall.z, 0.0));
-    float tFar = min(min(tbig.x, tbig.y), min(tbig.z, tMax));
-    return tNear <= tFar;
-}
+// One bit of sun visibility per pixel, 8x4 pixels per uint. 1 = lit.
+[[vk::binding(0, 1)]] RWTexture2D<uint> shadowBits : register(u0, space1);
 
-// Möller-Trumbore against a triangle already stored as origin + two edges, so
-// the two subtractions are not repeated per ray.
-bool triangleHit(BvhTriangle tri, float3 origin, float3 dir, float tMax) {
-    float3 pv = cross(dir, tri.e2);
-    float det = dot(tri.e1, pv);
-    // Two-sided: a shadow caster occludes regardless of winding, and culling
-    // backfaces here would put holes in the shadows of single-sided art.
-    if (abs(det) < 1e-8) {
-        return false;
-    }
-    float invDet = 1.0 / det;
-    float3 tv = origin - tri.v0;
-    float u = dot(tv, pv) * invDet;
-    if (u < 0.0 || u > 1.0) {
-        return false;
-    }
-    float3 qv = cross(tv, tri.e1);
-    float v = dot(dir, qv) * invDet;
-    if (v < 0.0 || u + v > 1.0) {
-        return false;
-    }
-    float t = dot(tri.e2, qv) * invDet;
-    return t > RAY_EPSILON && t < tMax;
-}
-
-// Walk one BLAS in model space. Returns on the first hit.
-bool blasOccluded(uint nodeOffset, uint triangleOffset, float3 origin, float3 dir, float tMax) {
-    float3 invDir = 1.0 / dir;
-
-    uint stack[BLAS_STACK];
-    uint sp = 0;
-    stack[sp++] = nodeOffset;
-
-    while (sp > 0) {
-        BvhNode node = blasNodes[stack[--sp]];
-
-        float tNear;
-        if (!slabTest(node.boundsMin, node.boundsMax, origin, invDir, tMax, tNear)) {
-            continue;
-        }
-
-        if (node.count == 0) {
-            // Interior: push both children. No near-first ordering here — for
-            // an ANY-hit query the first hit found is as good as the nearest,
-            // so the sort would be pure overhead.
-            if (sp + 2 <= BLAS_STACK) {
-                stack[sp++] = nodeOffset + node.leftFirst;
-                stack[sp++] = nodeOffset + node.leftFirst + 1;
-            }
-            continue;
-        }
-
-        // Leaf: primitives are contiguous (the builder writes them in leaf
-        // order), so this is a linear scan of adjacent memory.
-        for (uint i = 0; i < node.count; ++i) {
-            if (triangleHit(blasTriangles[triangleOffset + node.leftFirst + i], origin, dir,
-                            tMax)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// Walk the TLAS in world space, descending into a BLAS only for instances the
-// ray actually enters.
-bool sceneOccluded(float3 origin, float3 dir, float tMax) {
-    if (tlasNodeCount == 0) {
-        return false;
-    }
-    float3 invDir = 1.0 / dir;
-
-    uint stack[TLAS_STACK];
-    uint sp = 0;
-    stack[sp++] = 0;
-
-    while (sp > 0) {
-        BvhNode node = tlasNodes[stack[--sp]];
-
-        float tNear;
-        if (!slabTest(node.boundsMin, node.boundsMax, origin, invDir, tMax, tNear)) {
-            continue;
-        }
-
-        if (node.count == 0) {
-            if (sp + 2 <= TLAS_STACK) {
-                stack[sp++] = node.leftFirst;
-                stack[sp++] = node.leftFirst + 1;
-            }
-            continue;
-        }
-
-        for (uint i = 0; i < node.count; ++i) {
-            TlasInstance inst = tlasInstances[node.leftFirst + i];
-
-            // Transform the RAY into model space rather than the model into
-            // world space. One matrix-vector product per instance versus one
-            // per vertex is the entire reason a two-level structure exists.
-            float3 mOrigin = mul(inst.worldToModel, float4(origin, 1.0)).xyz;
-            float3 mDir = mul(inst.worldToModel, float4(dir, 0.0)).xyz;
-
-            // The transform may scale, which changes what tMax means in model
-            // space. Normalizing and rescaling keeps the cutoff honest.
-            float scale = length(mDir);
-            if (scale < 1e-8) {
-                continue;
-            }
-            if (blasOccluded(inst.blasNodeOffset, inst.blasTriangleOffset, mOrigin, mDir / scale,
-                             tMax * scale)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
+// The buffers and `tlasNodeCount` above are what the walks bind to.
+#define RT_TRACE_TRAVERSAL
+#include "rt_trace.hlsli"
 
 // World-space position at a depth texel, for normal reconstruction.
 float3 worldAt(int2 c, uint2 size) {
@@ -250,57 +130,94 @@ float3 reconstructNormal(int2 c, uint2 size) {
     return len > 1e-6 ? n / len : float3(0.0, 1.0, 0.0);
 }
 
-[numthreads(8, 8, 1)]
-void CSMain(uint3 tid : SV_DispatchThreadID) {
-    if (tid.x >= outputSize.x || tid.y >= outputSize.y) {
-        return;
+// One tile per group: 8x4 = 32 threads, each owning one bit of the output word.
+//
+// The word is assembled in groupshared memory with an atomic OR rather than
+// with WaveActiveBallot. Ballot would be one instruction, but it is only
+// equivalent to this when the group maps onto the wave the way you assumed,
+// and the wave width here is not a constant — this machine reports 32 while
+// its own driver advertises a subgroup size of 64. An atomic OR into LDS is
+// correct at every wave width, and against a BVH traversal its cost does not
+// register.
+groupshared uint g_tileBits;
+
+[numthreads(8, 4, 1)]
+void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    if (gi == 0) {
+        g_tileBits = 0;
     }
-    int2 coord = int2(tid.xy);
+    GroupMemoryBarrierWithGroupSync();
 
-    // Depth is sampled at the mask's resolution; when the mask is half-res
-    // this is a 2x2 corner tap, which is what the depth-aware upsample in the
-    // composite expects.
-    uint2 depthSize;
-    sceneDepth.GetDimensions(depthSize.x, depthSize.y);
-    int2 depthCoord = int2((float2(coord) + 0.5) / float2(outputSize) * float2(depthSize));
-    float depth = sceneDepth.Load(int3(depthCoord, 0));
+    const int2 coord = int2(tid.xy);
+    const bool inBounds = tid.x < outputSize.x && tid.y < outputSize.y;
 
-    // Reversed-Z: 0 is the far plane, so depth == 0 is sky. Nothing to shade,
-    // and casting a ray from the far plane is the single most expensive way to
-    // learn that.
-    if (depth <= 0.0) {
-        shadowMask[coord] = 1.0;
-        return;
+    // "Lit" is the default for everything that is not a shaded surface facing
+    // the sun: out-of-bounds padding lanes, and sky. Sky must read lit rather
+    // than shadowed or the fog and skybox pick up a dark wash.
+    bool lit = true;
+
+    if (inBounds) {
+        uint2 depthSize;
+        sceneDepth.GetDimensions(depthSize.x, depthSize.y);
+        const int2 depthCoord =
+            int2((float2(coord) + 0.5) / float2(outputSize) * float2(depthSize));
+        const float depth = sceneDepth.Load(int3(depthCoord, 0));
+
+        // Reversed-Z: 0 is the far plane, so depth == 0 is sky. Casting a ray
+        // from the far plane is the most expensive possible way to learn that.
+        if (depth > 0.0) {
+            float3 normal;
+            if (hasGBuffer != 0u) {
+                normal = octDecode(sceneNormal.Load(int3(depthCoord, 0)).xy);
+            } else {
+                normal = reconstructNormal(depthCoord, depthSize);
+            }
+
+            const float3 toLight = -sunDirection; // sunDirection is where light TRAVELS
+            const float ndotl = dot(normal, toLight);
+
+            // Facing away from the sun: already unlit by N.L in the lighting
+            // pass, so a traversal would only confirm the dot product.
+            if (ndotl <= 0.0) {
+                lit = false;
+            } else {
+                float2 ndc = (float2(coord) + 0.5) / float2(outputSize) * 2.0 - 1.0;
+                ndc.y = -ndc.y;
+                const float4 world = mul(invViewProj, float4(ndc, depth, 1.0));
+                const float3 worldPos = world.xyz / world.w;
+
+                // Bias along the normal, scaled by grazing angle. A constant
+                // bias either acne-stripes flat surfaces or detaches contact
+                // shadows on steep ones.
+                const float slope = saturate(1.0 - ndotl);
+                const float3 rayOrigin = worldPos +
+                                         normal * (normalBias * (1.0 + slope * 4.0)) +
+                                         toLight * depthBias;
+
+                // The jittered sun-disk ray. Sampling the cone rather than its
+                // axis is the entire difference between a hard shadow and a
+                // penumbra that widens with occluder distance.
+                const float2 xi = rtSample2D(uint2(coord), frameIndex);
+                const float3 rayDir = sampleCone(toLight, sunCosThetaMax, xi);
+
+                // A cone sample can land below the horizon on a grazing
+                // surface; that ray would start by burrowing into the geometry
+                // it came from, so treat it as occluded instead of tracing it.
+                if (dot(normal, rayDir) <= 0.0) {
+                    lit = false;
+                } else {
+                    lit = !sceneOccluded(rayOrigin, rayDir, rayMaxDistance);
+                }
+            }
+        }
     }
 
-    // Normal reconstructed from depth rather than read from a G-buffer, for
-    // the same reason GTAO does it: the engine has no normal target, and four
-    // extra depth taps are cheaper than adding a full-res normal write.
-    float3 normal = reconstructNormal(depthCoord, depthSize);
-    float3 toLight = -sunDirection; // sunDirection is where light TRAVELS
-
-    // A surface facing away from the sun is already unlit by N.L in the
-    // lighting pass. Tracing it would spend a full traversal to confirm what
-    // the dot product already said.
-    float ndotl = dot(normal, toLight);
-    if (ndotl <= 0.0) {
-        shadowMask[coord] = 0.0;
-        return;
+    if (lit) {
+        InterlockedOr(g_tileBits, 1u << gi);
     }
+    GroupMemoryBarrierWithGroupSync();
 
-    // Reconstruct world position from depth.
-    float2 ndc = (float2(coord) + 0.5) / float2(outputSize) * 2.0 - 1.0;
-    ndc.y = -ndc.y;
-    float4 clip = float4(ndc, depth, 1.0);
-    float4 world = mul(invViewProj, clip);
-    float3 worldPos = world.xyz / world.w;
-
-    // Offset along the normal, scaled by grazing angle. A constant bias either
-    // acne-stripes flat surfaces or detaches contact shadows on steep ones;
-    // scaling by 1/N.L spends the bias where the geometry actually needs it.
-    float slope = clamp(1.0 - ndotl, 0.0, 1.0);
-    float3 rayOrigin = worldPos + normal * (normalBias * (1.0 + slope * 4.0)) +
-                       toLight * depthBias;
-
-    shadowMask[coord] = sceneOccluded(rayOrigin, toLight, rayMaxDistance) ? 0.0 : 1.0;
+    if (gi == 0) {
+        shadowBits[int2(gid.xy)] = g_tileBits;
+    }
 }

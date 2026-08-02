@@ -50,11 +50,21 @@ bool verify_smoke_screenshot(const char* path) {
 
 } // namespace
 
-// Usage: playground [--smoke [frames]] [--engine-camera=on|off]
+// Usage: playground [--smoke [frames]] [--rt-bench frames] [--engine-camera=on|off]
 //   --smoke: self-drive for N frames (default 240) and exit — the integration-
 //            test mode. Prints "[smoke] OK ..." and "[smoke] screenshot OK ..."
 //            on success; exit code 1 if the run or the screenshot check fails,
 //            2 on bad arguments.
+//   --rt-bench N: the same self-driven run turned into a MEASUREMENT JIG —
+//            pinned camera, no screenshot, none of the smoke run's scripted
+//            mid-run settings flips. Prints a machine-readable
+//            "[rtbench] ..." table: per-pass CPU record time (mean + p95 over
+//            the run, first 30 frames discarded as warm-up), the sim/render/
+//            fence/present_wait means, and the ray-tracing stats line. Honours
+//            PLAYGROUND_RT for which traced effects run. Exit code 0.
+//            This is the gate docs/rt_lighting_plan.md asks for before any
+//            traversal change may claim a performance win; the numbers are
+//            only worth quoting from a -DCMAKE_BUILD_TYPE=RelWithDebInfo tree.
 //   --engine-camera=off: drive the camera rig from the demo instead of letting
 //            the engine drive it (Application::set_camera_driven_by_engine) —
 //            coverage for the escape hatch a game with a custom rig uses.
@@ -66,6 +76,11 @@ bool verify_smoke_screenshot(const char* path) {
 int main(int argc, char** argv) {
     int smoke_frames = -1;
     bool engine_camera = true;
+    bool rt_bench = false;
+    // --rt-bench N reuses the smoke driver wholesale (fixed timestep,
+    // deterministic environment pins, settings persistence off), so it sets the
+    // same frame counter; the flag is what swaps the fence behaviour and the
+    // end-of-run output.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--build-pack") == 0) {
             if (i + 1 >= argc) {
@@ -108,13 +123,32 @@ int main(int argc, char** argv) {
                 }
                 smoke_frames = frames;
             }
+        } else if (std::strcmp(argv[i], "--rt-bench") == 0) {
+            // Frame count is REQUIRED here (unlike --smoke's optional one):
+            // there is no defensible default sample size for a benchmark, and
+            // silently picking one is how misleading numbers get quoted.
+            if (i + 1 >= argc) {
+                std::cerr << "--rt-bench needs a frame count\n";
+                return 2;
+            }
+            const char* arg = argv[++i];
+            const char* arg_end = arg + std::strlen(arg);
+            int frames = 0;
+            auto [parse_end, ec] = std::from_chars(arg, arg_end, frames);
+            if (ec != std::errc{} || parse_end != arg_end || frames <= 0) {
+                std::cerr << "invalid --rt-bench frame count (expected a positive integer): " << arg
+                          << "\n";
+                return 2;
+            }
+            smoke_frames = frames;
+            rt_bench = true;
         } else {
             std::cerr << "unknown argument: " << argv[i] << "\n";
             return 2;
         }
     }
 
-    playground::PlaygroundGame game(smoke_frames, engine_camera);
+    playground::PlaygroundGame game(smoke_frames, engine_camera, rt_bench);
     if (!game.init_engine()) {
         return 1;
     }
@@ -126,7 +160,10 @@ int main(int argc, char** argv) {
     game.stop();
     game.shutdown_engine();
 
-    if (smoke_frames > 0 && !verify_smoke_screenshot(playground::PlaygroundGame::SMOKE_SCREENSHOT_PATH)) {
+    // The bench run takes no screenshot — capturing one blocks the frame on the
+    // GPU, which is the one thing a timing run must not do.
+    if (smoke_frames > 0 && !rt_bench &&
+        !verify_smoke_screenshot(playground::PlaygroundGame::SMOKE_SCREENSHOT_PATH)) {
         return 1;
     }
     return 0;

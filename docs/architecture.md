@@ -40,7 +40,7 @@ Root namespace `bracken`, one sub-namespace per module.
 | `async_model_loader.hpp` (@root) | `bracken` | decodes models on the job pool and uploads at the frame fence. Registration is in REQUEST order, not completion order — handles end up inside draw commands, so completion-order registration made the frame's content differ per run |
 | `core/random.hpp` | `core` | `Rng` (SplitMix64). Deterministic **by seed**, deliberately not by deriving values from game state — a scatter derived from one coordinate is constant whenever that coordinate is |
 | `mesh_simplify.hpp` (@root) | `bracken` | vertex-clustering mesh simplification, used to generate LOD levels at load time without an asset pipeline. Deterministic; averages each cell rather than picking a member, so the simplified surface stays centred on the original |
-| `render/raytracing/` | `render::rt` | software BVH for compute-shader ray tracing: 32-byte nodes (two per cache line), binned-SAH builder, and a two-level BLAS/TLAS split. SDL3 GPU exposes no hardware ray tracing, so the acceleration structure is the engine's own — see "Ray tracing" |
+| `render/raytracing/` | `render::rt` | software BVH for compute-shader ray tracing: a binned-SAH builder over 32-byte one-AABB nodes (`bvh.hpp`), converted at upload to the 64-byte both-children traversal node the GPU walks (`bvh_gpu.hpp`), and a two-level BLAS/TLAS split. SDL3 GPU exposes no hardware ray tracing, so the acceleration structure is the engine's own — see "Ray tracing" |
 | `navigation/` | `nav` | `NavGrid` — walkability sampled from a height function, plus A* with string-pulled paths. A grid rather than a polygon navmesh: it is built from the height function the engine already has and is trivially inspectable; the limitation (one height per cell, so no bridges over roads) is stated rather than hidden |
 | `physics/` | `physics` | `PhysicsWorld` (glm-only pimpl over vendored **Jolt Physics** — linked PRIVATE, Jolt never in public headers). `physics/internal/` holds the `JoltJobSystem` bridge onto `core::jobs::JobSystem` — the one header in the tree that includes Jolt (see "Physics" below) |
 | `dev/` | `dev` | `DevUI` — the Dear ImGui developer overlay (F10 in the playground) — and `dev_panels` (the built-in Stats / Environment / Graphics / Camera panels). Compiles to a no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`; ImGui appears only in `dev/*.cpp`, never in a header |
@@ -639,19 +639,79 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    without the gate the forward pass would sample the AO of whatever is
    BEHIND the surface).
 7b. **`RT shadows` / `RT reflections`** (only when `rt_shadows` or
-   `rt_reflections` is on) — `render::RtRenderer`, two compute dispatches over
-   the engine's own software BVH (SDL3 GPU exposes no hardware ray tracing).
-   Both read the prepass depth; reflections additionally require the prepass
-   G-buffer and are skipped without it. Recorded after GTAO and before the
-   forward pass, outside any render pass (a compute pass requires that).
-   * The shadow pass writes an **R8 visibility mask** (1 = lit) at its own
-     resolution — half res by default — published as
-     `frame_rt_shadow_texture_`. Every opaque sun-shadow receiver samples it
-     with a NORMALIZED UV: model/instanced slot **10**, terrain slot **8**, and
-     grass slot **6**. Traced visibility *replaces* the cascade result rather
-     than multiplying with it, so terrain and grass still receive RT shadows
-     when CSM and GTAO are both disabled. A 1x1 white dummy is bound when the
-     feature is off.
+   `rt_reflections` is on) — `render::RtRenderer`, a chain of compute
+   dispatches over the engine's own software BVH (SDL3 GPU exposes no hardware
+   ray tracing). Both read the prepass depth **and the prepass G-buffer**,
+   which is why the G-buffer is now allocated for either feature rather than
+   for reflections alone. Recorded after GTAO and before the forward pass,
+   outside any render pass (a compute pass requires that).
+   * **Both signals are stochastic and denoised.** The shadow ray is jittered
+     across the sun's disk and the reflection ray importance-samples the GGX
+     lobe, one sample per pixel per frame each. A single sample of either is
+     pure noise; the denoisers are not a polish step but a load-bearing part
+     of the algorithm, and neither signal is viewable without them.
+   * The shadow chain is four dispatches: **trace** (writes one visibility BIT
+     per pixel, 8×4 pixels packed per `R32_UINT` tile) → **classify** (per-tile
+     uniform/mixed verdict over a 3×3 tile neighbourhood) → **temporal**
+     (velocity reprojection + mean/second-moment accumulation) → **filter**
+     (variance-guided, fused with the upsample). Only the filter needs wave
+     intrinsics, and it is the one shader in the tree compiled against
+     Vulkan 1.1 — see `SHADER_WAVE_OPS` in `shaders/CMakeLists.txt`.
+   * The filter publishes a **full-resolution R8 visibility mask** (1 = lit) as
+     `frame_rt_shadow_texture_`. It was half-res and consumed with a plain
+     bilinear tap, which crawled along every silhouette under camera motion
+     because bilinear weights cannot see a depth edge; the upsample is now part
+     of the filter's own depth-aware weighting. Every opaque sun-shadow
+     receiver samples it with a NORMALIZED UV: model/instanced slot **10**,
+     terrain slot **8**, and grass slot **6** — unchanged, because that UV math
+     was always resolution-independent. Traced visibility *replaces* the
+     cascade result rather than multiplying with it, so terrain and grass still
+     receive RT shadows when CSM and GTAO are both disabled. A 1x1 white dummy
+     is bound when the feature is off.
+   * The two traced passes share ONE copy of the BVH walk. `rt_trace.hlsli`
+     owns the node/triangle/instance structs, the slab test, the octahedral
+     decode, the any-hit walk (`sceneOccluded`, no child ordering) and the
+     closest-hit walk (`sceneClosest`, near-child-first with `hit.t`
+     tightening); the entry shaders keep their own binding blocks and include
+     it in two phases (structs before their `StructuredBuffer` declarations,
+     walks after). It used to be copy-pasted into both, and the copies had
+     already drifted — only one of them had the child ordering.
+   * The node the GPU walks is **64 bytes and carries both children**
+     (`BvhNodeGpu`, `render/raytracing/bvh_gpu.hpp`): two AABBs, two links, so
+     one fetch resolves a binary decision instead of a node fetch followed by
+     two dependent child fetches, and the closest-hit walk gets its ordering
+     from data it already has. A side with `count == 0` is an interior link,
+     `count > 0` a leaf's primitive window — so leaves live in their parent,
+     are intersected inline and never reach the stack. The CPU **build**
+     format stays the 32-byte one-AABB `BvhNode`; `convert_to_gpu_nodes` maps
+     one new node per old INTERIOR node when `RtScene` uploads (per BLAS at
+     build time, per TLAS rebuild otherwise — two linear passes, ~5 % of the
+     binned-SAH build it follows). Node count halves as the node doubles, so
+     the buffers are the same size, and `RtSceneStats::blas_nodes`/`tlas_nodes`
+     count what is uploaded. A tree whose root is itself a leaf (one-triangle
+     BLAS, one-instance TLAS) has no interior node to fold into, so one node is
+     emitted with the real leaf on the left and an unreachable sentinel leaf on
+     the right. Stacks are 64 entries: the builder caps depth at 64, and the
+     walk defers at most ONE side per visit where the old one pushed two.
+     `bvh_gpu_layout.test.cpp` is the gate — it mirrors the HLSL walk in C++
+     over the production conversion and checks it against a reference
+     traversal of the 32-byte tree, ray for ray.
+   * The reflection chain is **trace → temporal**. The trace writes two
+     read-write targets: the RGBA16F raw radiance, and an R16F **hit distance**
+     normalized by the ray's max distance (1.0 on a miss or any early-out).
+     Nothing consumes the second one yet — it is produced now because the
+     virtual-hit-point reprojection the temporal pass wants next needs the
+     reflected point's distance, and the trace is the only place it is free.
+     The temporal pass reprojects
+     through velocity and constrains the history to its own neighbourhood's
+     colour range (a TAA-style clamp) rather than to a depth test: what
+     invalidates a reflection is the REFLECTED content changing, which a depth
+     test on the receiving surface cannot see — a mirror can be perfectly
+     static while everything in it moves. Its output carries the accumulated
+     sample count in alpha, which the resolve already treated purely as a
+     validity test. The water reflection path is deliberately NOT denoised: it
+     writes the same target with different alpha semantics (an SSR/IBL
+     hand-off weight), so the resolve falls back to the raw trace for it.
    * That mask was formerly **RG8 with GTAO copied through in R**, so the
      forward stage could read both from one sampler. It is not, and must not
      be again: the copy indexed the AO texture with a texel coordinate scaled
@@ -829,6 +889,197 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
 `contracts/frustum.hpp` extracts planes from `view_projection`. Culling runs on
 the CPU for the main view and independently per shadow cascade during
 instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
+
+---
+
+## Ray tracing
+
+**SDL3 GPU has no hardware ray tracing**, on any backend. There is no
+acceleration-structure API, no ray pipeline, no shader table. Every ray in this
+engine is compute-shader arithmetic against buffers the engine builds and
+uploads itself, and everything below follows from that.
+
+Both traced effects are **off by default** and independently switchable
+(`GraphicsSettings::rt_shadows`, `rt_reflections`). Nothing is allocated and no
+structure is built until one of them is on.
+
+### The two-level BVH
+
+Two node formats, and the split is deliberate.
+
+- **Build format**, `BvhNode` (`render/raytracing/bvh.hpp`): 32 bytes — one
+  AABB, `left_first`, `count`, with siblings adjacent so the right child is
+  `left + 1`. Built by binned SAH (`BvhBuildOptions`: 16 bins per axis, leaf at
+  ≤ 4 triangles, `max_depth` 64). The builder is **deterministic** — the same
+  mesh always produces the same tree, which is what lets a traced frame sit
+  inside the smoke gate. Triangles are stored as `BvhTriangle`, 48 bytes in
+  Möller–Trumbore form (v0 / e1 / e2 + `prim_id`).
+- **Traversal format**, `BvhNodeGpu` (`render/raytracing/bvh_gpu.hpp`): 64
+  bytes holding *both* children's AABBs and links —
+  `{lmin, lchild, lmax, lcount, rmin, rchild, rmax, rcount}`, where `count == 0`
+  on a side means "interior, `child` is that child's own node" and `count > 0`
+  means "leaf, `child` is its first primitive". One fetch resolves a binary
+  decision, leaves never occupy a node or a stack slot, and the closest-hit
+  walk's near-first ordering comes from data already in hand.
+  `convert_to_gpu_nodes` maps one new node per old *interior* node in two
+  linear passes. Only interior nodes survive, so node count roughly halves as
+  the node doubles and the buffers do not grow. A degenerate root (single-leaf
+  BLAS, single-instance TLAS) is encoded as one node with the real leaf on the
+  left and an unreachable sentinel leaf on the right, rather than as a case in
+  every walk. Traversal stacks are 64 entries, which is a proof rather than a
+  guess: a visit defers at most one side, so `max_depth` 64 with the root at
+  depth 0 bounds a root-to-leaf path at 64 converted nodes.
+
+`RtScene` (`render/raytracing/rt_scene.hpp`) owns both levels.
+`build_blas_for_models` builds one BLAS per model, fanned out over the job
+pool, and **concatenates every BLAS into one node buffer and one triangle
+buffer** — a compute shader has a fixed binding set and cannot rebind per
+instance, so each model records only its offsets into the shared buffers and
+traversal adds them.
+
+`set_instances` rebuilds the TLAS **only when the FNV-1a content hash of the
+`(handle, transform)` list changes.** That skip is a load-bearing performance
+contract, not an optimization: the renderer hands this the whole model-command
+list on every traced frame, so without it a village that never moves would pay
+a full binned-SAH build on the main thread every frame forever.
+`RtSceneStats::tlas_builds` exists so that contract can be asserted on — a
+static scene must read 1 no matter how many frames pass. `upload` writes a
+changed TLAS into the frame's own command buffer through persistent grow-only
+buffers, so a moving scene costs one copy rather than two buffer creations plus
+a mid-frame submit.
+
+Per-triangle shading attributes (`TriangleAttributes`, 64 B: three normals plus
+one flat base colour baked at load from the albedo texture's centroid-UV
+sample, via `internal/model_material_proxy.hpp`) are **optional and gathered
+only when reflections are on** — a shadow ray asks a yes/no question and needs
+none of it. That is why enabling reflections after the structure was built for
+shadows alone forces a rebuild (`SceneRenderer::ensure_raytracing_scene`
+handles this, so a runtime toggle works without host cooperation).
+
+The structure's cost is itemized in `RtStats` (`render/rt_renderer.hpp`):
+`blas_bytes`, `attribute_bytes` and `tlas_bytes`, summing to
+`acceleration_bytes`. The three have separate levers — BLAS follows the loaded
+model set, attributes exist only because reflections are on, and TLAS follows
+the per-frame instance count.
+
+### The two traced effects
+
+Both are **one sample per pixel, stochastic, and denoised**, which makes the
+denoisers load-bearing rather than polish. `RtRenderer`
+(`render/rt_renderer.hpp`) drives both; they share one `RtScene`, so enabling
+the second costs a second dispatch rather than a second structure. Traversal
+code common to both lives in `shaders/rt_trace.hlsli`; sampling sequences live
+in `shaders/rt_sampling.hlsli`. Traced resolution is per-effect
+(`RtResolution`: Full / Half / Quarter, both defaulting to Full) and is the
+dominant ray-count dial.
+
+**Sun shadows** (`shaders/rt_shadow.comp.hlsl`). No primary rays — world
+position comes from the depth prepass. **Any-hit** traversal with no child
+ordering, N·L and sky rejection before traversal, slope-scaled normal bias, and
+one ray jittered across the solar disk (`RtShadowSettings::sun_angular_radius_degrees`,
+surfaced as `GraphicsSettings::rt_sun_softness_deg`) so that a single ray per
+pixel integrates into a real penumbra over time. Output is 1 bit per pixel
+packed 8×4 per uint. The denoiser chain is tile classify
+(`shaders/rt_shadow_denoise_classify.comp.hlsl`) → temporal
+(`shaders/rt_shadow_denoise_temporal.comp.hlsl`; mean / moment / count / depth
+history in RGBA16F, reprojected through the prepass velocity buffer) →
+variance-guided spatial filter fused with the upsample
+(`shaders/rt_shadow_denoise_filter.comp.hlsl`) to a full-res **R8 mask**.
+
+That mask **replaces** the CSM term in the forward shaders rather than
+combining with it (fragment sampler slots: model/instanced 10, terrain 8, grass
+6). Two consequences worth holding onto: anything absent from the instance list
+has *no* sun shadow rather than falling back to cascades, and beyond
+`RtShadowSettings::max_distance` the cascades take over.
+
+**Reflections** (`shaders/rt_reflection.comp.hlsl`). GGX visible-NDF importance
+sampling, closest-hit traversal with near-child-first ordering and
+`hit.t`-tightened culling, and a roughness-gated handover to the prefiltered IBL
+probe — `shaders/reflection_gate.hlsli` is shared by the compute pass and the
+forward shaders precisely so the traced weight and the IBL weight always sum to
+one (a hard cutoff put a visible seam through any surface whose roughness
+crossed it). Hit shading is the interpolated `TriangleAttributes` normal and
+flat colour lit by sun N·L with **no visibility test**, plus a flat ambient.
+Denoise is temporal only (σ-clamped neighbourhood, accumulation count in
+alpha), then a full-res material/depth/normal-guided resolve
+(`shaders/rt_reflection_resolve.frag.hlsl`) evaluates the *receiver* BRDF. A
+separate analytic water path (`RtWaterReceiver`,
+`RtRenderer::render_water_reflections`) reuses the same target undenoised,
+because its alpha carries a handoff weight rather than a sample count.
+
+**Hit distance.** The reflection trace writes each pixel's normalized hit
+distance (`hit.t / max_distance`, 1.0 on a miss or any early-out) to a second
+R16F target at the traced resolution, exposed as
+`RtRenderer::reflection_hit_distance`. **Nothing consumes it yet.** It exists
+because that is the one point in the frame where the number is free, and
+virtual-hit-point reprojection — reprojecting the reflected point rather than
+the surface carrying it — is what stops low-roughness reflections smearing
+under camera motion. Producing it now means that lands as a denoiser change
+rather than as a change to the traversal everything depends on.
+
+**Determinism.** Both passes seed from their own frame counter, so a traced
+frame is reproducible and the smoke gate applies to it unchanged.
+
+### Instance range — `rt_max_instance_range`
+
+`SceneRenderer::refresh_raytracing_instances` builds the instance list straight
+off the sealed packet's model and skinned draw commands, so the traced scene
+cannot desync from the rasterized one. `GraphicsSettings::rt_max_instance_range`
+(`RtRange`: Near / Medium / Far / **Unlimited**, the default) caps how far an
+instance may be from the camera and still be traced; `rt_range_units`
+(`contracts/graphics_settings.hpp`) maps it to world units on the
+`draw_distance_units` scale, with `Unlimited` returning infinity so the use site
+tests `std::isfinite` and skips the filter entirely.
+
+Distance is measured to the instance's world-space **bounds**, from the same
+`Model::bounding_center` / `bounding_half_diag` pair the main-view cull uses, so
+a large building near the threshold never pops; a model the manager cannot
+resolve has no bounds and is kept. The filter runs **before**
+`RtScene::set_instances`, so the content hash sees the filtered list.
+
+That last point is also the knob's price, and it is a real trade: with a finite
+range the instance list becomes a function of camera position, so a camera
+crossing the threshold changes the list and correctly re-triggers a TLAS
+rebuild that `Unlimited` never pays on a static scene. In exchange it cuts both
+traversal and TLAS size. Distant sun shadows keep coming from the cascade maps,
+which already outrange the traced mask.
+
+### Timing and instrumentation
+
+Three entries appear in `RenderStats::pass_times_ms` when tracing:
+**`RTInstances`** (the CPU-side range filter, content hash and any rebuild),
+**`RTShadows`** (trace plus the three denoiser dispatches) and
+**`RTReflectionTrace`** (trace plus its temporal denoise); the full-res resolve
+is separately timed as `RTReflectionResolve`. The two inside `RtRenderer` are
+timed there rather than at the call site because `SceneRenderer` makes one
+`render()` call for both signals and cannot tell them apart —
+`RtRenderer::set_timer_pool` lends it the scene renderer's timeline, and a null
+pool times nothing. As everywhere else in this engine these are **CPU record
+times**; there is no GPU-side number to report.
+
+The playground's `--rt-bench N` flag (`examples/playground/main.cpp`) is the
+measurement jig: a pinned camera, no screenshot, none of the smoke run's
+scripted mid-run settings flips, and a machine-readable per-pass mean/p95 table
+at exit. `PLAYGROUND_RT` selects which effects run and `PLAYGROUND_RT_RANGE`
+pins the range enum.
+
+### Known limits
+
+- **Skinned meshes trace their bind pose.** The BLAS is built from the model's
+  bind-pose CPU geometry, so the shadow an animated character casts is its bind
+  pose translated and rotated into place. It tracks the character around the
+  world and does not animate with it. Because the traced mask *replaces* CSM,
+  this is not a fallback — it is the shadow. Fixing it means re-skinning the
+  vertices and refitting the BVH every frame.
+- **A ray hit cannot sample textures.** No UVs, no material index, no bindless.
+  Hit shading is an interpolated normal and one flat colour per triangle, full
+  stop.
+- **Reflection hit lighting is unshadowed and its ambient is a constant**, so
+  reflections show neither cast shadows nor bounced light.
+- **Ray tracing requires the CPU geometry the BVH is built from.** A host must
+  call `ModelManager::set_retain_cpu_geometry(true)` (`model_loader.hpp`)
+  *before* loading, or the builder finds nothing to build from and says so
+  rather than producing an empty structure.
 
 ---
 
@@ -1292,8 +1543,8 @@ lock-free design of plan §7:
 - **Memory-model discipline**: every atomic documents its protocol (what it
   publishes, its ordering, its release/acquire pairing partner) at its
   declaration; bare `seq_cst` in a hot path requires a justifying comment.
-  Race-shaped stress tests per primitive plus the TSan lane (`cmake --preset
-  tsan`) guard the protocols.
+  Race-shaped stress tests per primitive plus a TSan run (reconfigure `build/`
+  with `-DCMAKE_{C,CXX}_FLAGS=-fsanitize=thread`) guard the protocols.
 
 **Wait semantics are unchanged**: `wait(handle)` is a helping wait (drains
 own deque, injection queue, then steals; parks when there is nothing to
@@ -1406,6 +1657,19 @@ debugging "why is this value zero / where did my draw go":
   model's bounding-sphere center); overlapping transparent geometry can still
   blend in the wrong order. Shadow passes still alpha-test `BLEND` casters at
   0.5 rather than rendering translucent shadows.
+- **Ray-traced sun shadows of skinned meshes are the BIND POSE** — the BLAS is
+  built from the model's bind-pose CPU geometry, so an animated character's
+  traced shadow tracks it around the world but does not animate with it. And
+  because the traced mask *replaces* the cascade term rather than combining
+  with it, this is not a degradation to CSM — it is the shadow. Same reason,
+  same place: an instance dropped by `rt_max_instance_range` has no traced sun
+  shadow at all beyond the cutoff, which is why the cascades are still running.
+  See "Ray tracing".
+- **Ray tracing silently builds nothing without retained CPU geometry** — the
+  BVH is built from the model's CPU-side triangles, which are freed at GPU
+  upload unless `ModelManager::set_retain_cpu_geometry(true)`
+  (`model_loader.hpp`) was set *before* the load. Models in that state are
+  skipped with a warning rather than contributing an empty BLAS.
 - **The IBL cubemaps contain the procedural sky only** — no scene geometry
   (no reflection probes/SSR): metals mirror the open sky even indoors, and
   the reflected clouds are frozen at the last chain refresh (cloud scroll

@@ -20,27 +20,15 @@
 //    so a ray that escapes the scene is not a black hole in the reflection.
 
 #include "reflection_gate.hlsli"
+#include "rt_sampling.hlsli"
 
-static const uint TLAS_STACK = 32;
-static const uint BLAS_STACK = 32;
-static const float RAY_EPSILON = 0.02;
+// The BVH structs and the traversal walks are shared with rt_shadow.comp.hlsl
+// — see rt_trace.hlsli for why it is included in two phases.
+#define RT_TRACE_TYPES
+#include "rt_trace.hlsli"
 
-struct BvhNode {
-    float3 boundsMin;
-    uint leftFirst;
-    float3 boundsMax;
-    uint count;
-};
-
-struct BvhTriangle {
-    float3 v0;
-    float pad0;
-    float3 e1;
-    uint primId;
-    float3 e2;
-    float pad2;
-};
-
+// Stays here: only reflections bind the attribute buffer, and hit SHADING is
+// this pass's business, not the traversal's.
 struct TriangleAttributes {
     float3 n0;
     float pad0;
@@ -49,14 +37,6 @@ struct TriangleAttributes {
     float3 n2;
     float pad2;
     float4 baseColor;
-};
-
-struct TlasInstance {
-    float4x4 worldToModel;
-    float3 boundsMin;
-    uint blasNodeOffset;
-    float3 boundsMax;
-    uint blasTriangleOffset;
 };
 
 [[vk::binding(0, 2)]]
@@ -78,6 +58,8 @@ cbuffer RtReflectionUniforms : register(b0, space2) {
     float4 waterSimWindow;  // min XZ, inverse extent, edge fade width
     float4 waterFlowTime;   // flow XZ, speed, absolute time
     float4 waterDetail;     // detail strength, receiver mode, visibility bias, unused
+    uint frameIndex;        // advances the GGX sample sequence
+    float3 _pad1;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
@@ -88,158 +70,25 @@ SamplerState sceneDepthSampler : register(s0, space0);
 Texture2D<float4> sceneNormal : register(t1, space0);
 [[vk::combinedImageSampler]][[vk::binding(1, 0)]]
 SamplerState sceneNormalSampler : register(s1, space0);
-[[vk::binding(2, 0)]] StructuredBuffer<BvhNode> tlasNodes : register(t2, space0);
+[[vk::binding(2, 0)]] StructuredBuffer<BvhNodeGpu> tlasNodes : register(t2, space0);
 [[vk::binding(3, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t3, space0);
-[[vk::binding(4, 0)]] StructuredBuffer<BvhNode> blasNodes : register(t4, space0);
+[[vk::binding(4, 0)]] StructuredBuffer<BvhNodeGpu> blasNodes : register(t4, space0);
 [[vk::binding(5, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t5, space0);
 [[vk::binding(6, 0)]] StructuredBuffer<TriangleAttributes> blasAttributes : register(t6, space0);
 
 [[vk::binding(0, 1)]] RWTexture2D<float4> reflectionOut : register(u0, space1);
+// Normalized hit distance (hit.t / rayMaxDistance), 1.0 on a miss or any
+// early-out. R16F, traced resolution, written by every in-bounds thread so the
+// target never carries a stale frame's geometry. NOTHING CONSUMES IT YET: it
+// exists because R3's virtual-hit-point reprojection needs the reflected
+// point's distance to reproject the *virtual* position rather than the surface
+// carrying it, and the trace is the only place that number is free. Writing it
+// now keeps that from being a change to the traversal later.
+[[vk::binding(1, 1)]] RWTexture2D<float> reflectionHitDistance : register(u1, space1);
 
-struct Hit {
-    float t;
-    // NOTE: not named `triangle` — that is a reserved HLSL keyword (a
-    // geometry-shader primitive modifier) and the error it produces
-    // ("modifiers must appear before type") does not mention the name.
-    uint triIndex;   // absolute index into blasTriangles / blasAttributes
-    uint instanceIndex; // TLAS instance whose transform owns triIndex
-    float2 bary;     // u, v
-    bool valid;
-};
-
-bool slabTest(float3 boundsMin, float3 boundsMax, float3 origin, float3 invDir, float tMax,
-              out float tNear) {
-    float3 t0 = (boundsMin - origin) * invDir;
-    float3 t1 = (boundsMax - origin) * invDir;
-    float3 tsmall = min(t0, t1);
-    float3 tbig = max(t0, t1);
-    tNear = max(max(tsmall.x, tsmall.y), max(tsmall.z, 0.0));
-    float tFar = min(min(tbig.x, tbig.y), min(tbig.z, tMax));
-    return tNear <= tFar;
-}
-
-// Closest hit within one BLAS. `hit` carries the running best so a later
-// instance cannot overwrite a nearer one.
-void blasClosest(uint nodeOffset, uint triangleOffset, float3 origin, float3 dir, float scale,
-                 inout Hit hit) {
-    float3 invDir = 1.0 / dir;
-
-    uint stack[BLAS_STACK];
-    uint sp = 0;
-    stack[sp++] = nodeOffset;
-
-    while (sp > 0) {
-        BvhNode node = blasNodes[stack[--sp]];
-
-        float tNear;
-        // Cull against the CURRENT best distance, so as the search tightens it
-        // rejects more of the tree. This is the closest-hit equivalent of the
-        // shadow ray's early-out and the main reason it is not far worse.
-        if (!slabTest(node.boundsMin, node.boundsMax, origin, invDir, hit.t * scale, tNear)) {
-            continue;
-        }
-
-        if (node.count == 0) {
-            if (sp + 2 <= BLAS_STACK) {
-                stack[sp++] = nodeOffset + node.leftFirst;
-                stack[sp++] = nodeOffset + node.leftFirst + 1;
-            }
-            continue;
-        }
-
-        for (uint i = 0; i < node.count; ++i) {
-            uint index = triangleOffset + node.leftFirst + i;
-            BvhTriangle tri = blasTriangles[index];
-
-            float3 pv = cross(dir, tri.e2);
-            float det = dot(tri.e1, pv);
-            if (abs(det) < 1e-8) {
-                continue;
-            }
-            float invDet = 1.0 / det;
-            float3 tv = origin - tri.v0;
-            float u = dot(tv, pv) * invDet;
-            if (u < 0.0 || u > 1.0) {
-                continue;
-            }
-            float3 qv = cross(tv, tri.e1);
-            float v = dot(dir, qv) * invDet;
-            if (v < 0.0 || u + v > 1.0) {
-                continue;
-            }
-            float t = dot(tri.e2, qv) * invDet;
-            // Model-space t converted back to world scale before comparing.
-            float worldT = t / scale;
-            if (t > RAY_EPSILON && worldT < hit.t) {
-                hit.t = worldT;
-                hit.triIndex = index;
-                hit.bary = float2(u, v);
-                hit.valid = true;
-            }
-        }
-    }
-}
-
-Hit sceneClosest(float3 origin, float3 dir, float tMax) {
-    Hit hit;
-    hit.t = tMax;
-    hit.triIndex = 0;
-    hit.instanceIndex = 0;
-    hit.bary = float2(0, 0);
-    hit.valid = false;
-
-    if (tlasNodeCount == 0) {
-        return hit;
-    }
-    float3 invDir = 1.0 / dir;
-
-    uint stack[TLAS_STACK];
-    uint sp = 0;
-    stack[sp++] = 0;
-
-    while (sp > 0) {
-        BvhNode node = tlasNodes[stack[--sp]];
-
-        float tNear;
-        if (!slabTest(node.boundsMin, node.boundsMax, origin, invDir, hit.t, tNear)) {
-            continue;
-        }
-
-        if (node.count == 0) {
-            if (sp + 2 <= TLAS_STACK) {
-                stack[sp++] = node.leftFirst;
-                stack[sp++] = node.leftFirst + 1;
-            }
-            continue;
-        }
-
-        for (uint i = 0; i < node.count; ++i) {
-            uint instanceIndex = node.leftFirst + i;
-            TlasInstance inst = tlasInstances[instanceIndex];
-            float3 mOrigin = mul(inst.worldToModel, float4(origin, 1.0)).xyz;
-            float3 mDir = mul(inst.worldToModel, float4(dir, 0.0)).xyz;
-            float scale = length(mDir);
-            if (scale < 1e-8) {
-                continue;
-            }
-            float previousT = hit.t;
-            blasClosest(inst.blasNodeOffset, inst.blasTriangleOffset, mOrigin, mDir / scale, scale, hit);
-            if (hit.t < previousT) {
-                hit.instanceIndex = instanceIndex;
-            }
-        }
-    }
-    return hit;
-}
-
-// Inverse of octEncode in prepass_gbuffer.frag.hlsl.
-float3 octDecode(float2 e) {
-    e = e * 2.0 - 1.0;
-    float3 n = float3(e.xy, 1.0 - abs(e.x) - abs(e.y));
-    float t = saturate(-n.z);
-    n.xy += select(n.xy >= 0.0, float2(-t, -t), float2(t, t));
-    return normalize(n);
-}
+// The buffers and `tlasNodeCount` above are what the walks bind to.
+#define RT_TRACE_TRAVERSAL
+#include "rt_trace.hlsli"
 
 // Must stay operation-identical to water.frag.hlsl. The analytic receiver
 // uses this normal for the ray; the water forward pass uses it for Fresnel,
@@ -357,12 +206,14 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (waterDetail.y > 0.5) {
         if (!waterReceiver(ndc, depth, worldPos, normal, roughness)) {
             reflectionOut[coord] = float4(0, 0, 0, 0);
+            reflectionHitDistance[coord] = 1.0;
             return;
         }
     } else {
         // Reversed-Z: 0 is the far plane. Sky reflects nothing.
         if (depth <= 0.0) {
             reflectionOut[coord] = float4(0, 0, 0, 0);
+            reflectionHitDistance[coord] = 1.0;
             return;
         }
         float4 gbuf = sceneNormal.Load(int3(depthCoord, 0));
@@ -382,14 +233,51 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float gate = rtReflectionWeight(roughness, fadeStart, maxRoughness);
     if (gate <= 0.0) {
         reflectionOut[coord] = float4(0, 0, 0, 0);
+        reflectionHitDistance[coord] = 1.0;
         return;
     }
 
     float3 viewDir = normalize(worldPos - cameraPosition);
-    float3 rayDir = reflect(viewDir, normal);
+
+    // GGX IMPORTANCE SAMPLING, not a mirror ray. A single reflect() about the
+    // surface normal is only correct for a perfect mirror; every rougher
+    // surface has a LOBE, and collapsing it to its axis is why the roughness
+    // gate had to be held down at 0.55 — anything blurrier than that looked
+    // wrong, so it was handed to the IBL probe instead.
+    //
+    // Sampling the VISIBLE normal distribution (Heitz 2018) rather than the
+    // full NDF matters at grazing angles, where half the NDF's samples point
+    // into the surface and would have to be discarded.
+    float3 rayDir;
+    {
+        const float alpha = max(roughness * roughness, 1e-4);
+        float3 tangent, bitangent;
+        buildBasis(normal, tangent, bitangent);
+        // View vector pointing FROM the surface toward the camera.
+        const float3 v = -viewDir;
+        const float3 vTangent =
+            float3(dot(v, tangent), dot(v, bitangent), dot(v, normal));
+        const float2 xi = rtSample2D(uint2(coord), frameIndex);
+        const float3 hTangent = sampleGGXVndf(vTangent, alpha, xi);
+        const float3 h = hTangent.x * tangent + hTangent.y * bitangent + hTangent.z * normal;
+        rayDir = reflect(viewDir, h);
+        // A sampled half-vector can still put the ray under the horizon on a
+        // grazing pixel. Fall back to the mirror direction rather than tracing
+        // a ray that starts by entering the surface it came from.
+        if (dot(rayDir, normal) <= 0.0) {
+            rayDir = reflect(viewDir, normal);
+        }
+    }
+
     float3 rayOrigin = worldPos + normal * normalBias;
 
     Hit hit = sceneClosest(rayOrigin, rayDir, rayMaxDistance);
+
+    // Normalized so the target stays format-independent and the consumer only
+    // ever needs `rayMaxDistance` to recover metres. A miss is 1.0 rather than
+    // 0.0 because "as far as the ray could see" is the useful answer for a
+    // reprojection: it reads as the sky, which is at infinity.
+    reflectionHitDistance[coord] = hit.valid ? (hit.t / rayMaxDistance) : 1.0;
 
     if (!hit.valid) {
         // Water already owns a high-quality SSR/IBL fallback. Leave alpha at

@@ -82,6 +82,11 @@ Read the doc that matches the task before diving into code:
   Prepare-stage fan-out, and the pipelined frame — `on_simulate` overlapping
   the previous frame's rendering). Read §7
   (synchronization design) before touching any concurrency code.
+- [docs/rt_lighting_plan.md](docs/rt_lighting_plan.md) — **the plan of record
+  for the ray-traced lighting system** (no phase landed yet): probe-field GI,
+  froxel-reservoir local-light shadows, hit-lighting upgrades, screen-probe
+  gather, denoiser evolution, scalability tiers. Read it before touching
+  anything under `render/raytracing/` or the `rt_*` shaders.
 - [docs/skinned_mesh_format.md](docs/skinned_mesh_format.md) — the `.glb`
   authoring contract (bones, channels, clip naming, IK bone names).
 - [docs/effects_system.md](docs/effects_system.md) — particle effects:
@@ -107,7 +112,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `memory/` | `bracken::memory` | arena allocator, frame allocator |
 | `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) over `pipeline_catalog.hpp` (one `constexpr` row per `PipelineType`: shaders, resources, vertex layout, target, depth/blend state), `gpu_uniforms.hpp` (CPU↔GPU contract) |
 | `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO, TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas |
-| `render/raytracing/` | `render::rt` | software BVH (32-byte nodes, binned SAH, two-level BLAS/TLAS) + `RtScene`; `render/rt_renderer.hpp` drives the two compute passes. **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
+| `render/raytracing/` | `render::rt` | software BVH (32-byte nodes, binned SAH, two-level BLAS/TLAS) + `RtScene`; `render/rt_renderer.hpp` drives the traced passes and their denoisers. **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when an instance actually moves (content hash), which is what keeps a static scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
 | `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
 | `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
@@ -357,11 +362,11 @@ Env: `BRACKEN_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.
 `hardware_concurrency()-1`, min 1; `=1` is the single-worker debug mode —
 same code path, one worker).
 
-A `CMakePresets.json` (version 6) at the repo root defines **one** tree,
-`build/`, configured by the `default` preset. There is no preset zoo and no
-second directory: five parallel trees meant five things that could disagree
-with each other and with the documentation describing them, and four of them
-were stale most of the time.
+There is **one** build tree, `build/`, configured by the
+`cmake -S . -B build -G Ninja` line above. There is no preset file, no preset
+zoo and no second directory: five parallel trees meant five things that could
+disagree with each other and with the documentation describing them, and four
+of them were stale most of the time.
 
 Everything the old lanes did is a `-D` flag on the same tree, used when you
 actually need it:

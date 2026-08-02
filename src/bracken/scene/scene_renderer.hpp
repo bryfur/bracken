@@ -525,7 +525,14 @@ private:
     /// Refresh the TLAS from THIS frame's draws — the packet is the source of
     /// truth for what is on screen, so the traced scene cannot desync from the
     /// rasterized one.
-    void refresh_raytracing_instances(const FramePacket& frame);
+    /// @param cmd the frame's command buffer, so a TLAS that actually changed
+    ///   is uploaded into it instead of through its own mid-frame submit.
+    /// @param camera_pos the draw camera's world position, the origin the range
+    ///   filter measures from.
+    /// @param max_range GraphicsSettings::rt_max_instance_range in world units
+    ///   (rt_range_units). Infinity — the default — skips the filter entirely.
+    void refresh_raytracing_instances(const FramePacket& frame, SDL_GPUCommandBuffer* cmd,
+                                      const glm::vec3& camera_pos, float max_range);
     std::unique_ptr<gpu::GPUTexture> default_normal_texture_; // 1x1 (128,128,255) flat tangent-space normal
     std::unique_ptr<gpu::GPUTexture> dummy_black_texture_;    // 1x1 black emissive fallback
     std::unique_ptr<gpu::GPUTexture> dummy_black_cube_;       // 1x1x6 black cube for the IBL slots when

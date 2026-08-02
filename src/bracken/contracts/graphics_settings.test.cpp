@@ -1,4 +1,5 @@
 #include "bracken/contracts/graphics_settings.hpp"
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
@@ -52,6 +53,25 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
     // RayTracingFlagsRoundTrip below.
     EXPECT_FALSE(s.rt_shadows);
     EXPECT_FALSE(s.rt_reflections);
+    // Unlimited by default: the range filter must be inert until dialed, or
+    // adding the knob would silently change what every existing scene traces.
+    EXPECT_EQ(s.rt_max_instance_range, RtRange::Unlimited);
+}
+
+TEST_F(GraphicsSettingsTest, RtRangeUnitsMapping) {
+    // Deliberately DrawDistance table entries — the traced range is meant to be
+    // read against the drawn one, and Far is exactly the D4000 default.
+    EXPECT_FLOAT_EQ(rt_range_units(RtRange::Near), 1000.0f);
+    EXPECT_FLOAT_EQ(rt_range_units(RtRange::Medium), 2000.0f);
+    EXPECT_FLOAT_EQ(rt_range_units(RtRange::Far), 4000.0f);
+    EXPECT_FLOAT_EQ(rt_range_units(RtRange::Far), draw_distance_units(DrawDistance::D4000));
+    // Infinity, not a big number: the use site tests isfinite() and skips the
+    // whole filter rather than comparing every instance against a sentinel.
+    EXPECT_FALSE(std::isfinite(rt_range_units(RtRange::Unlimited)));
+    // Saturating, like shadow_map_texels: a corrupt file or a stray cast can
+    // still present an out-of-range value through this public int-backed enum.
+    EXPECT_FLOAT_EQ(rt_range_units(static_cast<RtRange>(-7)), 1000.0f);
+    EXPECT_FALSE(std::isfinite(rt_range_units(static_cast<RtRange>(99))));
 }
 
 // The rt_* flags are persisted like every other field, which means any run
@@ -62,15 +82,26 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
 TEST_F(GraphicsSettingsTest, RayTracingFlagsRoundTrip) {
     GraphicsSettings written;
     written.rt_shadows = true;
+    written.rt_shadow_resolution = bracken::RtResolution::Full;
+    written.rt_reflection_resolution = bracken::RtResolution::Half;
+    written.rt_sun_softness_deg = 1.25f;
+    written.rt_reflection_max_roughness = 0.42f;
     written.rt_reflections = true;
+    written.rt_max_instance_range = bracken::RtRange::Medium;
     ASSERT_TRUE(written.save(TEST_FILE));
 
     GraphicsSettings read;
     ASSERT_FALSE(read.rt_shadows);
     ASSERT_FALSE(read.rt_reflections);
+    ASSERT_EQ(read.rt_max_instance_range, bracken::RtRange::Unlimited);
     ASSERT_TRUE(read.load(TEST_FILE));
     EXPECT_TRUE(read.rt_shadows);
+    EXPECT_EQ(read.rt_shadow_resolution, bracken::RtResolution::Full);
+    EXPECT_EQ(read.rt_reflection_resolution, bracken::RtResolution::Half);
+    EXPECT_FLOAT_EQ(read.rt_sun_softness_deg, 1.25f);
+    EXPECT_FLOAT_EQ(read.rt_reflection_max_roughness, 0.42f);
     EXPECT_TRUE(read.rt_reflections);
+    EXPECT_EQ(read.rt_max_instance_range, bracken::RtRange::Medium);
 
     // ...and back off again, so a file holding `0` really does clear them
     // rather than leaving the previous value standing.
@@ -79,9 +110,33 @@ TEST_F(GraphicsSettingsTest, RayTracingFlagsRoundTrip) {
     GraphicsSettings reread;
     reread.rt_shadows = true;
     reread.rt_reflections = true;
+    reread.rt_max_instance_range = bracken::RtRange::Near;
     ASSERT_TRUE(reread.load(TEST_FILE));
     EXPECT_FALSE(reread.rt_shadows);
     EXPECT_FALSE(reread.rt_reflections);
+    EXPECT_EQ(reread.rt_max_instance_range, bracken::RtRange::Unlimited);
+}
+
+// An out-of-range value on the wire must land on a real enumerator, not stay
+// castable garbage that then indexes the meters table.
+TEST_F(GraphicsSettingsTest, RtMaxInstanceRangeClampsOnLoad) {
+    {
+        std::ofstream out(TEST_FILE);
+        out << "settings_version=" << GraphicsSettings::CURRENT_SETTINGS_VERSION << "\n";
+        out << "rt_max_instance_range=17\n";
+    }
+    GraphicsSettings read;
+    ASSERT_TRUE(read.load(TEST_FILE));
+    EXPECT_EQ(read.rt_max_instance_range, RtRange::Unlimited);
+
+    {
+        std::ofstream out(TEST_FILE);
+        out << "settings_version=" << GraphicsSettings::CURRENT_SETTINGS_VERSION << "\n";
+        out << "rt_max_instance_range=-3\n";
+    }
+    GraphicsSettings low;
+    ASSERT_TRUE(low.load(TEST_FILE));
+    EXPECT_EQ(low.rt_max_instance_range, RtRange::Near);
 }
 
 TEST_F(GraphicsSettingsTest, GetDrawDistanceMapping) {
@@ -144,6 +199,7 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     original.auto_exposure_max_ev = 6.0f;
     original.auto_exposure_speed_up = 3.0f;
     original.auto_exposure_speed_down = 0.5f;
+    original.rt_max_instance_range = RtRange::Far;
 
     ASSERT_TRUE(original.save(TEST_FILE));
 
@@ -182,6 +238,7 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     EXPECT_FLOAT_EQ(loaded.auto_exposure_max_ev, 6.0f);
     EXPECT_FLOAT_EQ(loaded.auto_exposure_speed_up, 3.0f);
     EXPECT_FLOAT_EQ(loaded.auto_exposure_speed_down, 0.5f);
+    EXPECT_EQ(loaded.rt_max_instance_range, RtRange::Far);
     EXPECT_EQ(loaded.settings_version, GraphicsSettings::CURRENT_SETTINGS_VERSION);
 }
 

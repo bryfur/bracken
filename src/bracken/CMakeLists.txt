@@ -95,6 +95,12 @@ set(ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 # base's typeinfo emitted — keep Jolt's RTTI ABI matched to ours.
 set(CPP_RTTI_ENABLED ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(JoltPhysics)
+# SYSTEM, same reasoning as tinygltf below: Jolt/Core/Array.h trips -Wshadow
+# (GCC flags its `pointer` typedef against the inherited member), and a
+# vendored header must never be able to fail our -Werror build.
+get_target_property(BRACKEN_JOLT_INCLUDES Jolt INTERFACE_INCLUDE_DIRECTORIES)
+set_target_properties(Jolt PROPERTIES
+    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${BRACKEN_JOLT_INCLUDES}")
 
 # Compile shaders (HLSL -> SPIRV) at build time
 # Also fetches SDL_shadercross for both CLI (build-time) and library (runtime)
