@@ -143,10 +143,16 @@ struct RtStats {
     /// is what the rays actually see rather than what the frame drew.
     uint32_t instances = 0;
     /// How many times the TLAS has been rebuilt since startup. A PERFORMANCE
-    /// contract, not a curiosity: a static scene must hold at 1 no matter how
-    /// many frames pass, and a finite rt_max_instance_range is the documented
-    /// way to make it climb. Mirrors rt::RtSceneStats::tlas_builds.
+    /// contract, not a curiosity: a scene whose instance SET is stable must
+    /// hold at 1 no matter how many frames pass or how much moves, and a finite
+    /// rt_max_instance_range is the documented way to make it climb. Mirrors
+    /// rt::RtSceneStats::tlas_builds.
     uint32_t tlas_builds = 0;
+    /// How many times it was refitted instead — same instances, new transforms.
+    /// Only meaningful next to `tlas_builds`: builds≈1 with refits≈frames is
+    /// the healthy reading for a live scene. Mirrors
+    /// rt::RtSceneStats::tlas_refits.
+    uint32_t tlas_refits = 0;
     std::size_t blas_bytes = 0;       ///< concatenated BLAS nodes + triangles
     std::size_t tlas_bytes = 0;       ///< TLAS nodes + instance records
     std::size_t attribute_bytes = 0;  ///< per-triangle shading attributes; 0 without reflections

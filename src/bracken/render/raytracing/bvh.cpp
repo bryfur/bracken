@@ -318,13 +318,51 @@ Tlas build_tlas(std::span<const TlasInstance> instances, const BvhBuildOptions& 
     builder.build_range(0, 0, static_cast<uint32_t>(prims.size()), 0);
 
     tlas.instances.resize(prims.size());
+    tlas.source_index.resize(prims.size());
     for (std::size_t i = 0; i < prims.size(); ++i) {
         tlas.instances[i] = instances[prims[i].source];
+        tlas.source_index[i] = prims[i].source;
     }
 
     fill_stats(out_stats, tlas.nodes, static_cast<uint32_t>(prims.size()), builder.leaf_count,
                builder.max_depth_seen);
     return tlas;
+}
+
+void refit_tlas(Tlas& tlas) {
+    if (tlas.nodes.empty()) {
+        return;
+    }
+
+    // BOTTOM-UP BY REVERSE INDEX, with no ordering pass, because the builder
+    // guarantees children sit at HIGHER indices than their parent. Evidence,
+    // from `Builder::build_range` above: a node is emplaced into `nodes` before
+    // it is built, and when it turns out to be interior its two children are
+    // appended with `left_index = nodes.size()` taken at that moment — so
+    // left_index > node_index always, strictly, and right = left + 1. Walking
+    // indices downwards therefore visits every child before its parent.
+    //
+    // (The same invariant is what lets `bvh_gpu.cpp` number interior nodes in
+    // one forward pass, and what lets the 32-byte node omit the right child.
+    // If it were ever broken, that conversion would break first and loudly.)
+    for (std::size_t i = tlas.nodes.size(); i-- > 0;) {
+        BvhNode& node = tlas.nodes[i];
+        Aabb bounds;
+        if (node.count == 0) {
+            const BvhNode& left = tlas.nodes[node.left_first];
+            const BvhNode& right = tlas.nodes[node.left_first + 1];
+            bounds.grow(Aabb{left.bounds_min, left.bounds_max});
+            bounds.grow(Aabb{right.bounds_min, right.bounds_max});
+        } else {
+            for (uint32_t k = 0; k < node.count; ++k) {
+                const TlasInstance& inst = tlas.instances[node.left_first + k];
+                bounds.grow(inst.bounds_min);
+                bounds.grow(inst.bounds_max);
+            }
+        }
+        node.bounds_min = bounds.lo;
+        node.bounds_max = bounds.hi;
+    }
 }
 
 } // namespace bracken::render::rt

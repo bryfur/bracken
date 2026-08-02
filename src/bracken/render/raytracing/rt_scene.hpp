@@ -51,7 +51,25 @@ struct RtSceneStats {
     /// static scene must show 1 here no matter how many frames have gone by,
     /// and the only way to keep that true is to be able to assert on it.
     uint32_t tlas_builds = 0;
+    /// How many times the TLAS was REFITTED instead — same instances, new
+    /// transforms. Reported next to `tlas_builds` everywhere, because the two
+    /// only mean something as a pair: a live scene with one animated character
+    /// should read builds≈1, refits≈frames, and any drift back towards
+    /// builds≈frames is the topology check failing to engage.
+    uint32_t tlas_refits = 0;
 };
+
+/// A refit tree keeps the topology the instances had when they were last
+/// built, so its bounds only ever grow. Two triggers force a real rebuild:
+/// the measured one (SAH cost against the last full build) and this counter as
+/// a backstop, so a pathological motion pattern that keeps the cost flat while
+/// the tree quietly stops matching the scene still gets a fresh build.
+inline constexpr uint32_t k_tlas_max_refits_between_builds = 64;
+/// SAH cost growth, relative to the last full build, that forces a rebuild.
+/// 1.5 is deliberately loose: a rebuild costs ~25x a refit here, so paying one
+/// to recover a few percent of traversal cost is a bad trade, whereas a tree
+/// half again as expensive to walk as a fresh one is worth 0.5 ms.
+inline constexpr float k_tlas_refit_sah_rebuild_ratio = 1.5f;
 
 /**
  * The GPU-side acceleration structure: every model's BLAS concatenated into
@@ -91,18 +109,35 @@ public:
     void build_blas_for_models(const ModelManager& models, bool want_attributes);
 
     /**
-     * Rebuild the TLAS from this frame's instances.
+     * Take this frame's instances, doing the least work they permit.
      *
-     * SKIPPED ENTIRELY WHEN NOTHING MOVED, and that is load-bearing rather than
-     * an optimization: the renderer hands this the whole model-command list off
-     * every traced frame, so without the check a village that never moves paid a
-     * full binned-SAH build (2569 instances ≈ 0.49 ms at -O2, and ~18 ms in an
-     * unoptimized tree) on the main thread, every frame, forever. The docs used
-     * to claim this skip existed; it did not.
+     * THREE CASES, decided from two hashes computed in one pass over the list.
+     * Neither is a caller promise — the instance list is rebuilt from the frame
+     * packet every frame and there is nobody to make such a promise.
      *
-     * The check is a content hash over (handle, transform) — not a caller
-     * promise — because the instance list is rebuilt from the packet each frame
-     * and there is nobody to make such a promise.
+     *  a. **Content hash unchanged** — nothing moved, nothing appeared. Keep
+     *     the TLAS, keep the buffers, do no work. Load-bearing rather than an
+     *     optimization: without it a village that never moves paid a full
+     *     binned-SAH build (2569 instances ≈ 0.49 ms at -O2, ~18 ms in an
+     *     unoptimized tree) on the main thread every frame, forever.
+     *  b. **Topology hash unchanged, content hash changed** — the same models
+     *     in the same order, moved. REFIT: recompute the world bounds of the
+     *     instances whose transform actually differs from last frame, then
+     *     re-union the existing tree's node bounds bottom-up (`refit_tlas`).
+     *     No SAH, no partition, no allocation.
+     *  c. **Topology hash changed** — an instance was added, removed, or the
+     *     order changed. Full rebuild; there is no tree to refit onto.
+     *
+     * Case (b) is why this is not a footnote: case (a) sounded like it covered
+     * the playground and did not. A single animated character changes the
+     * content hash every frame, so before the refit path landed the "static
+     * scene builds once" contract engaged in exactly zero live frames and
+     * `RTInstances` was the most expensive CPU pass in the frame.
+     *
+     * A refit tree keeps the topology the instances had when they were last
+     * built, so it degrades as they drift; see
+     * `k_tlas_refit_sah_rebuild_ratio` and `k_tlas_max_refits_between_builds`
+     * for the two triggers that force a real rebuild back.
      */
     void set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances);
 
@@ -147,6 +182,15 @@ private:
         bool valid = false;
     };
 
+    /// Case (c) of set_instances: throw the tree away and build a new one.
+    void rebuild_tlas(std::span<const std::pair<ModelHandle, glm::mat4>> instances);
+    /// Case (b): update the moved instances and re-union the existing tree.
+    /// Returns false when the result degraded past
+    /// `k_tlas_refit_sah_rebuild_ratio`, meaning the caller should rebuild
+    /// instead — the refit is left in place and simply overwritten.
+    [[nodiscard]] bool refit_tlas_in_place(
+        std::span<const std::pair<ModelHandle, glm::mat4>> instances);
+
     std::unordered_map<ModelHandle, ModelEntry> entries_;
     /// The concatenated BLAS nodes in UPLOAD form. The 32-byte build nodes are
     /// converted per model as they are appended and are not kept: nothing
@@ -178,7 +222,31 @@ private:
     /// whether one has been seen at all. An empty list is a legitimate state
     /// distinct from "never called", hence the flag rather than a sentinel.
     uint64_t instance_hash_ = 0;
+    /// Hash of the same list's COUNT AND HANDLES only — everything that decides
+    /// the tree's shape-eligibility, and nothing that merely decides where the
+    /// boxes are. Equal topology hash + unequal content hash is precisely the
+    /// refit case, and both come out of the same single pass over the list.
+    uint64_t topology_hash_ = 0;
     bool has_instance_hash_ = false;
+    /// Every instance's transform as it arrived last time, indexed by INPUT
+    /// index (i.e. before the no-BLAS filter). The refit path compares against
+    /// this so it recomputes an inverse and eight corner transforms only for
+    /// the instances that actually moved — in the playground, the character
+    /// and nothing else, out of 2570.
+    std::vector<glm::mat4> last_transforms_;
+    /// For each slot of `tlas_.instances`, the INPUT index it came from.
+    /// Composed at build time from the builder's `Tlas::source_index` (slot ->
+    /// filtered index) and the filter's own mapping (filtered -> input), so
+    /// the refit path can walk slots and never needs an inverse permutation.
+    std::vector<uint32_t> input_index_of_slot_;
+    /// Scratch for the rebuild path's filtered instance list; a member so a
+    /// rebuild allocates nothing once warm.
+    std::vector<TlasInstance> tlas_build_scratch_;
+    std::vector<uint32_t> filtered_to_input_scratch_;
+    /// `sah_cost` of the tree the last FULL build produced, and how many refits
+    /// have been stacked on it since. The pair drives the two rebuild triggers.
+    float last_build_sah_ = 0.0f;
+    uint32_t refits_since_build_ = 0;
     RtSceneStats stats_{};
 };
 

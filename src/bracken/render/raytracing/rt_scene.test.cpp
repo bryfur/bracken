@@ -200,15 +200,164 @@ TEST(RtScene, UnchangedInstancesDoNotRebuildTheTlas) {
     }
     EXPECT_EQ(scene.stats().tlas_builds, 1u) << "a static instance list rebuilt the TLAS";
 
-    // Moving anything at all must rebuild.
+    // Moving something must NOT rebuild: same models, same order, new place —
+    // that is a refit, and it is the case that decides whether a live scene
+    // pays a binned-SAH build every frame.
     instances[1].second = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 7.5f));
     scene.set_instances(instances);
-    EXPECT_EQ(scene.stats().tlas_builds, 2u) << "a moved instance did NOT rebuild the TLAS";
+    EXPECT_EQ(scene.stats().tlas_builds, 1u) << "a moved instance forced a full TLAS rebuild";
+    EXPECT_EQ(scene.stats().tlas_refits, 1u) << "a moved instance did not refit the TLAS";
 
-    // Dropping one is a change too: the count participates in the hash so a
-    // truncated list cannot collide with the longer one it is a prefix of.
+    // Dropping one is a TOPOLOGY change: the count participates in both hashes
+    // so a truncated list cannot collide with the longer one it is a prefix of,
+    // and there is no tree to refit onto.
     instances.pop_back();
     scene.set_instances(instances);
-    EXPECT_EQ(scene.stats().tlas_builds, 3u);
+    EXPECT_EQ(scene.stats().tlas_builds, 2u);
+    EXPECT_EQ(scene.stats().tlas_refits, 1u);
     EXPECT_EQ(scene.stats().instances, 1u);
+}
+
+// Only the three cases exist, and each has to be reachable from the same
+// entry point — the whole saving is in never taking the expensive one by
+// accident.
+TEST(RtScene, TopologyChangesRebuildAndTransformChangesRefit) {
+    Fixture f;
+    auto a = f.models.register_model("a", make_cube());
+    auto b = f.models.register_model("b", make_cube(2.0f));
+    ASSERT_TRUE(a);
+    ASSERT_TRUE(b);
+    RtScene scene;
+    scene.build_blas_for_models(f.models, false);
+
+    std::vector<std::pair<bracken::ModelHandle, glm::mat4>> instances{
+        {a.value(), glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 0.0f))},
+        {b.value(), glm::translate(glm::mat4(1.0f), glm::vec3(9.0f, 0.0f, 0.0f))},
+        {a.value(), glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 9.0f))},
+    };
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.stats().tlas_builds, 1u);
+    EXPECT_EQ(scene.stats().tlas_refits, 0u);
+
+    // Transform-only, repeatedly: refits, never a build.
+    for (int i = 1; i <= 5; ++i) {
+        instances[0].second =
+            glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, static_cast<float>(i) * 0.1f, 0.0f));
+        scene.set_instances(instances);
+    }
+    EXPECT_EQ(scene.stats().tlas_builds, 1u);
+    EXPECT_EQ(scene.stats().tlas_refits, 5u);
+
+    // ADDING one: rebuild.
+    instances.emplace_back(b.value(), glm::translate(glm::mat4(1.0f), glm::vec3(0, 0, 20.0f)));
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.stats().tlas_builds, 2u);
+    EXPECT_EQ(scene.stats().tlas_refits, 5u);
+
+    // REORDERING, with every transform and every handle preserved as a
+    // multiset: still a rebuild. The topology hash is over the handle
+    // SEQUENCE, deliberately — the refit path maps slots back to input
+    // positions, so a permuted list is a different structure to it even
+    // though it draws the same picture.
+    std::swap(instances[0], instances[1]);
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.stats().tlas_builds, 3u);
+    EXPECT_EQ(scene.stats().tlas_refits, 5u);
+
+    // REMOVING one: rebuild.
+    instances.erase(instances.begin());
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.stats().tlas_builds, 4u);
+    EXPECT_EQ(scene.stats().tlas_refits, 5u);
+}
+
+// A refit tree keeps the topology its instances had at build time, so it has
+// to be given up on eventually. Both triggers are exercised here because the
+// counter alone would let a slowly-degrading scene coast for 64 frames and the
+// SAH ratio alone cannot see motion that keeps the cost flat.
+TEST(RtScene, RefitDegradationForcesARebuild) {
+    Fixture f;
+    auto a = f.models.register_model("a", make_cube());
+    ASSERT_TRUE(a);
+
+    // --- the measured trigger: large accumulated motion ------------------
+    {
+        RtScene scene;
+        scene.build_blas_for_models(f.models, false);
+        std::vector<std::pair<bracken::ModelHandle, glm::mat4>> instances;
+        for (int i = 0; i < 64; ++i) {
+            instances.emplace_back(
+                a.value(),
+                glm::translate(glm::mat4(1.0f), glm::vec3(static_cast<float>(i % 8) * 4.0f, 0.0f,
+                                                          static_cast<float>(i / 8) * 4.0f)));
+        }
+        scene.set_instances(instances);
+        ASSERT_EQ(scene.stats().tlas_builds, 1u);
+
+        // Fling half the grid a long way out, in one step. The leaves keep
+        // their old grouping, so the interior boxes have to swell to cover
+        // pairs that are now nowhere near each other.
+        for (std::size_t i = 0; i < instances.size(); i += 2) {
+            instances[i].second = glm::translate(
+                glm::mat4(1.0f), glm::vec3(static_cast<float>(i) * 250.0f, 0.0f,
+                                           static_cast<float>(i) * -250.0f));
+        }
+        scene.set_instances(instances);
+        EXPECT_EQ(scene.stats().tlas_builds, 2u)
+            << "a badly degraded refit was accepted instead of rebuilding";
+        EXPECT_EQ(scene.stats().tlas_refits, 0u);
+    }
+
+    // --- the counter backstop: many tiny moves ---------------------------
+    {
+        RtScene scene;
+        scene.build_blas_for_models(f.models, false);
+        std::vector<std::pair<bracken::ModelHandle, glm::mat4>> instances{
+            {a.value(), glm::mat4(1.0f)},
+            {a.value(), glm::translate(glm::mat4(1.0f), glm::vec3(50.0f, 0.0f, 0.0f))},
+        };
+        scene.set_instances(instances);
+        ASSERT_EQ(scene.stats().tlas_builds, 1u);
+
+        // Jiggle by a hair, so the SAH ratio never moves; only the count does.
+        for (uint32_t i = 1; i <= k_tlas_max_refits_between_builds; ++i) {
+            instances[0].second = glm::translate(
+                glm::mat4(1.0f), glm::vec3(0.0f, static_cast<float>(i) * 1e-3f, 0.0f));
+            scene.set_instances(instances);
+        }
+        EXPECT_EQ(scene.stats().tlas_refits, k_tlas_max_refits_between_builds);
+        EXPECT_EQ(scene.stats().tlas_builds, 1u) << "the backstop fired early";
+
+        instances[0].second = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f));
+        scene.set_instances(instances);
+        EXPECT_EQ(scene.stats().tlas_builds, 2u) << "the refit-count backstop never fired";
+        EXPECT_EQ(scene.stats().tlas_refits, k_tlas_max_refits_between_builds);
+    }
+}
+
+// Rebuilding the BLAS set renumbers every offset a TLAS instance carries, so
+// the "nothing moved" skip and the refit path must both be invalidated — a
+// host enabling reflections mid-run does exactly this without touching a
+// single transform.
+TEST(RtScene, RebuildingTheBlasSetInvalidatesTheInstanceCache) {
+    Fixture f;
+    auto a = f.models.register_model("a", make_cube());
+    ASSERT_TRUE(a);
+
+    RtScene scene;
+    scene.build_blas_for_models(f.models, false);
+    const std::vector<std::pair<bracken::ModelHandle, glm::mat4>> instances{
+        {a.value(), glm::mat4(1.0f)},
+        {a.value(), glm::translate(glm::mat4(1.0f), glm::vec3(4.0f, 0.0f, 0.0f))},
+    };
+    scene.set_instances(instances);
+    ASSERT_EQ(scene.stats().tlas_builds, 1u);
+
+    // Same instances, byte for byte. The structure underneath them is new.
+    scene.build_blas_for_models(f.models, /*want_attributes=*/true);
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.stats().tlas_builds, 1u) << "stats reset with the BLAS build, so this counts "
+                                                "the ONE build that followed it";
+    EXPECT_EQ(scene.stats().instances, 2u);
+    EXPECT_GT(scene.stats().tlas_nodes, 0u);
 }

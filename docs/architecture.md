@@ -685,8 +685,14 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
      are intersected inline and never reach the stack. The CPU **build**
      format stays the 32-byte one-AABB `BvhNode`; `convert_to_gpu_nodes` maps
      one new node per old INTERIOR node when `RtScene` uploads (per BLAS at
-     build time, per TLAS rebuild otherwise — two linear passes, ~5 % of the
-     binned-SAH build it follows). Node count halves as the node doubles, so
+     build time, per TLAS rebuild **or refit** otherwise — two linear passes,
+     ~5 % of the binned-SAH build it follows). Both passes and `refit_tlas`
+     rely on the same builder invariant: a child's index is always strictly
+     greater than its parent's, because `Builder::build_range` emplaces a node
+     before it recurses and appends both children at the then-current
+     `nodes.size()`. That is what lets the conversion number interiors in one
+     forward pass and lets a refit run bottom-up as a plain reverse index walk
+     with no topological sort. Node count halves as the node doubles, so
      the buffers are the same size, and `RtSceneStats::blas_nodes`/`tlas_nodes`
      count what is uploaded. A tree whose root is itself a leaf (one-triangle
      BLAS, one-instance TLAS) has no interior node to fold into, so one node is
@@ -937,16 +943,58 @@ buffer** — a compute shader has a fixed binding set and cannot rebind per
 instance, so each model records only its offsets into the shared buffers and
 traversal adds them.
 
-`set_instances` rebuilds the TLAS **only when the FNV-1a content hash of the
-`(handle, transform)` list changes.** That skip is a load-bearing performance
-contract, not an optimization: the renderer hands this the whole model-command
-list on every traced frame, so without it a village that never moves would pay
-a full binned-SAH build on the main thread every frame forever.
-`RtSceneStats::tlas_builds` exists so that contract can be asserted on — a
-static scene must read 1 no matter how many frames pass. `upload` writes a
-changed TLAS into the frame's own command buffer through persistent grow-only
-buffers, so a moving scene costs one copy rather than two buffer creations plus
-a mid-frame submit.
+`set_instances` decides between **three** cases, from two FNV-1a hashes of the
+`(handle, transform)` list computed in a single pass over it:
+
+- **Content hash unchanged** → nothing at all. Load-bearing rather than an
+  optimization: the renderer hands this the whole model-command list on every
+  traced frame, so without it a village that never moves would pay a full
+  binned-SAH build on the main thread every frame forever.
+- **Topology hash (count + handle *sequence*) unchanged, content changed** →
+  **refit**. Only the instances whose transform actually differs from last
+  frame get a new inverse and a new eight-corner world AABB (the previous
+  frame's transforms are kept in `last_transforms_` for exactly this
+  comparison); then `refit_tlas` (`bvh.hpp`) re-unions every node bottom-up
+  over the existing topology and the tree is reconverted and re-uploaded. No
+  SAH, no partition, no allocation.
+- **Topology hash changed** (instance added, removed, or reordered) → full
+  rebuild, since there is no tree to refit onto. Reordering counts because the
+  refit path maps TLAS slots back to input positions.
+
+The refit case is the one that matters in a live scene: a single animated
+character changes the content hash every frame, so before it existed the
+"static scene builds once" contract engaged in exactly zero live frames and
+`RTInstances` was the most expensive CPU pass in the playground frame
+(~0.54 ms mean, `tlas_builds` = frame count). With it, `--rt-bench 120
+PLAYGROUND_RT=both` reads 0.12 ms mean / 2 builds / 117 refits.
+
+A refit tree keeps the topology its instances had at the last build, so its
+bounds only ever grow — conservative supersets, so the hit *set* never changes,
+but traversal slowly gets worse. Two triggers force a real rebuild back:
+`sah_cost` (`bvh.hpp`) growing past `k_tlas_refit_sah_rebuild_ratio` (1.5×) of
+the last full build's, measured on the refitted tree before it is uploaded, and
+`k_tlas_max_refits_between_builds` (64) as a counter backstop for motion that
+keeps the cost flat while the tree stops matching the scene. Both constants are
+in `rt_scene.hpp`. `RtSceneStats::tlas_builds` and `tlas_refits` exist so the
+policy can be asserted on and are printed as a pair by the playground's
+`[smoke] rt accel` and `[rtbench] rt` lines — a scene whose instance set is
+stable must read builds = 1 no matter how much moves.
+
+Rebuilding the BLAS set (`build_blas_for_models`, e.g. when a host enables
+reflections at runtime) renumbers every offset a TLAS instance carries, so it
+drops the remembered hashes: the next `set_instances` is a full rebuild even if
+nothing moved.
+
+`upload` writes a changed TLAS into the frame's own command buffer through
+persistent grow-only buffers, so a moving scene costs one copy rather than two
+buffer creations plus a mid-frame submit.
+
+The 32-byte tree stays authoritative across a refit and the 64-byte upload form
+is re-derived from it, rather than the uploaded form being refitted in place.
+That keeps `convert_to_gpu_nodes` the single producer of every byte the GPU
+sees — so `bvh_gpu_layout.test.cpp` covers the refit path for free — and keeps
+the SAH gate reading the same structure the builder produced. The price is two
+extra linear passes over ~2N nodes, noise against the build being skipped.
 
 Per-triangle shading attributes (`TriangleAttributes`, 64 B: three normals plus
 one flat base colour baked at load from the albedo texture's centroid-UV

@@ -704,7 +704,7 @@ enum class RtRange     : int { Near = 0, Medium = 1, Far = 2, Unlimited = 3 };
 | `rt_reflection_resolution` | RtResolution | Full | [Full, Quarter] (same dial for the reflection trace) |
 | `rt_sun_softness_deg` | float | 0.35 | [0, 10] (angular RADIUS of the sun disk in degrees; the real sun is ~0.265. 0 collapses the cone to a hard shadow. Free to trace — same ray count, the denoiser works harder) |
 | `rt_reflection_max_roughness` | float | 0.75 | [0, 1] (roughness at which traced specular hands over entirely to the prefiltered IBL probe; the two weights always sum to 1) |
-| `rt_max_instance_range` | RtRange | **Unlimited** | [Near, Unlimited] → {1000, 2000, 4000, ∞} world units via `rt_range_units` (instances whose bounds lie entirely beyond it are dropped before the TLAS hash; distant sun shadows fall back to the cascades. A finite value makes camera motion re-trigger TLAS rebuilds — see architecture.md "Ray tracing") |
+| `rt_max_instance_range` | RtRange | **Unlimited** | [Near, Unlimited] → {1000, 2000, 4000, ∞} world units via `rt_range_units` (instances whose bounds lie entirely beyond it are dropped before the TLAS hashes; distant sun shadows fall back to the cascades. A finite value makes camera motion change the instance SET, which is a topology change and therefore a full TLAS rebuild rather than the refit a mere move costs — see architecture.md "Ray tracing") |
 | `volumetric_fog` | bool | false | — |
 | `god_rays` | bool | false | requires `volumetric_fog` (not enforced here) |
 | `window_mode` | int | 0 | [0, 2] |

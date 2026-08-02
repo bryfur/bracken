@@ -38,10 +38,13 @@ Möller–Trumbore form (v0/e1/e2 + `prim_id`). CPU binned-SAH build (16 bins,
 leaf ≤ 4 tris, max depth 64), one BLAS per model fanned out over the job pool
 (~80 ms single-threaded across the playground's 52 models), everything
 concatenated into one node buffer + one triangle buffer so traversal never
-rebinds. The TLAS is rebuilt only when the FNV-1a content hash of the
-`(handle, transform)` instance list changes (`RtScene::set_instances`,
-`rt_scene.cpp`) — 2569 instances ≈ 0.49 ms at -O2 — and is written into the
-frame's command buffer through persistent grow-only buffers. Playground scale:
+rebinds. The TLAS is rebuilt only when the instance SET changes — a second
+FNV-1a hash over the count and handle sequence alone — while a list whose
+`(handle, transform)` content hash moved but whose topology did not costs a
+bottom-up **refit** of the existing tree (`RtScene::set_instances`,
+`rt_scene.cpp`; a full build is 2569 instances ≈ 0.49 ms at -O2, the refit
+~4.5× less end to end). Either way it is written into the frame's command
+buffer through persistent grow-only buffers. Playground scale:
 6.2 M drawn triangles = ~600 k unique behind instancing, ~29 MB of BLAS.
 
 **Traced effects** (`render/rt_renderer.hpp/.cpp`): both 1 sample/pixel,
@@ -254,8 +257,11 @@ Small, zero-visual-change groundwork everything else stands on:
 
   The CPU build format is untouched — `convert_to_gpu_nodes` maps one new node
   per old *interior* node in two linear passes, called per BLAS in
-  `build_blas_for_models` and per TLAS rebuild in `set_instances` (measured at
-  4.6 % of the binned-SAH build it follows for 2569 instances). Only interior
+  `build_blas_for_models` and per TLAS rebuild **or refit** in `set_instances`
+  (measured at 4.6 % of the binned-SAH build it follows for 2569 instances —
+  which is also why a refit re-derives the 64-byte form rather than editing it
+  in place: the conversion stays the single producer of every uploaded byte,
+  and `bvh_gpu_layout.test.cpp` therefore still covers the refit path). Only interior
   nodes survive, so node count halves as the node doubles and the buffers do
   not grow: the playground's 140736 BLAS nodes became 70339, at the same
   26.7 MB. A degenerate root (single-leaf BLAS, single-instance TLAS) is
@@ -360,7 +366,8 @@ Small, zero-visual-change groundwork everything else stands on:
   hash every frame and forces a full binned-SAH TLAS rebuild. That is the
   first concrete argument for TLAS refit over rebuild, and it is exactly the
   kind of claim this harness exists to license. (Ratios only — those runs were
-  in an `-O0` default tree.)
+  in an `-O0` default tree.) **The refit landed on the strength of it** — see
+  the finding note at the end of §10 for the before/after table.
 
   Still outstanding for this bullet: the WP2 64-byte-node A/B has **not** been
   re-measured through the harness, and there is no Apple-device number. No
@@ -754,7 +761,8 @@ currently lacks.
 
 CWBVH/8-wide traversal (portable-compute evidence says BVH2 wins without
 vendor intrinsics — recorded verdict, revisit only with new measurements);
-GPU BVH builds (our BLASes are static, TLAS is 0.49 ms on CPU); persistent
+GPU BVH builds (our BLASes are static, TLAS is 0.49 ms on CPU to build and
+refits for a fraction of that); persistent
 threads and ray sorting at ≤1 rpp; dense 3D radiance cascades (memory ∝
 volume³); 2D radiance cascades (camera-constrained); Lumen surface cache,
 mesh SDFs, Brixelizer bricks, surfel GI (second-structure rule); NRD/DLSS-RR/
@@ -794,6 +802,38 @@ transforms changed) and/or a static/dynamic TLAS split is now a tracked R0
 follow-up — it should land before R2, whose reservoir work assumes TLAS cost
 stays flat. (Numbers from a default `-O0` tree: ratios meaningful, absolutes
 not.)
+
+**Landed (R0 follow-up, 2026-08-02): TLAS refit.** `RtScene::set_instances` is
+now a three-case decision taken from two hashes computed in one pass — content
+unchanged (do nothing), topology unchanged (**refit**), topology changed (full
+rebuild) — where topology is the instance count plus the handle *sequence*.
+The refit recomputes an inverse and an eight-corner world AABB only for the
+instances whose transform actually differs from last frame (the playground: one
+skinned character out of 2570), then `refit_tlas` (`bvh.hpp`) re-unions every
+node bottom-up over the existing topology as a plain reverse index walk — the
+builder guarantees children sit at higher indices than their parent, which is
+the same invariant the 64-byte conversion already relies on. The 32-byte tree
+stays authoritative and the 64-byte upload form is re-derived, so
+`convert_to_gpu_nodes` remains the single producer of every uploaded byte.
+Refit quality is gated by `sah_cost` against the last full build (rebuild past
+1.5×) with a 64-refit counter backstop; `RtSceneStats`/`RtStats` gained
+`tlas_refits` and both playground lines print the pair.
+
+Measured, same `-O0` default tree, `--rt-bench 120 PLAYGROUND_RT=both`, before
+→ after:
+
+| | mean_ms | p95_ms | tlas_builds | tlas_refits |
+|---|---|---|---|---|
+| `RTInstances` before | 0.5439 | 0.5871 | 119 | — |
+| `RTInstances` after | 0.1200 | 0.1485 | 2 | 117 |
+
+4.5× on the mean, 4.0× on p95, and `RTInstances` is no longer 4× the next
+pass — it is now ~2× `ShadowPass` and the residual is the content hash over
+2570 instances plus the upload, not a build. `--smoke 30 PLAYGROUND_RT=both`
+reproduces `mean_luma=83.9 stddev=47.9` bit for bit, which is the evidence the
+refitted tree answers rays identically in the real scene; the seeded
+refit-vs-rebuild ray equivalence proof is `tlas_refit.test.cpp`. (Ratios
+meaningful, absolutes not.)
 
 ## 11. Immediate next actions
 

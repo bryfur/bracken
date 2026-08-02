@@ -81,8 +81,14 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
     return g;
 }
 
+/// The two hashes `set_instances` decides on, both from one pass over the list.
+struct InstanceHashes {
+    uint64_t content = 0;  ///< count + handles + transforms: "did anything move"
+    uint64_t topology = 0; ///< count + handles only: "is this the same tree's worth of instances"
+};
+
 /**
- * Content hash of an instance list, for "did anything actually move".
+ * Content and topology hashes of an instance list.
  *
  * Fields are hashed explicitly rather than as a byte blob over the pair: the
  * pair has padding between the handle and the matrix, and hashing
@@ -93,24 +99,56 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
  * words; a byte-at-a-time walk of the same data is the difference between
  * ~10 us and ~40 us, and the whole point of this hash is to be much cheaper
  * than the ~490 us build it guards.
+ *
+ * The topology hash is a SEPARATE accumulator over the same walk rather than a
+ * second pass: it costs one multiply-xor per instance and saves re-reading the
+ * whole list. It deliberately hashes the handle SEQUENCE, not a set — a
+ * reordered list has the same instances but a different slot-to-input mapping,
+ * which the refit path relies on, so reordering must read as a topology change.
  */
-uint64_t hash_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
-    uint64_t h = core::k_fnv1a_offset_basis_64;
-    const auto mix = [&h](uint32_t word) {
+InstanceHashes hash_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
+    InstanceHashes out{core::k_fnv1a_offset_basis_64, core::k_fnv1a_offset_basis_64};
+    const auto mix = [](uint64_t& h, uint32_t word) {
         h ^= static_cast<uint64_t>(word);
         h *= core::k_fnv1a_prime_64;
     };
     // The count participates so that a truncated list cannot collide with the
     // longer one it is a prefix of.
-    mix(static_cast<uint32_t>(instances.size()));
+    mix(out.content, static_cast<uint32_t>(instances.size()));
+    mix(out.topology, static_cast<uint32_t>(instances.size()));
     for (const auto& [handle, transform] : instances) {
-        mix(static_cast<uint32_t>(handle));
+        mix(out.content, static_cast<uint32_t>(handle));
+        mix(out.topology, static_cast<uint32_t>(handle));
         const auto* m = reinterpret_cast<const uint32_t*>(glm::value_ptr(transform));
         for (int i = 0; i < 16; ++i) {
-            mix(m[i]);
+            mix(out.content, m[i]);
         }
     }
-    return h;
+    return out;
+}
+
+/**
+ * World-space AABB and inverse transform of one instance.
+ *
+ * All eight corners are transformed rather than the min/max pair: a rotated
+ * box's extents are not the transformed extents, and getting that wrong makes
+ * the TLAS cull geometry that is actually visible.
+ */
+void fill_instance_placement(const glm::vec3& bounds_min, const glm::vec3& bounds_max,
+                             const glm::mat4& transform, TlasInstance& out) {
+    glm::vec3 lo(std::numeric_limits<float>::max());
+    glm::vec3 hi(std::numeric_limits<float>::lowest());
+    for (int c = 0; c < 8; ++c) {
+        const glm::vec3 corner{(c & 1) ? bounds_max.x : bounds_min.x,
+                               (c & 2) ? bounds_max.y : bounds_min.y,
+                               (c & 4) ? bounds_max.z : bounds_min.z};
+        const glm::vec3 w = glm::vec3(transform * glm::vec4(corner, 1.0f));
+        lo = glm::min(lo, w);
+        hi = glm::max(hi, w);
+    }
+    out.world_to_model = glm::inverse(transform);
+    out.bounds_min = lo;
+    out.bounds_max = hi;
 }
 
 } // namespace
@@ -126,6 +164,18 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
     blas_triangles_.clear();
     attributes_.clear();
     stats_ = {};
+
+    // The BLAS set is about to be renumbered, so every offset in the current
+    // TLAS is stale and neither the "nothing moved" skip nor the refit path may
+    // be allowed to keep it. Dropping the remembered hashes forces the next
+    // set_instances through a full rebuild even if the scene has not moved a
+    // millimetre — which is what happens when a host enables reflections
+    // mid-run and every BLAS gains attributes.
+    has_instance_hash_ = false;
+    last_transforms_.clear();
+    input_index_of_slot_.clear();
+    refits_since_build_ = 0;
+    last_build_sah_ = 0.0f;
 
     // Collect the models worth building for, so the parallel build below has a
     // dense index space.
@@ -248,62 +298,139 @@ void RtScene::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> i
         return;
     }
 
-    // Nothing moved: keep the TLAS, keep the buffers, do no work. The village
-    // is static, so in the playground this is the path taken every frame after
-    // the first — see the header for why this is not merely an optimization.
-    const uint64_t hash = hash_instances(instances);
-    if (has_instance_hash_ && hash == instance_hash_) {
+    const InstanceHashes hashes = hash_instances(instances);
+
+    // (a) Nothing moved: keep the TLAS, keep the buffers, do no work.
+    if (has_instance_hash_ && hashes.content == instance_hash_) {
         return;
     }
-    instance_hash_ = hash;
-    has_instance_hash_ = true;
 
-    std::vector<TlasInstance> list;
-    list.reserve(instances.size());
+    // (b) Same models in the same order, moved. The size check is not
+    // redundant with the topology hash — it is what makes the *indexing* below
+    // safe rather than merely probable, since `last_transforms_` and
+    // `input_index_of_slot_` are indexed by input position.
+    const bool same_topology = has_instance_hash_ && hashes.topology == topology_hash_ &&
+                               instances.size() == last_transforms_.size() && !tlas_.nodes.empty();
+    const bool refit_budget_left = refits_since_build_ < k_tlas_max_refits_between_builds;
+
+    bool refitted = false;
+    if (same_topology && refit_budget_left) {
+        refitted = refit_tlas_in_place(instances);
+    }
+    if (!refitted) {
+        rebuild_tlas(instances); // (c), and the fallback when a refit degraded
+    }
+
+    instance_hash_ = hashes.content;
+    topology_hash_ = hashes.topology;
+    has_instance_hash_ = true;
+    last_transforms_.resize(instances.size());
+    for (std::size_t i = 0; i < instances.size(); ++i) {
+        last_transforms_[i] = instances[i].second;
+    }
+
+    stats_.tlas_nodes = static_cast<uint32_t>(tlas_gpu_nodes_.size());
+    tlas_dirty_ = true;
+}
+
+void RtScene::rebuild_tlas(std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
+    BRACKEN_PROFILE_ZONE("RtScene::rebuild_tlas");
+
+    tlas_build_scratch_.clear();
+    tlas_build_scratch_.reserve(instances.size());
+    filtered_to_input_scratch_.clear();
+    filtered_to_input_scratch_.reserve(instances.size());
     uint32_t drawn = 0;
 
-    for (const auto& [handle, transform] : instances) {
+    for (std::size_t i = 0; i < instances.size(); ++i) {
+        const auto& [handle, transform] = instances[i];
         auto it = entries_.find(handle);
         if (it == entries_.end() || !it->second.valid) {
             continue; // no BLAS for this model: it simply casts no rays
         }
         const ModelEntry& e = it->second;
 
-        // World AABB of the transformed model bounds. Transforming all eight
-        // corners rather than the min/max pair: a rotated box's extents are
-        // not the transformed extents, and getting that wrong makes the TLAS
-        // cull geometry that is actually visible.
-        glm::vec3 lo(std::numeric_limits<float>::max());
-        glm::vec3 hi(std::numeric_limits<float>::lowest());
-        for (int c = 0; c < 8; ++c) {
-            const glm::vec3 corner{(c & 1) ? e.bounds_max.x : e.bounds_min.x,
-                                   (c & 2) ? e.bounds_max.y : e.bounds_min.y,
-                                   (c & 4) ? e.bounds_max.z : e.bounds_min.z};
-            const glm::vec3 w = glm::vec3(transform * glm::vec4(corner, 1.0f));
-            lo = glm::min(lo, w);
-            hi = glm::max(hi, w);
-        }
-
         TlasInstance inst;
-        inst.world_to_model = glm::inverse(transform);
-        inst.bounds_min = lo;
-        inst.bounds_max = hi;
+        fill_instance_placement(e.bounds_min, e.bounds_max, transform, inst);
         inst.blas_node_offset = e.node_offset;
         inst.blas_triangle_offset = e.triangle_offset;
-        list.push_back(inst);
+        tlas_build_scratch_.push_back(inst);
+        filtered_to_input_scratch_.push_back(static_cast<uint32_t>(i));
         drawn += e.triangle_count;
     }
 
-    tlas_ = build_tlas(list);
+    tlas_ = build_tlas(tlas_build_scratch_);
+
+    // Compose slot -> input from the builder's slot -> filtered permutation and
+    // the filter's filtered -> input mapping, once, here. The refit path then
+    // walks slots directly and never needs an inverse permutation.
+    input_index_of_slot_.resize(tlas_.instances.size());
+    for (std::size_t slot = 0; slot < tlas_.instances.size(); ++slot) {
+        input_index_of_slot_[slot] = filtered_to_input_scratch_[tlas_.source_index[slot]];
+    }
+
     // Convert to the traversal layout. Two linear passes over ~2N nodes for N
     // instances, against a binned-SAH build of the same list — a few percent
-    // of a path that already runs only when something moved.
+    // of a path that already runs only when the instance SET changed.
     convert_to_gpu_nodes(tlas_.nodes, tlas_gpu_nodes_, convert_scratch_);
+
+    last_build_sah_ = sah_cost(tlas_.nodes);
+    refits_since_build_ = 0;
     stats_.tlas_builds++;
-    stats_.instances = static_cast<uint32_t>(list.size());
-    stats_.tlas_nodes = static_cast<uint32_t>(tlas_gpu_nodes_.size());
+    stats_.instances = static_cast<uint32_t>(tlas_build_scratch_.size());
     stats_.drawn_triangles = drawn;
-    tlas_dirty_ = true;
+}
+
+bool RtScene::refit_tlas_in_place(std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
+    BRACKEN_PROFILE_ZONE("RtScene::refit_tlas");
+
+    // Only the instances whose transform actually differs pay for an inverse
+    // and eight corner transforms. That is the bulk of the saving in practice:
+    // the playground moves one skinned character out of 2570 instances, so the
+    // refit touches one placement and then does a pure bounds sweep.
+    for (std::size_t slot = 0; slot < tlas_.instances.size(); ++slot) {
+        const uint32_t input = input_index_of_slot_[slot];
+        const glm::mat4& transform = instances[input].second;
+        if (transform == last_transforms_[input]) {
+            continue;
+        }
+        auto it = entries_.find(instances[input].first);
+        if (it == entries_.end() || !it->second.valid) {
+            // The handle sequence is unchanged by construction, so this is
+            // unreachable unless the BLAS set was rebuilt underneath us — in
+            // which case the offsets are stale too and a rebuild is the answer.
+            return false;
+        }
+        fill_instance_placement(it->second.bounds_min, it->second.bounds_max, transform,
+                                tlas_.instances[slot]);
+    }
+
+    refit_tlas(tlas_);
+
+    // QUALITY GATE, measured rather than assumed. A refit keeps the topology
+    // the instances had when they were last built, so its bounds only grow;
+    // `sah_cost` is exactly the "how much more will a ray walk through" number
+    // and it is one linear pass over the nodes we just touched, i.e. cache-hot
+    // and far cheaper than the build it decides against. The counter backstop
+    // in set_instances covers the case this metric cannot see: motion that
+    // keeps the cost flat while the tree stops matching the scene.
+    const float cost = sah_cost(tlas_.nodes);
+    if (last_build_sah_ > 0.0f && cost > last_build_sah_ * k_tlas_refit_sah_rebuild_ratio) {
+        return false; // caller rebuilds; the half-refit tree is simply replaced
+    }
+
+    // Reconvert and re-upload. THE 32-BYTE TREE STAYS AUTHORITATIVE and the
+    // 64-byte form is re-derived, rather than refitting the uploaded form
+    // directly: it keeps `convert_to_gpu_nodes` the single producer of every
+    // byte the GPU sees (so `bvh_gpu_layout.test.cpp` still covers the refit
+    // path for free), and it keeps `sah_cost` above reading the same structure
+    // the builder produced. The price is two extra linear passes over ~2N
+    // nodes, which is noise against the binned-SAH build being skipped.
+    convert_to_gpu_nodes(tlas_.nodes, tlas_gpu_nodes_, convert_scratch_);
+
+    ++refits_since_build_;
+    stats_.tlas_refits++;
+    return true;
 }
 
 void RtScene::upload(gpu::GPUDevice& device, SDL_GPUCommandBuffer* cmd) {

@@ -1900,13 +1900,15 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
                 rt.shadows_traced, rt.reflections_traced, rt.shadow_rays, rt.reflection_rays,
                 static_cast<double>(rt.acceleration_bytes) / (1024.0 * 1024.0));
             // The structure, itemized. `instances` is post-range-filter, so it
-            // is what the rays actually see; `tlas_builds` should read 1 on a
-            // static scene and is the number a finite rt_max_instance_range
-            // trades traversal against.
+            // is what the rays actually see; `tlas_builds` should read 1 while
+            // the instance SET is stable — a moving instance costs a
+            // `tlas_refits` tick instead — and is the number a finite
+            // rt_max_instance_range trades traversal against.
             std::cout << std::format(
-                "[smoke] rt accel instances={} tlas_builds={} blas={:.1f}MB attrs={:.1f}MB "
-                "tlas={:.3f}MB\n",
-                rt.instances, rt.tlas_builds, static_cast<double>(rt.blas_bytes) / (1024.0 * 1024.0),
+                "[smoke] rt accel instances={} tlas_builds={} tlas_refits={} blas={:.1f}MB "
+                "attrs={:.1f}MB tlas={:.3f}MB\n",
+                rt.instances, rt.tlas_builds, rt.tlas_refits,
+                static_cast<double>(rt.blas_bytes) / (1024.0 * 1024.0),
                 static_cast<double>(rt.attribute_bytes) / (1024.0 * 1024.0),
                 static_cast<double>(rt.tlas_bytes) / (1024.0 * 1024.0));
         }
@@ -2731,10 +2733,11 @@ void PlaygroundGame::print_rt_bench_report() {
     }
     const auto& rt = scene_renderer().raytracing_stats();
     std::cout << std::format("[rtbench] rt shadows_traced={} reflections_traced={} shadow_rays={} "
-                             "reflection_rays={} instances={} tlas_builds={} blas_mb={:.2f} "
+                             "reflection_rays={} instances={} tlas_builds={} tlas_refits={} "
+                             "blas_mb={:.2f} "
                              "attrs_mb={:.2f} tlas_mb={:.3f} accel_mb={:.2f}\n",
                              rt.shadows_traced, rt.reflections_traced, rt.shadow_rays,
-                             rt.reflection_rays, rt.instances, rt.tlas_builds,
+                             rt.reflection_rays, rt.instances, rt.tlas_builds, rt.tlas_refits,
                              static_cast<double>(rt.blas_bytes) / (1024.0 * 1024.0),
                              static_cast<double>(rt.attribute_bytes) / (1024.0 * 1024.0),
                              static_cast<double>(rt.tlas_bytes) / (1024.0 * 1024.0),

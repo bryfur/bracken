@@ -146,6 +146,12 @@ struct TlasInstance {
 struct Tlas {
     std::vector<BvhNode> nodes;
     std::vector<TlasInstance> instances;
+    /// For each entry of `instances`, its index in the list that was handed to
+    /// `build_tlas`. The builder PERMUTES instances into leaf order (a leaf's
+    /// primitives have to be contiguous), so a caller that keeps its own list
+    /// in its own order has no other way to find the slot holding a given
+    /// instance — which is exactly what `refit_tlas` needs before it runs.
+    std::vector<uint32_t> source_index;
 
     [[nodiscard]] bool empty() const noexcept { return nodes.empty(); }
 };
@@ -153,12 +159,35 @@ struct Tlas {
 /**
  * Build a TLAS over world-space instance bounds.
  *
- * Rebuilt only when instances move. A static scene builds it once; the
- * playground's village never moves, so this is not per-frame work there.
+ * Rebuilt only when the set of instances CHANGES. When the same instances have
+ * merely moved, `refit_tlas` updates the existing tree's bounds instead — see
+ * `RtScene::set_instances` for the three-case policy.
  */
 [[nodiscard]] Tlas build_tlas(std::span<const TlasInstance> instances,
                               const BvhBuildOptions& options = {},
                               BvhBuildStats* out_stats = nullptr);
+
+/**
+ * Recompute an existing TLAS's node bounds in place, keeping its topology.
+ *
+ * The caller has already written this frame's world bounds into
+ * `tlas.instances` (using `Tlas::source_index` to find each slot); this walks
+ * the tree bottom-up and re-unions every node from its children, or from its
+ * instance window for a leaf. O(nodes), no partitioning, no SAH, no
+ * allocation — the difference between ~0.5 ms and ~0.02 ms on the playground's
+ * 2570 instances.
+ *
+ * WHAT IT COSTS: a refitted tree is topologically the tree the instances had
+ * when they were LAST built, so bounds only ever grow relative to a fresh
+ * build and traversal slowly gets worse as things drift apart. That is the
+ * caller's problem to bound — `RtScene` watches `sah_cost` and forces a real
+ * rebuild when it degrades (with a refit-count backstop).
+ *
+ * Correctness is not at stake either way: refitted bounds are conservative
+ * supersets of the true ones, so the hit SET is unchanged; only the number of
+ * boxes a ray walks through moves.
+ */
+void refit_tlas(Tlas& tlas);
 
 /** SAH cost of a finished tree, for comparing builds. Traversal-cost 1.0,
  *  intersection-cost 1.0, which is the usual normalization. */

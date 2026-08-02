@@ -278,7 +278,9 @@ struct GraphicsSettings {
     /// existed until someone dials it. The price of a finite setting is stated
     /// where it is consumed (SceneRenderer::refresh_raytracing_instances):
     /// crossing the threshold changes the instance list, so a moving camera can
-    /// re-trigger TLAS rebuilds that a static scene otherwise never pays.
+    /// re-trigger full TLAS rebuilds that a static scene otherwise never pays
+    /// — a moving instance only costs a refit, but an instance dropping in or
+    /// out of range changes the topology and there is no tree to refit onto.
     RtRange rt_max_instance_range = RtRange::Unlimited;
     bool volumetric_fog = false;              // Atmospheric fog haze (expensive, off by default)
     bool god_rays = false;                    // Light shafts through shadows (requires volumetric_fog)

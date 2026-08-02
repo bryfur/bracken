@@ -117,6 +117,7 @@ void RtRenderer::publish_scene_stats() {
     const rt::RtSceneStats& s = scene_.stats();
     stats_.instances = s.instances;
     stats_.tlas_builds = s.tlas_builds;
+    stats_.tlas_refits = s.tlas_refits;
     stats_.blas_bytes = s.blas_bytes;
     stats_.tlas_bytes = s.tlas_bytes;
     stats_.attribute_bytes = s.attribute_bytes;

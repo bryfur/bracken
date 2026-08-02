@@ -335,7 +335,7 @@ Run it after any change that could affect rendering. You can also open `playgrou
 
 `--rt-bench <frames>` reuses the same self-driven run — fixed timestep, deterministic environment, settings persistence off — and turns it into a benchmark. The differences from `--smoke` are all in service of measuring one thing at a time: the camera is **pinned** at a raised vantage over the plaza (the orbit would measure a different scene every frame), **none** of the scripted mid-run settings flips run (each would change what is being timed halfway through), and no screenshot is taken (the capture blocks the frame on a GPU fence). The frame count is required.
 
-It prints one `[rtbench] ...` record per line, fixed field order, so two builds diff as two files: a `run` header, one `pass` row per entry in `RenderStats::pass_times_ms` with the mean and p95 CPU record time (the first 30 frames are discarded as warm-up — pipeline creation, denoiser history, the initial BVH build), four `frame` rows for sim/render/fence/present_wait, and the `rt` line with ray counts, live instance count, TLAS rebuild count and the acceleration-structure byte split. Exit code 0.
+It prints one `[rtbench] ...` record per line, fixed field order, so two builds diff as two files: a `run` header, one `pass` row per entry in `RenderStats::pass_times_ms` with the mean and p95 CPU record time (the first 30 frames are discarded as warm-up — pipeline creation, denoiser history, the initial BVH build), four `frame` rows for sim/render/fence/present_wait, and the `rt` line with ray counts, live instance count, the TLAS rebuild **and refit** counts and the acceleration-structure byte split. Exit code 0.
 
 ```bash
 PLAYGROUND_RT=both ./playground --rt-bench 240        # trace both signals
@@ -4472,7 +4472,12 @@ traced instance list gets no sun shadow there rather than falling back to CSM.
   `RTReflectionResolve` in `pass_times_ms` (CPU record time — there is no GPU
   timestamp API), and `SceneRenderer::raytracing_stats()` returns an `RtStats`
   with the dispatched ray counts, the live instance count, the TLAS rebuild
-  count and the BLAS/attribute/TLAS byte split.
+  and refit counts and the BLAS/attribute/TLAS byte split. Read
+  `tlas_builds`/`tlas_refits` as a pair: an instance moving costs a refit
+  (bounds re-unioned over the existing topology), an instance appearing,
+  vanishing or changing places in the list costs a full binned-SAH rebuild, and
+  builds climbing with the frame count means something in your list is churning
+  its topology every frame.
 
 ### Quick reference: which knob lives where
 
