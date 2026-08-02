@@ -244,6 +244,8 @@ void SceneRenderer::shutdown() {
 
     depth_texture_.reset();
     velocity_texture_.reset();
+    // Before the device goes: the probe atlases are released through it.
+    probe_volume_.reset();
 
     if (default_sampler_ && context_) {
         context_->device().release_sampler(default_sampler_);
@@ -1028,6 +1030,38 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 gtao_->invalidate_history();
             }
 
+            // ===== Probe-field GI: scroll the clipmap to follow the camera.
+            // R1a is STRUCTURE ONLY — this allocates the cascades' atlases,
+            // re-snaps each cascade's window in whole probe-spacing steps, and
+            // marks the probes that entered as uninitialized. Nothing traces
+            // into the field and nothing samples it yet (R1b/R1c), so with
+            // gi_mode == Off — the default — not one byte is allocated and this
+            // block is a single enum compare. =====
+            if (gfx.gi_mode != GiMode::Off && cmd && context_) {
+                if (!probe_volume_ && !gi_init_failed_) {
+                    auto volume = std::make_unique<render::gi::ProbeVolume>();
+                    if (volume->init(context_->device())) {
+                        probe_volume_ = std::move(volume);
+                    } else {
+                        // init() already logged the reason. Latch the failure:
+                        // retrying a 30 MB allocation every frame would turn
+                        // one bad allocation into a per-frame stall and a log
+                        // flood. Toggling gi_mode off and on again clears it.
+                        gi_init_failed_ = true;
+                        BRACKEN_LOG_WARN(LOG_TAG, "GI probe field unavailable; gi_mode has no effect");
+                    }
+                }
+                if (probe_volume_) {
+                    BRACKEN_PROFILE_ZONE_COLOR("GIProbes", 0x27AE60);
+                    BRACKEN_GPU_SCOPE(cmd, "GIProbes");
+                    BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "GIProbes");
+                    probe_volume_->update(cmd, draw_camera.position);
+                }
+            } else if (probe_volume_ || gi_init_failed_) {
+                probe_volume_.reset();
+                gi_init_failed_ = false;
+            }
+
             // Ray-traced sun shadows. The mask is its own R8 texture on its
             // own fragment sampler slot; it does NOT touch frame_ao_texture_.
             // It used to: the pass copied GTAO through into R of an RG8 mask
@@ -1662,6 +1696,11 @@ void SceneRenderer::set_raytracing_instances(
 const render::RtStats& SceneRenderer::raytracing_stats() const {
     static const render::RtStats k_empty{};
     return rt_renderer_ ? rt_renderer_->stats() : k_empty;
+}
+
+const render::gi::GiStats& SceneRenderer::gi_stats() const {
+    static const render::gi::GiStats k_empty{};
+    return probe_volume_ ? probe_volume_->stats() : k_empty;
 }
 
 } // namespace bracken::scene

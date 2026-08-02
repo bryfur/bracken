@@ -30,6 +30,11 @@ void GraphicsSettings::clamp_to_valid_ranges() {
     rt_sun_softness_deg = std::clamp(rt_sun_softness_deg, 0.0f, 10.0f);
     rt_reflection_max_roughness = std::clamp(rt_reflection_max_roughness, 0.0f, 1.0f);
     rt_max_instance_range = clamp_enum(rt_max_instance_range, RtRange::Near, RtRange::Unlimited);
+    // ProbesScreen is a real enumerator and clamps like one, even though it
+    // behaves as Probes until phase R4 — a settings file that already holds it
+    // must survive the version that implements it unchanged.
+    gi_mode = clamp_enum(gi_mode, GiMode::Off, GiMode::ProbesScreen);
+    gi_quality = clamp_enum(gi_quality, GiQuality::Low, GiQuality::High);
     shadow_distance = std::clamp(shadow_distance, 200.0f, 20000.0f);
     // Budget bounds mirror render::lighting::LOCAL_SHADOW_MAX_{POINT,SPOT}_BUDGET
     // (the 8x8 atlas holds 8*6 point-face tiles + 16 spot tiles exactly).
@@ -93,6 +98,8 @@ bool GraphicsSettings::save(const std::string& path) const {
     out << "rt_sun_softness_deg=" << rt_sun_softness_deg << "\n";
     out << "rt_reflection_max_roughness=" << rt_reflection_max_roughness << "\n";
     out << "rt_max_instance_range=" << static_cast<int>(rt_max_instance_range) << "\n";
+    out << "gi_mode=" << static_cast<int>(gi_mode) << "\n";
+    out << "gi_quality=" << static_cast<int>(gi_quality) << "\n";
     out << "volumetric_fog=" << volumetric_fog << "\n";
     out << "god_rays=" << god_rays << "\n";
     out << "window_mode=" << static_cast<int>(window_mode) << "\n";
@@ -196,6 +203,8 @@ bool GraphicsSettings::load(const std::string& path) {
     read_float("rt_sun_softness_deg", rt_sun_softness_deg);
     read_float("rt_reflection_max_roughness", rt_reflection_max_roughness);
     read_enum("rt_max_instance_range", rt_max_instance_range);
+    read_enum("gi_mode", gi_mode);
+    read_enum("gi_quality", gi_quality);
     read_bool("rt_reflections", rt_reflections);
     read_bool("volumetric_fog", volumetric_fog);
     read_bool("god_rays", god_rays);

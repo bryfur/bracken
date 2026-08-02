@@ -342,7 +342,7 @@ PLAYGROUND_RT=both ./playground --rt-bench 240        # trace both signals
 PLAYGROUND_RT=both PLAYGROUND_RT_RANGE=1 ./playground --rt-bench 240   # ...with a Medium instance range
 ```
 
-`PLAYGROUND_RT=shadows|reflections|both` selects which traced effects run and `PLAYGROUND_RT_RANGE=0..3` pins `rt_max_instance_range` (Near/Medium/Far/Unlimited); both also work with `--smoke`. Two standing caveats: the reported times are **CPU record times** (SDL3 has no GPU timestamp API — `present_wait` is the CPU-bound-vs-GPU-bound signal), and a number from a default `build/` is not a performance number, because no `CMAKE_BUILD_TYPE` means `-O0` with live assertions. Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
+`PLAYGROUND_RT=shadows|reflections|both` selects which traced effects run and `PLAYGROUND_RT_RANGE=0..3` pins `rt_max_instance_range` (Near/Medium/Far/Unlimited); both also work with `--smoke`. `PLAYGROUND_GI=probes|probes_screen|off` pins `gi_mode` on exactly the same terms — an **unset** variable means Off, because these settings persist and "leave it alone" would silently inherit the last interactive session's choice. With GI on, `--smoke` prints an extra `[smoke] gi ...` line (mode, cascades, probes, probes invalidated this frame and cumulatively, atlas MB); after phase R1a it renders identically to GI off, because the probe field lights nothing yet. Two standing caveats: the reported times are **CPU record times** (SDL3 has no GPU timestamp API — `present_wait` is the CPU-bound-vs-GPU-bound signal), and a number from a default `build/` is not a performance number, because no `CMAKE_BUILD_TYPE` means `-O0` with live assertions. Reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
 
 ### Gotchas checklist
 
@@ -562,6 +562,8 @@ Enum modes are `enum class : int` with **stable underlying values** — they are
 | `ibl_enabled` | `true` | image-based lighting: ambient diffuse + specular come from the prefiltered procedural sky; `false` falls back to the two-color hemisphere ambient |
 | `bloom_enabled` / `bloom_strength` | `true` / `0.25f` | bloom toggle + intensity (0.0–1.0) |
 | `bloom_threshold` | `1.1f` | post-exposure HDR luminance above which bloom contributes |
+| `gi_mode` | `GiMode::Off` | diffuse GI from the probe clipmap: `Off` / `Probes` / `ProbesScreen` (0/1/2). `ProbesScreen` behaves as `Probes` until phase R4. See [Probe-field GI](#probe-field-gi-structure-only) — today it allocates and scrolls a probe field and lights nothing |
+| `gi_quality` | `GiQuality::Medium` | probe ray budget (`Low`/`Medium`/`High`, 0/1/2). Persisted now, consumed by phase R1b — it currently changes nothing |
 | `volumetric_fog` | `false` | expensive; off by default |
 | `god_rays` | `false` | requires `volumetric_fog` |
 | `window_mode` / `resolution_index` | `0` / `0` | see window management above |
@@ -7714,3 +7716,28 @@ prerequisite the software BVH already has.
 `max_distance` is the strongest dial: traversal cost scales with how much of
 the tree a ray can reach, so a shorter ray is cheaper *and* misses distant
 occluders. Trade it against `resolution` before reaching for anything else.
+
+## Probe-field GI (structure only)
+
+```cpp
+gs.gi_mode = GiMode::Probes;     // Off (default) / Probes / ProbesScreen
+gs.gi_quality = GiQuality::Medium;
+```
+
+`GiMode::Probes` allocates and scrolls a probe field — three camera-centred
+cascades of 24×12×24 probes at 150 / 300 / 600 world-unit spacing, with
+octahedral irradiance and visibility atlases, about 30 MB in total — and **that
+is all it does today**. Nothing traces into the field, nothing samples it, and
+your scene renders exactly as it does with `gi_mode = Off`. The probe update
+(rays, shading, temporal blend) is phase R1b of
+`docs/rt_lighting_plan.md`; the forward-pass and fog consumption that makes
+bounce light visible is R1c. Until both land, the only reasons to turn this on
+are to measure what the structure costs and to check that the scroll behaves —
+`SceneRenderer::gi_stats()` reports probes invalidated per frame and
+cumulatively, and the playground prints a `[smoke] gi ...` line.
+
+Two forward-looking values you can set now and rely on later: `ProbesScreen` is
+a valid, persisted mode that behaves identically to `Probes` until the
+screen-probe gather of phase R4 lands, and `gi_quality` is persisted but read by
+nothing until R1b. Both exist early so a settings file written today keeps its
+meaning.

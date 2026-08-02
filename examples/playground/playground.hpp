@@ -160,6 +160,11 @@ private:
     /// both OFF: the flags are persisted in settings.cfg, so "leave them
     /// alone" silently inherited ray tracing from whatever ran last.
     void apply_rt_mode(bracken::GraphicsSettings& gs) const;
+    /// Pin gi_mode from PLAYGROUND_GI, on exactly the same terms as
+    /// apply_rt_mode: an UNSET var means OFF, because gi_mode is persisted too
+    /// and "leave it alone" would inherit a 30 MB probe field from whatever ran
+    /// last.
+    void apply_gi_mode(bracken::GraphicsSettings& gs) const;
 
     // Sim-side (on_simulate; pool job — no GPU/SDL/main-thread-tier calls):
     void update_smoke_driver(float dt); // movement synthesis: orbit/chase/attack
@@ -334,6 +339,7 @@ private:
     // PLAYGROUND_ASYNC=0 restores serial model loading (the A/B baseline).
     bool async_load_disabled_ = false;
     std::string rt_mode_; // PLAYGROUND_RT: shadows | reflections | both
+    std::string gi_mode_; // PLAYGROUND_GI: probes | probes_screen | off
     float ambient_ripple_timer_ = 0.0f; // occasional ambient rings on the river
 
     // Game state

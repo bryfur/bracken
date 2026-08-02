@@ -26,6 +26,7 @@ Root namespace `bracken`, one sub-namespace per module.
 | `gpu/` | `gpu` | `GPUDevice`, `GPUBuffer`, `GPUTexture`, `ShaderManager`, `GPUPipeline`, `GPUComputePipeline`/`ComputePass` (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) + `pipeline_catalog.hpp` (what each pipeline *is*), `gpu_uniforms.hpp` (CPU↔GPU contract), `gpu_debug.hpp` |
 | `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `color_grading.hpp` |
 | `render/lighting/` | `render::lighting` | `ClusterGrid` (CPU light binning), `LocalShadowMap`/`LocalShadowSelector` (budgeted point/spot shadow atlas + tile cache), and the cluster/atlas **budget constants** in `light.hpp` (the light *structs* are `contracts/light.hpp`) |
+| `render/gi/` | `render::gi` | probe-field global illumination: `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three scrolled cascades of octahedral irradiance + visibility atlases, `gi_math.hpp` is the header-only CPU source of truth for the addressing R1b's shaders will mirror (torus wrap, atlas tiling, octahedral encode/decode, world↔probe mapping). **Structure only after phase R1a — it allocates and scrolls; nothing traces into it and nothing samples it.** See "Probe-field GI" |
 | `render_graph/` | `render_graph` | pass scheduler (topo-sort, transient pool) — **in-tree, tested, not wired into `SceneRenderer`** |
 | `scene/` | `scene` | `FramePacket` (immutable per-frame snapshot) + `FrameBuilder` (lane-based write interface) + `PacketRing` (SPSC handoff ring), `SceneRenderer` (frame orchestrator), `ScenePrep`, `RenderPlan`, `MotionHistory`, `transform_math.hpp` |
 | `animation/` | `animation` | `animation_types.hpp` (skeleton/clips/constants), `AnimationPlayer`, `AnimationStateMachine`, `ik_solver` |
@@ -1128,6 +1129,111 @@ pins the range enum.
   call `ModelManager::set_retain_cpu_geometry(true)` (`model_loader.hpp`)
   *before* loading, or the builder finds nothing to build from and says so
   rather than producing an empty structure.
+
+---
+
+## Probe-field GI
+
+Phase R1 of `docs/rt_lighting_plan.md` §5.2. **After R1a, what exists is the
+structure and nothing else**: the probe volume allocates its atlases, follows
+the camera, and records which probes entered its window. No ray is cast into
+it, no shader samples it, and `ambientIBL` is untouched. This section describes
+what is in the tree, not what the phase is for.
+
+Gated by `GraphicsSettings::gi_mode` (`contracts/graphics_settings.hpp`), which
+defaults to `GiMode::Off` — with GI off nothing here is allocated and the frame
+is byte-for-byte the pre-GI frame.
+
+### The clipmap
+
+`ProbeVolume` (`render/gi/probe_volume.hpp`) holds **3 cascades** of
+**24 × 12 × 24 = 6912 probes** each (20736 total). Y is half of X/Z because
+this is a ground-plane engine and a settlement is far wider than it is tall.
+Cascade 0's spacing is **150 world units** — 1.5 m at the playground's
+`VILLAGE_SCALE` of 100 units/metre, which is the scale every asset in this repo
+is authored at — and doubles per level (150 / 300 / 600), so the cascades reach
+3600 / 7200 / 14400 units across. Each coarser lattice is a strict subset of
+the finer one, which is what will let R1b blend across a cascade boundary
+without resampling.
+
+Three 2D textures per cascade, over one tiling defined once in
+`render/gi/gi_math.hpp`:
+
+| Texture | Format | Per probe | Atlas | Bytes |
+|---|---|---|---|---|
+| irradiance | `RGBA16F` | 8×8 (6×6 octahedral payload + 1 border ring) | 2304 × 192 | 3.375 MB |
+| visibility | `RG16F` (mean / mean² ray distance, for the Chebyshev leak test) | 16×16 (14×14 payload + border) | 4608 × 384 | 6.75 MB |
+| probe state | `R8_UINT` (0 = uninitialized, 1 = active) | 1 texel | 288 × 24 | 6.75 KB |
+
+**≈10.13 MB per cascade, ≈30.4 MB for the field** (pinned by
+`probe_volume.test.cpp`; the plan budgets ~35 MB). The border ring is what lets
+a bilinear tap at a payload edge wrap around the octahedron instead of bleeding
+into the neighbouring probe; R1b writes it.
+
+**The tiling**: column = `x + GRID_X * y` (288 columns), row = `z` (24 rows) —
+which is exactly the linear probe index split at `PROBES_PER_ATLAS_ROW`, so
+`probe_index()` and `probe_atlas_origin()` are one number read two ways and
+there is no second mapping to keep in sync. 2D rather than 3D because SDL3 GPU
+3D textures are not portably compute-storage-writable and the octahedral
+payload is 2D per probe regardless.
+
+### Scrolling
+
+Cascades are camera-centred but move in **whole probe-spacing steps**
+(`cascade_base` snaps `camera / spacing` to the nearest lattice point), so the
+field is stationary in world space and the window slides over it in integer
+steps. Storage uses **torus addressing** (`wrap_coord`): a probe's slot is a
+pure function of its absolute lattice coordinate, so a probe still inside the
+window after a scroll keeps the exact texels it had, and only the probes that
+*entered* land on a slot whose previous occupant left.
+
+`for_each_entering_probe` (`render/gi/gi_math.hpp`) defines "entering" as set
+difference — in the new window, not in the old — rather than as a per-axis
+plane list. Same set, but it cannot double-count the corner two arms of a
+diagonal scroll share, and a jump larger than the grid degenerates into "all of
+them" with no special case. It costs one pass over 6912 probes on frames where
+that cascade actually moved and nothing at all otherwise; a stationary camera
+does zero work.
+
+Entering probes are marked `PROBE_UNINITIALIZED` in a CPU byte mirror, and a
+cascade that scrolled re-uploads its **whole** 6912-byte state texture rather
+than a dirty rect. That is a measured trade: the worst case is all three
+cascades scrolling in one frame, 20.25 KB, against which describing an L-shaped
+slab in two or three partial copies saves kilobytes on a bus already moving
+megabytes of instance data.
+
+### Frame integration
+
+`SceneRenderer::render_frame` creates the volume **lazily** on the first frame
+with `gi_mode != GiMode::Off` and **destroys** it the moment the mode returns
+to `Off` — the same policy as `normal_rough_texture_`, for the same reason
+(30 MB nobody asked for). Toggling GI back on therefore restarts from a cold
+field, which is what a fresh allocation is anyway. The update runs between GTAO
+and the traced passes, outside any render pass (the state upload opens its own
+copy pass), timed as **`GIProbes`** in `RenderStats::pass_times_ms`.
+
+`SceneRenderer::gi_stats()` returns `render::gi::GiStats` — cascade/probe
+counts, atlas bytes, probes invalidated this frame and cumulatively. The
+cumulative figure is the one worth reading: a cascade only scrolls when the
+camera crosses a whole spacing, so the per-frame number is zero on most frames.
+The playground prints a `[smoke] gi ...` line when the mode is on, and
+`PLAYGROUND_GI=probes|probes_screen|off` pins it exactly as `PLAYGROUND_RT`
+pins the traced effects (unset = off, because `gi_mode` persists).
+
+### Known limits (R1a)
+
+- **Nothing consumes the field.** No probe update pass, no ray budget, no
+  sampling in the forward pass or the fog march. Every probe stays
+  `PROBE_UNINITIALIZED` forever and the atlases hold whatever the driver
+  allocated. R1b traces and blends; R1c consumes.
+- **`GiMode::ProbesScreen` behaves as `Probes`.** It is declared early so the
+  on-disk integer is fixed before players have settings files; the screen-probe
+  gather it names is phase R4.
+- **`GiQuality` is stored and persisted but read by nothing.** R1b's rays/probe
+  and update-cadence tables are its first consumer.
+- **No relocation, no classification.** Probes sit exactly on the lattice, so a
+  probe inside geometry stays inside it. Both arrive with R1b, and both are
+  what make sparse grids survive interiors.
 
 ---
 

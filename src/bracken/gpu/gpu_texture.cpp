@@ -83,6 +83,11 @@ size_t GPUTexture::get_bytes_per_pixel(SDL_GPUTextureFormat format) {
     // the transfer buffer and silently truncating the upload.
     switch (format) {
         case SDL_GPU_TEXTUREFORMAT_R8_UNORM:
+        // Integer single-channel: the GI probe-state atlas
+        // (render/gi/probe_volume.cpp) is uploaded from a CPU byte mirror, and
+        // an unlisted format here would reject that upload rather than
+        // mis-size it.
+        case SDL_GPU_TEXTUREFORMAT_R8_UINT:
             return 1;
         case SDL_GPU_TEXTUREFORMAT_R16_UNORM:
             return 2;

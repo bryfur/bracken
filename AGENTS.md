@@ -108,6 +108,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) over `pipeline_catalog.hpp` (one `constexpr` row per `PipelineType`: shaders, resources, vertex layout, target, depth/blend state), `gpu_uniforms.hpp` (CPU↔GPU contract) |
 | `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO, TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas |
 | `render/raytracing/` | `render::rt` | software BVH (32-byte nodes, binned SAH, two-level BLAS/TLAS) + `RtScene`; `render/rt_renderer.hpp` drives the traced passes and their denoisers. **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
+| `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for the addressing R1b's shaders will mirror. **Structure only so far** — it allocates and scrolls, nothing traces into it and nothing samples it. Off by default (`gi_mode`) |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
 | `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
 | `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
@@ -415,7 +416,9 @@ recorded `mean_luma` figures drifted by several points with no code change at
 all. The playground now calls `Application::set_settings_persistence(false)`
 as soon as `--smoke` is parsed, resets `GraphicsSettings{}` wholesale in
 `setup_smoke_run()`, and pins `rt_shadows`/`rt_reflections` from
-`PLAYGROUND_RT` (unset = both off). `[smoke] settings persist=0 shadow_mode=…`
+`PLAYGROUND_RT` (unset = both off) and `gi_mode` from `PLAYGROUND_GI`
+(`probes`|`probes_screen`|`off`; unset = off, same rule and same reason).
+`[smoke] settings persist=0 shadow_mode=…`
 prints what the run actually rendered with — check it before believing any
 luma number, yours or a commit message's.
 

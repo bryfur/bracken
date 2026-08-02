@@ -195,8 +195,9 @@ pinned camera, no screenshot, none of the mid-run settings flips, and a
 machine-readable `[rtbench] ...` table of per-pass CPU record times (mean and
 p95 over the run) plus the ray-tracing stats. It is the gate for any traversal
 performance claim. `PLAYGROUND_RT=shadows|reflections|both` picks which traced
-effects run; numbers are only worth quoting from a
-`-DCMAKE_BUILD_TYPE=RelWithDebInfo` tree.
+effects run and `PLAYGROUND_GI=probes|probes_screen|off` pins the probe-field
+GI mode (unset means off for both, because those settings persist); numbers are
+only worth quoting from a `-DCMAKE_BUILD_TYPE=RelWithDebInfo` tree.
 
 ### Developer overlay
 

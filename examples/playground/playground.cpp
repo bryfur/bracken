@@ -206,6 +206,12 @@ bool PlaygroundGame::on_init() {
     if (const char* rt = SDL_getenv("PLAYGROUND_RT"); rt != nullptr) {
         rt_mode_ = rt;
     }
+    // PLAYGROUND_GI=probes|probes_screen|off, read here for the same reason
+    // PLAYGROUND_RT is: the setting has to be pinned before init_renderer()
+    // could load a persisted one.
+    if (const char* gi = SDL_getenv("PLAYGROUND_GI"); gi != nullptr) {
+        gi_mode_ = gi;
+    }
 
     if (const char* env = SDL_getenv("PLAYGROUND_LOD"); env != nullptr) {
         lod_disabled_ = env[0] == '0';
@@ -404,6 +410,7 @@ bool PlaygroundGame::on_init() {
     {
         auto edit = edit_graphics_settings();
         apply_rt_mode(*edit);
+        apply_gi_mode(*edit);
         // No request_graphics_settings() here: the edit handle commits on
         // scope exit if anything changed (the old code requested the same
         // value twice into the same slot).
@@ -1507,6 +1514,18 @@ void PlaygroundGame::apply_rt_mode(bracken::GraphicsSettings& gs) const {
     gs.rt_reflections = rt_mode_ == "reflections" || rt_mode_ == "both";
 }
 
+void PlaygroundGame::apply_gi_mode(bracken::GraphicsSettings& gs) const {
+    // `probes_screen` is accepted now so the pin vocabulary does not change
+    // when phase R4 makes it mean something; today it behaves as `probes`.
+    if (gi_mode_ == "probes") {
+        gs.gi_mode = bracken::GiMode::Probes;
+    } else if (gi_mode_ == "probes_screen") {
+        gs.gi_mode = bracken::GiMode::ProbesScreen;
+    } else {
+        gs.gi_mode = bracken::GiMode::Off;
+    }
+}
+
 // One-time smoke-run configuration — the retired driver's frame-1 block, now
 // run from the end of on_init (main thread, renderer up, no sim in flight, so
 // the render-side touches are legal; the env-var parsing happens once instead
@@ -1540,6 +1559,10 @@ void PlaygroundGame::setup_smoke_run() {
     *gs = bracken::GraphicsSettings{};
     // Ray tracing: pinned from PLAYGROUND_RT, off when it is unset.
     apply_rt_mode(*gs);
+    // Probe-field GI: pinned from PLAYGROUND_GI, off when it is unset. Same
+    // rule and the same reason — gi_mode persists, so an unpinned smoke run
+    // would inherit whatever the last interactive session left behind.
+    apply_gi_mode(*gs);
     // TAA so the smoke always exercises the temporal path (and the final
     // screenshot captures it). This is also the struct default; kept explicit
     // because PLAYGROUND_AA below overrides it and the intent should read.
@@ -1911,6 +1934,25 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
                 static_cast<double>(rt.blas_bytes) / (1024.0 * 1024.0),
                 static_cast<double>(rt.attribute_bytes) / (1024.0 * 1024.0),
                 static_cast<double>(rt.tlas_bytes) / (1024.0 * 1024.0));
+        }
+        {   // Probe-field GI. Printed only when it is on, because "gi off" on
+            // every default run would be one more line of nothing. What it
+            // proves today is that the field was ALLOCATED and SCROLLED —
+            // nothing traces into it and nothing samples it until R1b/R1c, so
+            // `invalidated` is the whole observable: it must be non-zero on the
+            // frame the volume is placed and must settle to a plane's worth (or
+            // zero) as the camera moves.
+            const auto& gi = scene_renderer().gi_stats();
+            if (gi.active) {
+                std::cout << std::format(
+                    "[smoke] gi mode={} quality={} cascades={} probes={} invalidated={} total={} "
+                    "atlas={:.1f}MB spacing={:.0f}..{:.0f}\n",
+                    static_cast<int>(graphics_settings().gi_mode),
+                    static_cast<int>(graphics_settings().gi_quality), gi.cascades, gi.probes,
+                    gi.probes_invalidated, gi.probes_invalidated_total,
+                    static_cast<double>(gi.atlas_bytes) / (1024.0 * 1024.0),
+                    gi.per_cascade.front().spacing, gi.per_cascade.back().spacing);
+            }
         }
         // Tier-3 evidence: that the controller left the ground, that the nav
         // grid built, and that the villager actually pathed somewhere.

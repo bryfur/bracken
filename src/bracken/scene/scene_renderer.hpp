@@ -12,6 +12,7 @@
 #include "bracken/contracts/render_stats.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
+#include "bracken/render/gi/probe_volume.hpp"
 #include "bracken/render/rt_renderer.hpp"
 #include "bracken/render/lighting/local_shadows.hpp"
 #include "bracken/scene/frame_packet.hpp"
@@ -198,6 +199,12 @@ public:
     void set_raytracing_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances);
 
     [[nodiscard]] const render::RtStats& raytracing_stats() const;
+
+    /** Probe-field GI accounting — cascade count, probe count, how many probes
+     *  the scroll invalidated this frame, and the atlas bytes. All zero (and
+     *  `active == false`) while `gi_mode == GiMode::Off`, which is the default.
+     *  Read-only, main-thread; mirrors raytracing_stats(). */
+    [[nodiscard]] const render::gi::GiStats& gi_stats() const;
 
     /** Effect/particle counts of the LAST CONSUMED packet's effect-instance
      *  snapshot — render-side data, safe for the dev overlay to read while
@@ -488,6 +495,20 @@ private:
     std::unique_ptr<gpu::GPUTexture> depth_texture_;
     SDL_GPUSampler* default_sampler_ = nullptr;
     std::unique_ptr<gpu::GPUTexture> dummy_white_texture_;    // 1x1 white for binding slots that need a texture
+
+    /// Probe-field GI. Created LAZILY on the first frame with
+    /// `gi_mode != GiMode::Off` and DESTROYED the moment it goes back to Off —
+    /// the same policy as normal_rough_texture_ above, and for the same reason:
+    /// the field is ~30 MB of atlases, and a game that never enables GI must
+    /// never pay for it. The cost of destroying rather than parking it is that
+    /// toggling GI back on restarts from a cold field (every probe
+    /// uninitialized), which is exactly what a fresh allocation would be
+    /// anyway — the atlases hold no valid contents across a shutdown.
+    std::unique_ptr<render::gi::ProbeVolume> probe_volume_;
+    /// Latched allocation failure, so a device that cannot give us the atlases
+    /// costs one attempt rather than one per frame. Cleared when gi_mode goes
+    /// back to Off, which is the only way to ask for a retry.
+    bool gi_init_failed_ = false;
 
     // Compute-shader ray tracing. Null-checked everywhere: both features are
     // off by default and nothing is built unless one is on.

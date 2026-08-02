@@ -392,6 +392,46 @@ serve both ends).
 The single highest-value addition in this plan: bounce light and correct sky
 occlusion, everywhere, at a cost that *amortizes*.
 
+**Landed (R1a, 2026-08-02) — the structure, and only the structure.**
+`render/gi/` (namespace `render::gi`) is in the tree: `ProbeVolume`
+(`render/gi/probe_volume.hpp`) owns the three cascades' atlases, and
+`gi_math.hpp` is the header-only CPU source of truth for every mapping R1b's
+shaders will mirror — torus wrap, the atlas tiling, octahedral encode/decode
+(the `octDecode` convention already in `shaders/rt_trace.hlsli`, not a second
+one), and the world↔probe mapping per cascade. Shipped numbers: 3 cascades ×
+24×12×24 probes, spacing 150/300/600 world units (1.5/3/6 m at the playground's
+100 units/metre), irradiance 8×8 texels/probe RGBA16F (2304×192, 3.375 MB),
+visibility 16×16 RG16F (4608×384, 6.75 MB), probe state 1 texel R8_UINT
+(288×24) — **10.13 MB per cascade, 30.4 MB for the field**, comfortably inside
+the ~35 MB this section estimated. Tiling is column = `x + GRID_X*y`, row = `z`,
+i.e. the linear probe index split at `PROBES_PER_ATLAS_ROW`, so there is exactly
+one mapping and not two.
+
+Scrolling works and is tested: cascades snap to whole probe steps, torus
+addressing keeps a surviving probe's texels, and `for_each_entering_probe`
+defines "entered" as *in the new window, not in the old* rather than as a
+per-axis plane list — the same set, but it cannot double-count the corner a
+diagonal scroll's two arms share, and a jump past one grid width degenerates to
+a full invalidation with no special case. A scrolled cascade re-uploads its
+whole 6912-byte state texture (worst case 20.25 KB/frame across three cascades)
+instead of carrying dirty rects.
+
+`GiMode { Off = 0, Probes, ProbesScreen }` and `GiQuality { Low, Medium, High }`
+landed with all seven touch points and a dev-panel combo. Two are deliberately
+ahead of their implementation, both documented as such in the enum, the tooltip
+and the docs: `ProbesScreen` behaves as `Probes` until R4, and `gi_quality` is
+persisted but read by nothing until R1b. `SceneRenderer` owns the volume
+lazily (created on the first non-Off frame, destroyed when it returns to Off)
+and scrolls it in a `GIProbes` timer scope; the playground pins it with
+`PLAYGROUND_GI` and prints a `[smoke] gi ...` line.
+
+**Nothing consumes the field.** No ray is cast into it, no shader samples it,
+every probe stays uninitialized, and the default (`Off`) path is byte-identical
+— `--smoke 30` reproduces its baseline luma exactly with GI on *or* off, which
+is the correctness claim R1a is allowed to make. Probe relocation and
+classification are R1b's, with the update pass. What follows in this section is
+still the plan, not the tree.
+
 **Structure.** DDGI-shaped, 3 scrolled cascades centered on the camera
 (spacings ~1.5 m / 3 m / 6 m — wide enough for the village, tunable), each
 ~24×12×24 probes ⇒ ~21 k probes total. Per probe: 6×6 octahedral irradiance

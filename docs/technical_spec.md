@@ -667,6 +667,8 @@ enum class AAMode      : int { Off = 0, FXAA = 1, TAA = 2 };
 enum class TonemapMode : int { ACESFitted = 0, ACESNarkowicz = 1, Reinhard = 2, None = 3 };
 enum class RtResolution: int { Full = 0, Half = 1, Quarter = 2 };
 enum class RtRange     : int { Near = 0, Medium = 1, Far = 2, Unlimited = 3 };
+enum class GiMode      : int { Off = 0, Probes = 1, ProbesScreen = 2 };
+enum class GiQuality   : int { Low = 0, Medium = 1, High = 2 };
 ```
 
 #### Field table (name = file key; defaults verified by `graphics_settings.test.cpp::DefaultValues`/`LoadEmptyFileKeepsDefaults`)
@@ -705,6 +707,8 @@ enum class RtRange     : int { Near = 0, Medium = 1, Far = 2, Unlimited = 3 };
 | `rt_sun_softness_deg` | float | 0.35 | [0, 10] (angular RADIUS of the sun disk in degrees; the real sun is ~0.265. 0 collapses the cone to a hard shadow. Free to trace — same ray count, the denoiser works harder) |
 | `rt_reflection_max_roughness` | float | 0.75 | [0, 1] (roughness at which traced specular hands over entirely to the prefiltered IBL probe; the two weights always sum to 1) |
 | `rt_max_instance_range` | RtRange | **Unlimited** | [Near, Unlimited] → {1000, 2000, 4000, ∞} world units via `rt_range_units` (instances whose bounds lie entirely beyond it are dropped before the TLAS hashes; distant sun shadows fall back to the cascades. A finite value makes camera motion change the instance SET, which is a topology change and therefore a full TLAS rebuild rather than the refit a mere move costs — see architecture.md "Ray tracing") |
+| `gi_mode` | GiMode | **Off** | [Off, ProbesScreen] (diffuse GI from the scrolled probe clipmap, `render/gi/probe_volume.hpp`. Off by default: the field costs ~30 MB of atlases the moment it exists. `ProbesScreen` is a valid, clamping, persisted value that **behaves as `Probes` until phase R4** — declared early so the on-disk integer for the tier is fixed before players have settings files. After phase R1a the field allocates and scrolls and lights nothing; see architecture.md "Probe-field GI") |
+| `gi_quality` | GiQuality | Medium | [Low, High] (probe ray budget: rays per probe and update cadence. **Stored and persisted now, consumed by phase R1b** — it currently changes nothing. Defined with the mode rather than with the update pass so the file format changes once instead of twice) |
 | `volumetric_fog` | bool | false | — |
 | `god_rays` | bool | false | requires `volumetric_fog` (not enforced here) |
 | `window_mode` | int | 0 | [0, 2] |

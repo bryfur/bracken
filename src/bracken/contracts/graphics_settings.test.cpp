@@ -56,6 +56,51 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
     // Unlimited by default: the range filter must be inert until dialed, or
     // adding the knob would silently change what every existing scene traces.
     EXPECT_EQ(s.rt_max_instance_range, RtRange::Unlimited);
+    // Diffuse GI is OFF by default: the probe field costs ~30 MB of atlases the
+    // moment it exists, and until phase R1b it buys nothing. gi_quality is
+    // stored regardless (R1b reads it) so the file format does not change again.
+    EXPECT_EQ(s.gi_mode, GiMode::Off);
+    EXPECT_EQ(s.gi_quality, GiQuality::Medium);
+}
+
+// GiMode::ProbesScreen is declared before it does anything (it behaves as
+// Probes until phase R4). That is only safe if it is a first-class value now —
+// a clamp that rejected it would silently rewrite a forward-looking settings
+// file back to Probes, which is exactly the migration this pre-declaration
+// exists to avoid.
+TEST_F(GraphicsSettingsTest, GiSettingsRoundTripAndClamp) {
+    GraphicsSettings written;
+    written.gi_mode = GiMode::ProbesScreen;
+    written.gi_quality = GiQuality::High;
+    ASSERT_TRUE(written.save(TEST_FILE));
+
+    GraphicsSettings read;
+    ASSERT_EQ(read.gi_mode, GiMode::Off);
+    ASSERT_TRUE(read.load(TEST_FILE));
+    EXPECT_EQ(read.gi_mode, GiMode::ProbesScreen);
+    EXPECT_EQ(read.gi_quality, GiQuality::High);
+
+    // ...and back to Off, so a file holding 0 really clears it.
+    GraphicsSettings off;
+    ASSERT_TRUE(off.save(TEST_FILE));
+    GraphicsSettings reread;
+    reread.gi_mode = GiMode::Probes;
+    reread.gi_quality = GiQuality::Low;
+    ASSERT_TRUE(reread.load(TEST_FILE));
+    EXPECT_EQ(reread.gi_mode, GiMode::Off);
+    EXPECT_EQ(reread.gi_quality, GiQuality::Medium);
+
+    // Out of range on the wire lands on a real enumerator.
+    {
+        std::ofstream out(TEST_FILE);
+        out << "settings_version=" << GraphicsSettings::CURRENT_SETTINGS_VERSION << "\n";
+        out << "gi_mode=9\n";
+        out << "gi_quality=-4\n";
+    }
+    GraphicsSettings clamped;
+    ASSERT_TRUE(clamped.load(TEST_FILE));
+    EXPECT_EQ(clamped.gi_mode, GiMode::ProbesScreen);
+    EXPECT_EQ(clamped.gi_quality, GiQuality::Low);
 }
 
 TEST_F(GraphicsSettingsTest, RtRangeUnitsMapping) {
@@ -200,6 +245,8 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     original.auto_exposure_speed_up = 3.0f;
     original.auto_exposure_speed_down = 0.5f;
     original.rt_max_instance_range = RtRange::Far;
+    original.gi_mode = GiMode::Probes;
+    original.gi_quality = GiQuality::Low;
 
     ASSERT_TRUE(original.save(TEST_FILE));
 
@@ -239,6 +286,8 @@ TEST_F(GraphicsSettingsTest, SaveLoadRoundTripsAllFields) {
     EXPECT_FLOAT_EQ(loaded.auto_exposure_speed_up, 3.0f);
     EXPECT_FLOAT_EQ(loaded.auto_exposure_speed_down, 0.5f);
     EXPECT_EQ(loaded.rt_max_instance_range, RtRange::Far);
+    EXPECT_EQ(loaded.gi_mode, GiMode::Probes);
+    EXPECT_EQ(loaded.gi_quality, GiQuality::Low);
     EXPECT_EQ(loaded.settings_version, GraphicsSettings::CURRENT_SETTINGS_VERSION);
 }
 

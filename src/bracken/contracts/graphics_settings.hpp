@@ -114,6 +114,45 @@ enum class RtRange : int {
     Unlimited = 3,
 };
 
+/**
+ * Diffuse global illumination.
+ *
+ * `Probes` is the scrolled probe clipmap (`render/gi/probe_volume.hpp`): three
+ * camera-centred cascades of octahedral irradiance + visibility probes, updated
+ * from a fixed ray budget per frame rather than per pixel, which is what makes
+ * GI affordable on hardware that cannot afford a ray per pixel.
+ *
+ * `ProbesScreen` adds the screen-probe gather of phase R4. IT IS DECLARED NOW
+ * AND BEHAVES AS `Probes` UNTIL R4 LANDS — deliberately, so the on-disk integer
+ * for the quality tier is fixed before players have settings files. It is a
+ * valid value and clamps like any other; it simply does not yet do the extra
+ * thing its name promises.
+ *
+ * `Off` is the default and is the pre-GI engine exactly: ambient comes from the
+ * IBL sky probe or the hemisphere fallback, as it always has.
+ */
+enum class GiMode : int {
+    Off = 0,
+    Probes = 1,
+    ProbesScreen = 2,
+};
+
+/**
+ * Probe-field budget tier: rays per probe per update and how often a probe is
+ * revisited.
+ *
+ * STORED BUT NOT YET CONSUMED. R1a allocates and scrolls the probe volume;
+ * nothing traces into it, so this value currently changes nothing. It is
+ * defined here rather than with the update pass so that the settings file
+ * format is complete in one change instead of two — the field is read by R1b,
+ * which is where the rays/probe and cadence tables will live.
+ */
+enum class GiQuality : int {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+};
+
 /** Per-cascade shadow map edge length in texels. */
 enum class ShadowResolution : int {
     R512 = 0,
@@ -282,6 +321,15 @@ struct GraphicsSettings {
     /// — a moving instance only costs a refit, but an instance dropping in or
     /// out of range changes the topology and there is no tree to refit onto.
     RtRange rt_max_instance_range = RtRange::Unlimited;
+    // --- Probe-field global illumination ---------------------------------
+    /// Diffuse GI mode. OFF BY DEFAULT: the probe field costs ~30 MB of atlases
+    /// the moment it is switched on, and (until R1b) buys nothing. `Off` is the
+    /// pre-GI path byte for byte.
+    GiMode gi_mode = GiMode::Off;
+    /// Probe ray budget tier. Stored and persisted now, consumed by R1b — see
+    /// the enum. Medium is the default because it is the tier the plan's
+    /// mid-range budget (§6 of docs/rt_lighting_plan.md) is written against.
+    GiQuality gi_quality = GiQuality::Medium;
     bool volumetric_fog = false;              // Atmospheric fog haze (expensive, off by default)
     bool god_rays = false;                    // Light shafts through shadows (requires volumetric_fog)
     WindowMode window_mode = WindowMode::Windowed;

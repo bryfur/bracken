@@ -378,6 +378,32 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
         }
         ImGui::Unindent();
     }
+
+    // Diffuse GI. Deliberately OUTSIDE the rt_* block: the probe field is its
+    // own signal with its own budget, and phase R1c wires it into the forward
+    // pass whether or not anything is tracing shadows or reflections.
+    static const char* const GI_MODES[] = {"Off", "Probes", "Probes + screen"};
+    changed |= combo_enum("Global illumination", settings.gi_mode, GI_MODES, 3);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Diffuse GI from a scrolled probe clipmap: 3 camera-centred\n"
+                          "cascades, octahedral irradiance + visibility, ~30 MB.\n"
+                          "\"Probes + screen\" adds the screen-probe gather and is\n"
+                          "DECLARED BUT NOT IMPLEMENTED — it behaves exactly as\n"
+                          "\"Probes\" until phase R4 lands.\n"
+                          "Today the field allocates and scrolls; it lights nothing\n"
+                          "until R1b traces into it and R1c reads it.");
+    }
+    if (settings.gi_mode != GiMode::Off) {
+        ImGui::Indent();
+        static const char* const GI_QUALITIES[] = {"Low", "Medium", "High"};
+        changed |= combo_enum("GI quality", settings.gi_quality, GI_QUALITIES, 3);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Probe ray budget: rays per probe and how often each probe\n"
+                              "is revisited. Stored and persisted now, consumed by the\n"
+                              "R1b update pass — it currently changes nothing.");
+        }
+        ImGui::Unindent();
+    }
     changed |= ImGui::Checkbox("Bloom", &settings.bloom_enabled);
     changed |= ImGui::Checkbox("Volumetric fog", &settings.volumetric_fog);
     changed |= ImGui::Checkbox("God rays", &settings.god_rays);
