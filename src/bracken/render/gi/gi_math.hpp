@@ -74,11 +74,36 @@ inline constexpr int PROBE_BORDER_TEXELS = 1;
 inline constexpr int IRRADIANCE_PROBE_TEXELS = IRRADIANCE_PAYLOAD_TEXELS + 2 * PROBE_BORDER_TEXELS; // 8
 inline constexpr int VISIBILITY_PROBE_TEXELS = VISIBILITY_PAYLOAD_TEXELS + 2 * PROBE_BORDER_TEXELS; // 16
 
-/// Per-probe state (`probe_state` texture, R8_UINT). Richer states — relocated,
-/// classified-inactive, backface-heavy — arrive with R1b's classification pass;
-/// these two are what the structure alone can say.
+/// Per-probe SCHEDULING state (`probe_state` texture, R8_UINT). Owned by the
+/// CPU: `ProbeCascade` writes it as the scroll invalidates probes and as the
+/// updater schedules them, and `ProbeVolume` uploads the whole 6912-byte plane
+/// whenever it changed.
+///
+/// The GPU's CLASSIFICATION verdict deliberately does NOT live here — see
+/// PROBE_CLASS_* below for why a second writer would lose its writes.
 inline constexpr std::uint8_t PROBE_UNINITIALIZED = 0;
 inline constexpr std::uint8_t PROBE_ACTIVE = 1;
+
+/**
+ * Per-probe CLASSIFICATION verdict, stored in the W channel of the per-probe
+ * offset texture (`ProbeVolume::probe_offset`, RGBA16F: xyz = the relocation
+ * offset in world units, w = one of these).
+ *
+ * WHY NOT IN `probe_state`. That texture has a CPU writer — every scroll
+ * re-uploads all of it from `ProbeCascade::state()`, which is the only way an
+ * entering probe can be made to read as uninitialized on the GPU. A GPU-written
+ * verdict in the same texels would be silently erased by the next scroll, and
+ * the erasure would look like "classification is flaky" rather than like a
+ * lost-update bug. One texture, one writer.
+ *
+ * R1c's sampler reads BOTH: `probe_state` for "has this probe ever been
+ * filled", and this channel for "is it inside geometry" (skip it) plus xyz for
+ * where the probe actually sampled from, which is where its irradiance is
+ * valid. Anything sampling the field must apply the offset — a probe nudged
+ * 0.45 spacings out of a wall is not at its lattice position any more.
+ */
+inline constexpr float PROBE_CLASS_OK = 0.0f;
+inline constexpr float PROBE_CLASS_INSIDE_GEOMETRY = 2.0f;
 
 // ---------------------------------------------------------------------------
 // THE 2D TILING — defined once, here
@@ -309,6 +334,196 @@ std::uint32_t for_each_entering_probe(const glm::ivec3& old_base, const glm::ive
     return oct_decode(uv);
 }
 
+/**
+ * BORDER WRAP. Given a texel of a probe's FULL tile (border included, so
+ * `tile_local` is in [0, payload + 2)^2), return the payload texel it must
+ * replicate — in payload coordinates, [0, payload)^2. Passing an interior texel
+ * is a programming error and returns it unchanged (clamped).
+ *
+ * The octahedron's outer square edge folds onto itself: walking off the top
+ * edge re-enters the top edge from the opposite side, mirrored. So the border
+ * ring is not "clamp to edge" (which is what a naive copy does, and which makes
+ * a bilinear tap at the payload boundary blend two directions that are 90 apart
+ * on the sphere) — each border texel takes the payload texel diagonally opposite
+ * across the relevant axis, and the four corners take the opposite corner.
+ *
+ * Shader counterpart: `giBorderSource(int2, int)` in `shaders/gi_probe.hlsli`.
+ */
+[[nodiscard]] inline glm::ivec2 probe_border_source(const glm::ivec2& tile_local, int payload_texels) {
+    const int last = payload_texels - 1;
+    const int tile = payload_texels + 2 * PROBE_BORDER_TEXELS;
+    const bool left = tile_local.x < PROBE_BORDER_TEXELS;
+    const bool right = tile_local.x >= tile - PROBE_BORDER_TEXELS;
+    const bool top = tile_local.y < PROBE_BORDER_TEXELS;
+    const bool bottom = tile_local.y >= tile - PROBE_BORDER_TEXELS;
+    // Payload coordinate of this texel, valid only on the axes that are inside.
+    const int px = std::clamp(tile_local.x - PROBE_BORDER_TEXELS, 0, last);
+    const int py = std::clamp(tile_local.y - PROBE_BORDER_TEXELS, 0, last);
+
+    if ((left || right) && (top || bottom)) {
+        // Corner: the antipode of the octahedron's corner is the opposite corner.
+        return {left ? 0 : last, top ? 0 : last};
+    }
+    if (top || bottom) {
+        return {last - px, top ? 0 : last};
+    }
+    if (left || right) {
+        return {left ? 0 : last, last - py};
+    }
+    return {px, py};
+}
+
+// ---------------------------------------------------------------------------
+// Probe ray directions
+// ---------------------------------------------------------------------------
+
+/**
+ * Spherical Fibonacci: `count` directions spread over the whole sphere with no
+ * clustering at the poles and no preferred axis. `index` is in [0, count).
+ *
+ * The whole sphere, not a hemisphere: a probe has no normal, it integrates
+ * incoming radiance from every direction, and the octahedral payload it feeds
+ * covers 4pi.
+ *
+ * Shader counterpart: `giSphericalFibonacci(uint, uint)` in
+ * `shaders/gi_probe.hlsli` — a transliteration of this body, float for float.
+ */
+[[nodiscard]] inline glm::vec3 spherical_fibonacci(int index, int count) {
+    // Golden-ratio conjugate. The azimuth advances by this fraction of a turn
+    // per sample, which is the most irrational rotation there is and therefore
+    // the one that takes longest to revisit a direction.
+    constexpr float GOLDEN_CONJUGATE = 0.6180339887498949f;
+    const float n = static_cast<float>(count);
+    const float i = static_cast<float>(index);
+    const float phi = 6.283185307179586f * (i * GOLDEN_CONJUGATE - std::floor(i * GOLDEN_CONJUGATE));
+    // Uniform in cos(theta) — that is what makes the set area-uniform rather
+    // than angle-uniform (which would bunch at the poles).
+    const float cos_theta = 1.0f - (2.0f * i + 1.0f) / n;
+    const float sin_theta = std::sqrt(std::max(0.0f, 1.0f - cos_theta * cos_theta));
+    return {std::cos(phi) * sin_theta, std::sin(phi) * sin_theta, cos_theta};
+}
+
+/**
+ * The per-frame rotation applied to the whole Fibonacci set.
+ *
+ * WHY: a fixed direction set traced every frame samples the same `count` points
+ * of the sphere forever, so the estimate converges to a biased answer — a
+ * 64-direction quadrature of the scene, not the scene. Rotating the set makes
+ * consecutive updates of the same probe sample DIFFERENT directions, so the EMA
+ * blend below integrates rather than averaging one fixed quadrature.
+ *
+ * DETERMINISTIC: derived from the frame counter alone through the R3 sequence
+ * (the 3D generalization of R2 in `shaders/rt_sampling.hlsli`; Roberts 2018,
+ * with 1/g, 1/g^2, 1/g^3 for the root of x^4 = x + 1), then turned into a
+ * uniformly-distributed rotation by Shoemake's quaternion construction. Same
+ * frame index in, same rotation out, on the CPU and in the shader — which is
+ * what keeps a `--smoke` run reproducible.
+ *
+ * Shader counterpart: `giRayRotation(uint)` in `shaders/gi_probe.hlsli`.
+ */
+[[nodiscard]] inline glm::mat3 probe_ray_rotation(std::uint32_t frame_index) {
+    constexpr float R3_A = 0.8191725133961644f; // 1/g
+    constexpr float R3_B = 0.6710436067037893f; // 1/g^2
+    constexpr float R3_C = 0.5497004779019702f; // 1/g^3
+    const float f = static_cast<float>(frame_index);
+    const auto frac = [](float v) { return v - std::floor(v); };
+    const float u1 = frac(R3_A * f);
+    const float u2 = frac(R3_B * f);
+    const float u3 = frac(R3_C * f);
+
+    // Shoemake (Graphics Gems III): three uniforms -> a uniformly distributed
+    // unit quaternion. Cheaper and better distributed than three Euler angles,
+    // which bunch rotations near the poles of whichever axis is applied last.
+    const float s1 = std::sqrt(1.0f - u1);
+    const float s2 = std::sqrt(u1);
+    const float t1 = 6.283185307179586f * u2;
+    const float t2 = 6.283185307179586f * u3;
+    const float x = s1 * std::sin(t1);
+    const float y = s1 * std::cos(t1);
+    const float z = s2 * std::sin(t2);
+    const float w = s2 * std::cos(t2);
+
+    return {// column 0
+            glm::vec3{1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y + z * w), 2.0f * (x * z - y * w)},
+            // column 1
+            glm::vec3{2.0f * (x * y - z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z + x * w)},
+            // column 2
+            glm::vec3{2.0f * (x * z + y * w), 2.0f * (y * z - x * w), 1.0f - 2.0f * (x * x + y * y)}};
+}
+
+/// Direction of probe ray `index` of `count` on frame `frame_index`.
+[[nodiscard]] inline glm::vec3 probe_ray_direction(int index, int count, std::uint32_t frame_index) {
+    return probe_ray_rotation(frame_index) * spherical_fibonacci(index, count);
+}
+
+// ---------------------------------------------------------------------------
+// Blend: change-adaptive hysteresis
+// ---------------------------------------------------------------------------
+//
+// Per `docs/rt_lighting_plan.md` §5.2, the blend is an EMA whose hysteresis is
+// driven by how far the new estimate is from the stored one (GI-1.0's
+// Algorithm 3 shape). Two constants and one curve:
+
+/// Steady-state hysteresis. High, because at 32-96 rays a probe's per-update
+/// estimate is extremely noisy and the accumulated value IS the signal. A pure
+/// 0.97 EMA reaches 90% of a step in ~76 updates — invisible at real
+/// time-of-day rates, unacceptable for a lightning flash, which is what the
+/// adaptive floor below exists for.
+inline constexpr float PROBE_HYSTERESIS_MAX = 0.97f;
+/// Floor reached when the new estimate disagrees with history by 100% or more
+/// (a light switched on, a storm front, a door opened). 0.70 reaches 90% of a
+/// step in ~7 updates.
+inline constexpr float PROBE_HYSTERESIS_MIN = 0.70f;
+/// Relative change at which the hysteresis has fully collapsed to the floor.
+inline constexpr float PROBE_CHANGE_SATURATION = 1.0f;
+
+/// Hysteresis for a normalized new-vs-old delta. `delta` is
+/// |new - old| / max(|old|, epsilon), so it is scale-free: a courtyard at 0.02
+/// and a sunlit wall at 20.0 respond to a doubling at the same rate.
+[[nodiscard]] inline float probe_blend_hysteresis(float delta) {
+    const float t = std::clamp(delta / PROBE_CHANGE_SATURATION, 0.0f, 1.0f);
+    return PROBE_HYSTERESIS_MAX + (PROBE_HYSTERESIS_MIN - PROBE_HYSTERESIS_MAX) * t;
+}
+
+/// One EMA step of the adaptive blend, per colour channel set. Mirrors
+/// `giBlend()` in `shaders/gi_probe_blend.comp.hlsl`.
+[[nodiscard]] inline glm::vec3 probe_blend(const glm::vec3& old_value, const glm::vec3& new_value) {
+    const float old_mag = glm::length(old_value);
+    const float delta = glm::length(new_value - old_value) / std::max(old_mag, 1e-4f);
+    const float hysteresis = probe_blend_hysteresis(delta);
+    return new_value + (old_value - new_value) * hysteresis;
+}
+
+// ---------------------------------------------------------------------------
+// Classification / relocation thresholds
+// ---------------------------------------------------------------------------
+
+/// Backface fraction above which a probe is assumed to be sitting in a wall and
+/// is nudged. A quarter of the sphere blocked from the inside is far more than
+/// any convex exterior corner produces.
+inline constexpr float PROBE_RELOCATE_BACKFACE_FRACTION = 0.25f;
+/// Backface fraction above which relocation has failed and the probe is written
+/// off as interior (PROBE_CLASS_INSIDE_GEOMETRY).
+inline constexpr float PROBE_INSIDE_BACKFACE_FRACTION = 0.75f;
+/// Relocation offsets are clamped to this fraction of the cascade spacing.
+/// Below 0.5 by construction: a probe that could move a full spacing would
+/// cross into its neighbour's cell and the trilinear weights at sample time
+/// would be nonsense.
+inline constexpr float PROBE_MAX_OFFSET_FRACTION = 0.45f;
+
+/// Ray hit distances are clamped to this multiple of the cascade spacing before
+/// they enter the visibility moments. Chebyshev only ever compares a sample's
+/// distance-to-probe against the stored mean, and a sample is at most ~1
+/// spacing away from the probe that answers for it; letting one ray that flew
+/// 4000 units into open sky drag the mean up would make the test declare every
+/// nearby surface visible. 1.5 leaves headroom for the diagonal.
+inline constexpr float PROBE_VISIBILITY_DISTANCE_SCALE = 1.5f;
+/// Directional sharpness of the visibility blend's weighting lobe. Visibility
+/// is a HIGH-frequency signal (a wall is either there or not), so its texels
+/// take a much narrower cone of rays than the irradiance texels do — the
+/// DDGI-standard trade.
+inline constexpr float PROBE_VISIBILITY_SHARPNESS = 50.0f;
+
 // ---------------------------------------------------------------------------
 // One cascade's CPU-side state
 // ---------------------------------------------------------------------------
@@ -322,6 +537,14 @@ std::uint32_t for_each_entering_probe(const glm::ivec3& old_base, const glm::ive
  * (`gi_math.test.cpp`) — `gi::ProbeVolume` owns one of these per cascade
  * alongside the atlases and does nothing with the geometry itself.
  */
+/// One probe scheduled for update this frame. `was_uninitialized` is what tells
+/// the blend pass to take the new estimate wholesale instead of blending it
+/// into whatever the slot's previous occupant left behind.
+struct ProbeUpdateSlot {
+    int slot = 0;
+    bool was_uninitialized = false;
+};
+
 class ProbeCascade {
 public:
     /// (Re)bind to a cascade level. Leaves the cascade UNPLACED: the first
@@ -334,6 +557,7 @@ public:
         state_.assign(static_cast<std::size_t>(PROBES_PER_CASCADE), PROBE_UNINITIALIZED);
         state_dirty_ = true;
         last_invalidated_ = 0;
+        cursor_ = 0;
     }
 
     /// Move the window to follow the camera. Returns the number of probes
@@ -364,7 +588,66 @@ public:
         return entered;
     }
 
+    /**
+     * Choose up to `budget` slots to trace this frame, appending them to `out`.
+     * Returns how many were appended.
+     *
+     * TWO PHASES, and the order is the whole policy:
+     *
+     *  A. Every UNINITIALIZED slot, in slot order, jumps the queue. Those are
+     *     the probes the scroll just brought into the window, holding the
+     *     radiance of whatever used to occupy their storage — they are the
+     *     visible-lag case, and nothing else in the field is wrong.
+     *  B. The remainder of the budget comes from a persistent round-robin
+     *     cursor over probes that are already live. The cursor advances past
+     *     every slot EXAMINED, not every slot taken, so it cannot stall on a
+     *     run of uninitialized slots.
+     *
+     * DETERMINISM: the output is a pure function of (state, cursor, budget), all
+     * of which are main-thread state advanced once per frame. Two runs of the
+     * same camera path update the same probes on the same frames — which is
+     * what the smoke gate rests on.
+     *
+     * A slot never appears twice in one call: phase B only accepts slots that
+     * are already PROBE_ACTIVE, and phase A's picks are promoted to ACTIVE only
+     * after phase B has finished looking. Two threads writing one probe's texels
+     * in the same dispatch would be a data race on the atlas, not a duplicated
+     * cost.
+     */
+    std::uint32_t select_updates(std::uint32_t budget, std::vector<ProbeUpdateSlot>& out) {
+        if (budget == 0 || state_.size() != static_cast<std::size_t>(PROBES_PER_CASCADE)) {
+            return 0;
+        }
+        const std::size_t first = out.size();
+        std::uint32_t taken = 0;
+        for (int s = 0; s < PROBES_PER_CASCADE && taken < budget; ++s) {
+            if (state_[static_cast<std::size_t>(s)] == PROBE_UNINITIALIZED) {
+                out.push_back({s, true});
+                ++taken;
+            }
+        }
+        int examined = 0;
+        while (taken < budget && examined < PROBES_PER_CASCADE) {
+            const int s = (cursor_ + examined) % PROBES_PER_CASCADE;
+            ++examined;
+            if (state_[static_cast<std::size_t>(s)] == PROBE_ACTIVE) {
+                out.push_back({s, false});
+                ++taken;
+            }
+        }
+        cursor_ = (cursor_ + examined) % PROBES_PER_CASCADE;
+        // Now it is safe to promote: phase B has stopped reading the states.
+        for (std::size_t i = first; i < out.size(); ++i) {
+            if (out[i].was_uninitialized) {
+                state_[static_cast<std::size_t>(out[i].slot)] = PROBE_ACTIVE;
+                state_dirty_ = true;
+            }
+        }
+        return taken;
+    }
+
     [[nodiscard]] int cascade() const { return cascade_; }
+    [[nodiscard]] int update_cursor() const { return cursor_; }
     [[nodiscard]] float spacing() const { return cascade_spacing(cascade_); }
     [[nodiscard]] bool placed() const { return placed_; }
     /// Absolute coordinate of the (0,0,0) corner probe.
@@ -395,6 +678,10 @@ private:
     std::vector<std::uint8_t> state_;
     bool state_dirty_ = false;
     std::uint32_t last_invalidated_ = 0;
+    /// Round-robin position for select_updates(). Persistent across frames —
+    /// that is what makes the rota cover the whole cascade instead of
+    /// re-tracing the first `budget` probes forever.
+    int cursor_ = 0;
 };
 
 } // namespace bracken::render::gi

@@ -256,6 +256,43 @@ luminance-weighted blend; CPU reference for the depth-reprojection fallback:
 history back over the offscreen scene color — history itself stays
 unsharpened so the kernel never compounds).
 
+**Probe-field GI (compute)** — four passes over `render::gi::ProbeVolume`'s
+atlases, recorded once per cascade whose turn the rota gives it and all timed as
+one `GIProbes` scope. `gi_probe_trace.comp` casts one ray per (scheduled probe,
+ray slot) over the SAME software BVH the other traced effects walk — it includes
+`rt_trace.hlsli` in both phases and uses the **closest-hit** walk, because a
+probe ray has to shade what it finds. Hit shading is flat `TriangleAttributes`
+albedo times (sun N·L with a **CSM atlas fetch** for visibility + the frame's
+point/spot lights, range-windowed, read straight out of the cluster light
+buffer's byte layout + π × last frame's own probe irradiance at the hit, which
+is what makes one bounce per update converge to infinite bounce); a miss samples
+the IBL sky-CAPTURE cube (raw radiance — `IBL::capture_map()`), falling back to
+the `EnvironmentState` hemisphere behind a uniform flag when the cube dummy is
+bound. **That shader includes `shadow_common.hlsli` and calls `calcShadow()`
+directly**: its cbuffer's first 336 bytes are `ShadowDataUniforms` field for
+field under the names that file requires, which is the only formulation in which
+the probe path and the raster path cannot drift apart on the deliberately
+standard-Z cascade atlas. Output is RGB radiance + a **signed** hit distance per
+ray, negative on a backface — the classification signal.
+`gi_probe_blend.comp` and `gi_probe_blend_visibility.comp` run one threadgroup
+per probe with `[numthreads]` equal to the probe's tile (8×8 / 16×16): payload
+threads cosine-weight (or `cos^50`-weight, for the visibility moments) the whole
+ray set against their own octahedral direction, then a
+`GroupMemoryBarrierWithGroupSync` later the border threads replicate the
+octahedral wrap out of `groupshared` — the border is a pure function of the
+payload the group just computed, so a separate pass would re-read the atlas it
+had only just written. Both read-modify-write their atlas, which is why their
+`RWTexture2D` carries an explicit `[[vk::image_format]]`: a storage image
+declared `Unknown` may only be WRITTEN without the optional
+`shaderStorageImageReadWithoutFormat` device feature. `gi_probe_classify.comp`
+is one thread per probe: backface fraction → a relocation offset (and, past
+75% at the clamp, an inside-geometry verdict) into the per-probe RGBA16F offset
+texture, plus two `InterlockedAdd` diagnostic counters. Ray directions are
+spherical Fibonacci rotated per frame from the frame counter alone, and all four
+passes derive them the same way — the blend and classify passes rebuild each
+ray's direction rather than having it written out, which is why `frameIndex` is
+a uniform of all of them.
+
 **Auto exposure (compute)** — `exposure_histogram.comp` builds a 256-bin
 log2-luminance histogram of the TAA-resolved (pre-bloom) HDR scene color:
 each 16×16 workgroup accumulates its tile into `groupshared` bins and merges
@@ -292,12 +329,18 @@ count first), `shadow_common.hlsli` (cascade selection, PCF/PCSS),
 `fog.hlsli` (distance-fog factors + `hazeSunColor`, the sun-scatter /
 day-dimmed haze color shared by surface fog AND the sky's horizon haze —
 they must stay one function so fog melts into the sky at the horizon),
-`rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
+`gi_probe.hlsli` (the probe field's grid constants, torus wrap, atlas tiling,
+octahedral encode/decode + the octahedral **border wrap**, spherical-Fibonacci
+ray directions and their R3/Shoemake per-frame rotation, and the
+change-adaptive blend curve — every function a transliteration of
+`render/gi/gi_math.hpp`, which is the source of truth and is tested with no GPU;
+binding-free by construction, so unlike `rt_trace.hlsli` it can be included
+anywhere), `rt_sampling.hlsli` (R2 + interleaved-gradient-noise sample sequence, cone and
 GGX-VNDF sampling, the packed visibility-tile helpers), `rt_trace.hlsli` (the
 software two-level BVH: `BvhNodeGpu`/`BvhTriangle`/`TlasInstance`, `slabTest`,
 `octDecode`, the any-hit `blasOccluded`/`sceneOccluded` walk and the
 closest-hit `Hit`/`blasClosest`/`sceneClosest` walk — shared by
-`rt_shadow.comp` and `rt_reflection.comp`). The traversal node is **64 bytes
+`rt_shadow.comp`, `rt_reflection.comp` and `gi_probe_trace.comp`). The traversal node is **64 bytes
 and holds BOTH children** (Aila–Laine): two AABBs and two links, so one fetch
 resolves a binary decision and a leaf never needs a node of its own. The CPU
 build format is still the 32-byte one-AABB `BvhNode` (`bvh.hpp`); the

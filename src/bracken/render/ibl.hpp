@@ -175,6 +175,22 @@ public:
     void update(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, const EnvironmentState& env,
                 float sky_time);
 
+    /**
+     * The sky-CAPTURE cube: raw radiance, not a convolution of it.
+     *
+     * The other three maps are what the forward pass wants — irradiance for
+     * diffuse, prefiltered GGX for specular, the split-sum LUT for the Fresnel
+     * fit. Probe rays want the thing all three were built from: a probe-ray
+     * miss is a look straight at the sky in one direction, and the answer to
+     * that is L(dir), not any integral of it. `render::gi::ProbeVolume` is the
+     * only consumer (see gi_probe_trace.comp.hlsl's miss path), and this is
+     * therefore the accessor that would look unused if you did not know why it
+     * exists.
+     *
+     * Valid from `init()` onward — the chain is built synchronously there — and
+     * refreshed amortized after any sky change.
+     */
+    SDL_GPUTexture* capture_map() const { return capture_ ? capture_->handle() : nullptr; }
     SDL_GPUTexture* irradiance_map() const { return irradiance_ ? irradiance_->handle() : nullptr; }
     SDL_GPUTexture* specular_map() const { return specular_ ? specular_->handle() : nullptr; }
     SDL_GPUTexture* brdf_lut() const { return brdf_lut_ ? brdf_lut_->handle() : nullptr; }

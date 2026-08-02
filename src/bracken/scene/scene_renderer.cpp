@@ -1030,14 +1030,53 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 gtao_->invalidate_history();
             }
 
-            // ===== Probe-field GI: scroll the clipmap to follow the camera.
-            // R1a is STRUCTURE ONLY — this allocates the cascades' atlases,
-            // re-snaps each cascade's window in whole probe-spacing steps, and
-            // marks the probes that entered as uninitialized. Nothing traces
-            // into the field and nothing samples it yet (R1b/R1c), so with
-            // gi_mode == Off — the default — not one byte is allocated and this
-            // block is a single enum compare. =====
-            if (gfx.gi_mode != GiMode::Off && cmd && context_) {
+            // ===== The acceleration structure, for EVERY consumer of it.
+            //
+            // GI IS A RAY-TRACED FEATURE. `gi_mode != Off` builds the BVH — with
+            // per-triangle attributes, because probe rays SHADE what they hit —
+            // even when rt_shadows and rt_reflections are both off, and it
+            // therefore inherits every constraint the other two carry: models
+            // must have kept their CPU geometry (see build_raytracing_scene),
+            // the first frame after enabling it pays a full BLAS build, and
+            // ~30 MB of BLAS plus the attribute buffer stay resident. That is
+            // documented in docs/user_guide.md and it is not a detail a host
+            // can discover from the setting's name.
+            //
+            // Owned here rather than asked of the host: a toggle flipped at
+            // runtime would otherwise leave the structure unbuilt, every trace
+            // would return immediately, and the setting would silently do
+            // nothing. =====
+            const bool gi_active = gfx.gi_mode != GiMode::Off;
+            const bool rt_traces_active = gfx.rt_shadows || gfx.rt_reflections;
+            render::RtRenderer::FrameParams rt_frame_params;
+            render::RtReflectionSettings rt_reflection_settings;
+            bool rt_reflection_resolve_ready = false;
+            if ((rt_traces_active || gi_active) && rt_renderer_ && cmd) {
+                ensure_raytracing_scene(gfx.rt_reflections || gi_active);
+                {
+                    // Timed separately from the traces: this is the CPU-side
+                    // TLAS work (range filter, content hash, and the rebuild
+                    // when the hash moved), which is exactly the number
+                    // rt_max_instance_range trades against.
+                    BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "RTInstances");
+                    refresh_raytracing_instances(frame, cmd, draw_camera.position,
+                                                 rt_range_units(gfx.rt_max_instance_range));
+                }
+            }
+
+            // ===== Probe-field GI: scroll the clipmap to follow the camera,
+            // then trace/blend/classify this frame's share of it.
+            //
+            // Everything the trace reads is already in place at this point in
+            // the frame, which is why the block sits HERE and not earlier: the
+            // CSM atlas was rendered, the cluster light buffer uploaded, the IBL
+            // sky-capture chain refreshed, and the TLAS brought up to date
+            // immediately above. Nothing SAMPLES the field yet (R1c), so this
+            // must leave the image bit-identical while doing all the work.
+            //
+            // With gi_mode == Off — the default — not one byte is allocated and
+            // this is a single enum compare. =====
+            if (gi_active && cmd && context_) {
                 if (!probe_volume_ && !gi_init_failed_) {
                     auto volume = std::make_unique<render::gi::ProbeVolume>();
                     if (volume->init(context_->device())) {
@@ -1056,6 +1095,37 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     BRACKEN_GPU_SCOPE(cmd, "GIProbes");
                     BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "GIProbes");
                     probe_volume_->update(cmd, draw_camera.position);
+
+                    render::gi::ProbeUpdateParams gi_params;
+                    gi_params.pipelines = pipeline_registry_.get();
+                    gi_params.scene = rt_renderer_ ? &rt_renderer_->scene() : nullptr;
+                    gi_params.quality = gfx.gi_quality;
+                    gi_params.camera_position = draw_camera.position;
+                    // Third ROW of the view matrix is the camera's -forward in
+                    // world space; calcShadow needs a view depth for the hit.
+                    gi_params.camera_forward = -glm::vec3(draw_camera.view[0][2], draw_camera.view[1][2],
+                                                          draw_camera.view[2][2]);
+                    gi_params.environment = env_;
+                    gi_params.sun_intensity = gfx.sun_intensity;
+                    gi_params.shadow = frame_shadow_uniforms_;
+                    gi_params.shadow_atlas = shadow_map_->atlas_texture();
+                    gi_params.shadow_compare_sampler = shadow_map_->shadow_compare_sampler();
+                    gi_params.shadow_raw_sampler = shadow_map_->shadow_sampler();
+                    // The sky-CAPTURE cube (raw radiance), not the irradiance
+                    // convolution: a probe-ray miss is a look straight at the
+                    // sky in one direction.
+                    gi_params.sky_cube = (ibl_ && ibl_->is_ready()) ? ibl_->capture_map() : nullptr;
+                    gi_params.sky_cube_fallback =
+                        dummy_black_cube_ ? dummy_black_cube_->handle() : nullptr;
+                    gi_params.sky_sampler =
+                        (ibl_ && ibl_->cube_sampler() != nullptr) ? ibl_->cube_sampler() : default_sampler_;
+                    gi_params.light_data = cluster_grid_.light_data_buffer();
+                    gi_params.light_count = cluster_grid_.total_lights();
+                    gi_params.light_capacity = render::lighting::MAX_LIGHTS;
+                    if (gi_params.sky_cube_fallback != nullptr && gi_params.sky_sampler != nullptr &&
+                        gi_params.shadow_atlas != nullptr && gi_params.light_data != nullptr) {
+                        probe_volume_->trace(cmd, gi_params);
+                    }
                 }
             } else if (probe_volume_ || gi_init_failed_) {
                 probe_volume_.reset();
@@ -1071,25 +1141,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // thread read out of bounds, got 0, and the frame rendered fully
             // ambient-occluded. Un-multiplexing also stops full-res GTAO being
             // point-downsampled to the mask's resolution on every traced frame.
-            render::RtRenderer::FrameParams rt_frame_params;
-            render::RtReflectionSettings rt_reflection_settings;
-            bool rt_reflection_resolve_ready = false;
-            if ((gfx.rt_shadows || gfx.rt_reflections) && rt_renderer_ &&
-                post_->offscreen_depth() && cmd) {
-                // Own the acceleration structure here rather than asking the
-                // host to. A toggle flipped at runtime otherwise leaves the
-                // structure unbuilt, RtRenderer::render() returns immediately,
-                // and the setting silently does nothing.
-                ensure_raytracing_scene(gfx.rt_reflections);
-                {
-                    // Timed separately from the traces: this is the CPU-side
-                    // TLAS work (range filter, content hash, and the rebuild
-                    // when the hash moved), which is exactly the number
-                    // rt_max_instance_range trades against.
-                    BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "RTInstances");
-                    refresh_raytracing_instances(frame, cmd, draw_camera.position,
-                                                 rt_range_units(gfx.rt_max_instance_range));
-                }
+            if (rt_traces_active && rt_renderer_ && post_->offscreen_depth() && cmd) {
                 BRACKEN_PROFILE_ZONE_COLOR("RT shadows", 0x8E44AD);
                 BRACKEN_GPU_SCOPE(cmd, "RT shadows");
                 rt_frame_params.inv_view_proj = glm::inverse(draw_camera.view_projection);
@@ -1602,8 +1654,11 @@ void SceneRenderer::ensure_raytracing_scene(bool want_attributes) {
     // Building every model's BLAS is on the order of a second for a scene this
     // size. That is a visible hitch when it happens because someone ticked a
     // checkbox, so say what is going on rather than looking like a hang.
+    // "reflections or GI": both need the attribute buffer to shade a hit, and a
+    // host that only ticked `gi_mode` deserves to see why its frame time just
+    // grew by a second and its memory by ~27 MB.
     BRACKEN_LOG_INFO(LOG_TAG, "ray tracing enabled: building the acceleration structure{}",
-                     want_attributes ? " with triangle attributes (reflections)" : "");
+                     want_attributes ? " with triangle attributes (reflections/GI)" : "");
     build_raytracing_scene(*model_manager_, want_attributes);
 }
 

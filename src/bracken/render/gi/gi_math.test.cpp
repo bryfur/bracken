@@ -479,3 +479,341 @@ TEST(GiMath, PayloadTexelDirectionsCoverTheSphere) {
     EXPECT_GT(upper, 0);
     EXPECT_GT(lower, 0);
 }
+
+// ===========================================================================
+// R1b — what the update passes mirror
+// ===========================================================================
+
+namespace {
+
+/// Deterministic unit directions, so a coverage claim is reproducible rather
+/// than "it passed on my machine".
+std::vector<glm::vec3> sample_sphere(int count) {
+    std::vector<glm::vec3> out;
+    out.reserve(static_cast<std::size_t>(count));
+    // A second, unrelated low-discrepancy set: using spherical Fibonacci to
+    // test spherical Fibonacci would only prove it agrees with itself.
+    for (int i = 0; i < count; ++i) {
+        const float u = (static_cast<float>(i) + 0.5f) / static_cast<float>(count);
+        const float v = std::fmod(static_cast<float>(i) * 0.7548776662466927f, 1.0f);
+        const float z = 1.0f - 2.0f * u;
+        const float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
+        const float phi = 6.283185307179586f * v;
+        out.push_back({std::cos(phi) * r, std::sin(phi) * r, z});
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(GiMath, SphericalFibonacciIsDeterministicAndUnit) {
+    for (const int count : {32, 64, 96}) {
+        for (int i = 0; i < count; ++i) {
+            const glm::vec3 a = spherical_fibonacci(i, count);
+            const glm::vec3 b = spherical_fibonacci(i, count);
+            EXPECT_EQ(a, b) << "same inputs must give bit-identical directions";
+            EXPECT_NEAR(glm::length(a), 1.0f, 1e-5f);
+        }
+    }
+}
+
+TEST(GiMath, SphericalFibonacciCoversTheSphereEvenly) {
+    // Three claims, one per failure mode a hand-written direction set has:
+    //  * COVERAGE — no direction of the sphere is far from every ray, or a
+    //    probe has a blind spot that never gets sampled.
+    //  * SEPARATION — no two rays are nearly the same, or the budget is spent
+    //    twice on one direction.
+    //  * BALANCE — the set's centroid is at the origin, so the estimate has no
+    //    built-in directional bias.
+    // The thresholds are the measured values with headroom, not aspirations.
+    const std::vector<glm::vec3> queries = sample_sphere(4000);
+    struct Case {
+        int count;
+        float min_best_dot;
+    };
+    for (const Case& c : {Case{32, 0.85f}, Case{64, 0.90f}, Case{96, 0.93f}}) {
+        std::vector<glm::vec3> dirs;
+        dirs.reserve(static_cast<std::size_t>(c.count));
+        for (int i = 0; i < c.count; ++i) {
+            dirs.push_back(spherical_fibonacci(i, c.count));
+        }
+
+        float worst = 1.0f;
+        for (const glm::vec3& q : queries) {
+            float best = -1.0f;
+            for (const glm::vec3& d : dirs) {
+                best = std::max(best, glm::dot(d, q));
+            }
+            worst = std::min(worst, best);
+        }
+        EXPECT_GT(worst, c.min_best_dot) << "coverage gap at count " << c.count;
+
+        float max_pair = -1.0f;
+        glm::vec3 centroid{0.0f};
+        for (std::size_t i = 0; i < dirs.size(); ++i) {
+            centroid += dirs[i];
+            for (std::size_t j = i + 1; j < dirs.size(); ++j) {
+                max_pair = std::max(max_pair, glm::dot(dirs[i], dirs[j]));
+            }
+        }
+        EXPECT_LT(max_pair, 0.97f) << "two rays nearly coincide at count " << c.count;
+        EXPECT_LT(glm::length(centroid) / static_cast<float>(c.count), 0.02f)
+            << "direction set is biased at count " << c.count;
+    }
+}
+
+TEST(GiMath, RayRotationIsDeterministicAndOrthonormal) {
+    for (const std::uint32_t frame : {0u, 1u, 7u, 1000u, 65535u}) {
+        const glm::mat3 a = probe_ray_rotation(frame);
+        const glm::mat3 b = probe_ray_rotation(frame);
+        EXPECT_EQ(a, b) << "the rotation must be a pure function of the frame counter";
+
+        // A rotation, not a general matrix: lengths preserved, handedness kept.
+        // A non-orthonormal "rotation" would stretch the ray set and quietly
+        // break the cosine weighting the blend passes apply to it.
+        for (int c = 0; c < 3; ++c) {
+            EXPECT_NEAR(glm::length(a[c]), 1.0f, 1e-4f);
+        }
+        EXPECT_NEAR(glm::dot(a[0], a[1]), 0.0f, 1e-4f);
+        EXPECT_NEAR(glm::dot(a[0], a[2]), 0.0f, 1e-4f);
+        EXPECT_NEAR(glm::dot(a[1], a[2]), 0.0f, 1e-4f);
+        EXPECT_NEAR(glm::determinant(a), 1.0f, 1e-4f);
+    }
+}
+
+TEST(GiMath, RayRotationActuallyMovesTheSetBetweenFrames) {
+    // The whole point of rotating is that consecutive updates of one probe
+    // sample DIFFERENT directions; a rotation that barely moved would leave the
+    // estimate converging to a fixed 64-direction quadrature of the scene.
+    float worst = 0.0f;
+    for (std::uint32_t frame = 0; frame < 32; ++frame) {
+        const glm::vec3 a = probe_ray_direction(0, 64, frame);
+        const glm::vec3 b = probe_ray_direction(0, 64, frame + 1);
+        worst = std::max(worst, glm::dot(a, b));
+        EXPECT_NEAR(glm::length(a), 1.0f, 1e-4f);
+    }
+    EXPECT_LT(worst, 0.999f);
+}
+
+TEST(GiMath, OctahedralCosineWeightsIntegrateToPi) {
+    // The blend divides by the weight total, so what has to be true is that the
+    // texel set is a fair quadrature of the sphere: sum of max(0, cos) over the
+    // payload, times the per-texel solid angle 4pi/N, must come out at
+    // integral(cos) over the hemisphere = pi. The octahedral map is only
+    // APPROXIMATELY equal-area, which is where the tolerance comes from (the
+    // measured spread over 300 normals is 2.86 .. 3.25).
+    const float solid_angle = 4.0f * 3.14159265358979f /
+                              static_cast<float>(IRRADIANCE_PAYLOAD_TEXELS * IRRADIANCE_PAYLOAD_TEXELS);
+    for (const glm::vec3& n : sample_sphere(300)) {
+        float sum = 0.0f;
+        for (int y = 0; y < IRRADIANCE_PAYLOAD_TEXELS; ++y) {
+            for (int x = 0; x < IRRADIANCE_PAYLOAD_TEXELS; ++x) {
+                sum += std::max(0.0f, glm::dot(probe_texel_direction({x, y}, IRRADIANCE_PAYLOAD_TEXELS), n));
+            }
+        }
+        EXPECT_NEAR(sum * solid_angle, 3.14159265358979f, 0.35f);
+    }
+}
+
+TEST(GiMath, BorderReplicatesTheOctahedralWrap) {
+    constexpr int P = IRRADIANCE_PAYLOAD_TEXELS;
+    constexpr int T = P + 2 * PROBE_BORDER_TEXELS;
+
+    // Corners take the OPPOSITE corner (the octahedron's -Z point is all four
+    // square corners, so they are the same direction).
+    EXPECT_EQ(probe_border_source({0, 0}, P), glm::ivec2(0, 0));
+    EXPECT_EQ(probe_border_source({T - 1, 0}, P), glm::ivec2(P - 1, 0));
+    EXPECT_EQ(probe_border_source({0, T - 1}, P), glm::ivec2(0, P - 1));
+    EXPECT_EQ(probe_border_source({T - 1, T - 1}, P), glm::ivec2(P - 1, P - 1));
+
+    // Edges MIRROR along the edge — not clamp-to-edge, which is the bug this
+    // test exists to catch: walking off the top of the octahedron's square
+    // re-enters the top from the opposite side.
+    for (int x = 1; x < T - 1; ++x) {
+        const glm::ivec2 top = probe_border_source({x, 0}, P);
+        EXPECT_EQ(top.y, 0);
+        EXPECT_EQ(top.x, P - 1 - (x - 1));
+        const glm::ivec2 bottom = probe_border_source({x, T - 1}, P);
+        EXPECT_EQ(bottom.y, P - 1);
+        EXPECT_EQ(bottom.x, P - 1 - (x - 1));
+    }
+    for (int y = 1; y < T - 1; ++y) {
+        const glm::ivec2 left = probe_border_source({0, y}, P);
+        EXPECT_EQ(left.x, 0);
+        EXPECT_EQ(left.y, P - 1 - (y - 1));
+        const glm::ivec2 right = probe_border_source({T - 1, y}, P);
+        EXPECT_EQ(right.x, P - 1);
+        EXPECT_EQ(right.y, P - 1 - (y - 1));
+    }
+
+    // Every border source must be a real payload texel — an out-of-range value
+    // would sample garbage on the GPU with no diagnostic at all.
+    for (int y = 0; y < T; ++y) {
+        for (int x = 0; x < T; ++x) {
+            const glm::ivec2 s = probe_border_source({x, y}, P);
+            EXPECT_GE(s.x, 0);
+            EXPECT_GE(s.y, 0);
+            EXPECT_LT(s.x, P);
+            EXPECT_LT(s.y, P);
+        }
+    }
+}
+
+TEST(GiMath, HysteresisCurveSpansTheDocumentedRange) {
+    EXPECT_FLOAT_EQ(probe_blend_hysteresis(0.0f), PROBE_HYSTERESIS_MAX);
+    EXPECT_FLOAT_EQ(probe_blend_hysteresis(PROBE_CHANGE_SATURATION), PROBE_HYSTERESIS_MIN);
+    EXPECT_FLOAT_EQ(probe_blend_hysteresis(10.0f), PROBE_HYSTERESIS_MIN);
+    // Monotonic: more disagreement can only ever mean less history.
+    float previous = PROBE_HYSTERESIS_MAX + 1.0f;
+    for (int i = 0; i <= 20; ++i) {
+        const float h = probe_blend_hysteresis(static_cast<float>(i) * 0.1f);
+        EXPECT_LE(h, previous);
+        previous = h;
+    }
+}
+
+TEST(GiMath, BlendConvergesAtBothHysteresisExtremes) {
+    // The two ends of the curve, as pure EMAs, so the documented time constants
+    // are pinned rather than asserted in a comment: 0.97 reaches 90% of a step
+    // in 76 updates, 0.70 in 7.
+    const auto steps_to_90 = [](float hysteresis) {
+        float v = 0.0f;
+        for (int i = 1; i <= 500; ++i) {
+            v = 1.0f + (v - 1.0f) * hysteresis;
+            if (v >= 0.9f) {
+                return i;
+            }
+        }
+        return -1;
+    };
+    EXPECT_EQ(steps_to_90(PROBE_HYSTERESIS_MAX), 76);
+    EXPECT_EQ(steps_to_90(PROBE_HYSTERESIS_MIN), 7);
+
+    // And the adaptive blend itself, on a full step from dark to lit: it starts
+    // at the fast end because the disagreement is total, and eases toward the
+    // slow end as the estimate closes — 16 updates, which at cascade 0's
+    // every-frame rota is a quarter of a second.
+    glm::vec3 v{0.0f};
+    int steps = -1;
+    for (int i = 1; i <= 500; ++i) {
+        v = probe_blend(v, glm::vec3(1.0f, 1.0f, 1.0f));
+        if (v.x >= 0.9f) {
+            steps = i;
+            break;
+        }
+    }
+    EXPECT_EQ(steps, 16);
+
+    // A SMALL change is treated as noise and integrated slowly — that is the
+    // half of the curve that makes a 32-ray estimate usable at all.
+    glm::vec3 w{1.0f};
+    int slow = -1;
+    for (int i = 1; i <= 500; ++i) {
+        w = probe_blend(w, glm::vec3(1.05f));
+        if (w.x >= 1.0f + 0.9f * 0.05f) {
+            slow = i;
+            break;
+        }
+    }
+    EXPECT_GT(slow, 40) << "a 5% change must not be adopted at the fast rate";
+}
+
+// --- The update rota -------------------------------------------------------
+
+TEST(GiMath, UninitializedProbesJumpTheUpdateQueue) {
+    ProbeCascade cascade;
+    cascade.reset(0);
+    cascade.update(glm::vec3(0.0f));
+    ASSERT_TRUE(cascade.placed());
+
+    // A freshly placed cascade is entirely uninitialized, so the first turns
+    // are pure phase A: slots in order, budget at a time, and the round-robin
+    // cursor has not moved because phase B never ran.
+    std::vector<ProbeUpdateSlot> picked;
+    EXPECT_EQ(cascade.select_updates(100, picked), 100u);
+    ASSERT_EQ(picked.size(), 100u);
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_EQ(picked[static_cast<std::size_t>(i)].slot, i);
+        EXPECT_TRUE(picked[static_cast<std::size_t>(i)].was_uninitialized);
+    }
+    EXPECT_EQ(cascade.update_cursor(), 0);
+
+    picked.clear();
+    EXPECT_EQ(cascade.select_updates(100, picked), 100u);
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_EQ(picked[static_cast<std::size_t>(i)].slot, 100 + i);
+    }
+}
+
+TEST(GiMath, SteadyStateUpdatesRoundRobinFromAPersistentCursor) {
+    ProbeCascade cascade;
+    cascade.reset(0);
+    cascade.update(glm::vec3(0.0f));
+
+    // One enormous turn initializes the whole cascade, so what follows is pure
+    // phase B.
+    std::vector<ProbeUpdateSlot> picked;
+    EXPECT_EQ(cascade.select_updates(PROBES_PER_CASCADE, picked), PROBES_PER_CASCADE);
+
+    for (int turn = 0; turn < 3; ++turn) {
+        picked.clear();
+        EXPECT_EQ(cascade.select_updates(100, picked), 100u);
+        for (int i = 0; i < 100; ++i) {
+            EXPECT_EQ(picked[static_cast<std::size_t>(i)].slot, turn * 100 + i);
+            EXPECT_FALSE(picked[static_cast<std::size_t>(i)].was_uninitialized);
+        }
+        EXPECT_EQ(cascade.update_cursor(), (turn + 1) * 100);
+    }
+
+    // The cursor wraps rather than stalling at the end of the cascade.
+    picked.clear();
+    const int remaining = PROBES_PER_CASCADE - 300;
+    EXPECT_EQ(cascade.select_updates(static_cast<std::uint32_t>(remaining) + 50u, picked),
+              static_cast<std::uint32_t>(remaining) + 50u);
+    EXPECT_EQ(picked.back().slot, 49);
+    EXPECT_EQ(cascade.update_cursor(), 50);
+}
+
+TEST(GiMath, ScrolledInProbesPreemptTheRoundRobin) {
+    ProbeCascade cascade;
+    cascade.reset(0);
+    cascade.update(glm::vec3(0.0f));
+    std::vector<ProbeUpdateSlot> picked;
+    cascade.select_updates(PROBES_PER_CASCADE, picked); // everything live
+
+    // Move one whole probe step along X: exactly one plane enters the window.
+    const std::uint32_t entered = cascade.update(glm::vec3(cascade_spacing(0), 0.0f, 0.0f));
+    ASSERT_EQ(entered, static_cast<std::uint32_t>(GRID_Y * GRID_Z));
+
+    picked.clear();
+    cascade.select_updates(64, picked);
+    ASSERT_EQ(picked.size(), 64u);
+    for (const ProbeUpdateSlot& slot : picked) {
+        EXPECT_TRUE(slot.was_uninitialized)
+            << "an entering probe must outrank a probe that already holds valid radiance";
+    }
+}
+
+TEST(GiMath, UpdateSelectionIsDeterministicAndDuplicateFree) {
+    const auto run = [] {
+        ProbeCascade cascade;
+        cascade.reset(1);
+        cascade.update(glm::vec3(0.0f));
+        std::vector<int> order;
+        for (int turn = 0; turn < 12; ++turn) {
+            std::vector<ProbeUpdateSlot> picked;
+            cascade.select_updates(700, picked);
+            // A slot chosen twice in ONE turn would be two threadgroups writing
+            // one probe's texels in the same dispatch — a data race, not just
+            // duplicated work.
+            std::set<int> unique;
+            for (const ProbeUpdateSlot& s : picked) {
+                EXPECT_TRUE(unique.insert(s.slot).second) << "duplicate slot in one turn";
+                order.push_back(s.slot);
+            }
+            cascade.update(glm::vec3(static_cast<float>(turn) * 40.0f, 0.0f, 0.0f));
+        }
+        return order;
+    };
+    EXPECT_EQ(run(), run());
+}

@@ -1316,4 +1316,189 @@ BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, depthB, 100);
 BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, fadeStart, 104);
 BRACKEN_HLSL_FIELD(RtReflectionResolveUniforms, intensity, 108);
 
+// ===========================================================================
+// Probe-field GI (phase R1b of docs/rt_lighting_plan.md)
+// ===========================================================================
+
+/**
+ * One probe scheduled for update this frame — the record of
+ * `gi_probe_trace/blend/classify`'s update-list StructuredBuffer.
+ *
+ * The CPU sends the probe's LATTICE world position; the shader adds the
+ * relocation offset it reads out of the offset texture, so a probe that was
+ * nudged out of a wall on a previous update keeps its nudge without the CPU
+ * ever having to know about it.
+ */
+struct alignas(16) GiProbeUpdateRecord {
+    glm::vec3 worldPosition{0.0f};
+    /// Storage slot inside the cascade (`gi_math.hpp`'s torus wrap already
+    /// applied), which is also the atlas tile index.
+    uint32_t slot = 0;
+    /// Bit 0: the probe was PROBE_UNINITIALIZED when it was scheduled, so the
+    /// blend passes take the new estimate wholesale instead of blending into
+    /// whatever the slot's previous occupant left.
+    uint32_t flags = 0;
+    float _pad0 = 0.0f;
+    float _pad1 = 0.0f;
+    float _pad2 = 0.0f;
+};
+BRACKEN_HLSL_CBUFFER(GiProbeUpdateRecord, 32);
+BRACKEN_HLSL_FIELD(GiProbeUpdateRecord, worldPosition, 0);
+BRACKEN_HLSL_FIELD(GiProbeUpdateRecord, slot, 12);
+BRACKEN_HLSL_FIELD(GiProbeUpdateRecord, flags, 16);
+BRACKEN_HLSL_FIELD(GiProbeUpdateRecord, _pad0, 20);
+BRACKEN_HLSL_FIELD(GiProbeUpdateRecord, _pad1, 24);
+BRACKEN_HLSL_FIELD(GiProbeUpdateRecord, _pad2, 28);
+
+inline constexpr uint32_t GI_UPDATE_FLAG_UNINITIALIZED = 1u;
+
+/// What the classify pass counts, per cascade, into its read-write buffer.
+/// Read back through a fenced download (see render::gi::ProbeVolume), never
+/// synchronously — these are diagnostics, not a frame dependency.
+struct alignas(16) GiProbeCounters {
+    uint32_t relocated = 0;
+    uint32_t insideGeometry = 0;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiProbeCounters, 16);
+BRACKEN_HLSL_FIELD(GiProbeCounters, relocated, 0);
+BRACKEN_HLSL_FIELD(GiProbeCounters, insideGeometry, 4);
+BRACKEN_HLSL_FIELD(GiProbeCounters, _pad0, 8);
+BRACKEN_HLSL_FIELD(GiProbeCounters, _pad1, 12);
+
+/**
+ * GiProbeTraceUniforms (set 2, b0) — gi_probe_trace.comp.hlsl.
+ *
+ * The leading 336 bytes ARE `ShadowDataUniforms`, field for field and in order,
+ * and the shader declares them under exactly the names `shadow_common.hlsli`
+ * requires. That is not a coincidence and not a copy: it lets the trace shader
+ * `#include "shadow_common.hlsli"` and call `calcShadow()` — the same code the
+ * forward pass runs — so the cascade selection, the standard-Z atlas
+ * addressing, the normal-offset and slope-scaled biases and the distance fade
+ * cannot drift between the raster and probe paths. `docs/rt_lighting_plan.md`
+ * §8 calls the alternative out by name as a trap; this is the answer to it.
+ */
+struct alignas(16) GiProbeTraceUniforms {
+    ShadowDataUniforms shadow{};
+    glm::vec3 cameraPosition{0.0f};
+    float rayMaxDistance = 4000.0f;
+    /// Unit view direction: `calcShadow` selects a cascade by VIEW depth, and a
+    /// probe-ray hit has to be projected onto this to have one.
+    glm::vec3 cameraForward{0.0f, 0.0f, -1.0f};
+    float probeSpacing = 150.0f;
+    glm::vec3 sunDirection{0.0f, -1.0f, 0.0f}; ///< direction light TRAVELS
+    float normalBias = 1.0f;
+    glm::vec3 sunColor{0.0f};
+    /// Scale on the previous-frame probe irradiance fed back at each hit. 1.0
+    /// is true infinite bounce; below 1 it is a geometric series that converges
+    /// faster, which is the knob for a scene bright enough to ring.
+    float bounceScale = 1.0f;
+    glm::vec3 ambientSky{0.0f};
+    /// 1 when the IBL sky-capture cube is bound and valid; 0 falls back to the
+    /// ambientSky/ambientGround hemisphere on a ray miss.
+    float useSkyCube = 0.0f;
+    glm::vec3 ambientGround{0.0f};
+    /// PROBE_MAX_OFFSET_FRACTION * probeSpacing, precomputed.
+    float maxOffset = 0.0f;
+    /// Absolute lattice coordinate of each cascade's corner probe (xyz; w
+    /// unused). All three, because a ray fired from cascade 2 can land inside
+    /// cascade 0 and must take its bounce from the finest field that covers it.
+    glm::ivec4 cascadeBase[3]{};
+    uint32_t cascadeIndex = 0;
+    uint32_t rayCount = 0;
+    uint32_t probeCount = 0;
+    uint32_t tlasNodeCount = 0;
+    uint32_t lightCount = 0;
+    /// The light buffer's per-array capacity (MAX_LIGHTS) — the payload strides
+    /// are derived from it exactly as cluster_lighting.hlsli derives them.
+    uint32_t lightCapacity = 0;
+    /// Advances the ray-set rotation. Must change every frame or every update
+    /// of a probe re-samples the same directions and the estimate is biased.
+    uint32_t frameIndex = 0;
+    uint32_t _pad0 = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiProbeTraceUniforms, 512);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, shadow, 0);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, cameraPosition, 336);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, rayMaxDistance, 348);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, cameraForward, 352);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, probeSpacing, 364);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, sunDirection, 368);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, normalBias, 380);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, sunColor, 384);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, bounceScale, 396);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, ambientSky, 400);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, useSkyCube, 412);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, ambientGround, 416);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, maxOffset, 428);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, cascadeBase, 432);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, cascadeIndex, 480);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, rayCount, 484);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, probeCount, 488);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, tlasNodeCount, 492);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, lightCount, 496);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, lightCapacity, 500);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, frameIndex, 504);
+BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, _pad0, 508);
+
+/**
+ * GiProbeBlendUniforms (set 2, b0) — shared by gi_probe_blend.comp.hlsl and
+ * gi_probe_blend_visibility.comp.hlsl. The two differ only in payload size,
+ * which is a compile-time constant in each shader (and therefore not a uniform
+ * that could disagree with the atlas it writes).
+ */
+struct alignas(16) GiProbeBlendUniforms {
+    uint32_t probeCount = 0;
+    uint32_t rayCount = 0;
+    /// Distances entering the visibility moments are clamped here
+    /// (PROBE_VISIBILITY_DISTANCE_SCALE * spacing). Ignored by the irradiance
+    /// blend, which carries the field so both passes take one struct.
+    float distanceClamp = 0.0f;
+    /// What a miss recorded as its distance, so the visibility blend can treat
+    /// "no occluder" as "the clamp" instead of as a real surface at 4000 units.
+    float rayMaxDistance = 0.0f;
+    /// The trace's frame counter. The blend passes RE-DERIVE each ray's
+    /// direction from it to weight that ray's radiance — so this must be the
+    /// value the trace ran with, or every texel weights the wrong ray.
+    uint32_t frameIndex = 0;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+    uint32_t _pad2 = 0;
+};
+BRACKEN_HLSL_CBUFFER(GiProbeBlendUniforms, 32);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, probeCount, 0);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, rayCount, 4);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, distanceClamp, 8);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, rayMaxDistance, 12);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, frameIndex, 16);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad0, 20);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad1, 24);
+BRACKEN_HLSL_FIELD(GiProbeBlendUniforms, _pad2, 28);
+
+/** GiProbeClassifyUniforms (set 2, b0) — gi_probe_classify.comp.hlsl. */
+struct alignas(16) GiProbeClassifyUniforms {
+    uint32_t probeCount = 0;
+    uint32_t rayCount = 0;
+    /// Which cascade's counter slot this dispatch accumulates into.
+    uint32_t cascadeIndex = 0;
+    /// PROBE_MAX_OFFSET_FRACTION * spacing.
+    float maxOffset = 0.0f;
+    float probeSpacing = 0.0f;
+    /// Same contract as GiProbeBlendUniforms::frameIndex — this pass rebuilds
+    /// the backface rays' directions to decide which way to nudge the probe.
+    uint32_t frameIndex = 0;
+    float _pad0 = 0.0f;
+    float _pad1 = 0.0f;
+};
+BRACKEN_HLSL_CBUFFER(GiProbeClassifyUniforms, 32);
+BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, probeCount, 0);
+BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, rayCount, 4);
+BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, cascadeIndex, 8);
+BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, maxOffset, 12);
+BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, probeSpacing, 16);
+BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, frameIndex, 20);
+BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, _pad0, 24);
+BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, _pad1, 28);
+
 } // namespace bracken::gpu

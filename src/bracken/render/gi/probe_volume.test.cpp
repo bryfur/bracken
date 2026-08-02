@@ -21,6 +21,11 @@ TEST(ProbeVolume, UninitializedIsInert) {
     EXPECT_EQ(volume.irradiance(0), nullptr);
     EXPECT_EQ(volume.visibility(0), nullptr);
     EXPECT_EQ(volume.probe_state(0), nullptr);
+    EXPECT_EQ(volume.probe_offset(0), nullptr);
+    // Same for the update pass: no device, no pipelines, nothing to trace.
+    volume.trace(nullptr, ProbeUpdateParams{});
+    EXPECT_EQ(volume.stats().rays_this_frame, 0u);
+    EXPECT_EQ(volume.stats().probes_updated, 0u);
     // update() on a volume that was never init()ed is a no-op, not a null
     // deref: SceneRenderer only calls it when the field exists, but a host
     // driving one directly must not be able to fault the engine with it.
@@ -47,14 +52,29 @@ TEST(ProbeVolume, AtlasFootprintMatchesTheDocumentedFigure) {
                                    static_cast<std::size_t>(atlas_height(VISIBILITY_PROBE_TEXELS)) * 4;
     const std::size_t state = static_cast<std::size_t>(PROBES_PER_ATLAS_ROW) *
                               static_cast<std::size_t>(ATLAS_ROWS) * 1;
+    // R1b's addition: one RGBA16F texel per probe carrying the relocation
+    // offset (xyz) and the classification verdict (w).
+    const std::size_t offset = static_cast<std::size_t>(PROBES_PER_ATLAS_ROW) *
+                               static_cast<std::size_t>(ATLAS_ROWS) * 8;
 
     EXPECT_EQ(irradiance, 3538944u); // RGBA16F, 3.375 MB
     EXPECT_EQ(visibility, 7077888u); // RG16F,   6.75 MB
     EXPECT_EQ(state, 6912u);         // R8_UINT, one texel per probe
+    EXPECT_EQ(offset, 55296u);       // RGBA16F, one texel per probe
 
-    const std::size_t per_cascade = irradiance + visibility + state;
+    const std::size_t per_cascade = irradiance + visibility + state + offset;
     const std::size_t total = per_cascade * CASCADE_COUNT;
-    EXPECT_EQ(per_cascade, 10623744u);
-    EXPECT_EQ(total, 31871232u); // ~30.4 MB for the whole field
+    EXPECT_EQ(per_cascade, 10679040u);
+    EXPECT_EQ(total, 32037120u); // ~30.6 MB for the whole field
     EXPECT_LT(total, 35u * 1024u * 1024u) << "the field outgrew the plan's ~35 MB budget";
+}
+
+// The transient buffers the update passes need, which are NOT part of the
+// field's resident footprint but are allocated alongside it.
+TEST(ProbeVolume, TraceBufferFootprintIsBoundedByTheWorstQuality) {
+    const std::size_t rays = static_cast<std::size_t>(gi_max_rays_per_dispatch()) * 16; // float4
+    const std::size_t lists = static_cast<std::size_t>(gi_max_probes_per_dispatch()) * 32 * CASCADE_COUNT;
+    EXPECT_EQ(rays, 2654208u); // 2.53 MB — one cascade's worst-case turn
+    EXPECT_EQ(lists, 165888u); // 162 KB — one update list per cascade
+    EXPECT_LT(rays + lists, 4u * 1024u * 1024u);
 }

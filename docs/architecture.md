@@ -26,7 +26,7 @@ Root namespace `bracken`, one sub-namespace per module.
 | `gpu/` | `gpu` | `GPUDevice`, `GPUBuffer`, `GPUTexture`, `ShaderManager`, `GPUPipeline`, `GPUComputePipeline`/`ComputePass` (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) + `pipeline_catalog.hpp` (what each pipeline *is*), `gpu_uniforms.hpp` (CPU↔GPU contract), `gpu_debug.hpp` |
 | `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `color_grading.hpp` |
 | `render/lighting/` | `render::lighting` | `ClusterGrid` (CPU light binning), `LocalShadowMap`/`LocalShadowSelector` (budgeted point/spot shadow atlas + tile cache), and the cluster/atlas **budget constants** in `light.hpp` (the light *structs* are `contracts/light.hpp`) |
-| `render/gi/` | `render::gi` | probe-field global illumination: `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three scrolled cascades of octahedral irradiance + visibility atlases, `gi_math.hpp` is the header-only CPU source of truth for the addressing R1b's shaders will mirror (torus wrap, atlas tiling, octahedral encode/decode, world↔probe mapping). **Structure only after phase R1a — it allocates and scrolls; nothing traces into it and nothing samples it.** See "Probe-field GI" |
+| `render/gi/` | `render::gi` | probe-field global illumination: `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three scrolled cascades of octahedral irradiance + visibility atlases, `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror (torus wrap, atlas tiling, octahedral encode/decode + the border wrap, world↔probe mapping, spherical-Fibonacci ray directions and their per-frame rotation, the change-adaptive blend curve), and `probe_schedule.hpp` is the per-frame ray budget and the cascade rota. **After phase R1b the field traces, blends and classifies itself; nothing samples it yet (R1c).** GI on builds the acceleration structure with attributes even with `rt_shadows`/`rt_reflections` off. See "Probe-field GI" |
 | `render_graph/` | `render_graph` | pass scheduler (topo-sort, transient pool) — **in-tree, tested, not wired into `SceneRenderer`** |
 | `scene/` | `scene` | `FramePacket` (immutable per-frame snapshot) + `FrameBuilder` (lane-based write interface) + `PacketRing` (SPSC handoff ring), `SceneRenderer` (frame orchestrator), `ScenePrep`, `RenderPlan`, `MotionHistory`, `transform_math.hpp` |
 | `animation/` | `animation` | `animation_types.hpp` (skeleton/clips/constants), `AnimationPlayer`, `AnimationStateMachine`, `ik_solver` |
@@ -1134,15 +1134,28 @@ pins the range enum.
 
 ## Probe-field GI
 
-Phase R1 of `docs/rt_lighting_plan.md` §5.2. **After R1a, what exists is the
-structure and nothing else**: the probe volume allocates its atlases, follows
-the camera, and records which probes entered its window. No ray is cast into
-it, no shader samples it, and `ambientIBL` is untouched. This section describes
-what is in the tree, not what the phase is for.
+Phase R1 of `docs/rt_lighting_plan.md` §5.2. **After R1b the field is traced,
+blended and classified, and still consumed by nothing**: probe rays are cast,
+their hits shaded, the results accumulated into the atlases, and probes buried
+in geometry are nudged out or written off — but no shader samples the result,
+and `ambientIBL` is untouched. `--smoke` renders bit-identically with GI on and
+off, which is the correctness claim R1b is allowed to make. R1c is the
+consumer (forward-pass ambient + the fog march).
 
 Gated by `GraphicsSettings::gi_mode` (`contracts/graphics_settings.hpp`), which
 defaults to `GiMode::Off` — with GI off nothing here is allocated and the frame
 is byte-for-byte the pre-GI frame.
+
+**GI is a ray-traced feature.** `gi_mode != Off` builds the acceleration
+structure **with per-triangle attributes** even when `rt_shadows` and
+`rt_reflections` are both off, because a probe ray shades what it hits. It
+therefore inherits every constraint the other traced features carry: models must
+still hold their CPU geometry when the structure is built, the first frame after
+enabling it pays a full BLAS build (~1 s on the playground village), and the
+BLAS + attribute buffers stay resident (27 MB there). `SceneRenderer` owns that
+build — `ensure_raytracing_scene(gfx.rt_reflections || gi_active)` — so a
+runtime toggle cannot leave the structure unbuilt and the setting silently
+inert.
 
 ### The clipmap
 
@@ -1164,11 +1177,28 @@ Three 2D textures per cascade, over one tiling defined once in
 | irradiance | `RGBA16F` | 8×8 (6×6 octahedral payload + 1 border ring) | 2304 × 192 | 3.375 MB |
 | visibility | `RG16F` (mean / mean² ray distance, for the Chebyshev leak test) | 16×16 (14×14 payload + border) | 4608 × 384 | 6.75 MB |
 | probe state | `R8_UINT` (0 = uninitialized, 1 = active) | 1 texel | 288 × 24 | 6.75 KB |
+| probe offset | `RGBA16F` (xyz = relocation offset in world units, w = classification verdict) | 1 texel | 288 × 24 | 54 KB |
 
-**≈10.13 MB per cascade, ≈30.4 MB for the field** (pinned by
-`probe_volume.test.cpp`; the plan budgets ~35 MB). The border ring is what lets
-a bilinear tap at a payload edge wrap around the octahedron instead of bleeding
-into the neighbouring probe; R1b writes it.
+**≈10.19 MB per cascade, ≈30.6 MB for the field** (pinned by
+`probe_volume.test.cpp`; the plan budgets ~35 MB). Plus ~2.7 MB of transient
+trace buffers — the per-ray results and one update list per cascade — sized once
+for the worst quality tier so a `gi_quality` change never reallocates.
+
+The border ring is what lets a bilinear tap at a payload edge wrap around the
+octahedron instead of bleeding into the neighbouring probe. It is **not**
+clamp-to-edge: the octahedron's outer square folds onto itself, so each border
+texel replicates the payload texel mirrored across that edge and each corner
+takes the opposite corner (`probe_border_source`, mirrored by `giBorderSource`
+in `shaders/gi_probe.hlsli`). The blend passes fill it from groupshared memory
+in the same dispatch that computes the payload — see below.
+
+**Two writers, two textures, no overlap.** `probe state` is CPU-owned:
+`ProbeCascade` writes it as the scroll invalidates probes and as the updater
+schedules them, and a scrolled cascade re-uploads all of it. The classification
+verdict therefore lives in `probe offset`'s W channel instead, because a
+GPU-written value in the state texture would be erased by the next scroll's
+upload and the erasure would read as "classification is flaky" rather than as a
+lost update.
 
 **The tiling**: column = `x + GRID_X * y` (288 columns), row = `z` (24 rows) —
 which is exactly the linear probe index split at `PROBES_PER_ATLAS_ROW`, so
@@ -1208,32 +1238,205 @@ megabytes of instance data.
 with `gi_mode != GiMode::Off` and **destroys** it the moment the mode returns
 to `Off` — the same policy as `normal_rough_texture_`, for the same reason
 (30 MB nobody asked for). Toggling GI back on therefore restarts from a cold
-field, which is what a fresh allocation is anyway. The update runs between GTAO
-and the traced passes, outside any render pass (the state upload opens its own
-copy pass), timed as **`GIProbes`** in `RenderStats::pass_times_ms`.
+field, which is what a fresh allocation is anyway.
+
+**Where in the frame, and why there.** The GI block runs after GTAO, after the
+`RTInstances` scope that brings the TLAS up to date, and before the traced
+shadow/reflection passes — outside any render pass (the state upload and the
+buffer updates open their own copy passes). Everything the trace reads is
+already in place at that point: the CSM atlas was rendered, the cluster light
+buffer uploaded, the IBL sky-capture chain refreshed, and the TLAS refitted.
+Moving the block earlier would silently feed the probes last frame's shadows.
+All of it is timed as **`GIProbes`** in `RenderStats::pass_times_ms`
+(0.054 ms mean CPU record on the playground village at Medium, `--rt-bench 120`
+in an `-O0` tree — a ratio, not a number).
 
 `SceneRenderer::gi_stats()` returns `render::gi::GiStats` — cascade/probe
-counts, atlas bytes, probes invalidated this frame and cumulatively. The
-cumulative figure is the one worth reading: a cascade only scrolls when the
-camera crosses a whole spacing, so the per-frame number is zero on most frames.
-The playground prints a `[smoke] gi ...` line when the mode is on, and
-`PLAYGROUND_GI=probes|probes_screen|off` pins it exactly as `PLAYGROUND_RT`
-pins the traced effects (unset = off, because `gi_mode` persists).
+counts, atlas bytes, probes invalidated this frame and cumulatively, plus what
+the update did: `rays_this_frame`, `probes_updated` (and the per-cascade split),
+`probes_relocated`, `probes_inside_geometry`, and the cumulative `rays_total` /
+`probes_updated_total`. The invalidation figure is worth reading cumulatively —
+a cascade only scrolls when the camera crosses a whole spacing, so the per-frame
+number is zero on most frames. The last two are **lagged**: both are GPU-derived
+and reach the CPU through a fenced, polled, never-blocking download (the same
+shape `render::AutoExposure` uses for its exposure state), so they describe a
+recent frame's scheduled probes rather than necessarily the last one's. Nothing
+in the frame waits on them.
 
-### Known limits (R1a)
+The playground prints `[smoke] gi ...` and `[smoke] gi update ...` lines when
+the mode is on, and `PLAYGROUND_GI=probes|probes_screen|off` pins it exactly as
+`PLAYGROUND_RT` pins the traced effects (unset = off, because `gi_mode`
+persists).
 
-- **Nothing consumes the field.** No probe update pass, no ray budget, no
-  sampling in the forward pass or the fog march. Every probe stays
-  `PROBE_UNINITIALIZED` forever and the atlases hold whatever the driver
-  allocated. R1b traces and blends; R1c consumes.
+### The update: budget, rota, passes
+
+The field is refreshed by a **fixed ray budget per frame**, never per pixel.
+That single property is what makes diffuse GI affordable on hardware that cannot
+trace one ray per pixel, and it is why the numbers below are per frame rather
+than per resolution.
+
+**Budget** (`render/gi/probe_schedule.hpp`, `gi_budget`), from
+`GraphicsSettings::gi_quality`:
+
+| Quality | rays/probe | probes per cascade turn | peak rays/frame |
+|---|---|---|---|
+| `Low` | 32 | 864 (1/8 of a cascade) | 55,296 |
+| `Medium` | 64 | 1728 (1/4) | 221,184 |
+| `High` | 96 | 1728 (1/4) | 331,776 |
+
+**Rota** (`gi_cascade_updates_on_frame`): cascade 0 every frame, cascade 1 on
+odd frames, cascade 2 on frames ≡ 2 (mod 4).
+
+```
+frame:  0     1     2     3     4     5     6     7
+c0:     x     x     x     x     x     x     x     x
+c1:           x           x           x           x
+c2:                 x                       x
+```
+
+The coarse cascades are **phased** rather than both landing on frame 0, so at
+most **two** cascades ever trace in one frame — that is where the "peak" column
+above comes from, and it is a third cheaper than the naive schedule. Fine
+cascades update more often because they cover the geometry the camera is
+standing in; cascade 2 is 600-unit spacing out at the draw distance, where a
+four-frame lag is not visible. At Medium, cascade 0 refreshes fully every
+4 frames and cascade 2 every 16.
+
+**Which probes** (`ProbeCascade::select_updates`), in two phases:
+
+1. Every `PROBE_UNINITIALIZED` slot, in slot order, jumps the queue — those are
+   the probes the scroll just brought into the window, holding the radiance of a
+   different point in the world. They are the visible-lag case.
+2. The rest of the budget comes from a persistent round-robin cursor over
+   already-live probes. The cursor advances past every slot **examined**, not
+   every slot taken, so it cannot stall on a run of uninitialized slots.
+
+A slot never appears twice in one turn (phase 2 only accepts already-`ACTIVE`
+slots, and phase 1's picks are promoted only after phase 2 has finished
+looking) — two threadgroups writing one probe's texels in the same dispatch
+would be a data race on the atlas, not merely duplicated work. The whole
+selection is a pure function of (state, cursor, budget), all main-thread state,
+so the same camera path updates the same probes on the same frames.
+
+**Four dispatches per updating cascade**, in this order
+(`gpu::ComputePipelineType::GiProbe*`):
+
+1. **`gi_probe_trace`** — one thread per (scheduled probe, ray). Directions are
+   spherical Fibonacci over the whole sphere, rotated per frame by a
+   deterministic uniform-random quaternion derived from the frame counter
+   through the R3 sequence (`probe_ray_rotation`). Rays start at the probe's
+   lattice position **plus its relocation offset**. Closest-hit traversal
+   through the shared `rt_trace.hlsli` walks — any-hit is not enough, the hit
+   has to be shaded. Output: RGB radiance + a **signed** distance per ray, where
+   the sign is negative on a backface hit.
+2. **`gi_probe_blend`** — one threadgroup per probe, one thread per texel of its
+   8×8 irradiance tile. Payload threads cosine-weight the whole ray set against
+   their own octahedral direction; a barrier later, the border threads replicate
+   the wrap out of groupshared memory. Border-in-the-same-pass is deliberate:
+   the border is a pure function of the payload the group just computed, so a
+   separate pass would re-read the atlas it had only just written to copy 28 of
+   64 texels. The coupling it buys is that `[numthreads]` must equal the tile.
+3. **`gi_probe_blend_visibility`** — the same shape over the 16×16 visibility
+   tile, storing mean and mean² of the hit distance. Distances are clamped to
+   1.5 × the cascade spacing (Chebyshev only ever compares against a shading
+   point at most ~1 spacing away, so one ray into open sky must not drag the
+   mean up), and the directional lobe is `cos^50` rather than `cos` because
+   visibility is a high-frequency signal. At 32–96 rays most visibility texels
+   get no ray inside their lobe on a given update and keep their previous value;
+   the per-frame rotation is what gives every texel its turn.
+4. **`gi_probe_classify`** — one thread per probe: backface fraction from the
+   ray signs, then relocation and classification (below).
+
+**Hit shading v1** lives in the trace shader:
+
+```
+L_out = albedo_flat * ( sunColor * max(0, N.L) * sunVisibility
+                      + local point/spot lights, range-windowed
+                      + pi * previous-frame probe irradiance ) / pi
+      | on a miss: sky radiance in the ray direction
+```
+
+- `albedo_flat` is `TriangleAttributes::baseColor`, baked from the albedo
+  texture's centroid-UV sample at load. SDL3 GPU has no bindless, so a hit
+  cannot sample a texture; the flat table is the answer and it already existed
+  for reflections.
+- `sunVisibility` is a **CSM atlas fetch, not a second ray**. The trace shader
+  embeds `ShadowDataUniforms` field for field and `#include`s
+  `shadow_common.hlsli`, calling the same `calcShadow()` the forward pass calls —
+  so the standard-Z cascade addressing, the normal-offset and slope-scaled
+  biases, the cascade blend and the distance fade cannot drift between the two
+  paths. (`docs/rt_lighting_plan.md` §8 names reimplementing it as a trap; this
+  is the answer.) PCSS is downgraded to PCF for probe rays: the EMA integrates
+  visibility over dozens of updates, so 20 extra taps per ray buy nothing.
+- Local lights are a flat loop over the ≤256 packet lights with a range window,
+  reading the same `[header][LightHeader×N][PointLight×N][SpotLight×N]` byte
+  layout `cluster_lighting.hlsli` reads. The froxel grid cannot serve here — a
+  world-space hit has no froxel.
+- The bounce term is **last frame's own field** sampled at the hit (trilinear
+  over 8 probes with a smooth backface weight, from the finest cascade covering
+  the point with a one-probe margin). That is the DDGI recursion: update *n*
+  contains *n−1* bounces, so the series converges to `1/(1 − albedo)` for any
+  physical albedo. `bounceScale` below 1 shortens it.
+- A miss samples the **IBL sky-capture cube** (`IBL::capture_map()` — raw
+  radiance, not the irradiance convolution), so probes carry the real
+  time-of-day sky *with occlusion*: blue in a courtyard, dark under an eave.
+  With IBL unavailable the slot binds the engine's black cube dummy and a
+  uniform flag falls the shader back to the `EnvironmentState`
+  `ambient_sky`/`ambient_ground` hemisphere.
+
+**Units.** The atlas stores **cosine-weighted mean incoming radiance**, i.e.
+irradiance/π — deliberately the same convention as the IBL irradiance cube
+(`ibl_irradiance.frag.hlsl` stores `(1/π)∫L·cosθ`), so R1c can substitute one
+for the other with no scale factor appearing anywhere.
+
+**Blend.** Per texel, an EMA with **change-adaptive hysteresis**
+(`probe_blend`, mirrored by `giBlend`): the hysteresis runs from **0.97** when
+the new estimate agrees with history down to **0.70** when it disagrees by 100%
+or more, driven by the scale-free delta `|new − old| / max(|old|, ε)`. As pure
+EMAs those reach 90% of a step in 76 and 7 updates; the adaptive curve takes a
+full dark→lit step in **16** updates and a 5% nudge in 65, which is exactly the
+split that makes a 32-ray estimate usable while a lightning flash still lands.
+Probes whose slot was uninitialized take the new estimate **wholesale** — one
+update, not a 76-update fade in from a stranger's radiance.
+
+**Classification and relocation** (minimal viable, and what makes a sparse grid
+survive interiors). A lattice anchored at the world origin does not know where
+the walls are; some probes land inside a building shell and would shade what
+they see from *inside* it, reading as brightly lit and leaking that into every
+surface whose trilinear cage touches them. The signal is the sign of the ray
+distance — nothing else can tell "inside a wall" from "in a dark alley".
+
+- backface fraction > **25%** → step the probe **0.25 spacings** away from the
+  resultant of its backface ray directions, clamped to **0.45 spacings** total
+  (below 0.5 by construction, or a probe would cross into its neighbour's cell
+  and the trilinear weights would be nonsense).
+- still > **75%** backfaces while already at the clamp → `PROBE_CLASS_INSIDE_GEOMETRY`.
+  The blend passes skip it from then on; R1c must drop it from the cage.
+- Relocation **lags by one update on purpose**: the rays that motivate a nudge
+  were traced from the *old* position, so a full jump would overshoot. The probe
+  converges over a few turns of the rota, and the trace picks the new offset up
+  when it next fires that probe's rays.
+
+Observed on the playground village at Medium (`--smoke 30`): 66 of 1728
+scheduled probes relocated in a frame, 1 written off as interior.
+
+### Known limits (R1b)
+
+- **Nothing consumes the field.** No sampling in the forward pass or the fog
+  march; `ambientIBL` and the hemisphere fallback are untouched. R1c consumes.
 - **`GiMode::ProbesScreen` behaves as `Probes`.** It is declared early so the
   on-disk integer is fixed before players have settings files; the screen-probe
   gather it names is phase R4.
-- **`GiQuality` is stored and persisted but read by nothing.** R1b's rays/probe
-  and update-cadence tables are its first consumer.
-- **No relocation, no classification.** Probes sit exactly on the lattice, so a
-  probe inside geometry stays inside it. Both arrive with R1b, and both are
-  what make sparse grids survive interiors.
+- **The bounce sample skips the Chebyshev test.** It is a secondary term feeding
+  a heavily filtered EMA, and the visibility moments are themselves still
+  converging while the field fills. R1c's primary sampler — the one whose leaks
+  a player would see — applies it.
+- **Local lights at a probe hit are unshadowed.** Ray-traced local-light shadows
+  are phase R2; an unshadowed lamp in a secondary bounce is a far smaller error
+  than no lamp at all.
+- **Skinned meshes trace their bind pose**, like every other traced signal here.
+  At probe spacing the error is invisible (`docs/rt_lighting_plan.md` §5.8), and
+  characters *receive* GI normally once R1c samples the field.
 
 ---
 

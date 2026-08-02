@@ -739,4 +739,12 @@ RtReflection
   cs        rt_reflection.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=5 rw_textures=2 rw_buffers=0 uniform_buffers=1
 RtReflectionTemporal
   cs        rt_reflection_denoise_temporal.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
+GiProbeTrace
+  cs        gi_probe_trace.comp.spv entry=CSMain samplers=6 ro_textures=4 ro_buffers=7 rw_textures=0 rw_buffers=1 uniform_buffers=1
+GiProbeBlend
+  cs        gi_probe_blend.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=2 rw_textures=1 rw_buffers=0 uniform_buffers=1
+GiProbeBlendVisibility
+  cs        gi_probe_blend_visibility.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=2 rw_textures=1 rw_buffers=0 uniform_buffers=1
+GiProbeClassify
+  cs        gi_probe_classify.comp.spv entry=CSMain samplers=0 ro_textures=0 ro_buffers=2 rw_textures=1 rw_buffers=1 uniform_buffers=1
 )GOLDEN"

@@ -1936,12 +1936,21 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
                 static_cast<double>(rt.tlas_bytes) / (1024.0 * 1024.0));
         }
         {   // Probe-field GI. Printed only when it is on, because "gi off" on
-            // every default run would be one more line of nothing. What it
-            // proves today is that the field was ALLOCATED and SCROLLED —
-            // nothing traces into it and nothing samples it until R1b/R1c, so
-            // `invalidated` is the whole observable: it must be non-zero on the
+            // every default run would be one more line of nothing.
+            //
+            // Two lines, two claims. The FIELD line is R1a's: the clipmap was
+            // allocated and scrolled, so `invalidated` must be non-zero on the
             // frame the volume is placed and must settle to a plane's worth (or
-            // zero) as the camera moves.
+            // zero) as the camera moves. The UPDATE line is R1b's: rays were
+            // actually cast, probes were actually blended, and the classifier
+            // found the number of buried probes a village full of solid
+            // buildings ought to contain. `relocated`/`inside` come off a
+            // fenced, polled download and therefore describe a recent frame
+            // rather than the last one — see render::gi::GiStats.
+            //
+            // Neither line says anything about the IMAGE, and that is the
+            // point: nothing samples the field until R1c, so mean_luma below
+            // must be identical with GI on and off.
             const auto& gi = scene_renderer().gi_stats();
             if (gi.active) {
                 std::cout << std::format(
@@ -1952,6 +1961,13 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
                     gi.probes_invalidated, gi.probes_invalidated_total,
                     static_cast<double>(gi.atlas_bytes) / (1024.0 * 1024.0),
                     gi.per_cascade.front().spacing, gi.per_cascade.back().spacing);
+                std::cout << std::format(
+                    "[smoke] gi update rays={} probes={} c0={} c1={} c2={} relocated={} inside={} "
+                    "rays_total={} probes_total={}\n",
+                    gi.rays_this_frame, gi.probes_updated, gi.per_cascade[0].probes_updated,
+                    gi.per_cascade[1].probes_updated, gi.per_cascade[2].probes_updated,
+                    gi.probes_relocated, gi.probes_inside_geometry, gi.rays_total,
+                    gi.probes_updated_total);
             }
         }
         // Tier-3 evidence: that the controller left the ground, that the nav

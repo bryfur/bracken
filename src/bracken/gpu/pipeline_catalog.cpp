@@ -804,6 +804,47 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      .resources = {.num_samplers = 3,                   // raw trace, velocity, history
                    .num_readwrite_storage_textures = 1, // accumulated history out
                    .num_uniform_buffers = 1}},
+    {.name = "GiProbeTrace",
+     .shader = "gi_probe_trace.comp.spv",
+     .entry_point = "CSMain",
+     // The widest binding block in the engine, and every entry earns its slot.
+     // Sampled: the CSM atlas twice (comparison + raw, because it includes
+     // shadow_common.hlsli verbatim rather than reimplementing the cascade
+     // math), the IBL sky-capture cube for ray misses, and all three cascades'
+     // irradiance atlases for the previous-frame bounce. Read-only storage
+     // textures: this cascade's relocation offsets plus all three cascades'
+     // probe states (so the bounce can reject a slot whose previous occupant
+     // has not been overwritten yet). Read-only storage buffers: the four
+     // acceleration-structure buffers, the per-triangle attributes that make a
+     // hit shadeable, the clustered-lighting byte buffer, and the frame's
+     // update list. One read-write buffer out: the per-ray radiance + signed
+     // distance the three passes below consume.
+     .resources = {.num_samplers = 6,
+                   .num_readonly_storage_textures = 4,
+                   .num_readonly_storage_buffers = 7,
+                   .num_readwrite_storage_buffers = 1,
+                   .num_uniform_buffers = 1}},
+    {.name = "GiProbeBlend",
+     .shader = "gi_probe_blend.comp.spv",
+     .entry_point = "CSMain",
+     .resources = {.num_readonly_storage_textures = 1,  // relocation/classification
+                   .num_readonly_storage_buffers = 2,   // ray results, update list
+                   .num_readwrite_storage_textures = 1, // irradiance atlas (read-modify-write)
+                   .num_uniform_buffers = 1}},
+    {.name = "GiProbeBlendVisibility",
+     .shader = "gi_probe_blend_visibility.comp.spv",
+     .entry_point = "CSMain",
+     .resources = {.num_readonly_storage_textures = 1,
+                   .num_readonly_storage_buffers = 2,
+                   .num_readwrite_storage_textures = 1, // visibility moments
+                   .num_uniform_buffers = 1}},
+    {.name = "GiProbeClassify",
+     .shader = "gi_probe_classify.comp.spv",
+     .entry_point = "CSMain",
+     .resources = {.num_readonly_storage_buffers = 2,
+                   .num_readwrite_storage_textures = 1, // per-probe offset + verdict
+                   .num_readwrite_storage_buffers = 1,  // diagnostic counters
+                   .num_uniform_buffers = 1}},
 }};
 
 static_assert(k_compute_descs.size() == static_cast<size_t>(ComputePipelineType::Count),

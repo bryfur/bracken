@@ -170,6 +170,14 @@ enum class ComputePipelineType {
     RtReflection,      ///< Ray-traced specular reflections over the same BVH (closest-hit, GGX-sampled)
     RtReflectionTemporal, ///< Reflection denoiser: velocity reprojection + neighbourhood-clamped accumulation
 
+    // Probe-field GI (render/gi/, docs/rt_lighting_plan.md §5.2). All four run
+    // inside one GIProbes timer scope, in this order, once per cascade whose
+    // turn the rota gives it.
+    GiProbeTrace,           ///< One ray per (scheduled probe, ray slot) over the same BVH; hit shading v1
+    GiProbeBlend,           ///< Cosine-weighted fold of the ray set into the irradiance atlas + border
+    GiProbeBlendVisibility, ///< Sharp-lobe fold of ray distances into the visibility moments + border
+    GiProbeClassify,        ///< Backface fraction -> probe relocation offset + inside-geometry verdict
+
     // Count for iteration
     Count
 };

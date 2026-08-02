@@ -451,6 +451,15 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("volumetric_fog.frag.spv", 3, 0, gpu::VolumetricFogUniforms),
     ROW("exposure_histogram.comp.spv", 2, 0, gpu::ExposureHistogramUniforms),
     ROW("exposure_adapt.comp.spv", 2, 0, gpu::ExposureAdaptUniforms),
+    // Probe-field GI (render/gi/). GiProbeTraceUniforms's leading 336 bytes are
+    // ShadowDataUniforms field for field, which is what lets the trace shader
+    // include shadow_common.hlsli and call calcShadow() instead of
+    // reimplementing the standard-Z cascade math — so this row also pins that
+    // embedding, not just the tail.
+    ROW("gi_probe_trace.comp.spv", 2, 0, gpu::GiProbeTraceUniforms),
+    ROW("gi_probe_blend.comp.spv", 2, 0, gpu::GiProbeBlendUniforms),
+    ROW("gi_probe_blend_visibility.comp.spv", 2, 0, gpu::GiProbeBlendUniforms),
+    ROW("gi_probe_classify.comp.spv", 2, 0, gpu::GiProbeClassifyUniforms),
 
     // ---- renderer-owned mirrors (same contract, different header) ----
     ROW("model.frag.spv", 3, 2, render::lighting::ClusterParams),
@@ -578,6 +587,16 @@ TEST(UniformLayout, StructuredBufferStridesMatchCpuRecords) {
         {"skinned_model.vert.spv", 0, 0, "glm::mat4", sizeof(glm::mat4)},
         {"prepass_skinned.vert.spv", 0, 0, "glm::mat4", sizeof(glm::mat4)},
         {"shadow_skinned.vert.spv", 0, 0, "glm::mat4", sizeof(glm::mat4)},
+        // The GI update list: the CPU writes one of these per probe scheduled
+        // this frame, and three compute passes read it. Its slot differs per
+        // shader because the trace binds the whole acceleration structure ahead
+        // of it and the blend passes bind almost nothing.
+        {"gi_probe_trace.comp.spv", 0, 16, "gpu::GiProbeUpdateRecord",
+         sizeof(bracken::gpu::GiProbeUpdateRecord)},
+        {"gi_probe_blend.comp.spv", 0, 2, "gpu::GiProbeUpdateRecord",
+         sizeof(bracken::gpu::GiProbeUpdateRecord)},
+        {"gi_probe_classify.comp.spv", 0, 1, "gpu::GiProbeUpdateRecord",
+         sizeof(bracken::gpu::GiProbeUpdateRecord)},
     };
     for (const StrideRow& row : rows) {
         SCOPED_TRACE(::testing::Message() << row.cpu_type << " vs " << row.shader);

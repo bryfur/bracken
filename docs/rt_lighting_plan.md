@@ -432,6 +432,70 @@ is the correctness claim R1a is allowed to make. Probe relocation and
 classification are R1b's, with the update pass. What follows in this section is
 still the plan, not the tree.
 
+**Landed (R1b, 2026-08-02) — the update: probes trace, accumulate and
+classify.** The field now fills itself. Four compute passes per updating cascade
+(`gpu::ComputePipelineType::GiProbe*`, all inside the one `GIProbes` timer):
+
+- `gi_probe_trace.comp.hlsl` — one thread per (scheduled probe, ray).
+  Spherical-Fibonacci directions over the whole sphere, rotated per frame by a
+  uniform-random quaternion derived from the frame counter through the R3
+  sequence and Shoemake's construction — deterministic, mirrored on the CPU in
+  `gi_math.hpp` and tested for determinism, orthonormality, coverage
+  (worst-case best dot ≥ 0.85/0.90/0.93 at 32/64/96 rays), separation and
+  balance. Closest-hit through `rt_trace.hlsli`'s shared walks. Hit shading v1
+  exactly as specified above, with one thing better than planned: rather than
+  transliterating the cascade math, the shader's cbuffer embeds
+  `ShadowDataUniforms` field for field under the names `shadow_common.hlsli`
+  requires and **includes that file**, calling the same `calcShadow()` the
+  forward pass calls. §8's "CSM-at-hit convention trap" is therefore not a
+  parity test but a structural impossibility. Misses sample `IBL::capture_map()`
+  — the raw sky-radiance capture cube, newly exposed for this — with a uniform
+  flag falling back to the `EnvironmentState` hemisphere when IBL is
+  unavailable. Output per ray: RGB radiance + a **signed** distance, negative on
+  a backface.
+- `gi_probe_blend.comp.hlsl` / `gi_probe_blend_visibility.comp.hlsl` — one
+  threadgroup per probe, one thread per tile texel, `[numthreads]` equal to the
+  tile. Cosine weighting for irradiance, a `cos^50` lobe and a 1.5×spacing
+  distance clamp for the visibility moments. **The border ring is folded into
+  the same dispatch** via `groupshared` + one barrier rather than being a fourth
+  pass: it is a pure function of the payload the group just computed, so a
+  separate pass would re-read the atlas it had only just written to copy 28 of
+  64 texels. The blend is the planned change-adaptive EMA, 0.97 → 0.70 on a
+  scale-free delta; measured response is 16 updates for a full dark→lit step and
+  65 for a 5% nudge, both pinned by test. Uninitialized probes take the estimate
+  wholesale.
+- `gi_probe_classify.comp.hlsl` — backface fraction per probe; >25% steps the
+  probe 0.25 spacings away from the resultant backface direction, clamped to
+  0.45; >75% while already at the clamp marks it inside geometry. The verdict
+  and the offset live in a new per-probe RGBA16F texture rather than in
+  `probe_state`, because that texture has a CPU writer (the scroll re-uploads
+  all of it) that would erase a GPU-written verdict. Relocation lags one update
+  on purpose — the rays that motivated it were cast from the old position.
+
+**Budget and rota**, `render/gi/probe_schedule.hpp`: rays/probe {32, 64, 96} and
+{1/8, 1/4, 1/4} of a cascade per turn; cascade 0 every frame, cascade 1 on odd
+frames, cascade 2 on frames ≡ 2 (mod 4). The coarse cascades are **phased** so
+at most two trace in any one frame, which puts the peak at 55 k / 221 k / 332 k
+rays — under this section's own {85 k, …, 500 k} tier examples. Which probes:
+scrolled-in uninitialized probes jump the queue, the rest come from a persistent
+round-robin cursor; the whole selection is a pure function of main-thread state
+and is tested for exact sets, determinism and the absence of duplicates within a
+turn (a duplicate would be two threadgroups racing on one probe's texels).
+
+**GI is a ray-traced feature, loudly.** `gi_mode != Off` now routes through the
+same `ensure_raytracing_scene(want_attributes=true)` the traced effects use, so
+turning it on builds the BLAS + attribute buffers even with `rt_shadows` and
+`rt_reflections` off, and inherits the retained-CPU-geometry requirement. Said
+in the code, in `docs/architecture.md`, and in `docs/user_guide.md`.
+
+Measured on the playground village (`--smoke 30`, Medium): 110592 rays and 1728
+probes on a cascade-0-only frame, 5.53 M rays over the run, 66 of a frame's 1728
+scheduled probes relocated and 1 written off as interior. `--rt-bench 120` puts
+`GIProbes` at **0.054 ms mean / 0.065 p95** CPU record time with `RTInstances`
+unchanged at 0.126 vs 0.122 (`-O0` tree — ratios only). And the claim that
+matters: **`--smoke 30` reproduces `mean_luma=86.5 stddev=44.9` bit for bit with
+GI on and with GI off.** Consumption is R1c.
+
 **Structure.** DDGI-shaped, 3 scrolled cascades centered on the camera
 (spacings ~1.5 m / 3 m / 6 m — wide enough for the village, tunable), each
 ~24×12×24 probes ⇒ ~21 k probes total. Per probe: 6×6 octahedral irradiance
