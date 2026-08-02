@@ -279,6 +279,25 @@ void ComputePass::dispatch_for(const GPUComputePipeline& pipeline, uint32_t item
     dispatch(pipeline.group_count_x(items_x), pipeline.group_count_y(items_y), pipeline.group_count_z(items_z));
 }
 
+void ComputePass::dispatch_indirect(const GPUBuffer& args, uint32_t offset) {
+    if (!pass_) {
+        return;
+    }
+    if (args.type() != GPUBuffer::Type::Indirect) {
+        // SDL would fail its own validation here, but only in a debug device
+        // build and only as a driver-flavoured message. Say which buffer type
+        // was needed instead.
+        BRACKEN_LOG_ERROR(LOG_TAG,
+                          "ComputePass::dispatch_indirect: buffer is not GPUBuffer::Type::Indirect "
+                          "(SDL_GPU_BUFFERUSAGE_INDIRECT is required); dispatch skipped");
+        return;
+    }
+    if (args.handle() == nullptr) {
+        return;
+    }
+    SDL_DispatchGPUComputeIndirect(pass_, args.handle(), offset);
+}
+
 void ComputePass::end() {
     if (pass_) {
         SDL_EndGPUComputePass(pass_);

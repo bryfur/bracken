@@ -239,6 +239,7 @@ TEST_F(GpuLifetimeFixture, EveryBufferTypeFailsCleanlyWithoutADevice) {
     const gpu::GPUBuffer::Type types[] = {
         gpu::GPUBuffer::Type::Vertex, gpu::GPUBuffer::Type::Index, gpu::GPUBuffer::Type::Uniform,
         gpu::GPUBuffer::Type::Storage, gpu::GPUBuffer::Type::ComputeStorage,
+        gpu::GPUBuffer::Type::Indirect,
     };
     for (gpu::GPUBuffer::Type type : types) {
         SCOPED_TRACE(static_cast<int>(type));
@@ -246,6 +247,47 @@ TEST_F(GpuLifetimeFixture, EveryBufferTypeFailsCleanlyWithoutADevice) {
         EXPECT_EQ(gpu::GPUBuffer::create_dynamic(device, type, 128), nullptr);
         EXPECT_TRUE(sink->saw(LogLevel::Error, "Failed to create buffer"));
     }
+}
+
+// The buffer Type -> SDL usage-flag mapping, which is a pure function and
+// therefore the one part of the indirect-dispatch path (R4a) that IS checkable
+// without a device. SDL_DispatchGPUComputeIndirect itself is exercised first by
+// R4b; ComputePass::dispatch_indirect says so in its doc comment rather than
+// implying coverage that does not exist.
+TEST(GpuBufferTypes, IndirectCarriesTheIndirectAndComputeWriteBits) {
+    const SDL_GPUBufferUsageFlags indirect = gpu::GPUBuffer::usage_flags(gpu::GPUBuffer::Type::Indirect);
+    EXPECT_TRUE((indirect & SDL_GPU_BUFFERUSAGE_INDIRECT) != 0)
+        << "SDL_DispatchGPUComputeIndirect requires SDL_GPU_BUFFERUSAGE_INDIRECT";
+    // The arguments are produced by a compute pass — that is the entire point
+    // of dispatching indirectly — so the write bit is part of the contract.
+    EXPECT_TRUE((indirect & SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE) != 0);
+    // And it is not a vertex/index/graphics-storage buffer wearing a new name.
+    EXPECT_EQ(indirect & (SDL_GPU_BUFFERUSAGE_VERTEX | SDL_GPU_BUFFERUSAGE_INDEX |
+                          SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ),
+              0u);
+}
+
+// No OTHER type may carry the indirect bit: a buffer that can be dispatched
+// from without having been declared as such is how an argument-layout mistake
+// becomes a driver hang instead of a validation message.
+TEST(GpuBufferTypes, OnlyIndirectCarriesTheIndirectBit) {
+    const gpu::GPUBuffer::Type others[] = {
+        gpu::GPUBuffer::Type::Vertex, gpu::GPUBuffer::Type::Index, gpu::GPUBuffer::Type::Uniform,
+        gpu::GPUBuffer::Type::Storage, gpu::GPUBuffer::Type::ComputeStorage,
+    };
+    for (gpu::GPUBuffer::Type type : others) {
+        SCOPED_TRACE(static_cast<int>(type));
+        EXPECT_EQ(gpu::GPUBuffer::usage_flags(type) & SDL_GPU_BUFFERUSAGE_INDIRECT, 0u);
+    }
+}
+
+// The command layout dispatch_indirect documents, pinned against SDL's own
+// struct: three consecutive Uint32 group counts, 12 bytes, no stride field.
+TEST(GpuBufferTypes, IndirectDispatchCommandIsThreeUint32GroupCounts) {
+    static_assert(sizeof(SDL_GPUIndirectDispatchCommand) == 12, "three Uint32s, nothing else");
+    EXPECT_EQ(offsetof(SDL_GPUIndirectDispatchCommand, groupcount_x), 0u);
+    EXPECT_EQ(offsetof(SDL_GPUIndirectDispatchCommand, groupcount_y), 4u);
+    EXPECT_EQ(offsetof(SDL_GPUIndirectDispatchCommand, groupcount_z), 8u);
 }
 
 // A default-constructed Mapping owns nothing: destroying it must not unmap,

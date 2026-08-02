@@ -79,6 +79,27 @@ public:
                                                  SDL_GPUTextureUsageFlags usage);
 
     /**
+     * @brief Create a 2D texture with an explicit mip-level count
+     *
+     * The chain is ALLOCATED, not filled: nothing is uploaded and
+     * SDL_GenerateMipmapsForGPUTexture is not called, because the callers that
+     * want this (the HZB pyramid) compute each level themselves with a
+     * reduction that is not a box filter. Contents of every level are undefined
+     * until written. `mip_levels` is clamped to the chain the dimensions allow.
+     *
+     * @param device The GPU device
+     * @param width Texture width
+     * @param height Texture height
+     * @param format SDL GPU texture format
+     * @param usage SDL GPU texture usage flags
+     * @param mip_levels Levels to allocate (1 = no chain)
+     * @return Unique pointer to the texture, or nullptr on failure
+     */
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_2d(GPUDevice& device, int width, int height,
+                                                 SDL_GPUTextureFormat format, SDL_GPUTextureUsageFlags usage,
+                                                 uint32_t mip_levels);
+
+    /**
      * @brief Create a render target texture
      *
      * @param device The GPU device

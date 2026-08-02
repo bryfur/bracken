@@ -341,6 +341,33 @@ passes derive them the same way — the blend and classify passes rebuild each
 ray's direction rather than having it written out, which is why `frameIndex` is
 a uniform of all of them.
 
+**Hierarchical-Z pyramid (compute)** — two passes, both timed as one `HZB`
+scope, and both **built but unconsumed** (R4a of `docs/rt_lighting_plan.md`
+§5.5; R4b's screen-probe gather is the reader). They run only when
+`gi_mode == GiMode::ProbesScreen`. `hzb_copy.comp` writes mip 0 of an R32_FLOAT
+mip chain from the D32 prepass depth — the depth arrives through a **sampler**
+because a depth format cannot be a compute storage texture — and stores the raw
+reversed-Z device depth without linearizing (that would bake this frame's
+projection into the pyramid). `hzb_reduce.comp` is dispatched once per further
+mip, **each in its own compute pass**, reading mip N-1 and writing mip N of the
+same texture: both arrive as set-1 read-write bindings, because SDL3 GPU only
+permits reading a texture inside a compute pass when it was created with
+`COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE`, and the read-write binding's
+`mip_level` is the only way to name one level. Both `RWTexture2D` declarations
+carry `[[vk::image_format("r32f")]]` for the same reason the GI blend passes do
+— a storage image declared Unknown may only be written without the optional
+`shaderStorageImageReadWithoutFormat` feature.
+
+The reduction is a **MAX**, not a min: under reversed-Z a larger stored depth is
+a *closer* surface, and a march may skip a footprint only when the ray is in
+front of the footprint's closest surface, so that is what a coarse texel must
+keep. The gather is 2×2 except at a trailing odd edge, where the last
+destination texel extends to the end of the source (a plain `dst*2 + {0,1}`
+gather drops the last row/column of an odd mip, and clamping does not fix it —
+it re-reads a column already covered). `render/hzb.hpp` carries the CPU mirror
+of both rules and `render/hzb.test.cpp` brute-forces the whole pyramid against
+it.
+
 **Auto exposure (compute)** — `exposure_histogram.comp` builds a 256-bin
 log2-luminance histogram of the TAA-resolved (pre-bloom) HDR scene color:
 each 16×16 workgroup accumulates its tile into `groupshared` bins and merges

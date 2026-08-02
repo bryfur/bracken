@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include <cstdint>
 #include <memory>
@@ -201,6 +202,43 @@ public:
      *  items_z ELEMENTS (ceil-div by the shader's threadgroup size). */
     void dispatch_for(const GPUComputePipeline& pipeline, uint32_t items_x, uint32_t items_y = 1,
                       uint32_t items_z = 1);
+
+    /**
+     * @brief Dispatch with the workgroup counts read from a GPU buffer
+     *
+     * Wraps SDL_DispatchGPUComputeIndirect. What SDL requires of the caller,
+     * read off SDL_gpu.h rather than assumed:
+     *
+     * - `args` must carry SDL_GPU_BUFFERUSAGE_INDIRECT — i.e. it must have
+     *   been created as GPUBuffer::Type::Indirect.
+     * - The 12 bytes at `offset` must be one SDL_GPUIndirectDispatchCommand:
+     *   three consecutive Uint32 group counts (x, y, z), in that order. There
+     *   is no count/stride parameter — this is exactly one dispatch. SDL states
+     *   no alignment requirement beyond the struct's own (4 bytes), but the
+     *   underlying APIs do: Vulkan's vkCmdDispatchIndirect and D3D12's
+     *   ExecuteIndirect both require the argument offset to be a multiple of 4,
+     *   so keep `offset` 4-byte aligned. Pack argument records at 16 bytes if
+     *   you want them to also be addressable as std140 storage-buffer uints.
+     * - A pipeline must already be bound (`bind_pipeline`) — SDL says so
+     *   explicitly, and the counts are workgroups, so the shader's [numthreads]
+     *   is what they multiply against.
+     * - The counts are NOT synchronized against the pass that wrote them.
+     *   SDL's rule for compute is that a dispatch depending on a previous
+     *   dispatch's output needs a pass boundary; the producing pass must
+     *   therefore have ENDED before the pass containing this call begins.
+     *
+     * NOT EXERCISED AT RUNTIME YET (R4a). Nothing in the engine dispatches
+     * indirectly; the consumer is R4b's adaptive screen-probe placement, which
+     * is the first pass whose workgroup count only the GPU knows. The mapping
+     * this package can and does test CPU-side is Type::Indirect ->
+     * SDL_GPU_BUFFERUSAGE_INDIRECT (gpu_resource_lifetime.test.cpp); the SDL
+     * call itself is a one-line forward that no test can drive without a
+     * device, and it is honest to say so here rather than imply coverage.
+     *
+     * @param args Buffer holding the dispatch command (Type::Indirect)
+     * @param offset Byte offset of the command within `args` (4-byte aligned)
+     */
+    void dispatch_indirect(const GPUBuffer& args, uint32_t offset = 0);
 
     /** End the pass (idempotent; also called by the destructor). */
     void end();

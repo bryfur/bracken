@@ -749,4 +749,8 @@ GiProbeBlendVisibility
   cs        gi_probe_blend_visibility.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=2 rw_textures=1 rw_buffers=0 uniform_buffers=1
 GiProbeClassify
   cs        gi_probe_classify.comp.spv entry=CSMain samplers=0 ro_textures=0 ro_buffers=2 rw_textures=1 rw_buffers=1 uniform_buffers=1
+HzbCopy
+  cs        hzb_copy.comp.spv entry=CSMain samplers=1 ro_textures=0 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
+HzbReduce
+  cs        hzb_reduce.comp.spv entry=CSMain samplers=0 ro_textures=0 ro_buffers=0 rw_textures=2 rw_buffers=0 uniform_buffers=1
 )GOLDEN"

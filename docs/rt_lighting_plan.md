@@ -1,8 +1,9 @@
 # Ray-Traced Lighting — Research & Plan of Record
 
 Status: **in progress — R0 (foundations), R1 (probe-field GI), R2
-(froxel-RIS local-light shadows) and R3 (honest hit lighting) have landed**;
-R4 onward is still proposal. Written 2026-08-02 against the working tree at the
+(froxel-RIS local-light shadows), R3 (honest hit lighting) and R4a (the HZB +
+the `gpu/` layer's indirect-dispatch wrapper) have landed**; R4b onward is still
+proposal. Written 2026-08-02 against the working tree at the
 RT-denoiser series (post "RT shadows: stop multiplexing ambient occlusion into
 the shadow mask"); R0's landed work packages are marked in §5.0 and R1's three
 packages in §5.2. As of R1c the probe field lights the frame — the first
@@ -110,8 +111,10 @@ ambient term is a hard-coded `fogColor * 0.2`, and histogram auto-exposure.
 6. The reflection pass is **wave-divergence bound**, not traversal bound
    (measured; see the comment in `rt_reflection.comp.hlsl`'s `blasClosest`) —
    scattered reflective texels leave nearly every wave with one active lane.
-7. No HZB, no previous-frame depth/normal, no indirect dispatch wrapper, no
-   GPU timestamps (SDL3 has none — CPU record times only).
+7. ~~No HZB, no previous-frame depth/normal, no indirect dispatch wrapper~~,
+   no GPU timestamps (SDL3 has none — CPU record times only). **R4a added the
+   HZB and `ComputePass::dispatch_indirect`** (§5.5); no previous-frame
+   depth/normal target still stands.
 
 ---
 
@@ -967,12 +970,72 @@ dispatches compute.
 
 ### 5.5 R4 — Screen-probe gather (the quality tier)
 
+**Landed (R4a, 2026-08-02) — the HZB and the `gpu/` layer's indirect dispatch,
+and nothing that changes a pixel.** The foundation half: the pyramid is built,
+nothing marches it; the wrapper exists, nothing dispatches through it. Both
+smoke baselines are bit-identical (`--smoke 30` 86.5/44.9,
+`PLAYGROUND_RT=both PLAYGROUND_GI=probes` 81.7/49.8), and
+`PLAYGROUND_GI=probes_screen` reproduces the `probes` figure exactly while
+adding an `HZB` timer row and an `hzb=1600x900 mips=11` field to the
+`[smoke] gi` line.
+
+- **Indirect dispatch** (`gpu/gpu_compute.hpp`, `gpu/gpu_buffer.hpp`).
+  `ComputePass::dispatch_indirect(const GPUBuffer&, offset)` wraps
+  `SDL_DispatchGPUComputeIndirect`; `GPUBuffer::Type::Indirect` is
+  `INDIRECT | COMPUTE_STORAGE_WRITE` — the write bit is not decoration, since a
+  workgroup count the CPU could compute would not need indirection at all. The
+  doc comment records what SDL actually requires, read off the header rather
+  than assumed: the 12 bytes at `offset` are one
+  `SDL_GPUIndirectDispatchCommand` (three `Uint32` counts, x/y/z; no count or
+  stride field — exactly one dispatch), a pipeline must already be bound, 4-byte
+  offset alignment, and the producing pass must have ENDED because SDL provides
+  no intra-pass ordering. It also records, in the same place, that **no test
+  drives the SDL call** — the type→usage mapping and the command layout are
+  pinned CPU-side and the rest waits for R4b, which is the honest statement.
+- **HZB** (`render/hzb.hpp/.cpp`, `shaders/hzb_copy.comp.hlsl` +
+  `hzb_reduce.comp.hlsl`). One R32_FLOAT mip chain at depth resolution
+  (1600×900 ⇒ 11 levels, ~7.7 MB), built right after the depth prepass.
+  `HzbCopy` writes mip 0 from the D32 depth through a sampler (a depth format
+  cannot be a compute storage texture); `HzbReduce` runs once per further mip,
+  each in its own compute pass — required, because SDL3 has no intra-pass
+  barrier. A single-pass groupshared ladder (SPD) is the known optimization and
+  is deliberately not here: it would land before anything measured the naive
+  chain. Timed as `HZB`.
+
+  *The reduction is a MAX.* This section says "min-depth pyramid" above; that is
+  the standard-Z spelling. The engine's depth is reversed-Z, so a larger value
+  is a CLOSER surface, and the conservative rule — a march may skip a footprint
+  only when the ray is in front of everything in it — means a coarse texel must
+  keep the footprint's CLOSEST surface, i.e. the maximum. A min would keep the
+  farthest and screen rays would pass through near geometry.
+
+  *The footprint is not always 2×2.* Mip N is `max(1, size >> N)`, so an odd
+  source loses its last row/column to integer division and a plain 2×2 gather
+  never reads it; clamping re-reads a covered texel rather than fixing it. The
+  last destination texel therefore extends to the end of the source (at most one
+  extra texel, since a source extent is `2·dst` or `2·dst + 1`), keeping the
+  footprints a partition and making "mip N texel == max over its whole mip-0
+  region" true by induction. `render/hzb.test.cpp` brute-forces both claims
+  against even, odd, 3×3 and 1600×900 grids, plus mip-count formula, partition
+  and determinism.
+- **Gating.** The pyramid builds only when `gi_mode == GiMode::ProbesScreen` —
+  the mode R4b will consume it from, and which still behaves exactly as `Probes`
+  otherwise. That keeps every existing configuration byte-for-byte untouched
+  *and* gives the pyramid a live path to run in, which an unreachable pass would
+  not have.
+
+*Still to come here:* the screen probes themselves, the trace ladder that
+marches this pyramid, probe-space filtering, and the mid-roughness specular
+hand-off — all R4b.
+
 GI-1.0's shape over our tracer, `GiMode::ProbesScreen`, mid/high GPUs only:
 
-- **HZB.** New min-depth pyramid pass after the prepass (the engine's first —
+- ~~**HZB.** New min-depth pyramid pass after the prepass (the engine's first —
   also unlocks future occlusion culling). Enters the `gpu/` layer with the
   indirect-dispatch wrapper (`ComputePass::dispatch_indirect`,
-  `GPUBuffer::Type::Indirect`).
+  `GPUBuffer::Type::Indirect`).~~ **Landed (R4a)** — see above; the pyramid is a
+  reversed-Z *closest-surface* (MAX) pyramid, which is this bullet's "min-depth"
+  under the engine's depth convention.
 - **Probes.** One 8×8 octahedral probe per 8×8 screen tile (adaptive extras
   where depth/normal interpolation fails — the indirect dispatch consumer),
   placed on G-buffer depth, jittered. ~32 k probes at 1080p ⇒ ~2 M ray
@@ -1097,7 +1160,7 @@ Dependency-ordered; each phase ships alone.
 | **R1** | probe-field GI + fog coupling + settings + smoke pins | bounce visible in pinned art shots (`PLAYGROUND_TOD_HOUR` sunset: west walls warm); closed-hut leak test; Floor-tier budget met on the weakest local box; luma bands re-baselined for `PLAYGROUND_RT=gi` |
 | **R2** | froxel-RIS local shadows (Ratio), light IDs, scalar denoise clone | 32-light night scene fully shadowed (atlas caps exceeded) within budget; penumbra-vs-radius test; atlas A/B luma parity on atlas-sized scenes |
 | **R3** | `rt_hit_shade.hlsli`, CSM-at-hit, probe-at-hit, virtual reproj, rough→probe fallback | reflection interiors/shadows correct in pinned shots; orbit-ghosting metric improves; no reflection cost regression >10 % |
-| **R4** | HZB + indirect dispatch wrapper, screen probes, probe-space filtering, mid-rough specular from probes | `ProbesScreen` vs `Probes` A/B sharpness; handoff-seam scene clean; Silver budget held |
+| **R4** | ~~HZB + indirect dispatch wrapper~~ (**R4a, landed**), screen probes, probe-space filtering, mid-rough specular from probes (R4b) | R4a: every configuration bit-identical, `probes_screen` == `probes` luma with the `HZB` row present. R4b: `ProbesScreen` vs `Probes` A/B sharpness; handoff-seam scene clean; Silver budget held |
 | **R5** | SSILVB/bent-cone, denoiser core (gradients, dual history, exposure-aware), Full-DI tier | lightning/toggle scene: history resets locally within 2 frames, no global flash-smear; contact-GI A/B |
 | **R6** | emissive mesh lights, area-light authoring, stretch cache decision | dusk-windows shot; emissive in reflections + probes; watch-list re-evaluation recorded here |
 

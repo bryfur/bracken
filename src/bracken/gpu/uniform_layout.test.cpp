@@ -460,6 +460,9 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("gi_probe_blend.comp.spv", 2, 0, gpu::GiProbeBlendUniforms),
     ROW("gi_probe_blend_visibility.comp.spv", 2, 0, gpu::GiProbeBlendUniforms),
     ROW("gi_probe_classify.comp.spv", 2, 0, gpu::GiProbeClassifyUniforms),
+    // Hierarchical-Z pyramid (render/hzb.hpp).
+    ROW("hzb_copy.comp.spv", 2, 0, gpu::HzbCopyUniforms),
+    ROW("hzb_reduce.comp.spv", 2, 0, gpu::HzbReduceUniforms),
 
     // ---- renderer-owned mirrors (same contract, different header) ----
     ROW("model.frag.spv", 3, 2, render::lighting::ClusterParams),

@@ -33,6 +33,14 @@ public:
                         ///< targets); also readable as a graphics-stage
                         ///< read-only SSBO (COMPUTE_STORAGE_READ | WRITE |
                         ///< GRAPHICS_STORAGE_READ)
+        /// Indirect dispatch/draw arguments (INDIRECT | COMPUTE_STORAGE_WRITE).
+        /// The WRITE bit is not optional decoration: the point of an indirect
+        /// buffer here is that a *GPU* pass decides the workgroup count — a
+        /// count the CPU could compute would not need indirection at all — so
+        /// the producing compute shader must be able to write it. Contents must
+        /// match SDL_GPUIndirectDispatchCommand (three Uint32 group counts) at
+        /// the offset handed to ComputePass::dispatch_indirect.
+        Indirect,
     };
 
     ~GPUBuffer();
@@ -168,6 +176,16 @@ public:
      * @brief Check if this is a dynamic buffer
      */
     bool is_dynamic() const { return transfer_buffer_ != nullptr; }
+
+    /**
+     * @brief SDL usage flags a buffer Type maps to
+     *
+     * Public because it is the whole contract of Type and it is a pure
+     * function: a test can pin "Indirect implies SDL_GPU_BUFFERUSAGE_INDIRECT"
+     * without a GPU device, which is the only part of the indirect path that
+     * is checkable CPU-side.
+     */
+    [[nodiscard]] static SDL_GPUBufferUsageFlags usage_flags(Type type) { return get_usage_flags(type); }
 
 private:
     GPUBuffer() = default;

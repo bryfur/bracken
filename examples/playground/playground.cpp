@@ -1968,14 +1968,23 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
             // must be identical with GI on and off.
             const auto& gi = scene_renderer().gi_stats();
             if (gi.active) {
+                // The Hi-Z pyramid (R4a) is built only for GiMode::ProbesScreen
+                // and read by nothing yet, so the field is APPENDED when it
+                // exists rather than printed as `hzb=off` otherwise: a
+                // `PLAYGROUND_GI=probes` run must stay byte-identical, line for
+                // line, against the pre-R4a baseline.
+                std::string hzb_field;
+                if (const auto* hzb = scene_renderer().hzb(); hzb != nullptr && hzb->is_ready()) {
+                    hzb_field = std::format(" hzb={}x{} mips={}", hzb->width(), hzb->height(), hzb->mip_count());
+                }
                 std::cout << std::format(
                     "[smoke] gi mode={} quality={} cascades={} probes={} invalidated={} total={} "
-                    "atlas={:.1f}MB spacing={:.0f}..{:.0f}\n",
+                    "atlas={:.1f}MB spacing={:.0f}..{:.0f}{}\n",
                     static_cast<int>(graphics_settings().gi_mode),
                     static_cast<int>(graphics_settings().gi_quality), gi.cascades, gi.probes,
                     gi.probes_invalidated, gi.probes_invalidated_total,
                     static_cast<double>(gi.atlas_bytes) / (1024.0 * 1024.0),
-                    gi.per_cascade.front().spacing, gi.per_cascade.back().spacing);
+                    gi.per_cascade.front().spacing, gi.per_cascade.back().spacing, hzb_field);
                 std::cout << std::format(
                     "[smoke] gi update rays={} probes={} c0={} c1={} c2={} relocated={} inside={} "
                     "rays_total={} probes_total={}\n",

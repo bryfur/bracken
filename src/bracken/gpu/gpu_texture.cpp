@@ -270,13 +270,26 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
 
 std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, int height, SDL_GPUTextureFormat format,
                                                   SDL_GPUTextureUsageFlags usage) {
+    return create_2d(device, width, height, format, usage, 1);
+}
+
+std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, int height, SDL_GPUTextureFormat format,
+                                                  SDL_GPUTextureUsageFlags usage, uint32_t mip_levels) {
     BRACKEN_ASSERT_MAIN_THREAD();
+    if (width <= 0 || height <= 0 || mip_levels == 0) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_2d: invalid dimensions {}x{} levels={}", width, height,
+                          mip_levels);
+        return nullptr;
+    }
+    // A level beyond the chain is not a warning case in SDL, it is a create
+    // failure — clamp so the caller's arithmetic and SDL's cannot disagree.
+    mip_levels = std::min(mip_levels, calculate_mip_levels(width, height));
     auto texture = std::unique_ptr<GPUTexture>(new GPUTexture());
     texture->device_ = &device;
     texture->width_ = width;
     texture->height_ = height;
     texture->format_ = format;
-    texture->mip_levels_ = 1;
+    texture->mip_levels_ = mip_levels;
 
     // Check if this is a depth format
     texture->is_depth_ =
@@ -294,7 +307,7 @@ std::unique_ptr<GPUTexture> GPUTexture::create_2d(GPUDevice& device, int width, 
     tex_info.width = static_cast<Uint32>(width);
     tex_info.height = static_cast<Uint32>(height);
     tex_info.layer_count_or_depth = 1;
-    tex_info.num_levels = 1;
+    tex_info.num_levels = mip_levels;
 
     texture->texture_ = device.create_texture(tex_info);
     if (!texture->texture_) {

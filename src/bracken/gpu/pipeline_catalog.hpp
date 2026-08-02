@@ -183,6 +183,11 @@ enum class ComputePipelineType {
     GiProbeBlendVisibility, ///< Sharp-lobe fold of ray distances into the visibility moments + border
     GiProbeClassify,        ///< Backface fraction -> probe relocation offset + inside-geometry verdict
 
+    // Hierarchical-Z pyramid (render/hzb.hpp, docs/rt_lighting_plan.md §5.5).
+    // Built only for GiMode::ProbesScreen; R4b's screen march is the consumer.
+    HzbCopy,   ///< Mip 0: D32 prepass depth (sampled) -> R32F storage level
+    HzbReduce, ///< Mip N: conservative (reversed-Z MAX) reduction of mip N-1, one dispatch per mip
+
     // Count for iteration
     Count
 };

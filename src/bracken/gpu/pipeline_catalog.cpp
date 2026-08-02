@@ -901,6 +901,23 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
                    .num_readwrite_storage_textures = 1, // per-probe offset + verdict
                    .num_readwrite_storage_buffers = 1,  // diagnostic counters
                    .num_uniform_buffers = 1}},
+    {.name = "HzbCopy",
+     .shader = "hzb_copy.comp.spv",
+     .entry_point = "CSMain",
+     // The prepass depth arrives as a SAMPLED texture because it is D32_FLOAT
+     // and a depth format cannot be a compute storage texture; mip 0 of the
+     // R32F pyramid is the one read-write target.
+     .resources = {.num_samplers = 1, .num_readwrite_storage_textures = 1, .num_uniform_buffers = 1}},
+    {.name = "HzbReduce",
+     .shader = "hzb_reduce.comp.spv",
+     .entry_point = "CSMain",
+     // TWO read-write storage textures, one of which is only ever read. That is
+     // not sloppiness: source and destination are two mips of the SAME texture,
+     // and SDL3 GPU only permits reading a texture inside a compute pass when
+     // it was created with COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE — at which
+     // point the read-write binding, with its explicit mip_level, is the only
+     // way to name a single level.
+     .resources = {.num_readwrite_storage_textures = 2, .num_uniform_buffers = 1}},
 }};
 
 static_assert(k_compute_descs.size() == static_cast<size_t>(ComputePipelineType::Count),

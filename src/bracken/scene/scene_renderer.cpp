@@ -244,8 +244,10 @@ void SceneRenderer::shutdown() {
 
     depth_texture_.reset();
     velocity_texture_.reset();
-    // Before the device goes: the probe atlases are released through it.
+    // Before the device goes: the probe atlases and the Hi-Z pyramid's mip
+    // chain + sampler are released through it.
     probe_volume_.reset();
+    hzb_.reset();
 
     if (default_sampler_ && context_) {
         context_->device().release_sampler(default_sampler_);
@@ -1037,6 +1039,50 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // ===== Depth prepass: velocity + scene depth for opaque draws =====
             // (MASK/BLEND/skybox/particles keep their forward depth behavior.)
             frame_prepass_active_ = render_depth_prepass(frame, draw_camera);
+
+            // ===== Hierarchical-Z pyramid (R4a, docs/rt_lighting_plan.md
+            // §5.5): a conservative closest-surface mip chain over the depth
+            // the prepass just wrote. It sits HERE, immediately after the
+            // prepass and before GTAO, because that is the earliest point its
+            // only input exists and because every future consumer (R4b's screen
+            // march, and occlusion culling if it ever lands) runs later in the
+            // frame.
+            //
+            // GATED ON ITS FUTURE CONSUMER. Nothing reads the pyramid in this
+            // package, so building it unconditionally would be a screen-sized
+            // allocation and eleven dispatches that no configuration benefits
+            // from. `GiMode::ProbesScreen` — which behaves exactly as `Probes`
+            // until R4b — is the one mode that will consume it, so it is the
+            // one mode that builds it. Every other configuration, including the
+            // default, is untouched: not a byte allocated, one enum compare. =====
+            const bool hzb_wanted = gfx.gi_mode == GiMode::ProbesScreen && frame_prepass_active_ &&
+                                    post_->offscreen_depth() != nullptr && cmd != nullptr;
+            if (hzb_wanted) {
+                if (!hzb_ && !hzb_init_failed_) {
+                    auto pyramid = std::make_unique<render::HzbPyramid>();
+                    if (pyramid->init(context_->device(), context_->width(), context_->height())) {
+                        hzb_ = std::move(pyramid);
+                    } else {
+                        // init() logged the reason. Latch it: retrying a
+                        // format-support check and a mip-chain allocation every
+                        // frame would be a per-frame stall and a log flood.
+                        hzb_init_failed_ = true;
+                    }
+                }
+                if (hzb_) {
+                    hzb_->resize(context_->width(), context_->height());
+                    BRACKEN_PROFILE_ZONE_COLOR("HZB", 0x2C81C4);
+                    BRACKEN_GPU_SCOPE(cmd, "HZB");
+                    BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "HZB");
+                    hzb_->build(cmd, *pipeline_registry_, *post_->offscreen_depth());
+                }
+            } else if (gfx.gi_mode != GiMode::ProbesScreen && (hzb_ || hzb_init_failed_)) {
+                // Released the moment the mode leaves ProbesScreen, mirroring
+                // probe_volume_. A frame that merely lost its prepass keeps the
+                // pyramid allocated — that is a transient, not a mode change.
+                hzb_.reset();
+                hzb_init_failed_ = false;
+            }
 
             // ===== GTAO: computed from the prepass depth BEFORE the forward
             // pass — the forward shaders sample the full-res AO texture in

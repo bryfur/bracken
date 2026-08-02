@@ -14,6 +14,7 @@
 #include "bracken/render/lighting/light_cluster.hpp"
 #include "bracken/render/gi/gi_bindings.hpp"
 #include "bracken/render/gi/probe_volume.hpp"
+#include "bracken/render/hzb.hpp"
 #include "bracken/render/rt_renderer.hpp"
 #include "bracken/render/lighting/local_shadows.hpp"
 #include "bracken/scene/frame_packet.hpp"
@@ -206,6 +207,14 @@ public:
      *  `active == false`) while `gi_mode == GiMode::Off`, which is the default.
      *  Read-only, main-thread; mirrors raytracing_stats(). */
     [[nodiscard]] const render::gi::GiStats& gi_stats() const;
+
+    /** The hierarchical-Z pyramid, or null when it is not built.
+     *
+     *  Built only for `gi_mode == GiMode::ProbesScreen` (R4a) — the pass is
+     *  gated on its future consumer so that no configuration that exists today
+     *  allocates it or spends a dispatch on it. Exposed so a host can report
+     *  `hzb=WxH mips=N`; the pyramid's texture is renderer-internal. */
+    [[nodiscard]] const render::HzbPyramid* hzb() const { return hzb_.get(); }
 
     /** Effect/particle counts of the LAST CONSUMED packet's effect-instance
      *  snapshot — render-side data, safe for the dev overlay to read while
@@ -516,6 +525,16 @@ private:
     /// costs one attempt rather than one per frame. Cleared when gi_mode goes
     /// back to Off, which is the only way to ask for a retry.
     bool gi_init_failed_ = false;
+
+    /// Hierarchical-Z pyramid over the prepass depth. Same lazy-create /
+    /// destroy-on-off policy as probe_volume_ and normal_rough_texture_, on the
+    /// same argument: it is a screen-sized mip chain, and R4b's screen-probe
+    /// gather is the only thing that will ever read it, so it is built only for
+    /// GiMode::ProbesScreen. Nothing consumes it in R4a.
+    std::unique_ptr<render::HzbPyramid> hzb_;
+    /// Latched init failure (the device may not support R32_FLOAT with
+    /// SIMULTANEOUS read-write) — same one-attempt policy as gi_init_failed_.
+    bool hzb_init_failed_ = false;
 
     // Compute-shader ray tracing. Null-checked everywhere: both features are
     // off by default and nothing is built unless one is on.

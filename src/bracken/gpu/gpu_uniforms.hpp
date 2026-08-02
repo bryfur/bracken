@@ -1704,4 +1704,44 @@ BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, frameIndex, 20);
 BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, _pad0, 24);
 BRACKEN_HLSL_FIELD(GiProbeClassifyUniforms, _pad1, 28);
 
+/**
+ * HzbCopyUniforms (set 2, b0) — hzb_copy.comp.hlsl.
+ *
+ * Mip 0 of the hierarchical-Z pyramid is the same size as the prepass depth it
+ * copies, so one extent serves both. The trailing pad is named because HLSL
+ * rounds the cbuffer to 16 bytes and uniform_layout.test.cpp compares the
+ * declared extent against sizeof.
+ */
+struct alignas(16) HzbCopyUniforms {
+    uint32_t mipWidth = 0;
+    uint32_t mipHeight = 0;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+};
+BRACKEN_HLSL_CBUFFER(HzbCopyUniforms, 16);
+BRACKEN_HLSL_FIELD(HzbCopyUniforms, mipWidth, 0);
+BRACKEN_HLSL_FIELD(HzbCopyUniforms, mipHeight, 4);
+BRACKEN_HLSL_FIELD(HzbCopyUniforms, _pad0, 8);
+BRACKEN_HLSL_FIELD(HzbCopyUniforms, _pad1, 12);
+
+/**
+ * HzbReduceUniforms (set 2, b0) — hzb_reduce.comp.hlsl.
+ *
+ * Both extents are sent rather than the destination alone: the source's parity
+ * is what decides whether the last destination texel gathers two or three
+ * texels along an axis (render/hzb.hpp), and re-deriving `src = dst * 2` in the
+ * shader gets that wrong for exactly the edge the pyramid must not drop.
+ */
+struct alignas(16) HzbReduceUniforms {
+    uint32_t dstWidth = 0;
+    uint32_t dstHeight = 0;
+    uint32_t srcWidth = 0;
+    uint32_t srcHeight = 0;
+};
+BRACKEN_HLSL_CBUFFER(HzbReduceUniforms, 16);
+BRACKEN_HLSL_FIELD(HzbReduceUniforms, dstWidth, 0);
+BRACKEN_HLSL_FIELD(HzbReduceUniforms, dstHeight, 4);
+BRACKEN_HLSL_FIELD(HzbReduceUniforms, srcWidth, 8);
+BRACKEN_HLSL_FIELD(HzbReduceUniforms, srcHeight, 12);
+
 } // namespace bracken::gpu

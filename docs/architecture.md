@@ -24,7 +24,7 @@ Root namespace `bracken`, one sub-namespace per module.
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload poller); `AssetRegistry` (typed, stable handles — a host-facing utility: no engine system instantiates it); `AssetPack` (read-only bundle: sorted TOC, on-demand entry reads, worker-safe). The pack is generic; the model-aware async loader lives at the root because `core/` may not include upward |
 | `memory/` | `memory` | `Arena` (bump + destructor registration), `FrameAllocator` |
 | `gpu/` | `gpu` | `GPUDevice`, `GPUBuffer`, `GPUTexture`, `ShaderManager`, `GPUPipeline`, `GPUComputePipeline`/`ComputePass` (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) + `pipeline_catalog.hpp` (what each pipeline *is*), `gpu_uniforms.hpp` (CPU↔GPU contract), `gpu_debug.hpp` |
-| `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI; `color_grading.hpp` |
+| `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI, hierarchical-Z pyramid (`hzb.hpp`, built for `GiMode::ProbesScreen` only); `color_grading.hpp` |
 | `render/lighting/` | `render::lighting` | `ClusterGrid` (CPU light binning), `LocalShadowMap`/`LocalShadowSelector` (budgeted point/spot shadow atlas + tile cache), and the cluster/atlas **budget constants** in `light.hpp` (the light *structs* are `contracts/light.hpp`) |
 | `render/gi/` | `render::gi` | probe-field global illumination: `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three scrolled cascades of octahedral irradiance + visibility atlases, `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror (torus wrap, atlas tiling, octahedral encode/decode + the border wrap, world↔probe mapping, spherical-Fibonacci ray directions and their per-frame rotation, the change-adaptive blend curve), and `probe_schedule.hpp` is the per-frame ray budget and the cascade rota. `gi_bindings.hpp` is the per-frame handoff (three atlas bindings + the cascade window corners) every consumer takes. **After phase R1c the field traces, blends, classifies itself AND lights the frame**: `shaders/gi_sample.hlsli` replaces the diffuse half of the ambient term in every scene fragment shader and modulates the volumetric fog's in-scatter. GI on builds the acceleration structure with attributes even with `rt_shadows`/`rt_reflections` off. See "Probe-field GI" |
 | `render_graph/` | `render_graph` | pass scheduler (topo-sort, transient pool) — **in-tree, tested, not wired into `SceneRenderer`** |
@@ -618,7 +618,20 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    coverage boost, so both passes discard the same texels). Skinned MASK
    meshes are the one exception (no masked skinned variant — they keep the
    old forward-only depth behavior).
-7. **`GTAO`** (only when `ao_mode != Off` and the prepass ran this frame) —
+7. **`HZB`** (only when `gi_mode == GiMode::ProbesScreen` and the prepass ran
+   this frame) — `render::HzbPyramid` builds a conservative hierarchical-Z
+   pyramid over the depth the prepass just wrote: one R32_FLOAT texture with a
+   full mip chain at the offscreen depth's resolution (1600×900 ⇒ **11 mips**).
+   `HzbCopy` writes mip 0 from the D32 depth (which must arrive through a
+   SAMPLER — a depth format cannot be a compute storage texture), then
+   `HzbReduce` runs **once per further mip, each in its own compute pass**
+   because SDL3 GPU offers no intra-pass synchronization. Timed as `HZB`.
+   **Nothing reads it** — the pass is R4a of `docs/rt_lighting_plan.md` §5.5
+   and is gated on its future consumer (R4b's screen-probe gather) precisely so
+   that every configuration that exists today is bit-identical. See the HZB
+   subsection under "Ray tracing" for the reduction direction and the odd-edge
+   footprint rule.
+8. **`GTAO`** (only when `ao_mode != Off` and the prepass ran this frame) —
    `render::GTAO`, computed from the prepass depth alone BEFORE the forward
    pass; the forward shaders sample the result in their ambient term (screen
    AO never touches direct sun light or speculars, and is min-combined with
@@ -758,7 +771,7 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
      requiring a bindless texture array. The proxy is built only for models
      whose CPU geometry is retained for RT; shadows-only GPU memory remains 48
      bytes per triangle and reflection attributes remain 64 bytes per triangle.
-8. **`HDROffscreen`** (the normal path whenever the post stack initialized) —
+9. **`HDROffscreen`** (the normal path whenever the post stack initialized) —
    the whole 3D scene renders into the linear-HDR offscreen target: terrain,
    grass, static/instanced/skinned models, skybox, sorted transparent
    (alphaMode `BLEND`) meshes, particles, debug lines.
@@ -792,7 +805,7 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    RGB `ONE + ONE` while preserving destination alpha. Running here makes the
    result part of water refraction, TAA history, bloom and auto exposure rather
    than a late, shimmering composite overlay.
-9. **`Water`** (only when a `render::WaterRenderer` region is configured via
+10. **`Water`** (only when a `render::WaterRenderer` region is configured via
    `SceneRenderer::water()->set_region(...)`) — two parts. **`WaterSim`**
    (recorded earlier, right after `IBL` upkeep, outside every render pass):
    the engine's first compute-storage-TEXTURE user — a 512² RG16F ping-pong
@@ -831,7 +844,7 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    particles rendered in step 8, so the water overdraws them where they
    overlap on screen. Terrain above the water level hides the plane by the
    depth test, so a region rect can generously cover a carved riverbed.
-10. **Post chain** (all offscreen, swapchain not yet acquired):
+11. **Post chain** (all offscreen, swapchain not yet acquired):
    **`TAA`** (only when `aa_mode == AAMode::TAA`;
    `render::TAA`: resolves the jittered HDR offscreen color against a
    double-buffered RGBA16F history using the prepass velocity + scene depth —
@@ -860,7 +873,7 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    and sky pixels are marched too, so shafts silhouette against the sky;
    god rays force-disabled when shadows are off because the atlas would
    contain garbage).
-11. **Late swapchain acquire** → **`Composite`** (depth-aware joint-bilateral
+12. **Late swapchain acquire** → **`Composite`** (depth-aware joint-bilateral
    upsample of the half-res fog, scene + bloom + fog, then exposure =
    manual bias × exp2(adapted EV) — the adapted EV is read from the
    auto-exposure state buffer bound as the pass's only fragment SSBO (a
@@ -875,18 +888,18 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    composite goes to an LDR intermediate and **`FXAA`** resolves to the
    swapchain; otherwise (Off and TAA — TAA already resolved pre-bloom)
    composite writes the swapchain directly.
-12. **`UI`** — the packet's `ui_commands()` + 3D billboards, straight to
+13. **`UI`** — the packet's `ui_commands()` + 3D billboards, straight to
    swapchain.
    **`PostUICallback`** — optional host hook that renders into the swapchain
    after UI (`SceneRenderer::set_post_ui_callback`). There is a single slot:
    `Application::init_dev_ui()` claims it for the dev overlay's ImGui draw,
    so a host can't use both the overlay and its own post-UI callback.
-13. Fallback: if the post stack isn't ready, steps 6–11 collapse to a single
+14. Fallback: if the post stack isn't ready, steps 6–12 collapse to a single
    **`MainScene`** pass direct to swapchain (no depth prepass, no AO — every
    draw keeps its `GREATER_OR_EQUAL` write-on pipeline and samples the white
    dummy AO texture). Minimized windows skip all recording but still submit,
    keeping the frame lifecycle balanced.
-14. **Screenshot readback** (only when `request_screenshot(path)` was called
+15. **Screenshot readback** (only when `request_screenshot(path)` was called
    since the last frame; `Application` defers the request and forwards it to
    `SceneRenderer::request_screenshot` at the frame fence, so a request from
    sim frame i captures frame i's rendering): after UI/PostUICallback, a copy pass
@@ -1274,6 +1287,55 @@ range enum.
   call `ModelManager::set_retain_cpu_geometry(true)` (`model_loader.hpp`)
   *before* loading, or the builder finds nothing to build from and says so
   rather than producing an empty structure.
+
+### Hierarchical-Z pyramid (R4a) — `render/hzb.hpp`
+
+The screen-space half of the trace ladder starts here: a conservative depth
+pyramid a ray march can step through in log-n texture fetches instead of BVH
+triangle tests. R4a builds it; **R4b's screen-probe gather is the first thing
+that reads it.** Until then it is gated on `gi_mode == GiMode::ProbesScreen`
+(the mode that will consume it, and which otherwise still behaves exactly as
+`Probes`), so no configuration that exists today allocates it.
+
+**Structure.** One `R32_FLOAT` texture with a full mip chain at the offscreen
+depth's resolution — 1600×900 ⇒ 11 levels, ~7.7 MB. Usage is
+`SAMPLER | COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE` and the flag is not
+decoration: the reduce pass reads one mip and writes the next of the *same*
+texture, and SDL3's rule is that reading a texture inside a compute pass
+requires exactly that flag (plain `READ | WRITE` means "one shader writes, a
+*different* shader reads"). Support for the combination is queried at `init()`
+via `SDL_GPUTextureSupportsFormat` and a device that refuses it gets a warning
+and no pyramid, not a null texture with no explanation.
+
+**Why MAX and not MIN.** The scene depth is reversed-Z zero-to-one, so a
+*larger* stored value is a *closer* surface. A screen march may skip a whole
+footprint in one step only when the ray is provably in front of everything
+inside it — closer than the footprint's **closest** surface — so a coarse texel
+must retain that closest surface, which here is the maximum of its source
+texels. A min would retain the farthest surface and the march would step
+straight through near geometry. The literature's "min-depth pyramid" (and
+`docs/rt_lighting_plan.md` §5.5) is the standard-Z spelling of the identical
+rule; the arithmetic follows the buffer's depth convention.
+
+**Why the footprint is not always 2×2.** Mip N is `max(1, size >> N)`, so an
+odd source dimension loses its last row/column to integer division — a 5-wide
+source reduces to 2, and a plain 2×2 gather never reads column 4. Clamping the
+gather to bounds does not fix that; it re-reads a column already covered. The
+*last* destination texel therefore extends to the end of the source. A source
+dimension is either `2·dst` or `2·dst + 1`, so the extension is at most one
+texel and the gather is 2×2, 3×2, 2×3 or 3×3. The footprints stay a partition
+of the source, which is what makes "mip N texel == max over its whole mip-0
+region" true by induction — brute-forced in `render/hzb.test.cpp` against both
+the immediate source and the mip-0 grid, at even, odd, 3×3 and 1600×900 sizes.
+
+**Cost shape.** One dispatch per mip, each in its own compute pass. The pass
+boundary is required (SDL3 has no intra-pass barrier: a dispatch reading a
+previous dispatch's output must sit in a later pass); the *one shader per mip*
+is not. A single-pass groupshared ladder (the FidelityFX SPD shape — up to 12
+mips from one dispatch through LDS and a globally coherent counter) is the known
+optimization and is deliberately **not** in this package: it would land before
+anything measured what the naive chain costs. Timed as `HZB` in
+`RenderStats::pass_times_ms`.
 
 ---
 
@@ -1783,8 +1845,8 @@ positions and the transmittance-weighted integral over 24 steps hide it.
 
 - **Registry vs catalogue.** These are two files on purpose.
   **`gpu/pipeline_catalog.hpp`** is the catalogue: one `constexpr`
-  `PipelineDesc` row per `PipelineType` (56) and one `ComputePipelineDesc` per
-  `ComputePipelineType` (3), carrying the shader pair, the resource counts
+  `PipelineDesc` row per `PipelineType` (67) and one `ComputePipelineDesc` per
+  `ComputePipelineType` (16), carrying the shader pair, the resource counts
   those shaders declare, the vertex layout (`VertexLayout`), the render target
   (`TargetFormat`) and the fixed-function state — cull, blend, the depth
   triple, depth clip, depth bias. `build_pipeline_config(desc, formats)` turns
@@ -1836,6 +1898,20 @@ positions and the transmittance-weighted integral over 24 steps hide it.
   read-only resources bind after the pipeline, `dispatch_for()` sizes the
   grid from the pipeline's threadgroup. Binding-order conventions are
   documented in [shaders/README.md](../src/bracken/shaders/README.md).
+- **Indirect dispatch exists as of R4a** — `ComputePass::dispatch_indirect(const
+  GPUBuffer&, offset)` wraps `SDL_DispatchGPUComputeIndirect`, and
+  `GPUBuffer::Type::Indirect` (`INDIRECT | COMPUTE_STORAGE_WRITE`) is the buffer
+  type it accepts. The 12 bytes at `offset` must be one
+  `SDL_GPUIndirectDispatchCommand` (three `Uint32` workgroup counts, x/y/z; no
+  count or stride parameter — it is exactly one dispatch), a pipeline must
+  already be bound, and the pass that *wrote* the arguments must have ended,
+  since SDL provides no intra-pass ordering. **Nothing dispatches indirectly
+  yet**: the wrapper landed with the HZB so that R4b's adaptive screen-probe
+  placement — the first pass whose workgroup count only the GPU knows — does not
+  have to add a `gpu/` layer feature and a shader at once. What is tested
+  CPU-side is the type→usage-flag mapping and the command layout
+  (`gpu_resource_lifetime.test.cpp`); the SDL call itself is exercised first at
+  runtime by R4b, and its doc comment says so rather than implying coverage.
 - **Uniform contract**: every HLSL cbuffer has an `alignas(16)` CPU mirror in
   `gpu/gpu_uniforms.hpp`, annotated with its `(set, binding)`. They must match
   **byte-for-byte** — this is the most common way to break rendering silently.

@@ -84,6 +84,11 @@ SDL_GPUBufferUsageFlags GPUBuffer::get_usage_flags(Type type) {
             // so compute results feed fragment shaders without a copy.
             return SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ | SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE |
                    SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ;
+        case Type::Indirect:
+            // Written by a compute pass, then consumed as dispatch/draw
+            // arguments. No READ bit: nothing reads these back in a shader, and
+            // the producer writes all three group counts unconditionally.
+            return SDL_GPU_BUFFERUSAGE_INDIRECT | SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE;
     }
     return SDL_GPU_BUFFERUSAGE_VERTEX;
 }
