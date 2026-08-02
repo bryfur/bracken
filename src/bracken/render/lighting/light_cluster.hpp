@@ -3,6 +3,7 @@
 #include "bracken/contracts/camera_state.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
+#include "bracken/render/lighting/cluster_index.hpp"
 #include "bracken/render/lighting/light.hpp"
 #include <array>
 #include <cstdint>
@@ -17,19 +18,12 @@ class JobSystem;
 
 namespace bracken::render::lighting {
 
-// Std140-compatible layout shared with clusters.hlsli.
-// All fields packed contiguously; HLSL cbuffer layout requires 16-byte alignment.
-struct alignas(16) ClusterParams {
-    glm::mat4 view;
-    glm::mat4 invProjection;
-    glm::vec4 screenSize;     // (width, height, 1/width, 1/height)
-    glm::vec4 zPlanes;        // (near, far, log(far/near), 1/log(far/near))
-    glm::uvec4 gridDim;       // (X, Y, Z, totalLightCount)
-    // .x = per-cluster light cap (shader clamps its loop with it);
-    // .y = light-data buffer capacity in lights (max_lights_) — the shader
-    //      derives its payload section offsets from it (cluster_lighting.hlsli).
-    glm::uvec4 maxPerCluster;
-};
+// ClusterParams and the froxel index math live in cluster_index.hpp — the CPU
+// half of the include the fragment and compute shaders share.
+
+// A remap entry for a light that no longer exists this frame. Mirrors
+// LIGHT_REMAP_INVALID in shaders/cluster_compute.hlsli.
+inline constexpr uint32_t LIGHT_REMAP_INVALID = 0xFFFFFFFFu;
 
 class ClusterGrid {
 public:
@@ -98,9 +92,23 @@ public:
     // unchanged. Staging lives in member scratch (light_staging_).
     void upload(SDL_GPUCopyPass* copy_pass);
 
+    // Forget last frame's light identities. Call this on any frame the grid
+    // does NOT build (the renderer skips binning entirely when the scene has
+    // no dynamic lights) — otherwise the next build would remap against a
+    // "previous frame" that is two or more frames old, and a consumer's
+    // temporal history would be reused across a gap where nothing was lit.
+    void reset_light_history();
+
     SDL_GPUBuffer* light_data_buffer() const;
     SDL_GPUBuffer* cluster_offsets_buffer() const;
     SDL_GPUBuffer* light_indices_buffer() const;
+    // uint[max_lights]: the stable id of each light in PACKED order — index it
+    // with the same header index the cluster light list yields.
+    SDL_GPUBuffer* light_stable_ids_buffer() const;
+    // uint[max_lights]: PREVIOUS frame's packed index -> this frame's packed
+    // index, LIGHT_REMAP_INVALID where the light is gone. Entries at or past
+    // the previous frame's light count are LIGHT_REMAP_INVALID too.
+    SDL_GPUBuffer* light_remap_buffer() const;
 
     const ClusterParams& params() const { return params_; }
 
@@ -108,6 +116,12 @@ public:
     const std::vector<PointLight>& point_lights() const { return points_; }
     const std::vector<SpotLight>& spot_lights() const { return spots_; }
     const std::vector<uint32_t>& light_indices() const { return light_indices_; }
+    // Resolved stable ids in packed (header) order — the CPU side of
+    // light_stable_ids_buffer(). Never 0 for a light that made it into the
+    // frame. See contracts/light.hpp for the identity contract.
+    const std::vector<uint32_t>& stable_ids() const { return stable_ids_; }
+    // The CPU side of light_remap_buffer(); always max_lights entries.
+    const std::vector<uint32_t>& index_remap() const { return remap_; }
     // Per-cluster (offset, count) packed as uvec2 — flat array of 2*CLUSTER_COUNT u32.
     const std::vector<uint32_t>& cluster_offsets() const { return cluster_offsets_; }
     uint32_t total_lights() const { return static_cast<uint32_t>(points_.size() + spots_.size()); }
@@ -137,6 +151,12 @@ private:
     };
 
     void compute_cluster_bounds(core::jobs::JobSystem& js);
+    // Resolve every light's stable id (host-supplied wins, else the quantized
+    // content hash) and diff this frame's identities against last frame's into
+    // remap_. Runs at the top of build(), serially, in emission order — the
+    // determinism the identity contract promises comes from that order and
+    // nothing else. Two <= MAX_LIGHTS passes; no allocation after warm-up.
+    void assign_stable_ids_and_remap();
     // Count + warn-once for a light past the frame cap; always returns false.
     bool reject_over_cap();
     static bool sphere_intersects_aabb(const glm::vec3& center, float radius, const glm::vec3& aabb_min,
@@ -162,6 +182,13 @@ private:
     std::vector<uint32_t> chunk_truncated_;
     std::vector<uint8_t> light_staging_;        // scratch for upload() packing
 
+    // Persistent light identity (contracts/light.hpp). All three are plain
+    // vectors walked in index order — no hashing container, no pointer-order
+    // iteration, so the result is bit-identical run to run.
+    std::vector<uint32_t> stable_ids_;      // this frame, packed (header) order
+    std::vector<uint32_t> prev_stable_ids_; // last built frame, same order
+    std::vector<uint32_t> remap_;           // max_lights_ entries, prev idx -> cur idx
+
     ClusterParams params_{};
     glm::mat4 last_projection_{0.0f};
     float last_near_ = 0.0f;
@@ -184,6 +211,13 @@ private:
     std::unique_ptr<gpu::GPUBuffer> light_data_buf_;
     std::unique_ptr<gpu::GPUBuffer> cluster_offsets_buf_;
     std::unique_ptr<gpu::GPUBuffer> light_indices_buf_;
+    // Identity side-channel: two uint[max_lights] buffers uploaded with the
+    // cluster buffers in the same copy pass. They are PARALLEL to the light
+    // data rather than fields inside it because LightHeader is exactly 8 bytes
+    // on both sides (the shader hardcodes that stride), and because a consumer
+    // wants both arrays indexed by PACKED index — one load, no header hop.
+    std::unique_ptr<gpu::GPUBuffer> light_stable_ids_buf_;
+    std::unique_ptr<gpu::GPUBuffer> light_remap_buf_;
 };
 
 } // namespace bracken::render::lighting

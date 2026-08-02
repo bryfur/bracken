@@ -1709,9 +1709,10 @@ positions and the transmittance-weighted integral over 24 steps hide it.
   `sizeof(T)`, plus each `StructuredBuffer` element stride against its CPU
   record. Its table is required to be exhaustive: a uniform block in any
   staged `.spv` that no row covers fails the test.
-  `ClusterParams` is intentionally duplicated between
-  `render/lighting/light_cluster.hpp` and `gpu_uniforms.hpp` to avoid a header
-  dependency; keep both in sync.
+  `ClusterParams` lives in `render/lighting/cluster_index.hpp` (with the froxel
+  index math it belongs to) and is intentionally not mirrored in
+  `gpu_uniforms.hpp`, to avoid a header dependency; its HLSL counterpart is
+  `shaders/cluster_index.hlsli`, shared by the fragment and compute paths.
 - **Skinned palettes**: bone palettes are packed in the `FramePacket` at
   build time (`FrameBuilder::alloc_bone_palette` + prefix-summed
   `BonePalette::matrix_offset`); the renderer uploads `frame.palettes()` in
@@ -1733,6 +1734,39 @@ positions and the transmittance-weighted integral over 24 steps hide it.
   a zero that reads as "free" (`gpu/gpu_debug.hpp`). Use RenderDoc/Nsight for
   real GPU timing, and `Application::present_wait_ms()` to decide whether it
   is worth looking.
+
+### Persistent light identity and the prev→current remap (R2a)
+
+The frame packet rebuilds its light arrays every frame, so a light's array
+index is not stable: index 3 is a different lantern tomorrow. Anything that
+reuses per-light state across frames needs identity instead. `PointLightDesc`
+/ `SpotLightDesc` therefore carry a `stable_id` (`0` = engine assigns, the
+default), and `ClusterGrid::build()` resolves it at the top of binning —
+main-thread tier, serial, in emission order: host-supplied non-zero ids pass
+through verbatim and are claimed first; everything else gets an FNV-1a hash of
+`{type, position quantized to 5 world units, color quantized to 0.25,
+intensity quantized to the nearest octave}`, with in-frame collisions broken
+by re-hashing with an occurrence counter. A static torch keeps its id; a
+flickering one keeps it (intensity is quantized by RATIO, which is how a torch
+actually animates); a light that teleports past the quantum gets a new one,
+and that is correct — its history would be wrong. Full contract, including
+what the collision scheme does and does not promise, is in
+`contracts/light.hpp`. The identity is written back into the uploaded light
+records (into bytes that were declared padding — sizes and offsets unchanged)
+and into a packed-order `uint[MAX_LIGHTS]` GPU buffer; a second
+`uint[MAX_LIGHTS]` buffer holds the **remap**, last frame's packed index →
+this frame's packed index, `0xFFFFFFFF` where the light is gone. Both upload
+with the cluster buffers in the same copy pass, and both are ~1 KB.
+`SceneRenderer` calls `reset_light_history()` on frames where it skips binning
+entirely (zero dynamic lights), so the next build cannot remap across the gap.
+All of this is renderer-side state — it never rides the packet, which is what
+keeps it compatible with the pipelined frame (`docs/rt_lighting_plan.md` §8).
+**Nothing reads either buffer yet.** The consumer is R2b's froxel reservoirs
+(§5.3), which reach them through `shaders/cluster_compute.hlsli` — the
+compute-side froxel accessor whose index math and light-record decode are the
+same includes (`cluster_index.hlsli`, `cluster_light_load.hlsli`) the fragment
+path uses, and whose CPU mirror `render/lighting/cluster_index.hpp` is what
+the binner itself calls.
 
 ---
 

@@ -355,17 +355,21 @@ void FrameBuilder::Lane::add_point_light(const bracken::render::lighting::PointL
     assert_filling();
     // Desc -> GPU POD. The engine owns _pad0/_pad1 and shadow_slot; a host
     // never names them, which is the whole reason the descriptor exists.
-    new (push_slot(point_lights_)) bracken::render::lighting::PointLight{
+    // stable_id is host DATA (0 = "engine assigns") and is assigned by
+    // position, not name, only because it sits past the padding.
+    auto* l = new (push_slot(point_lights_)) bracken::render::lighting::PointLight{
         light.position, light.radius, light.color, light.intensity, light.casts_shadows};
+    l->stable_id = light.stable_id;
 }
 
 void FrameBuilder::Lane::add_spot_light(const bracken::render::lighting::SpotLightDesc& light) {
     assert_filling();
     // The cone cosines are taken HERE — every host used to write
     // std::cos(glm::radians(x)) itself, and the shader wants the cosine.
-    new (push_slot(spot_lights_)) bracken::render::lighting::SpotLight{
+    auto* l = new (push_slot(spot_lights_)) bracken::render::lighting::SpotLight{
         light.position,   light.radius,          light.direction, std::cos(light.inner_angle.radians()),
         light.color,      std::cos(light.outer_angle.radians()),  light.intensity, light.casts_shadows};
+    l->stable_id = light.stable_id;
 }
 
 void FrameBuilder::Lane::add_billboard_3d(float world_x, float world_y, float world_z, float width, float fill_ratio,

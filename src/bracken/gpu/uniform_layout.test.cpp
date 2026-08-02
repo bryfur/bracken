@@ -466,6 +466,9 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("model_instanced.frag.spv", 3, 2, render::lighting::ClusterParams),
     ROW("terrain.frag.spv", 3, 2, render::lighting::ClusterParams),
     ROW("grass.frag.spv", 3, 2, render::lighting::ClusterParams),
+    // The compute mirror of the same cbuffer — cluster_compute.hlsli binds it
+    // on set 2 (compute uniforms) instead of set 3 (fragment uniforms).
+    ROW("cluster_compute_validate.comp.spv", 2, 0, render::lighting::ClusterParams),
     ROW("terrain.vert.spv", 1, 0, render::TerrainTransformUniforms),
     ROW("terrain.frag.spv", 3, 0, render::TerrainLightingUniforms),
     ROW("grass.vert.spv", 1, 0, render::GrassVertexUniforms),

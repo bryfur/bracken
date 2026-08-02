@@ -2,6 +2,7 @@
 
 #include "bracken/contracts/camera_state.hpp"
 #include "bracken/core/jobs/job_system.hpp"
+#include "bracken/render/lighting/cluster_index.hpp"
 #include "bracken/render/lighting/light.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
 
@@ -11,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#include <set>
+#include <vector>
 
 namespace {
 
@@ -57,20 +60,13 @@ struct CpuOnlyClusterGrid {
     }
 };
 
-// Replicates the shader-side lookup in clusters.hlsli (clusterZSlice +
-// clusterIndexFromScreen, INCLUDING the `1 - uv.y` flip) so the CPU<->shader
-// screen-orientation contract is pinned by a CPU test. screen_uv is
-// SV_Position-style: (0,0) = top-left of the screen.
+// The shader-side lookup, as the ENGINE ships it: cluster_index.hpp is the CPU
+// mirror of shaders/cluster_index.hlsli, and light_cluster.cpp's binner calls
+// its clusterZSlice half itself. These tests used to carry a hand-copied
+// transliteration here — which pinned the contract only as well as the copy
+// was maintained.
 uint32_t shader_cluster_index(glm::vec2 screen_uv, float view_depth, const ClusterParams& cp) {
-    auto clamp_dim = [](float v, uint32_t dim) {
-        return static_cast<uint32_t>(std::clamp(v, 0.0f, static_cast<float>(dim - 1)));
-    };
-    float depth = std::max(view_depth, cp.zPlanes.x);
-    float t = std::log(depth / cp.zPlanes.x) * cp.zPlanes.w;
-    uint32_t cz = clamp_dim(std::floor(t * static_cast<float>(cp.gridDim.z)), cp.gridDim.z);
-    uint32_t cx = clamp_dim(std::floor(screen_uv.x * static_cast<float>(cp.gridDim.x)), cp.gridDim.x);
-    uint32_t cy = clamp_dim(std::floor((1.0f - screen_uv.y) * static_cast<float>(cp.gridDim.y)), cp.gridDim.y);
-    return (cz * cp.gridDim.y + cy) * cp.gridDim.x + cx;
+    return cluster_index_from_screen(screen_uv, view_depth, cp);
 }
 
 // Unprojects an NDC (x, y) + positive forward depth to a view-space position,
@@ -514,4 +510,381 @@ TEST(ClusterGrid, PerClusterCountNeverExceedsCap) {
         max_count = std::max(max_count, cnt);
     }
     EXPECT_EQ(max_count, MAX_LIGHTS_PER_CLUSTER);
+}
+
+// ===========================================================================
+// Froxel index parity: the shared math vs. the binner's own cluster bounds
+// ===========================================================================
+
+namespace {
+
+// The Z-slice boundary formula light_cluster.cpp bins against
+// (`exp_z_slice`), restated from the documented exponential distribution
+// rather than borrowed from the implementation — a mirror that copied the
+// code would agree with a typo.
+float slice_depth(uint32_t z, float near_z, float far_z) {
+    return near_z * std::pow(far_z / near_z, static_cast<float>(z) / static_cast<float>(CLUSTER_DIM_Z));
+}
+
+} // namespace
+
+// The refactored index math (render/lighting/cluster_index.hpp — the CPU
+// mirror of shaders/cluster_index.hlsli, which BOTH the fragment path and the
+// new compute path include) must land on exactly the cluster the binner's
+// AABB path binned a light into, everywhere in the grid. This is the guarantee
+// that lets a compute pass read a pixel's froxel light list and get the same
+// answer the forward pass gets for the same pixel.
+TEST(ClusterGrid, FroxelIndexMathAgreesWithBinnerAcrossTheGrid) {
+    const float near_plane = 0.1f;
+    const float far_plane = 100.0f;
+    CameraState cam = make_camera(1920, 1080, 60.0f, 16.0f / 9.0f, near_plane, far_plane);
+    const glm::mat4 inv_proj = glm::inverse(cam.projection);
+
+    // Sweep the whole grid, strided so one pass stays under MAX_LIGHTS; every
+    // cluster index in the sweep is checked in both directions.
+    struct Probe {
+        uint32_t expected_cluster;
+        glm::vec2 screen_uv;
+        float depth;
+        glm::vec3 view_pos;
+    };
+    std::vector<Probe> probes;
+    for (uint32_t z = 0; z < CLUSTER_DIM_Z; ++z) {
+        for (uint32_t y = 0; y < CLUSTER_DIM_Y; ++y) {
+            for (uint32_t x = 0; x < CLUSTER_DIM_X; ++x) {
+                // Tile center in NDC (cx = 0 starts at NDC -1, per
+                // unproject_corner) and the GEOMETRIC mean depth of the slice
+                // — the exact midpoint of an exponentially distributed slice.
+                const float ndc_x = ((static_cast<float>(x) + 0.5f) / CLUSTER_DIM_X) * 2.0f - 1.0f;
+                const float ndc_y = ((static_cast<float>(y) + 0.5f) / CLUSTER_DIM_Y) * 2.0f - 1.0f;
+                const float depth =
+                    std::sqrt(slice_depth(z, near_plane, far_plane) * slice_depth(z + 1, near_plane, far_plane));
+                Probe p;
+                p.expected_cluster = (z * CLUSTER_DIM_Y + y) * CLUSTER_DIM_X + x;
+                // SV_Position-style uv: y = 0 is the TOP of the screen.
+                p.screen_uv = glm::vec2(ndc_x * 0.5f + 0.5f, 1.0f - (ndc_y * 0.5f + 0.5f));
+                p.depth = depth;
+                p.view_pos = view_pos_from_ndc(inv_proj, ndc_x, ndc_y, depth);
+                probes.push_back(p);
+            }
+        }
+    }
+    ASSERT_EQ(probes.size(), CLUSTER_COUNT);
+
+    CpuOnlyClusterGrid cg;
+    constexpr std::size_t BATCH = 128; // well under MAX_LIGHTS
+    for (std::size_t base = 0; base < probes.size(); base += BATCH) {
+        const std::size_t end = std::min(base + BATCH, probes.size());
+        std::vector<PointLight> lights;
+        for (std::size_t i = base; i < end; ++i) {
+            PointLight p{};
+            p.position = probes[i].view_pos; // identity view => view == world
+            // Small but not degenerate: it must reach the cluster's AABB,
+            // which is the conservative box around the frustum cell.
+            p.radius = 0.05f;
+            p.color = glm::vec3(1.0f);
+            p.intensity = 1.0f;
+            lights.push_back(p);
+        }
+        cg.run(cam, 1920, 1080, near_plane, far_plane, lights, {});
+
+        const auto& offsets = cg.g.cluster_offsets();
+        const auto& indices = cg.g.light_indices();
+        for (std::size_t i = base; i < end; ++i) {
+            const Probe& probe = probes[i];
+            SCOPED_TRACE(::testing::Message() << "cluster " << probe.expected_cluster);
+            // (a) the pure math: shared index function -> the intended cluster.
+            const uint32_t cidx = cluster_index_from_screen(probe.screen_uv, probe.depth, cg.g.params());
+            ASSERT_EQ(cidx, probe.expected_cluster);
+            // (b) parity with the binner's independent AABB path: the light
+            // placed at that point is in THAT cluster's bin.
+            const uint32_t offset = offsets[cidx * 2 + 0];
+            const uint32_t count = offsets[cidx * 2 + 1];
+            const uint32_t light_index = static_cast<uint32_t>(i - base);
+            bool found = false;
+            for (uint32_t k = 0; k < count; ++k) {
+                if (indices[offset + k] == light_index) {
+                    found = true;
+                    break;
+                }
+            }
+            EXPECT_TRUE(found) << "binner and froxel index math disagree about this cluster";
+        }
+    }
+}
+
+// The Z-slice half on its own, at the boundaries the geometric-mean sweep
+// above deliberately stays away from.
+TEST(ClusterGrid, ZSliceMathCoversTheWholeRangeMonotonically) {
+    CpuOnlyClusterGrid cg;
+    cg.run(make_camera(1920, 1080, 60.0f, 16.0f / 9.0f, 0.1f, 100.0f), 1920, 1080, 0.1f, 100.0f, {}, {});
+    const ClusterParams& cp = cg.g.params();
+
+    // Clamping at both ends: behind the near plane and past the far plane.
+    EXPECT_EQ(cluster_z_slice(-5.0f, cp), 0u);
+    EXPECT_EQ(cluster_z_slice(0.0f, cp), 0u);
+    EXPECT_EQ(cluster_z_slice(1e6f, cp), CLUSTER_DIM_Z - 1);
+
+    uint32_t previous = 0;
+    for (uint32_t z = 0; z < CLUSTER_DIM_Z; ++z) {
+        const float d = std::sqrt(slice_depth(z, 0.1f, 100.0f) * slice_depth(z + 1, 0.1f, 100.0f));
+        const uint32_t got = cluster_z_slice(d, cp);
+        EXPECT_EQ(got, z);
+        EXPECT_GE(got, previous);
+        previous = got;
+    }
+}
+
+// ===========================================================================
+// Persistent light identity (contracts/light.hpp) and the prev->current remap
+// ===========================================================================
+
+namespace {
+
+PointLight make_point(glm::vec3 pos, glm::vec3 color = glm::vec3(1.0f), float intensity = 1.0f) {
+    PointLight p{};
+    p.position = pos;
+    p.radius = 3.0f;
+    p.color = color;
+    p.intensity = intensity;
+    return p;
+}
+
+SpotLight make_spot(glm::vec3 pos, glm::vec3 color = glm::vec3(1.0f), float intensity = 1.0f) {
+    SpotLight s{};
+    s.position = pos;
+    s.radius = 3.0f;
+    s.direction = glm::vec3(0.0f, -1.0f, 0.0f);
+    s.inner_cos = 0.9f;
+    s.outer_cos = 0.7f;
+    s.color = color;
+    s.intensity = intensity;
+    return s;
+}
+
+// One frame through the CPU pipeline; returns the resolved stable ids.
+std::vector<uint32_t> run_frame(CpuOnlyClusterGrid& cg, const std::vector<PointLight>& points,
+                                const std::vector<SpotLight>& spots = {}) {
+    cg.run(make_camera(1920, 1080), 1920, 1080, 0.1f, 100.0f, points, spots);
+    return cg.g.stable_ids();
+}
+
+} // namespace
+
+TEST(LightIdentity, SameSceneEmittedTwiceGetsIdenticalIds) {
+    const std::vector<PointLight> scene = {make_point({0.0f, 1.0f, -10.0f}), make_point({12.0f, 2.0f, -30.0f}),
+                                           make_point({-20.0f, 0.5f, -45.0f}, glm::vec3(1.0f, 0.4f, 0.1f), 8.0f)};
+    CpuOnlyClusterGrid cg;
+    const std::vector<uint32_t> first = run_frame(cg, scene);
+    const std::vector<uint32_t> second = run_frame(cg, scene);
+    ASSERT_EQ(first.size(), 3u);
+    EXPECT_EQ(first, second);
+    for (uint32_t id : first) {
+        EXPECT_NE(id, 0u) << "0 is the 'engine assigns' sentinel and must never survive assignment";
+    }
+
+    // ...and a second grid, from scratch, agrees: assignment is a pure
+    // function of the emission sequence, not of accumulated state.
+    CpuOnlyClusterGrid fresh;
+    EXPECT_EQ(run_frame(fresh, scene), first);
+}
+
+TEST(LightIdentity, ReorderedEmissionOfDistinctLightsMovesIdsWithTheLights) {
+    const PointLight a = make_point({0.0f, 1.0f, -10.0f});
+    const PointLight b = make_point({40.0f, 2.0f, -30.0f});
+    const PointLight c = make_point({-40.0f, 3.0f, -60.0f});
+
+    CpuOnlyClusterGrid cg;
+    const std::vector<uint32_t> forward = run_frame(cg, {a, b, c});
+    const std::vector<uint32_t> reversed = run_frame(cg, {c, b, a});
+    ASSERT_EQ(forward.size(), 3u);
+    ASSERT_EQ(reversed.size(), 3u);
+    // Identity follows the LIGHT, not the slot.
+    EXPECT_EQ(reversed[0], forward[2]);
+    EXPECT_EQ(reversed[1], forward[1]);
+    EXPECT_EQ(reversed[2], forward[0]);
+
+    // And the remap says exactly that: prev slot 0 (light a) is now slot 2.
+    const auto& remap = cg.g.index_remap();
+    ASSERT_EQ(remap.size(), MAX_LIGHTS);
+    EXPECT_EQ(remap[0], 2u);
+    EXPECT_EQ(remap[1], 1u);
+    EXPECT_EQ(remap[2], 0u);
+    for (uint32_t i = 3; i < MAX_LIGHTS; ++i) {
+        EXPECT_EQ(remap[i], LIGHT_REMAP_INVALID);
+    }
+}
+
+TEST(LightIdentity, SurvivorsKeepIdsAndTheRemapNamesTheVanished) {
+    const PointLight a = make_point({0.0f, 1.0f, -10.0f});
+    const PointLight b = make_point({40.0f, 2.0f, -30.0f});
+    const PointLight c = make_point({-40.0f, 3.0f, -60.0f});
+    const PointLight d = make_point({0.0f, 30.0f, -80.0f});
+
+    CpuOnlyClusterGrid cg;
+    const std::vector<uint32_t> before = run_frame(cg, {a, b, c});
+    // b is removed, d appears; a and c survive and shift down a slot.
+    const std::vector<uint32_t> after = run_frame(cg, {a, c, d});
+    ASSERT_EQ(after.size(), 3u);
+    EXPECT_EQ(after[0], before[0]); // a
+    EXPECT_EQ(after[1], before[2]); // c
+    EXPECT_NE(after[2], before[0]);
+    EXPECT_NE(after[2], before[1]);
+    EXPECT_NE(after[2], before[2]); // d is new
+
+    const auto& remap = cg.g.index_remap();
+    EXPECT_EQ(remap[0], 0u);                    // a: slot 0 -> slot 0
+    EXPECT_EQ(remap[1], LIGHT_REMAP_INVALID);   // b: gone
+    EXPECT_EQ(remap[2], 1u);                    // c: slot 2 -> slot 1
+    EXPECT_EQ(remap[3], LIGHT_REMAP_INVALID);   // nothing was there last frame
+}
+
+TEST(LightIdentity, FirstFrameAndResetHistoryRemapToNothing) {
+    CpuOnlyClusterGrid cg;
+    (void)run_frame(cg, {make_point({0.0f, 1.0f, -10.0f})});
+    // Nothing preceded frame 1, so no previous index maps anywhere.
+    for (uint32_t id : cg.g.index_remap()) {
+        EXPECT_EQ(id, LIGHT_REMAP_INVALID);
+    }
+
+    (void)run_frame(cg, {make_point({0.0f, 1.0f, -10.0f})});
+    EXPECT_EQ(cg.g.index_remap()[0], 0u) << "a static light must remap to itself";
+
+    // The renderer calls this on any frame it skips binning; the next build
+    // must then behave like a first frame rather than reach across the gap.
+    cg.g.reset_light_history();
+    for (uint32_t id : cg.g.index_remap()) {
+        EXPECT_EQ(id, LIGHT_REMAP_INVALID);
+    }
+    (void)run_frame(cg, {make_point({0.0f, 1.0f, -10.0f})});
+    for (uint32_t id : cg.g.index_remap()) {
+        EXPECT_EQ(id, LIGHT_REMAP_INVALID);
+    }
+}
+
+TEST(LightIdentity, MovementBelowTheQuantumKeepsTheIdAndATeleportDoesNot) {
+    // Base sits at a quantum CENTER (10 = 2 * 5) so the sub-quantum walk below
+    // cannot straddle a rounding boundary.
+    const glm::vec3 base(10.0f, 10.0f, -10.0f);
+    CpuOnlyClusterGrid cg;
+    const uint32_t id = run_frame(cg, {make_point(base)}).front();
+
+    // Jitter well inside the quantum, in every axis: same identity.
+    for (float d : {0.5f, -0.5f, 1.9f, -1.9f}) {
+        const std::vector<uint32_t> ids = run_frame(cg, {make_point(base + glm::vec3(d, -d, d))});
+        EXPECT_EQ(ids.front(), id) << "sub-quantum motion of " << d << " must not change identity";
+        EXPECT_EQ(cg.g.index_remap()[0], 0u);
+    }
+
+    // A teleport past the quantum is a different light as far as temporal
+    // history is concerned, and the remap says so: nothing carries over.
+    const std::vector<uint32_t> moved =
+        run_frame(cg, {make_point(base + glm::vec3(4.0f * LIGHT_ID_POSITION_QUANTUM, 0.0f, 0.0f))});
+    EXPECT_NE(moved.front(), id);
+    EXPECT_EQ(cg.g.index_remap()[0], LIGHT_REMAP_INVALID);
+}
+
+TEST(LightIdentity, IntensityFlickerBelowAnOctaveKeepsTheId) {
+    const glm::vec3 pos(10.0f, 10.0f, -10.0f);
+    CpuOnlyClusterGrid cg;
+    const uint32_t id = run_frame(cg, {make_point(pos, glm::vec3(1.0f), 4.0f)}).front();
+    // A torch flickering +-20% stays in its octave — the reason intensity is
+    // quantized in log2 rather than by an absolute step.
+    for (float k : {1.1f, 0.9f, 1.18f, 0.85f}) {
+        EXPECT_EQ(run_frame(cg, {make_point(pos, glm::vec3(1.0f), 4.0f * k)}).front(), id);
+    }
+    // Two octaves up is a different light.
+    EXPECT_NE(run_frame(cg, {make_point(pos, glm::vec3(1.0f), 16.0f)}).front(), id);
+}
+
+TEST(LightIdentity, IdenticalLightsGetDistinctDeterministicIds) {
+    // Four lanterns with byte-identical content: the hash collides four ways
+    // and the occurrence counter has to break it, the same way every run.
+    const PointLight lantern = make_point({10.0f, 10.0f, -10.0f});
+    const std::vector<PointLight> four(4, lantern);
+
+    CpuOnlyClusterGrid cg;
+    const std::vector<uint32_t> ids = run_frame(cg, four);
+    ASSERT_EQ(ids.size(), 4u);
+    std::set<uint32_t> unique(ids.begin(), ids.end());
+    EXPECT_EQ(unique.size(), 4u) << "identical lights must still get distinct identities";
+    EXPECT_EQ(unique.count(0u), 0u);
+
+    // Deterministic: same sequence, same ids, on a fresh grid.
+    CpuOnlyClusterGrid fresh;
+    EXPECT_EQ(run_frame(fresh, four), ids);
+    // And stable frame over frame, so their reservoirs survive.
+    EXPECT_EQ(run_frame(cg, four), ids);
+    for (uint32_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(cg.g.index_remap()[i], i);
+    }
+}
+
+TEST(LightIdentity, HostSuppliedIdsPassThroughUntouchedAndWinOverHashing) {
+    PointLight tagged = make_point({10.0f, 10.0f, -10.0f});
+    tagged.stable_id = 0xC0FFEEu;
+    PointLight untagged = make_point({10.0f, 10.0f, -10.0f}); // identical content
+
+    CpuOnlyClusterGrid cg;
+    const std::vector<uint32_t> ids = run_frame(cg, {tagged, untagged});
+    ASSERT_EQ(ids.size(), 2u);
+    EXPECT_EQ(ids[0], 0xC0FFEEu) << "a host-supplied id must survive verbatim";
+    EXPECT_NE(ids[1], 0xC0FFEEu);
+
+    // Order must not matter for the host's id: emit it second and it still
+    // wins, with the auto-assigned light forced to move.
+    const std::vector<uint32_t> swapped = run_frame(cg, {untagged, tagged});
+    EXPECT_EQ(swapped[1], 0xC0FFEEu);
+    EXPECT_NE(swapped[0], 0xC0FFEEu);
+
+    // A host id that teleports keeps its identity — that is the whole point of
+    // supplying one.
+    PointLight moved = make_point({80.0f, 4.0f, -70.0f});
+    moved.stable_id = 0xC0FFEEu;
+    const std::vector<uint32_t> after = run_frame(cg, {moved});
+    EXPECT_EQ(after.front(), 0xC0FFEEu);
+    EXPECT_EQ(cg.g.index_remap()[1], 0u) << "prev slot 1 held the host-tagged light; it is slot 0 now";
+}
+
+TEST(LightIdentity, PointsAndSpotsWithMatchingContentAreDifferentLights) {
+    const glm::vec3 pos(10.0f, 10.0f, -10.0f);
+    CpuOnlyClusterGrid cg;
+    cg.run(make_camera(1920, 1080), 1920, 1080, 0.1f, 100.0f, {make_point(pos)}, {make_spot(pos)});
+    const auto& ids = cg.g.stable_ids();
+    ASSERT_EQ(ids.size(), 2u);
+    EXPECT_NE(ids[0], ids[1]) << "light TYPE is part of the identity hash";
+}
+
+TEST(LightIdentity, ResolvedIdsAreWrittenBackIntoTheUploadedLightData) {
+    // The parallel GPU buffer is the fast path; the light records carry the
+    // same value so "who is this light" is answerable from the light data too.
+    CpuOnlyClusterGrid cg;
+    cg.run(make_camera(1920, 1080), 1920, 1080, 0.1f, 100.0f,
+           {make_point({10.0f, 10.0f, -10.0f}), make_point({40.0f, 2.0f, -30.0f})},
+           {make_spot({-20.0f, 5.0f, -25.0f})});
+    const auto& ids = cg.g.stable_ids();
+    ASSERT_EQ(ids.size(), 3u);
+    EXPECT_EQ(cg.g.point_lights()[0].stable_id, ids[0]);
+    EXPECT_EQ(cg.g.point_lights()[1].stable_id, ids[1]);
+    EXPECT_EQ(cg.g.spot_lights()[0].stable_id, ids[2]);
+}
+
+TEST(LightIdentity, RemapIsSizedToTheFrameCapAndStaysInBounds) {
+    std::vector<PointLight> many;
+    for (uint32_t i = 0; i < MAX_LIGHTS; ++i) {
+        many.push_back(make_point({static_cast<float>(i) * 7.0f, 1.0f, -20.0f}));
+    }
+    CpuOnlyClusterGrid cg;
+    const std::vector<uint32_t> ids = run_frame(cg, many);
+    EXPECT_EQ(ids.size(), MAX_LIGHTS);
+    EXPECT_EQ(std::set<uint32_t>(ids.begin(), ids.end()).size(), MAX_LIGHTS);
+
+    (void)run_frame(cg, many);
+    const auto& remap = cg.g.index_remap();
+    ASSERT_EQ(remap.size(), MAX_LIGHTS);
+    for (uint32_t i = 0; i < MAX_LIGHTS; ++i) {
+        ASSERT_NE(remap[i], LIGHT_REMAP_INVALID);
+        EXPECT_LT(remap[i], MAX_LIGHTS);
+        EXPECT_EQ(remap[i], i) << "an unchanged light list must remap to itself";
+    }
 }

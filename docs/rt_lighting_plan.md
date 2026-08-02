@@ -709,6 +709,60 @@ under add/remove churn; energy A/B vs. atlas scene (mean luma within band);
 penumbra widens with light radius (analytic disc occluder test scene);
 determinism.
 
+**Landed (R2a, 2026-08-02) — persistent identity + compute-side froxel
+access, with zero image change.** The foundation half of R2, and nothing but:
+every default is untouched, both smoke baselines are bit-identical
+(`--smoke 30` 86.5/44.9, `PLAYGROUND_RT=both` 83.9/47.9), and no shader in the
+frame path reads any of it.
+
+- **`stable_id` on `PointLightDesc`/`SpotLightDesc`** (`contracts/light.hpp`),
+  appended with a `0` default so every existing positional initializer keeps
+  compiling and meaning what it meant (pinned by a `TestFrame` test). `0` =
+  engine assigns; a host-supplied non-zero id passes through verbatim and
+  wins. Auto-assignment happens at the top of `ClusterGrid::build()` —
+  main-thread tier, serial, emission order — as an FNV-1a hash of
+  `{type, round(pos / 5.0), round(color / 0.25), round(log2(intensity))}`.
+  Intensity is quantized by RATIO because that is how a torch flickers; an
+  absolute step would have re-identified every torch in the village every
+  frame. In-frame collisions are broken by re-hashing with an occurrence
+  counter, so two identical lanterns get distinct, deterministic ids.
+- **The remap**, built in the same pass: `remap[prev_packed_index] =
+  current_packed_index`, `0xFFFFFFFF` where the light vanished. Two
+  `<= MAX_LIGHTS` passes, no hashing container, no pointer-order iteration.
+  History is renderer-side per §8 — `reset_light_history()` exists and
+  `SceneRenderer` calls it on frames it skips binning, so a lights → no
+  lights → lights sequence cannot remap across the gap.
+- **Where it rides to the GPU:** two parallel `uint[MAX_LIGHTS]` storage
+  buffers (stable ids in packed order; the remap), uploaded with the cluster
+  buffers in the same copy pass, ~1 KB each. `LightHeader` is exactly 8 bytes
+  on both sides with the stride hardcoded in the shader, so it had no room —
+  and packed-order arrays are what a reservoir wants anyway (one load, no
+  header hop). The ids ALSO land in the light records, in bytes that were
+  declared padding: no size, offset or shader load changed.
+- **`shaders/cluster_compute.hlsli`** — the compute-side froxel accessor R2b
+  dispatches against. The bindings differ (set 0 / set 2 vs. fragment's
+  set 2 / set 3, per SDL3 GPU's layout) and the arithmetic cannot: the froxel
+  index math moved to `cluster_index.hlsli` and the light-record decode to
+  `cluster_light_load.hlsli`, both included by the fragment path and the
+  compute path alike — the `shadow_common`/`gi_probe` move again.
+  `render/lighting/cluster_index.hpp` is the CPU mirror, and
+  `light_cluster.cpp`'s binner calls its `cluster_z_slice` directly rather
+  than keeping a private lambda that could drift.
+- **Tests** (+14): froxel-index parity across a full 3456-cluster sweep,
+  checked in both directions (the shared math returns the intended cluster,
+  AND the binner's independent AABB path binned a light there); Z-slice
+  monotonicity and clamping; id stability across identical frames and across
+  a fresh grid; reorder/add/remove with the remap naming exactly who moved and
+  who vanished; sub-quantum jitter and intensity flicker keeping the id while
+  a teleport does not; identical-light collision determinism; host ids winning
+  regardless of emission order; the remap at the frame cap. The old
+  hand-copied shader-index transliteration in `light_cluster.test.cpp` is
+  gone — the tests now call the shipped function.
+- **`cluster_compute_validate.comp`** exists only so the new include is a
+  compiled artifact rather than a text file. Nothing dispatches it; it is
+  registered in no pipeline; delete it when R2b's real pass includes the same
+  header.
+
 ### 5.4 R3 — Honest hit lighting (reflections meet GI)
 
 One shared include, `rt_hit_shade.hlsli`, used by probe rays and reflection

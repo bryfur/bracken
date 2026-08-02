@@ -151,3 +151,46 @@ TEST(TestFrame, LanesAreReachableForFannedOutEmission) {
         EXPECT_EQ(frame.draws()[i].model_handle, i + 1);
     }
 }
+
+// The R2a packet-API change, from a host's side of the fence: PointLightDesc
+// and SpotLightDesc grew a `stable_id`, and the field was APPENDED with a
+// default precisely so that every positional aggregate initializer a game
+// already wrote keeps compiling and keeps meaning what it meant. If this test
+// ever needs editing to compile, the change was not source-compatible.
+TEST(TestFrame, LightDescsStaySourceCompatibleAndDefaultToEngineAssignedIds) {
+    TestFrame frame;
+    auto& sink = frame.sink();
+
+    // Pre-R2a spellings, verbatim: positional, no stable_id in sight.
+    sink.add_point_light({{1.0f, 2.0f, 3.0f}, 50.0f, {1.0f, 0.5f, 0.25f}, 100.0f, true});
+    sink.add_spot_light({{4.0f, 5.0f, 6.0f},
+                         30.0f,
+                         {0.0f, -1.0f, 0.0f},
+                         bracken::core::Degrees{18.0f},
+                         bracken::core::Degrees{25.0f},
+                         {0.2f, 0.4f, 1.0f},
+                         80.0f,
+                         false});
+    // ...and the new spelling, for a host that owns its own identity space.
+    bracken::render::lighting::PointLightDesc tagged;
+    tagged.position = {7.0f, 8.0f, 9.0f};
+    tagged.radius = 10.0f;
+    tagged.intensity = 5.0f;
+    tagged.stable_id = 0xABCDEFu;
+    sink.add_point_light(tagged);
+
+    frame.seal();
+
+    ASSERT_EQ(frame.point_lights().size(), 2u);
+    ASSERT_EQ(frame.spot_lights().size(), 1u);
+    // 0 = "engine assigns"; the packet carries the host's answer unchanged and
+    // the renderer resolves it during binning, not here.
+    EXPECT_EQ(frame.point_lights()[0].stable_id, 0u);
+    EXPECT_EQ(frame.spot_lights()[0].stable_id, 0u);
+    EXPECT_EQ(frame.point_lights()[1].stable_id, 0xABCDEFu);
+    // The fields the old initializers named still land where they landed.
+    EXPECT_EQ(frame.point_lights()[0].radius, 50.0f);
+    EXPECT_TRUE(frame.point_lights()[0].casts_shadows);
+    EXPECT_EQ(frame.spot_lights()[0].radius, 30.0f);
+    EXPECT_FALSE(frame.spot_lights()[0].casts_shadows);
+}

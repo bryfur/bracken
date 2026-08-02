@@ -2716,7 +2716,7 @@ Emission is multi-lane: `Lane& lane(uint32_t i)` returns one writer's private st
 - `draw_model(handle, transform, tint = {1,1,1,1}, DrawFlags flags = DrawFlags::None, motion_id = 0)`
 - `draw_skinned(handle, transform, BonePaletteId palette, tint = {1,1,1,1}, DrawFlags flags = DrawFlags::None, motion_id = 0)` — an invalid id drops the draw with a warning.
 - `[[nodiscard]] alloc_bone_palette(joint_count /* 1..=animation::MAX_BONES */)` → `BonePaletteAllocation { std::span<glm::mat4> matrices; BonePaletteId id; bool valid(); }` — 16-byte-aligned **uninitialized** packet memory; the host writes every matrix before seal. Budget `FramePacket::MAX_BONE_PALETTES = 1024` per frame; over-budget allocations log an error and return an invalid allocation (empty span) — the visible build-time failure replacing the old render-time silent drop. One palette may be shared by many draws, across lanes (allocation must happen-before use) — reusing the id replaces the renderer's old pointer-dedupe of shared palettes.
-- `add_point_light(const PointLightDesc&)` / `add_spot_light(const SpotLightDesc&)` — host descriptors, not the GPU PODs (`src/bracken/contracts/light.hpp`). `PointLightDesc` = position/radius/color (linear vec3)/intensity + `casts_shadows` opt-in; `SpotLightDesc` adds direction + `core::Degrees inner_angle`/`outer_angle` (half-angles from the axis). The builder converts to `PointLight`/`SpotLight`, taking `std::cos(angle.radians())` for the cone and leaving `_pad0`/`_pad1`/`shadow_slot` at their engine-owned defaults — a host never names them.
+- `add_point_light(const PointLightDesc&)` / `add_spot_light(const SpotLightDesc&)` — host descriptors, not the GPU PODs (`src/bracken/contracts/light.hpp`). `PointLightDesc` = position/radius/color (linear vec3)/intensity + `casts_shadows` opt-in + `stable_id` (persistent identity, `0` = engine assigns — the default); `SpotLightDesc` adds direction + `core::Degrees inner_angle`/`outer_angle` (half-angles from the axis). The builder converts to `PointLight`/`SpotLight`, taking `std::cos(angle.radians())` for the cone, copying `stable_id` across, and leaving `_pad0`/`_pad1`/`shadow_slot` at their engine-owned defaults — a host never names those.
 - `add_billboard_3d(wx, wy, wz, width, fill_ratio, fill_color, bg_color, frame_color)`
 - `add_debug_line(start, end, color)`; `add_debug_sphere(center, radius, color, segments = 16)` (3 × segments circle-outline lines in the XZ/XY/YZ planes); `add_debug_box(min, max, color)` (12 AABB edges).
 - `spawn_effect(const EffectDefinition*, position, direction = {1,0,0})` — consumed exactly once from the sealed packet.
@@ -4190,14 +4190,19 @@ Std140-compatible PODs, sizes static_asserted in
 `src/bracken/render/lighting/light_cluster.cpp`:
 
 - `PointLight` — `{vec3 position, float radius, vec3 color, float
-  intensity, bool casts_shadows, int32 shadow_slot (+pad)}` = **48 bytes**
-  (`shadow_slot` at byte 36 — read by the shader; engine-assigned each
-  frame, -1 = unshadowed; `casts_shadows` is the host opt-in and is never
-  read on the GPU).
+  intensity, bool casts_shadows, int32 shadow_slot, uint32 stable_id (+pad)}`
+  = **48 bytes** (`shadow_slot` at byte 36 — read by the shader;
+  engine-assigned each frame, -1 = unshadowed; `casts_shadows` is the host
+  opt-in and is never read on the GPU).
 - `SpotLight` — `{vec3 position, float radius, vec3 direction, float
   inner_cos, vec3 color, float outer_cos, float intensity, bool
-  casts_shadows, int32 shadow_slot (+pad)}` = **64 bytes** (`shadow_slot`
-  at byte 56).
+  casts_shadows, int32 shadow_slot, uint32 stable_id}` = **64 bytes**
+  (`shadow_slot` at byte 56).
+- **Sizes are unchanged by R2a.** `stable_id` (byte 40 of `PointLight`,
+  byte 60 of `SpotLight`) took over bytes that were declared padding, so
+  every existing offset, `static_assert` and shader load is untouched; the
+  two offsets are themselves `static_assert`ed now. See
+  `contracts/light.hpp` for the identity contract.
 - `LightHeader` — `{uint32 type, uint32 payload_index}` = **8 bytes**;
   `payload_index` indexes the per-type payload array.
 - `ClusterParams` (`light_cluster.hpp`, `alignas(16)`) —
@@ -4224,6 +4229,13 @@ GPU buffers (all `gpu::GPUBuffer::Type::Storage`, dynamic):
 3. **Light indices buffer** — capacity `CLUSTER_COUNT ×
    MAX_LIGHTS_PER_CLUSTER` u32 = **1 769 472 bytes**; only the used prefix is
    uploaded.
+4. **Light stable-id buffer** — `uint32 × max_lights` = **1 024 bytes**; the
+   persistent identity of each light in PACKED (header) order.
+5. **Light index remap buffer** — `uint32 × max_lights` = **1 024 bytes**;
+   previous frame's packed index → this frame's packed index, `0xFFFFFFFF`
+   where the light no longer exists. Both are uploaded in the same copy pass
+   as the three above; no shader reads them yet (R2b's froxel reservoirs are
+   the consumer — `docs/rt_lighting_plan.md` §5.3).
 
 #### Public API (`render::lighting::ClusterGrid`)
 
@@ -4241,9 +4253,12 @@ void add_spot_light(const SpotLight& l);
 void build(core::jobs::JobSystem& js);
 void build();                                  // convenience: JobSystem::instance()
 void upload(SDL_GPUCopyPass* copy_pass);       // caller-owned pass
-SDL_GPUBuffer* light_data_buffer() const;      // + cluster_offsets_buffer(), light_indices_buffer()
+void reset_light_history();                    // forget last frame's identities
+SDL_GPUBuffer* light_data_buffer() const;      // + cluster_offsets_buffer(), light_indices_buffer(),
+                                               //   light_stable_ids_buffer(), light_remap_buffer()
 const ClusterParams& params() const;
-// test/debug: point_lights(), spot_lights(), light_indices(), cluster_offsets(), total_lights()
+// test/debug: point_lights(), spot_lights(), light_indices(), cluster_offsets(), total_lights(),
+//             stable_ids(), index_remap()
 ```
 
 Staging lives in member scratch (`light_staging_`); upload records into the
@@ -4266,7 +4281,24 @@ caller's copy pass (the engine batches it into the frame's consolidated
   `parallel_for(js, …)` fan-out (per-slice z depths precomputed serially;
   disjoint per-cluster writes, no merge).
 - `add_*_light` drops silently once `points + spots >= max_lights_`.
-- `build()` transforms each light center to view space, then does
+- `build()` first resolves **persistent light identity**
+  (`assign_stable_ids_and_remap`, serial, emission order): host-supplied
+  non-zero `stable_id`s are claimed verbatim in one pass, then every light
+  that asked the engine (`stable_id == 0`) gets a quantized content hash —
+  FNV-1a over `{type, round(position / 5.0), round(color / 0.25),
+  round(log2(intensity))}` — with in-frame collisions broken by re-hashing
+  with an occurrence counter until the id is unclaimed. Ids are never 0. The
+  resolved values are written back into the uploaded light records AND into
+  the packed stable-id buffer. The **remap** is then a diff of last frame's
+  packed id list against this one: `remap[prev_index] = current_index`, or
+  `LIGHT_REMAP_INVALID` (`0xFFFFFFFF`) where the light is gone. Two
+  `<= MAX_LIGHTS` passes; no hashing container and no pointer-order
+  iteration anywhere, so the result is bit-identical run to run. Identity
+  history is renderer-side, main-thread tier — it never rides the packet.
+  `reset_light_history()` clears it, and `SceneRenderer` calls it on frames
+  it skips binning entirely (zero dynamic lights) so the next build cannot
+  remap across the gap. Full contract: `contracts/light.hpp`.
+- `build()` then transforms each light center to view space, and does
   **per-light cluster-range insertion**: a conservative cluster-index box
   (Z slices from the inverse exponential mapping; X/Y tiles from the NDC
   bounds of the sphere's view-space AABB corners projected through

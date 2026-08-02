@@ -115,61 +115,12 @@ float localLightShadow(int shadow_slot, bool is_point, float3 light_pos, float r
 }
 
 // ---------------------------------------------------------------------------
-// Light data loads
+// Light data loads — the decode is cluster_light_load.hlsli, shared verbatim
+// with the compute path. It reads `lightDataBuf` and `clusterParams` by name,
+// both declared above, which is why the include sits HERE and not at the top.
 // ---------------------------------------------------------------------------
 
-// Light-data buffer section offsets. ClusterGrid::upload() (light_cluster.cpp)
-// packs the buffer as:
-//   [LightDataHeader 16B][LightHeader * cap][PointLight * cap][SpotLight * cap]
-// where cap = clusterParams.maxPerCluster.y — the CPU-side buffer capacity
-// (ClusterGrid max_lights_) — so the offsets follow the CPU layout instead of
-// hardcoding a light count. Strides: LightHeader 8B, PointLight 48B, SpotLight 64B.
-uint pointLightsBase() { return 16u + clusterParams.maxPerCluster.y * 8u; }
-uint spotLightsBase()  { return 16u + clusterParams.maxPerCluster.y * (8u + 48u); }
-
-LightHeader loadLightHeader(uint i) {
-    uint base = 16u + i * 8u; // headers start right after the 16B LightDataHeader
-    uint2 raw = lightDataBuf.Load2(base);
-    LightHeader h;
-    h.type = raw.x;
-    h.payload_index = raw.y;
-    return h;
-}
-
-PointLightGPU loadPointLight(uint i) {
-    uint base = pointLightsBase() + i * 48;
-    uint4 a = lightDataBuf.Load4(base);
-    uint4 b = lightDataBuf.Load4(base + 16);
-    uint4 c = lightDataBuf.Load4(base + 32);
-    PointLightGPU p;
-    p.position    = asfloat(a.xyz);
-    p.radius      = asfloat(a.w);
-    p.color       = asfloat(b.xyz);
-    p.intensity   = asfloat(b.w);
-    // c.x is the CPU-side casts_shadows byte + padding (never read here);
-    // shadow_slot is engine-assigned each frame (-1 = unshadowed).
-    p.shadow_slot = asint(c.y);
-    return p;
-}
-
-SpotLightGPU loadSpotLight(uint i) {
-    uint base = spotLightsBase() + i * 64;
-    uint4 a = lightDataBuf.Load4(base);
-    uint4 b = lightDataBuf.Load4(base + 16);
-    uint4 c = lightDataBuf.Load4(base + 32);
-    uint4 d = lightDataBuf.Load4(base + 48);
-    SpotLightGPU s;
-    s.position    = asfloat(a.xyz);
-    s.radius      = asfloat(a.w);
-    s.direction   = asfloat(b.xyz);
-    s.inner_cos   = asfloat(b.w);
-    s.color       = asfloat(c.xyz);
-    s.outer_cos   = asfloat(c.w);
-    s.intensity   = asfloat(d.x);
-    // d.y is the CPU-side casts_shadows byte + padding (never read here).
-    s.shadow_slot = asint(d.z);
-    return s;
-}
+#include "cluster_light_load.hlsli"
 
 float3 accumulateClusterLights(float3 P, float3 N, float3 V,
                                 float3 baseColor, float metallic, float roughness, float ao,

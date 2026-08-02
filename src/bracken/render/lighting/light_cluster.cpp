@@ -1,5 +1,7 @@
 #include "bracken/render/lighting/light_cluster.hpp"
 
+#include "bracken/core/assert.hpp"
+#include "bracken/core/hash.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
 #include "bracken/core/logger.hpp"
@@ -27,6 +29,11 @@ static_assert(offsetof(PointLight, shadow_slot) == 36, "PointLight::shadow_slot 
 static_assert(sizeof(SpotLight) == 64, "SpotLight must be 64 bytes (std140)");
 static_assert(offsetof(SpotLight, shadow_slot) == 56, "SpotLight::shadow_slot read at byte 56 by the shader");
 static_assert(sizeof(LightHeader) == 8, "LightHeader must be 8 bytes");
+// stable_id took over declared padding (contracts/light.hpp). These pin that
+// it stayed padding-shaped: the sizes above are unchanged, and the bytes it
+// occupies are past every offset the shader loads.
+static_assert(offsetof(PointLight, stable_id) == 40, "PointLight::stable_id must sit in the old _pad1 bytes");
+static_assert(offsetof(SpotLight, stable_id) == 60, "SpotLight::stable_id must sit in the old _pad1 bytes");
 
 // Single GPU layout combining headers + point payloads + spot payloads.
 // Layout: [u32 headerCount][u32 pointCount][u32 spotCount][u32 _pad]
@@ -51,6 +58,62 @@ constexpr size_t cluster_offsets_buffer_size() {
 
 constexpr size_t light_indices_buffer_size() {
     return static_cast<size_t>(CLUSTER_COUNT) * MAX_LIGHTS_PER_CLUSTER * sizeof(uint32_t);
+}
+
+// The two identity side-channel buffers are both uint[max_lights] (1 KB each
+// at MAX_LIGHTS = 256).
+constexpr size_t light_id_buffer_size(uint32_t max_lights) {
+    return static_cast<size_t>(max_lights) * sizeof(uint32_t);
+}
+
+// ---------------------------------------------------------------------------
+// Persistent light identity (contracts/light.hpp)
+// ---------------------------------------------------------------------------
+
+// Round-to-nearest quantization. Round-to-nearest, not floor: floor puts a
+// boundary at every multiple of the quantum in each axis independently, which
+// triples the odds a jittering light straddles one.
+int32_t quantize(float v, float q) {
+    return static_cast<int32_t>(std::lround(v / q));
+}
+
+// Intensity is snapped in log2 because a flickering torch animates it by a
+// RATIO. An absolute quantum here would re-id every torch in the village
+// every frame, which is precisely the failure this hash exists to avoid.
+int32_t quantize_intensity(float intensity) {
+    if (!(intensity > 0.0f)) {
+        return std::numeric_limits<int32_t>::min(); // one bucket for "off"
+    }
+    return static_cast<int32_t>(std::lround(std::log2(intensity) / LIGHT_ID_INTENSITY_OCTAVE));
+}
+
+uint32_t hash_step(uint32_t h, uint32_t word) {
+    // FNV-1a over the four bytes of `word` — core::fnv1a's mixing, applied to
+    // an integer stream instead of a string.
+    for (int b = 0; b < 4; ++b) {
+        h ^= (word >> (b * 8)) & 0xFFu;
+        h *= core::k_fnv1a_prime_32;
+    }
+    return h;
+}
+
+uint32_t hash_step(uint32_t h, int32_t word) {
+    return hash_step(h, static_cast<uint32_t>(word));
+}
+
+// The quantized content hash: type + snapped position + snapped color +
+// snapped intensity. Never returns 0 (0 is the "engine assigns" sentinel).
+uint32_t content_hash(uint32_t type, const glm::vec3& position, const glm::vec3& color, float intensity) {
+    uint32_t h = core::k_fnv1a_offset_basis_32;
+    h = hash_step(h, type);
+    h = hash_step(h, quantize(position.x, LIGHT_ID_POSITION_QUANTUM));
+    h = hash_step(h, quantize(position.y, LIGHT_ID_POSITION_QUANTUM));
+    h = hash_step(h, quantize(position.z, LIGHT_ID_POSITION_QUANTUM));
+    h = hash_step(h, quantize(color.r, LIGHT_ID_COLOR_QUANTUM));
+    h = hash_step(h, quantize(color.g, LIGHT_ID_COLOR_QUANTUM));
+    h = hash_step(h, quantize(color.b, LIGHT_ID_COLOR_QUANTUM));
+    h = hash_step(h, quantize_intensity(intensity));
+    return h == 0u ? 1u : h;
 }
 
 // View-space frustum corner for cluster (cx,cy,cz) at the given Z slice.
@@ -119,7 +182,12 @@ bool ClusterGrid::init(gpu::GPUDevice& device, uint32_t max_lights) {
         gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Storage, cluster_offsets_buffer_size());
     light_indices_buf_ =
         gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Storage, light_indices_buffer_size());
-    if (!light_data_buf_ || !cluster_offsets_buf_ || !light_indices_buf_) {
+    light_stable_ids_buf_ =
+        gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Storage, light_id_buffer_size(max_lights_));
+    light_remap_buf_ =
+        gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Storage, light_id_buffer_size(max_lights_));
+    if (!light_data_buf_ || !cluster_offsets_buf_ || !light_indices_buf_ || !light_stable_ids_buf_ ||
+        !light_remap_buf_) {
         BRACKEN_LOG_ERROR(LOG_TAG, "ClusterGrid::init: failed to allocate storage buffers");
         shutdown();
         return false;
@@ -131,6 +199,11 @@ void ClusterGrid::shutdown() {
     light_data_buf_.reset();
     cluster_offsets_buf_.reset();
     light_indices_buf_.reset();
+    light_stable_ids_buf_.reset();
+    light_remap_buf_.reset();
+    stable_ids_.clear();
+    prev_stable_ids_.clear();
+    remap_.clear();
     points_.clear();
     spots_.clear();
     headers_.clear();
@@ -245,6 +318,104 @@ bool ClusterGrid::add_spot_light(const SpotLight& l) {
     return true;
 }
 
+void ClusterGrid::reset_light_history() {
+    prev_stable_ids_.clear();
+    if (remap_.size() != max_lights_) {
+        remap_.assign(max_lights_, LIGHT_REMAP_INVALID);
+    } else {
+        std::fill(remap_.begin(), remap_.end(), LIGHT_REMAP_INVALID);
+    }
+}
+
+void ClusterGrid::assign_stable_ids_and_remap() {
+    BRACKEN_PROFILE_ZONE_COLOR("ClusterGrid::assign_stable_ids", 0x27AE60);
+    const std::size_t n = headers_.size();
+    BRACKEN_ASSERT(n <= max_lights_, "packed light count cannot exceed the frame cap");
+    stable_ids_.assign(n, 0u);
+
+    // Pass 1: host-supplied ids, verbatim. They go FIRST so an auto-assigned
+    // hash can never squat on one — the contract says the host wins, and that
+    // has to hold regardless of emission order.
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& h = headers_[i];
+        stable_ids_[i] = (h.type == LIGHT_TYPE_POINT) ? points_[h.payload_index].stable_id
+                                                      : spots_[h.payload_index].stable_id;
+    }
+
+    // Is `id` already claimed by a light other than `self`? A linear scan over
+    // at most MAX_LIGHTS entries, run at most a handful of times — the whole
+    // pass is <= 256 * 256 integer compares in the pathological case where
+    // every light in the frame is identical, and typically ~n.
+    const auto claimed_by_other = [&](uint32_t id, std::size_t self) {
+        for (std::size_t j = 0; j < n; ++j) {
+            if (j != self && stable_ids_[j] == id) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Pass 2: hash the lights that asked the engine to (stable_id == 0), in
+    // EMISSION order, disambiguating collisions with an occurrence counter.
+    // Two identical lanterns therefore get distinct ids; which lantern gets
+    // which follows emission order, and the contract documents that.
+    for (std::size_t i = 0; i < n; ++i) {
+        if (stable_ids_[i] != 0u) {
+            continue;
+        }
+        const auto& h = headers_[i];
+        uint32_t base = 0;
+        if (h.type == LIGHT_TYPE_POINT) {
+            const auto& p = points_[h.payload_index];
+            base = content_hash(LIGHT_TYPE_POINT, p.position, p.color, p.intensity);
+        } else {
+            const auto& s = spots_[h.payload_index];
+            base = content_hash(LIGHT_TYPE_SPOT, s.position, s.color, s.intensity);
+        }
+        uint32_t id = base;
+        for (uint32_t occurrence = 1; claimed_by_other(id, i); ++occurrence) {
+            id = hash_step(base, occurrence);
+            if (id == 0u) {
+                id = 1u;
+            }
+        }
+        stable_ids_[i] = id;
+    }
+
+    // Write the resolved ids back into the light copies the frame uploads, so
+    // "what identity did this light have" is answerable from the light data
+    // alone (the parallel GPU buffer below is the fast path, not the record).
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& h = headers_[i];
+        if (h.type == LIGHT_TYPE_POINT) {
+            points_[h.payload_index].stable_id = stable_ids_[i];
+        } else {
+            spots_[h.payload_index].stable_id = stable_ids_[i];
+        }
+    }
+
+    // The remap: previous frame's packed index -> this frame's packed index,
+    // LIGHT_REMAP_INVALID where the light is gone. Lights that APPEARED this
+    // frame simply have no prev entry pointing at them — a consumer detects
+    // them by finding no reservoir to reproject, which is the correct answer.
+    if (remap_.size() != max_lights_) {
+        remap_.assign(max_lights_, LIGHT_REMAP_INVALID);
+    } else {
+        std::fill(remap_.begin(), remap_.end(), LIGHT_REMAP_INVALID);
+    }
+    BRACKEN_ASSERT(prev_stable_ids_.size() <= max_lights_, "prev light count cannot exceed the frame cap");
+    for (std::size_t p = 0; p < prev_stable_ids_.size(); ++p) {
+        const uint32_t prev_id = prev_stable_ids_[p];
+        for (std::size_t c = 0; c < n; ++c) {
+            if (stable_ids_[c] == prev_id) {
+                remap_[p] = static_cast<uint32_t>(c);
+                break;
+            }
+        }
+    }
+    prev_stable_ids_.assign(stable_ids_.begin(), stable_ids_.end());
+}
+
 void ClusterGrid::compute_cluster_bounds(core::jobs::JobSystem& js) {
     BRACKEN_PROFILE_ZONE_COLOR("ClusterGrid::compute_cluster_bounds", 0x27AE60);
     const float near_z = -params_.zPlanes.x;
@@ -319,6 +490,10 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
     BRACKEN_PROFILE_ZONE_COLOR("ClusterGrid::build", 0x27AE60);
     const glm::mat4& view = params_.view;
 
+    // Identity first: it must run even on a frame with zero lights, or the
+    // remap would still describe the frame before that one.
+    assign_stable_ids_and_remap();
+
     const std::size_t light_count = headers_.size();
     if (light_count == 0) {
         // No dynamic lights: bins/indices are already empty from begin_frame().
@@ -359,11 +534,10 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
     // math); insertion then chunks the CLUSTER range — see bin_chunk.
     const float near_z = params_.zPlanes.x;
     const float far_z = params_.zPlanes.y;
-    const float dim_z = static_cast<float>(CLUSTER_DIM_Z);
-    auto z_slice_of = [&](float depth) {
-        float t = std::log(std::max(depth, near_z) / near_z) * params_.zPlanes.w;
-        return static_cast<uint32_t>(std::clamp(std::floor(t * dim_z), 0.0f, dim_z - 1.0f));
-    };
+    // The shared froxel Z math (cluster_index.hpp) — the same function the
+    // shaders' cluster_index.hlsli mirrors. Binning and lookup drifting apart
+    // is exactly the bug that header exists to make impossible.
+    auto z_slice_of = [&](float depth) { return cluster_z_slice(depth, params_); };
     // NDC -> tile index, matching unproject_corner(): index 0 starts at NDC -1
     // (left / bottom of screen).
     auto tile_of = [](float ndc, uint32_t dim) {
@@ -586,6 +760,17 @@ void ClusterGrid::upload(SDL_GPUCopyPass* copy_pass) {
     if (idx_bytes > 0) {
         light_indices_buf_->update(copy_pass, light_indices_.data(), idx_bytes);
     }
+
+    // The identity side-channel. Both are <= 1 KB and both change every frame
+    // a light moves in or out, so there is no dirty flag worth the branch —
+    // the whole point of putting them in this copy pass is that they cost
+    // nothing next to the light data above.
+    if (light_stable_ids_buf_ && !stable_ids_.empty()) {
+        light_stable_ids_buf_->update(copy_pass, stable_ids_.data(), stable_ids_.size() * sizeof(uint32_t));
+    }
+    if (light_remap_buf_ && remap_.size() == max_lights_) {
+        light_remap_buf_->update(copy_pass, remap_.data(), remap_.size() * sizeof(uint32_t));
+    }
     // Pass ownership stays with the caller — do not end it here.
 }
 
@@ -597,6 +782,12 @@ SDL_GPUBuffer* ClusterGrid::cluster_offsets_buffer() const {
 }
 SDL_GPUBuffer* ClusterGrid::light_indices_buffer() const {
     return light_indices_buf_ ? light_indices_buf_->handle() : nullptr;
+}
+SDL_GPUBuffer* ClusterGrid::light_stable_ids_buffer() const {
+    return light_stable_ids_buf_ ? light_stable_ids_buf_->handle() : nullptr;
+}
+SDL_GPUBuffer* ClusterGrid::light_remap_buffer() const {
+    return light_remap_buf_ ? light_remap_buf_->handle() : nullptr;
 }
 
 } // namespace bracken::render::lighting

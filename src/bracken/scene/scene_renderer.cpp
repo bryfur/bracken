@@ -855,6 +855,10 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // No dynamic lights: publish zeroed params so the shaders see
             // gridDim.w == 0 instead of last frame's stale light count.
             frame_cluster_params_ = {};
+            // Binning is skipped entirely on this path, so the grid's light
+            // identity history would otherwise survive the gap and let the
+            // next build remap against a frame that is no longer "previous".
+            cluster_grid_.reset_light_history();
         }
 
         // ===== One copy pass for every renderer-owned per-frame upload =====

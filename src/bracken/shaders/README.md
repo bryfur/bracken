@@ -329,10 +329,30 @@ skybox and sky-capture passes; includes `fog.hlsli` for the shared
 linear→sRGB transfer, interleaved gradient noise, the ACES tonemap curves —
 Narkowicz + Hill fit, consumed by `composite.frag` — and the shared
 `viewPosFromDepth`/`worldPosFromDepth` depth-reconstruction helpers used by
-`gtao`/`volumetric_fog`), `cluster_lighting.hlsli` + `clusters.hlsli`
-(cluster grid sampling + the local point/spot shadow bindings and sampling —
-define `CLUSTER_SSBO_BINDING_BASE` to the including shader's fragment sampler
-count first), `shadow_common.hlsli` (cascade selection, PCF/PCSS),
+`gtao`/`volumetric_fog`), `cluster_index.hlsli` (the froxel
+index math — grid constants, `ClusterParams`, the light records,
+`clusterZSlice`/`clusterIndexFromScreen`, `pointFalloff`/`spotConeFactor`;
+binding-free AND pbr-free by construction, so the fragment and compute paths
+share one copy of the arithmetic, and its CPU mirror
+`render/lighting/cluster_index.hpp` is what the binner itself calls),
+`cluster_light_load.hlsli` (the packed light-data decode — NAMES `lightDataBuf`
+and `clusterParams`, so the including file declares them first),
+`cluster_lighting.hlsli` + `clusters.hlsli`
+(the FRAGMENT path: cluster grid sampling, the PBR accumulator, and the local
+point/spot shadow bindings and sampling — define `CLUSTER_SSBO_BINDING_BASE`
+to the including shader's fragment sampler count first),
+`cluster_compute.hlsli` (the COMPUTE path to the same froxel grid: SDL3 GPU
+puts compute storage buffers on set 0 and compute uniforms on set 2, so the
+bindings must differ from the fragment path — but the two includes above mean
+the index math and record decode cannot. Declares five consecutive set-0
+storage buffers from `CLUSTER_COMPUTE_SSBO_BINDING_BASE` (light data, cluster
+offsets, light indices, light stable ids, prev→current index remap) plus
+`ClusterParams` at `CLUSTER_COMPUTE_PARAMS_BINDING` on set 2, and exposes
+`clusterFroxelIndex`/`clusterFroxelLightCount`/`clusterFroxelLight` plus the
+identity helpers `clusterLightStableId`/`clusterRemapPrevLight`. Its only
+current consumer is `cluster_compute_validate.comp` — a shader nothing
+dispatches, whose entire job is to make the include a compiled build artifact
+until R2b's real pass arrives), `shadow_common.hlsli` (cascade selection, PCF/PCSS),
 `fog.hlsli` (distance-fog factors + `hazeSunColor`, the sun-scatter /
 day-dimmed haze color shared by surface fog AND the sky's horizon haze —
 they must stay one function so fog melts into the sky at the horizon),

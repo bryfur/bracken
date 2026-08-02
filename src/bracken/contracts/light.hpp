@@ -49,6 +49,10 @@ struct PointLightDesc {
     /// Opt in to the per-frame local-shadow budget. The engine picks the
     /// winners and writes the atlas slot; a host never sees one.
     bool casts_shadows = false;
+    /// PERSISTENT IDENTITY across frames. 0 = "engine assigns" (the default,
+    /// and what every existing call site gets). See the identity contract
+    /// below the GPU structs.
+    uint32_t stable_id = 0;
 };
 
 struct SpotLightDesc {
@@ -63,6 +67,8 @@ struct SpotLightDesc {
     glm::vec3 color{1.0f};
     float intensity = 0.0f;
     bool casts_shadows = false;
+    /// PERSISTENT IDENTITY across frames. 0 = "engine assigns". See below.
+    uint32_t stable_id = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -89,7 +95,12 @@ struct PointLight {
     // Engine-written before upload: base atlas tile of the light's 6 cube
     // faces (tiles [slot, slot+6)), -1 = unshadowed.
     int32_t shadow_slot = -1;
-    float _pad1[2] = {0.0f, 0.0f};
+    // Persistent identity, carried over from PointLightDesc::stable_id.
+    // 0 on arrival = "engine assigns"; the engine resolves it during binning
+    // and it is non-zero from then on. Occupies what used to be declared
+    // padding — sizeof/offsets are unchanged and no shader reads these bytes.
+    uint32_t stable_id = 0;
+    float _pad1 = 0.0f;
 };
 
 struct SpotLight {
@@ -105,8 +116,61 @@ struct SpotLight {
     uint8_t _pad0[3] = {0, 0, 0};
     // Engine-written before upload: the light's atlas tile, -1 = unshadowed.
     int32_t shadow_slot = -1;
-    float _pad1 = 0.0f;
+    // Persistent identity — see PointLight::stable_id. Occupies what used to
+    // be declared padding; sizeof/offsets unchanged.
+    uint32_t stable_id = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Persistent light identity (`stable_id`)
+//
+// The frame packet rebuilds its light arrays every frame, so a light's array
+// index is NOT stable frame-to-frame: index 3 can be a different lantern
+// tomorrow. Anything that reuses per-light state across frames — R2's
+// froxel reservoirs above all — needs identity instead of position-in-array.
+//
+// Contract:
+//
+//   * A host may set `stable_id` to any non-zero value it likes. Non-zero IDs
+//     pass through the engine UNTOUCHED and win over hashing. A host that
+//     already has entity ids should use them; that is the exact case this
+//     field exists for.
+//   * `stable_id == 0` (the default, and what every pre-existing call site
+//     gets) means "engine assigns". The engine derives one during binning
+//     from a QUANTIZED CONTENT HASH of the light — type, position snapped to
+//     `LIGHT_ID_POSITION_QUANTUM` world units, color snapped to
+//     `LIGHT_ID_COLOR_QUANTUM`, intensity snapped to the nearest octave — so:
+//       - a static torch keeps its id for as long as it exists;
+//       - a light jittering/flickering below the quanta keeps its id, EXCEPT
+//         when the jitter happens to straddle a quantum boundary (rounding is
+//         to nearest, so the boundary is a real, if rare, edge — one frame of
+//         reset history there, no worse than the frame a light appears);
+//       - a light that TELEPORTS further than the quantum gets a NEW id, and
+//         that is correct: temporal history for the old position would be
+//         wrong, so it resets.
+//   * Two lights whose quantized content collides inside one frame are
+//     disambiguated deterministically, in EMISSION order, by re-hashing with
+//     an occurrence counter. Two identical lanterns therefore get distinct
+//     ids. Their two identities swap only if the host reorders the emission
+//     of the identical lights — harmless by construction: the lights are
+//     identical, so any state reused across the swap is the state that light
+//     would have had anyway.
+//   * Auto-assigned ids are never 0, and are bit-identical run to run for the
+//     same emission sequence (no pointer-order iteration anywhere in the
+//     assignment).
+//
+// The renderer keeps the prev-frame-index -> current-frame-index remap that
+// consumers actually read (render/lighting/light_cluster.hpp). Identity
+// history is renderer-side, main-thread tier: it never rides the packet.
+// ---------------------------------------------------------------------------
+
+/// Quanta for the auto-assigned identity hash. Position is world units;
+/// color is per linear-RGB channel; intensity is snapped in log2 (octaves),
+/// because a flickering torch animates intensity by a *ratio*, and an
+/// absolute quantum there would re-id it every frame.
+inline constexpr float LIGHT_ID_POSITION_QUANTUM = 5.0f;
+inline constexpr float LIGHT_ID_COLOR_QUANTUM = 0.25f;
+inline constexpr float LIGHT_ID_INTENSITY_OCTAVE = 1.0f;
 
 // 0 = point, 1 = spot. payload_index is the index into the corresponding
 // per-type array uploaded to the GPU.
