@@ -4,6 +4,7 @@
 #include "bracken/contracts/environment.hpp"
 #include "bracken/contracts/light.hpp"
 #include "bracken/contracts/model_handle.hpp"
+#include "bracken/contracts/shadow_capsule.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/core/color.hpp"
 #include "bracken/memory/arena.hpp"
@@ -329,6 +330,23 @@ public:
      *  silent drop (docs/multithreading_plan.md §4.2). */
     static constexpr uint32_t MAX_BONE_PALETTES = 1024;
 
+    /**
+     * Per-frame analytic shadow-occluder budget (docs/rt_lighting_plan.md
+     * §5.8). Accounted at BUILD time in add_shadow_capsules, like the palette
+     * budget above and for the same reason — over-budget capsules are refused
+     * visibly there (counted, summarized once at seal) instead of being
+     * dropped inside a render pass.
+     *
+     * 256 is sized off what the feature is FOR: ~a dozen capsules per animated
+     * character, so this is roughly twenty on-screen characters' worth. It is
+     * deliberately not larger — every capsule is tested by every any-hit ray in
+     * a LINEAR loop before the BVH walk (the set is far too small for a tree to
+     * pay for itself), so the budget is also the cost ceiling of the feature.
+     * A host that wants crowds should emit capsules only for the characters
+     * near enough for their shadow to read.
+     */
+    static constexpr uint32_t MAX_SHADOW_CAPSULES = 256;
+
     explicit FramePacket(std::size_t initial_arena_bytes = k_default_arena_bytes);
     ~FramePacket() = default;
 
@@ -374,6 +392,25 @@ public:
         return ui_commands_;
     }
 
+    /**
+     * The frame's analytic shadow occluders (docs/rt_lighting_plan.md §5.8).
+     *
+     * Per-frame DYNAMIC data, which is why it rides the packet like every
+     * other per-frame description rather than reaching the renderer through a
+     * side channel: the host derives these from its live skeletons inside
+     * on_simulate, and the renderer must see exactly the set that belongs to
+     * the frame it is drawing. Empty on every frame the host emits none, and
+     * on every frame of a host that has never heard of them.
+     *
+     * Consumed ONLY by the traced any-hit (visibility) passes — see
+     * `contracts/shadow_capsule.hpp` for why the closest-hit paths keep the
+     * bind-pose triangles instead.
+     */
+    [[nodiscard]] std::span<const bracken::render::rt::ShadowCapsule> shadow_capsules() const {
+        assert_readable();
+        return shadow_capsules_;
+    }
+
     /** All bone palettes of the frame in deterministic (lane, allocation)
      *  order; SkinnedDrawCommand::palette.value indexes this span. */
     [[nodiscard]] std::span<const BonePalette> palettes() const {
@@ -399,17 +436,23 @@ public:
         uint32_t draws_dropped_invalid_handle = 0;
         uint32_t skinned_dropped_invalid_palette = 0;
         uint32_t palettes_over_budget = 0;
+        /// ShadowCapsules refused because the frame's MAX_SHADOW_CAPSULES
+        /// budget was exhausted. Counted per CAPSULE, not per call: a host
+        /// handing in one over-budget span of forty wants to know it lost
+        /// forty occluders, not one call.
+        uint32_t shadow_capsules_over_budget = 0;
 
         [[nodiscard]] bool any() const {
             return draws_dropped_invalid_handle != 0 || skinned_dropped_invalid_palette != 0 ||
-                   palettes_over_budget != 0;
+                   palettes_over_budget != 0 || shadow_capsules_over_budget != 0;
         }
     };
 
     [[nodiscard]] BuildDiagnostics build_diagnostics() const noexcept {
         return {drops_invalid_handle_.load(std::memory_order_relaxed),
                 drops_invalid_palette_.load(std::memory_order_relaxed),
-                drops_palette_budget_.load(std::memory_order_relaxed)};
+                drops_palette_budget_.load(std::memory_order_relaxed),
+                drops_capsule_budget_.load(std::memory_order_relaxed)};
     }
 
     /** Total matrix count across palettes() — the size of the packed palette
@@ -579,12 +622,34 @@ private:
         return palette_slots_.load(std::memory_order_relaxed);
     }
 
+    /**
+     * Claim `count` of the frame's MAX_SHADOW_CAPSULES slots, returning how
+     * many were actually granted (0 when the budget is already spent). Any
+     * fill-stage thread; the caller must count the shortfall visibly.
+     *
+     * A count-based claim rather than the palette's one-at-a-time bool because
+     * the emit API takes a SPAN: a partial grant lets a host that overruns the
+     * budget keep the first N of its occluders instead of losing whichever
+     * calls happened to land last, which is the more useful failure.
+     */
+    [[nodiscard]] uint32_t take_capsule_slots(uint32_t count) noexcept {
+        const uint32_t first = capsule_slots_.fetch_add(count, std::memory_order_relaxed);
+        if (first >= MAX_SHADOW_CAPSULES) {
+            return 0;
+        }
+        const uint32_t room = MAX_SHADOW_CAPSULES - first;
+        return count < room ? count : room;
+    }
+
     /** Emit-time drop counters, bumped from any fill-stage lane thread.
      *  Relaxed: each is a self-contained count on an already-failing path,
      *  published to readers by the Filling → Sealed release edge. */
     void count_drop_invalid_handle() noexcept { drops_invalid_handle_.fetch_add(1, std::memory_order_relaxed); }
     void count_drop_invalid_palette() noexcept { drops_invalid_palette_.fetch_add(1, std::memory_order_relaxed); }
     void count_drop_palette_budget() noexcept { drops_palette_budget_.fetch_add(1, std::memory_order_relaxed); }
+    void count_drop_capsule_budget(uint32_t n) noexcept {
+        drops_capsule_budget_.fetch_add(n, std::memory_order_relaxed);
+    }
 
     struct SlabState {
         std::byte* base = nullptr;
@@ -626,12 +691,17 @@ private:
     // past the cap on over-budget frames; reset() zeroes it. No pairing
     // partner.
     std::atomic<uint32_t> palette_slots_{0};
+    // capsule_slots_ — MAX_SHADOW_CAPSULES accounting; relaxed fetch_add,
+    // publishes nothing (capsule data rides the seal edge). May over-count past
+    // the cap on an over-budget frame; reset() zeroes it. No pairing partner.
+    std::atomic<uint32_t> capsule_slots_{0};
     // Emit-time drop counts (see count_drop_*): relaxed fetch_add on failing
     // paths only, zeroed by reset(). No pairing partner — their values ride
     // the seal edge like the rest of the payload.
     std::atomic<uint32_t> drops_invalid_handle_{0};
     std::atomic<uint32_t> drops_invalid_palette_{0};
     std::atomic<uint32_t> drops_palette_budget_{0};
+    std::atomic<uint32_t> drops_capsule_budget_{0};
 
     // state_ — the packet lifecycle word (Retired → Filling → Sealed →
     // Consuming → Retired). Every transition is a release store by the stage
@@ -660,6 +730,7 @@ private:
     std::span<const bracken::render::lighting::PointLight> point_lights_;
     std::span<const bracken::render::lighting::SpotLight> spot_lights_;
     std::span<const UiCommand> ui_commands_;
+    std::span<const bracken::render::rt::ShadowCapsule> shadow_capsules_;
     std::span<const BonePalette> palettes_;
     uint32_t palette_matrix_total_ = 0;
 

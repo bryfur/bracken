@@ -27,6 +27,7 @@ static_assert(k_lane_storable<bracken::render::lighting::SpotLight>);
 static_assert(k_lane_storable<BillboardDrawCommand>);
 static_assert(k_lane_storable<DebugLineDrawCommand>);
 static_assert(k_lane_storable<EffectSpawnCommand>);
+static_assert(k_lane_storable<bracken::render::rt::ShadowCapsule>);
 static_assert(k_lane_storable<UiCommand>); // variant of trivially copyable alternatives
 static_assert(k_lane_storable<BonePalette>);
 
@@ -225,6 +226,7 @@ void FrameBuilder::seal() {
     pkt.billboards_ = merge_chain(&Lane::billboards_);
     pkt.debug_lines_ = merge_chain(&Lane::debug_lines_);
     pkt.effect_spawns_ = merge_chain(&Lane::effect_spawns_);
+    pkt.shadow_capsules_ = merge_chain(&Lane::shadow_capsules_);
     pkt.ui_commands_ = merge_chain(&Lane::ui_);
 
     // One summary line per frame for everything the fill refused, throttled
@@ -236,9 +238,11 @@ void FrameBuilder::seal() {
         BRACKEN_LOG_WARN_THROTTLED(
             5.0, "scene",
             "frame {}: dropped {} draw(s) with an invalid ModelHandle, {} skinned draw(s) with an invalid bone "
-            "palette id, and refused {} palette allocation(s) over the {}-palette frame budget",
+            "palette id, refused {} palette allocation(s) over the {}-palette frame budget, and refused {} shadow "
+            "capsule(s) over the {}-capsule frame budget",
             pkt.frame_index_, build_diag.draws_dropped_invalid_handle, build_diag.skinned_dropped_invalid_palette,
-            build_diag.palettes_over_budget, FramePacket::MAX_BONE_PALETTES);
+            build_diag.palettes_over_budget, FramePacket::MAX_BONE_PALETTES,
+            build_diag.shadow_capsules_over_budget, FramePacket::MAX_SHADOW_CAPSULES);
     }
 
     // Filling → Sealed: THE payload publish edge (see FramePacket::state_).
@@ -433,6 +437,28 @@ void FrameBuilder::Lane::add_debug_box(const glm::vec3& min, const glm::vec3& ma
     add_debug_line(c[1], c[5], color);
     add_debug_line(c[2], c[6], color);
     add_debug_line(c[3], c[7], color);
+}
+
+void FrameBuilder::Lane::add_shadow_capsules(std::span<const bracken::render::rt::ShadowCapsule> capsules) {
+    assert_filling();
+    if (capsules.empty()) {
+        return;
+    }
+    // Budget FIRST, then copy: a truncated span is the documented behaviour, so
+    // the grant decides how many items are pushed rather than the push
+    // discovering the cap. take_capsule_slots is a single relaxed fetch_add, so
+    // this stays one atomic per CALL and not one per capsule.
+    const auto requested = static_cast<uint32_t>(capsules.size());
+    const uint32_t granted = packet_->take_capsule_slots(requested);
+    if (granted < requested) {
+        // Counted, not logged per call, for the reason alloc_bone_palette gives:
+        // a host that overruns this budget overruns it every frame, and seal()
+        // prints the one line that says what the budget is.
+        packet_->count_drop_capsule_budget(requested - granted);
+    }
+    for (uint32_t i = 0; i < granted; ++i) {
+        new (push_slot(shadow_capsules_)) bracken::render::rt::ShadowCapsule{capsules[i]};
+    }
 }
 
 void FrameBuilder::Lane::spawn_effect(const bracken::EffectDefinition* definition, const glm::vec3& position,

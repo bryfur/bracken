@@ -395,6 +395,11 @@ bool PlaygroundGame::on_init() {
                 break;
             }
         }
+        // Ray-traced shadow proxies (docs/rt_lighting_plan.md §5.8). Resolved
+        // here, next to the lantern, because it is the same operation for the
+        // same reason: find_joint is a linear name scan, so it happens once at
+        // load and the INDEX is what the per-frame code keeps.
+        resolve_capsule_bones(*pm);
     }
 
     // Reuse an existing small mesh as the carried lantern rather than adding
@@ -2267,6 +2272,154 @@ void PlaygroundGame::update_player(float dt) {
     float lateral_lean = std::clamp(-facing_.turn_rate * 0.04f, -0.12f, 0.12f);
     anim::apply_body_lean(anim_player_.mutable_bone_matrices(), anim_player_.mutable_world_transforms(),
                           model->skeleton, ik.spine, forward_lean, lateral_lean);
+
+    // LAST, after every procedural layer. The capsules are supposed to be where
+    // the character actually IS, and foot IK and body lean both move joints
+    // after the clip is sampled — deriving them before this line would put the
+    // shadow back a step behind the pose, which is a subtler version of exactly
+    // the bug this feature fixes.
+    rebuild_shadow_capsules(*model);
+}
+
+// ---------------------------------------------------------------------------
+// Ray-traced shadow proxies (docs/rt_lighting_plan.md §5.8)
+//
+// A skinned mesh traces its BIND POSE, and the traced sun mask REPLACES the
+// cascade shadow, so before this the character dragged a rigid statue's
+// silhouette around the village. The engine now skips skinned instances in its
+// any-hit walks and tests these capsules instead.
+//
+// THE HOST DERIVES THEM, and that division is deliberate: the engine cannot
+// know which bones of an arbitrary rig are a torso and which are a sleeve, and
+// name-guessing is the sort of content assumption the engine/game split exists
+// to keep out. What the host owes is a dozen segments that follow the live
+// skeleton; what it gets back is an animated shadow.
+// ---------------------------------------------------------------------------
+namespace {
+
+/// Radii in MODEL units, which are world units here — the character transform
+/// is a translate+rotate with no scale.
+///
+/// HAND-TUNED against the box geometry in character.cpp, not computed: the mesh
+/// is a stack of boxes and a capsule cannot match a box cross section (the
+/// torso is 30 wide and 18 deep), so every one of these is a judgement about
+/// which silhouette reads better in shadow. They deliberately sit nearer the
+/// box's SMALLER half-extent than its larger: an over-fat proxy is the failure
+/// you notice, because it turns a figure into a snowman.
+constexpr float CAPSULE_R_PELVIS = 12.0f;   // hips box 14 x 8, spine box 15 x 9
+constexpr float CAPSULE_R_CHEST = 11.0f;    // spine box 15 x 9
+constexpr float CAPSULE_R_HEAD = 9.0f;      // head box 9 x 9
+constexpr float CAPSULE_R_UPPER_LEG = 6.0f; // 5.5 half-extent
+constexpr float CAPSULE_R_LOWER_LEG = 5.5f; // 5.0 half-extent
+constexpr float CAPSULE_R_FOOT = 5.0f;      // 5.0 half-extent
+constexpr float CAPSULE_R_ARM = 5.0f;       // 4.5 half-extent
+
+/// The head and the arms have no CHILD joint to run a segment to, so their far
+/// end is an offset in the bone's own frame — which is what keeps them rotating
+/// with the bone instead of pointing stubbornly up the world axis.
+constexpr glm::vec3 CAPSULE_HEAD_TIP{0.0f, 22.0f, 0.0f};  // head box top, y 182
+constexpr glm::vec3 CAPSULE_ARM_TIP{0.0f, -50.0f, 0.0f};  // arm box runs 153 -> 103
+constexpr glm::vec3 CAPSULE_FOOT_TIP{0.0f, 0.0f, -9.0f};  // foot box reaches forward
+
+} // namespace
+
+void PlaygroundGame::resolve_capsule_bones(const bracken::Model& model) {
+    using bracken::animation::find_joint;
+    const auto& sk = model.skeleton;
+    // The playground's rig (character.cpp) names these to match the engine's
+    // default FootIKBoneNames, which is also what docs/skinned_mesh_format.md
+    // documents as the convention. A rig that names them differently resolves
+    // to invalid indices and takes the whole-body fallback below rather than
+    // silently producing capsules parked at the origin.
+    capsule_bones_.hips = find_joint(sk, "Hips");
+    capsule_bones_.spine = find_joint(sk, "Spine");
+    capsule_bones_.head = find_joint(sk, "Head");
+    capsule_bones_.left_upper_leg = find_joint(sk, "LeftUpperLeg");
+    capsule_bones_.left_lower_leg = find_joint(sk, "LeftLowerLeg");
+    capsule_bones_.left_foot = find_joint(sk, "LeftFoot");
+    capsule_bones_.right_upper_leg = find_joint(sk, "RightUpperLeg");
+    capsule_bones_.right_lower_leg = find_joint(sk, "RightLowerLeg");
+    capsule_bones_.right_foot = find_joint(sk, "RightFoot");
+    capsule_bones_.left_arm = find_joint(sk, "LeftArm");
+    capsule_bones_.right_arm = find_joint(sk, "RightArm");
+
+    const bracken::animation::JointIndex required[] = {
+        capsule_bones_.hips,            capsule_bones_.spine,           capsule_bones_.head,
+        capsule_bones_.left_upper_leg,  capsule_bones_.left_lower_leg,  capsule_bones_.left_foot,
+        capsule_bones_.right_upper_leg, capsule_bones_.right_lower_leg, capsule_bones_.right_foot,
+        capsule_bones_.left_arm,        capsule_bones_.right_arm};
+    capsule_bones_.valid = true;
+    for (const auto& j : required) {
+        capsule_bones_.valid = capsule_bones_.valid && j.valid();
+    }
+    if (capsule_bones_.valid) {
+        BRACKEN_LOG_INFO("playground", "RT shadow capsules: resolved 11 bones on the character rig");
+    }
+}
+
+void PlaygroundGame::rebuild_shadow_capsules(const bracken::Model& model) {
+    using bracken::animation::attachment_position;
+    using bracken::render::rt::ShadowCapsule;
+
+    shadow_capsules_.clear();
+
+    if (!capsule_bones_.valid) {
+        // FALLBACK, and a visibly worse one rather than nothing at all: one
+        // capsule down the model's own bounding box. The character still casts
+        // a shadow that moves with it — it just does not articulate. Better
+        // than the bind-pose statue, worse than the real thing, and it says so
+        // once instead of failing quietly.
+        if (!capsule_fallback_logged_) {
+            capsule_fallback_logged_ = true;
+            BRACKEN_LOG_WARN("playground",
+                             "RT shadow capsules: the character rig does not use the expected bone "
+                             "names (Hips/Spine/Head/...); falling back to ONE whole-body capsule "
+                             "from the model bounds. Its shadow will move but not articulate");
+        }
+        const glm::vec3 lo = model.bounds.min;
+        const glm::vec3 hi = model.bounds.max;
+        const glm::vec3 mid{(lo.x + hi.x) * 0.5f, 0.0f, (lo.z + hi.z) * 0.5f};
+        // Radius from the SMALLER horizontal half-extent, for the reason the
+        // per-bone radii are: an over-fat proxy is the visible failure.
+        const float radius = 0.5f * std::min(hi.x - lo.x, hi.z - lo.z);
+        const glm::vec3 p0 = glm::vec3(player_transform_ *
+                                       glm::vec4(mid + glm::vec3(0.0f, lo.y + radius, 0.0f), 1.0f));
+        const glm::vec3 p1 = glm::vec3(player_transform_ *
+                                       glm::vec4(mid + glm::vec3(0.0f, hi.y - radius, 0.0f), 1.0f));
+        shadow_capsules_.push_back(ShadowCapsule{p0, radius, p1, 0.0f});
+        return;
+    }
+
+    // Every point below comes from the joint's WORLD transform, not its
+    // skinning matrix — attachment_position is the engine API that gets that
+    // distinction right (see animation/attachment.hpp; using the skinning
+    // matrix here would park the whole figure near the origin at a strange
+    // angle, which is the classic symptom).
+    const auto at = [&](bracken::animation::JointIndex j, const glm::vec3& local = glm::vec3(0.0f)) {
+        return attachment_position(player_transform_, anim_player_, j, local);
+    };
+    const auto add = [&](const glm::vec3& a, const glm::vec3& b, float r) {
+        shadow_capsules_.push_back(ShadowCapsule{a, r, b, 0.0f});
+    };
+
+    // 11 capsules: torso in two, head, four leg segments, two feet, two arms.
+    // The arms and head run to a BONE-LOCAL offset because they have no child
+    // joint; everything else runs joint to joint, so it follows the rig with no
+    // authored lengths to keep in sync.
+    add(at(capsule_bones_.hips), at(capsule_bones_.spine), CAPSULE_R_PELVIS);
+    add(at(capsule_bones_.spine), at(capsule_bones_.head), CAPSULE_R_CHEST);
+    add(at(capsule_bones_.head), at(capsule_bones_.head, CAPSULE_HEAD_TIP), CAPSULE_R_HEAD);
+
+    add(at(capsule_bones_.left_upper_leg), at(capsule_bones_.left_lower_leg), CAPSULE_R_UPPER_LEG);
+    add(at(capsule_bones_.left_lower_leg), at(capsule_bones_.left_foot), CAPSULE_R_LOWER_LEG);
+    add(at(capsule_bones_.left_foot), at(capsule_bones_.left_foot, CAPSULE_FOOT_TIP), CAPSULE_R_FOOT);
+
+    add(at(capsule_bones_.right_upper_leg), at(capsule_bones_.right_lower_leg), CAPSULE_R_UPPER_LEG);
+    add(at(capsule_bones_.right_lower_leg), at(capsule_bones_.right_foot), CAPSULE_R_LOWER_LEG);
+    add(at(capsule_bones_.right_foot), at(capsule_bones_.right_foot, CAPSULE_FOOT_TIP), CAPSULE_R_FOOT);
+
+    add(at(capsule_bones_.left_arm), at(capsule_bones_.left_arm, CAPSULE_ARM_TIP), CAPSULE_R_ARM);
+    add(at(capsule_bones_.right_arm), at(capsule_bones_.right_arm, CAPSULE_ARM_TIP), CAPSULE_R_ARM);
 }
 
 // AIM the camera. The engine owns the rig and drives it in its sim-stage
@@ -2584,6 +2737,16 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
             anim_player_.write_palette(palette.matrices);
             fb.draw_skinned(player_model_, player_transform_, palette.id, {1.0f, 1.0f, 1.0f, 1.0f},
                             scene::DrawFlags::None, MOTION_ID_PLAYER);
+
+            // The ANIMATED shadow proxy for that skinned draw
+            // (docs/rt_lighting_plan.md §5.8). Emitted next to the draw it
+            // belongs to, and only when the draw actually happened: the traced
+            // any-hit passes skip this instance's bind-pose triangles, so
+            // without these the character would cast no traced shadow at all.
+            // Copied into packet memory, so shadow_capsules_ is free to be
+            // rebuilt next frame. The orbs, props and village are not skinned
+            // and are unaffected — their triangles are already the right shape.
+            fb.add_shadow_capsules(shadow_capsules_);
 
             // Bone attachment: the lantern follows the hand through every
             // animation with no per-frame math on this side. One call.

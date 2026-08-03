@@ -1,6 +1,8 @@
 # Ray-Traced Lighting — Research & Plan of Record
 
-Status: **COMPLETE — every phase R0 through R6 has landed** (2026-08-02).
+Status: **COMPLETE — every phase R0 through R6 has landed** (2026-08-02),
+plus the cross-cutting **§5.8 dynamic/skinned geometry policy** (capsule
+occluders for the two visibility signals; see its landed note).
 R0 (foundations), R1 (probe-field GI), R2 (froxel-RIS local-light shadows),
 R3 (honest hit lighting), R4 (HZB + indirect dispatch in R4a, the screen-probe
 gather in R4b), R5 (SSILVB in R5a, the denoiser core in R5b, the Full-DI tier
@@ -130,9 +132,19 @@ ambient term is a hard-coded `fogColor * 0.2`, and histogram auto-exposure.
    ambient is a flat constant. Reflections show no GI and no shadows.~~
    **Fixed by R3** — reflection and probe rays now share
    `shaders/rt_hit_shade.hlsli`. See §5.4.
-3. Skinned meshes trace their **bind pose** (translated/rotated into place).
+3. ~~Skinned meshes trace their **bind pose** (translated/rotated into place).
    Because the traced sun mask *replaces* CSM, an animated character's RT
-   shadow does not animate.
+   shadow does not animate.~~ **Half-fixed by §5.8**, and the half matters:
+   the two VISIBILITY signals (sun shadow, local-light DI, and both R5b
+   gradient replays) no longer trace skinned instances at all — they are
+   flagged in the TLAS and skipped, and per-bone **capsule occluders** driven
+   by the live skeleton answer instead, so the character's shadow animates.
+   The CLOSEST-HIT paths — reflections, GI probe rays, screen probes — are
+   deliberately unchanged and still see the bind-pose triangles, because a ray
+   there has to shade what it finds and the pose error is invisible at those
+   scales. So: **shadows fixed; reflections and GI still bind-pose BY
+   DESIGN.** The capsule shadow is also a simplification — no hat brim, no
+   cloth — which is the trade §5.8 chose over per-frame re-skinning.
 4. Local (point/spot) lights get 8×8-tile rasterized atlas shadows under hard
    budgets (8 point / 16 spot / 6 tile updates a frame) — no penumbras, and
    light #9 gets nothing.
@@ -1892,6 +1904,91 @@ contract:
 Capsule occluders are a small analytic intersection in the shadow kernels
 (`animation/attachment.hpp` already reads joint world transforms), traced
 before the BVH walk; ≤ a dozen capsules per character.
+
+#### LANDED (2026-08-02)
+
+The sun/local-DI row shipped exactly as written; the other three rows needed no
+work because they were already describing the status quo.
+
+**What landed.**
+
+* `render::rt::ShadowCapsule` in the **leaf layer**
+  (`contracts/shadow_capsule.hpp`): 32 B, `{p0, radius, p1, _pad}`, two float4
+  registers, mirrored byte for byte in `shaders/rt_trace.hlsli`. `p0 == p1` is a
+  legal sphere, which is what makes a head expressible without a special case.
+* **The packet carries them.** `FrameSink::add_shadow_capsules(span)` →
+  arena-copied → `FramePacket::shadow_capsules()`, merged in (lane, emission)
+  order like every other command chain. Budget
+  `MAX_SHADOW_CAPSULES = 256`, accounted at build time; an over-budget span is
+  truncated and the remainder counted in
+  `FrameDiagnostics::shadow_capsules_over_budget`. No side channel, no retained
+  set, no host pointers — this is per-frame dynamic data and it flows the way
+  per-frame dynamic data flows here.
+* **The skinned flag rides the high bit of
+  `TlasInstance::blas_node_offset`** (`k_tlas_skinned_flag`). A bit rather than a
+  field because that struct is uploaded by raw memcpy and has no spare word; the
+  offset's ceiling is `static_assert`ed and is three orders of magnitude past any
+  storage-buffer limit. `refresh_raytracing_instances` already appended skinned
+  draws last, so the list was ALREADY partitioned and the renderer just passes
+  the split point. That index is mixed into the **topology** hash only — a refit
+  never rewrites `blas_node_offset`, so a moved split must force a rebuild, while
+  the content hash's "did anything move" answer stays bit-for-bit what it was.
+* **The any-hit walks skip flagged instances and sweep the capsules first**
+  (linear, early-out, before the TLAS descent). Closest-hit walks unchanged.
+* **`render/raytracing/capsule_occluder.hpp` is the CPU source of truth** for the
+  intersection, written statement for statement against the HLSL and unit-tested
+  over hit/miss/graze/cap/inside/degenerate/parallel/tMax. That file exists
+  because the GPU copy reports one boolean per pixel, so a sign error in it is
+  indistinguishable from a denoiser artefact.
+* **Both gradient shaders bind the same buffer and the same count as their
+  trace.** This was the one non-obvious requirement and it is load-bearing: a
+  replay that cannot see the occluders its trace saw reports a full gradient on
+  every capsule-shadowed stratum forever, which is a permanent history reset
+  exactly on the character. Measured: `sun_grad_fire` held at **0.0086** against
+  R5b's static 0.0085 (`PLAYGROUND_SUN_SWEEP=0 --rt-bench 120`, 3-run
+  identical). That number, not the screenshot, is the proof the replay agrees.
+* **Binding budget.** `rt_shadow`/`rt_shadow_gradient` had read-only headroom and
+  take a fifth RO storage buffer. `rt_local_shadow`/`rt_local_shadow_gradient`
+  were at SDL3's eight-RO ceiling, so the capsules ride a **read-write slot they
+  only ever read** — R2b's precedent, R6's precedent, same reason.
+
+**One design decision worth recording, because it is a contract and not a
+numerical dodge: a capsule does not occlude a point inside itself.** A capsule
+is a proxy for a body, and the points inside it are that body's own surface. A
+cylinder cannot fit a box cross section (the playground torso is 30 wide and 18
+deep), so a chest pixel genuinely does sit inside its own torso proxy, and
+occluding it paints the character black. Those pixels are correct anyway — a
+surface facing away from the light is already unlit by N·L before a ray is cast.
+The rejection is per capsule, so an arm still shadows a chest.
+
+**Measured effect.** RT-off is bit-identical (86.3/45.5). `PLAYGROUND_RT=both`
+83.7/48.4 → 83.7/48.3; `+RT_LOCAL=ratio` 85.3/47.7 → 85.3/47.6; night
+`TOD_HOUR=1 +RT_LOCAL=full` 38.0/55.5 → 38.2/55.7. All 3-run identical. The
+aggregate barely moves because the character is a small part of the frame; the
+image change is entirely local and is what the before/after shots show — a
+hard-edged bind-pose box detached from the character's feet, replaced by a
+smooth articulated figure that tracks the walk cycle. At the night pin the
+local light's hard bind-pose bars around the feet become one soft contact
+shadow.
+
+**Still open here.**
+
+* **The host owes the capsules.** A skinned draw with no capsules now casts NO
+  traced shadow — the bind-pose fallback was removed rather than retained. That
+  is the right default (a wrong shadow is worse than none, given the mask
+  replaces CSM), but it is a real API obligation and it is documented in the
+  user guide rather than enforced. A diagnostic counting skinned draws that
+  produced no capsule would be cheap and is not built.
+* **Capsules are engine-agnostic about WHICH bones.** Deriving them is host
+  work by design, but there is no helper — every game writes the same twelve
+  `attachment_position` calls. A `SkeletonCapsuleRig` utility in `animation/`
+  would be a reasonable follow-up if a second host ever appears.
+* **The sweep is unbounded by distance.** Every any-hit ray tests every capsule,
+  including rays on the far side of the map. A whole-set bounding sphere tested
+  once would cut that to nearly nothing for a crowd, and was not built because at
+  one character the loop does not measure.
+* **Reflections and GI still show the bind pose.** By design, per the table
+  above — recorded here so it is not rediscovered as a bug.
 
 ---
 

@@ -36,6 +36,12 @@
 //     StructuredBuffer<BvhTriangle>  blasTriangles;
 //     uint                           tlasNodeCount;   // cbuffer member
 //
+// And, ONLY for a shader that additionally defines RT_TRACE_CAPSULES before the
+// traversal phase (the four any-hit passes — see capsulesOccluded):
+//
+//     StructuredBuffer<ShadowCapsule> shadowCapsules;      // or RWStructuredBuffer
+//     uint                            shadowCapsuleCount;  // cbuffer member
+//
 // Bindings deliberately stay in the entry shaders (unlike
 // cluster_lighting.hlsli, which owns its slots): the two RT passes have
 // different sampled-texture counts and reflections bind a sixth buffer of
@@ -95,15 +101,63 @@ struct BvhTriangle {
     float pad2;
 };
 
+// SKINNED FLAG: the high bit of blasNodeOffset. Mirrors k_tlas_skinned_flag in
+// render/raytracing/bvh.hpp — the CPU struct below is uploaded by raw memcpy,
+// so the two must agree bit for bit.
+//
+// A skinned instance's BLAS holds the model's BIND POSE. The closest-hit walks
+// keep it (a reflection needs something shadeable where the character is, and a
+// probe ray cannot see the pose error); the ANY-HIT walks skip it, because
+// their result replaces the cascade shadow and a bind-pose statue dragged
+// around the world is exactly the artefact this exists to remove. The animated
+// occluder those walks use instead is the frame's ShadowCapsule set — see
+// RT_TRACE_CAPSULES below and docs/rt_lighting_plan.md §5.8.
+//
+// EVERY READ MASKS. tlasNodeOffset() is the only legal way to get the index.
+static const uint TLAS_SKINNED_FLAG = 0x80000000u;
+static const uint TLAS_NODE_OFFSET_MASK = 0x7FFFFFFFu;
+
 struct TlasInstance {
     float4x4 worldToModel;
     float3 boundsMin;
-    // Where this instance's BLAS starts in the CONVERTED (64-byte) node array.
-    // Its root is that offset + 0; node links inside a BLAS are relative to it.
+    // Where this instance's BLAS starts in the CONVERTED (64-byte) node array,
+    // OR'd with TLAS_SKINNED_FLAG for a skinned instance. Its root is that
+    // offset + 0; node links inside a BLAS are relative to it.
     uint blasNodeOffset;
     float3 boundsMax;
     uint blasTriangleOffset;
 };
+
+uint tlasNodeOffset(TlasInstance inst) {
+    return inst.blasNodeOffset & TLAS_NODE_OFFSET_MASK;
+}
+
+bool tlasInstanceIsSkinned(TlasInstance inst) {
+    return (inst.blasNodeOffset & TLAS_SKINNED_FLAG) != 0u;
+}
+
+// ---------------------------------------------------------------------------
+// Analytic capsule occluders (docs/rt_lighting_plan.md §5.8).
+//
+// The CPU SOURCE OF TRUTH for everything below is
+// render/raytracing/capsule_occluder.hpp, which is unit-tested over the graze,
+// cap, parallel, inside, degenerate and t-window cases this file can only be
+// eyeballed for. The two are written statement for statement; edit one, edit
+// the other.
+// ---------------------------------------------------------------------------
+
+// Mirrors bracken::render::rt::ShadowCapsule (contracts/shadow_capsule.hpp),
+// 32 bytes / two float4 registers. The radius rides in p0's w because two
+// consecutive float3s do not pack.
+struct ShadowCapsule {
+    float3 p0;
+    float radius;
+    float3 p1;
+    float pad0;
+};
+
+// See k_capsule_parallel_epsilon.
+static const float CAPSULE_PARALLEL_EPSILON = 1e-8;
 
 struct Hit {
     float t;
@@ -153,6 +207,97 @@ bool triangleHit(BvhTriangle tri, float3 origin, float3 dir, float tMax) {
     }
     float t = dot(tri.e2, qv) * invDet;
     return t > RAY_EPSILON && t < tMax;
+}
+
+// Does the ray hit this sphere anywhere in [tMin, tMax]? `dd` is dot(dir, dir),
+// carried in so a non-unit model-space direction stays correct.
+bool sphereOccluded(float3 origin, float3 dir, float dd, float3 center, float radiusSq,
+                    float tMin, float tMax) {
+    float3 oc = origin - center;
+    float b = dot(dir, oc);
+    float c = dot(oc, oc) - radiusSq;
+    float disc = b * b - dd * c;
+    if (disc < 0.0 || dd <= 0.0) {
+        return false;
+    }
+    float sq = sqrt(disc);
+    // Both roots: an origin between them is a ray starting inside the sphere,
+    // and the far root is where it leaves.
+    float t0 = (-b - sq) / dd;
+    float t1 = (-b + sq) / dd;
+    return (t0 >= tMin && t0 <= tMax) || (t1 >= tMin && t1 <= tMax);
+}
+
+// Does the ray hit this capsule anywhere in [tMin, tMax]? Three parts, because
+// a capsule is three surfaces welded together:
+//
+//  1. INSIDE-REJECTION. An origin within the capsule is not occluded by it.
+//     That is the contract, not a numerical dodge: a capsule is a PROXY for a
+//     body, and the points inside it are that body's own surface. Occluding
+//     them paints every character's own skin black — a cylinder cannot fit a
+//     box cross section, so a chest pixel genuinely does sit inside its own
+//     torso proxy. Those pixels are fine anyway: a surface facing away from the
+//     light is already unlit by N.L before any ray is cast, and one facing the
+//     light is not occluded by the body behind it. The rejection is PER
+//     CAPSULE, so an arm still shadows a chest that lies inside the torso.
+//  2. THE INFINITE CYLINDER as a quadratic, with BOTH roots tested and each
+//     accepted only when its axial coordinate lands inside the segment. The far
+//     root matters for a ray that starts inside the cylinder but past a cap —
+//     straight above a head.
+//  3. THE TWO CAP SPHERES, always, not selected by which side a root fell on.
+//     That buys every degenerate case: p0 == p1 (the axis vanishes and the
+//     answer is a pure sphere test) and a ray parallel to the axis (the
+//     quadratic degenerates, and a parallel ray can only enter through a cap).
+//
+// Radius <= 0 occludes nothing, which is the useful reading of a degenerate
+// emit inside a per-item hot loop.
+bool capsuleOccluded(float3 origin, float3 dir, float tMin, float tMax, ShadowCapsule capsule) {
+    float radiusSq = capsule.radius * capsule.radius;
+    if (radiusSq <= 0.0) {
+        return false;
+    }
+    float3 ba = capsule.p1 - capsule.p0;
+    float3 oa = origin - capsule.p0;
+    float baba = dot(ba, ba);
+    float dd = dot(dir, dir);
+
+    // 1. inside-rejection, via the clamped axial parameter.
+    float h = baba > 0.0 ? saturate(dot(oa, ba) / baba) : 0.0;
+    float3 radial = oa - ba * h;
+    if (dot(radial, radial) <= radiusSq) {
+        return false;
+    }
+
+    // 2. infinite cylinder, clamped to the segment. a t^2 + 2 b t + c = 0, all
+    // three scaled by baba so the axial coordinate comes out in the same units
+    // and no division by |ba| is needed.
+    float bard = dot(ba, dir);
+    float baoa = dot(ba, oa);
+    float rdoa = dot(dir, oa);
+    float oaoa = dot(oa, oa);
+    float a = baba * dd - bard * bard;
+    float b = baba * rdoa - baoa * bard;
+    float c = baba * oaoa - baoa * baoa - radiusSq * baba;
+    if (a > CAPSULE_PARALLEL_EPSILON) {
+        float disc = b * b - a * c;
+        if (disc >= 0.0) {
+            float sq = sqrt(disc);
+            float t0 = (-b - sq) / a;
+            float y0 = baoa + t0 * bard;
+            if (y0 >= 0.0 && y0 <= baba && t0 >= tMin && t0 <= tMax) {
+                return true;
+            }
+            float t1 = (-b + sq) / a;
+            float y1 = baoa + t1 * bard;
+            if (y1 >= 0.0 && y1 <= baba && t1 >= tMin && t1 <= tMax) {
+                return true;
+            }
+        }
+    }
+
+    // 3. the caps.
+    return sphereOccluded(origin, dir, dd, capsule.p0, radiusSq, tMin, tMax) ||
+           sphereOccluded(origin, dir, dd, capsule.p1, radiusSq, tMin, tMax);
 }
 
 // Inverse of octEncode in prepass_gbuffer.frag.hlsl.
@@ -245,6 +390,17 @@ bool instancesOccluded(uint firstInstance, uint count, float3 origin, float3 dir
     for (uint i = 0; i < count; ++i) {
         TlasInstance inst = tlasInstances[firstInstance + i];
 
+        // SKINNED INSTANCES DO NOT OCCLUDE HERE. Their BLAS is the bind pose,
+        // and this walk's answer REPLACES the cascade shadow, so including them
+        // means an animated character casts a rigid statue's silhouette that
+        // never matches its pose. The animated stand-in is the ShadowCapsule
+        // set, tested once per ray in sceneOccluded before this walk begins.
+        // The closest-hit walk below is deliberately NOT changed: a reflection
+        // or probe ray still finds the character, bind pose and all.
+        if (tlasInstanceIsSkinned(inst)) {
+            continue;
+        }
+
         // Transform the RAY into model space rather than the model into world
         // space. One matrix-vector product per instance versus one per vertex
         // is the entire reason a two-level structure exists.
@@ -257,7 +413,7 @@ bool instancesOccluded(uint firstInstance, uint count, float3 origin, float3 dir
         if (scale < 1e-8) {
             continue;
         }
-        if (blasOccluded(inst.blasNodeOffset, inst.blasTriangleOffset, mOrigin, mDir / scale,
+        if (blasOccluded(tlasNodeOffset(inst), inst.blasTriangleOffset, mOrigin, mDir / scale,
                          tMax * scale)) {
             return true;
         }
@@ -265,9 +421,51 @@ bool instancesOccluded(uint firstInstance, uint count, float3 origin, float3 dir
     return false;
 }
 
+// The frame's analytic capsule occluders, as one any-hit query.
+//
+// GATED, not unconditional: only the four passes that ask a VISIBILITY question
+// bind the capsule buffer (rt_shadow, rt_local_shadow and their two R5b
+// gradient replays). The closest-hit consumers of this file — rt_reflection,
+// gi_probe_trace, gi_screen_probe_trace — never call sceneOccluded and must not
+// be made to declare a buffer they would never read, because an unread
+// declaration changes the reflected resource layout (see the README's note on
+// DXC's combinedImageSampler merging). A shader defines RT_TRACE_CAPSULES
+// before the traversal phase to opt in; without it this compiles to a constant
+// false and the traversal is byte-identical to its pre-capsule form.
+//
+// Phase 2 additionally REQUIRES, from an opting-in shader:
+//     StructuredBuffer<ShadowCapsule> shadowCapsules;   (or RWStructuredBuffer)
+//     uint                            shadowCapsuleCount;  // cbuffer member
+//
+// A LINEAR loop with an early-out, deliberately. The set is ~a dozen capsules
+// per character and 256 at the frame budget, which is far below where any
+// acceleration structure pays back the pointer chasing it costs — and it runs
+// BEFORE the TLAS walk precisely because a hit here skips that walk entirely,
+// which is the common case for the pixels in a character's own shadow.
+#ifdef RT_TRACE_CAPSULES
+bool capsulesOccluded(float3 origin, float3 dir, float tMin, float tMax) {
+    [loop] for (uint i = 0; i < shadowCapsuleCount; ++i) {
+        if (capsuleOccluded(origin, dir, tMin, tMax, shadowCapsules[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+#else
+bool capsulesOccluded(float3 origin, float3 dir, float tMin, float tMax) {
+    return false;
+}
+#endif
+
 // Walk the TLAS in world space, descending into a BLAS only for instances the
 // ray actually enters.
 bool sceneOccluded(float3 origin, float3 dir, float tMax) {
+    // The analytic occluders first: they answer for the animated characters the
+    // TLAS deliberately no longer holds for this query, and a hit here costs a
+    // dozen quadratics instead of a tree descent.
+    if (capsulesOccluded(origin, dir, RAY_EPSILON, tMax)) {
+        return true;
+    }
     if (tlasNodeCount == 0) {
         return false;
     }
@@ -443,8 +641,12 @@ void instancesClosest(uint firstInstance, uint count, float3 origin, float3 dir,
         if (scale < 1e-8) {
             continue;
         }
+        // NO skinned skip here, deliberately: a closest-hit ray has to shade
+        // what it finds, and dropping skinned instances would delete every
+        // character from reflections and from the GI probe field. The bind-pose
+        // approximation is accepted there — see TLAS_SKINNED_FLAG.
         float previousT = hit.t;
-        blasClosest(inst.blasNodeOffset, inst.blasTriangleOffset, mOrigin, mDir / scale, scale,
+        blasClosest(tlasNodeOffset(inst), inst.blasTriangleOffset, mOrigin, mDir / scale, scale,
                     hit);
         if (hit.t < previousT) {
             hit.instanceIndex = instanceIndex;

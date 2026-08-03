@@ -155,7 +155,9 @@ cbuffer RtLocalShadowUniforms : register(b0, space2) {
     /// rebuild), in which case an emissive index in the history names a
     /// different triangle and the history must be dropped.
     uint emissiveHistoryValid;
-    float _pad0;
+    /// Analytic capsule occluders in `shadowCapsules` (§5.8). 0 collapses the
+    /// capsule loop to nothing and reproduces the pre-capsule trace exactly.
+    uint shadowCapsuleCount;
 };
 
 // NOTE THE ABSENCE of the depthA/depthB pair every other depth-reading pass
@@ -270,11 +272,22 @@ struct RtReservoir {
 /// phase existed. When the scene has no emitter this binds a 1-element stand-in
 /// and `emissiveCount` is 0, so nothing indexes it.
 [[vk::binding(5, 1)]] RWStructuredBuffer<EmissiveRecord> emissiveRecords : register(u5, space1);
+/// The frame's analytic capsule occluders (docs/rt_lighting_plan.md §5.8) —
+/// READ ONLY, riding a read-write slot for the third time in this shader and
+/// for the third time for the same reason: the eight read-only storage-buffer
+/// slots SDL3 allows a compute pipeline are spent to the last one above (four
+/// acceleration + four cluster), and R2b set the precedent that a read-only use
+/// of a read-write binding is legal and is what the budget leaves. The sun
+/// pass, which has read-only headroom, binds the same data at t6 in set 0.
+/// When the host emits no capsules this binds a 1-element stand-in and
+/// `shadowCapsuleCount` is 0, so nothing indexes it.
+[[vk::binding(6, 1)]] RWStructuredBuffer<ShadowCapsule> shadowCapsules : register(u6, space1);
 
 #define RT_EMISSIVE_FUNCTIONS
 #include "rt_emissive.hlsli"
 
 // The buffers and `tlasNodeCount` above are what the walks bind to.
+#define RT_TRACE_CAPSULES
 #define RT_TRACE_TRAVERSAL
 #include "rt_trace.hlsli"
 

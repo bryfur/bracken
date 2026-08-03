@@ -32,6 +32,7 @@
 // depends on this directory).
 
 #include "bracken/contracts/light.hpp"
+#include "bracken/contracts/shadow_capsule.hpp"
 #include "bracken/scene/frame_builder.hpp"
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/frame_sink.hpp"
@@ -157,6 +158,11 @@ public:
         return packet_->effect_spawns();
     }
     [[nodiscard]] std::span<const scene::UiCommand> ui_commands() const { return packet_->ui_commands(); }
+    /** The frame's analytic shadow occluders, in (lane, emission) order — see
+     *  scene::FrameSink::add_shadow_capsules. */
+    [[nodiscard]] std::span<const bracken::render::rt::ShadowCapsule> shadow_capsules() const {
+        return packet_->shadow_capsules();
+    }
 
     /** Every UI text/button string of the frame, in emission order. The views
      *  point into packet memory and are valid while this TestFrame lives. */

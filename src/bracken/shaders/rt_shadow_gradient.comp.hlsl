@@ -70,7 +70,9 @@ cbuffer RtShadowGradientUniforms : register(b0, space2) {
     float depthA;           // projection[2][2], for linearizing reversed-Z
     float depthB;           // projection[3][2]
     float depthRejectRelative;
-    uint _pad0;
+    /// §5.8 — the capsule set the trace used. The replay MUST see the same one
+    /// or every capsule-shadowed stratum reports a permanent gradient.
+    uint shadowCapsuleCount;
     uint _pad1;
 };
 
@@ -113,9 +115,18 @@ SamplerState historySampler : register(s3, space0);
 [[vk::binding(6, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t6, space0);
 [[vk::binding(7, 0)]] StructuredBuffer<BvhNodeGpu> blasNodes : register(t7, space0);
 [[vk::binding(8, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t8, space0);
+/// The frame's capsule occluders — the SAME buffer the trace bound, and this is
+/// load-bearing rather than tidy. This pass RE-TRACES last frame's sample to
+/// ask whether the lighting changed under it; if it could not see the occluders
+/// the trace saw, every pixel a capsule shadows would report a full gradient
+/// forever and the denoiser's accumulation would be permanently reset exactly
+/// on the character. A fifth read-only storage buffer, which this pass has room
+/// for (five of the eight SDL3 allows).
+[[vk::binding(9, 0)]] StructuredBuffer<ShadowCapsule> shadowCapsules : register(t9, space0);
 
 [[vk::binding(0, 1)]] RWTexture2D<float> gradientOut : register(u0, space1);
 
+#define RT_TRACE_CAPSULES
 #define RT_TRACE_TRAVERSAL
 #include "rt_trace.hlsli"
 

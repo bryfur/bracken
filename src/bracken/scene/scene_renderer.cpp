@@ -599,6 +599,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     frame_diagnostics_.draws_dropped_unknown_model += build_diag.draws_dropped_invalid_handle;
     frame_diagnostics_.skinned_dropped_no_skeleton += build_diag.skinned_dropped_invalid_palette;
     frame_diagnostics_.palettes_over_budget += build_diag.palettes_over_budget;
+    frame_diagnostics_.shadow_capsules_over_budget += build_diag.shadow_capsules_over_budget;
     const GraphicsSettings& gfx = graphics_ ? *graphics_ : default_graphics_;
     const float dt = frame.dt();
 
@@ -955,6 +956,15 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 }
                 if (frame_local_shadows_active_) {
                     local_shadows_->upload(copy_pass); // slot SSBO, only when dirty
+                }
+                if (rt_renderer_) {
+                    // The frame's analytic capsule occluders, straight off the
+                    // packet (docs/rt_lighting_plan.md §5.8). Unconditional on
+                    // the RT toggles: it is one small copy, it is what the four
+                    // any-hit passes bind, and gating it on which traced
+                    // features happen to be on this frame is exactly how a
+                    // buffer ends up holding another frame's pose.
+                    rt_renderer_->upload_shadow_capsules(copy_pass, frame.shadow_capsules());
                 }
                 SDL_EndGPUCopyPass(copy_pass);
             } else {
@@ -2101,13 +2111,26 @@ void SceneRenderer::refresh_raytracing_instances(const FramePacket& frame,
     // it, the effect was not "falls back to CSM" but "has no sun shadow at
     // all". The player character in the playground was the obvious victim.
     //
-    // LIMITATION, stated here because it is visible: the BLAS is built from
-    // the model's bind-pose CPU geometry, so the shadow a skinned instance
-    // casts is its BIND POSE, translated and rotated to the right place. It
-    // tracks the character around the world and does not animate with it.
-    // Fixing that properly means re-skinning the vertices and refitting the
-    // BVH every frame (a refit is O(n) and would fit in the Prepare-stage
-    // fan-out) — worth doing, but a bigger change than restoring the shadow.
+    // THE BIND-POSE LIMITATION, and what now answers it (§5.8 of
+    // docs/rt_lighting_plan.md). The BLAS is built from the model's bind-pose
+    // CPU geometry, so a skinned instance's TRIANGLES are its bind pose,
+    // translated and rotated into place — a rigid statue that tracks the
+    // character around the world without animating. That was visibly wrong for
+    // the two VISIBILITY signals, whose answer replaces the cascade shadow, and
+    // acceptable for the closest-hit ones, which need something shadeable where
+    // the character is and cannot see the pose error at reflection or probe
+    // scale.
+    //
+    // So the split is made explicit rather than suffered: the skinned instances
+    // go at the END of the list, `skinned_first` marks where they start, and
+    // RtScene stamps `k_tlas_skinned_flag` into their node offsets. The any-hit
+    // walks skip flagged instances and test the frame's ShadowCapsules — which
+    // the HOST derives from its live skeletons and emits through the packet —
+    // while the closest-hit walks are untouched.
+    //
+    // The append order IS the partition; there is no sort. Everything above
+    // came from model_commands(), everything below from skinned_commands().
+    const auto skinned_first = static_cast<uint32_t>(rt_instances_scratch_.size());
     for (const SkinnedDrawCommand& draw : frame.skinned_commands()) {
         if (draw.model_handle != INVALID_MODEL_HANDLE && within_range(draw.model_handle, draw.transform)) {
             rt_instances_scratch_.emplace_back(draw.model_handle, draw.transform);
@@ -2116,7 +2139,7 @@ void SceneRenderer::refresh_raytracing_instances(const FramePacket& frame,
 
     // The filter runs BEFORE this, deliberately: set_instances hashes the list
     // it is given, so what the TLAS skip-check sees is the filtered content.
-    rt_renderer_->set_instances(rt_instances_scratch_, cmd);
+    rt_renderer_->set_instances(rt_instances_scratch_, cmd, skinned_first);
 }
 
 void SceneRenderer::set_raytracing_instances(

@@ -131,16 +131,63 @@ struct BvhBuildOptions {
  * cheaper than transforming the model's geometry into world space, which is
  * the entire reason a two-level structure exists.
  */
+/**
+ * SKINNED FLAG, carried in the high bit of `TlasInstance::blas_node_offset`.
+ *
+ * A skinned instance's BLAS is its model's BIND POSE — the acceleration
+ * structure is built once from CPU geometry and the instance carries only the
+ * character's root transform. That is fine for the closest-hit paths
+ * (reflections, GI probe rays), which need something shadeable where the
+ * character is and cannot see the pose error at probe scale. It is NOT fine
+ * for the any-hit visibility paths, whose result REPLACES the cascade shadow:
+ * there the bind pose is a rigid statue dragged around the world
+ * (docs/rt_lighting_plan.md §1 limit 3). Those walks skip flagged instances
+ * and test the frame's ShadowCapsules instead (§5.8).
+ *
+ * WHY A FLAG BIT AND NOT A FIELD. `TlasInstance` is uploaded to the GPU by raw
+ * memcpy — the CPU struct IS the shader struct — and it is exactly 96 bytes
+ * with no spare word. A new field would grow the per-instance record by a full
+ * 16-byte register for one bit, across every instance of every frame. The
+ * offset it rides in is an index into the converted BLAS node array, whose size
+ * is bounded by the loaded model set: the playground's is ~230k nodes, and the
+ * static_assert below pins the ceiling this trick assumes.
+ *
+ * EVERY READ MASKS. `blas_node_offset` must never be used raw again — see
+ * `tlas_blas_node_offset()` here, and the identical masking in
+ * `shaders/rt_trace.hlsli`'s two instance loops.
+ */
+inline constexpr uint32_t k_tlas_skinned_flag = 0x80000000u;
+inline constexpr uint32_t k_tlas_node_offset_mask = ~k_tlas_skinned_flag;
+/// The largest BLAS node array the flag leaves room for. 2^31 converted
+/// 64-byte nodes is 128 GB of node buffer — three orders of magnitude past any
+/// GPU's storage-buffer limit — so the bit is free in every sense that matters.
+inline constexpr uint32_t k_tlas_max_blas_nodes = k_tlas_node_offset_mask;
+static_assert(k_tlas_skinned_flag == (1u << 31), "the skinned flag is the sign bit of the offset");
+
 struct TlasInstance {
     glm::mat4 world_to_model{1.0f};
     glm::vec3 bounds_min{0.0f}; ///< world-space AABB of this instance
     /// Where this instance's BLAS starts in the CONVERTED (64-byte) node
-    /// array the shaders index — see `bvh_gpu.hpp`. `RtScene` assigns it; the
-    /// builder only copies it around.
+    /// array the shaders index — see `bvh_gpu.hpp` — OR'd with
+    /// `k_tlas_skinned_flag` when the instance came from a skinned draw.
+    /// `RtScene` assigns both halves; the builder only copies it around.
+    /// Read it through `tlas_blas_node_offset()`, never raw.
     uint32_t blas_node_offset = 0;
     glm::vec3 bounds_max{0.0f};
     uint32_t blas_triangle_offset = 0;
 };
+
+/// The node offset with the skinned flag masked off — the value traversal
+/// indexes `blasNodes` with.
+[[nodiscard]] inline constexpr uint32_t tlas_blas_node_offset(const TlasInstance& inst) noexcept {
+    return inst.blas_node_offset & k_tlas_node_offset_mask;
+}
+
+/// Whether this instance came from a skinned draw, and therefore traces its
+/// bind pose. See `k_tlas_skinned_flag`.
+[[nodiscard]] inline constexpr bool tlas_instance_is_skinned(const TlasInstance& inst) noexcept {
+    return (inst.blas_node_offset & k_tlas_skinned_flag) != 0u;
+}
 
 /** A TLAS is itself a BVH, over instance AABBs rather than triangles. */
 struct Tlas {

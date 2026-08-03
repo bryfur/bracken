@@ -131,7 +131,7 @@ SECOND candidate stream from them under multi-source RIS weights
 (`ris_source_scale`). **That half requires the `Full` tier** — a ratio estimator
 can only scale lighting the forward loop already evaluates, and it does not
 evaluate an emissive triangle; under `Ratio` emissive surfaces still glow and
-still feed GI, but cast no direct shadow. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer, **plus the surface's own emission**, which is what makes bounce FROM emissives fall out of the existing probe recursion). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
+still feed GI, but cast no direct shadow. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer, **plus the surface's own emission**, which is what makes bounce FROM emissives fall out of the existing probe recursion). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. **Skinned meshes are split by signal (§5.8)**: their BLAS is the bind pose, so the ANY-HIT walks flag and skip them and trace the frame's per-bone `ShadowCapsule` set instead (`contracts/shadow_capsule.hpp`, emitted by the host through `FrameSink::add_shadow_capsules`, intersection mirrored between `render/raytracing/capsule_occluder.hpp` and `shaders/rt_trace.hlsli`), while CLOSEST-HIT walks keep the bind-pose triangles so characters stay in reflections and probes. A skinned draw with no capsules casts NO traced shadow — the bind-pose fallback was removed, not retained. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
 | `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror — addressing, ray directions, the blend curve, and the sampler's cascade/weight math. **Complete as of R1c**: the field traces and accumulates itself, and `shaders/gi_sample.hlsli` replaces the DIFFUSE half of the ambient term in every scene fragment shader (three banded atlases, three sampler slots) plus the volumetric fog's in-scatter. Off by default (`gi_mode`); GI on builds the ray-tracing acceleration structure with attributes |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
 | `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
@@ -290,6 +290,12 @@ draws it.
   frame, enforced at **build time** in `FrameBuilder::alloc_bone_palette`
   (over-budget allocations log an error and return an invalid id; draws
   using an invalid id are dropped with a warning).
+- `MAX_SHADOW_CAPSULES = 256` (`scene/frame_packet.hpp`) — analytic shadow
+  occluders per frame (docs/rt_lighting_plan.md §5.8), enforced at **build
+  time** in `FrameSink::add_shadow_capsules` (over-budget spans are truncated
+  and the remainder counted in `FrameDiagnostics::shadow_capsules_over_budget`).
+  Also the feature's cost ceiling: every capsule is tested by every any-hit ray
+  in a linear loop.
 - `CSM_MAX_CASCADES = 4` (`render/shadow_map.hpp`) — 2×2-quadrant D32 atlas.
 - Cluster lighting (`render/lighting/light.hpp`): 16×9×24 grid,
   `MAX_LIGHTS = 256`, `MAX_LIGHTS_PER_CLUSTER = 128`. Local light shadows:
@@ -502,12 +508,12 @@ docs/rt_lighting_plan.md §5.5) instead of behaving as `Probes`.
 | Invocation | pre-R5a | at R5a | at R6 |
 |---|---|---|---|
 | `--smoke 30 PLAYGROUND_GI=probes` | `84.3 / 46.9` | `84.6 / 46.8` | `84.7 / 46.7` |
-| `PLAYGROUND_RT=both --smoke 30` | `83.9 / 47.9` | `83.7 / 48.4` | `83.7 / 48.4` |
+| `PLAYGROUND_RT=both --smoke 30` | `83.9 / 47.9` | `83.7 / 48.4` | `83.7 / 48.4` (§5.8: `83.7 / 48.3`) |
 | `PLAYGROUND_RT=both PLAYGROUND_GI=probes --smoke 30` | `81.7 / 49.8` | `81.8 / 50.0` | `81.9 / 49.9` |
-| `PLAYGROUND_RT_LOCAL=ratio PLAYGROUND_RT=both --smoke 30` | `85.3 / 47.5` | `85.0 / 47.9` | `85.3 / 47.7` |
+| `PLAYGROUND_RT_LOCAL=ratio PLAYGROUND_RT=both --smoke 30` | `85.3 / 47.5` | `85.0 / 47.9` | `85.3 / 47.7` (§5.8: `85.3 / 47.6`) |
 | `PLAYGROUND_RT_LOCAL=full PLAYGROUND_RT=both --smoke 30` (R5c) | — | `85.0 / 47.7` | `85.4 / 47.4` |
 | night, `PLAYGROUND_TOD_HOUR=1 … RT_LOCAL=ratio` | — | `36.2 / 58.8` | `35.5 / 57.4` |
-| night, `PLAYGROUND_TOD_HOUR=1 … RT_LOCAL=full` | — | `36.3 / 58.6` | `38.0 / 55.5` |
+| night, `PLAYGROUND_TOD_HOUR=1 … RT_LOCAL=full` | — | `36.3 / 58.6` | `38.0 / 55.5` (§5.8: `38.2 / 55.7`) |
 
 **R6 moved the traced rows for two separate reasons, and it is worth keeping
 them apart** (docs/rt_lighting_plan.md §5.7): emissive surfaces now GLOW in
@@ -518,6 +524,17 @@ which widens the traced penumbras. The night `full` row is the headline —
 were switched on and they lift the near-black, not the bright. The `RT=both`
 row without a local tier is unchanged, which is the check that the emissive
 DI path is genuinely gated on the Full tier and not leaking.
+
+**§5.8 (skinned-geometry policy) moved only the traced rows, and only
+slightly.** Animated characters no longer cast their BIND POSE into the two
+visibility signals: skinned instances are flagged out of the any-hit walks and
+per-bone `ShadowCapsule`s from the live skeleton answer instead. The aggregate
+barely moves because the character is a small part of the frame — the change is
+entirely local, and the way to see it is the character's own shadow, not the
+mean. The RT-off row is **bit-identical**, which is the check that nothing
+reached the raster path. Reflections and GI probe rays still see the bind pose
+BY DESIGN (a closest-hit ray has to shade what it finds); see
+docs/rt_lighting_plan.md §5.8.
 
 **R5c added the last row and it is a GATE, not a datum.** `Ratio` and `Full`
 are two estimates of the same lighting, so their means must agree — they land

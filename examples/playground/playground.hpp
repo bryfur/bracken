@@ -15,6 +15,7 @@
 
 #include "bracken/action_map.hpp"
 #include "bracken/animation/attachment.hpp"
+#include "bracken/contracts/shadow_capsule.hpp"
 #include "bracken/core/random.hpp"
 #include "bracken/navigation/nav_grid.hpp"
 #include "bracken/physics/character_controller.hpp"
@@ -172,6 +173,12 @@ private:
     void quicksave();  // writes playground_quicksave.sav (atomic)
     void quickload();  // restores it if present
     void update_player(float dt);
+    /// Resolve the capsule bones once, at model load. See capsule_bones_.
+    void resolve_capsule_bones(const bracken::Model& model);
+    /// Rebuild `shadow_capsules_` from the character's LIVE joint world
+    /// transforms. Call after every procedural layer has been applied and
+    /// before the frame is described.
+    void rebuild_shadow_capsules(const bracken::Model& model);
     void update_camera(bracken::SimFrame& sim); // non-const: records camera-forward feedback
     void update_orbs(float dt);
     void update_wanderer(float dt); // nav-grid pathing demo
@@ -299,6 +306,33 @@ private:
     /// than by hand-written matrix math.
     bracken::animation::Attachment lantern_attach_{};
     bracken::ModelHandle lantern_model_ = bracken::INVALID_MODEL_HANDLE;
+
+    // --- Ray-traced shadow proxies (docs/rt_lighting_plan.md §5.8) --------
+    /// The character's capsule occluders, rebuilt from the LIVE skeleton every
+    /// frame after the animation + IK + lean layers have run, and emitted
+    /// through the frame sink. A member rather than a local so the per-frame
+    /// derivation allocates nothing once warm.
+    ///
+    /// Why the host owns this and not the engine: the engine has no idea which
+    /// bones of an arbitrary skeleton are a torso and which are a sleeve, and
+    /// guessing from names is exactly the kind of content assumption the
+    /// engine/game split exists to keep out. Deriving the proxy is a game's
+    /// job; testing it against rays is the engine's.
+    std::vector<bracken::render::rt::ShadowCapsule> shadow_capsules_;
+    /// Joint indices resolved ONCE at load (find_joint is a linear name scan).
+    /// `valid` is false when the character model's bone names did not match,
+    /// in which case the derivation falls back to a single whole-body capsule.
+    struct CapsuleBones {
+        bracken::animation::JointIndex hips{}, spine{}, head{};
+        bracken::animation::JointIndex left_upper_leg{}, left_lower_leg{}, left_foot{};
+        bracken::animation::JointIndex right_upper_leg{}, right_lower_leg{}, right_foot{};
+        bracken::animation::JointIndex left_arm{}, right_arm{};
+        bool valid = false;
+    };
+    CapsuleBones capsule_bones_{};
+    /// Logged once, not per frame: a name mismatch is a standing content
+    /// condition, so the warning is a fact about the asset and not an event.
+    bool capsule_fallback_logged_ = false;
     /// Walkability + A* over the terrain, for the wandering villager.
     bracken::nav::NavGrid nav_;
     /// A villager that paths around the village on the nav grid.

@@ -131,7 +131,8 @@ struct InstanceHashes {
  * reordered list has the same instances but a different slot-to-input mapping,
  * which the refit path relies on, so reordering must read as a topology change.
  */
-InstanceHashes hash_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
+InstanceHashes hash_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances,
+                              uint32_t skinned_first) {
     InstanceHashes out{core::k_fnv1a_offset_basis_64, core::k_fnv1a_offset_basis_64};
     const auto mix = [](uint64_t& h, uint32_t word) {
         h ^= static_cast<uint64_t>(word);
@@ -141,6 +142,15 @@ InstanceHashes hash_instances(std::span<const std::pair<ModelHandle, glm::mat4>>
     // longer one it is a prefix of.
     mix(out.content, static_cast<uint32_t>(instances.size()));
     mix(out.topology, static_cast<uint32_t>(instances.size()));
+    // The skinned partition point goes into the TOPOLOGY hash and deliberately
+    // NOT into the content hash. It decides a bit baked into every built
+    // instance record (k_tlas_skinned_flag), so a change to it must force a
+    // rebuild rather than a refit — a refit updates bounds and leaves the flags
+    // as the last build wrote them. It says nothing about where anything IS,
+    // which is what the content hash is for: mixing it there would be a second
+    // way to answer "did something move", and the movement answer must stay
+    // exactly what it was before capsules existed.
+    mix(out.topology, skinned_first);
     for (const auto& [handle, transform] : instances) {
         mix(out.content, static_cast<uint32_t>(handle));
         mix(out.topology, static_cast<uint32_t>(handle));
@@ -339,13 +349,15 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
                      stats_.build_ms);
 }
 
-void RtScene::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
+void RtScene::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances,
+                            uint32_t skinned_first) {
     BRACKEN_PROFILE_ZONE("RtScene::set_instances");
     if (entries_.empty()) {
         return;
     }
+    skinned_first_ = std::min<uint32_t>(skinned_first, static_cast<uint32_t>(instances.size()));
 
-    const InstanceHashes hashes = hash_instances(instances);
+    const InstanceHashes hashes = hash_instances(instances, skinned_first_);
 
     // (a) Nothing moved: keep the TLAS, keep the buffers, do no work.
     if (has_instance_hash_ && hashes.content == instance_hash_) {
@@ -410,7 +422,18 @@ void RtScene::rebuild_tlas(std::span<const std::pair<ModelHandle, glm::mat4>> in
 
         TlasInstance inst;
         fill_instance_placement(e.bounds_min, e.bounds_max, transform, inst);
+        // The skinned flag rides the offset's high bit — see k_tlas_skinned_flag
+        // in bvh.hpp for why it is a bit and not a field, and for the ceiling
+        // that makes it free. The caller partitions the list, so this is a
+        // comparison against the partition point rather than a per-instance
+        // lookup. Asserted rather than masked: an offset that reached the sign
+        // bit would silently mark real geometry invisible to every shadow ray.
+        BRACKEN_ASSERT(e.node_offset <= k_tlas_max_blas_nodes,
+                       "BLAS node offset {} has reached the skinned-flag bit", e.node_offset);
         inst.blas_node_offset = e.node_offset;
+        if (i >= skinned_first_) {
+            inst.blas_node_offset |= k_tlas_skinned_flag;
+        }
         inst.blas_triangle_offset = e.triangle_offset;
         tlas_build_scratch_.push_back(inst);
         filtered_to_input_scratch_.push_back(static_cast<uint32_t>(i));
@@ -459,6 +482,13 @@ bool RtScene::refit_tlas_in_place(std::span<const std::pair<ModelHandle, glm::ma
             // which case the offsets are stale too and a rebuild is the answer.
             return false;
         }
+        // Placement only — `fill_instance_placement` writes the bounds and the
+        // inverse transform and never touches `blas_node_offset`, so the
+        // skinned flag the last BUILD stamped survives every refit. That is the
+        // invariant that makes the flag safe to carry in the offset at all: a
+        // refit path that rewrote the offset would strip it, and the character
+        // would silently return to casting its bind pose the frame after the
+        // first refit. Flag changes force a rebuild through the topology hash.
         fill_instance_placement(it->second.bounds_min, it->second.bounds_max, transform,
                                 tlas_.instances[slot]);
     }

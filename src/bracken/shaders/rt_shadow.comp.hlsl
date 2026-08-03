@@ -76,7 +76,10 @@ cbuffer RtShadowUniforms : register(b0, space2) {
     /// is reconstructed from depth taps as it used to be — worse, but better
     /// than not running.
     uint hasGBuffer;
-    float _pad0;
+    /// Analytic capsule occluders in `shadowCapsules` (docs/rt_lighting_plan.md
+    /// §5.8). 0 means the host emitted none this frame, which collapses the
+    /// capsule loop to nothing and reproduces the pre-capsule trace exactly.
+    uint shadowCapsuleCount;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
@@ -96,11 +99,17 @@ SamplerState sceneNormalSampler : register(s1, space0);
 [[vk::binding(3, 0)]] StructuredBuffer<TlasInstance> tlasInstances : register(t3, space0);
 [[vk::binding(4, 0)]] StructuredBuffer<BvhNodeGpu> blasNodes : register(t4, space0);
 [[vk::binding(5, 0)]] StructuredBuffer<BvhTriangle> blasTriangles : register(t5, space0);
+// The frame's animated capsule occluders. A FIFTH read-only storage buffer,
+// which this pass has room for (SDL3 GPU's ceiling is eight and the four
+// acceleration buffers are all it spent) — unlike rt_local_shadow, which was
+// already at the wall and has to ride a read-write slot for the same data.
+[[vk::binding(6, 0)]] StructuredBuffer<ShadowCapsule> shadowCapsules : register(t6, space0);
 
 // One bit of sun visibility per pixel, 8x4 pixels per uint. 1 = lit.
 [[vk::binding(0, 1)]] RWTexture2D<uint> shadowBits : register(u0, space1);
 
 // The buffers and `tlasNodeCount` above are what the walks bind to.
+#define RT_TRACE_CAPSULES
 #define RT_TRACE_TRAVERSAL
 #include "rt_trace.hlsli"
 

@@ -729,15 +729,15 @@ ExposureAdapt
 WaterSim
   cs        water_sim.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtShadow
-  cs        rt_shadow.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=4 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        rt_shadow.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=5 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtShadowClassify
   cs        rt_shadow_denoise_classify.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtShadowTemporal
   cs        rt_shadow_denoise_temporal.comp.spv entry=CSMain samplers=4 ro_textures=3 ro_buffers=0 rw_textures=2 rw_buffers=1 uniform_buffers=1
 RtShadowGradient
-  cs        rt_shadow_gradient.comp.spv entry=CSMain samplers=4 ro_textures=1 ro_buffers=4 rw_textures=1 rw_buffers=0 uniform_buffers=1
+  cs        rt_shadow_gradient.comp.spv entry=CSMain samplers=4 ro_textures=1 ro_buffers=5 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtLocalShadowGradient
-  cs        rt_local_shadow_gradient.comp.spv entry=CSMain samplers=3 ro_textures=1 ro_buffers=8 rw_textures=1 rw_buffers=2 uniform_buffers=2
+  cs        rt_local_shadow_gradient.comp.spv entry=CSMain samplers=3 ro_textures=1 ro_buffers=8 rw_textures=1 rw_buffers=3 uniform_buffers=2
 RtGradientReconstruct
   cs        rt_gradient_reconstruct.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtShadowFilter
@@ -747,7 +747,7 @@ RtReflection
 RtReflectionTemporal
   cs        rt_reflection_denoise_temporal.comp.spv entry=CSMain samplers=6 ro_textures=0 ro_buffers=1 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtLocalShadow
-  cs        rt_local_shadow.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=8 rw_textures=3 rw_buffers=3 uniform_buffers=2
+  cs        rt_local_shadow.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=8 rw_textures=3 rw_buffers=4 uniform_buffers=2
 RtDiTemporal
   cs        rt_di_denoise_temporal.comp.spv entry=CSMain samplers=5 ro_textures=1 ro_buffers=1 rw_textures=2 rw_buffers=0 uniform_buffers=1
 RtDiSpatial

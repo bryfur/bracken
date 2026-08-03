@@ -52,7 +52,9 @@ cbuffer RtLocalShadowGradientUniforms : register(b0, space2) {
     /// record set was renumbered since, which is the epoch test.
     uint emissiveCount;
     uint emissiveHistoryValid;
-    uint _pad0;
+    /// §5.8 — the capsule set the trace used. The replay MUST see the same one
+    /// or every capsule-shadowed stratum reports a permanent gradient.
+    uint shadowCapsuleCount;
     uint _pad1;
     uint _pad2;
 };
@@ -120,10 +122,17 @@ struct RtReservoir {
 /// stratum reports a full gradient every frame, and the denoiser's history is
 /// reset forever exactly where the new lights are.
 [[vk::binding(2, 1)]] RWStructuredBuffer<EmissiveRecord> emissiveRecords : register(u2, space1);
+/// The frame's capsule occluders (§5.8), read-only in a read-write slot for the
+/// third time and the same reason. The SAME buffer the trace bound: a replay
+/// that cannot see the occluders the trace saw reports a full gradient on every
+/// capsule-shadowed stratum, forever — the identical failure the emissive
+/// records above were added to prevent.
+[[vk::binding(3, 1)]] RWStructuredBuffer<ShadowCapsule> shadowCapsules : register(u3, space1);
 
 #define RT_EMISSIVE_FUNCTIONS
 #include "rt_emissive.hlsli"
 
+#define RT_TRACE_CAPSULES
 #define RT_TRACE_TRAVERSAL
 #include "rt_trace.hlsli"
 

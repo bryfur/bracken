@@ -2,6 +2,7 @@
 
 #include "bracken/contracts/environment.hpp"
 #include "bracken/contracts/graphics_settings.hpp"
+#include "bracken/contracts/shadow_capsule.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_compute.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
@@ -11,6 +12,7 @@
 
 #include <array>
 #include <memory>
+#include <span>
 
 namespace bracken::gpu {
 // Forward-declared rather than including gpu_debug.hpp: this header only holds
@@ -466,8 +468,31 @@ public:
     /// @param cmd The frame's command buffer, so a changed TLAS is written into
     ///   it rather than through its own submit. Null is valid (host calling
     ///   outside a frame); see RtScene::upload.
+    /// @param skinned_first Index of the first SKINNED instance in a list
+    ///   partitioned static-then-skinned; see RtScene::set_instances. Skinned
+    ///   instances are excluded from the ANY-HIT walks (their BLAS is the bind
+    ///   pose) and stand in through upload_shadow_capsules() instead.
     void set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances,
-                       SDL_GPUCommandBuffer* cmd = nullptr);
+                       SDL_GPUCommandBuffer* cmd = nullptr,
+                       uint32_t skinned_first = 0xFFFFFFFFu);
+
+    /**
+     * Take this frame's analytic capsule occluders (docs/rt_lighting_plan.md
+     * §5.8) and record their upload into an ALREADY-OPEN copy pass.
+     *
+     * Call once per frame from the renderer's batched frame-upload pass,
+     * before render(). The span is copied; nothing is retained. An empty span
+     * is valid and is the normal state for a host with no animated characters
+     * on screen — the count uniform goes to zero and the trace's capsule loop
+     * collapses to nothing.
+     *
+     * The buffer is grow-only: a frame whose capsule count fits the existing
+     * allocation reallocates nothing, which is the steady state, since the
+     * count is a function of how many characters are on screen and not of what
+     * they are doing.
+     */
+    void upload_shadow_capsules(SDL_GPUCopyPass* copy_pass,
+                                std::span<const rt::ShadowCapsule> capsules);
 
     struct FrameParams {
         glm::mat4 inv_view_proj{1.0f};
@@ -737,6 +762,14 @@ private:
     /// record slot when the scene has no emitter. A storage-buffer descriptor
     /// may not be empty; `emissiveCount = 0` is what stops it being indexed.
     [[nodiscard]] bool ensure_emissive_dummy();
+    /// Create (once) the one-element stand-in bound into the capsule slot on a
+    /// frame with no capsules. Same rule as the emissive dummy: a storage-buffer
+    /// descriptor may not be empty, and `shadowCapsuleCount = 0` is what stops
+    /// it being indexed.
+    [[nodiscard]] bool ensure_capsule_dummy();
+    /// The buffer the four any-hit passes bind, and the count they read — the
+    /// real one when the frame had capsules, the stand-in when it did not.
+    [[nodiscard]] SDL_GPUBuffer* capsule_binding();
     /// Allocate/keep the Full-DI tier's six RGBA16F targets at the local
     /// signal's traced resolution. Invalidates the DI history on any change.
     [[nodiscard]] bool ensure_di_targets(int traced_w, int traced_h);
@@ -840,6 +873,22 @@ private:
     uint32_t local_emissive_history_valid_ = 0;
     SDL_GPUBuffer* local_emissive_bound_ = nullptr;
     std::unique_ptr<gpu::GPUBuffer> local_emissive_dummy_;
+
+    // ---- analytic capsule occluders (docs/rt_lighting_plan.md §5.8) ----
+    /// The frame's ShadowCapsules, uploaded once in the renderer's copy pass
+    /// and bound by all four any-hit passes. Grow-only: `capsule_capacity_` is
+    /// the element count it is sized for, and a scene with a stable cast never
+    /// reallocates. ComputeStorage rather than Storage because rt_local_shadow
+    /// and its gradient bind it to a READ-WRITE slot — their eight read-only
+    /// slots were spent before capsules existed — while the two sun passes bind
+    /// the very same buffer read-only. One buffer, two binding kinds.
+    std::unique_ptr<gpu::GPUBuffer> capsule_buffer_;
+    std::size_t capsule_capacity_ = 0;
+    /// Capsules the last upload actually wrote — the value every one of the
+    /// four `shadowCapsuleCount` uniforms is set from, so the trace and its
+    /// replay cannot disagree about the occluder set.
+    uint32_t capsule_count_ = 0;
+    std::unique_ptr<gpu::GPUBuffer> capsule_dummy_;
 
     // ---- reflection denoiser state ----
     /// Ping-ponged accumulation (RGBA16F): rgb = radiance, a = sample count.

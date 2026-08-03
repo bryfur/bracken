@@ -63,6 +63,7 @@ void FramePacket::reset() {
     point_lights_ = {};
     spot_lights_ = {};
     ui_commands_ = {};
+    shadow_capsules_ = {};
     palettes_ = {};
     palette_matrix_total_ = 0;
     effect_emitters_ = {};
@@ -84,9 +85,11 @@ void FramePacket::reset() {
 
     active_slab_.store(nullptr, std::memory_order_relaxed);
     palette_slots_.store(0, std::memory_order_relaxed);
+    capsule_slots_.store(0, std::memory_order_relaxed);
     drops_invalid_handle_.store(0, std::memory_order_relaxed);
     drops_invalid_palette_.store(0, std::memory_order_relaxed);
     drops_palette_budget_.store(0, std::memory_order_relaxed);
+    drops_capsule_budget_.store(0, std::memory_order_relaxed);
 
     // Explicit cross-thread handoff: the retiring thread takes the arena
     // owner binding for the reset. The caller's frame fence (ring retire

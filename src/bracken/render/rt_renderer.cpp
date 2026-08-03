@@ -105,6 +105,10 @@ void RtRenderer::shutdown() {
     local_reservoirs_[0].reset();
     local_reservoirs_[1].reset();
     local_reservoir_capacity_ = 0;
+    capsule_buffer_.reset();
+    capsule_dummy_.reset();
+    capsule_capacity_ = 0;
+    capsule_count_ = 0;
     reflection_history_[0].reset();
     reflection_history_[1].reset();
     reflection_history_valid_ = false;
@@ -351,12 +355,80 @@ void RtRenderer::build_scene(gpu::GPUDevice& device, const ModelManager& models,
 }
 
 void RtRenderer::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances,
-                               SDL_GPUCommandBuffer* cmd) {
-    scene_.set_instances(instances);
+                               SDL_GPUCommandBuffer* cmd, uint32_t skinned_first) {
+    scene_.set_instances(instances, skinned_first);
     if (device_ != nullptr) {
         scene_.upload(*device_, cmd);
         publish_scene_stats();
     }
+}
+
+void RtRenderer::upload_shadow_capsules(SDL_GPUCopyPass* copy_pass,
+                                        std::span<const rt::ShadowCapsule> capsules) {
+    // The count is latched even on the paths that upload nothing, so a frame
+    // that goes from "some capsules" to "none" actually clears the occluders
+    // instead of tracing against last frame's pose forever.
+    capsule_count_ = 0;
+    if (device_ == nullptr || copy_pass == nullptr || capsules.empty()) {
+        return;
+    }
+
+    // Grow-only, geometric, with a floor — the bone-palette buffer's pattern.
+    // The floor is the frame budget itself: FramePacket::MAX_SHADOW_CAPSULES is
+    // 256 records = 8 KB, which is small enough that sizing for the worst case
+    // up front is cheaper than ever thinking about it again.
+    const std::size_t required = capsules.size() * sizeof(rt::ShadowCapsule);
+    if (!capsule_buffer_ || capsule_capacity_ < required) {
+        capsule_capacity_ = std::max(required * 2, std::size_t{256} * sizeof(rt::ShadowCapsule));
+        capsule_buffer_ = gpu::GPUBuffer::create_dynamic(
+            *device_, gpu::GPUBuffer::Type::ComputeStorage, capsule_capacity_);
+        if (!capsule_buffer_) {
+            BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the shadow-capsule buffer ({} bytes)",
+                              capsule_capacity_);
+            capsule_capacity_ = 0;
+            return;
+        }
+    }
+
+    gpu::GPUBuffer::Mapping mapping = capsule_buffer_->map();
+    if (!mapping) {
+        BRACKEN_LOG_ERROR("rt", "RtRenderer: could not map the shadow-capsule transfer buffer");
+        return;
+    }
+    std::memcpy(mapping.data(), capsules.data(), required);
+    mapping.upload(copy_pass, required);
+    capsule_count_ = static_cast<uint32_t>(capsules.size());
+}
+
+bool RtRenderer::ensure_capsule_dummy() {
+    if (capsule_dummy_) {
+        return true;
+    }
+    if (device_ == nullptr) {
+        return false;
+    }
+    // One zeroed capsule. ComputeStorage for the same reason the real buffer is:
+    // two of the four consumers bind it to a read-write slot.
+    const rt::ShadowCapsule zero{};
+    capsule_dummy_ = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::ComputeStorage,
+                                                   &zero, sizeof(zero));
+    if (!capsule_dummy_) {
+        BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the shadow-capsule stand-in buffer");
+        return false;
+    }
+    return true;
+}
+
+SDL_GPUBuffer* RtRenderer::capsule_binding() {
+    // A storage-buffer descriptor may never be empty, so a capsule-less frame
+    // still binds SOMETHING; `shadowCapsuleCount == 0` is what guarantees it is
+    // never indexed. Returning the stand-in whenever the real buffer is missing
+    // (not only when the count is zero) also covers the failed-allocation path
+    // above, which leaves the count at zero but may leave the pointer null.
+    if (capsule_count_ > 0 && capsule_buffer_) {
+        return capsule_buffer_->handle();
+    }
+    return ensure_capsule_dummy() ? capsule_dummy_->handle() : nullptr;
 }
 
 // One place that copies the structure's accounting out of RtScene, so the
@@ -475,6 +547,9 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                 std::cos(glm::radians(std::max(shadows.sun_angular_radius_degrees, 0.0f)));
             u.frameIndex = sun_shadow_.frame_index;
             u.hasGBuffer = normal_rough != nullptr ? 1u : 0u;
+            // §5.8. The gradient replay below reads the SAME latched count, so
+            // the two dispatches cannot disagree about the occluder set.
+            u.shadowCapsuleCount = capsule_count_;
 
             // cycle = false: the OTHER half of this ping-pong is the previous
             // frame's bits and the gradient pass is about to read it, so a
@@ -496,9 +571,11 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                      nearest_clamp_sampler_},
                 }};
                 pass.bind_samplers(0, textures);
-                const std::array<SDL_GPUBuffer*, 4> buffers{
+                // Four acceleration buffers, then the capsule set at t6 (§5.8).
+                // This pass has read-only headroom; rt_local_shadow does not.
+                const std::array<SDL_GPUBuffer*, 5> buffers{
                     scene_.tlas_nodes(), scene_.tlas_instances(), scene_.blas_nodes(),
-                    scene_.blas_triangles()};
+                    scene_.blas_triangles(), capsule_binding()};
                 pass.bind_storage_buffers(0, buffers);
                 pass.push_uniforms(0, &u, sizeof(u));
                 // One group PER TILE — the group is the 8x4 tile whose bits it
@@ -763,6 +840,8 @@ bool RtRenderer::trace_sun_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoise
     u.depthA = params.depth_a;
     u.depthB = params.depth_b;
     u.depthRejectRelative = GRADIENT_DEPTH_REJECT_RELATIVE;
+    // Exactly what the trace used, one dispatch ago (§5.8).
+    u.shadowCapsuleCount = capsule_count_;
 
     const SDL_GPUStorageTextureReadWriteBinding rw{.texture = d.gradient[0]->handle(),
                                                    .mip_level = 0, .layer = 0, .cycle = true,
@@ -786,8 +865,12 @@ bool RtRenderer::trace_sun_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoise
     // because render() advances it only after this returns.
     const std::array<SDL_GPUTexture*, 1> ro_tex{d.bits[d.bits_index]->handle()};
     pass.bind_storage_textures(0, ro_tex);
-    const std::array<SDL_GPUBuffer*, 4> buffers{scene_.tlas_nodes(), scene_.tlas_instances(),
-                                                scene_.blas_nodes(), scene_.blas_triangles()};
+    // The capsule set as a fifth, and the SAME buffer the trace bound: a replay
+    // that cannot see the trace's occluders fires a gradient on every
+    // capsule-shadowed pixel, every frame, forever.
+    const std::array<SDL_GPUBuffer*, 5> buffers{scene_.tlas_nodes(), scene_.tlas_instances(),
+                                                scene_.blas_nodes(), scene_.blas_triangles(),
+                                                capsule_binding()};
     pass.bind_storage_buffers(0, buffers);
     pass.push_uniforms(0, &u, sizeof(u));
     pass.dispatch_for(*pipeline, static_cast<uint32_t>(sx), static_cast<uint32_t>(sy));
@@ -825,7 +908,12 @@ bool RtRenderer::trace_local_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoi
     // Exactly what the trace resolved a dispatch ago — see the members.
     u.emissiveCount = local_emissive_count_;
     u.emissiveHistoryValid = local_emissive_history_valid_;
+    u.shadowCapsuleCount = capsule_count_; // exactly what the trace used
     if (local_emissive_bound_ == nullptr && !ensure_emissive_dummy()) {
+        return false;
+    }
+    SDL_GPUBuffer* capsule_buf = capsule_binding();
+    if (capsule_buf == nullptr) {
         return false;
     }
 
@@ -836,12 +924,17 @@ bool RtRenderer::trace_local_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoi
     // The emissive records ride the second slot for the same budget reason the
     // trace's third does, and are the SAME buffer the trace bound — a replay
     // aimed at a different record set is not a replay.
-    const std::array<SDL_GPUStorageBufferReadWriteBinding, 2> rw_bufs{{
+    // The capsule set rides a third slot for the same budget reason, and is the
+    // SAME buffer the trace bound — a replay aimed at a different occluder set
+    // is not a replay, and would fire a gradient on every capsule-shadowed
+    // stratum forever.
+    const std::array<SDL_GPUStorageBufferReadWriteBinding, 3> rw_bufs{{
         {.buffer = local_reservoirs_[prev_reservoir]->handle(), .cycle = false,
          .padding1 = 0, .padding2 = 0, .padding3 = 0},
         {.buffer = local_emissive_bound_ != nullptr ? local_emissive_bound_
                                                     : local_emissive_dummy_->handle(),
          .cycle = false, .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        {.buffer = capsule_buf, .cycle = false, .padding1 = 0, .padding2 = 0, .padding3 = 0},
     }};
     gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw_tex, 1}, rw_bufs);
     if (!pass) {
@@ -1254,6 +1347,7 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     u.emissiveHistoryValid = (emissive_live && local_emissive_epoch_ == epoch) ? 1u : 0u;
     local_emissive_epoch_ = epoch;
     local_emissive_count_ = u.emissiveCount;
+    u.shadowCapsuleCount = capsule_count_; // §5.8; the replay reads the same latch
     local_emissive_history_valid_ = u.emissiveHistoryValid;
     stats_.emissive_di_sampled = emissive_live;
 
@@ -1289,18 +1383,29 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     // a read-write slot for the same budget reason. A scene with no emitter
     // binds the 1-element stand-in — a storage-buffer descriptor may not be
     // empty — and `emissiveCount = 0` is what stops anything indexing it.
+    //
+    // The FOURTH is §5.8's capsule set, read-only in the shader and in a
+    // read-write slot for the third time and the same budget reason. Its
+    // `capsule_binding()` substitutes the 1-element stand-in on a frame with no
+    // capsules, exactly as the emissive dummy does.
     if (!ensure_emissive_dummy()) {
         return false;
     }
     SDL_GPUBuffer* emissive_buf =
         emissive_live ? scene_.emissive_records() : local_emissive_dummy_->handle();
     local_emissive_bound_ = emissive_buf;
-    const std::array<SDL_GPUStorageBufferReadWriteBinding, 3> rw_bufs{{
+    SDL_GPUBuffer* capsule_buf = capsule_binding();
+    if (capsule_buf == nullptr) {
+        return false;
+    }
+    const std::array<SDL_GPUStorageBufferReadWriteBinding, 4> rw_bufs{{
         {.buffer = local_reservoirs_[next]->handle(), .cycle = false,
          .padding1 = 0, .padding2 = 0, .padding3 = 0},
         {.buffer = local_reservoirs_[prev]->handle(), .cycle = false,
          .padding1 = 0, .padding2 = 0, .padding3 = 0},
         {.buffer = emissive_buf, .cycle = false,
+         .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        {.buffer = capsule_buf, .cycle = false,
          .padding1 = 0, .padding2 = 0, .padding3 = 0},
     }};
     gpu::ComputePass pass = gpu::ComputePass::begin(cmd, rw_tex, rw_bufs);

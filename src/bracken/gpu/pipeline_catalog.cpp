@@ -801,8 +801,13 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // per triangle and reflections cost 112. The output is one BIT per pixel
      // packed into 8x4 tiles, not an R8 mask — the denoiser's classifier reads
      // 32 pixels per fetch off the back of that.
+     //
+     // FIVE read-only storage buffers since §5.8: the fifth is the frame's
+     // ShadowCapsule set, the animated stand-in for the skinned instances this
+     // walk now skips. This pass has the headroom (five of SDL3's eight);
+     // rt_local_shadow does not, and rides a read-write slot for the same data.
      .resources = {.num_samplers = 2,
-                   .num_readonly_storage_buffers = 4,
+                   .num_readonly_storage_buffers = 5,
                    .num_readwrite_storage_textures = 1,
                    .num_uniform_buffers = 1}},
     {.name = "RtShadowClassify",
@@ -833,10 +838,12 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // lighting changed" from "a different surface is here now". Read-only
      // storage texture: the PREVIOUS frame's packed bits, the thing being
      // compared against. Then the four acceleration buffers, because this pass
-     // genuinely re-traces.
+     // genuinely re-traces — plus, since §5.8, the capsule set as a fifth. The
+     // replay must see the occluders the trace saw, or every capsule-shadowed
+     // pixel reports a permanent gradient and its history never accumulates.
      .resources = {.num_samplers = 4,
                    .num_readonly_storage_textures = 1,
-                   .num_readonly_storage_buffers = 4,
+                   .num_readonly_storage_buffers = 5,
                    .num_readwrite_storage_textures = 1,
                    .num_uniform_buffers = 1}},
     {.name = "RtLocalShadowGradient",
@@ -854,11 +861,14 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // Without them a flagged index falls through the light remap as
      // out-of-range and every emissive-lit stratum reports a full gradient
      // forever — a permanent history reset exactly where the new lights are.
+     // §5.8 added a THIRD for the identical reason and with the identical
+     // failure mode: the frame's ShadowCapsule set, which the replay must see
+     // because the trace did.
      .resources = {.num_samplers = 3,
                    .num_readonly_storage_textures = 1,
                    .num_readonly_storage_buffers = 8,
                    .num_readwrite_storage_textures = 1,
-                   .num_readwrite_storage_buffers = 2,
+                   .num_readwrite_storage_buffers = 3,
                    .num_uniform_buffers = 2}},
     {.name = "RtGradientReconstruct",
      .shader = "rt_gradient_reconstruct.comp.spv",
@@ -949,10 +959,15 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // riding a read-write slot because there is no read-only one left. Its
      // Vose alias table rides INSIDE the records (one bucket per record), which
      // is what kept this to one slot rather than two.
+     //
+     // §5.8 added a FOURTH, again for the budget and not by preference: the
+     // frame's ShadowCapsule set, the animated occluders that stand in for the
+     // skinned instances the any-hit walk now skips. The sun pass binds the
+     // same data as an ordinary read-only buffer because it has slots left.
      .resources = {.num_samplers = 3,
                    .num_readonly_storage_buffers = 8,
                    .num_readwrite_storage_textures = 3,
-                   .num_readwrite_storage_buffers = 3,
+                   .num_readwrite_storage_buffers = 4,
                    .num_uniform_buffers = 2}},
     {.name = "RtDiTemporal",
      .shader = "rt_di_denoise_temporal.comp.spv",

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <glm/glm.hpp>
+#include <span>
 
 namespace bracken::scene {
 
@@ -74,6 +75,12 @@ public:
     }
     void add_debug_box(const glm::vec3& min, const glm::vec3& max, bracken::core::Color color) {
         builder_->add_debug_box(min, max, color);
+    }
+    /** Analytic shadow occluders for the traced visibility passes — see
+     *  FrameBuilder::Lane::add_shadow_capsules for the contract and the budget.
+     *  Copied into packet memory; emit them fresh every frame. */
+    void add_shadow_capsules(std::span<const bracken::render::rt::ShadowCapsule> capsules) {
+        builder_->add_shadow_capsules(capsules);
     }
     void spawn_effect(const bracken::EffectDefinition* definition, const glm::vec3& position,
                       const glm::vec3& direction = {1, 0, 0}) {

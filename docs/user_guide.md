@@ -726,7 +726,7 @@ Counters: `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distanc
 
 ### What the frame threw away: frame_diagnostics
 
-`Application::frame_diagnostics()` returns a `FrameDiagnostics` covering every silent drop path: `draws_dropped_unknown_model`, `skinned_dropped_no_skeleton`, `palettes_over_budget`, `effect_models_unresolved`, `lights_dropped`, `cluster_lights_dropped`, and `camera_missing`. Unlike `render_stats()` these are accumulated **unconditionally** — a dropped draw is not opt-in instrumentation. `diag.any()` is the one-line "is anything wrong" predicate. If you built a frame and see nothing, read this before reading anything else.
+`Application::frame_diagnostics()` returns a `FrameDiagnostics` covering every silent drop path: `draws_dropped_unknown_model`, `skinned_dropped_no_skeleton`, `palettes_over_budget`, `shadow_capsules_over_budget`, `effect_models_unresolved`, `lights_dropped`, `cluster_lights_dropped`, and `camera_missing`. Unlike `render_stats()` these are accumulated **unconditionally** — a dropped draw is not opt-in instrumentation. `diag.any()` is the one-line "is anything wrong" predicate. If you built a frame and see nothing, read this before reading anything else.
 
 ### Where the frame's time went
 
@@ -4560,9 +4560,14 @@ traced instance list gets no sun shadow there rather than falling back to CSM.
 
 #### Things to know before you ship it
 
-- **Skinned meshes trace their bind pose.** An animated character's traced
-  shadow tracks it around the world but does not animate with it. Since the
-  traced mask replaces CSM, that *is* the shadow, not a fallback.
+- **Skinned characters need you to emit shadow capsules — or they cast no
+  traced shadow at all.** A BLAS is built once from bind-pose CPU geometry, so a
+  skinned instance's triangles are a rigid statue; because the traced mask
+  *replaces* CSM, that statue used to BE the character's shadow. The engine now
+  excludes skinned instances from the shadow walks entirely and traces analytic
+  capsules you supply instead. See "Shadow capsules for skinned characters"
+  below — this is the one traced feature with a host obligation attached, and
+  skipping it means your characters have no traced shadow.
 - **A ray hit cannot sample textures** — no bindless, no UVs at the hit. Hit
   shading is an interpolated normal plus one flat colour per triangle, baked
   from the albedo map's centroid sample at load. That restriction stands; the
@@ -4604,6 +4609,103 @@ traced instance list gets no sun shadow there rather than falling back to CSM.
   vanishing or changing places in the list costs a full binned-SAH rebuild, and
   builds climbing with the frame count means something in your list is churning
   its topology every frame.
+
+### Shadow capsules for skinned characters
+
+**If you have animated characters and you turn on `rt_shadows` or
+`rt_local_shadows`, read this section. It is the one traced feature with a host
+obligation attached.**
+
+#### Why you have to do anything
+
+The acceleration structure is built once, from your model's CPU-side triangles,
+in the **bind pose**. A skinned instance in the TLAS carries only the
+character's root transform — the vertices are never re-skinned. So the shadow a
+skinned mesh cast used to be a rigid statue sliding around the world in a
+T-pose, and because the traced mask **replaces** the cascade shadow rather than
+combining with it, that statue *was* the character's shadow.
+
+The engine's answer (`docs/rt_lighting_plan.md` §5.8) is to stop tracing skinned
+triangles for visibility at all, and to trace **capsules you supply** instead —
+a sphere-swept segment per bone, driven by the live skeleton, so the shadow
+animates. The exclusion is per signal:
+
+- **Sun shadows and local-light DI** skip skinned instances and use your
+  capsules. Emit none, and your character has no traced shadow.
+- **Reflections and GI probe rays** are unchanged and still see the bind-pose
+  triangles — your character stays in mirrors and keeps bouncing light, with the
+  pose error that is invisible at those scales. **Reflections are still the bind
+  pose. Capsules do not fix that and are not meant to.**
+
+#### The recipe
+
+`render::rt::ShadowCapsule` is `{vec3 p0; float radius; vec3 p1;}` in world
+space — the set of points within `radius` of the segment `p0..p1`. `p0 == p1`
+is legal and degenerates to a sphere, which is how you express a head or a fist.
+
+Read joint **world** transforms, not skinning matrices —
+`animation/attachment.hpp` is the API that gets that distinction right, and
+using a skinning matrix here parks the whole figure near the origin at a strange
+angle (the classic symptom).
+
+```cpp
+// ONCE, at load — find_joint is a linear name scan.
+hips_  = bracken::animation::find_joint(model->skeleton, "Hips");
+spine_ = bracken::animation::find_joint(model->skeleton, "Spine");
+// ...
+
+// EVERY FRAME, in on_simulate, AFTER the animation update and after every
+// procedural layer (foot IK, body lean) — those move joints too, and deriving
+// capsules before them puts the shadow a step behind the pose.
+using bracken::animation::attachment_position;
+const auto at = [&](auto joint, glm::vec3 local = {}) {
+    return attachment_position(character_world, player_, joint, local);
+};
+capsules_.clear();
+capsules_.push_back({at(hips_), 12.0f, at(spine_)});    // pelvis + abdomen
+capsules_.push_back({at(spine_), 11.0f, at(head_)});    // chest
+// A bone with no CHILD joint runs to a BONE-LOCAL offset, so it rotates with
+// the bone instead of pointing stubbornly up the world axis:
+capsules_.push_back({at(head_), 9.0f, at(head_, {0, 22, 0})});
+// ... upper/lower legs, feet, arms
+
+frame.add_shadow_capsules(capsules_);   // copied into packet memory
+```
+
+The span is **copied**; your vector is free to be rebuilt next frame. Emit them
+every frame — there is no retained set.
+
+#### Choosing radii
+
+Hand-tune them; do not compute them. A capsule cannot match a box or a torso
+cross section (the playground character's chest is 30 units wide and 18 deep),
+so every radius is a judgement about which silhouette reads better in shadow.
+Bias toward the **smaller** half-extent: an over-fat proxy is the failure you
+notice, because it turns a figure into a snowman. ~a dozen capsules per
+character is the intended density — torso in two, head, four leg segments, two
+feet, two arms is a good default. `examples/playground/playground.cpp`'s
+`rebuild_shadow_capsules` is a complete worked example, radii included.
+
+#### Rules and gotchas
+
+- **Budget: 256 capsules per frame** (`FramePacket::MAX_SHADOW_CAPSULES`). An
+  over-budget span is **truncated**, not rejected, and the remainder lands in
+  `FrameDiagnostics::shadow_capsules_over_budget`. Every capsule is tested by
+  every any-hit ray in a linear loop, so the budget is also the cost ceiling —
+  for a crowd, emit capsules only for the characters near enough for their
+  shadow to read.
+- **A capsule does not shadow points inside itself.** That is deliberate: a
+  capsule is a proxy for a body, and the points inside it are that body's own
+  surface, so occluding them would paint your character black. The rejection is
+  per capsule, so an arm still shadows a chest.
+- **Non-skinned objects need nothing.** Props, buildings, orbs and terrain
+  already trace their real triangles. This is only about skinned draws.
+- **Test it headlessly.** `bracken/testing/frame_test.hpp` exposes
+  `TestFrame::shadow_capsules()`, so your derivation is unit-testable with no
+  GPU: pose the skeleton, emit, seal, assert on the segments.
+- **What you give up.** The shadow animates and is smooth, but it is a proxy —
+  no hat brim, no cloak, no weapon silhouette, no cloth. If you need those, you
+  need per-frame re-skinning and a BLAS refit, which the engine does not do.
 
 ### Quick reference: which knob lives where
 
@@ -7895,8 +7997,10 @@ every constraint those two carry:
   on the playground's 60-model village. Enable it at load, not mid-combat.
 - The BLAS + attribute buffers stay **resident** (27 MB on that village) on top
   of the field's own ~30 MB.
-- Skinned meshes contribute their **bind pose**, like every other traced signal.
-  At probe spacing that is invisible.
+- Skinned meshes contribute their **bind pose** — GI probe rays are closest-hit
+  and deliberately still see the character's triangles (the shadow capsules
+  replace them only in the any-hit visibility walks). At probe spacing the pose
+  error is invisible, and characters *receive* GI normally.
 
 Per-frame ray cost comes from `gi_quality`: 32 / 64 / 96 rays per probe over
 1/8 / 1/4 / 1/4 of a cascade per turn, with cascade 0 updating every frame,

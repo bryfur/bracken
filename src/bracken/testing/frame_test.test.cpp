@@ -194,3 +194,90 @@ TEST(TestFrame, LightDescsStaySourceCompatibleAndDefaultToEngineAssignedIds) {
     EXPECT_EQ(frame.spot_lights()[0].radius, 30.0f);
     EXPECT_FALSE(frame.spot_lights()[0].casts_shadows);
 }
+
+// ---------------------------------------------------------------------------
+// Analytic shadow occluders (docs/rt_lighting_plan.md §5.8). Published on the
+// host surface because deriving them from a rig is the HOST's job — so a game
+// has to be able to unit-test its own derivation with no GPU in the room.
+// ---------------------------------------------------------------------------
+
+namespace {
+using bracken::render::rt::ShadowCapsule;
+
+/// Two "limbs", the way a host would emit them from joint world transforms.
+std::vector<ShadowCapsule> limbs(float y) {
+    return {
+        ShadowCapsule{{0.0f, y, 0.0f}, 12.0f, {0.0f, y + 35.0f, 0.0f}, 0.0f},
+        ShadowCapsule{{-12.0f, y - 5.0f, 0.0f}, 6.0f, {-12.0f, y - 50.0f, 0.0f}, 0.0f},
+    };
+}
+} // namespace
+
+TEST(TestFrame, ShadowCapsulesAreCopiedIntoThePacket) {
+    TestFrame frame;
+    {
+        // The span dies at the end of this scope; the packet must not care.
+        const std::vector<ShadowCapsule> caps = limbs(95.0f);
+        frame.sink().add_shadow_capsules(caps);
+    }
+    frame.seal();
+
+    ASSERT_EQ(frame.shadow_capsules().size(), 2u);
+    EXPECT_EQ(frame.shadow_capsules()[0].p0, glm::vec3(0.0f, 95.0f, 0.0f));
+    EXPECT_EQ(frame.shadow_capsules()[0].radius, 12.0f);
+    EXPECT_EQ(frame.shadow_capsules()[1].p1, glm::vec3(-12.0f, 45.0f, 0.0f));
+    EXPECT_EQ(frame.build_diagnostics().shadow_capsules_over_budget, 0u);
+}
+
+TEST(TestFrame, ShadowCapsulesConcatenateAcrossCalls) {
+    TestFrame frame;
+    frame.sink().add_shadow_capsules(limbs(95.0f));
+    frame.sink().add_shadow_capsules({}); // an empty span is a legal no-op
+    frame.sink().add_shadow_capsules(limbs(200.0f));
+    frame.seal();
+
+    ASSERT_EQ(frame.shadow_capsules().size(), 4u);
+    EXPECT_EQ(frame.shadow_capsules()[0].p0.y, 95.0f);
+    EXPECT_EQ(frame.shadow_capsules()[2].p0.y, 200.0f);
+}
+
+TEST(TestFrame, NoShadowCapsulesIsTheDefault) {
+    TestFrame frame;
+    frame.sink().draw_model(1, glm::mat4(1.0f));
+    frame.seal();
+    EXPECT_TRUE(frame.shadow_capsules().empty());
+}
+
+TEST(TestFrame, ShadowCapsulesOverBudgetAreTruncatedAndCounted) {
+    TestFrame frame;
+    constexpr uint32_t k_budget = FramePacket::MAX_SHADOW_CAPSULES;
+    // One over-budget span, so the truncation has to happen mid-call.
+    const std::vector<ShadowCapsule> flood(k_budget + 40, ShadowCapsule{});
+    frame.sink().add_shadow_capsules(flood);
+    // And a second call once the budget is entirely spent.
+    frame.sink().add_shadow_capsules(limbs(0.0f));
+    frame.seal();
+
+    // The capsules that FIT are kept — a host that overruns the budget keeps
+    // its first occluders rather than losing whichever call landed last.
+    EXPECT_EQ(frame.shadow_capsules().size(), k_budget);
+    // Counted per capsule, not per call: 40 from the flood, 2 from the second.
+    EXPECT_EQ(frame.build_diagnostics().shadow_capsules_over_budget, 42u);
+    EXPECT_TRUE(frame.build_diagnostics().any());
+}
+
+TEST(TestFrame, ShadowCapsulesMergeInLaneOrder) {
+    TestFrame frame(/*lane_count=*/3);
+    frame.builder().lane(2).add_shadow_capsules(limbs(300.0f));
+    frame.builder().lane(0).add_shadow_capsules(limbs(100.0f));
+    frame.builder().lane(1).add_shadow_capsules(limbs(200.0f));
+    frame.seal();
+
+    // Deterministic (lane-index, emission-order), not emission order — the same
+    // rule every other command chain follows, and what keeps a fanned-out frame
+    // byte-identical at any worker count.
+    ASSERT_EQ(frame.shadow_capsules().size(), 6u);
+    EXPECT_EQ(frame.shadow_capsules()[0].p0.y, 100.0f);
+    EXPECT_EQ(frame.shadow_capsules()[2].p0.y, 200.0f);
+    EXPECT_EQ(frame.shadow_capsules()[4].p0.y, 300.0f);
+}

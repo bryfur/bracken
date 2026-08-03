@@ -736,6 +736,40 @@ the passes have different sampled-texture counts, only reflections bind the
 per-triangle attribute buffer, and only `rt_local_shadow.comp` binds the
 cluster grid.
 
+**A THIRD, OPTIONAL macro: `RT_TRACE_CAPSULES`** (docs/rt_lighting_plan.md
+§5.8). Define it alongside `RT_TRACE_TRAVERSAL` to opt into the analytic
+`ShadowCapsule` sweep `sceneOccluded` runs before it walks the TLAS, and declare
+two more things: a `StructuredBuffer<ShadowCapsule> shadowCapsules` (a
+`RWStructuredBuffer` is equally acceptable — see the slot note below) and a
+`uint shadowCapsuleCount` cbuffer member. Without the macro `capsulesOccluded`
+compiles to a constant `false` and the traversal is byte-identical to its
+pre-capsule form.
+
+It is **opt-in rather than unconditional** for a binding reason, not a taste
+one: only the four ANY-HIT passes (`rt_shadow.comp`, `rt_local_shadow.comp`,
+`rt_shadow_gradient.comp`, `rt_local_shadow_gradient.comp`) call
+`sceneOccluded`, and forcing `rt_reflection.comp` / `gi_probe_trace.comp` /
+`gi_screen_probe_trace.comp` to declare a buffer they never read would change
+their reflected resource layout — see the note above on DXC leaving an unread
+`Texture2D`/sampler pair unmerged. Declare what you read.
+
+Two of those four bind the capsules **read-only** (`rt_shadow` at t6,
+`rt_shadow_gradient` at t9 — both have room under SDL3's eight read-only storage
+buffers) and two bind the *same* buffer to a **read-write** slot they only ever
+read (`rt_local_shadow` at u6, `rt_local_shadow_gradient` at u3), because their
+eight read-only slots were spent before capsules existed. Reading through a
+read-write binding is legal and is the precedent R2b's reservoir ping-pong and
+R6's emissive records already set.
+
+The traversal also carries a **skinned flag in the high bit of
+`TlasInstance::blasNodeOffset`** (`TLAS_SKINNED_FLAG`, mirroring
+`k_tlas_skinned_flag` in `render/raytracing/bvh.hpp` — the CPU struct is
+uploaded by raw memcpy, so the two must agree bit for bit). Any-hit walks
+`continue` past a flagged instance, because its BLAS is a bind pose and the
+capsules are the animated stand-in; closest-hit walks are deliberately
+unchanged, because a reflection or probe ray has to shade what it finds. **Every
+read of that field masks** — use `tlasNodeOffset(inst)`, never the raw member.
+
 ## SDL3 GPU resource binding order
 
 Bindings must follow SDL3 GPU's set layout, expressed with

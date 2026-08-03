@@ -133,6 +133,7 @@ void draw_stats_tab(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
             diagnostic_row("Draws with an unknown model handle", diag.draws_dropped_unknown_model);
             diagnostic_row("Skinned draws with no skeleton", diag.skinned_dropped_no_skeleton);
             diagnostic_row("Bone palettes over budget", diag.palettes_over_budget);
+            diagnostic_row("Shadow capsules over budget", diag.shadow_capsules_over_budget);
             diagnostic_row("Effect models unresolved", diag.effect_models_unresolved);
             diagnostic_row("Lights past MAX_LIGHTS", diag.lights_dropped);
             diagnostic_row("Cluster light insertions dropped", diag.cluster_lights_dropped);

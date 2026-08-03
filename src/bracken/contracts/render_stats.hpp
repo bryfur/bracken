@@ -100,6 +100,10 @@ struct FrameDiagnostics {
     /// alloc_bone_palette() calls refused because the frame's
     /// MAX_BONE_PALETTES budget was exhausted (each one drops a draw).
     uint32_t palettes_over_budget = 0;
+    /// add_shadow_capsules() capsules refused because the frame's
+    /// MAX_SHADOW_CAPSULES budget was exhausted — analytic occluders the
+    /// traced visibility passes therefore did not test against.
+    uint32_t shadow_capsules_over_budget = 0;
     /// Effect emitters naming a model the ModelManager does not have.
     uint32_t effect_models_unresolved = 0;
     /// Lights the cluster grid refused because MAX_LIGHTS was reached.
@@ -119,6 +123,7 @@ struct FrameDiagnostics {
         draws_dropped_unknown_model += other.draws_dropped_unknown_model;
         skinned_dropped_no_skeleton += other.skinned_dropped_no_skeleton;
         palettes_over_budget += other.palettes_over_budget;
+        shadow_capsules_over_budget += other.shadow_capsules_over_budget;
         effect_models_unresolved += other.effect_models_unresolved;
         lights_dropped += other.lights_dropped;
         cluster_lights_dropped += other.cluster_lights_dropped;
@@ -130,7 +135,8 @@ struct FrameDiagnostics {
     /// about — the one-line "should I look at the numbers?" predicate.
     [[nodiscard]] bool any() const {
         return draws_dropped_unknown_model != 0 || skinned_dropped_no_skeleton != 0 || palettes_over_budget != 0 ||
-               effect_models_unresolved != 0 || lights_dropped != 0 || cluster_lights_dropped != 0 || camera_missing;
+               shadow_capsules_over_budget != 0 || effect_models_unresolved != 0 || lights_dropped != 0 ||
+               cluster_lights_dropped != 0 || camera_missing;
     }
 };
 

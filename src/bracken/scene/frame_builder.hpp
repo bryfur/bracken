@@ -184,6 +184,34 @@ public:
         void add_debug_sphere(const glm::vec3& center, float radius, bracken::core::Color color, int segments = 16);
         void add_debug_box(const glm::vec3& min, const glm::vec3& max, bracken::core::Color color);
 
+        /**
+         * Add analytic shadow occluders for this frame
+         * (docs/rt_lighting_plan.md §5.8).
+         *
+         * The capsules are COPIED into packet memory at emit time, like every
+         * other command — the span may point at a stack array that dies on the
+         * next line. Call it as often as you like; the frame's capsules are the
+         * concatenation of every call in (lane-index, emission-order) order.
+         *
+         * WHAT THEY ARE FOR: a skinned mesh traces its BIND POSE, and the
+         * traced sun mask REPLACES the cascade result, so an animated character
+         * otherwise casts a rigid statue's shadow. Derive ~a dozen capsules
+         * from the live skeleton (`animation/attachment.hpp`'s joint WORLD
+         * transforms — not skinning matrices) and emit them every frame; the
+         * any-hit passes test them before the BVH walk and skip the skinned
+         * instance's bind-pose triangles entirely. Closest-hit paths
+         * (reflections, GI probes) are unaffected and still see the bind pose,
+         * which is what keeps the character in mirrors.
+         *
+         * Budget: FramePacket::MAX_SHADOW_CAPSULES per frame. An over-budget
+         * span is TRUNCATED — the capsules that fit are kept — and the
+         * remainder counted in FramePacket::build_diagnostics(), which seal()
+         * summarizes in one throttled line. Nothing is dropped silently.
+         *
+         * An empty span is a legal no-op (a host with no characters on screen).
+         */
+        void add_shadow_capsules(std::span<const bracken::render::rt::ShadowCapsule> capsules);
+
         /** Queue a particle effect spawn (mirror of add_particle_effect_spawn;
          *  consumed exactly once from the sealed packet). */
         void spawn_effect(const bracken::EffectDefinition* definition, const glm::vec3& position,
@@ -266,6 +294,7 @@ public:
         Chain<BillboardDrawCommand> billboards_;
         Chain<DebugLineDrawCommand> debug_lines_;
         Chain<EffectSpawnCommand> effect_spawns_;
+        Chain<bracken::render::rt::ShadowCapsule> shadow_capsules_;
         Chain<UiCommand> ui_;
         Chain<PaletteFill> palettes_;
         std::byte* text_cur_ = nullptr;
@@ -361,6 +390,9 @@ public:
     }
     void add_debug_box(const glm::vec3& min, const glm::vec3& max, bracken::core::Color color) {
         lane(0).add_debug_box(min, max, color);
+    }
+    void add_shadow_capsules(std::span<const bracken::render::rt::ShadowCapsule> capsules) {
+        lane(0).add_shadow_capsules(capsules);
     }
     void spawn_effect(const bracken::EffectDefinition* definition, const glm::vec3& position,
                       const glm::vec3& direction = {1, 0, 0}) {

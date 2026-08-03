@@ -1237,7 +1237,10 @@ struct alignas(16) RtShadowUniforms {
     float sunCosThetaMax;
     uint32_t frameIndex;      // advances the sample sequence
     uint32_t hasGBuffer;      // 0 = reconstruct the normal from depth taps
-    float _pad0 = 0.0f;
+    /// Analytic capsule occluders bound at t6 (docs/rt_lighting_plan.md §5.8).
+    /// Took the slot that was `_pad0`, so the cbuffer's extent is unchanged.
+    /// 0 collapses the capsule loop and reproduces the pre-capsule trace.
+    uint32_t shadowCapsuleCount = 0;
 };
 
 BRACKEN_HLSL_CBUFFER(RtShadowUniforms, 128);
@@ -1252,7 +1255,7 @@ BRACKEN_HLSL_FIELD(RtShadowUniforms, depthBias, 108);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, sunCosThetaMax, 112);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, frameIndex, 116);
 BRACKEN_HLSL_FIELD(RtShadowUniforms, hasGBuffer, 120);
-BRACKEN_HLSL_FIELD(RtShadowUniforms, _pad0, 124);
+BRACKEN_HLSL_FIELD(RtShadowUniforms, shadowCapsuleCount, 124);
 
 /**
  * Froxel-RIS local-light shadow trace — matches rt_local_shadow.comp.hlsl
@@ -1302,7 +1305,11 @@ struct alignas(16) RtLocalShadowUniforms {
     float emissiveTotalPower = 0.0f;
     uint32_t emissiveCandidateCount = 0;
     uint32_t emissiveHistoryValid = 0;
-    float _pad1 = 0.0f;
+    /// Analytic capsule occluders, bound at u6 in SET 1 for this pass — the
+    /// eight read-only slots were spent before capsules existed, so a read-only
+    /// use of a read-write binding is what the budget leaves (R2b's precedent).
+    /// Took the slot that was `_pad1`, so the extent is unchanged.
+    uint32_t shadowCapsuleCount = 0;
 };
 
 BRACKEN_HLSL_CBUFFER(RtLocalShadowUniforms, 144);
@@ -1323,7 +1330,7 @@ BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveCount, 124);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveTotalPower, 128);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveCandidateCount, 132);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveHistoryValid, 136);
-BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, _pad1, 140);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, shadowCapsuleCount, 140);
 
 /**
  * The Full-DI tier's temporal denoiser — matches
@@ -1470,7 +1477,10 @@ struct alignas(16) RtShadowGradientUniforms {
     float depthA = 0.0f;
     float depthB = 0.0f;
     float depthRejectRelative = 0.05f;
-    uint32_t _pad0 = 0;
+    /// §5.8 — the capsule set the trace used. The replay must see the SAME one
+    /// or every capsule-shadowed stratum fires a gradient forever. Took the
+    /// slot that was `_pad0`, so the extent is unchanged.
+    uint32_t shadowCapsuleCount = 0;
     uint32_t _pad1 = 0;
 };
 
@@ -1490,7 +1500,7 @@ BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, historyValid, 120);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, depthA, 124);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, depthB, 128);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, depthRejectRelative, 132);
-BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, _pad0, 136);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, shadowCapsuleCount, 136);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, _pad1, 140);
 
 /**
@@ -1518,7 +1528,9 @@ struct alignas(16) RtLocalShadowGradientUniforms {
     /// vanished analytic light is.
     uint32_t emissiveCount = 0;
     uint32_t emissiveHistoryValid = 0;
-    uint32_t _pad0 = 0;
+    /// §5.8 — same contract as the sun gradient's: the replay must see the
+    /// trace's capsules. Took the slot that was `_pad0`.
+    uint32_t shadowCapsuleCount = 0;
     uint32_t _pad1 = 0;
     uint32_t _pad2 = 0;
 };
@@ -1536,7 +1548,7 @@ BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, hasGBuffer, 100);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, historyValid, 104);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, emissiveCount, 108);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, emissiveHistoryValid, 112);
-BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad0, 116);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, shadowCapsuleCount, 116);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad1, 120);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad2, 124);
 

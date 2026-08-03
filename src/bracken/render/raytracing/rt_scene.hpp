@@ -170,8 +170,24 @@ public:
      * built, so it degrades as they drift; see
      * `k_tlas_refit_sah_rebuild_ratio` and `k_tlas_max_refits_between_builds`
      * for the two triggers that force a real rebuild back.
+     *
+     * @param skinned_first Index of the first SKINNED instance in the list.
+     *   The caller must hand in a PARTITIONED list — every static instance,
+     *   then every skinned one — and this is the split point; `instances.size()`
+     *   (the default) means "none are skinned". Instances at or past it get
+     *   `k_tlas_skinned_flag` set in their `blas_node_offset`, which is what
+     *   makes the any-hit walks skip their bind-pose triangles in favour of the
+     *   frame's ShadowCapsules (docs/rt_lighting_plan.md §5.8).
+     *
+     *   A partition index rather than a per-instance flag in the input, because
+     *   the renderer builds the list by appending the skinned draws after the
+     *   static ones anyway, and this keeps the element type — and therefore the
+     *   CONTENT HASH's inputs — exactly what they were. Moving the split forces
+     *   a full rebuild (it is mixed into the topology hash), because a refit
+     *   updates bounds and would leave the last build's flags in place.
      */
-    void set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances);
+    void set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances,
+                       uint32_t skinned_first = 0xFFFFFFFFu);
 
     /**
      * Upload whatever changed. Main-thread; no-op when nothing is dirty.
@@ -329,6 +345,10 @@ private:
     /// refit case, and both come out of the same single pass over the list.
     uint64_t topology_hash_ = 0;
     bool has_instance_hash_ = false;
+    /// Partition point of the last accepted list: instances at or past it are
+    /// skinned and carry `k_tlas_skinned_flag`. Clamped to the list size on
+    /// entry, so the "none are skinned" default needs no sentinel handling.
+    uint32_t skinned_first_ = 0xFFFFFFFFu;
     /// Every instance's transform as it arrived last time, indexed by INPUT
     /// index (i.e. before the no-BLAS filter). The refit path compares against
     /// this so it recomputes an inverse and eight corner transforms only for
