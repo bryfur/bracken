@@ -2,7 +2,12 @@
 
 Status: **COMPLETE — every phase R0 through R6 has landed** (2026-08-02),
 plus the cross-cutting **§5.8 dynamic/skinned geometry policy** (capsule
-occluders for the two visibility signals; see its landed note).
+occluders for the two visibility signals; see its landed note) and the
+**R7 quality package** (2026-08-02): spatial reservoir reuse under pairwise
+MIS (§5.3), the directional basis for the Full-DI tier (§5.7's first
+follow-up), a second a-trous iteration of the DI spatial filter, and the
+`[rtbench] di noise` probe that makes all three measurable. R7 closed the two
+oldest deferred items in this document; §5.3 and §5.7 carry its landed notes.
 R0 (foundations), R1 (probe-field GI), R2 (froxel-RIS local-light shadows),
 R3 (honest hit lighting), R4 (HZB + indirect dispatch in R4a, the screen-probe
 gather in R4b), R5 (SSILVB in R5a, the denoiser core in R5b, the Full-DI tier
@@ -883,8 +888,10 @@ default, seven touch points, dev-panel row, `[smoke] settings` field and a
   table**, having cost 0.0384 / 0.0423. Frame render 2.069 → 2.177 ms and
   `present_wait` 1.631 → 1.762 ms: the real cost is on the device, as it should
   be for 360 k more rays. 1398 tests pass.
-- **Still open here.** No spatial reuse pass (§5.3's "High only" pairwise-MIS
-  neighbours) — temporal alone is enough at this light count. The emitter
+- **Still open here.** ~~No spatial reuse pass (§5.3's "High only" pairwise-MIS
+  neighbours) — temporal alone is enough at this light count.~~ *(Landed in
+  R7a below; "temporal alone is enough" turned out to be true of a STATIC
+  camera and false of a moving one — see the noise table there.)* The emitter
   radius is one global constant (10 world units); per-light authoring is R6's.
   And the Full-DI tier remains R5's, deliberately not declared as an
   enumerator so an on-disk `2` clamps down rather than opting into a tier that
@@ -1032,6 +1039,172 @@ scene fragment shaders stop calling `accumulateClusterLights` altogether.
   moments driving the DI spatial radius (it uses the accumulation count as a
   proxy); and per-light opt-out, which would let the atlas keep a gameplay-
   critical hard shadow while everything else is traced.
+
+**Landed (R7a, 2026-08-02) — spatial reservoir reuse, pairwise MIS, in BOTH
+tiers.** The "optional spatial pass (3-5 neighbours, pairwise MIS) on High only"
+this section has proposed since it was written, deferred by R2b on the grounds
+that "temporal alone is enough at this light count". That was measured against a
+PINNED camera. Against a moving one the same scene's frame-to-frame DI noise is
+**twelve times higher** (0.00047 vs 0.00593, `[rtbench] di noise`), which is the
+condition the user complaint that opened R7 was made in and the condition the
+whole repo's measurement apparatus had been structurally unable to see.
+
+- **Two dispatches of ONE pipeline**, not two pipelines and not one dispatch.
+  A spatial pass reads its NEIGHBOURS' temporal output and a compute dispatch has
+  no cross-workgroup barrier, so reuse inside a single dispatch could only reach
+  the thread's own 8x4 group — which is neither the documented radius nor free of
+  tile-boundary structure. The split is forced by the memory model. One pipeline
+  because R5b's gradient replay has to reproduce every resolution the trace makes
+  (the per-light emitter radius, the emissive epoch, the capsule set, the sample
+  sequence), and a second module is a second place for those to drift; `stage` is
+  a uniform, the bindings are identical, and what the CPU changes between the two
+  dispatches is which reservoir buffer sits in each of the two slots. A THIRD
+  reservoir buffer joins the ping-pong as stage 0's scratch — not as a ping-pong
+  member, because the pair must keep meaning exactly "last frame's final" and
+  "this frame's final" for the temporal merge and the gradient replay both.
+- **The ray moved AFTER the reuse**, as this section prescribes. Tracing before
+  the merge would shadow a light the pixel then discards and pair one light's
+  radiance with another light's visibility — an unbounded bias, worst exactly
+  where the spatial pass helps most.
+- **The gradient replay is unchanged and did not need to be.** The contract it
+  depends on is that `reservoirOut` holds THE LIGHT THE RAY WAS AIMED AT and that
+  the ray's cap sample is `rtSample2D(coord, frameIndex)` at the pixel's own
+  coordinate. Both were true before R7a and are true after it: the spatial merge
+  changes which light lands in that record, not the record's meaning nor the
+  sample stream. Written down at the top of `rt_local_shadow.comp.hlsl`, because
+  it is the reason the merge writes its result into the reservoir the gradient
+  reads rather than keeping a pre-spatial copy for the replay's benefit.
+- **PAIRWISE MIS, derived and tested before it was transliterated.**
+  `render/lighting/reservoir.hpp`'s `PairwiseSpatialMerge` is the source of
+  truth. Pair each neighbour against the canonical —
+  `a_i(x) = M_i p̂_i(x) / (M_i p̂_i(x) + M_c p̂_c(x))`, `b_i = 1 - a_i` — and set
+  `m_i = a_i / k`, `m_c = (1/k) Σ_i b_i`. Those sum to 1 for EVERY x
+  unconditionally, including both degenerate cases (a light outside the
+  neighbour's domain gives `a_i = 0, b_i = 1`; one outside the canonical's gives
+  `a_i = 1, b_i = 0`), which is the whole unbiasedness argument. The estimator is
+  `W = Σ_j m_j(X_j) p̂_c(X_j) W_j / p̂_c(y)` with **no division by M** — the
+  structural difference from the temporal `finalize()`, and the thing to check
+  first if the tier ever goes dim. Cost is three target evaluations per
+  neighbour, one of which (`p̂_i(X_c)`, our sample at the neighbour's surface) is
+  what makes it pairwise rather than 1/Z and is why the pass reconstructs each
+  neighbour's SURFACE rather than only gating on a stored depth.
+- **Seven CPU tests** (`reservoir.test.cpp`), of which two are the ones that
+  matter: partition-of-unity checked directly on the algebra, and a **brute-force
+  unbiasedness gate** over 20 000 deterministic trials in a toy world of four
+  pixels with deliberately DISJOINT froxel domains, against an integral small
+  enough to add up exactly. Measured on that same world, the confidence-weighted
+  (1/Z) merge the temporal path uses lands at **0.65x** the integral — 35 % of the
+  energy lost — which is what the world was built to expose and what the pairwise
+  weights fix. The other five pin the identity at k = 0 (bit for bit), that an
+  empty neighbour is not an input, that `w_sum` is order-independent, that a light
+  outside the centre's domain can never be selected, and that confidence sums.
+- **The neighbour ring is documented and deterministic**: eight directions at
+  45-degree steps at two alternating radii, walked with a STRIDE OF 3 (coprime
+  with 8, so three picks span 135 degrees rather than clustering in a quadrant)
+  from a start that rotates with both `frameIndex` and the pixel — the first so a
+  surface accumulates a different neighbourhood every frame, the second so the
+  whole screen does not sample in lockstep and print the ring into the noise.
+  Gated on depth (the temporal merge's relative 5 %) and normal (dot > 0.9);
+  **that gate is a VARIANCE gate, not a bias one** — the pairwise weights are
+  unbiased across a crease too, so a neighbour let through would contribute a
+  sample with `p̂_c` near zero and cost three evaluations to do it.
+- **BOTH TIERS, and the decision is recorded rather than inherited.** §5.3 said
+  "High only". The reuse improves WHICH LIGHT the reservoir picks, and both tiers
+  spend that choice — Ratio's mask is the winner's visibility bit, Full's estimate
+  is the winner's radiance — so gating it to Full would have meant two sampling
+  paths behind one gradient replay, the arrangement R2b spent its whole design
+  avoiding. `RtLocalShadowSettings::spatial_neighbors = 0` is the escape hatch and
+  the A/B control at once, and it reproduces the pre-R7a image **bit for bit**:
+  `PLAYGROUND_RT_SPATIAL=0` gives `RT=both RT_LOCAL=ratio` `85.3 / 47.6` and night
+  `35.7 / 57.6`, which are R6's recorded Ratio pins to the digit. The shipped
+  default k = 3 moves them to `85.3 / 47.5` and `35.3 / 57.2`.
+- **k = 5 was measured and is not better**: `0.00457 / 0.00795` against k = 3's
+  `0.00448 / 0.00798` under the moving camera. Three neighbours is where the ring
+  stops adding information faster than it adds cost.
+
+**Landed (R7c, 2026-08-02) — a second a-trous iteration of the DI spatial
+filter.** `RtDiSpatial` is dispatched twice, `stepSize` 1 then 2: the same tap
+count over twice the footprint, which is what a second pass buys that widening
+the first does not. It is skippable two ways and both matter — **per pixel**, a
+texel whose accumulation has reached `DI_FILTER_CONVERGED_COUNT` passes through
+the wide iteration untouched, so a steady-state image stays exactly as sharp as
+it was and the wide pass works only where the noise is; and **per frame**, by
+`di_spatial_iterations = 1`, which reproduces the R5c chain. `isFinal` decides
+whether the diffuse alpha carries the count onward or becomes the view depth the
+forward reconstruction reads — a uniform rather than an inference, because
+getting it backwards makes the forward pass read a sample count as a depth and
+reject every tap, silently. **It costs no memory**: the intermediate target is
+the `raw` triple, which the temporal dispatch has already consumed and which
+nothing reads again until next frame's trace overwrites it.
+
+**The instrument, and why R7 built one first.** `[rtbench] di noise` is a
+compute reduction over the FINAL DI targets — mean absolute frame-to-frame delta
+of `luminance(diffuse) + luminance(spec)`, accumulated as rounded fixed point
+into three more slots of the R5b counter buffer and differenced across the same
+lagged readback. It measures the demodulated buffers rather than the frame
+because the frame carries the sun, TAA, bloom and auto-exposure, every one of
+which would move the number for reasons unrelated to this denoiser. It is OFF
+unless `RtLocalShadowSettings::di_noise_probe` is set, which only `--rt-bench`
+does. `PLAYGROUND_RT_BENCH_ORBIT=1` gives the bench the smoke run's ORBITING
+camera, which is the only condition in this repo that reproduces the complaint:
+a moving camera disoccludes, and a disocclusion is where a 1-spp reservoir
+estimate is at its worst.
+
+Two things the probe taught, both recorded because both are easy to repeat.
+Its first version shared one per-texel clamp between the delta and the level
+lanes, and reported a **15 % level drop from spatial reuse** — a denoiser
+improvement reading as a signal loss, because smoothing the demodulated
+specular tail moves texels from "clamped" to "measured". The frame it came from
+got BRIGHTER over the same change. And a truncating fixed-point accumulator
+biases a 5e-4 quantity toward zero, which is the direction that would flatter
+the change under test; it rounds now.
+
+**Measured**, playground village, 1600x900, Linux/Vulkan, RelWithDebInfo,
+`--rt-bench 120`, 90 sampled frames. `before` is `PLAYGROUND_RT_SPATIAL=0
+PLAYGROUND_RT_DI_ITERS=1` in the same binary, so the directional basis and the
+two-dispatch split are common to both columns and the comparison isolates the
+two noise fixes:
+
+| condition | mean abs delta | p95 | reduction |
+|---|---|---|---|
+| pinned camera, day, before | 0.00047 | 0.00123 | — |
+| pinned camera, day, after | **0.00041** | **0.00099** | −13 % / −20 % |
+| pinned camera, night, before | 0.00049 | 0.00128 | — |
+| pinned camera, night, after | **0.00045** | **0.00108** | −8 % / −16 % |
+| ORBITING camera, day, before | 0.00593 | 0.00900 | — |
+| ORBITING camera, day, after | **0.00448** | **0.00798** | **−24 %** / −11 % |
+| ORBITING camera, night, before | 0.00608 | 0.00912 | — |
+| ORBITING camera, night, after | **0.00467** | **0.00812** | **−23 %** / −11 % |
+
+Split between the two fixes (day, orbiting): spatial reuse alone
+`0.00593 -> 0.00456`, the second iteration alone `0.00593 -> 0.00577`. **Spatial
+reuse is the larger half by a wide margin**, which is the answer to "is a second
+blur enough" and it is no.
+
+The honest reading of that table has three parts. The pinned camera understates
+the problem by an order of magnitude and the fix by half. Under motion the
+package removes about a quarter of the frame-to-frame delta — a real
+improvement, not a transformation; one ray per pixel is still one ray per pixel.
+And `level` is a CONTEXT figure dominated by the demodulated specular tail, not
+an energy measure: read the absolute delta, not the ratio.
+
+**Cost.** `--rt-bench 120`, back to back: `RTLocalShadows` CPU record
+`0.0334 -> 0.0345 ms` (the second dispatch is inside the same scope), frame
+render `4.226 -> 4.256 ms`, `present_wait` `3.540 -> 3.608 ms` — so **~0.07 ms
+on the device** for k = 3 plus the extra a-trous iteration, and fps 206.6 ->
+206.1. The always-on halves (the two-dispatch split itself, the direction
+target) cannot be A/B'd without reverting and are not separately attributed.
+
+**The R5b gradient check, run and reported rather than assumed.** `--rt-bench
+120` with and without `PLAYGROUND_SUN_SWEEP=3`: `sun_grad_fire` is unmoved at
+`0.0083 / 0.0086`, and `local_grad_fire` **rises 0.0192 -> 0.0205** (+6.8 %
+relative, +0.13 percentage points), with `local_accum` `23.81 -> 23.63` (−0.8 %).
+The rise is real and attributable: spatial reuse makes a pixel more often
+shadowed by a light whose ray passes near the walking character, so the replay
+finds more genuine changes. It is not the failure the check exists to catch —
+that would be the replay disagreeing with the trace about WHICH light, which the
+contract above rules out — and the accumulation window it costs is under one
+percent. Recorded here rather than waived.
 
 ### 5.4 R3 — Honest hit lighting (reflections meet GI)
 
@@ -1598,7 +1771,8 @@ seam in indirect); tier A/B screenshots.
   the street is the money shot of this whole plan).
 - Sphere/disk **area-light** polish for the DI pass (solid-angle sampling is
   already correct; this is authoring surface: radius on `PointLightDesc`).
-- **A DIRECTIONAL basis for the Full-DI tier** — a third traced target carrying
+- ~~**A DIRECTIONAL basis for the Full-DI tier**~~ (**LANDED, R7b** — note at
+  the end of this section) — a third traced target carrying
   the winning light's dominant direction, so the forward pass can re-apply
   `N·L` with its own NORMAL-MAPPED normal instead of inheriting the prepass
   G-buffer's geometric one. This is the named cost of R5c (§5.3): under a
@@ -1864,10 +2038,10 @@ Validated (`BRACKEN_GPU_DEBUG=1`) run clean. 1523 tests pass (+17).
 The stretch cache was NOT taken — see the status header. What is recorded, in
 rough value order:
 
-1. **A directional basis for the Full-DI tier** (the third traced target above).
-   Still the single most valuable item: it is what would let `Full` become the
-   default recommendation instead of `Ratio`, and R5c's night A/B is the
-   evidence for it.
+1. ~~**A directional basis for the Full-DI tier** (the third traced target
+   above).~~ **DONE — R7b, 2026-08-02**; the landed note is at the end of this
+   section. It was the single most valuable item and it delivered what it
+   promised: the cobbles have their bump lighting back.
 2. **Per-froxel emissive candidate lists.** The ~2.1 ms above is a scene-wide
    alias draw paying for long rays; binning emitters into the cluster grid the
    way point lights are would localize both.
@@ -1888,6 +2062,77 @@ rough value order:
    spatial radius (R5c), `max_accum_frames` above 16 for reflections under a
    moving-camera A/B (R3), and the WP2 64-byte-node A/B through the harness plus
    an Apple-device number (R0) — none of which R6 touched.
+
+**Landed (R7b, 2026-08-02) — the directional basis. The named cost of R5c is
+paid.** A third traced target carries the winning light's DIRECTION (octahedral
+RG16F, traced resolution), and the four scene fragment shaders use it to correct
+the cosine with their own normal-mapped normal instead of inheriting the prepass
+G-buffer's geometric one.
+
+- **A CLAMPED RATIO, not a factor moved across.** The obvious implementation is
+  to stop multiplying `NdotL` in at the trace and multiply it in at the forward
+  pass. It is equivalent on paper. **It was implemented, measured and rejected**:
+  dividing the cosine out inflates the stored estimate by `1/cos`, unbounded at a
+  grazing light, and every texel whose geometric normal barely sees the emitter
+  then carries a huge demodulated value into a denoiser whose entire job is to
+  average it with its neighbours — so the tier gets noisier at exactly the angles
+  it was supposed to be fixed at. The night village measured **38.2 -> 43.7 mean
+  luma** under that form: a systematic brightening, not a wash, because the clamp
+  at zero truncates only the darkening half. What shipped instead is
+  `relief = clamp(max(dot(N_shading, L), 0) / max(dot(N_geometric, L), 0.05), 0,
+  4)`, applied per pixel at full resolution where it can be bounded, with the
+  demodulated pair **unchanged from R5c bit for bit**. `N_geometric` is the
+  interpolated vertex normal the fragment shader already has — the same quantity
+  the prepass wrote — so the denominator reconstructs the factor the trace
+  applied. Six CPU tests in `local_di.test.cpp` pin it, including that the relief
+  is EXACTLY 1 for equal normals (which is why terrain and grass, having no
+  normal map, are untouched in both arithmetic and pixels) and that both halves
+  of the clamp bite where they should.
+- **A direction is not a radiance and is not filtered like one.** The temporal
+  pass DECODES the history, mixes as a vector with the same alpha the radiance
+  halves use, and RENORMALIZES; the spatial pass weights decoded vectors with the
+  same edge-aware weights and renormalizes; the forward 4-tap does the same.
+  Never an EMA on the stored encoding: octahedral coordinates are discontinuous
+  across the fold seam, and an average taken there points at neither input. The
+  direction history is sampled with a NEAREST sampler for the same reason, unlike
+  the two radiance histories. A fully cancelled sum falls back to the surface
+  normal, which makes both cosines equal and the relief exactly 1 — R5c's
+  behaviour, which is the right thing to degrade to.
+- **A third fragment storage texture**, so `CLUSTER_SSBO_BINDING_BASE` moved from
+  `CLUSTER_SAMPLER_COUNT + 2` to `+ 3` in all four scene shaders and the three
+  `k_fs_lit_*` rows went to `num_storage_textures = 3`. Its 1x1 stand-in is a
+  SEPARATE RG16F texture: a storage image is declared in the shader with a
+  channel count and binding a four-channel filler into a two-channel slot is
+  undefined rather than merely wasteful.
+- **What the night A/B shows now.** `PLAYGROUND_TOD_HOUR=1 … RT_LOCAL=full`,
+  same frame R5c photographed: the cobbles under the flashlight have per-stone
+  relief — lit top faces, dark mortar joints, a bevel on every paver — where R5c
+  rendered the albedo over a smooth wash. The stone paving around each lamp, the
+  masonry of the timber-frame house and the roof tiles all gain the same. The
+  character's shadow under the flashlight is unchanged and still reads as a
+  silhouette. **Mean luma 38.2 -> 37.0 with a NARROWER histogram (55.7 -> 54.4)**,
+  which is what "redistributed, not added" should look like: the bumps facing the
+  light gain, the ones facing away lose, and the frame does not get brighter.
+- **The energy gate against Ratio, re-run.** By day `85.3` vs `85.6` (0.3 luma,
+  where R5c's was 0.1); by night `35.3` vs `37.0` (1.7 luma, where R6's was 2.5).
+  The night gap — the one that matters, because that is where local lights
+  dominate — **narrowed**, which is the expected direction: Ratio's analytic loop
+  always had the normal-mapped normal, and Full now has it too. The day gap
+  widened by 0.2 luma on a frame whose local-light contribution is a few percent.
+- **Still open here**: the relief corrects only the COSINE. `D`, `Vis`, the
+  Burley shape and the Schlick fraction stay evaluated against the geometric
+  normal at traced resolution, so a normal-mapped surface's specular LOBE still
+  does not track its bumps. That is a deliberate stopping point (a sharper signal
+  reconstructed from a blurrier one) rather than an oversight, and it is written
+  out as approximation 1 of four in `render/lighting/local_di.hpp`.
+- **`Full` is still not the default recommendation, and the reason changed.**
+  R5c's reason was the missing relief; that is fixed. What remains is cost — Full
+  is two more half-res RGBA16F passes and an emissive stream Ratio does not pay
+  for — and the fact that Ratio's mask is a scalar four shaders sample with a
+  hardware bilinear where Full's three targets are storage textures they gather
+  by hand. `Ratio` remains the recommendation for the Silver tier and below;
+  `Full` is now the right choice for any scene where local lights carry the
+  image, which at night is all of them.
 
 ### 5.8 Dynamic & skinned geometry policy (cross-cutting)
 
@@ -2034,6 +2279,8 @@ Dependency-ordered; each phase ships alone.
 | **R4** | ~~HZB + indirect dispatch wrapper~~ (**R4a, landed**), screen probes, probe-space filtering, mid-rough specular from probes (R4b) | R4a: every configuration bit-identical, `probes_screen` == `probes` luma with the `HZB` row present. R4b: `ProbesScreen` vs `Probes` A/B sharpness; handoff-seam scene clean; Silver budget held |
 | **R5** | ~~SSILVB/bent-cone (R5a), denoiser core — gradients, dual history, exposure-aware (R5b), Full-DI tier (R5c)~~ (**COMPLETE, 2026-08-02**) | lightning/toggle scene: history resets locally within 2 frames, no global flash-smear; contact-GI A/B. **Met**: R5b's sweep table shows the gradient response and the local signal's independence from the sun; R5c's Ratio-vs-Full energy gate lands inside 0.1 luma by day and by night |
 | **R6** | ~~emissive mesh lights, area-light authoring, stretch cache decision~~ (**COMPLETE, 2026-08-02**) | night-village shot with lit windows lighting their own stonework; emissive in reflections + probes measured in isolation (0.125%/0.348%/13.2% of bytes); watch-list re-evaluation and the standing follow-up list recorded in §5.7. **Stretch NOT taken** — the SHaRC-shaped cache was gated on a measured deficiency and none exists |
+
+| **R7** | ~~spatial reservoir reuse (pairwise MIS), the Full-DI directional basis, a second a-trous iteration, the `di noise` probe~~ (**COMPLETE, 2026-08-02**) | the two oldest deferred items in this document closed. **Met**: `spatial_neighbors = 0` reproduces every pre-R7 pin bit for bit; brute-force unbiasedness gate on the pairwise weights; `di noise` down 23–24 % under a moving camera; night cobbles have their relief back at 1.2 luma LOWER mean. **Not met and recorded**: `local_grad_fire` rose 0.0192 → 0.0205 |
 
 Standing rules for every phase: TSAN suite run after any job-system-adjacent
 work (HQ builder, probe update scheduling); every new cbuffer gets its

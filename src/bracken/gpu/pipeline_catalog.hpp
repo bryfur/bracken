@@ -195,6 +195,11 @@ enum class ComputePipelineType {
     /// the two targets share one reprojection.
     RtDiTemporal,
     RtDiSpatial,
+    /// The R7 temporal-noise probe over the filtered DI pair: mean absolute
+    /// frame-to-frame delta, accumulated into the shared denoiser counters. Not
+    /// part of the frame — dispatched only when a caller sets
+    /// `RtLocalShadowSettings::di_noise_probe`, which only `--rt-bench` does.
+    RtDiNoise,
 
     // Probe-field GI (render/gi/, docs/rt_lighting_plan.md §5.2). All four run
     // inside one GIProbes timer scope, in this order, once per cascade whose

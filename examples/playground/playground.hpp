@@ -454,6 +454,14 @@ private:
     // per-frame samples kept so the report can quote a p95 rather than only a
     // mean (a mean hides exactly the rebuild spikes this measures).
     bool rt_bench_ = false;
+    // R7's developer knobs for the traced local-light tier, from
+    // PLAYGROUND_RT_SPATIAL / PLAYGROUND_RT_DI_ITERS plus the bench's probe.
+    // Held as scalars rather than as a SceneRenderer::RtLocalTuning because
+    // this header only forward-declares that class; setup_smoke_run assembles
+    // the struct at the one call site that needs it.
+    uint32_t rt_spatial_neighbors_ = 3;
+    uint32_t rt_di_spatial_iterations_ = 2;
+    bool rt_di_noise_probe_ = false;
     static constexpr int RT_BENCH_WARMUP_FRAMES = 30; // pipeline/PSO/history warm-up, discarded
     /// Per-pass CPU record times, keyed by the pass name. The key is a
     /// std::string copy, not the PassTiming string_view: the view points at a
@@ -474,6 +482,11 @@ private:
     std::vector<float> rt_bench_shadow_fire_;
     std::vector<float> rt_bench_local_accum_;
     std::vector<float> rt_bench_local_fire_;
+    /// R7's Full-DI temporal-noise probe: mean absolute frame-to-frame delta of
+    /// the demodulated local-light estimate, and the level it is a delta of.
+    /// Empty unless the tier ran (the probe is meaningless with no DI targets).
+    std::vector<float> rt_bench_di_noise_;
+    std::vector<float> rt_bench_di_level_;
     /**
      * PLAYGROUND_SUN_SWEEP=<deg/s> — a continuous sun-azimuth sweep for the
      * duration of an --rt-bench run.

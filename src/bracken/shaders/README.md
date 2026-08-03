@@ -155,14 +155,15 @@ numbers and SDL's binds. `model`/`model_instanced` are AT it. Anything further
 these shaders need is a storage buffer or a STORAGE TEXTURE: R4b's screen-probe
 SH is the first, a FIFTH fragment storage buffer at
 `CLUSTER_SSBO_BINDING_BASE + 4` declared by `gi_screen_sample.hlsli`; R5c's
-Full-DI pair is the second.
+Full-DI pair — a TRIPLE since R7b's direction target — is the second.
 
 **R5c split `CLUSTER_SAMPLER_COUNT` out of `CLUSTER_SSBO_BINDING_BASE`, and the
 two are no longer the same number.** Fragment set 2 is laid out as sampled
-textures → STORAGE textures → storage buffers, so `local_di.hlsli`'s two
-read-only storage textures (`localDiDiffuseTexture` / `localDiSpecularTexture`,
-storage-texture slots 0 and 1, bound with `SDL_BindGPUFragmentStorageTextures`)
-sit in the gap and push the cluster buffers up by two. The local-shadow ATLAS
+textures → STORAGE textures → storage buffers, so `local_di.hlsli`'s
+read-only storage textures (`localDiDiffuseTexture` / `localDiSpecularTexture` /
+`localDiDirectionTexture`, storage-texture slots 0–2, bound with
+`SDL_BindGPUFragmentStorageTextures`) sit in the gap and push the cluster
+buffers up by THREE — two until R7b added the direction target. The local-shadow ATLAS
 follows the samplers (`CLUSTER_SAMPLER_COUNT - 1`) and the cluster buffers
 follow the buffers, which is why `cluster_lighting.hlsli` now takes both
 defines — with a fallback that keeps the old single-define spelling meaning
@@ -173,7 +174,11 @@ what it always meant. The pair is declared WITHOUT a
 class wanted. They are bound unconditionally — the 1×1 zero RGBA16F stand-in
 `SceneRenderer::dummy_di_texture_` when the tier is off, since the white sampler
 dummy carries SAMPLER usage only and cannot stand in for a storage texture —
-and `rtLocalShadowMode < 2` is what stops them being read.
+and `rtLocalShadowMode < 2` is what stops them being read. The direction slot
+takes a SEPARATE `dummy_di_dir_texture_` because it is RG16F where the other two
+are RGBA16F, and a storage image's channel count is declared in the shader:
+binding a four-channel filler into a two-channel slot is undefined, not merely
+wasteful.
 
 Directly below it is
 `rtLocalShadowTexture` (model/instanced 14, terrain 12, grass 10), the R8
@@ -185,7 +190,10 @@ mutually exclusive by construction rather than by a branch: in Ratio mode the
 engine never assigns a `shadow_slot`, so the atlas taps above are already dead.
 At `rtLocalShadowMode == 2` (`::Full`, R5c) this sampler is not read either:
 `accumulateClusterLights` is not called at all and `localDiLighting` supplies
-the whole local-light term from the two storage textures instead.
+the whole local-light term from the three storage textures instead — including
+(R7b) a **relief factor** built from the direction target and the shader's own
+two normals, which is what gives a normal-mapped surface its bump lighting back
+under a local light.
 The THREE slots below THAT
 are the probe field's atlases (model/instanced 11–13, terrain 9–11, grass
 7–9): irradiance and visibility with a LINEAR clamp sampler, the per-probe
@@ -337,7 +345,19 @@ reads the cluster grid: per pixel it draws six candidates from the pixel's
 froxel through `cluster_compute.hlsli`, weights them by `clusterLightTarget`,
 keeps one by weighted-reservoir sampling, merges the reprojected previous-frame
 reservoir (its light index resolved through the prev→current remap; a vanished
-light drops the history), and casts ONE sphere-cap ray at the winner. Its
+light drops the history), merges **k = 3 spatial neighbours under pairwise MIS**
+(R7a), and casts ONE sphere-cap ray at the surviving winner.
+
+**It is DISPATCHED TWICE**, one pipeline, `stage` selecting the half: stage 0
+resamples into a scratch reservoir, stage 1 reuses that scratch spatially,
+traces and writes the DI targets. A spatial pass reads its neighbours' output
+and compute has no cross-workgroup barrier, so the split is forced by the memory
+model rather than chosen; one pipeline rather than two because `rt_local_shadow_
+gradient.comp` replays this pass's decisions and a second module would be a
+second place for the emitter radius, the emissive epoch and the sample sequence
+to drift. The replay needed **no change**: its contract is that the stored
+reservoir names the light the ray was aimed at and that the cap sample is
+`rtSample2D(coord, frameIndex)`, and both survive the spatial merge. Its
 output is the same 8×4-packed bit tile `rt_shadow.comp` produces — which is the
 point, because it goes through the SAME `rt_shadow_denoise_*` chain, dispatched
 a second time against a second set of targets. Its two set-1 read-write storage
@@ -365,17 +385,31 @@ light on every ray.
 Under `diMode >= 2` (`LocalRtShadowMode::Full`, R5c) the same shader — one
 shader, not a variant, because R5b's gradient sibling replays its sampling
 decisions and a second trace variant would need a second gradient variant —
-ALSO evaluates the winner's BRDF into two extra read-write storage textures:
-demodulated diffuse (no albedo) and demodulated specular (dielectric Fresnel),
-with the alpha lanes carrying the texel's view depth and the winning light's
-Schlick fraction. `shaders/local_di.hlsli` owns the layout and the
+ALSO evaluates the winner's BRDF into three extra read-write storage textures:
+demodulated diffuse (no albedo), demodulated specular (dielectric Fresnel) and —
+since R7b — the winner's octahedral light DIRECTION (RG16F), with the two alpha
+lanes carrying the texel's view depth and the winning light's Schlick fraction. `shaders/local_di.hlsli` owns the layout and the
 multiply-back; `render/lighting/local_di.hpp` is the CPU source of truth and
 carries the derivation of both remodulation hooks. In Ratio mode those two
 slots take 1×1 stand-ins and the uniform branch leaves them unwritten. The
-pair is denoised by `rt_di_denoise_temporal.comp` + `rt_di_denoise_spatial.comp`
-— a RADIANCE denoiser, the reflection temporal pass's shape rather than the
-visibility chain's, because a radiance estimate has no packed bits, no tile
-classification and no Bernoulli second moment to share.
+triple is denoised by `rt_di_denoise_temporal.comp` + **two dispatches** of
+`rt_di_denoise_spatial.comp` (à-trous stride 1 then 2, R7c) — a RADIANCE
+denoiser, the reflection temporal pass's shape rather than the visibility
+chain's, because a radiance estimate has no packed bits, no tile classification
+and no Bernoulli second moment to share. The DIRECTION is filtered by all three
+but never averaged in its stored form: octahedral coordinates are discontinuous
+across the fold seam, so every stage decodes, sums vectors with the same weights
+the radiance halves use, and renormalizes. The second à-trous iteration writes
+into the `raw` triple, which the temporal dispatch has already consumed — so it
+costs a dispatch and no memory — and it passes converged texels straight
+through, which is what keeps a steady-state image sharp.
+
+`rt_di_noise.comp` (R7) is not part of the frame: it is a temporal-NOISE probe
+over the filtered DI targets, dispatched only when a caller sets
+`RtLocalShadowSettings::di_noise_probe` (only `--rt-bench` does). It exists
+because a screenshot is one frame and temporal noise is a statistic across
+frames, so the R7 package had no way to state its claim as a number until it
+was written.
 
 `rt_shadow_gradient.comp` and `rt_local_shadow_gradient.comp` (R5b) are the
 **A-SVGF temporal gradient** for the two visibility signals — the only thing in

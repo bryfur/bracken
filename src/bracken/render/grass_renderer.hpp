@@ -286,13 +286,19 @@ public:
      *
      * `active` is what turns the shader's `rtLocalShadowMode` to 2, i.e. what
      * makes it DROP the analytic point/spot loop and read these instead. The
-     * two textures must be non-null in either case: an unbound storage-texture
-     * descriptor is undefined, so the caller passes its 1x1 stand-in when the
+     * three textures must be non-null in either case: an unbound storage-texture
+     * descriptor is undefined, so the caller passes its 1x1 stand-ins when the
      * tier is off. Borrowed for one frame and never retained.
+     *
+     * `direction` is R7b's third target — the winning light's octahedral
+     * direction, which is what lets the shader re-apply N.L with its own
+     * normal-mapped normal instead of the geometric one the trace had.
      */
-    void set_local_di(SDL_GPUTexture* diffuse, SDL_GPUTexture* specular, bool active) {
+    void set_local_di(SDL_GPUTexture* diffuse, SDL_GPUTexture* specular,
+                      SDL_GPUTexture* direction, bool active) {
         local_di_diffuse_ = diffuse;
         local_di_specular_ = specular;
+        local_di_direction_ = direction;
         local_di_active_ = active;
     }
 
@@ -426,9 +432,11 @@ private:
     SDL_GPUBuffer* cluster_offsets_ = nullptr;
     SDL_GPUBuffer* cluster_indices_ = nullptr;
     SDL_GPUBuffer* cluster_local_shadow_slots_ = nullptr;
-    /// R5c's Full-DI pair + its flag. Borrowed, per frame; see set_local_di.
+    /// R5c's Full-DI pair, R7b's direction, and the flag. Borrowed, per frame;
+    /// see set_local_di.
     SDL_GPUTexture* local_di_diffuse_ = nullptr;
     SDL_GPUTexture* local_di_specular_ = nullptr;
+    SDL_GPUTexture* local_di_direction_ = nullptr;
     bool local_di_active_ = false;
     const void* cluster_params_ = nullptr;
     size_t cluster_params_size_ = 0;

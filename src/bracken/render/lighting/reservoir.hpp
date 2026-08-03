@@ -190,6 +190,179 @@ struct ReservoirBuilder {
 }
 
 /**
+ * SPATIAL reuse of a neighbouring pixel's reservoir, with PAIRWISE MIS
+ * (docs/rt_lighting_plan.md §5.3's "optional spatial pass (3-5 neighbours,
+ * pairwise MIS)", landed as R7a).
+ *
+ * WHY THIS IS NOT `merge()`. The temporal merge above combines two estimates of
+ * the SAME integral at the SAME point, so weighting them by confidence
+ * (`m_j = M_j / sum M`) and letting `finalize()` divide by the total M is both
+ * correct and cheap. A spatial neighbour is a different point: the light it
+ * picked may be one THIS pixel could never have drawn (a different froxel, a
+ * light behind this surface, an occluder between), and the confidence weighting
+ * has no way to notice. Reusing it under `m_j = M_j / sum M` is the classic
+ * ReSTIR spatial bias — visible as brightening along depth discontinuities and
+ * as light leaking around corners.
+ *
+ * THE WEIGHTS. Write `p̂_c` for this pixel's target function and `p̂_i` for
+ * neighbour i's, `M_c` / `M_i` for their confidences, and `k` for the number of
+ * neighbours actually accepted. Pair each neighbour against the canonical:
+ *
+ *     a_i(x) = M_i p̂_i(x) / ( M_i p̂_i(x) + M_c p̂_c(x) )
+ *     b_i(x) = 1 - a_i(x) = M_c p̂_c(x) / ( M_i p̂_i(x) + M_c p̂_c(x) )
+ *
+ *     m_i(x) = a_i(x) / k                 (neighbour i)
+ *     m_c(x) = (1/k) * sum_i b_i(x)       (the canonical)
+ *
+ * These sum to 1 for EVERY x, unconditionally: `sum_i m_i + m_c =
+ * (1/k) sum_i (a_i + b_i) = 1`. That is the whole unbiasedness argument, and it
+ * survives the two degenerate cases that matter — a light outside neighbour i's
+ * domain gives `p̂_i = 0`, hence `a_i = 0` and `b_i = 1`; a light outside the
+ * canonical's gives `p̂_c = 0`, hence `a_i = 1` and `b_i = 0`. In both the pair
+ * still sums to one and the input that could not have produced x gets weight
+ * zero, which is exactly the condition generalized RIS asks for.
+ *
+ * THE ESTIMATOR. Each input contributes `w_j = m_j(X_j) * p̂_c(X_j) * W_j`, one
+ * survives by weighted reservoir sampling, and
+ *
+ *     W_out = ( sum_j w_j ) / p̂_c(y)
+ *
+ * with NO division by M — the MIS weights already normalize, which is the
+ * structural difference from `ReservoirBuilder::finalize()`. The `1/k` is
+ * factored out of every weight and applied once at the end, so it cannot
+ * influence the selection and the streaming order cannot influence `w_sum`.
+ *
+ * THE ONE APPROXIMATION, NAMED. The derivation needs `p̂_j(x) = 0` exactly when
+ * x is outside input j's candidate domain. In the shipped pass the domain is the
+ * neighbour's froxel light list and the target function is its unshadowed
+ * contribution, which vanishes out of range and behind the surface — so the two
+ * agree wherever the cluster grid's range binning agrees with the light's own
+ * falloff, and disagree for a light that is in range of the neighbour's froxel
+ * but was never drawn into its M candidates. That residual is the standard
+ * practical bias of every shipped ReSTIR spatial pass; the tests below pin the
+ * exact case (explicit disjoint domains, `p̂ = 0` outside) because it is the one
+ * the maths actually claims.
+ *
+ * COST, per neighbour: three target-function evaluations —
+ * `p̂_c(X_i)` (its sample here), `p̂_i(X_i)` (its sample there) and `p̂_i(X_c)`
+ * (our sample there). The last is what makes it PAIRWISE rather than 1/Z, and
+ * it is why the shader reconstructs each neighbour's surface rather than only
+ * gating on its depth.
+ *
+ * Mirrored in `shaders/rt_local_shadow.comp.hlsl`'s spatial stage.
+ */
+struct PairwiseSpatialMerge {
+    /// The running selection. `sample_count` accumulates confidence as inputs
+    /// arrive; `light_index` and `weight` are only meaningful after `finalize`.
+    Reservoir r{};
+    /// Sum of the `m_j * p̂_c * W_j` weights, WITHOUT the shared `1/k`.
+    float w_sum = 0.0f;
+    /// p̂_c of the current selection. `finalize()` divides by it.
+    float target_pdf = 0.0f;
+    /// `sum_i b_i(X_c)` — the canonical's MIS weight, accumulated one neighbour
+    /// at a time because it cannot be known until every neighbour has been seen.
+    float canonical_mis_sum = 0.0f;
+    /// Neighbours actually accepted. `k` in the weights above.
+    uint32_t neighbors = 0;
+
+    Reservoir canonical{};
+    /// p̂_c(X_c) — the canonical's own sample under its own target function.
+    float canonical_pdf = 0.0f;
+
+    /**
+     * Seat the canonical reservoir. `canonical_pdf_here` is p̂_c(X_c): the
+     * centre pixel's selected candidate re-evaluated at the centre pixel, which
+     * is the value `ReservoirBuilder::finalize()` already had and did not store.
+     */
+    void begin(const Reservoir& c, float canonical_pdf_here) {
+        canonical = c;
+        canonical_pdf = canonical_pdf_here;
+        r = Reservoir{};
+        w_sum = 0.0f;
+        target_pdf = 0.0f;
+        canonical_mis_sum = 0.0f;
+        neighbors = 0;
+    }
+
+    /**
+     * Fold one neighbour in.
+     *
+     * @param other              the neighbour's reservoir, already depth/normal gated.
+     * @param other_pdf_here     p̂_c(X_i) — its sample, evaluated at THIS pixel.
+     * @param other_pdf_there    p̂_i(X_i) — its sample, evaluated at ITS pixel.
+     * @param canonical_pdf_there p̂_i(X_c) — OUR sample, evaluated at its pixel.
+     * @param rand01             uniform in [0, 1).
+     *
+     * A neighbour holding no sample is not an input and does not count toward
+     * `k`: it can contribute nothing, and letting it dilute the canonical's MIS
+     * weight would darken the pixel for no reason.
+     */
+    void add_neighbor(const Reservoir& other, float other_pdf_here, float other_pdf_there,
+                      float canonical_pdf_there, float rand01) {
+        if (other.light_index == RESERVOIR_NO_LIGHT || other.sample_count <= 0.0f) {
+            return;
+        }
+        ++neighbors;
+
+        // a_i(X_i): how much of X_i's weight this pairing gives the neighbour.
+        const float a_num = other.sample_count * other_pdf_there;
+        const float a_den = a_num + canonical.sample_count * other_pdf_here;
+        const float a_i = a_den > 0.0f ? a_num / a_den : 0.0f;
+
+        // b_i(X_c): the canonical's share of ITS OWN sample under this pairing.
+        const float b_num = canonical.sample_count * canonical_pdf;
+        const float b_den = b_num + other.sample_count * canonical_pdf_there;
+        canonical_mis_sum += b_den > 0.0f ? b_num / b_den : 0.0f;
+
+        // Confidence adds whether or not the sample survives the draw: the
+        // neighbour's M candidates genuinely inform this pixel now.
+        r.sample_count += other.sample_count;
+
+        const float w = a_i * other_pdf_here * other.weight;
+        if (!(w > 0.0f)) {
+            return; // NaN-safe, as ReservoirBuilder::update is
+        }
+        w_sum += w;
+        if (rand01 * w_sum < w) {
+            r.light_index = other.light_index;
+            target_pdf = other_pdf_here;
+        }
+    }
+
+    /**
+     * Stream the canonical in LAST — its MIS weight depends on every neighbour —
+     * and close the reservoir.
+     *
+     * With no accepted neighbour this returns the canonical UNCHANGED, bit for
+     * bit. That is the contract the shipped `spatial_neighbors = 0` path leans
+     * on: turning spatial reuse off must reproduce the pre-R7a image exactly,
+     * not merely closely.
+     */
+    [[nodiscard]] Reservoir finalize(float rand01) {
+        if (neighbors == 0) {
+            return canonical;
+        }
+        const float w_c = canonical_mis_sum * canonical_pdf * canonical.weight;
+        r.sample_count += canonical.sample_count;
+        if (w_c > 0.0f) {
+            w_sum += w_c;
+            if (rand01 * w_sum < w_c) {
+                r.light_index = canonical.light_index;
+                target_pdf = canonical_pdf;
+            }
+        }
+        // The shared 1/k, applied once, where it cannot touch the selection.
+        const float denom = static_cast<float>(neighbors) * target_pdf;
+        r.weight = denom > 0.0f ? w_sum / denom : 0.0f;
+        // The record is this PIXEL's from here on, so it carries this pixel's
+        // depth — the lane is a disocclusion test for next frame's reprojection
+        // and a neighbour's depth would answer the wrong question.
+        r.depth = canonical.depth;
+        return r;
+    }
+};
+
+/**
  * Resolve a reservoir carried over from the previous frame against this frame's
  * light set.
  *

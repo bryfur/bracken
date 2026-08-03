@@ -203,6 +203,35 @@ public:
 
     [[nodiscard]] const render::RtStats& raytracing_stats() const;
 
+    /**
+     * R7 tuning for the traced LOCAL-light tier, and the noise probe's switch.
+     *
+     * A struct of its own rather than four setters, and here rather than on
+     * `GraphicsSettings`, because none of it is a quality LEVEL a player would
+     * ever be shown: two of the fields exist so a measurement can turn the R7
+     * package off and compare against itself, and the third costs a dispatch to
+     * produce a number the frame does not use. `GraphicsSettings` is the
+     * player-facing contract and these are a developer's instruments.
+     *
+     * The defaults are the shipped configuration, so a host that never touches
+     * this gets the tier as documented.
+     */
+    struct RtLocalTuning {
+        /// k — spatial reservoir-reuse neighbours (R7a). 0 reproduces the
+        /// pre-R7a sampling bit for bit, in BOTH tiers.
+        uint32_t spatial_neighbors = 3;
+        /// Radius of the neighbour ring, in traced texels.
+        float spatial_radius = 8.0f;
+        /// A-trous iterations of the Full-DI spatial filter (R7c). 1 is the R5c
+        /// chain; 2 adds a stride-2 pass that skips converged texels.
+        uint32_t di_spatial_iterations = 2;
+        /// Measure the Full-DI tier's frame-to-frame noise (R7). Off by
+        /// default: it is a whole dispatch spent on a diagnostic.
+        bool di_noise_probe = false;
+    };
+    void set_rt_local_tuning(const RtLocalTuning& tuning) { rt_local_tuning_ = tuning; }
+    [[nodiscard]] const RtLocalTuning& rt_local_tuning() const { return rt_local_tuning_; }
+
     /** Probe-field GI accounting — cascade count, probe count, how many probes
      *  the scroll invalidated this frame, and the atlas bytes. All zero (and
      *  `active == false`) while `gi_mode == GiMode::Off`, which is the default.
@@ -585,6 +614,7 @@ private:
     /// not "an extra effect on top of Ratio", it is which of two mutually
     /// exclusive code paths the frame's local lighting came out of.
     bool frame_rt_local_di_active_ = false;
+    RtLocalTuning rt_local_tuning_{};
     /// Normal+roughness G-buffer for ray-traced reflections. Allocated only
     /// while reflections are on, and released the moment they go off — a game
     /// that never enables them never pays for a screen-sized target.
@@ -875,11 +905,17 @@ private:
     // holds the slots and `rtLocalShadowMode < 2` is what stops them being read.
     SDL_GPUTexture* frame_rt_local_di_diffuse_ = nullptr;
     SDL_GPUTexture* frame_rt_local_di_specular_ = nullptr;
+    /// R7b's third DI target: the winning light's octahedral direction (RG16F).
+    SDL_GPUTexture* frame_rt_local_di_direction_ = nullptr;
     /// 1x1 RGBA16F zero, GRAPHICS_STORAGE_READ. Zeroed rather than left
     /// undefined for the reason every dummy here is: alpha 0 is the "no answer"
     /// the reconstruction rejects, so even a shader that ignored the mode flag
     /// would read no contribution rather than garbage.
     std::unique_ptr<gpu::GPUTexture> dummy_di_texture_;
+    /// The RG16F half of that stand-in, for R7b's direction slot. A separate
+    /// texture because the slot's channel count differs and a storage image's
+    /// does not get to be approximate.
+    std::unique_ptr<gpu::GPUTexture> dummy_di_dir_texture_;
 
     // Sky IBL is active this frame: settings flag on AND the prefilter chain
     // is alive. Drives the iblEnabled uniform flag of every scene shader.

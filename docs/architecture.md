@@ -1165,7 +1165,16 @@ has *no* sun shadow rather than falling back to cascades, and beyond
 `RtShadowSettings::max_distance` the cascades take over.
 
 **Local-light shadows** (`shaders/rt_local_shadow.comp.hlsl`,
-`LocalRtShadowMode::Ratio` R2b / `::Full` R5c — off by default). One shadow ray per pixel
+`LocalRtShadowMode::Ratio` R2b / `::Full` R5c — off by default). **Dispatched
+TWICE per frame since R7a**: stage 0 draws froxel candidates and merges the
+temporal reservoir into a scratch buffer; stage 1 merges k = 3 spatial
+neighbours under **pairwise MIS** (`render/lighting/reservoir.hpp`'s
+`PairwiseSpatialMerge`), traces the ray at the surviving winner and writes the
+DI targets. One pipeline, one `stage` uniform, identical bindings — a spatial
+pass cannot live in one dispatch because compute has no cross-workgroup
+barrier, and a second pipeline would be a second place for the gradient replay's
+resolutions to drift. `RtLocalShadowSettings::spatial_neighbors = 0` reproduces
+the pre-R7a image bit for bit. One shadow ray per pixel
 makes *every* point and spot light cast a soft shadow, which is possible only
 because the ray is aimed by a **reservoir** rather than by a loop over lights.
 Per pixel:
@@ -1283,16 +1292,37 @@ denoiser: the targets are read as fragment STORAGE textures, where no hardware
 filter exists, and upsampling in compute would mean two full-resolution RGBA16F
 targets to save a gather that has to happen anyway.
 
-**The named cost of `Full`**: local lighting is evaluated on the prepass
-G-buffer's **geometric** normal, at the traced resolution, and spatially
-filtered with a normal weight computed from that same geometric normal — so
-normal-map relief is absent from local-light shading. Under a flashlight at
-night the cobbles keep their albedo and lose their bump lighting where `Ratio`
-keeps both. It is inherent to a two-target demodulation (there is no light
-DIRECTION for the forward pass to re-apply a cosine with) and the fix — a third
-directional target — is R6's in `docs/rt_lighting_plan.md` §5.7. `Ratio`
-remains the default recommendation; `Full` is the answer when local lights are
-coloured and disagree, where the aggregate ratio's error is structural.
+**The directional basis** (R7b) is a THIRD traced target, RG16F, carrying the
+winning light's octahedral **direction** — and it is what pays R5c's named cost.
+Without it the tier's lighting was evaluated on the prepass G-buffer's
+*geometric* normal, so normal-map relief was absent: under a flashlight at night
+the cobbles kept their albedo and lost their bump lighting, where `Ratio` (whose
+analytic loop always had the shading normal) kept both. The forward pass now
+scales its estimate by a **relief factor**
+
+```
+relief = clamp( max(dot(N_shading, L), 0) / max(dot(N_geometric, L), 0.05), 0, 4 )
+```
+
+with `N_geometric` the interpolated vertex normal the fragment shader already
+has — the same quantity the prepass wrote, so the denominator reconstructs the
+cosine the trace applied. The two demodulated targets above are **unchanged**
+by this: the correction is a bounded ratio applied per pixel, not a factor moved
+out of the trace. Moving it out was implemented and rejected — dividing the
+cosine out inflates the stored estimate by `1/cos`, unbounded at a grazing
+light, straight into a buffer about to be blurred (`render/lighting/local_di.hpp`
+records the measurement). Relief is exactly 1 where the normal map is flat,
+which is why terrain and grass are bit-identical.
+
+A direction is not a radiance: every filter in the chain (temporal, spatial,
+and the forward 4-tap) averages DECODED vectors and RENORMALIZES rather than
+interpolating octahedral coordinates, which are discontinuous across the fold
+seam. A cancelled sum falls back to the surface normal, making the relief 1.
+
+`Ratio` is still the recommendation below the Gold tier, but for COST now
+rather than for quality: `Full` is three half-res targets and two more denoiser
+dispatches, and its outputs are fragment storage textures four shaders gather by
+hand where `Ratio`'s mask is one R8 channel a hardware bilinear reads.
 
 **Atlas coexistence.** In `Ratio` and `Full` modes alike `SceneRenderer` skips the local-shadow
 selector and the tile renders entirely, so no `shadow_slot` is ever assigned and

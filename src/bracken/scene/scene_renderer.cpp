@@ -309,28 +309,38 @@ void SceneRenderer::init_pipelines() {
             gpu::GPUTexture::create_2d(context_->device(), 1, 1, gpu::TextureFormat::RGBA8, &white_pixel);
     }
 
-    // 1x1 zero RGBA16F for the Full-DI tier's two READ-ONLY STORAGE texture
-    // slots when that tier is off (R5c). Storage-read usage, not SAMPLER: the
-    // four scene shaders Load() these rather than sampling them, because they
-    // have no seventeenth sampler to spare (shaders/local_di.hlsli). Alpha 0 is
-    // the "no answer" localDiSample rejects, so even a shader that ignored
-    // rtLocalShadowMode would read no contribution rather than garbage.
+    // 1x1 zeros for the Full-DI tier's READ-ONLY STORAGE texture slots when
+    // that tier is off (R5c; a third slot since R7b). Storage-read usage, not
+    // SAMPLER: the four scene shaders Load() these rather than sampling them,
+    // because they have no seventeenth sampler to spare
+    // (shaders/local_di.hlsli). Alpha 0 is the "no answer" localDiSample
+    // rejects, so even a shader that ignored rtLocalShadowMode would read no
+    // contribution rather than garbage.
+    //
+    // TWO FORMATS, because the direction target is RG16F where the radiance
+    // pair is RGBA16F, and a storage image is declared in the shader with a
+    // channel count: binding a four-channel stand-in into a two-channel slot is
+    // undefined rather than merely wasteful.
     {
         const std::array<uint16_t, 4> zero{0, 0, 0, 0};
         dummy_di_texture_ = gpu::GPUTexture::create_2d(
             context_->device(), 1, 1, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
             SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ);
-        if (dummy_di_texture_) {
+        dummy_di_dir_texture_ = gpu::GPUTexture::create_2d(
+            context_->device(), 1, 1, SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT,
+            SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ);
+        if (dummy_di_texture_ && dummy_di_dir_texture_) {
             // One-shot upload on its own command buffer: init() has no frame
-            // command buffer to ride, and this is a 16-byte copy that happens
+            // command buffer to ride, and this is a 24-byte copy that happens
             // once per process.
             if (SDL_GPUCommandBuffer* upload_cmd =
                     SDL_AcquireGPUCommandBuffer(context_->device().handle())) {
                 dummy_di_texture_->upload(upload_cmd, zero.data(), 1, 1);
+                dummy_di_dir_texture_->upload(upload_cmd, zero.data(), 1, 1);
                 SDL_SubmitGPUCommandBuffer(upload_cmd);
             }
         } else {
-            BRACKEN_LOG_WARN(LOG_TAG, "Failed to create the 1x1 local-DI stand-in texture");
+            BRACKEN_LOG_WARN(LOG_TAG, "Failed to create the 1x1 local-DI stand-in textures");
         }
     }
 
@@ -738,6 +748,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     frame_rt_local_di_active_ = false;
     frame_rt_local_di_diffuse_ = nullptr;
     frame_rt_local_di_specular_ = nullptr;
+    frame_rt_local_di_direction_ = nullptr;
     frame_rt_reflection_max_roughness_ = 0.0f;
     frame_rt_reflection_fade_start_ = 0.0f;
     // Sky IBL drives every scene shader's iblEnabled flag (the IBL sampler
@@ -1514,6 +1525,13 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 // ensure path here, only a second flag.
                 ls.full_di = gfx.rt_local_shadows == LocalRtShadowMode::Full;
                 ls.resolution = gfx.rt_local_shadow_resolution;
+                // R7's developer knobs (SceneRenderer::RtLocalTuning), which
+                // default to the shipped configuration — see the struct for why
+                // they are not GraphicsSettings fields.
+                ls.spatial_neighbors = rt_local_tuning_.spatial_neighbors;
+                ls.spatial_radius = rt_local_tuning_.spatial_radius;
+                ls.di_spatial_iterations = rt_local_tuning_.di_spatial_iterations;
+                ls.di_noise_probe = rt_local_tuning_.di_noise_probe;
 
                 // The frame's binned light buffers. Handed over as one struct
                 // that knows when it is incomplete, because "trace against a
@@ -1562,9 +1580,11 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 // falls back to Ratio, whose mask is live either way.
                 if (rt_renderer_->stats().local_di_traced &&
                     rt_renderer_->local_di_diffuse() != nullptr &&
-                    rt_renderer_->local_di_specular() != nullptr) {
+                    rt_renderer_->local_di_specular() != nullptr &&
+                    rt_renderer_->local_di_direction() != nullptr) {
                     frame_rt_local_di_diffuse_ = rt_renderer_->local_di_diffuse()->handle();
                     frame_rt_local_di_specular_ = rt_renderer_->local_di_specular()->handle();
+                    frame_rt_local_di_direction_ = rt_renderer_->local_di_direction()->handle();
                     frame_rt_local_di_active_ = true;
                 }
                 if (rt_renderer_->stats().reflections_traced &&

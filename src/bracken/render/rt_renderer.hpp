@@ -188,6 +188,47 @@ struct RtLocalShadowSettings {
     /// sample. `render::lighting::di_filter_radius` maps the count down from
     /// here to its floor.
     float di_filter_radius = 3.0f;
+
+    // ---- R7: spatial reservoir reuse, a second filter iteration, the probe ----
+
+    /**
+     * k — spatial reservoir-reuse neighbours per pixel (R7a,
+     * docs/rt_lighting_plan.md §5.3's deferred "3-5 neighbours, pairwise MIS").
+     *
+     * APPLIES TO BOTH TIERS, deliberately. The reuse improves WHICH LIGHT the
+     * reservoir picks, and both tiers spend that choice: Ratio's mask is the
+     * winner's visibility bit, Full's estimate is the winner's radiance. Gating
+     * it to Full would have meant two sampling paths behind one gradient replay,
+     * which is the arrangement §5.3 spent R2b avoiding.
+     *
+     * 0 turns it off and reproduces the pre-R7a image BIT for bit — the
+     * pairwise merge returns the canonical unchanged and the ray's sample
+     * stream is untouched. 3 is the plan's lower bound and the shipped default;
+     * past ~5 the neighbours start agreeing with each other faster than they add
+     * information, and each one costs three target-function evaluations plus a
+     * surface reconstruction.
+     */
+    uint32_t spatial_neighbors = 3;
+    /// Radius of the spatial neighbour ring, in TRACED texels. At half res that
+    /// is ~16 screen pixels — wide enough to reach a genuinely different
+    /// candidate set, narrow enough that the depth/normal gate usually passes.
+    float spatial_radius = 8.0f;
+    /**
+     * A-trous iterations of the DI spatial filter (R7c). 1 reproduces the R5c
+     * chain; 2 adds a stride-2 pass that only touches texels whose accumulation
+     * is still below `render::lighting::DI_FILTER_CONVERGED_COUNT`, so a
+     * converged image stays exactly as sharp as it was.
+     */
+    uint32_t di_spatial_iterations = 2;
+    /**
+     * Run the temporal-noise probe over the filtered DI targets (R7).
+     *
+     * OFF by default and meant to stay that way outside a measurement: it is a
+     * whole extra dispatch plus an R16F target, spent to produce one number the
+     * frame does not use. `--rt-bench` turns it on; nothing else should.
+     * Reported through `RtStats::DenoiseStats::di_noise*`.
+     */
+    bool di_noise_probe = false;
 };
 
 /**
@@ -412,6 +453,16 @@ struct RtStats {
         float local_gradient_fire = 0.0f;
         bool shadow_valid = false;
         bool local_valid = false;
+
+        /// R7's temporal-noise probe over the FILTERED Full-DI targets, valid
+        /// only when `RtLocalShadowSettings::di_noise_probe` was set. The one
+        /// number the smoke test structurally cannot produce: mean absolute
+        /// frame-to-frame delta of the demodulated local-light estimate, and the
+        /// mean level it is a delta of, so the figure reads both absolutely and
+        /// as a fraction. Under a pinned camera this IS the temporal noise.
+        float di_noise_mean_delta = 0.0f;
+        float di_noise_mean_level = 0.0f;
+        bool di_noise_valid = false;
     };
     DenoiseStats denoise{};
 };
@@ -615,6 +666,10 @@ public:
      *  and reconstruct with `localDiSample`. See shaders/local_di.hlsli. */
     [[nodiscard]] gpu::GPUTexture* local_di_diffuse() const;
     [[nodiscard]] gpu::GPUTexture* local_di_specular() const;
+    /** R7b's third target: the winning light's octahedral direction (RG16F), so
+     *  the forward pass can re-apply N.L with its own normal-mapped normal.
+     *  Live exactly when the other two are. */
+    [[nodiscard]] gpu::GPUTexture* local_di_direction() const;
     /** Reduced-resolution raw incoming radiance. Alpha is the trace validity
      *  gate consumed by resolve_reflections() or the specialized water pass;
      *  hosts should not composite this target directly. */
@@ -773,13 +828,18 @@ private:
     /// Allocate/keep the Full-DI tier's six RGBA16F targets at the local
     /// signal's traced resolution. Invalidates the DI history on any change.
     [[nodiscard]] bool ensure_di_targets(int traced_w, int traced_h);
-    /// The two DI denoiser dispatches (temporal EMA, then the accumulation-
-    /// driven edge-aware gather). No-op when the trace did not write the raw
-    /// pair.
+    /// The DI denoiser chain: the temporal EMA, then one or two a-trous
+    /// iterations of the accumulation-driven edge-aware gather, then R7's
+    /// probe when the caller asked for it. No-op when the trace did not write
+    /// the raw targets.
     void denoise_local_di(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                           SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
                           const FrameParams& params, const RtLocalShadowSettings& settings,
                           int traced_w, int traced_h);
+    /// R7's temporal-noise probe over the filtered DI targets. Off unless
+    /// `RtLocalShadowSettings::di_noise_probe`; costs a dispatch and an R16G16F
+    /// target when on.
+    void probe_di_noise(SDL_GPUCommandBuffer* cmd, int traced_w, int traced_h);
     /// Trace + denoise the froxel-RIS local-light signal. Returns whether the
     /// trace ran.
     [[nodiscard]] bool render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
@@ -822,6 +882,12 @@ private:
     /// four heterogeneous lanes, one of which is a light INDEX that must not be
     /// filtered, converted or clamped by anything.
     std::array<std::unique_ptr<gpu::GPUBuffer>, 2> local_reservoirs_;
+    /// R7a's third reservoir buffer: stage 0's output, which stage 1 reads as
+    /// its spatial neighbourhood. NOT part of the ping-pong — it never crosses a
+    /// frame boundary, and the ping-pong's two halves are still exactly "last
+    /// frame's final" and "this frame's final", which is what the gradient
+    /// replay and the temporal merge both depend on.
+    std::unique_ptr<gpu::GPUBuffer> local_reservoir_temp_;
 
     /**
      * The Full-DI tier's targets (R5c), all RGBA16F at the LOCAL signal's
@@ -834,19 +900,29 @@ private:
      * sigma-clamped EMA is the right shape and the visibility chain's is not.
      *
      * `raw` is what the trace wrote; `history` is the ping-ponged temporal
-     * accumulation; `filtered` is what the forward shaders read. Six targets
-     * rather than four because the last pass must not read the texture it
-     * writes, and rather than eight because the raw pair has no reader after
-     * the temporal dispatch that consumed it.
+     * accumulation; `filtered` is what the forward shaders read. Three targets
+     * per stage since R7b — diffuse, specular and the winning light's DIRECTION,
+     * the last RG16F where the first two are RGBA16F.
+     *
+     * R7c'S SECOND A-TROUS ITERATION COSTS NO NEW MEMORY, and that is the reason
+     * the triple is arranged this way: the first iteration writes into `raw`,
+     * which the temporal dispatch has already consumed by then and which nothing
+     * reads again until next frame's trace overwrites it, and the second reads
+     * `raw` and writes `filtered`. With one iteration configured, it writes
+     * `filtered` directly and `raw` is never re-entered.
      */
     struct RadianceDenoiser {
-        std::array<std::unique_ptr<gpu::GPUTexture>, 2> raw;      ///< [0] diffuse, [1] specular
-        std::array<std::array<std::unique_ptr<gpu::GPUTexture>, 2>, 2> history; ///< [ping][diffuse|spec]
-        std::array<std::unique_ptr<gpu::GPUTexture>, 2> filtered; ///< [0] diffuse, [1] specular
-        /// 1x1 stand-ins bound into the trace's two DI slots in Ratio mode. A
+        /// [0] diffuse, [1] specular, [2] direction — the same order everywhere
+        /// in this struct, and the order the shaders' bindings are in.
+        std::array<std::unique_ptr<gpu::GPUTexture>, 3> raw;
+        std::array<std::array<std::unique_ptr<gpu::GPUTexture>, 3>, 2> history; ///< [ping][signal]
+        std::array<std::unique_ptr<gpu::GPUTexture>, 3> filtered;
+        /// 1x1 stand-ins bound into the trace's three DI slots in Ratio mode. A
         /// storage-image descriptor may not be empty, and `diMode` is what
-        /// stops anything being written through them.
-        std::array<std::unique_ptr<gpu::GPUTexture>, 2> dummy;
+        /// stops anything being written through them. Typed to match: the
+        /// direction slot's stand-in is RG16F, because a storage image read or
+        /// written without a format must still agree on the channel count.
+        std::array<std::unique_ptr<gpu::GPUTexture>, 3> dummy;
         int history_index = 0;
         bool history_valid = false;
         int width = 0;
@@ -857,6 +933,10 @@ private:
     RadianceDenoiser local_di_;
     /// Whether the last render() produced live `local_di_.filtered` targets.
     bool local_di_ready_ = false;
+    /// R7's noise probe: last frame's per-texel scalar (R16F, traced res), and
+    /// whether it holds a measurement of the previous frame of THIS image.
+    std::unique_ptr<gpu::GPUTexture> di_noise_prev_;
+    bool di_noise_history_valid_ = false;
     int local_reservoir_index_ = 0;
     /// Element count the pair is currently sized for; a change reallocates and
     /// invalidates the history, because reservoir N describes a different pixel.
@@ -907,8 +987,10 @@ private:
 
     // ---- R5b diagnostics ----
     /**
-     * Eight uints, four per visibility signal: {accumulated-count sum, pixels
-     * counted, gradient-fired pixels, in-bounds pixels}.
+     * Twelve uints. Four per visibility signal: {accumulated-count sum, pixels
+     * counted, gradient-fired pixels, in-bounds pixels}. Then three for R7's DI
+     * noise probe at base 8: {fixed-point |delta| sum, fixed-point level sum,
+     * texels counted}, and one spare.
      *
      * NEVER RESET, and that is the design rather than an omission. Zeroing them
      * would cost a copy pass in every frame to serve a statistic nobody reads
@@ -935,7 +1017,7 @@ private:
     /// is what the harness averages.
     static constexpr int COUNTER_READBACK_FRAMES = 10;
     int frames_since_counter_readback_ = COUNTER_READBACK_FRAMES;
-    std::array<uint32_t, 8> counter_previous_{};
+    std::array<uint32_t, 12> counter_previous_{};
     bool counter_previous_valid_ = false;
 
     int screen_width_ = 0;

@@ -306,3 +306,304 @@ TEST(ReservoirHistoryClamp, BoundedMKeepsANewCandidateAbleToWin) {
     EXPECT_LT(unclamped, 1e-3f);
     EXPECT_GT(clamped, 0.07f);
 }
+
+// ---------------------------------------------------------------------------
+// Pairwise-MIS spatial reuse (R7a, docs/rt_lighting_plan.md §5.3)
+// ---------------------------------------------------------------------------
+//
+// The claim these tests make is the one a screenshot cannot: that reusing a
+// NEIGHBOUR'S reservoir leaves the estimator unbiased. A biased spatial pass
+// does not crash and does not look broken — it brightens depth discontinuities
+// and leaks light around corners by a few percent, forever — so it is checked
+// against brute force over a domain small enough to sum exactly.
+//
+// The world used below: `LIGHTS` discrete lights, each with a contribution
+// f(x) at the CENTRE pixel. Every pixel p has its own target function p̂_p and
+// its own DOMAIN D_p (the froxel list): p̂_p(x) is zero outside D_p, which is
+// the condition the derivation in reservoir.hpp names as its one assumption.
+// A reservoir at pixel p is built by streaming M uniform draws from D_p, which
+// is exactly what the shipped pass does.
+
+namespace {
+
+using bracken::render::lighting::PairwiseSpatialMerge;
+
+constexpr uint32_t LIGHTS = 6;
+
+/// One pixel of the toy world: a target function and the froxel list it draws
+/// candidates from.
+struct Pixel {
+    std::vector<uint32_t> domain;
+    std::array<float, LIGHTS> target{};
+
+    [[nodiscard]] float pdf(uint32_t light) const {
+        for (uint32_t d : domain) {
+            if (d == light) {
+                return target[light];
+            }
+        }
+        return 0.0f; // outside the domain: p̂ == 0, the derivation's assumption
+    }
+};
+
+/// Build one pixel's reservoir the way the trace does: M uniform draws from the
+/// froxel list, RIS-weighted by p̂ over the source pdf (1 / |list|).
+Reservoir sample_pixel(const Pixel& p, uint32_t m, Uniforms& u) {
+    ReservoirBuilder r;
+    const auto n = static_cast<float>(p.domain.size());
+    for (uint32_t i = 0; i < m; ++i) {
+        const auto slot = std::min(static_cast<std::size_t>(u.next() * n), p.domain.size() - 1);
+        const uint32_t light = p.domain[slot];
+        const float pdf = p.pdf(light);
+        r.update(light, pdf * n, pdf, u.next());
+    }
+    r.finalize();
+    return r.r;
+}
+
+/// The centre pixel and three neighbours, deliberately DISAGREEING: neighbour 2
+/// cannot see light 0 or 1 at all, and neighbour 3's domain is disjoint from the
+/// centre's except for one light. A 1/Z merge of these is visibly biased; the
+/// pairwise weights are what make it not.
+struct World {
+    Pixel centre;
+    std::array<Pixel, 3> neighbors;
+};
+
+World make_world() {
+    World w;
+    w.centre.domain = {0, 1, 2, 3};
+    w.centre.target = {2.0f, 0.5f, 1.25f, 3.0f, 0.0f, 0.0f};
+
+    w.neighbors[0].domain = {0, 1, 2, 3};
+    w.neighbors[0].target = {1.7f, 0.9f, 1.0f, 2.2f, 0.0f, 0.0f};
+
+    w.neighbors[1].domain = {2, 3, 4};
+    w.neighbors[1].target = {0.0f, 0.0f, 3.1f, 0.4f, 1.9f, 0.0f};
+
+    w.neighbors[2].domain = {3, 4, 5};
+    w.neighbors[2].target = {0.0f, 0.0f, 0.0f, 0.8f, 2.6f, 1.1f};
+
+    return w;
+}
+
+/// One spatial merge, driven end to end exactly as the shader drives it.
+Reservoir merge_world(const World& w, const std::array<Reservoir, 3>& neighbors,
+                      const Reservoir& canonical, Uniforms& u) {
+    PairwiseSpatialMerge m;
+    m.begin(canonical, canonical.light_index == RESERVOIR_NO_LIGHT
+                           ? 0.0f
+                           : w.centre.pdf(canonical.light_index));
+    for (std::size_t i = 0; i < neighbors.size(); ++i) {
+        const Reservoir& n = neighbors[i];
+        if (n.light_index == RESERVOIR_NO_LIGHT) {
+            m.add_neighbor(n, 0.0f, 0.0f, 0.0f, u.next());
+            continue;
+        }
+        const float canonical_there =
+            canonical.light_index == RESERVOIR_NO_LIGHT
+                ? 0.0f
+                : w.neighbors[i].pdf(canonical.light_index);
+        m.add_neighbor(n, w.centre.pdf(n.light_index), w.neighbors[i].pdf(n.light_index),
+                       canonical_there, u.next());
+    }
+    return m.finalize(u.next());
+}
+
+} // namespace
+
+// THE PROPERTY THE WHOLE SCHEME RESTS ON: the MIS weights sum to 1 at every
+// point of the union domain, including the two degenerate ones — a light the
+// neighbour cannot see (p̂_i = 0) and a light the centre cannot (p̂_c = 0).
+// Checked directly on the algebra rather than through a merge, because if this
+// fails every other test below fails for a reason that is harder to read.
+TEST(PairwiseSpatialMerge, MisWeightsPartitionUnity) {
+    const auto pair = [](float m_i, float p_i, float m_c, float p_c) {
+        const float den = m_i * p_i + m_c * p_c;
+        const float a = den > 0.0f ? (m_i * p_i) / den : 0.0f;
+        const float b = den > 0.0f ? (m_c * p_c) / den : 0.0f;
+        return a + b;
+    };
+    // Ordinary: both inputs see the light.
+    EXPECT_FLOAT_EQ(pair(12.0f, 1.5f, 30.0f, 0.75f), 1.0f);
+    // The neighbour cannot see it: a == 0, b == 1.
+    EXPECT_FLOAT_EQ(pair(12.0f, 0.0f, 30.0f, 0.75f), 1.0f);
+    // The centre cannot see it: a == 1, b == 0.
+    EXPECT_FLOAT_EQ(pair(12.0f, 1.5f, 30.0f, 0.0f), 1.0f);
+}
+
+// With no accepted neighbour the merge is the IDENTITY, bit for bit. This is
+// the contract `spatial_neighbors = 0` leans on: turning the pass off must
+// reproduce the pre-R7a image exactly, and "exactly" is a bit comparison.
+TEST(PairwiseSpatialMerge, NoNeighboursIsTheIdentity) {
+    Reservoir c{};
+    c.light_index = 3u;
+    c.weight = 1.234567f;
+    c.sample_count = 26.0f;
+    c.depth = 412.5f;
+
+    PairwiseSpatialMerge m;
+    m.begin(c, 2.5f);
+    const Reservoir out = m.finalize(0.5f);
+    EXPECT_EQ(out.light_index, c.light_index);
+    EXPECT_EQ(out.weight, c.weight);
+    EXPECT_EQ(out.sample_count, c.sample_count);
+    EXPECT_EQ(out.depth, c.depth);
+}
+
+// A neighbour holding nothing is not an input: it must not count toward k, or
+// it dilutes the canonical's MIS weight and darkens the pixel for free.
+TEST(PairwiseSpatialMerge, EmptyNeighboursAreNotInputs) {
+    Reservoir c{};
+    c.light_index = 1u;
+    c.weight = 2.0f;
+    c.sample_count = 8.0f;
+
+    PairwiseSpatialMerge m;
+    m.begin(c, 1.0f);
+    m.add_neighbor(Reservoir{}, 1.0f, 1.0f, 1.0f, 0.5f);
+    Reservoir zero_m{};
+    zero_m.light_index = 4u;
+    zero_m.weight = 9.0f;
+    zero_m.sample_count = 0.0f;
+    m.add_neighbor(zero_m, 1.0f, 1.0f, 1.0f, 0.5f);
+    EXPECT_EQ(m.neighbors, 0u);
+    EXPECT_EQ(m.finalize(0.5f).weight, c.weight);
+}
+
+// `w_sum` is a SUM, so it cannot depend on the order neighbours arrive in. The
+// selection does (it consumes the random stream), but the contribution weight
+// the estimator multiplies by is order-invariant — which is what makes the
+// shader's rotating neighbour offsets a sampling choice rather than a
+// correctness one.
+TEST(PairwiseSpatialMerge, WeightSumIsOrderIndependent) {
+    const World w = make_world();
+    Uniforms build(4242);
+    const Reservoir canonical = sample_pixel(w.centre, 4, build);
+    std::array<Reservoir, 3> n{sample_pixel(w.neighbors[0], 4, build),
+                               sample_pixel(w.neighbors[1], 4, build),
+                               sample_pixel(w.neighbors[2], 4, build)};
+
+    const auto run = [&](std::array<std::size_t, 3> order) {
+        PairwiseSpatialMerge m;
+        m.begin(canonical, w.centre.pdf(canonical.light_index));
+        for (std::size_t i : order) {
+            m.add_neighbor(n[i], w.centre.pdf(n[i].light_index),
+                           w.neighbors[i].pdf(n[i].light_index),
+                           w.neighbors[i].pdf(canonical.light_index), 1.0f);
+        }
+        (void)m.finalize(1.0f);
+        return m.w_sum;
+    };
+    EXPECT_NEAR(run({0, 1, 2}), run({2, 0, 1}), 1e-5f);
+    EXPECT_NEAR(run({0, 1, 2}), run({1, 2, 0}), 1e-5f);
+}
+
+// THE BRUTE-FORCE GATE. The RIS estimate of the centre pixel's integral is
+// f(y) * W. Summed over trials it must converge on the EXACT integral,
+// sum_x f(x) over the centre's domain — a number this toy world can just add
+// up. Run against the same trials WITHOUT spatial reuse as a control, so the
+// test says "reuse did not move the mean" and not merely "the mean is roughly
+// right".
+TEST(PairwiseSpatialMerge, UnbiasedAgainstBruteForce) {
+    const World w = make_world();
+    // f is deliberately NOT the target function: an estimator that is only
+    // unbiased for the function it importance-sampled is not unbiased.
+    const std::array<float, LIGHTS> f{1.0f, 4.0f, 0.25f, 2.0f, 3.5f, 0.75f};
+    double exact = 0.0;
+    for (uint32_t x : w.centre.domain) {
+        exact += f[x];
+    }
+
+    constexpr int TRIALS = 20000;
+    Uniforms u(20260802);
+    double reused = 0.0;
+    double control = 0.0;
+    for (int t = 0; t < TRIALS; ++t) {
+        const Reservoir canonical = sample_pixel(w.centre, 4, u);
+        const std::array<Reservoir, 3> n{sample_pixel(w.neighbors[0], 4, u),
+                                         sample_pixel(w.neighbors[1], 4, u),
+                                         sample_pixel(w.neighbors[2], 4, u)};
+        const Reservoir out = merge_world(w, n, canonical, u);
+        if (out.light_index != RESERVOIR_NO_LIGHT) {
+            reused += static_cast<double>(f[out.light_index] * out.weight);
+        }
+        if (canonical.light_index != RESERVOIR_NO_LIGHT) {
+            control += static_cast<double>(f[canonical.light_index] * canonical.weight);
+        }
+    }
+    reused /= TRIALS;
+    control /= TRIALS;
+
+    // 2% of the integral. The estimator's own standard error over 20 k trials
+    // is well inside that; a missing MIS weight is not. Measured on this exact
+    // world, the confidence-weighted (1/Z) merge the TEMPORAL path uses lands at
+    // 0.65x the integral — 35% of the energy lost, because the neighbours whose
+    // samples score p̂_c == 0 here still take their share of the 1/sum(M)
+    // normalization. That 35% is what the world was built to expose.
+    EXPECT_NEAR(reused, exact, exact * 0.02);
+    EXPECT_NEAR(control, exact, exact * 0.02);
+}
+
+// The union domain is NOT the centre's domain: neighbours 2 and 3 can hand this
+// pixel lights 4 and 5, which the centre's froxel never lists. The MIS weights
+// must give those samples weight zero at the centre — p̂_c is 0 there, so the
+// contribution is zero by construction — and the estimate must STILL come out
+// on the centre's own integral rather than on the union's.
+TEST(PairwiseSpatialMerge, ForeignLightsDoNotAddEnergy) {
+    const World w = make_world();
+    const std::array<float, LIGHTS> f{1.0f, 4.0f, 0.25f, 2.0f, 3.5f, 0.75f};
+    double exact = 0.0;
+    for (uint32_t x : w.centre.domain) {
+        exact += f[x];
+    }
+    // The union integral, which a scheme that forgot to evaluate p̂_c at the
+    // neighbour's sample would converge on instead.
+    const double union_integral = exact + static_cast<double>(f[4] + f[5]);
+    ASSERT_GT(union_integral, exact * 1.2);
+
+    constexpr int TRIALS = 20000;
+    Uniforms u(99);
+    double mean = 0.0;
+    int foreign = 0;
+    for (int t = 0; t < TRIALS; ++t) {
+        const Reservoir canonical = sample_pixel(w.centre, 4, u);
+        const std::array<Reservoir, 3> n{sample_pixel(w.neighbors[0], 4, u),
+                                         sample_pixel(w.neighbors[1], 4, u),
+                                         sample_pixel(w.neighbors[2], 4, u)};
+        const Reservoir out = merge_world(w, n, canonical, u);
+        if (out.light_index != RESERVOIR_NO_LIGHT) {
+            mean += static_cast<double>(f[out.light_index] * out.weight);
+            if (out.light_index >= 4u) {
+                ++foreign;
+            }
+        }
+    }
+    mean /= TRIALS;
+    EXPECT_EQ(foreign, 0) << "a light outside the centre's domain scores p̂_c == 0 "
+                             "and can never be selected";
+    EXPECT_NEAR(mean, exact, exact * 0.02);
+}
+
+// Confidence accumulates: the merged record stands for every candidate that
+// informed it, which is what next frame's temporal clamp then bounds.
+TEST(PairwiseSpatialMerge, ConfidenceIsTheSumOfItsInputs) {
+    Reservoir c{};
+    c.light_index = 0u;
+    c.weight = 1.0f;
+    c.sample_count = 10.0f;
+    c.depth = 100.0f;
+
+    Reservoir n{};
+    n.light_index = 1u;
+    n.weight = 1.0f;
+    n.sample_count = 7.0f;
+    n.depth = 900.0f; // deliberately different: the merged depth must be OURS
+
+    PairwiseSpatialMerge m;
+    m.begin(c, 1.0f);
+    m.add_neighbor(n, 1.0f, 1.0f, 1.0f, 0.5f);
+    const Reservoir out = m.finalize(0.5f);
+    EXPECT_FLOAT_EQ(out.sample_count, 17.0f);
+    EXPECT_FLOAT_EQ(out.depth, 100.0f);
+}

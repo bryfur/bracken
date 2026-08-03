@@ -48,6 +48,11 @@
  * the G-buffer carries roughness and metallic but NOT albedo, and F0 needs
  * albedo for a metal.
  *
+ * R7b LEAVES ALL OF THIS ALONE. It adds a third target carrying the winner's
+ * DIRECTION and a per-pixel RELIEF FACTOR built from it — see "THE DIRECTIONAL
+ * BASIS" below — but the two buffers above hold exactly what they held in R5c,
+ * bit for bit, and every statement in this section is still true of them.
+ *
  * ---------------------------------------------------------------------------
  * THE MULTIPLY-BACK, AND WHY BOTH METAL HOOKS ARE EXACT RATHER THAN FUDGES
  * ---------------------------------------------------------------------------
@@ -148,6 +153,157 @@ inline constexpr float DI_DIELECTRIC_F0 = 0.04f;
     const float denom = di_dielectric_fresnel(f);
     const float tint = 1.0f + (albedo - DI_DIELECTRIC_F0) * (1.0f - f) / denom;
     return 1.0f + std::clamp(metallic, 0.0f, 1.0f) * (tint - 1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// THE DIRECTIONAL BASIS (R7b, docs/rt_lighting_plan.md §5.7's first follow-up)
+// ---------------------------------------------------------------------------
+//
+// WHAT R5c COST, restated as arithmetic. Everything above bakes `NdotL` into
+// `E`, and the `N` in it is the PREPASS G-BUFFER'S — the geometric world
+// normal, because that is the only normal a compute pass reading a G-buffer
+// has. The forward shader has a better one: the normal-mapped `N` it computes
+// per texel from a tangent-space map. Under a flashlight at night this is the
+// whole difference between cobblestones and a photograph of cobblestones, and
+// R5c's own A/B named it as the tier's principal cost.
+//
+// THE FIX. The trace publishes the DIRECTION it shaded with, and the forward
+// pass applies a RELIEF FACTOR — the ratio of the cosine it can compute to the
+// cosine the trace already applied:
+//
+//     direction = L, the winning light's unit direction at the traced texel
+//     relief    = clamp( max(dot(N_shading, L), 0)
+//                        / max(dot(N_geometric, L), DI_RELIEF_MIN_COSINE),
+//                        0, DI_RELIEF_MAX )
+//     out       = relief * (diffuse * albedo * tint_d + spec * tint_s)
+//
+// `N_geometric` is the interpolated vertex normal the fragment shader already
+// has — the SAME quantity the prepass wrote into the G-buffer, so the
+// denominator reconstructs the factor the trace applied — and `N_shading` is the
+// normal-mapped one. The two demodulated buffers are UNCHANGED from R5c, down to
+// the bit: `E` still carries its cosine, the denoiser still sees the same
+// distribution, and every statistic ever measured about them still holds.
+//
+// A RATIO RATHER THAN MOVING THE COSINE, and this is the design decision worth
+// defending. The obvious formulation is to stop multiplying `NdotL` in at the
+// trace and multiply it in at the forward pass instead. It is equivalent on
+// paper, it was implemented and measured, and it was rejected: dividing the
+// cosine out inflates the stored estimate by `1/cos`, which is UNBOUNDED at a
+// grazing light. Every texel whose geometric normal barely sees the emitter then
+// carries a huge demodulated value into a denoiser whose entire job is to
+// average it with its neighbours — so the tier gets noisier at exactly the
+// angles it was supposed to be fixed at. The playground's night village measured
+// **38.2 -> 43.7 mean luma** under that formulation: a systematic brightening
+// rather than a wash, because the clamp at zero truncates only the darkening
+// half of the ratio.
+//
+// The ratio form keeps the inflation OUT of the denoised signal and applies it
+// per pixel, at full resolution, where it can be bounded.
+//
+// THE ENERGY IDENTITY IS THEREFORE TRIVIAL and exact: an unbumped texel has
+// `N_shading == N_geometric`, `relief == 1`, and the whole expression is R5c's
+// term for term. That is what `di_relief_factor` is tested against, and it is
+// why terrain and grass — which carry no normal map — come out of this phase
+// bit-identical in both arithmetic and pixels.
+//
+// WHAT THE TWO COSINES MEAN, precisely, because they are not the same quantity:
+//
+//   * the TRACED cosine is `dot(N_geometric, L)` at the traced texel. It is the
+//     one the reservoir's target function scored candidates with, so it decides
+//     WHICH LIGHT the pixel gets and whether it gets one at all.
+//   * the FULL-RES cosine is `dot(N_shading, L)` at the shading pixel. It
+//     decides HOW BRIGHT that light's contribution is.
+//
+// Splitting the two is the entire technique, and it is exactly what a
+// directional lightmap does. It also fixes the responsibility boundary: the
+// trace answers "which light, and is it visible", the forward answers "how does
+// this texel face it".
+//
+// THE APPROXIMATIONS, all four, named rather than buried:
+//
+//  1. ONLY THE COSINE IS CORRECTED. `D`, `Vis`, the Burley shape and the
+//     Schlick fraction `f` stay evaluated against the geometric normal at
+//     traced resolution. Re-deriving them at full res would make the specular
+//     lobe's SHAPE track the normal map through a half-resolution direction
+//     estimate — a sharper signal reconstructed from a blurrier one. The cosine
+//     is the term with the first-order per-texel variation under a bump map; the
+//     lobe shape is second order. A deliberate stopping point, not an oversight.
+//  2. THE RATIO IS CLAMPED. `DI_RELIEF_MIN_COSINE` in the denominator and
+//     `DI_RELIEF_MAX` on the result cap the brightening a normal map may claim.
+//     Physically a facet turned from grazing to head-on IS enormously brighter,
+//     and the cap says so only up to a point: beyond it the thing being scaled
+//     is a half-resolution stochastic estimate, and amplifying it further
+//     amplifies its error rather than its detail.
+//  3. A LIGHT THE GEOMETRIC NORMAL CANNOT SEE IS STILL DARK. The reservoir
+//     scores candidates by the geometric `NdotL`, so a facet whose geometric
+//     normal faces away from every light selects nothing and the estimate is
+//     zero however the normal map tilts. Relief is restored WITHIN the lit set,
+//     never conjured outside it. The failure looks like a bump that should catch
+//     a grazing light and does not — the opposite of the leak the alternative
+//     would produce, and the safe direction to be wrong in.
+//  4. DIRECTION DISCONTINUITIES. Directions do not average: two lights 90
+//     degrees apart average to a direction neither occupies, and two at 180
+//     degrees average to nothing at all. Every filter in this chain therefore
+//     averages DECODED vectors and RENORMALIZES, and a degenerate sum falls back
+//     to the surface normal — which makes both cosines equal, hence `relief`
+//     exactly 1, and degrades the pixel to R5c's flat behaviour rather than to
+//     black. The visible artefact is a softened, slightly wrong bump direction on
+//     the few texels where the reservoir genuinely disagrees across the filter
+//     footprint; it is bounded, local, and strictly better than no direction.
+
+/// Floor under the geometric cosine in the relief denominator. Not an epsilon
+/// for numerical safety — 0.05 is orders of magnitude above any float hazard —
+/// but the point at which "the trace barely lit this texel" stops being a number
+/// worth dividing by. With DI_RELIEF_MAX it bounds the amplification at a
+/// grazing light, which is the failure mode that killed the divide-the-cosine-out
+/// form.
+inline constexpr float DI_RELIEF_MIN_COSINE = 0.05f;
+
+/// Ceiling on the relief factor. 4x is two stops: enough that a cobble edge
+/// turned toward a flashlight reads as a lit edge, little enough that a
+/// half-resolution 1-spp estimate is never multiplied into a firefly. The
+/// darkening side is deliberately unbounded below — scaling an estimate toward
+/// zero cannot amplify its error.
+inline constexpr float DI_RELIEF_MAX = 4.0f;
+
+/// Below this squared length a filtered direction sum has cancelled itself out
+/// and names no direction. The consumer substitutes the surface normal, which
+/// makes the re-applied cosine 1 — R5c's behaviour, which is the right thing to
+/// degrade to. Mirrors `bentNormalize`'s test in bent_cone.hlsli, and for the
+/// same reason: both average unit vectors and both must survive them cancelling.
+inline constexpr float DI_DIRECTION_MIN_LENGTH_SQ = 1e-8f;
+
+/**
+ * The relief factor: how much brighter (or darker) this texel's own normal makes
+ * the traced estimate.
+ *
+ * `ndotl_geometric` is `dot(N_geometric, L)` — the cosine the trace already
+ * applied, recomputed at full resolution from the interpolated vertex normal and
+ * the denoised direction. `ndotl_shading` is the normal-mapped one. Exactly 1
+ * when they agree, which is the energy identity and the reason terrain, grass
+ * and every un-normal-mapped material are bit-identical to R5c.
+ */
+[[nodiscard]] inline float di_relief_factor(float ndotl_geometric,
+                                            float ndotl_shading) noexcept {
+    const float denom = std::max(ndotl_geometric, DI_RELIEF_MIN_COSINE);
+    return std::clamp(std::max(ndotl_shading, 0.0f) / denom, 0.0f, DI_RELIEF_MAX);
+}
+
+/**
+ * One channel of `localDiLighting`: the whole Full-tier local-light term, given
+ * a reconstructed estimate.
+ *
+ * `diffuse_demod` and `spec_demod` are the demodulated values the trace wrote,
+ * unchanged from R5c; `relief` is `di_relief_factor`. Passing 1 reproduces R5c
+ * exactly, which is the identity `local_di.test.cpp` pins.
+ *
+ * CPU mirror of `localDiRemodulate` in shaders/local_di.hlsli.
+ */
+[[nodiscard]] inline float di_remodulate_channel(float diffuse_demod, float spec_demod,
+                                                 float albedo, float metallic, float schlick,
+                                                 float relief) noexcept {
+    return relief * (diffuse_demod * albedo * di_diffuse_tint(albedo, metallic) +
+                     spec_demod * di_specular_tint(albedo, metallic, schlick));
 }
 
 // ---------------------------------------------------------------------------

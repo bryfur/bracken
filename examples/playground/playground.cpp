@@ -1620,7 +1620,15 @@ void PlaygroundGame::setup_smoke_run() {
     // because the forced-camera path pre-settles the rig's springs.
     // PLAYGROUND_CAMERA below still wins, so an A/B can pick its own vantage.
     if (rt_bench_) {
-        smoke_cam_forced_ = true;
+        // PLAYGROUND_RT_BENCH_ORBIT=1 gives the bench the SMOKE run's orbiting
+        // camera instead, which is the only condition in this repo that
+        // reproduces the thing R7 was asked to fix: a moving camera
+        // disoccludes, and a disocclusion is where a 1-spp reservoir estimate
+        // is at its worst. A pinned camera lets the temporal accumulation reach
+        // its ceiling everywhere and therefore UNDERSTATES both the problem and
+        // the fix. It is deliberately not the default — a per-pass timing table
+        // wants a scene that does not change under it.
+        smoke_cam_forced_ = SDL_getenv("PLAYGROUND_RT_BENCH_ORBIT") == nullptr;
         smoke_cam_target_ = village_pos(0.0f, 0.0f, 2.0f);
         smoke_cam_yaw_ = 310.0f;
         smoke_cam_pitch_ = 20.0f;
@@ -1634,6 +1642,30 @@ void PlaygroundGame::setup_smoke_run() {
         if (const char* sweep = SDL_getenv("PLAYGROUND_SUN_SWEEP"); sweep != nullptr && sweep[0]) {
             sun_sweep_deg_per_s_ = std::max(0.0f, static_cast<float>(SDL_atof(sweep)));
         }
+        // The R7 temporal-noise probe, on for every bench run because that is
+        // the only place the number is wanted and the only place a spare
+        // dispatch is affordable. A --smoke run measures ONE frame and could
+        // not report a frame-to-frame delta if it wanted to.
+        rt_di_noise_probe_ = true;
+    }
+    // PLAYGROUND_RT_SPATIAL=<k> / PLAYGROUND_RT_DI_ITERS=<n>: the A/B levers for
+    // the R7 package. Unset leaves the shipped defaults (3 neighbours, 2
+    // a-trous iterations); `PLAYGROUND_RT_SPATIAL=0 PLAYGROUND_RT_DI_ITERS=1` is
+    // the pre-R7 sampling and filtering, which is what the noise metric's
+    // "before" column is measured with. Not bench-only: the same A/B has to be
+    // available to a --smoke run for the luma baselines to mean anything.
+    if (const char* env = SDL_getenv("PLAYGROUND_RT_SPATIAL"); env != nullptr && env[0]) {
+        rt_spatial_neighbors_ = static_cast<uint32_t>(std::max(0, SDL_atoi(env)));
+    }
+    if (const char* env = SDL_getenv("PLAYGROUND_RT_DI_ITERS"); env != nullptr && env[0]) {
+        rt_di_spatial_iterations_ = static_cast<uint32_t>(std::clamp(SDL_atoi(env), 1, 2));
+    }
+    {
+        bracken::scene::SceneRenderer::RtLocalTuning tuning;
+        tuning.spatial_neighbors = rt_spatial_neighbors_;
+        tuning.di_spatial_iterations = rt_di_spatial_iterations_;
+        tuning.di_noise_probe = rt_di_noise_probe_;
+        scene_renderer().set_rt_local_tuning(tuning);
     }
     // PLAYGROUND_CAMERA="vx,vz,yaw,pitch,dist_m" pins the camera at a
     // village-space position for the whole run (art close-up hook).
@@ -2989,6 +3021,10 @@ void PlaygroundGame::update_rt_bench_fence() {
             rt_bench_local_accum_.push_back(denoise.local_mean_accum);
             rt_bench_local_fire_.push_back(denoise.local_gradient_fire);
         }
+        if (denoise.di_noise_valid) {
+            rt_bench_di_noise_.push_back(denoise.di_noise_mean_delta);
+            rt_bench_di_level_.push_back(denoise.di_noise_mean_level);
+        }
         ++rt_bench_sampled_frames_;
     }
 
@@ -3085,6 +3121,19 @@ void PlaygroundGame::print_rt_bench_report() {
             sun_sweep_deg_per_s_, sa.mean, sf.mean, rt_bench_shadow_accum_.size(), la.mean,
             lf.mean, rt_bench_local_accum_.size(), rt.shadow_gradient_rays,
             rt.local_shadow_gradient_rays);
+    }
+    // R7's temporal-noise probe: the number the smoke test structurally cannot
+    // produce, and the one the whole package is judged on. Under a pinned
+    // camera and a static sun this is temporal NOISE; under PLAYGROUND_SUN_SWEEP
+    // it also contains the legitimate change, so the two conditions are only
+    // ever compared against themselves.
+    {
+        const BenchSummary noise = summarize(rt_bench_di_noise_);
+        const BenchSummary level = summarize(rt_bench_di_level_);
+        std::cout << std::format(
+            "[rtbench] di noise={:.5f} p95={:.5f} level={:.5f} relative={:.5f} samples={}\n",
+            noise.mean, noise.p95, level.mean,
+            level.mean > 1e-6f ? noise.mean / level.mean : 0.0f, rt_bench_di_noise_.size());
     }
     std::cout << std::format("[rtbench] rt shadows_traced={} reflections_traced={} "
                              "local_shadows_traced={} shadow_rays={} "

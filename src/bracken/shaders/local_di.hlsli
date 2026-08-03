@@ -19,11 +19,20 @@
 //   diffuse.a   = linear view depth of the texel  (the spatial pass wrote it)
 //   spec.rgb    = D * Vis * F_d * E                               [dielectric F]
 //   spec.a      = the Schlick fraction (1 - LdotH)^5 of the winning light
+//   dir.rg      = the winning light's direction, octahedral        [R7b]
 //
 // with E = lightColor * atten * cone * NdotL * V * W — the reservoir estimate
 // of the WHOLE point+spot sum, not of one light, which is what makes one ray
 // enough. F_d is Schlick against F0 = 0.04: the G-buffer carries roughness and
 // metallic but not albedo, so a metal's real F0 is not knowable there.
+//
+// THE `NdotL` IN THERE IS THE GEOMETRIC ONE — the prepass G-buffer's, the only
+// normal a compute pass has. This shader has a better one, and R7b's third
+// target is what lets it be used: `localDiLighting` divides out the geometric
+// cosine and multiplies in the normal-mapped one, BOUNDED, which is what gives a
+// cobblestone back its bump lighting under a flashlight. The demodulated pair is
+// untouched by that — see render/lighting/local_di.hpp for why the correction is
+// a clamped ratio applied here rather than a factor moved out of the trace.
 //
 // BOTH halves therefore need a Fresnel correction on the way back, and both
 // corrections are exact rather than approximate. The diffuse one needs only the
@@ -97,6 +106,67 @@ float3 localDiSpecularTint(float3 albedo, float metallic, float schlickFraction)
 }
 
 // ---------------------------------------------------------------------------
+// The directional basis (R7b) — encoding, filtering, and the re-applied cosine
+// ---------------------------------------------------------------------------
+
+/// Below this squared length a filtered direction sum has cancelled itself out.
+/// CPU mirror: `DI_DIRECTION_MIN_LENGTH_SQ`.
+#define LOCAL_DI_DIRECTION_MIN_LENGTH_SQ 1e-8
+
+/// Unit vector -> [0,1]^2. The same octahedral mapping as
+/// prepass_gbuffer.frag.hlsl's `octEncode` and bent_cone.hlsli's
+/// `bentOctEncode`; spelled out here rather than shared because this header is
+/// included by four fragment shaders, two compute denoisers and the trace, and
+/// none of them may be forced to take a G-buffer or an AO header with it.
+float2 localDiDirEncode(float3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 e = n.xy;
+    if (n.z < 0.0) {
+        e = (1.0 - abs(n.yx)) * select(n.xy >= 0.0, float2(1.0, 1.0), float2(-1.0, -1.0));
+    }
+    return e * 0.5 + 0.5;
+}
+
+/// [0,1]^2 -> unit vector.
+float3 localDiDirDecode(float2 e) {
+    e = e * 2.0 - 1.0;
+    float3 n = float3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+    float t = saturate(-n.z);
+    n.xy += select(n.xy >= 0.0, float2(-t, -t), float2(t, t));
+    return normalize(n);
+}
+
+/// Close a weighted sum of DECODED directions. Every filter in this chain
+/// averages vectors and renormalizes rather than averaging octahedral
+/// coordinates — those are discontinuous across the fold seam, and an average
+/// taken there points at neither input. `fallback` is what a fully cancelled
+/// sum degrades to; every consumer passes the surface normal, which makes the
+/// re-applied cosine 1 and reproduces R5c's flat behaviour on that texel.
+float3 localDiDirNormalize(float3 sum, float3 fallback) {
+    float l2 = dot(sum, sum);
+    return (l2 > LOCAL_DI_DIRECTION_MIN_LENGTH_SQ) ? (sum * rsqrt(l2)) : fallback;
+}
+
+/// Floor under the geometric cosine, and the ceiling on the ratio. CPU mirrors:
+/// `DI_RELIEF_MIN_COSINE`, `DI_RELIEF_MAX`.
+#define LOCAL_DI_RELIEF_MIN_COSINE 0.05
+#define LOCAL_DI_RELIEF_MAX 4.0
+
+/// How much brighter this texel's own normal makes the traced estimate.
+/// Exactly 1 where the normal map is flat. CPU mirror: `di_relief_factor`.
+float localDiReliefFactor(float ndotlGeometric, float ndotlShading) {
+    return clamp(max(ndotlShading, 0.0) / max(ndotlGeometric, LOCAL_DI_RELIEF_MIN_COSINE), 0.0,
+                 LOCAL_DI_RELIEF_MAX);
+}
+
+/// One channel-set of the remodulation. CPU mirror: `di_remodulate_channel`.
+float3 localDiRemodulate(float3 diffuseDemod, float3 specDemod, float3 albedo, float metallic,
+                         float schlick, float relief) {
+    return relief * (diffuseDemod * albedo * localDiDiffuseTint(albedo, metallic) +
+                     specDemod * localDiSpecularTint(albedo, metallic, schlick));
+}
+
+// ---------------------------------------------------------------------------
 // The spatial filter's radius curve (shared with rt_di_denoise_spatial.comp)
 // ---------------------------------------------------------------------------
 
@@ -128,6 +198,12 @@ float localDiFilterRadius(float count, float maxRadius) {
 Texture2D<float4> localDiDiffuseTexture;
 [[vk::binding(LOCAL_DI_BINDING_BASE + 1, 2)]]
 Texture2D<float4> localDiSpecularTexture;
+/// R7b's third target: the winning light's octahedral direction, RG16F at the
+/// traced resolution. A third storage texture rather than a lane on one of the
+/// two above, because both alpha lanes are already carrying data the forward
+/// pass cannot reconstruct (the view depth and the Schlick fraction).
+[[vk::binding(LOCAL_DI_BINDING_BASE + 2, 2)]]
+Texture2D<float2> localDiDirectionTexture;
 
 /**
  * The reconstruction: a manual 4-tap bilinear from the traced resolution with
@@ -145,11 +221,12 @@ Texture2D<float4> localDiSpecularTexture;
  * zero — which is the correct local-light contribution for a pixel no local
  * light reaches.
  */
-void localDiSample(float2 uv, float viewDepth, out float3 diffuse, out float3 spec,
-                   out float schlickFraction) {
+void localDiSample(float2 uv, float viewDepth, float3 fallbackDir, out float3 diffuse,
+                   out float3 spec, out float schlickFraction, out float3 direction) {
     diffuse = float3(0.0, 0.0, 0.0);
     spec = float3(0.0, 0.0, 0.0);
     schlickFraction = 0.0;
+    direction = fallbackDir;
 
     uint2 size;
     localDiDiffuseTexture.GetDimensions(size.x, size.y);
@@ -163,6 +240,7 @@ void localDiSample(float2 uv, float viewDepth, out float3 diffuse, out float3 sp
 
     float4 diffuseSum = float4(0.0, 0.0, 0.0, 0.0);
     float4 specSum = float4(0.0, 0.0, 0.0, 0.0);
+    float3 dirSum = float3(0.0, 0.0, 0.0);
     float weightSum = 0.0;
     float tolerance = LOCAL_DI_DEPTH_TOLERANCE * max(viewDepth, 1.0);
 
@@ -187,6 +265,9 @@ void localDiSample(float2 uv, float viewDepth, out float3 diffuse, out float3 sp
             }
             diffuseSum += float4(d.rgb, 0.0) * w;
             specSum += localDiSpecularTexture.Load(int3(s, 0)) * w;
+            // Decoded, not interpolated in octahedral space — see
+            // localDiDirNormalize.
+            dirSum += localDiDirDecode(localDiDirectionTexture.Load(int3(s, 0)).xy) * w;
             weightSum += w;
         }
     }
@@ -197,6 +278,7 @@ void localDiSample(float2 uv, float viewDepth, out float3 diffuse, out float3 sp
     diffuse = diffuseSum.rgb / weightSum;
     spec = specSum.rgb / weightSum;
     schlickFraction = specSum.a / weightSum;
+    direction = localDiDirNormalize(dirSum, fallbackDir);
 }
 
 /**
@@ -207,14 +289,26 @@ void localDiSample(float2 uv, float viewDepth, out float3 diffuse, out float3 sp
  * lights are not summed here and are not summed there either, which is what
  * makes this per-light correct where the Ratio tier's one scalar is only
  * aggregate correct.
+ *
+ * `N` is the SHADING normal (normal-mapped) and `Ngeo` the interpolated vertex
+ * normal — the same quantity the prepass wrote into the G-buffer and therefore
+ * the same cosine the trace already applied. Pass the same vector twice and the
+ * relief factor is exactly 1, which reproduces R5c bit for bit; that is what
+ * terrain and grass do, having no normal map to disagree with.
+ *
+ * `Ngeo` is also the fallback direction when the filtered direction has
+ * cancelled, which makes both cosines equal and the relief 1 — the correct thing
+ * to degrade to.
  */
-float3 localDiLighting(float2 uv, float viewDepth, float3 albedo, float metallic) {
+float3 localDiLighting(float2 uv, float viewDepth, float3 albedo, float metallic, float3 N,
+                       float3 Ngeo) {
     float3 diffuse;
     float3 spec;
     float schlick;
-    localDiSample(uv, viewDepth, diffuse, spec, schlick);
-    return diffuse * albedo * localDiDiffuseTint(albedo, metallic) +
-           spec * localDiSpecularTint(albedo, metallic, schlick);
+    float3 L;
+    localDiSample(uv, viewDepth, Ngeo, diffuse, spec, schlick, L);
+    const float relief = localDiReliefFactor(dot(Ngeo, L), dot(N, L));
+    return localDiRemodulate(diffuse, spec, albedo, metallic, schlick, relief);
 }
 
 #endif // LOCAL_DI_BINDING_BASE

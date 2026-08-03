@@ -27,16 +27,33 @@
 // direct lighting is not. The surface's own motion vector is the correct one
 // here, and it is also the quiet one.
 //
-// History layout, both targets RGBA16F:
-//   diffuse: rgb = accumulated demodulated diffuse, a = accumulated frame count
-//   spec:    rgb = accumulated demodulated specular, a = accumulated Schlick f
+// History layout:
+//   diffuse (RGBA16F): rgb = accumulated demodulated diffuse, a = frame count
+//   spec    (RGBA16F): rgb = accumulated demodulated specular, a = Schlick f
+//   dir     (RG16F):   octahedral accumulated light direction        [R7b]
 //
 // The spatial pass downstream replaces the diffuse alpha with the texel's
 // linear view depth, which is what the forward reconstruction reads. The count
 // is an internal quantity and never leaves this pair.
+//
+// R7b'S THIRD TARGET IS ACCUMULATED DIFFERENTLY FROM THE OTHER TWO, and has to
+// be. A direction is not a radiance: it has no fireflies to clamp, no
+// neighbourhood variance worth computing, and — the part that actually bites —
+// it cannot be averaged in its stored form. Octahedral coordinates are
+// discontinuous across the fold seam, so an EMA taken on the encoded pair walks
+// through directions neither input names. So the history is DECODED, mixed as a
+// vector with the same alpha the radiance halves use, and RENORMALIZED. That
+// makes the mix a (non-uniform-speed) slerp toward the current sample, which is
+// the right shape: a reservoir that switched light should swing the direction
+// over exactly as many frames as it takes the radiance to follow, and both are
+// driven by the same `count`.
 
 #include "rt_sampling.hlsli"
 #include "rt_denoise.hlsli"
+// For the octahedral direction codec and its cancellation test. The resource
+// half of that header is conditional on LOCAL_DI_BINDING_BASE, which this pass
+// does not define, so it costs nothing but the maths.
+#include "local_di.hlsli"
 
 [[vk::binding(0, 2)]]
 cbuffer RtDiTemporalUniforms : register(b0, space2) {
@@ -75,34 +92,51 @@ Texture2D<float4> specularIn : register(t1, space0);
 SamplerState specularInSampler : register(s1, space0);
 
 [[vk::combinedImageSampler]][[vk::binding(2, 0)]]
-Texture2D<float2> velocityTexture : register(t2, space0);
+Texture2D<float2> directionIn : register(t2, space0);
 [[vk::combinedImageSampler]][[vk::binding(2, 0)]]
-SamplerState velocitySampler : register(s2, space0);
+SamplerState directionInSampler : register(s2, space0);
 
 [[vk::combinedImageSampler]][[vk::binding(3, 0)]]
-Texture2D<float4> diffuseHistory : register(t3, space0);
+Texture2D<float2> velocityTexture : register(t3, space0);
 [[vk::combinedImageSampler]][[vk::binding(3, 0)]]
-SamplerState diffuseHistorySampler : register(s3, space0);
+SamplerState velocitySampler : register(s3, space0);
 
 [[vk::combinedImageSampler]][[vk::binding(4, 0)]]
-Texture2D<float4> specularHistory : register(t4, space0);
+Texture2D<float4> diffuseHistory : register(t4, space0);
 [[vk::combinedImageSampler]][[vk::binding(4, 0)]]
-SamplerState specularHistorySampler : register(s4, space0);
+SamplerState diffuseHistorySampler : register(s4, space0);
+
+[[vk::combinedImageSampler]][[vk::binding(5, 0)]]
+Texture2D<float4> specularHistory : register(t5, space0);
+[[vk::combinedImageSampler]][[vk::binding(5, 0)]]
+SamplerState specularHistorySampler : register(s5, space0);
+
+/// The direction history. Sampled with a NEAREST sampler by the caller, unlike
+/// the two radiance histories: a bilinear tap on octahedral coordinates crosses
+/// the fold seam exactly where a silhouette does, and the reprojected direction
+/// is renormalized after decode anyway, so the filtering would buy nothing and
+/// cost a wrong direction at every edge.
+[[vk::combinedImageSampler]][[vk::binding(6, 0)]]
+Texture2D<float2> directionHistory : register(t6, space0);
+[[vk::combinedImageSampler]][[vk::binding(6, 0)]]
+SamplerState directionHistorySampler : register(s6, space0);
 
 /// R5b's reconstructed A-SVGF gradient at STRATUM resolution, for the LOCAL
 /// signal — the same texture the visibility temporal pass reads, dispatched
 /// against the same VisibilityDenoiser. A reservoir that changed which light it
 /// picked is a lighting change here in exactly the way it is there.
-[[vk::binding(5, 0)]] Texture2D<float> gradientTexture : register(t5, space0);
+[[vk::binding(7, 0)]] Texture2D<float> gradientTexture : register(t7, space0);
 
 /// render::AutoExposure::state_buffer(): float4 {current EV, target EV, avg
 /// log2 luma, valid}.
-[[vk::binding(6, 0)]] StructuredBuffer<float4> exposureState : register(t6, space0);
+[[vk::binding(8, 0)]] StructuredBuffer<float4> exposureState : register(t8, space0);
 
 [[vk::image_format("rgba16f")]]
 [[vk::binding(0, 1)]] RWTexture2D<float4> diffuseOut : register(u0, space1);
 [[vk::image_format("rgba16f")]]
 [[vk::binding(1, 1)]] RWTexture2D<float4> specularOut : register(u1, space1);
+[[vk::image_format("rg16f")]]
+[[vk::binding(2, 1)]] RWTexture2D<float2> directionOut : register(u2, space1);
 
 /// Neighbourhood mean and standard deviation of one 3x3 window, over texels the
 /// trace answered for. `validMask` comes from the DIFFUSE alpha for both
@@ -169,9 +203,11 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         // history: an alpha of 0 is what the forward reconstruction rejects.
         diffuseOut[coord] = float4(0.0, 0.0, 0.0, 0.0);
         specularOut[coord] = float4(0.0, 0.0, 0.0, 0.0);
+        directionOut[coord] = localDiDirEncode(float3(0.0, 1.0, 0.0));
         return;
     }
     float4 currentSpec = specularIn.Load(int3(coord, 0));
+    const float3 currentDir = localDiDirDecode(directionIn.Load(int3(coord, 0)).xy);
 
     const float adaptedEv = rtAdaptedEv(exposureState[0], exposureEnabled, manualExposureEv);
 
@@ -207,6 +243,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     float3 accumulated = current.rgb;
     float3 accumulatedSpec = currentSpec.rgb;
+    float3 accumulatedDir = currentDir;
     float schlick = currentSpec.a;
     float count = 1.0;
 
@@ -233,10 +270,21 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
                 // in [0, 1] by construction and has no fireflies, so it takes
                 // the EMA and none of the clamps.
                 schlick = lerp(histSpec.a, currentSpec.a, alpha);
+                // The direction: decoded, mixed as a VECTOR, renormalized. The
+                // fallback when the mix cancels is this frame's own direction,
+                // which is the one input that is certainly a real direction —
+                // not the surface normal, because unlike the forward pass this
+                // one has a better answer than "flat" available.
+                const float3 histDir =
+                    localDiDirDecode(directionHistory.SampleLevel(directionHistorySampler,
+                                                                  prevUv, 0).xy);
+                accumulatedDir =
+                    localDiDirNormalize(lerp(histDir, currentDir, alpha), currentDir);
             }
         }
     }
 
     diffuseOut[coord] = float4(accumulated, count);
     specularOut[coord] = float4(accumulatedSpec, schlick);
+    directionOut[coord] = localDiDirEncode(accumulatedDir);
 }

@@ -349,3 +349,165 @@ TEST(LocalDi, FilterRadiusNeverGoesBelowTheFloorEvenWithASmallerMax) {
     EXPECT_FLOAT_EQ(di_filter_radius(1.0f, 0.0f), DI_FILTER_MIN_RADIUS);
     EXPECT_FLOAT_EQ(di_filter_radius(100.0f, 0.0f), DI_FILTER_MIN_RADIUS);
 }
+
+// ---------------------------------------------------------------------------
+// The directional basis (R7b, docs/rt_lighting_plan.md §5.7)
+// ---------------------------------------------------------------------------
+//
+// The trace publishes the winning light's DIRECTION, and the forward pass scales
+// its estimate by a RELIEF FACTOR — the ratio of the cosine it can compute from
+// its normal-mapped normal to the one the trace already applied from the
+// geometric one. What these tests pin is that the correction is exactly 1 where
+// the normal map is flat (so R5c's whole energy argument survives untouched),
+// that it moves in the right direction and by the right amount where it is not,
+// and that it is BOUNDED — the bound being the thing that makes this formulation
+// preferable to dividing the cosine out of the trace.
+
+namespace {
+
+using bracken::render::lighting::di_relief_factor;
+using bracken::render::lighting::di_remodulate_channel;
+using bracken::render::lighting::DI_DIRECTION_MIN_LENGTH_SQ;
+using bracken::render::lighting::DI_RELIEF_MAX;
+using bracken::render::lighting::DI_RELIEF_MIN_COSINE;
+
+/// `localDiLighting`'s remodulation, given a perfectly reconstructed estimate,
+/// the denoised direction, and the two normals.
+glm::vec3 remodulate_directional(const DemodulatedEstimate& est, const glm::vec3& albedo,
+                                 float metallic, const glm::vec3& light_dir,
+                                 const glm::vec3& geometric_normal,
+                                 const glm::vec3& shading_normal) {
+    const float relief =
+        di_relief_factor(glm::dot(geometric_normal, light_dir), glm::dot(shading_normal, light_dir));
+    glm::vec3 out(0.0f);
+    for (int c = 0; c < 3; ++c) {
+        out[c] = di_remodulate_channel(est.diffuse[c], est.specular[c], albedo[c], metallic,
+                                       est.schlick, relief);
+    }
+    return out;
+}
+
+} // namespace
+
+// THE ENERGY IDENTITY, restated for the directional basis and now trivial: an
+// unbumped texel has the two normals equal, the relief is exactly 1, and the
+// expression is R5c's term for term. Same 1e-5 relative band, because it is the
+// same arithmetic with a factor of one in it.
+TEST(LocalDiDirectional, FlatNormalsReproduceTheAnalyticEvaluation) {
+    const glm::vec3 radiance{3.0f, 2.5f, 1.5f};
+    for (const Sample& s : SAMPLES) {
+        const glm::vec3 reference =
+            evaluate_pbr(s.n, s.v, s.l, radiance, s.albedo, s.metallic, s.roughness);
+        const DemodulatedEstimate est =
+            demodulate(s.n, s.v, s.l, radiance, s.metallic, s.roughness, 1.0f, 1.0f);
+        const glm::vec3 rebuilt =
+            remodulate_directional(est, s.albedo, s.metallic, s.l, s.n, /*shading=*/s.n);
+        for (int c = 0; c < 3; ++c) {
+            const float scale = std::max(std::abs(reference[c]), 1e-4f);
+            EXPECT_NEAR(rebuilt[c], reference[c], 1e-5f * scale) << s.name << ", channel " << c;
+        }
+    }
+}
+
+// The relief factor is exactly 1 for equal normals — checked directly, across
+// the whole range of incidence, because "exactly" is what terrain, grass and
+// every un-normal-mapped material depend on to stay bit-identical to R5c.
+TEST(LocalDiDirectional, EqualNormalsGiveExactlyUnity) {
+    for (float c : {1.0f, 0.75f, 0.5f, 0.2f, DI_RELIEF_MIN_COSINE}) {
+        EXPECT_FLOAT_EQ(di_relief_factor(c, c), 1.0f) << "cos " << c;
+    }
+    // Below the floor the ratio is no longer 1 — by construction, because the
+    // denominator has stopped tracking the numerator. That is the clamp doing
+    // its job and it must be visible in a test rather than discovered.
+    EXPECT_LT(di_relief_factor(0.01f, 0.01f), 1.0f);
+}
+
+// THE POINT OF THE WHOLE PACKAGE, as a number: a texel whose normal map tilts it
+// toward the light gets brighter, one tilted away gets darker, in proportion to
+// the cosine ratio. Before R7b both read the geometric value and the surface was
+// flat.
+TEST(LocalDiDirectional, BumpedNormalsScaleByTheCosineRatio) {
+    const Sample& s = SAMPLES[1]; // dielectric, oblique
+    const glm::vec3 radiance{2.0f, 2.0f, 2.0f};
+    const DemodulatedEstimate est =
+        demodulate(s.n, s.v, s.l, radiance, s.metallic, s.roughness, 1.0f, 1.0f);
+
+    const glm::vec3 flat = remodulate_directional(est, s.albedo, s.metallic, s.l, s.n, s.n);
+    const glm::vec3 toward = glm::normalize(s.n + s.l * 0.35f);
+    const glm::vec3 away = glm::normalize(s.n - s.l * 0.35f);
+    const glm::vec3 bright = remodulate_directional(est, s.albedo, s.metallic, s.l, s.n, toward);
+    const glm::vec3 dark = remodulate_directional(est, s.albedo, s.metallic, s.l, s.n, away);
+
+    const float base = glm::dot(s.n, s.l);
+    ASSERT_GT(base, DI_RELIEF_MIN_COSINE); // the ratio is unclamped here
+    for (int c = 0; c < 3; ++c) {
+        EXPECT_GT(bright[c], flat[c]);
+        EXPECT_LT(dark[c], flat[c]);
+        EXPECT_NEAR(bright[c], flat[c] * (glm::dot(toward, s.l) / base), 1e-5f);
+        EXPECT_NEAR(dark[c], flat[c] * (glm::dot(away, s.l) / base), 1e-5f);
+    }
+}
+
+// THE BOUND, which is the reason this formulation was chosen over dividing the
+// cosine out of the trace. A geometric normal that barely sees the light and a
+// normal map that faces it head-on would ask for an arbitrarily large
+// amplification of a half-resolution 1-spp estimate; the clamp says 4x and no
+// more. Both halves of the clamp are pinned, because a missing floor and a
+// missing ceiling fail in different ways.
+TEST(LocalDiDirectional, ReliefIsBoundedAboveAndTheDenominatorHasAFloor) {
+    // Grazing geometry, head-on bump: unbounded without the clamp.
+    EXPECT_FLOAT_EQ(di_relief_factor(1e-6f, 1.0f), DI_RELIEF_MAX);
+    EXPECT_FLOAT_EQ(di_relief_factor(0.0f, 1.0f), DI_RELIEF_MAX);
+    // Exactly at the floor, the ratio is 1 / DI_RELIEF_MIN_COSINE = 20, capped.
+    EXPECT_FLOAT_EQ(di_relief_factor(DI_RELIEF_MIN_COSINE, 1.0f), DI_RELIEF_MAX);
+    // Just inside the cap, it is the true ratio and not the cap.
+    EXPECT_NEAR(di_relief_factor(0.25f, 0.5f), 2.0f, 1e-6f);
+    EXPECT_LT(di_relief_factor(0.25f, 0.5f), DI_RELIEF_MAX);
+    // The darkening half is deliberately unbounded below.
+    EXPECT_NEAR(di_relief_factor(1.0f, 0.01f), 0.01f, 1e-6f);
+}
+
+// A texel the normal map turns fully away from the light contributes nothing,
+// and contributes it as a CLAMP rather than as a negative. Negative direct
+// lighting would subtract from the sun and the ambient at the same pixel, which
+// is the one way this basis could make a frame worse than having no direction.
+TEST(LocalDiDirectional, BackFacingTexelsClampToZeroRatherThanGoNegative) {
+    EXPECT_FLOAT_EQ(di_relief_factor(0.8f, -0.75f), 0.0f);
+    EXPECT_FLOAT_EQ(di_relief_factor(0.8f, 0.0f), 0.0f);
+    EXPECT_FLOAT_EQ(di_remodulate_channel(5.0f, 5.0f, 0.5f, 0.0f, 0.1f, 0.0f), 0.0f);
+}
+
+// Approximation 3 of the four named in local_di.hpp: relief is restored WITHIN
+// the lit set and never conjured outside it. A geometric normal facing away
+// scores zero in the reservoir's target function, so the trace writes nothing
+// and no amount of normal-map tilt brings the light back.
+TEST(LocalDiDirectional, ALightTheGeometricNormalCannotSeeStaysDark) {
+    const glm::vec3 n{0.0f, 1.0f, 0.0f};
+    const glm::vec3 l = glm::normalize(glm::vec3(0.3f, -1.0f, 0.0f)); // below the horizon
+    const glm::vec3 v = glm::normalize(glm::vec3(0.0f, 1.0f, 1.0f));
+    const DemodulatedEstimate est = demodulate(n, v, l, glm::vec3(4.0f), 0.0f, 0.4f, 1.0f, 1.0f);
+    EXPECT_EQ(est.diffuse, glm::vec3(0.0f));
+    EXPECT_EQ(est.specular, glm::vec3(0.0f));
+    // Even a normal map pointing straight at the light cannot resurrect it: the
+    // estimate being scaled is zero.
+    EXPECT_EQ(remodulate_directional(est, glm::vec3(0.8f), 0.0f, l, n, -l), glm::vec3(0.0f));
+}
+
+// Approximation 4: filtered directions cancel. The threshold has to be low
+// enough that a genuine unit vector never trips it and high enough that two
+// opposed taps do — this pins both ends, because the consumer's fallback
+// (substitute the geometric normal, relief becomes exactly 1) is a visible
+// behaviour change on any texel that reaches it.
+TEST(LocalDiDirectional, CancelledDirectionSumsAreDetected) {
+    const glm::vec3 a{0.0f, 1.0f, 0.0f};
+    const glm::vec3 opposed = a + glm::vec3(0.0f, -1.0f, 0.0f);
+    EXPECT_LT(glm::dot(opposed, opposed), DI_DIRECTION_MIN_LENGTH_SQ);
+
+    // Two taps 179 degrees apart still name a direction, barely, and must not
+    // fall back: the fallback is flatter than the answer it replaces.
+    const glm::vec3 nearly = a + glm::normalize(glm::vec3(0.0175f, -1.0f, 0.0f));
+    EXPECT_GT(glm::dot(nearly, nearly), DI_DIRECTION_MIN_LENGTH_SQ);
+
+    // A single unit tap, the common case, is nowhere near the threshold.
+    EXPECT_GT(glm::dot(a, a), DI_DIRECTION_MIN_LENGTH_SQ * 1e6f);
+}

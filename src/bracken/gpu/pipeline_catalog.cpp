@@ -61,21 +61,21 @@ constexpr ShaderResources k_ubo1_samp5{.num_samplers = 5, .num_uniform_buffers =
 /// not a seventeenth sampler (gpu::GiScreenProbeSh). The next feature that
 /// wants a per-pixel texture in these shaders has to pack or use a buffer.
 constexpr ShaderResources k_fs_lit_model{
-    .num_samplers = 16, .num_storage_textures = 2, .num_storage_buffers = 5, .num_uniform_buffers = 3};
+    .num_samplers = 16, .num_storage_textures = 3, .num_storage_buffers = 5, .num_uniform_buffers = 3};
 
 /// `terrain.frag`: material array + splatmap + shadow atlas (cmp + raw) +
 /// screen AO + IBL (irradiance / prefiltered / BRDF LUT) + traced sun mask +
 /// GI (irradiance / visibility / probe metadata) + traced LOCAL-light mask +
 /// local-shadow atlas; R4b's screen-probe SH is the fifth storage buffer.
 constexpr ShaderResources k_fs_lit_terrain{
-    .num_samplers = 14, .num_storage_textures = 2, .num_storage_buffers = 5, .num_uniform_buffers = 3};
+    .num_samplers = 14, .num_storage_textures = 3, .num_storage_buffers = 5, .num_uniform_buffers = 3};
 
 /// `grass.frag`: shadow atlas (cmp + raw) + screen AO + IBL (irradiance /
 /// prefiltered / BRDF LUT) + traced sun mask + GI (irradiance / visibility /
 /// probe metadata) + traced LOCAL-light mask + local-shadow atlas; R4b's
 /// screen-probe SH is the fifth storage buffer.
 constexpr ShaderResources k_fs_lit_grass{
-    .num_samplers = 12, .num_storage_textures = 2, .num_storage_buffers = 5, .num_uniform_buffers = 3};
+    .num_samplers = 12, .num_storage_textures = 3, .num_storage_buffers = 5, .num_uniform_buffers = 3};
 
 /// `grass.vert` / `prepass_grass.vert`: heightmap + splatmap samplers, plus the
 /// visible-chunk origin buffer for the chunked LOD.
@@ -964,9 +964,15 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // frame's ShadowCapsule set, the animated occluders that stand in for the
      // skinned instances the any-hit walk now skips. The sun pass binds the
      // same data as an ordinary read-only buffer because it has slots left.
-     .resources = {.num_samplers = 3,
+     // R7b added a FOURTH read-write storage texture, the Full-DI tier's
+    // direction target, and R7a added nothing to this row at all: the spatial
+    // reuse pass is a SECOND DISPATCH OF THIS PIPELINE with `stage` set, which
+    // is why its neighbourhood reads ride the reservoir slots that were already
+    // here. One pipeline, two dispatches — see the shader's header for why the
+    // gradient replay makes that the only sane arrangement.
+    .resources = {.num_samplers = 3,
                    .num_readonly_storage_buffers = 8,
-                   .num_readwrite_storage_textures = 3,
+                   .num_readwrite_storage_textures = 4,
                    .num_readwrite_storage_buffers = 4,
                    .num_uniform_buffers = 2}},
     {.name = "RtDiTemporal",
@@ -978,10 +984,13 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // because a reservoir that switched light is a lighting change for both.
      // Read-only storage buffer: render::AutoExposure's state block, for the
      // R5b exposure-aware sigma floor and firefly ceiling.
-     .resources = {.num_samplers = 5,
+     // R7b: seven samplers and three targets, not five and two — the winning
+     // light's direction is a third signal with a third history, accumulated as
+     // a renormalized vector rather than as an EMA on its stored encoding.
+     .resources = {.num_samplers = 7,
                    .num_readonly_storage_textures = 1,
                    .num_readonly_storage_buffers = 1,
-                   .num_readwrite_storage_textures = 2,
+                   .num_readwrite_storage_textures = 3,
                    .num_uniform_buffers = 1}},
     {.name = "RtDiSpatial",
      .shader = "rt_di_denoise_spatial.comp.spv",
@@ -991,8 +1000,22 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // resolution: the forward shaders reconstruct with their own depth-aware
      // 4-tap, so a fused upsample here would write two full-res RGBA16F targets
      // to save a gather that has to happen anyway.
-     .resources = {.num_samplers = 4,
-                   .num_readwrite_storage_textures = 2,
+     // R7b's direction target joins in and out; R7c dispatches this pipeline
+     // TWICE (a-trous stride 1 then 2) rather than adding a second one, because
+     // the two iterations differ only in two uniforms.
+     .resources = {.num_samplers = 5,
+                   .num_readwrite_storage_textures = 3,
+                   .num_uniform_buffers = 1}},
+    {.name = "RtDiNoise",
+     .shader = "rt_di_noise.comp.spv",
+     .entry_point = "CSMain",
+     // The R7 temporal-noise probe. The two filtered DI targets in, last
+     // frame's scalar in a read-write R16F it also updates, and the shared
+     // denoiser counter buffer. Off unless a caller asks for it — see
+     // RtLocalShadowSettings::di_noise_probe.
+     .resources = {.num_samplers = 2,
+                   .num_readwrite_storage_textures = 1,
+                   .num_readwrite_storage_buffers = 1,
                    .num_uniform_buffers = 1}},
     {.name = "GiProbeTrace",
      .shader = "gi_probe_trace.comp.spv",

@@ -85,9 +85,13 @@ Read the doc that matches the task before diving into code:
 - [docs/rt_lighting_plan.md](docs/rt_lighting_plan.md) — **the plan of record
   for the ray-traced lighting system** (R0 foundations, R1 probe-field GI,
   R2 froxel-reservoir local-light shadows, R3 honest hit lighting, R4 HZB +
-  screen probes and **all of R5** — SSILVB/bent-cone (R5a), the denoiser core
-  (R5b) and the Full-DI local-light tier (R5c) — have landed; R6 onward is
-  proposal): probe-field GI, froxel-reservoir local-light shadows,
+  screen probes, **all of R5** — SSILVB/bent-cone (R5a), the denoiser core
+  (R5b) and the Full-DI local-light tier (R5c) — R6 (emissive mesh lights,
+  area-light authoring), §5.8's capsule occluders and the **R7 quality
+  package** (spatial reservoir reuse under pairwise MIS, the Full-DI
+  directional basis, a second à-trous iteration, the `di noise` probe) have all
+  landed; §5.7's closing note carries what is still open): probe-field GI,
+  froxel-reservoir local-light shadows,
   hit-lighting upgrades, screen-probe gather, denoiser evolution, scalability
   tiers. Read it before touching
   anything under `render/raytracing/` or the `rt_*` shaders — and before touching the GTAO
@@ -495,6 +499,36 @@ baselines). The three the ray-tracing phases gate on:
 | `--smoke 30` (RT off, GI off) | `86.5 / 44.9` | `86.3 / 45.5` | `86.3 / 45.5` |
 | `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes` | `81.7 / 49.8` | `81.8 / 50.0` | `81.9 / 49.9` |
 | `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes_screen` | `82.3 / 50.4` | `82.2 / 50.5` | `82.3 / 50.5` |
+
+**The traced local-light pins, at R7** (Linux/Vulkan, RelWithDebInfo, 3-run
+identical). The first three are bit-identical to R6, which is the gate saying
+the R7 quality package did not reach the raster path:
+
+| Invocation (`--smoke 30`) | at R6 | at R7 |
+|---|---|---|
+| RT off | `86.3 / 45.5` | `86.3 / 45.5` |
+| `PLAYGROUND_RT=both` | `83.7 / 48.3` | `83.7 / 48.3` |
+| `PLAYGROUND_GI=probes` | `84.7 / 46.7` | `84.7 / 46.7` |
+| `RT=both RT_LOCAL=ratio` | `85.3 / 47.6` | `85.3 / 47.5` |
+| `RT=both RT_LOCAL=full` | `85.4 / 47.4` | `85.6 / 47.2` |
+| night, `TOD_HOUR=1 … ratio` | `35.7 / 57.6` | `35.3 / 57.2` |
+| night, `TOD_HOUR=1 … full` | `38.2 / 55.7` | `37.0 / 54.4` |
+
+`PLAYGROUND_RT_SPATIAL=0` turns R7's spatial reservoir reuse off and reproduces
+the R6 Ratio pins BIT for bit (`85.3 / 47.6`, night `35.7 / 57.6`) — that is
+what the escape hatch is for, and it is the evidence that the reuse is the only
+thing that moved them. `PLAYGROUND_RT_DI_ITERS=1` likewise restores R5c's
+single-iteration DI filter. Both are `SceneRenderer::RtLocalTuning` fields
+rather than `GraphicsSettings`: they are measurement instruments, not quality
+levels a player would be shown.
+
+**The DI temporal-noise probe** (`--rt-bench`, printed as `[rtbench] di
+noise=`) is the one number the smoke test structurally cannot produce — a
+screenshot is one frame and temporal noise is a statistic across frames.
+`PLAYGROUND_RT_BENCH_ORBIT=1` gives the bench the smoke run's MOVING camera,
+which is where the noise actually lives: pinned `0.00041`, orbiting `0.00448`,
+an order of magnitude apart. Do not quote a pinned-camera noise figure as
+evidence about live play.
 
 The GI rows moved for a second reason on top of the AO change: since R5a the
 diffuse GI term is gated by the AO pass's BENT CONE — sampled along the bent

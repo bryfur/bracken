@@ -170,16 +170,19 @@ SamplerState rtLocalShadowSampler;
 // 0-12 above + the local-shadow ATLAS at 13, declared by the include). R4b's
 // screen-probe SH buffer is a FIFTH storage buffer at base + 4, declared by
 // gi_screen_sample.hlsli.
-// R5c: the Full-DI tier's two demodulated targets are READ-ONLY STORAGE
+// R5c: the Full-DI tier's demodulated targets are READ-ONLY STORAGE
 // TEXTURES, which SDL3 GPU places between the sampled textures and the storage
 // buffers in fragment set 2. So the sampler count and the SSBO base are no
 // longer the same number, and both are declared: the local-shadow atlas
 // cluster_lighting.hlsli owns follows CLUSTER_SAMPLER_COUNT, the cluster
 // buffers follow CLUSTER_SSBO_BINDING_BASE. local_di.hlsli explains why the DI
-// pair cannot be samplers here.
+// targets cannot be samplers here. R7b made them THREE: the winning light's
+// direction joined them, so the forward pass can re-apply N.L with the
+// normal-mapped normal instead of inheriting the prepass G-buffer's geometric
+// one.
 #define CLUSTER_SAMPLER_COUNT 14
 #define LOCAL_DI_BINDING_BASE CLUSTER_SAMPLER_COUNT
-#define CLUSTER_SSBO_BINDING_BASE (CLUSTER_SAMPLER_COUNT + 2)
+#define CLUSTER_SSBO_BINDING_BASE (CLUSTER_SAMPLER_COUNT + 3)
 #include "local_di.hlsli"
 #include "gi_sample.hlsli"
 #include "cluster_lighting.hlsli"
@@ -364,7 +367,7 @@ float4 PSMain(PSInput input) : SV_Target {
         // -1 as the localVis argument is "no traced mask", which skips the
         // multiply outright rather than multiplying by 1.0.
         if (rtLocalShadowMode > 1.5) {
-            color += localDiLighting(screen_uv, input.viewDepth, baseColor, TERRAIN_METALLIC);
+            color += localDiLighting(screen_uv, input.viewDepth, baseColor, TERRAIN_METALLIC, N, N);
         } else {
             float localVis = -1.0;
             if (rtLocalShadowMode > 0.5) {

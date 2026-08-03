@@ -106,12 +106,17 @@ void SceneRenderer::render_3d_scene(const FramePacket& frame, const CameraState&
     // both of them at once.
     {
         SDL_GPUTexture* stand_in = dummy_di_texture_ ? dummy_di_texture_->handle() : nullptr;
+        SDL_GPUTexture* dir_stand_in =
+            dummy_di_dir_texture_ ? dummy_di_dir_texture_->handle() : nullptr;
         SDL_GPUTexture* di_diffuse = frame_rt_local_di_diffuse_ ? frame_rt_local_di_diffuse_ : stand_in;
         SDL_GPUTexture* di_specular =
             frame_rt_local_di_specular_ ? frame_rt_local_di_specular_ : stand_in;
-        terrain_->set_local_di(di_diffuse, di_specular, frame_rt_local_di_active_);
+        SDL_GPUTexture* di_direction =
+            frame_rt_local_di_direction_ ? frame_rt_local_di_direction_ : dir_stand_in;
+        terrain_->set_local_di(di_diffuse, di_specular, di_direction, frame_rt_local_di_active_);
         if (grass_renderer_) {
-            grass_renderer_->set_local_di(di_diffuse, di_specular, frame_rt_local_di_active_);
+            grass_renderer_->set_local_di(di_diffuse, di_specular, di_direction,
+                                          frame_rt_local_di_active_);
         }
     }
 
@@ -333,19 +338,23 @@ void SceneRenderer::bind_rt_local_shadow_mask(uint32_t slot) {
 
 void SceneRenderer::bind_local_di(uint32_t first_slot) {
     // Always bound, for the same reason every dummy in this file is always
-    // bound: the four scene shaders declare these two slots unconditionally and
-    // SDL3 GPU leaves an unbound descriptor undefined. Unlike the sampler
+    // bound: the four scene shaders declare these three slots unconditionally
+    // and SDL3 GPU leaves an unbound descriptor undefined. Unlike the sampler
     // dummies these are STORAGE textures, so the white 1x1 cannot stand in —
-    // it carries SAMPLER usage only — and `dummy_di_texture_` exists for
-    // exactly this. `rtLocalShadowMode < 2` is what stops them being read.
+    // it carries SAMPLER usage only — and the two `dummy_di_*` textures exist
+    // for exactly this. `rtLocalShadowMode < 2` is what stops them being read.
     SDL_GPUTexture* stand_in = dummy_di_texture_ ? dummy_di_texture_->handle() : nullptr;
+    SDL_GPUTexture* dir_stand_in =
+        dummy_di_dir_texture_ ? dummy_di_dir_texture_->handle() : nullptr;
     SDL_GPUTexture* diffuse = frame_rt_local_di_diffuse_ ? frame_rt_local_di_diffuse_ : stand_in;
     SDL_GPUTexture* specular = frame_rt_local_di_specular_ ? frame_rt_local_di_specular_ : stand_in;
-    if (!diffuse || !specular || !main_render_pass_) {
+    SDL_GPUTexture* direction =
+        frame_rt_local_di_direction_ ? frame_rt_local_di_direction_ : dir_stand_in;
+    if (!diffuse || !specular || !direction || !main_render_pass_) {
         return;
     }
-    SDL_GPUTexture* textures[2] = {diffuse, specular};
-    SDL_BindGPUFragmentStorageTextures(main_render_pass_, first_slot, textures, 2);
+    SDL_GPUTexture* textures[3] = {diffuse, specular, direction};
+    SDL_BindGPUFragmentStorageTextures(main_render_pass_, first_slot, textures, 3);
 }
 
 void SceneRenderer::bind_screen_ao(uint32_t slot, bool enabled) {

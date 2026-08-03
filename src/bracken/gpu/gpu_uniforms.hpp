@@ -1310,9 +1310,21 @@ struct alignas(16) RtLocalShadowUniforms {
     /// use of a read-write binding is what the budget leaves (R2b's precedent).
     /// Took the slot that was `_pad1`, so the extent is unchanged.
     uint32_t shadowCapsuleCount = 0;
+    /// R7a. 0 = RESAMPLE (froxel candidates + the temporal merge), 1 = REUSE
+    /// (the pairwise-MIS spatial merge) + the ray + the DI block. The pass is
+    /// dispatched twice per frame with the same bindings and different reservoir
+    /// buffers in the two slots; rt_local_shadow.comp.hlsl's header carries the
+    /// argument for why the split is forced rather than chosen.
+    uint32_t stage = 0;
+    /// k — spatial neighbours attempted. 0 makes stage 1's merge the identity
+    /// and reproduces the pre-R7a image bit for bit.
+    uint32_t spatialNeighbors = 0;
+    /// Neighbour ring radius, in traced texels.
+    float spatialRadius = 8.0f;
+    uint32_t _pad0 = 0;
 };
 
-BRACKEN_HLSL_CBUFFER(RtLocalShadowUniforms, 144);
+BRACKEN_HLSL_CBUFFER(RtLocalShadowUniforms, 160);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, invViewProj, 0);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, outputSize, 64);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, tlasNodeCount, 72);
@@ -1331,6 +1343,10 @@ BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveTotalPower, 128);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveCandidateCount, 132);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveHistoryValid, 136);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, shadowCapsuleCount, 140);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, stage, 144);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, spatialNeighbors, 148);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, spatialRadius, 152);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, _pad0, 156);
 
 /**
  * The Full-DI tier's temporal denoiser — matches
@@ -1378,17 +1394,52 @@ struct alignas(16) RtDiSpatialUniforms {
     float maxRadius = 3.0f;
     float depthSigma = 0.05f;
     float normalPower = 8.0f;
+    /// R7c: a-trous tap spacing, 1 on the first iteration and 2 on the second.
+    /// Above 1 also enables the converged-pixel pass-through, which is what
+    /// keeps a steady-state image sharp while the wide pass still hides a
+    /// disocclusion.
+    uint32_t stepSize = 1;
+    /// 1 on the frame's LAST iteration — the one that converts the diffuse alpha
+    /// from the accumulation count to the linear view depth the forward
+    /// reconstruction reads. An intermediate iteration must pass the count on.
+    uint32_t isFinal = 1;
     uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+    uint32_t _pad2 = 0;
 };
 
-BRACKEN_HLSL_CBUFFER(RtDiSpatialUniforms, 32);
+BRACKEN_HLSL_CBUFFER(RtDiSpatialUniforms, 48);
 BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, tracedSize, 0);
 BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, depthA, 8);
 BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, depthB, 12);
 BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, maxRadius, 16);
 BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, depthSigma, 20);
 BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, normalPower, 24);
-BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, _pad0, 28);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, stepSize, 28);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, isFinal, 32);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, _pad0, 36);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, _pad1, 40);
+BRACKEN_HLSL_FIELD(RtDiSpatialUniforms, _pad2, 44);
+
+/**
+ * The R7 temporal-noise probe — matches rt_di_noise.comp.hlsl (set 2, b0).
+ *
+ * A diagnostic, not part of the frame: dispatched only when
+ * `render::RtLocalShadowSettings::di_noise_probe` is set.
+ */
+struct alignas(16) RtDiNoiseUniforms {
+    glm::uvec2 tracedSize{0, 0};
+    /// First of this probe's three uints in the shared denoiser counter buffer.
+    uint32_t counterBase = 0;
+    /// 0 whenever `prevLuma` does not hold a measurement of the previous frame
+    /// of THIS image — the first probed frame, a resize, or any gap in the tier.
+    uint32_t historyValid = 0;
+};
+
+BRACKEN_HLSL_CBUFFER(RtDiNoiseUniforms, 16);
+BRACKEN_HLSL_FIELD(RtDiNoiseUniforms, tracedSize, 0);
+BRACKEN_HLSL_FIELD(RtDiNoiseUniforms, counterBase, 8);
+BRACKEN_HLSL_FIELD(RtDiNoiseUniforms, historyValid, 12);
 
 /**
  * Shadow-denoiser tile classification — matches
