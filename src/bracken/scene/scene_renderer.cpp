@@ -41,6 +41,7 @@
 #include <type_traits>
 
 #include "bracken/contracts/camera_state.hpp"
+#include "bracken/contracts/depth_linear.hpp"
 #include "bracken/contracts/graphics_settings.hpp"
 #include "bracken/scene/camera_jitter.hpp"
 #include "bracken/scene/frame_packet.hpp"
@@ -828,12 +829,14 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
         // exactly when the atlas is unavailable or the mode is Off).
         const bool shadows_on = plan.active_cascades > 0;
         if (shadows_on) {
-            // Near plane recovered from the reversed-Z RH_ZO projection
-            // (n = m32 / (m22 + 1); under standard-Z it was m32/m22).
+            // Near plane recovered from the projection: it is the linearized
+            // view depth of device depth 1, which under reversed Z is the near
+            // plane (contracts/depth_linear.hpp).
             // Shadow range is a quality setting (clamped by draw distance);
             // the shader fades shadows out over the tail instead of popping
             // them off.
-            const float cam_near = std::max(camera.projection[3][2] / (camera.projection[2][2] + 1.0f), 0.1f);
+            const float cam_near =
+                std::max(scene::linear_view_depth(1.0f, scene::depth_linear_terms(camera.projection)), 0.1f);
             const float shadow_far = std::min(gfx.get_draw_distance(), gfx.shadow_distance);
             shadow_map_->update(camera.view, camera.projection, light_dir_, cam_near, shadow_far);
             for (int c = 0; c < plan.active_cascades; ++c) {
@@ -1405,8 +1408,9 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     sp.camera_position = draw_camera.position;
                     sp.camera_forward = -glm::vec3(draw_camera.view[0][2], draw_camera.view[1][2],
                                                    draw_camera.view[2][2]);
-                    sp.depth_a = draw_camera.projection[2][2];
-                    sp.depth_b = draw_camera.projection[3][2];
+                    const auto sp_depth = scene::depth_linear_terms(draw_camera.projection);
+                    sp.depth_a = sp_depth.a;
+                    sp.depth_b = sp_depth.b;
                     sp.environment = env_;
                     // R5b: the probe-space firefly ceiling's absolute floor.
                     sp.exposure_state =
@@ -1498,8 +1502,9 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 rt_frame_params.manual_exposure_ev = std::log2(std::max(gfx.exposure, 1e-6f));
                 rt_frame_params.screen_width = context_->width();
                 rt_frame_params.screen_height = context_->height();
-                rt_frame_params.depth_a = draw_camera.projection[2][2];
-                rt_frame_params.depth_b = draw_camera.projection[3][2];
+                const auto rt_depth = scene::depth_linear_terms(draw_camera.projection);
+                rt_frame_params.depth_a = rt_depth.a;
+                rt_frame_params.depth_b = rt_depth.b;
 
                 // What the reflection trace shades its hits with (R3). Every
                 // one of these is already built and bound elsewhere this frame
@@ -1864,11 +1869,12 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 composite_params.contrast = gfx.contrast;
                 composite_params.saturation = gfx.saturation;
                 // Depth linearization constants for the joint bilateral fog
-                // upsample in the composite shader. viewZ = |B / (depth + A)|
-                // holds for both standard and reversed-Z RH_ZO projections as
-                // long as A/B come from the actual projection matrix.
-                composite_params.depth_a = draw_camera.projection[2][2];
-                composite_params.depth_b = draw_camera.projection[3][2];
+                // upsample in the composite shader (contracts/depth_linear.hpp:
+                // viewZ = |B / (depth + A)|, standard and reversed Z alike, as
+                // long as A/B come from the actual projection matrix).
+                const auto composite_depth = scene::depth_linear_terms(draw_camera.projection);
+                composite_params.depth_a = composite_depth.a;
+                composite_params.depth_b = composite_depth.b;
                 // Auto exposure: adapted-EV SSBO from the compute passes above
                 // (gfx.exposure stays the manual bias on top).
                 composite_params.auto_exposure = auto_exposure_active;

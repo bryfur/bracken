@@ -199,8 +199,33 @@ inline constexpr float GRADIENT_DILATION_RING2 = 0.3f;
  * a grazing ground plane has a large per-pixel depth derivative and
  * legitimately fails a very tight test. This is the knee of that curve, not an
  * optimum.
+ *
+ * RETUNED 0.0005 -> 0.0004 on 2026-08-02, and it is the ONE threshold in that
+ * package that moved. The knee above was measured against a depth
+ * linearization whose `depthA` sign was inverted (contracts/depth_linear.hpp),
+ * which made the EFFECTIVE threshold `0.0005 * (1 - 2t/far)` — a curve, not a
+ * constant, and always tighter than the nominal. Correcting the linearization
+ * loosened it, and the static `--rt-bench 120` run — where the sun does not
+ * move, so EVERY gradient fired is spurious — showed exactly that: fire
+ * 0.0086 -> 0.0100, sun accumulation 17.84 -> 17.19 frames. Rather than scale
+ * by a representative distance (there is no single one), the knee was
+ * RE-MEASURED on the same run:
+ *
+ *     nominal   fire     sun_accum
+ *     0.0005    0.0100   17.19
+ *     0.0004    0.0086   17.95   <- reproduces the pre-fix calibration
+ *     0.0003    0.0068   19.06
+ *     0.0002    0.0047   20.70
+ *
+ * 0.0004 restores the measured behaviour to within a rounding of the statistic,
+ * and the implied effective depth (1 - 2t/far = 0.8, i.e. t ~ 400 units) is the
+ * near-field canopy and grass geometry the doc above says the fire rate is
+ * dominated by. The 0.05 thresholds the same package touched were NOT retuned
+ * (see gpu_uniforms.hpp): they document an INTENT — 5% relative — and this one
+ * documents a MEASUREMENT, and only a measurement has to be re-taken when the
+ * ruler changes.
  */
-inline constexpr float GRADIENT_DEPTH_REJECT_RELATIVE = 0.0005f;
+inline constexpr float GRADIENT_DEPTH_REJECT_RELATIVE = 0.0004f;
 
 /**
  * Reconstructed gradient above which a pixel counts as "fired" for the bench

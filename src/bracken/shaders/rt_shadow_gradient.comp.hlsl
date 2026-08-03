@@ -42,6 +42,7 @@
 
 #include "rt_sampling.hlsli"
 #include "rt_denoise.hlsli"
+#include "depth_linear.hlsli"
 
 #define RT_TRACE_TYPES
 #include "rt_trace.hlsli"
@@ -155,8 +156,12 @@ float3 reconstructNormal(int2 c, uint2 size) {
     return len > 1e-6 ? n / len : float3(0.0, 1.0, 0.0);
 }
 
+/// See depth_linear.hlsli. Must stay EXACTLY the temporal pass's expression —
+/// the depth test below is deliberately the one that pass applies, so that a
+/// gradient can only fire where history would in fact have been used. Both were
+/// fixed together on 2026-08-02 (the depthA sign).
 float linearizeDepth(float d) {
-    return depthB / max(d - depthA, 1e-6);
+    return brackenLinearViewDepth(d, depthA, depthB);
 }
 
 [numthreads(8, 8, 1)]

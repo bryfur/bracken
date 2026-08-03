@@ -184,6 +184,19 @@ float localDiFilterRadius(float count, float maxRadius) {
 /// its bilinear weight. The denoiser's own tolerance, not the gradient's tight
 /// one: this asks "does this traced texel describe the surface I am shading?",
 /// which a neighbouring point on the same wall answers yes to.
+/// Relative window on |traced texel's view depth - this pixel's view depth|.
+///
+/// THE ONE PLACE IN THE ENGINE that compares a LINEARIZED depth against a TRUE
+/// one: `d.a` comes from rt_di_denoise_spatial's final iteration (device depth
+/// through depth_linear.hlsli) and `viewDepth` from the vertex shader's own
+/// `-viewPos.z`. Until 2026-08-02 the two disagreed systematically — the
+/// linearization's depthA sign was inverted, so `d.a` ran
+/// `t / (1 - 2t/far)` — and at 500 units the bias was 166 units against a
+/// window of 25. It did not black the term out (the weights are normalized, so
+/// a bias common to all four taps cancels), it compressed the good-tap to
+/// bad-tap ratio from ~5:1 to ~2:1: a depth-aware upsample quietly degrading
+/// toward the plain bilinear it exists to replace. Left at 0.05 after the fix —
+/// the constant was never the problem, and it now means what it says.
 #define LOCAL_DI_DEPTH_TOLERANCE 0.05
 
 #ifdef LOCAL_DI_BINDING_BASE

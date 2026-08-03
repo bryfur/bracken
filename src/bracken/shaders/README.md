@@ -113,6 +113,21 @@ Depth-reading shaders (`gtao`, `gtao_temporal`, `blur_ao`, `gtao_upsample`,
 `volumetric_fog`)
 test `depth <= 0.0` for sky; linearization/reconstruction goes through the (inverse)
 projection matrix and needs no convention-specific math.
+
+**Linearizing depth: include `depth_linear.hlsli`, do not write the
+expression.** `brackenLinearViewDepth(deviceDepth, a, b)` is
+`|b / (deviceDepth + a)|` with `a = projection[2][2]`, `b = projection[3][2]`
+of the same (jittered) projection the depth buffer was rendered with; it is
+exact for standard and reversed Z alike, and it is the transliteration of
+`contracts/depth_linear.hpp`, which carries the derivation and is pinned
+against the inverse-projection reference by a CPU test. The file declares no
+resource and reads no uniform, so any pass can take it without disturbing its
+reflected layout. This rule is not tidiness: four traced passes carried a copy
+with the sign of the `a` term inverted, every consumer compared its output only
+against other output of the same copy, and the result — 33% wrong at 500 units,
+100% at 1000, one saturated constant past `far/2` — went unnoticed until a pass
+needed an ABSOLUTE view depth. A copy of this formula is invisible when it is
+wrong; that is the whole argument for not making one.
 **Exception:** the shadow passes stay standard-Z — the CSM atlas is cleared
 to 1.0 with `LESS_OR_EQUAL` compares (pipeline + `SampleCmpLevelZero`
 sampler) and `orthoRH_ZO` light projections (orthographic depth is linear

@@ -14,6 +14,10 @@
 #ifndef BRACKEN_GI_SCREEN_PROBE_HLSLI
 #define BRACKEN_GI_SCREEN_PROBE_HLSLI
 
+// Include-guarded and declares no resource, so taking it here costs a consumer
+// nothing (same argument rt_denoise.hlsli makes for rt_sampling.hlsli).
+#include "depth_linear.hlsli"
+
 // ---------------------------------------------------------------------------
 // The grid — mirrors screen_probe_math.hpp
 // ---------------------------------------------------------------------------
@@ -196,10 +200,12 @@ float giSpThickness(float linearDepth) {
 /// Reversed-Z device depth -> positive linear view depth, from the same
 /// projection[2][2] / projection[3][2] pair the other traced passes carry.
 float giSpLinearDepth(float deviceDepth, float a, float b) {
-    // abs(depthB / (depth + depthA)) — the engine's one linearization, shared
-    // with composite.frag / blur_ao.frag / rt_reflection_resolve.frag.
+    // depth_linear.hlsli is the formula's one home. The only difference is the
+    // degenerate case: a screen trace wants a very large distance there, not 0,
+    // so a caller that forgot to test for sky gets an obviously wrong hit
+    // instead of one at the eye. CPU mirror: screen_trace_linear_depth.
     float denom = deviceDepth + a;
-    return abs(denom) < 1e-9 ? 1e9 : abs(b / denom);
+    return abs(denom) < 1e-9 ? 1e9 : brackenLinearViewDepth(deviceDepth, a, b);
 }
 
 // ---------------------------------------------------------------------------

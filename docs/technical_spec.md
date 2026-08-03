@@ -2640,8 +2640,8 @@ i.e. **reversed-Z via swapped near/far arguments** in an `RH_ZO` perspective (`G
 - Right-handed: view-space points in front of the camera (negative z) project to positive clip `w`.
 - Near plane → NDC z = 1, far plane → NDC z = 0; interior points strictly in (0, 1).
 - Scene depth targets clear to **0.0**; scene pipeline depth compare defaults to `GREATER_OR_EQUAL` (`gpu/gpu_pipeline.hpp` `PipelineConfig`).
-- Near-plane recovery from a reversed-Z RH_ZO matrix: `n = m[3][2] / (m[2][2] + 1)` (used in `scene_renderer.cpp` for the shadow-cascade near plane; under standard-Z it would be `m[3][2] / m[2][2]`).
-- Depth linearization `viewZ = |B / (depth + A)|` with `A = proj[2][2]`, `B = proj[3][2]` holds for both conventions; `SceneRenderer` passes these as `CompositeParams::depth_a/depth_b`.
+- Near-plane recovery from a reversed-Z RH_ZO matrix: `n = m[3][2] / (m[2][2] + 1)` — which is exactly the depth linearization below evaluated at device depth 1, and is spelled that way in `scene_renderer.cpp` so there is one formula rather than two identities to keep in step.
+- Depth linearization `viewZ = |B / (depth + A)|` with `A = proj[2][2]`, `B = proj[3][2]` holds for both conventions; `SceneRenderer` passes these as `CompositeParams::depth_a/depth_b`. **Single source: `contracts/depth_linear.hpp`** (`scene::linear_view_depth` / `scene::depth_linear_terms`), transliterated by `shaders/depth_linear.hlsli`, which every depth-linearizing shader includes rather than open-coding. Pinned against the inverse-projection reference by `contracts/depth_linear.test.cpp`. The `+ A` is load-bearing: four traced passes carried `- A` until 2026-08-02, which evaluates to `t / (1 - 2t/far)` — +33% at 500 units, +100% at 1000, and a single saturated constant past `far/2`.
 - Exception: shadow cascades stay standard-Z (see `render/shadow_map.hpp`; outside this chapter).
 
 `SceneRenderer` consumes `CameraState` by value semantics per frame: `view_projection` feeds frustum extraction; `view`/`projection` feed all draw uniforms; `position` feeds distance culling, fog, transparent sorting, and specular. `render_frame` caches `inverse(projection)` and only recomputes when `camera.projection` changes bit-wise (`cached_projection_` / `cached_inv_projection_` members).
@@ -4862,7 +4862,11 @@ for `GTAO_Full`):
 Depth linearization used by the temporal/blur/upsample/composite passes:
 `viewZ = |depthB / (depth + depthA)|` with `depthA = proj[2][2]`,
 `depthB = proj[3][2]` (glm RH_ZO) — valid for standard **and** reversed-Z
-projections. Zeros degrade to plain bilinear weighting in-shader.
+projections. Zeros degrade to plain bilinear weighting in-shader. The
+expression itself is NOT open-coded here or anywhere else: it lives in
+`contracts/depth_linear.hpp` and `shaders/depth_linear.hlsli`, which is the
+whole point (a sign typo in a copy is self-consistent and therefore invisible —
+see the 2026-08-02 entry under reversed-Z above).
 
 #### Pass algorithms
 

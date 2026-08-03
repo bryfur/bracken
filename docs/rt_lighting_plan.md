@@ -883,6 +883,18 @@ default, seven touch points, dev-panel row, `[smoke] settings` field and a
   against itself, and enough here to land every pixel in a Z slice with an empty
   light list. The pass takes its view depth from `clusterParams.view` instead,
   the matrix `ClusterGrid` binned against, and carries no depthA/depthB at all.
+  *(**Closed 2026-08-02.** The linearization was wrong, not merely unusable
+  here: the sign of the `depthA` term. `t_wrong = t / (1 - 2t/far)`, hence the
+  33 % at `far/8` = 500 units, 100 % at 1000, and a single saturated constant
+  past `far/2`. Fixed in `contracts/depth_linear.hpp` +
+  `shaders/depth_linear.hlsli`, which are now the formula's ONE home; only the
+  four traced passes carried the typo, the GTAO/composite/water/GI copies had
+  the sign right. `clusterParams.view` STAYS — it is not a workaround for the
+  typo but the stronger guarantee that the froxel lookup cannot disagree with
+  the binner **by construction**, which no shared formula can promise. What did
+  turn out to be broken all along is the local-DI reconstruction, which compared
+  the spatial filter's published depth against the forward pass's true
+  `input.viewDepth`; see the R2b follow-up list.)*
 - **Measured**, playground village, 1600×900, Linux/Vulkan, `--smoke 30`:
   `PLAYGROUND_RT=both` unchanged at `83.9 / 47.9`; adding
   `PLAYGROUND_RT_LOCAL=ratio` gives **`85.3 / 47.5`**, reproduced identically
@@ -2068,6 +2080,30 @@ rough value order:
    spatial radius (R5c), `max_accum_frames` above 16 for reflections under a
    moving-camera A/B (R3), and the WP2 64-byte-node A/B through the harness plus
    an Apple-device number (R0) — none of which R6 touched.
+9. ~~**The depth-linearization landmine R2b deferred**~~ (§5.3's "two ceilings
+   found the hard way", item 2). **DONE — 2026-08-02.** The sign of the `depthA`
+   term: `depthB / (d - depthA)` evaluates to `t / (1 - 2t/far)`, so +5 % at 100
+   units, +33 % at 500, +100 % at 1000, and one saturated constant for
+   everything past `far/2`. Four traced passes carried it (sun temporal + sun
+   spatial filter + A-SVGF gradient + local-DI spatial); the GTAO, composite,
+   water and GI copies had the sign right all along. The formula now has ONE
+   home — `contracts/depth_linear.hpp`, transliterated by
+   `shaders/depth_linear.hlsli`, which every depth-linearizing shader now
+   includes — pinned against the inverse-projection reference to under 0.1 %
+   from 10 to 4000 units, with the old error curve recorded as an executable
+   test rather than a claim. Three of the four consumers were
+   linearized-vs-linearized and only changed what their `0.05` thresholds mean
+   in real units; the fourth was the live instance of the trap, the local-DI
+   reconstruction comparing the spatial filter's published depth against the
+   forward pass's TRUE `input.viewDepth`. **No threshold was retuned** — the old
+   effective value was `0.05 * (1 - 2t/far)`, distance-dependent and therefore
+   not reproducible by any constant, and the nominal 5 % is what the comments
+   already documented as the intent. Costs and gains: RT-off is bit-identical,
+   ten of eleven smoke pins are unchanged, `night RT_LOCAL=ratio` moves
+   `35.3 / 57.2` -> `35.4 / 57.4`, and the visible change is a lantern's contact
+   shadow on cobble going from a smear to an edge. `sun_grad_fire` 0.0086 ->
+   0.0100 is the A-SVGF gradient no longer discarding strata it should have been
+   testing.
 
 **Landed (R7b, 2026-08-02) — the directional basis. The named cost of R5c is
 paid.** A third traced target carries the winning light's DIRECTION (octahedral

@@ -1,4 +1,5 @@
 #include "gtao.hpp"
+#include "bracken/contracts/depth_linear.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_pipeline.hpp"
@@ -184,9 +185,10 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
 
     const glm::vec2 working_size(static_cast<float>(ao_width_), static_cast<float>(ao_height_));
     const glm::vec2 inv_working(1.0f / static_cast<float>(ao_width_), 1.0f / static_cast<float>(ao_height_));
-    // Depth linearization constants (viewZ = |B / (depth + A)|, glm RH_ZO).
-    const float depth_a = params.projection[2][2];
-    const float depth_b = params.projection[3][2];
+    // Depth linearization constants (contracts/depth_linear.hpp).
+    const auto depth_terms = scene::depth_linear_terms(params.projection);
+    const float depth_a = depth_terms.a;
+    const float depth_b = depth_terms.b;
 
     // ---- 1. GTAO: depth -> raw AO + bent cone ----
     {

@@ -542,10 +542,61 @@ turns the emissive candidate stream off entirely, which is the records-off colum
 of §5.7's cost table. Both are `SceneRenderer::RtLocalTuning` fields, same status
 as `PLAYGROUND_RT_SPATIAL`: measurement instruments, not quality levels.
 
-`PLAYGROUND_RT_SPATIAL=0` turns R7's spatial reservoir reuse off and reproduces
+**The depth-linearization fix (2026-08-02) moved ONE row.** R2b's deferred
+landmine — four traced passes linearizing device depth as
+`depthB / (d - depthA)`, the sign of the `depthA` term inverted, which evaluates
+to `t / (1 - 2t/far)`: +33% at 500 units, +100% at 1000, one saturated constant
+past `far/2` — is closed. The formula now lives in exactly one place,
+`contracts/depth_linear.hpp` and its transliteration
+`shaders/depth_linear.hlsli`, pinned against the inverse-projection reference by
+`contracts/depth_linear.test.cpp`. **These are the current pins** (Linux/Vulkan,
+RelWithDebInfo, 3-run identical), and the whole eleven-row matrix is here rather
+than spread over the historical tables above:
+
+| Invocation (`--smoke 30`) | at R8 | at depth-fix |
+|---|---|---|
+| RT off | `86.3 / 45.5` | `86.3 / 45.5` (BIT-identical) |
+| `PLAYGROUND_AO=0` | `87.0 / 44.5` | `87.0 / 44.5` |
+| `PLAYGROUND_AO=2` | `86.0 / 45.7` | `86.0 / 45.7` |
+| `PLAYGROUND_RT=both` | `83.7 / 48.3` | `83.7 / 48.3` |
+| `PLAYGROUND_GI=probes` | `84.7 / 46.7` | `84.7 / 46.7` |
+| `RT=both GI=probes` | `81.9 / 49.8` | `81.9 / 49.8` |
+| `RT=both GI=probes_screen` | `82.3 / 50.4` | `82.3 / 50.4` |
+| `RT=both RT_LOCAL=ratio` | `85.3 / 47.5` | `85.3 / 47.5` |
+| `RT=both RT_LOCAL=full` | `85.5 / 47.3` | `85.5 / 47.3` |
+| night, `TOD_HOUR=1 … ratio` | `35.3 / 57.2` | **`35.4 / 57.4`** |
+| night, `TOD_HOUR=1 … full` | `36.0 / 55.0` | `36.0 / 55.0` |
+
+**A row not moving is not a row not changing**, and this is the one package
+where the distinction matters: the traced screenshots differ over 9–12% of their
+pixels, entirely along silhouettes, at a mean absolute delta of 0.09–0.11/255.
+The mean luma is simply blind to an edge-localized change. The RT-off row IS
+bit-identical, pixel for pixel, which is the gate saying nothing reached the
+raster path — the GTAO/composite/water/GI copies of the formula had the sign
+right all along and only moved house. The visible change worth knowing about is
+a lantern's contact shadow on cobble at night going from a smear to an edge
+(the local visibility filter no longer widening its radius over history it was
+wrongly rejecting), which is also what the one moved row is.
+
+**One threshold was retuned and the rest deliberately were not.**
+`GRADIENT_DEPTH_REJECT_RELATIVE` (`render/rt_denoise_math.hpp`) 0.0005 → 0.0004,
+because its documented value was MEASURED against the broken scale; the knee was
+re-measured on the same static `--rt-bench 120` and 0.0004 reproduces the
+pre-fix calibration (fire 0.0086, sun accumulation 17.95 vs 17.84 frames). The
+`0.05` relative depth thresholds in the denoiser temporal/filter passes and
+`LOCAL_DI_DEPTH_TOLERANCE` were left alone: their old effective value was
+`0.05 * (1 - 2t/far)`, a curve no constant reproduces, and 5% relative is what
+they always documented as their intent. `--rt-bench 120` fps is unchanged
+(247 vs 246, run-to-run).
+
+`PLAYGROUND_RT_SPATIAL=0` turns R7's spatial reservoir reuse off and reproduced
 the R6 Ratio pins BIT for bit (`85.3 / 47.6`, night `35.7 / 57.6`) — that is
 what the escape hatch is for, and it is the evidence that the reuse is the only
-thing that moved them. `PLAYGROUND_RT_DI_ITERS=1` likewise restores R5c's
+thing that moved them. **Since the 2026-08-02 depth-linearization fix that
+reproduction is close but no longer exact** (`85.2 / 47.6`, night
+`35.7 / 57.7`): the escape hatch turns the reuse off, not the denoiser the fix
+touched, so it can only ever isolate R7 against a fixed denoiser — which it
+still does. `PLAYGROUND_RT_DI_ITERS=1` likewise restores R5c's
 single-iteration DI filter, and R8 added `PLAYGROUND_RT_EMISSIVE=<M_e>` (0 = the
 emissive candidate stream off entirely, the records-off column of §5.7's cost
 table) and `PLAYGROUND_RT_EMISSIVE_LOCAL=<0..1>` (0 = R6's scene-wide alias

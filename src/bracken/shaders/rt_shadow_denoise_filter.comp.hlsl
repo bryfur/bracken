@@ -24,6 +24,7 @@
 // vulkan1.1 — see SHADER_WAVE_OPS in shaders/CMakeLists.txt.
 
 #include "rt_sampling.hlsli"
+#include "depth_linear.hlsli"
 
 [[vk::binding(0, 2)]]
 cbuffer RtShadowFilterUniforms : register(b0, space2) {
@@ -55,8 +56,15 @@ SamplerState sceneDepthSampler : register(s1, space0);
 
 [[vk::binding(0, 1)]] RWTexture2D<float> shadowMask : register(u0, space1);
 
+/// See depth_linear.hlsli. Self-consistent here — `h.a` is the neighbour's own
+/// depth written by the temporal pass with this same expression — so the fix
+/// (the depthA sign, 2026-08-02) changes what `depthSigma` means in real units
+/// rather than what is being compared: the effective sigma was
+/// depthSigma * (1 - 2t/far), and every surface past far/2 shared one saturated
+/// depth, which made wDepth uniformly 1 out there and the bilateral filter a
+/// plain box.
 float linearizeDepth(float d) {
-    return depthB / max(d - depthA, 1e-6);
+    return brackenLinearViewDepth(d, depthA, depthB);
 }
 
 [numthreads(8, 8, 1)]

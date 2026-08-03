@@ -1,5 +1,6 @@
 #include "bracken/render/water_renderer.hpp"
 
+#include "bracken/contracts/depth_linear.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/gpu/gpu_compute.hpp"
 #include "bracken/gpu/gpu_device.hpp"
@@ -258,9 +259,10 @@ void WaterRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, c
     fu.shallowColor = {region_.shallow_color, region_.foam_depth};
     fu.fogHorizon = {env_.fog_color_horizon, env_.fog_start};
     fu.fogSun = {env_.fog_color_sun, env_.fog_end};
+    const auto water_depth = scene::depth_linear_terms(projection);
     fu.screenDepthAB = {1.0f / static_cast<float>(std::max(screen_width, 1)),
-                        1.0f / static_cast<float>(std::max(screen_height, 1)), projection[2][2],
-                        projection[3][2]};
+                        1.0f / static_cast<float>(std::max(screen_height, 1)), water_depth.a,
+                        water_depth.b};
     fu.flowDetail = {region_.flow.x, region_.flow.y, region_.flow_speed, region_.detail_wave_strength};
     fu.simParams = {texel_world, region_.sim_normal_strength, region_.sim_displacement,
                     env_.fog_height_falloff};

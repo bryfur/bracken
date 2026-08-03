@@ -66,6 +66,7 @@
 
 #include "rt_sampling.hlsli"
 #include "rt_denoise.hlsli"
+#include "depth_linear.hlsli"
 
 [[vk::binding(0, 2)]]
 cbuffer RtShadowTemporalUniforms : register(b0, space2) {
@@ -139,11 +140,20 @@ SamplerState fastHistorySampler : register(s3, space0);
 /// a reset pass would cost a copy pass every frame to serve a statistic.
 [[vk::binding(2, 1)]] RWStructuredBuffer<uint> denoiseCounters : register(u2, space1);
 
-/// Reversed-Z depth -> positive linear view depth. Same algebra the GTAO pass
-/// uses; depthA/depthB are the projection terms so this does not need the
-/// whole matrix.
+/// Reversed-Z depth -> positive linear view depth, `|depthB / (d + depthA)|`.
+/// depth_linear.hlsli is the one home for that expression; depthA/depthB are
+/// the projection terms so this does not need the whole matrix.
+///
+/// This pass carried `depthB / max(d - depthA, 1e-6)` until 2026-08-02 — the
+/// sign of the depthA term inverted, which reads as t / (1 - 2t/far). It is
+/// self-consistent (`historyOut.a` below is written with the same expression it
+/// is later compared against), so the visible effect was not a wrong picture
+/// but a wrong SCALE: the reject threshold's effective value was
+/// depthRejectRelative * (1 - 2t/far) instead of depthRejectRelative, and past
+/// far/2 the clamp pinned every pixel to one constant, disabling rejection
+/// entirely out there. See contracts/depth_linear.hpp.
 float linearizeDepth(float d) {
-    return depthB / max(d - depthA, 1e-6);
+    return brackenLinearViewDepth(d, depthA, depthB);
 }
 
 // One partial per group, so the statistics cost three global atomics per 64

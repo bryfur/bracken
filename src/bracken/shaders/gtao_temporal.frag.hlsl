@@ -79,10 +79,11 @@ Texture2D<float2> depthHistoryTexture : register(t4, space2);
 SamplerState depthHistorySampler : register(s4, space2);
 
 #include "bent_cone.hlsli"
+#include "depth_linear.hlsli"
 
 // Positive linear view depth from non-linear [0,1] depth.
 float linearizeDepth(float depth) {
-    return abs(depthB / (depth + depthA));
+    return brackenLinearViewDepth(depth, depthA, depthB);
 }
 
 PSOutput PSMain(PSInput input) {

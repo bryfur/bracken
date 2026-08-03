@@ -43,6 +43,7 @@ cbuffer WaterFragmentUniforms : register(b0, space3) {
 [[vk::combinedImageSampler]][[vk::binding(4, 2)]] SamplerState rtReflectionSampler : register(s4, space2);
 
 #include "fog.hlsli"
+#include "depth_linear.hlsli"
 
 struct PSInput {
     float4 position : SV_Position;
@@ -52,7 +53,7 @@ struct PSInput {
 
 // Matches the composite/GTAO convention (glm RH_ZO reversed-Z).
 float linearizeDepth(float depth) {
-    return abs(screenDepthAB.w / (depth + screenDepthAB.z));
+    return brackenLinearViewDepth(depth, screenDepthAB.z, screenDepthAB.w);
 }
 
 // Analytic detail waves: a few directional gradients scrolling with the

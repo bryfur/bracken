@@ -1478,6 +1478,15 @@ struct alignas(16) RtShadowTemporalUniforms {
     float depthA = 0.0f;
     float depthB = 0.0f;
     float maxAccumFrames = 32.0f;
+    /// Relative linear-view-depth difference above which history is rejected.
+    /// NOT retuned when the linearization was fixed (2026-08-02,
+    /// contracts/depth_linear.hpp) and that is a decision, not an oversight:
+    /// the old effective threshold was `0.05 * (1 - 2t/far)` — 0.0475 at 100
+    /// units, 0.0375 at 500, 0.025 at 1000, and "never reject" past far/2,
+    /// where every surface linearized to the same saturated constant. No
+    /// constant reproduces a distance-dependent curve, and 5% is what this
+    /// field has always claimed to mean. Must stay equal to
+    /// RtShadowGradientUniforms::depthRejectRelative.
     float depthRejectRelative = 0.05f;
     /// R5b: the analytic sun gradient's global hysteresis floor, [0, 1]
     /// (render/rt_denoise_math.hpp's `lighting_reset_floor`). 0 is the identity
@@ -1636,6 +1645,11 @@ struct alignas(16) RtShadowFilterUniforms {
     float depthA = 0.0f;
     float depthB = 0.0f;
     float maxRadius = 3.0f;
+    /// Relative depth sigma of the bilateral weight. Same call as
+    /// RtShadowTemporalUniforms::depthRejectRelative above: NOT retuned when
+    /// the linearization was fixed, because the old effective sigma was
+    /// `0.05 * (1 - 2t/far)` and degenerated into a uniform-weight box filter
+    /// past far/2.
     float depthSigma = 0.05f;
     glm::uvec2 _pad0{0, 0};
 };

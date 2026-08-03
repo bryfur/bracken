@@ -16,6 +16,7 @@
  * headless.
  */
 
+#include "bracken/contracts/depth_linear.hpp"
 #include "bracken/render/gi/gi_math.hpp"
 
 #include <algorithm>
@@ -385,15 +386,14 @@ inline constexpr float SCREEN_PROBE_NORMAL_BIAS = 1.0f;
  * of a NaN that propagates.
  */
 [[nodiscard]] inline float screen_trace_linear_depth(float device_depth, float a, float b) {
-    // `abs(depthB / (depth + depthA))`, the engine's one linearization — the
-    // same expression composite.frag, blur_ao.frag and rt_reflection_resolve
-    // use, and it holds for standard and reversed Z alike as long as the pair
-    // comes from the live projection.
+    // contracts/depth_linear.hpp is the formula's one home (and carries the
+    // derivation). The only difference is the degenerate case, per the note
+    // above: a screen trace wants a very large distance there, not 0.
     const float denom = device_depth + a;
     if (std::abs(denom) < 1e-9f) {
         return 1e9f;
     }
-    return std::abs(b / denom);
+    return bracken::scene::linear_view_depth(device_depth, a, b);
 }
 
 // ============================================================================

@@ -9,6 +9,7 @@
 // evaluates the receiving surface's BRDF at full resolution.
 
 #include "reflection_gate.hlsli"
+#include "depth_linear.hlsli"
 
 struct PSInput {
     float4 position : SV_Position;
@@ -52,7 +53,10 @@ float3 octDecode(float2 e) {
 }
 
 float linearizeDepth(float d) {
-    return abs(depthB) > 1e-8 ? abs(depthB / (d + depthA)) : d;
+    // The depthB guard is this pass's own: with the terms unset it falls back
+    // to raw device depth rather than to 0, because the taps below are
+    // compared against each other and 0-vs-0 would accept every one of them.
+    return abs(depthB) > 1e-8 ? brackenLinearViewDepth(d, depthA, depthB) : d;
 }
 
 float2 envBRDFApprox(float roughness, float NoV) {

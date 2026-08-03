@@ -71,6 +71,7 @@
 
 #include "rt_sampling.hlsli"
 #include "local_di.hlsli"
+#include "depth_linear.hlsli"
 
 #define RT_TRACE_TYPES
 #include "rt_trace.hlsli" // octDecode
@@ -132,8 +133,24 @@ SamplerState sceneNormalSampler : register(s4, space0);
 [[vk::image_format("rg16f")]]
 [[vk::binding(2, 1)]] RWTexture2D<float2> directionOut : register(u2, space1);
 
+/// See depth_linear.hlsli. TWO consumers, and only one of them was
+/// self-consistent — which is why fixing the depthA sign here (2026-08-02) is
+/// the one place in this package that changes a picture rather than a scale:
+///
+///  - the `wDepth` bilateral weight below compares this against a neighbour run
+///    through the same expression: self-consistent, so the fix only changes
+///    what `depthSigma` means in real units;
+///  - `outAlpha` on the FINAL iteration publishes it as the traced texel's view
+///    depth, and local_di.hlsli's reconstruction compares that against the
+///    forward pass's TRUE `input.viewDepth` (through clusterParams.view). That
+///    mix was the live instance of the trap R2b flagged: at 500 units the two
+///    sides differed by a systematic 33% (166 units) against a
+///    LOCAL_DI_DEPTH_TOLERANCE window of 25, which did not black the term out
+///    (the weights are normalized, so a common factor cancels) but did compress
+///    the good-tap/bad-tap ratio from ~5:1 to ~2:1 — a depth-aware upsample
+///    quietly degrading toward the plain bilinear it exists to replace.
 float linearizeDepth(float d) {
-    return depthB / max(d - depthA, 1e-6);
+    return brackenLinearViewDepth(d, depthA, depthB);
 }
 
 /// The full-resolution depth/G-buffer texel a traced texel stands for. Same

@@ -77,6 +77,7 @@ SamplerState depthSampler : register(s3, space2);
 StructuredBuffer<float4> exposureState : register(t4, space2);
 
 #include "lighting.hlsli"
+#include "depth_linear.hlsli"
 
 float3 reinhard(float3 c) {
     return c / (c + 1.0);
@@ -98,7 +99,7 @@ static const float3x3 LMS_TO_LIN = {
 // Positive linear view depth from non-linear [0,1] depth (glm RH_ZO,
 // standard or reversed-Z — depthA/depthB come from the live projection).
 float linearizeDepth(float depth) {
-    return abs(depthB / (depth + depthA));
+    return brackenLinearViewDepth(depth, depthA, depthB);
 }
 
 // Joint bilateral upsample setup for the half-res fog texture: the 4 nearest

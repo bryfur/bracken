@@ -165,8 +165,26 @@ before it — which proves both self-sufficiency and the include guard.
     `viewZ = |B / (depth + A)|` with `A = proj[2][2]`, `B = proj[3][2]` holds
     for standard and reversed matrices alike, so `blur_ao`/`composite` needed
     no math change.
-  - `SceneRenderer` recovers the near plane as `m[3][2]/(m[2][2] + 1)`
-    (under standard-Z it was `m[3][2]/m[2][2]`).
+  - **That formula has exactly one home, and it is not a shader.**
+    `contracts/depth_linear.hpp` (`scene::linear_view_depth` /
+    `scene::depth_linear_terms`) is the source of truth and carries the
+    derivation; `shaders/depth_linear.hlsli` is its transliteration and every
+    shader that linearizes depth includes it rather than open-coding the
+    expression. `contracts/depth_linear.test.cpp` pins the C++ half against the
+    inverse-projection reference (`lighting.hlsli`'s `viewPosFromDepth`, the
+    expensive route) to under 0.1% from 10 to 4000 units. **Fixed 2026-08-02:**
+    four traced passes (sun-visibility temporal denoiser + spatial filter, the
+    A-SVGF gradient, the local-DI spatial filter) carried `B / max(d - A, 1e-6)`
+    — the sign of the `A` term inverted, which evaluates to
+    `t / (1 - 2t/far)`: +5% at 100 units, +33% at 500, +100% at 1000, and past
+    `far/2` the clamp pinned every surface to one constant. Self-consistent
+    wherever a linearized depth met another linearized depth, and genuinely
+    wrong where the local-DI reconstruction compared it against the forward
+    pass's true `input.viewDepth`. Do not open-code the expression again; the
+    self-consistency is exactly what hides the typo.
+  - `SceneRenderer` recovers the near plane as the linearized view depth of
+    device depth **1** — under reversed-Z that *is* the near plane, and it is
+    the same one formula rather than a second identity to keep in step.
   - `Frustum::extract_from_matrix` is convention-agnostic: the two depth-plane
     rows swap near/far roles under reversed-Z but the extracted plane set (and
     thus culling) is identical (`contracts/frustum.cpp`).
