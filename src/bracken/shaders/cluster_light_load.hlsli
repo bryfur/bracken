@@ -18,7 +18,8 @@
 //   [LightDataHeader 16B][LightHeader * cap][PointLight * cap][SpotLight * cap]
 // where cap = clusterParams.maxPerCluster.y — the CPU-side buffer capacity
 // (ClusterGrid max_lights_) — so the offsets follow the CPU layout instead of
-// hardcoding a light count. Strides: LightHeader 8B, PointLight 48B, SpotLight 64B.
+// hardcoding a light count. Strides: LightHeader 8B, PointLight 48B, SpotLight 80B
+// (SpotLight grew from 64 in R6, when source_radius found no spare padding there).
 uint pointLightsBase() { return 16u + clusterParams.maxPerCluster.y * 8u; }
 uint spotLightsBase()  { return 16u + clusterParams.maxPerCluster.y * (8u + 48u); }
 
@@ -44,13 +45,15 @@ PointLightGPU loadPointLight(uint i) {
     // c.x is the CPU-side casts_shadows byte + padding (never read here);
     // shadow_slot is engine-assigned each frame (-1 = unshadowed).
     p.shadow_slot = asint(c.y);
-    // c.z is stable_id, resolved during binning; c.w is the remaining pad.
+    // c.z is stable_id, resolved during binning; c.w was the remaining pad and
+    // carries source_radius since R6.
     p.stable_id   = c.z;
+    p.source_radius = asfloat(c.w);
     return p;
 }
 
 SpotLightGPU loadSpotLight(uint i) {
-    uint base = spotLightsBase() + i * 64;
+    uint base = spotLightsBase() + i * 80;
     uint4 a = lightDataBuf.Load4(base);
     uint4 b = lightDataBuf.Load4(base + 16);
     uint4 c = lightDataBuf.Load4(base + 32);
@@ -66,6 +69,9 @@ SpotLightGPU loadSpotLight(uint i) {
     // d.y is the CPU-side casts_shadows byte + padding (never read here).
     s.shadow_slot = asint(d.z);
     s.stable_id   = d.w;
+    // Row 5 exists only because SpotLight had no spare padding for R6's
+    // source_radius; y/z/w are declared pad.
+    s.source_radius = asfloat(lightDataBuf.Load(base + 64));
     return s;
 }
 
@@ -125,6 +131,11 @@ float clusterSpotLightTarget(SpotLightGPU sl, float3 P, float3 N) {
 struct ClusterLightSample {
     float3 position;
     float radius;   ///< the light's RANGE, not its emitter size
+    /// The EMITTER size, in world units (R6, contracts/light.hpp). 0 means the
+    /// host did not author one and the sampling pass should use its own
+    /// default — resolving that here would need the pass's uniform, which this
+    /// shared header deliberately does not name.
+    float source_radius;
     bool valid;
 };
 
@@ -132,16 +143,19 @@ ClusterLightSample clusterLightGeometry(uint packed_index) {
     ClusterLightSample s;
     s.position = float3(0, 0, 0);
     s.radius = 0.0;
+    s.source_radius = 0.0;
     s.valid = false;
     LightHeader h = loadLightHeader(packed_index);
     if (h.type == 0u) {
         PointLightGPU pl = loadPointLight(h.payload_index);
         s.position = pl.position;
         s.radius = pl.radius;
+        s.source_radius = pl.source_radius;
     } else {
         SpotLightGPU sl = loadSpotLight(h.payload_index);
         s.position = sl.position;
         s.radius = sl.radius;
+        s.source_radius = sl.source_radius;
     }
     s.valid = true;
     return s;

@@ -216,13 +216,23 @@ TEST(ClusterGrid, BuildIsDeterministic) {
 }
 
 TEST(LightStruct, SizesMatchSpec) {
-    // Strides hardcoded in cluster_lighting.hlsli (loadPointLight/loadSpotLight).
+    // Strides hardcoded in cluster_light_load.hlsli (loadPointLight/loadSpotLight).
+    // SpotLight is 80 since R6: source_radius found no spare padding there and
+    // the stride literal moved with it. PointLight had a declared pad and did
+    // not grow.
     EXPECT_EQ(sizeof(PointLight), 48u);
-    EXPECT_EQ(sizeof(SpotLight), 64u);
+    EXPECT_EQ(sizeof(SpotLight), 80u);
     EXPECT_EQ(sizeof(LightHeader), 8u);
     // shadow_slot byte offsets the shader reads (Load4 lanes c.y / d.z).
     EXPECT_EQ(offsetof(PointLight, shadow_slot), 36u);
     EXPECT_EQ(offsetof(SpotLight, shadow_slot), 56u);
+    // R6's source_radius, at the offsets the shader loads it from.
+    EXPECT_EQ(offsetof(PointLight, source_radius), 44u);
+    EXPECT_EQ(offsetof(SpotLight, source_radius), 64u);
+    // 0 means "the host did not author one"; the traced pass substitutes its
+    // own default. It is NOT "a point light" — see contracts/light.hpp.
+    EXPECT_EQ(PointLight{}.source_radius, 0.0f);
+    EXPECT_EQ(SpotLight{}.source_radius, 0.0f);
     // Host-facing defaults: opt-out of shadows, engine slot unassigned.
     PointLight p{};
     SpotLight s{};

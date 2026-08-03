@@ -345,6 +345,23 @@ buffers are the reservoir ping-pong, of which the second is only ever READ:
 SDL3 GPU allows a compute pipeline eight read-only storage buffers and the four
 acceleration-structure buffers plus four cluster buffers spend them exactly.
 
+**R6 gave it a SECOND candidate stream**, and the same ceiling shaped how: two
+emissive-mesh records drawn from a scene-wide power-weighted Vose table
+(`rt_emissive.hlsli`) join the six froxel candidates, out of a THIRD read-write
+storage buffer that is likewise only ever read. The alias table has exactly as
+many buckets as records, so it rides inside the 64-byte record rather than
+costing a fourth slot. The two streams' RIS weights each carry a
+balance-heuristic factor `M_current / M_source` — their domains are disjoint and
+their integrals must be summed rather than averaged — which is exactly `1.0f`
+when there is one stream, and is why the pre-R6 path is reproduced bit for bit.
+The emissive stream is sent only in the `Full` tier: a ratio estimator scales
+lighting the forward loop already evaluates, and the forward loop has no
+emissive light list. The shadow ray for an emissive winner aims at a point
+sampled uniformly on the TRIANGLE and stops short by 0.2% of the distance —
+a relative margin, not the analytic path's absolute bias — because unlike a
+lamp, this emitter IS geometry in the TLAS and would otherwise occlude its own
+light on every ray.
+
 Under `diMode >= 2` (`LocalRtShadowMode::Full`, R5c) the same shader — one
 shader, not a variant, because R5b's gradient sibling replays its sampling
 decisions and a second trace variant would need a second gradient variant —
@@ -378,7 +395,12 @@ The local variant differs in one place that matters: it must also reproduce
 WHICH LIGHT the previous frame's reservoir picked, resolved through R2a's
 prev→current remap, or it would report a full gradient on every pixel whose
 reservoir merely moved. A light the remap says is gone gives a gradient of 1
-with no ray at all. It takes the same eight-read-only-storage-buffer split
+with no ray at all. Since R6 the stored choice may instead be an EMISSIVE
+RECORD (bit 31 of the index is the source tag), resolved through the record
+epoch rather than the remap, so this pass binds the record buffer too — without
+it a flagged index reads as out-of-range, which reads as "the light is gone",
+which resets the denoiser's history every frame on precisely the pixels the new
+lights reach. It takes the same eight-read-only-storage-buffer split
 `rt_local_shadow.comp` does, and for the same ceiling; `clusterParams` at
 set 2 b1 is why it includes `cluster_compute.hlsli` whole despite drawing no
 new candidates — that view matrix is the only source of a view depth that agrees
@@ -441,7 +463,10 @@ atlases, recorded once per cascade whose turn the rota gives it and all timed as
 one `GIProbes` scope. `gi_probe_trace.comp` casts one ray per (scheduled probe,
 ray slot) over the SAME software BVH the other traced effects walk — it includes
 `rt_trace.hlsli` in both phases and uses the **closest-hit** walk, because a
-probe ray has to shade what it finds. Hit shading moved to `rt_hit_shade.hlsli`
+probe ray has to shade what it finds. Since R6 a hit's own EMISSION is part of
+what `rt_hit_shade.hlsli` returns, so a probe ray landing on a glowing window
+deposits that light into the field and bounce from emissives needs no separate
+mechanism. Hit shading moved to `rt_hit_shade.hlsli`
 in R3 and is shared with `rt_reflection.comp`: flat `TriangleAttributes`
 albedo times (sun N·L with a **CSM atlas fetch** for visibility + the frame's
 point/spot lights, range-windowed, read straight out of the cluster light
@@ -657,9 +682,14 @@ visibility temporal passes, the reflection temporal pass and the screen-probe
 filter all include it; it takes `rt_sampling.hlsli` itself for `rtSeed` and
 `luminance`), `rt_hit_shade.hlsli` (**the one
 hit-shading model** every traced signal uses, R3: `TriangleAttributes` in phase
-1, then `rtHitSkyRadiance` for a miss and `rtShadeHit` for a hit —
+1 — **80 bytes since R6**, the emissive proxy having joined the base-colour one
+— then `rtHitSkyRadiance` for a miss and `rtShadeHit` for a hit —
 `albedo_flat × (CSM-shadowed sun N·L + range-windowed point/spot lights + π ×
-probe-field irradiance) / π`. A **two-phase** include like `rt_trace.hlsli`, and
+probe-field irradiance) / π + emissive_flat`. The emission is added OUTSIDE the
+albedo and outside the Lambertian divide, because it is radiance leaving the
+surface on its own account; that one term is what makes a glowing window bright
+in reflections AND, via probe rays, what makes bounce from emissives fall out of
+the DDGI recursion for free. A **two-phase** include like `rt_trace.hlsli`, and
 it names resources it does not own — `shadowAtlas`/`shadowCmpSampler`,
 `shadowAtlasRaw`/`shadowRawSampler`, `giSkyCube`, `giIrradiance`, `giProbeState`,
 `lightDataBuf` — so the including shader owns their slots, exactly like
@@ -671,6 +701,17 @@ rays, **0 for probe rays**, because a probe already collects sky through its ray
 misses and adding a hemisphere on top would double-count it and break the bounce
 series' convergence. Consumers: `rt_reflection.comp`, `gi_probe_trace.comp` and
 `gi_screen_probe_trace.comp`),
+`rt_emissive.hlsli` (R6's emissive mesh lights, and a **two-phase** include for
+the same reason: `EmissiveRecord` (64 B, mirroring
+`render/raytracing/emissive_lights.hpp`) in phase 1 so the including shader can
+declare its record buffer, then the alias draw, the uniform-area triangle
+sample and the target function in phase 2. It names `emissiveRecords` and
+`clusterTargetLuminance`, so it must be included AFTER
+`cluster_light_load.hlsli`. Emission is treated as TWO-SIDED, because every
+forward shader in this tree adds it regardless of facing and a light that glows
+in the raster path while casting nothing would be exactly the silent
+disagreement these shared headers exist to prevent. Consumers:
+`rt_local_shadow.comp` and `rt_local_shadow_gradient.comp`),
 `rt_trace.hlsli` (the
 software two-level BVH: `BvhNodeGpu`/`BvhTriangle`/`TlasInstance`, `slabTest`,
 `octDecode`, the any-hit `blasOccluded`/`sceneOccluded` walk and the

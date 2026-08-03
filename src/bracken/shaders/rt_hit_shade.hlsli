@@ -92,12 +92,18 @@
 #if defined(RT_HIT_SHADE_TYPES) && !defined(BRACKEN_RT_HIT_SHADE_TYPES_INCLUDED)
 #define BRACKEN_RT_HIT_SHADE_TYPES_INCLUDED
 
-/// Per-triangle shading attributes, 64 B. Mirrors
-/// render::rt::TriangleAttributes: three model-space vertex normals and one
-/// FLAT base colour, sampled at load from the albedo texture's centroid UV
-/// (render/raytracing/internal/model_material_proxy.hpp). This is the whole
-/// material model a ray hit gets, and the reason it is enough for stylized
-/// content is that the packs' albedo maps are near-constant per triangle.
+/// Per-triangle shading attributes, 80 B. Mirrors
+/// render::rt::TriangleAttributes: three model-space vertex normals, one FLAT
+/// base colour sampled at load from the albedo texture's centroid UV, and (R6)
+/// the same treatment of the EMISSIVE channel
+/// (internal/model_material_proxy.hpp). This is the whole material model a ray
+/// hit gets, and the reason it is enough for stylized content is that the packs'
+/// albedo maps are near-constant per triangle.
+///
+/// `emissiveLuminance` is a cache of the Rec.709 luma of `emissive`, computed
+/// once on the CPU. The shading below does not read it — the BLAS-level light
+/// gather does, and it lives here because the alternative was a parallel array
+/// indexed the same way.
 struct TriangleAttributes {
     float3 n0;
     float pad0;
@@ -106,6 +112,8 @@ struct TriangleAttributes {
     float3 n2;
     float pad2;
     float4 baseColor;
+    float3 emissive;
+    float emissiveLuminance;
 };
 
 #endif // RT_HIT_SHADE_TYPES
@@ -261,6 +269,7 @@ float3 rtHitAmbient(float3 P, float3 N) {
 
 uint rtHitPointLightsBase() { return 16u + giLightCapacity * 8u; }
 uint rtHitSpotLightsBase() { return 16u + giLightCapacity * (8u + 48u); }
+// SpotLight's stride is 80 bytes since R6 (source_radius), PointLight's still 48.
 
 /// Smooth windowed inverse-square falloff. Operation-identical to
 /// `pointFalloff` in clusters.hlsli — a ray hit and a pixel must agree about
@@ -300,7 +309,7 @@ float3 rtHitLocalLights(float3 P, float3 N) {
             }
             acc += asfloat(b.xyz) * asfloat(b.w) * rtHitPointFalloff(dist, radius) * ndotl;
         } else {
-            uint base = rtHitSpotLightsBase() + header.y * 64u;
+            uint base = rtHitSpotLightsBase() + header.y * 80u;
             uint4 a = lightDataBuf.Load4(base);
             uint4 b = lightDataBuf.Load4(base + 16u);
             uint4 c = lightDataBuf.Load4(base + 32u);
@@ -332,8 +341,23 @@ float3 rtHitLocalLights(float3 P, float3 N) {
 // ---------------------------------------------------------------------------
 
 /**
- * Outgoing radiance of a Lambertian hit at `P` with world-space normal `N` and
- * flat albedo `albedo`.
+ * Outgoing radiance of a Lambertian hit at `P` with world-space normal `N`,
+ * flat albedo `albedo` and flat emitted radiance `emissive` (R6).
+ *
+ * EMISSION IS ADDED, NOT LIT. It is radiance leaving the surface on its own
+ * account, so it does not go through the 1/pi Lambertian divide and it is not
+ * modulated by albedo, shadow or ambient — a glowing window is exactly as bright
+ * seen in a reflection as it is seen directly, which is the whole claim. That
+ * also means a probe ray hitting an emitter deposits its light into the probe
+ * field, so bounce FROM emissives arrives with no additional machinery: it is
+ * the same recursion that already carries bounce from sunlit walls.
+ *
+ * The one thing this deliberately does NOT do is double-count against the
+ * emissive-light sampler (R6's records): those are DIRECT lighting for the
+ * froxel-RIS pass at PRIMARY surfaces, while this is the radiance of a
+ * SECONDARY hit. A reflection ray that lands on a lamp sees the lamp; the
+ * primary pixel under the lamp is lit by the sampler. They never describe the
+ * same transport path.
  *
  * `noise` only rotates calcShadow's PCSS poisson disk; every caller pins
  * `shadowEnabled` to PCF, which never reaches it, so it exists to keep the
@@ -345,7 +369,7 @@ float3 rtHitLocalLights(float3 P, float3 N) {
  * reflection ray should just shade the flipped normal. Nothing here inspects
  * the ray direction.
  */
-float3 rtShadeHit(float3 P, float3 N, float3 albedo, float2 noise) {
+float3 rtShadeHit(float3 P, float3 N, float3 albedo, float3 emissive, float2 noise) {
     float3 toSun = -sunDirection;
     float ndotl = saturate(dot(N, toSun));
 
@@ -359,8 +383,8 @@ float3 rtShadeHit(float3 P, float3 N, float3 albedo, float2 noise) {
     E += rtHitLocalLights(P, N);
     E += GI_PI * bounceScale * rtHitAmbient(P + N * normalBias, N);
 
-    // Lambertian outgoing radiance.
-    return albedo * E / GI_PI;
+    // Lambertian outgoing radiance, plus what the surface emits on its own.
+    return albedo * E / GI_PI + emissive;
 }
 
 #endif // RT_HIT_SHADE_FUNCTIONS

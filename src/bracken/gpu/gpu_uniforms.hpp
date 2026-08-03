@@ -1290,10 +1290,22 @@ struct alignas(16) RtLocalShadowUniforms {
     /// view dependence, which is why the Ratio tier never needed this and R5c
     /// is where it arrives.
     glm::vec3 cameraPosition{0.0f};
+    /// R6, emissive mesh lights. Records live, the alias table's normalizing
+    /// constant, M_e, and whether an emissive index in last frame's reservoir
+    /// still names the same triangle (0 after a TLAS topology rebuild).
+    ///
+    /// `emissiveCount` is 0 in the Ratio tier BY CONSTRUCTION, which is the
+    /// whole tier split: see the header comment of rt_local_shadow.comp.hlsl.
+    /// Zero also makes every RIS weight in that shader collapse to the R5c
+    /// expression bit for bit, which is what keeps the Ratio baselines exact.
+    uint32_t emissiveCount = 0;
+    float emissiveTotalPower = 0.0f;
+    uint32_t emissiveCandidateCount = 0;
+    uint32_t emissiveHistoryValid = 0;
     float _pad1 = 0.0f;
 };
 
-BRACKEN_HLSL_CBUFFER(RtLocalShadowUniforms, 128);
+BRACKEN_HLSL_CBUFFER(RtLocalShadowUniforms, 144);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, invViewProj, 0);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, outputSize, 64);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, tlasNodeCount, 72);
@@ -1307,7 +1319,11 @@ BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, historyValid, 100);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, candidateCount, 104);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, diMode, 108);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, cameraPosition, 112);
-BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, _pad1, 124);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveCount, 124);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveTotalPower, 128);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveCandidateCount, 132);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveHistoryValid, 136);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, _pad1, 140);
 
 /**
  * The Full-DI tier's temporal denoiser — matches
@@ -1496,10 +1512,18 @@ struct alignas(16) RtLocalShadowGradientUniforms {
     uint32_t tlasNodeCount = 0;
     uint32_t hasGBuffer = 0;
     uint32_t historyValid = 0;
+    /// R6 — the emissive record set the PREVIOUS frame's reservoirs were
+    /// written against, and whether it is still the same set. A flagged
+    /// reservoir index that cannot be resolved is a full gradient, exactly as a
+    /// vanished analytic light is.
+    uint32_t emissiveCount = 0;
+    uint32_t emissiveHistoryValid = 0;
     uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+    uint32_t _pad2 = 0;
 };
 
-BRACKEN_HLSL_CBUFFER(RtLocalShadowGradientUniforms, 112);
+BRACKEN_HLSL_CBUFFER(RtLocalShadowGradientUniforms, 128);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, invViewProj, 0);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, tracedSize, 64);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, stratumCount, 72);
@@ -1510,7 +1534,11 @@ BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, frameIndex, 92);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, tlasNodeCount, 96);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, hasGBuffer, 100);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, historyValid, 104);
-BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad0, 108);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, emissiveCount, 108);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, emissiveHistoryValid, 112);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad0, 116);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad1, 120);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad2, 124);
 
 /**
  * Dense reconstruction of the sparse gradient — matches

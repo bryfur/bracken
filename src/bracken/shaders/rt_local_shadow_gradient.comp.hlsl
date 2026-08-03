@@ -47,7 +47,14 @@ cbuffer RtLocalShadowGradientUniforms : register(b0, space2) {
     uint tlasNodeCount;
     uint hasGBuffer;
     uint historyValid;
+    /// R6 — the emissive record set the PREVIOUS frame's reservoirs were
+    /// written against. Zero either when there are no records or when the
+    /// record set was renumbered since, which is the epoch test.
+    uint emissiveCount;
+    uint emissiveHistoryValid;
     uint _pad0;
+    uint _pad1;
+    uint _pad2;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
@@ -83,6 +90,10 @@ SamplerState velocitySampler : register(s2, space0);
 #define CLUSTER_COMPUTE_PARAMS_BINDING 1
 #include "cluster_compute.hlsli"
 
+// R6's emissive record type, so the binding block below can declare its buffer.
+#define RT_EMISSIVE_TYPES
+#include "rt_emissive.hlsli"
+
 /// Mirrors render::lighting::Reservoir (16 B) and rt_local_shadow.comp.hlsl's
 /// RtReservoir field for field.
 struct RtReservoir {
@@ -93,12 +104,25 @@ struct RtReservoir {
 };
 
 #define RT_RESERVOIR_NO_LIGHT 0xFFFFFFFFu
+// Source tag — see rt_local_shadow.comp.hlsl, which owns the convention.
+#define RT_RESERVOIR_EMISSIVE_FLAG 0x80000000u
+#define RT_RESERVOIR_EMISSIVE_MASK 0x7FFFFFFFu
 
 [[vk::binding(0, 1)]] RWTexture2D<float> gradientOut : register(u0, space1);
 /// LAST FRAME'S reservoirs — READ ONLY, despite the read-write declaration, for
 /// the reason rt_local_shadow.comp.hlsl spells out: the eight read-only
 /// storage-buffer slots are spent above.
 [[vk::binding(1, 1)]] RWStructuredBuffer<RtReservoir> prevReservoirs : register(u1, space1);
+/// R6's emissive light records, read-only in a read-write slot for the same
+/// reason. A reservoir may now name one of these instead of an analytic light,
+/// and the replay has to be able to aim at it — WITHOUT this the flagged index
+/// falls through clusterRemapPrevLight as out-of-range, every emissive-lit
+/// stratum reports a full gradient every frame, and the denoiser's history is
+/// reset forever exactly where the new lights are.
+[[vk::binding(2, 1)]] RWStructuredBuffer<EmissiveRecord> emissiveRecords : register(u2, space1);
+
+#define RT_EMISSIVE_FUNCTIONS
+#include "rt_emissive.hlsli"
 
 #define RT_TRACE_TRAVERSAL
 #include "rt_trace.hlsli"
@@ -195,7 +219,19 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
-    const uint mapped = clusterRemapPrevLight(hist.lightIndex);
+    // R6: the stored choice may be an EMISSIVE RECORD rather than an analytic
+    // light. Same two outcomes, one translation each — the remap for analytic
+    // lights, the record epoch for emissive ones. An emissive index whose epoch
+    // has turned over names a different triangle now, and "the light I was
+    // shadowed by is not there any more" is exactly the gradient's 1.0 case.
+    const bool histEmissive = (hist.lightIndex & RT_RESERVOIR_EMISSIVE_FLAG) != 0u;
+    uint mapped;
+    if (histEmissive) {
+        const uint rec = hist.lightIndex & RT_RESERVOIR_EMISSIVE_MASK;
+        mapped = (emissiveHistoryValid != 0u && rec < emissiveCount) ? rec : LIGHT_REMAP_INVALID;
+    } else {
+        mapped = clusterRemapPrevLight(hist.lightIndex);
+    }
     if (mapped == LIGHT_REMAP_INVALID) {
         // The light this pixel was shadowed by no longer exists. No ray needed:
         // the answer changed by construction.
@@ -207,14 +243,47 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     const uint2 prevInTile = uint2(prevCoord) % RT_TILE_SIZE;
     const float prevLit = rtUnpackVisibility(prevShadowBits.Load(int3(int2(prevTile), 0)), prevInTile);
 
-    // ---- replay: the same light, the previous frame's sample --------------
+    // ---- replay: an EMISSIVE record, the previous frame's sample ----------
+    //
+    // Transliterated from the trace's own emissive branch, down to the relative
+    // ray-length margin that stops the emitter occluding itself. `rtSample2D`
+    // at (prevCoord, frameIndex - 1) returns EXACTLY the pair the previous
+    // frame drew — the replayability requirement §2 of the plan states — so
+    // this is a replay of the ray that ran, not a fresh sample of the same
+    // light.
+    if (histEmissive) {
+        const EmissiveRecord er = emissiveRecords[mapped];
+        const float2 xi = rtSample2D(uint2(prevCoord), frameIndex - 1u);
+        const float3 pt = rtEmissiveSamplePoint(er, xi);
+        const float3 toPt = pt - worldPos;
+        const float dist = length(toPt);
+        const float3 L = toPt / max(dist, 1e-4);
+        const float ndotl = dot(normal, L);
+        bool emissiveLit = true;
+        if (ndotl > 0.0 && dist > 1e-4) {
+            const float slope = saturate(1.0 - ndotl);
+            const float3 rayOrigin =
+                worldPos + normal * (normalBias * (1.0 + slope * 4.0)) + L * depthBias;
+            const float rayLen = min(dist * 0.998, dist - depthBias) - normalBias;
+            emissiveLit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, L, rayLen);
+        }
+        gradientOut[stratum] = abs((emissiveLit ? 1.0 : 0.0) - prevLit);
+        return;
+    }
+
+    // ---- replay: the same analytic light, the previous frame's sample ------
     bool replayLit = true;
     const ClusterLightSample geom = clusterLightGeometry(mapped);
     const float3 toLight = geom.position - worldPos;
     const float dist = length(toLight);
     const float3 L = toLight / max(dist, 1e-4);
 
-    const float sinThetaMax = min(lightSourceRadius / max(dist, 1e-4), 1.0);
+    // Per-light emitter radius since R6, with the pass default as the fallback
+    // — the same resolution the trace makes, or the replay would sample a
+    // different cone from the ray it is meant to be reproducing.
+    const float emitterRadius =
+        geom.source_radius > 0.0 ? geom.source_radius : lightSourceRadius;
+    const float sinThetaMax = min(emitterRadius / max(dist, 1e-4), 1.0);
     const float cosThetaMax = sqrt(saturate(1.0 - sinThetaMax * sinThetaMax));
 
     const float ndotl = dot(normal, L);

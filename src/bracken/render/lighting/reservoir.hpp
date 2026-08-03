@@ -138,6 +138,58 @@ struct ReservoirBuilder {
 };
 
 /**
+ * Balance-heuristic scale for one candidate source in a MULTI-SOURCE RIS draw
+ * (R6, docs/rt_lighting_plan.md §5.7).
+ *
+ * WHAT PROBLEM THIS SOLVES. Since R6 the local-light reservoir is fed by two
+ * candidate streams: `m_source` analytic lights drawn uniformly from the
+ * pixel's froxel, and a second batch drawn from a power-weighted alias table
+ * over emissive triangles. Their domains are DISJOINT — no draw from one can
+ * ever produce a sample of the other — and the quantity wanted is the SUM of
+ * the two integrals, `I_analytic + I_emissive`.
+ *
+ * Feeding both streams into one reservoir with the shipped `1/M` normalization
+ * would instead deliver
+ *
+ *     (M_a * I_a + M_e * I_e) / (M_a + M_e)
+ *
+ * a convex COMBINATION of the two halves — i.e. the frame dimmed toward
+ * whichever source happened to be drawn more often. That is an energy error,
+ * not a noise one, and it is invisible in a screenshot because it looks exactly
+ * like "the lighting is a bit dark".
+ *
+ * (Note the contrast with the TEMPORAL merge, where a convex combination is
+ * exactly right: `merge()` above combines two estimates of the SAME integral,
+ * so weighting them by confidence and summing to one is the correct thing.)
+ *
+ * THE FIX. Apply the balance heuristic per candidate:
+ * `m_i(x) = p_i(x) / sum_j p_j(x)` over all M draws. With disjoint domains
+ * every cross term vanishes, so `m` collapses to `1/M_source` for a candidate
+ * of that source. Folding that into each stream weight while KEEPING the
+ * shipped finalize (`W = w_sum / (M_total * p̂)`) leaves exactly one factor per
+ * candidate, and this function is that factor:
+ *
+ *     w_i = ris_source_scale(M_source, M_current) * p̂(x_i) / p_source(x_i)
+ *
+ * with `M_current = M_a + M_e` (this frame's candidates, history excluded — the
+ * history carries its own confidence weight through `merge()`).
+ *
+ * WHY IT IS A NO-OP FOR ONE SOURCE. With `m_source == m_total_current` this
+ * returns exactly 1.0f, and multiplying a float by 1.0f is exact — which is why
+ * every pre-R6 configuration reproduces its baseline BIT for bit rather than
+ * merely closely.
+ *
+ * Mirrored in `shaders/rt_local_shadow.comp.hlsl` as `sourceScaleA` /
+ * `sourceScaleE`.
+ */
+[[nodiscard]] inline float ris_source_scale(uint32_t m_source, uint32_t m_total_current) {
+    if (m_source == 0) {
+        return 0.0f;
+    }
+    return static_cast<float>(m_total_current) / static_cast<float>(m_source);
+}
+
+/**
  * Resolve a reservoir carried over from the previous frame against this frame's
  * light set.
  *

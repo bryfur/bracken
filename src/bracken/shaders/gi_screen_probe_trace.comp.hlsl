@@ -221,7 +221,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex) {
                 N = -N;
             }
             float3 P = origin + dir * hit.t;
-            radiance = rtShadeHit(P, N, attr.baseColor.rgb, float2(tid.x & 63u, texel));
+            radiance = rtShadeHit(P, N, attr.baseColor.rgb, attr.emissive, float2(tid.x & 63u, texel));
             distance = resume + hit.t;
             InterlockedAdd(gsWorldHits, 1u);
         } else {

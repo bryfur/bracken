@@ -823,9 +823,14 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
      triangle centroid before the source sRGB pixels are released at upload.
      It folds in vertex colour and `baseColorFactor`, so reflected hit shading
      preserves authored texture colour without retaining all CPU textures or
-     requiring a bindless texture array. The proxy is built only for models
-     whose CPU geometry is retained for RT; shadows-only GPU memory remains 48
-     bytes per triangle and reflection attributes remain 64 bytes per triangle.
+     requiring a bindless texture array. The same bake produces a per-triangle
+     EMISSIVE proxy (R6), which runs even with no texture at all — a bare
+     `emissive_factor` is the normal case for procedural content — and which
+     deliberately does NOT fold in vertex colour, because the forward shaders'
+     emissive term is `factor * texture` and this proxy exists to agree with
+     them. The proxy is built only for models whose CPU geometry is retained
+     for RT; shadows-only GPU memory remains 48 bytes per triangle and
+     reflection attributes are 80 bytes per triangle.
 9. **`HDROffscreen`** (the normal path whenever the post stack initialized) —
    the whole 3D scene renders into the linear-HDR offscreen target: terrain,
    grass, static/instanced/skinned models, skybox, sorted transparent
@@ -1074,19 +1079,59 @@ sees — so `bvh_gpu_layout.test.cpp` covers the refit path for free — and kee
 the SAH gate reading the same structure the builder produced. The price is two
 extra linear passes over ~2N nodes, noise against the build being skipped.
 
-Per-triangle shading attributes (`TriangleAttributes`, 64 B: three normals plus
-one flat base colour baked at load from the albedo texture's centroid-UV
-sample, via `internal/model_material_proxy.hpp`) are **optional and gathered
+Per-triangle shading attributes (`TriangleAttributes`, **80 B since R6**: three
+normals, one flat base colour, and one flat EMISSIVE radiance plus its cached
+Rec.709 luma, all baked at load from the respective textures' centroid-UV
+samples via `internal/model_material_proxy.hpp`) are **optional and gathered
 only when reflections are on** — a shadow ray asks a yes/no question and needs
-none of it. That is why enabling reflections after the structure was built for
+none of it. The emissive lanes cost ~25% of the largest single item in the
+acceleration budget (12.8 → 16.0 MB on the playground village) and buy two
+things at once: glowing surfaces in every traced hit, and — because the same
+lanes are what the BLAS-level light gather reads — the emissive mesh lights
+described under "Emissive mesh lights" below. That is why enabling reflections after the structure was built for
 shadows alone forces a rebuild (`SceneRenderer::ensure_raytracing_scene`
 handles this, so a runtime toggle works without host cooperation).
 
 The structure's cost is itemized in `RtStats` (`render/rt_renderer.hpp`):
-`blas_bytes`, `attribute_bytes` and `tlas_bytes`, summing to
-`acceleration_bytes`. The three have separate levers — BLAS follows the loaded
-model set, attributes exist only because reflections are on, and TLAS follows
-the per-frame instance count.
+`blas_bytes`, `attribute_bytes`, `tlas_bytes` and `emissive_bytes`, summing to
+`acceleration_bytes`. The four have separate levers — BLAS follows the loaded
+model set, attributes exist only because reflections are on, TLAS follows the
+per-frame instance count, and the emissive records follow how much of the
+content glows.
+
+#### Emissive mesh lights (R6)
+
+An emitting triangle is not only bright, it **illuminates**. Two levels, and
+the split is what makes it affordable:
+
+- **Per model, at BLAS build**: triangles whose `luminance x area` clears
+  `k_emissive_min_power` are kept in MODEL space on the model's entry
+  (`ModelEmissiveTriangle`, `render/raytracing/emissive_lights.hpp`). This is
+  the expensive walk and it runs exactly as often as `build_blas_for_models`.
+- **Per scene, when the instance list changes**: those are pushed through each
+  instance's transform into world space as 64-byte `EmissiveTriangle` records,
+  capped at `k_max_emissive_records` (8192; over budget keeps the brightest and
+  reports the drop in `RtStats::emissive_records_dropped`), and given a Vose
+  alias row EACH — the table has exactly as many buckets as records, so it rides
+  inside them and costs no second buffer. `render/lighting/alias_table.hpp` is
+  the CPU home.
+
+**The rebuild is a refit**, for the same reason the TLAS's is: world-space
+records are stale whenever anything moves, and a scene with one animated
+character moves every frame. `refresh_emissive_records` re-transforms only the
+records whose own instance moved — from the MODEL-space source, never from the
+previous world-space record, so long runs accumulate no drift — and rebuilds the
+alias table only when a power actually changed, which rigid motion never does.
+It cut `RTInstances` from 0.518 ms back to 0.194 ms against a 0.136 ms
+records-off baseline. The invariant that buys it: **each instance owns a
+contiguous slice of the record array**, which is why the over-budget cut is a
+power threshold applied as a stable filter rather than the sort it looks like it
+ought to be.
+
+**`emissive_epoch`** advances only on a TLAS topology rebuild. A record's index
+is stable within an epoch and meaningless across one, which is exactly the
+condition under which a reservoir may carry an emissive selection across a frame
+boundary — see "Local-light DI" below.
 
 ### The two traced effects
 
@@ -1139,6 +1184,27 @@ Per pixel:
    `spotConeFactor` the forward accumulator applies. Sharing that arithmetic is
    what keeps the estimator bias-free: the sampler weights a light zero exactly
    where `accumulateClusterLights` skips it.
+
+   **In the `Full` tier only (R6), a SECOND stream joins it**: M_e = 2 emissive
+   records drawn from the scene-wide power-weighted alias table, scored by
+   `rtEmissiveTarget` — deliberately the same physical quantity, so the two
+   streams are commensurable. The two domains are disjoint and their integrals
+   must be SUMMED, not averaged, so each candidate's weight carries a
+   balance-heuristic factor (`ris_source_scale`, `render/lighting/reservoir.hpp`)
+   of `M_current / M_source`. With one source that factor is exactly `1.0f`,
+   which is why the pre-R6 path is reproduced bit for bit rather than closely.
+   Feeding both streams under a shared `1/M` instead would deliver the convex
+   COMBINATION of the two halves — a uniformly dimmed frame, which is an energy
+   error that looks like an art decision. `emissive_lights.test.cpp` pins the
+   combined estimator against closed-form truth AND pins the wrong value the
+   naive weighting converges to.
+
+   Bit 31 of the reservoir's stored index is the **source tag** (free by
+   construction: light indices ≤ 256, record indices ≤ 8192). An analytic index
+   resolves through the prev→current remap; an emissive index resolves through
+   the record EPOCH, so a TLAS topology rebuild drops emissive history
+   wholesale — correct, because the alternative is a reservoir pointing at an
+   unrelated triangle.
 4. **Temporal merge** with the reprojected previous-frame reservoir. Its stored
    light index is a *previous* packed index, resolved through the frame's
    prev→current remap; a vanished light drops the history rather than silently
@@ -1147,11 +1213,23 @@ Per pixel:
    The candidate's p̂ is re-evaluated at the current surface, which is also why
    no normal test is needed — a light the new surface cannot see evaluates to
    zero and contributes nothing but M.
-5. One any-hit ray to a point sampled on the winner's emitter sphere
-   (`sampleCone` with `cosThetaMax` from `RtLocalShadowSettings::source_radius`
-   over the distance — 10 world units, one value for every light until R6's
-   per-light authoring). Output is one bit per pixel packed 8×4 per uint, the
-   same format the sun pass produces; a pixel whose froxel is empty writes LIT.
+5. One any-hit ray to a point sampled on the winner's emitter. For an analytic
+   light that is a point on its sphere (`sampleCone` with `cosThetaMax` from the
+   emitter radius over the distance); since R6 the radius is **per light**
+   (`PointLightDesc::source_radius` / the spot equivalent, 0 = the pass default
+   of 10 world units). For an emissive record it is a point sampled uniformly on
+   the TRIANGLE (square-root parametrization) — and because that triangle is
+   real geometry in the TLAS, the ray stops short by a RELATIVE margin (0.2% of
+   the distance) rather than the analytic path's absolute bias, or the emitter
+   occludes its own light on every single ray. Output is one bit per pixel
+   packed 8×4 per uint, the same format the sun pass produces; a pixel whose
+   froxel is empty writes LIT.
+
+   `rt_local_shadow_gradient.comp.hlsl` REPLAYS this decision one dispatch
+   later, so it takes the record buffer and the per-light radius too. Without
+   the record buffer a flagged index reads as out-of-range through the light
+   remap, which reads as "the light is gone", which resets the denoiser's
+   history every frame on exactly the pixels the new lights reach.
 
 Reservoir state is 16 B/px (`render/lighting/reservoir.hpp`: light index, W, M,
 linear depth) in a ping-ponged buffer pair at the traced resolution. p̂ is
@@ -1167,6 +1245,16 @@ point+spot subtotal by the denoised mask, so the analytic sum stays sharp and
 only the shadowing is stochastic. With one reservoir sample the ratio collapses
 to the selected light's visibility bit, because p̂(y)·W estimates the candidate
 sum that is also the denominator.
+
+**Emissive mesh lights are a `Full`-tier feature, and the reason is structural
+rather than provisional.** `Ratio`'s entire output is a scalar multiplying the
+forward pass's analytic point+spot subtotal — and that subtotal does not contain
+the emissive triangle, because the forward shader has no emissive light list and
+no budget for one. There is no value of a multiplier that ADDS a light. So the
+CPU sends `emissiveCount = 0` under `Ratio`, where emissive surfaces still glow
+(the hit shader's emission term reaches reflections at full strength) and still
+feed GI (probe rays deposit their radiance into the field), but cast no direct
+shadow of their own.
 
 `Full` (R5c) instead keeps the W and carries the radiance. Under `diMode >= 2`
 the trace also evaluates the winner's own BRDF and writes two **demodulated**
@@ -1855,8 +1943,17 @@ so the same camera path updates the same probes on the same frames.
 L_out = albedo_flat * ( sunColor * max(0, N.L) * sunVisibility
                       + local point/spot lights, range-windowed
                       + pi * previous-frame probe irradiance ) / pi
+      + emissive_flat                                    // R6
       | on a miss: sky radiance in the ray direction
 ```
+
+`emissive_flat` is added OUTSIDE the albedo and outside the Lambertian divide,
+because emission is radiance leaving the surface on its own account: a glowing
+window is exactly as bright reflected as seen directly, and no shadow or ambient
+term modulates it. The consequence that came free: a PROBE ray landing on an
+emitter deposits that radiance into the field, so **bounce from emissives is the
+existing DDGI recursion** rather than new machinery — and it is the only way
+emissive light reaches the frame at all under `LocalRtShadowMode::Ratio`.
 
 - `albedo_flat` is `TriangleAttributes::baseColor`, baked from the albedo
   texture's centroid-UV sample at load. SDL3 GPU has no bindless, so a hit

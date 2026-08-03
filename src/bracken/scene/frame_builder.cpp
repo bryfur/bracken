@@ -360,6 +360,7 @@ void FrameBuilder::Lane::add_point_light(const bracken::render::lighting::PointL
     auto* l = new (push_slot(point_lights_)) bracken::render::lighting::PointLight{
         light.position, light.radius, light.color, light.intensity, light.casts_shadows};
     l->stable_id = light.stable_id;
+    l->source_radius = light.source_radius;
 }
 
 void FrameBuilder::Lane::add_spot_light(const bracken::render::lighting::SpotLightDesc& light) {
@@ -370,6 +371,7 @@ void FrameBuilder::Lane::add_spot_light(const bracken::render::lighting::SpotLig
         light.position,   light.radius,          light.direction, std::cos(light.inner_angle.radians()),
         light.color,      std::cos(light.outer_angle.radians()),  light.intensity, light.casts_shadows};
     l->stable_id = light.stable_id;
+    l->source_radius = light.source_radius;
 }
 
 void FrameBuilder::Lane::add_billboard_3d(float world_x, float world_y, float world_z, float width, float fill_ratio,

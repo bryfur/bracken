@@ -217,7 +217,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             // The noise argument only rotates calcShadow's PCSS poisson disk,
             // which shadowEnabled = 1 (PCF) never reaches; feeding it the
             // ray/probe pair keeps it deterministic either way.
-            radiance = rtShadeHit(P, N, attr.baseColor.rgb, float2(tid.xy));
+            radiance = rtShadeHit(P, N, attr.baseColor.rgb, attr.emissive, float2(tid.xy));
             distance = hit.t;
         }
     }

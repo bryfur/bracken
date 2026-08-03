@@ -2748,7 +2748,7 @@ Emission is multi-lane: `Lane& lane(uint32_t i)` returns one writer's private st
 - `draw_model(handle, transform, tint = {1,1,1,1}, DrawFlags flags = DrawFlags::None, motion_id = 0)`
 - `draw_skinned(handle, transform, BonePaletteId palette, tint = {1,1,1,1}, DrawFlags flags = DrawFlags::None, motion_id = 0)` — an invalid id drops the draw with a warning.
 - `[[nodiscard]] alloc_bone_palette(joint_count /* 1..=animation::MAX_BONES */)` → `BonePaletteAllocation { std::span<glm::mat4> matrices; BonePaletteId id; bool valid(); }` — 16-byte-aligned **uninitialized** packet memory; the host writes every matrix before seal. Budget `FramePacket::MAX_BONE_PALETTES = 1024` per frame; over-budget allocations log an error and return an invalid allocation (empty span) — the visible build-time failure replacing the old render-time silent drop. One palette may be shared by many draws, across lanes (allocation must happen-before use) — reusing the id replaces the renderer's old pointer-dedupe of shared palettes.
-- `add_point_light(const PointLightDesc&)` / `add_spot_light(const SpotLightDesc&)` — host descriptors, not the GPU PODs (`src/bracken/contracts/light.hpp`). `PointLightDesc` = position/radius/color (linear vec3)/intensity + `casts_shadows` opt-in + `stable_id` (persistent identity, `0` = engine assigns — the default); `SpotLightDesc` adds direction + `core::Degrees inner_angle`/`outer_angle` (half-angles from the axis). The builder converts to `PointLight`/`SpotLight`, taking `std::cos(angle.radians())` for the cone, copying `stable_id` across, and leaving `_pad0`/`_pad1`/`shadow_slot` at their engine-owned defaults — a host never names those.
+- `add_point_light(const PointLightDesc&)` / `add_spot_light(const SpotLightDesc&)` — host descriptors, not the GPU PODs (`src/bracken/contracts/light.hpp`). `PointLightDesc` = position/radius/color (linear vec3)/intensity + `casts_shadows` opt-in + `stable_id` (persistent identity, `0` = engine assigns — the default) + `source_radius` (R6 area-light dial: the EMITTER's radius in world units, `0` = use `RtLocalShadowSettings::source_radius`; affects TRACED local shadows only, and `0` does not mean "point light"); `SpotLightDesc` adds direction + `core::Degrees inner_angle`/`outer_angle` (half-angles from the axis). The builder converts to `PointLight`/`SpotLight`, taking `std::cos(angle.radians())` for the cone, copying `stable_id` and `source_radius` across, and leaving `_pad0`/`_pad1`/`shadow_slot` at their engine-owned defaults — a host never names those.
 - `add_billboard_3d(wx, wy, wz, width, fill_ratio, fill_color, bg_color, frame_color)`
 - `add_debug_line(start, end, color)`; `add_debug_sphere(center, radius, color, segments = 16)` (3 × segments circle-outline lines in the XZ/XY/YZ planes); `add_debug_box(min, max, color)` (12 AABB edges).
 - `spawn_effect(const EffectDefinition*, position, direction = {1,0,0})` — consumed exactly once from the sealed packet.
@@ -4222,19 +4222,25 @@ Std140-compatible PODs, sizes static_asserted in
 `src/bracken/render/lighting/light_cluster.cpp`:
 
 - `PointLight` — `{vec3 position, float radius, vec3 color, float
-  intensity, bool casts_shadows, int32 shadow_slot, uint32 stable_id (+pad)}`
-  = **48 bytes** (`shadow_slot` at byte 36 — read by the shader;
-  engine-assigned each frame, -1 = unshadowed; `casts_shadows` is the host
-  opt-in and is never read on the GPU).
+  intensity, bool casts_shadows, int32 shadow_slot, uint32 stable_id,
+  float source_radius}` = **48 bytes** (`shadow_slot` at byte 36 — read by the
+  shader; engine-assigned each frame, -1 = unshadowed; `casts_shadows` is the
+  host opt-in and is never read on the GPU).
 - `SpotLight` — `{vec3 position, float radius, vec3 direction, float
   inner_cos, vec3 color, float outer_cos, float intensity, bool
-  casts_shadows, int32 shadow_slot, uint32 stable_id}` = **64 bytes**
-  (`shadow_slot` at byte 56).
-- **Sizes are unchanged by R2a.** `stable_id` (byte 40 of `PointLight`,
-  byte 60 of `SpotLight`) took over bytes that were declared padding, so
-  every existing offset, `static_assert` and shader load is untouched; the
-  two offsets are themselves `static_assert`ed now. See
-  `contracts/light.hpp` for the identity contract.
+  casts_shadows, int32 shadow_slot, uint32 stable_id, float source_radius
+  (+pad)}` = **80 bytes** (`shadow_slot` at byte 56, `source_radius` at 64).
+- **Sizes were unchanged by R2a and PointLight's is still unchanged.**
+  `stable_id` (byte 40 of `PointLight`, byte 60 of `SpotLight`) took over bytes
+  that were declared padding, and R6's `source_radius` did the same in
+  `PointLight`'s remaining `_pad1` (byte 44). `SpotLight` had nothing spare and
+  therefore **grew 64 → 80 bytes**, which moved exactly two shader stride
+  literals: `loadSpotLight` in `cluster_light_load.hlsli` and the flat light
+  walk in `rt_hit_shade.hlsli`. The alternative — a half float packed into the
+  three bytes after `casts_shadows` — keeps the stride at the price of storing
+  the one field a host authors in world units at 11 bits of mantissa, and was
+  rejected on that basis. Every offset named here is `static_assert`ed. See
+  `contracts/light.hpp` for the identity and area-light contracts.
 - `LightHeader` — `{uint32 type, uint32 payload_index}` = **8 bytes**;
   `payload_index` indexes the per-type payload array.
 - `ClusterParams` (`light_cluster.hpp`, `alignas(16)`) —

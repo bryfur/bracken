@@ -133,10 +133,30 @@ struct RtLocalShadowSettings {
     float depth_bias = 0.5f;
     /// Emitter radius in WORLD UNITS — the sphere the shadow ray samples a
     /// point on, and therefore the penumbra-width dial. 10 units is 10 cm at
-    /// the playground's 100 units/metre: a lantern flame or a torch head. One
-    /// value for every light until per-light authoring arrives with the area
-    /// lights of R6; a per-light radius belongs on PointLightDesc, not here.
+    /// the playground's 100 units/metre: a lantern flame or a torch head.
+    ///
+    /// Since R6 this is the DEFAULT rather than the only value: a host that
+    /// sets `PointLightDesc::source_radius` (or the spot equivalent) overrides
+    /// it per light, and 0 there means "use this". Every pre-R6 scene leaves
+    /// the desc field at 0 and therefore sees exactly what it saw before.
     float source_radius = 10.0f;
+    /**
+     * M_e — emissive-mesh light candidates drawn per pixel, on top of the
+     * `candidate_count` analytic ones (R6, docs/rt_lighting_plan.md §5.7).
+     *
+     * FULL TIER ONLY. The Ratio tier's mask is a scalar multiplying the forward
+     * pass's analytic subtotal, and no value of that scalar can ADD a light the
+     * subtotal does not contain — so emissive records are simply not sent when
+     * `full_di` is false, and this field is inert there. The tier note in
+     * rt_local_shadow.comp.hlsl's header carries the full argument.
+     *
+     * 2 is the shipped default and the plan's lower bound. The draws come out
+     * of a scene-wide power-weighted alias table, so each one is already an
+     * importance-sampled choice rather than a uniform one; past ~4 the extra
+     * draws mostly re-pick the same bright emitters and the reservoir's
+     * temporal reuse is the cheaper way to buy the same convergence.
+     */
+    uint32_t emissive_candidate_count = 2;
     /// M — candidates drawn from the pixel's froxel before one survives. The
     /// froxel list is short (the playground's densest is single digits), so
     /// beyond ~8 the extra draws mostly re-pick lights already considered.
@@ -338,8 +358,22 @@ struct RtStats {
     std::size_t blas_bytes = 0;       ///< concatenated BLAS nodes + triangles
     std::size_t tlas_bytes = 0;       ///< TLAS nodes + instance records
     std::size_t attribute_bytes = 0;  ///< per-triangle shading attributes; 0 without reflections
-    /// blas_bytes + tlas_bytes + attribute_bytes.
+    std::size_t emissive_bytes = 0;   ///< emissive light records; 0 without emitters
+    /// blas_bytes + tlas_bytes + attribute_bytes + emissive_bytes.
     std::size_t acceleration_bytes = 0;
+
+    /// R6, emissive mesh lights (docs/rt_lighting_plan.md §5.7). Mirrors
+    /// rt::RtSceneStats: how many MODEL triangles cleared the power threshold,
+    /// how many scene-space records they flattened into, and how many the cap
+    /// threw away (a running total — non-zero means the budget is binding).
+    uint32_t emissive_triangles = 0;
+    uint32_t emissive_records = 0;
+    uint32_t emissive_records_dropped = 0;
+    /// Whether emissive records actually took part in this frame's candidate
+    /// draw. FALSE in the Ratio tier even when records exist: see the tier note
+    /// on RtLocalShadowSettings::full_di — a ratio estimator cannot represent a
+    /// light the analytic forward loop does not evaluate.
+    bool emissive_di_sampled = false;
 
     /// A-SVGF gradient rays dispatched this frame, per signal — one thread per
     /// 3x3 stratum of the traced resolution, so exactly ceil(w/3)*ceil(h/3).
@@ -699,6 +733,10 @@ private:
     /// Create (once) the 1x1 stand-ins the trace binds into its two DI slots in
     /// Ratio mode. Size-independent, so they outlive a resolution change.
     [[nodiscard]] bool ensure_di_dummies();
+    /// Create (once) the one-element stand-in the trace binds into its emissive
+    /// record slot when the scene has no emitter. A storage-buffer descriptor
+    /// may not be empty; `emissiveCount = 0` is what stops it being indexed.
+    [[nodiscard]] bool ensure_emissive_dummy();
     /// Allocate/keep the Full-DI tier's six RGBA16F targets at the local
     /// signal's traced resolution. Invalidates the DI history on any change.
     [[nodiscard]] bool ensure_di_targets(int traced_w, int traced_h);
@@ -790,6 +828,18 @@ private:
     /// Element count the pair is currently sized for; a change reallocates and
     /// invalidates the history, because reservoir N describes a different pixel.
     int local_reservoir_capacity_ = 0;
+    /// The emissive record epoch the PREVIOUS frame's reservoirs were written
+    /// against (R6). Equal means an emissive index in the history still names
+    /// the same triangle; different means the record set was renumbered by a
+    /// TLAS topology rebuild and emissive history must be dropped.
+    uint32_t local_emissive_epoch_ = 0;
+    /// What the TRACE decided this frame, so the gradient replay one dispatch
+    /// later reaches the identical verdict. Recomputing it there would work and
+    /// would be a second place for the tier gate and the epoch test to disagree.
+    uint32_t local_emissive_count_ = 0;
+    uint32_t local_emissive_history_valid_ = 0;
+    SDL_GPUBuffer* local_emissive_bound_ = nullptr;
+    std::unique_ptr<gpu::GPUBuffer> local_emissive_dummy_;
 
     // ---- reflection denoiser state ----
     /// Ping-ponged accumulation (RGBA16F): rgb = radiance, a = sample count.

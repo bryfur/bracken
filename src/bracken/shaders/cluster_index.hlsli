@@ -32,6 +32,7 @@ struct PointLightGPU {
     float3 color;    float intensity;
     int shadow_slot; // base tile of the light's 6 faces in the local-shadow atlas; -1 = unshadowed
     uint stable_id;  // persistent identity (contracts/light.hpp); never 0 once the engine resolved it
+    float source_radius; // emitter RADIUS in world units (R6); 0 = use the pass's default
 };
 
 struct SpotLightGPU {
@@ -41,6 +42,7 @@ struct SpotLightGPU {
     float intensity;
     int shadow_slot;  // the light's tile in the local-shadow atlas; -1 = unshadowed
     uint stable_id;   // persistent identity (contracts/light.hpp)
+    float source_radius; // emitter RADIUS in world units (R6); 0 = use the pass's default
 };
 
 struct LightHeader {

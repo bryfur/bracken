@@ -1,15 +1,26 @@
 # Ray-Traced Lighting — Research & Plan of Record
 
-Status: **in progress — R0 (foundations), R1 (probe-field GI), R2
-(froxel-RIS local-light shadows), R3 (honest hit lighting), R4 (the HZB +
-indirect dispatch in R4a, the screen-probe gather in R4b), R5a (the SSILVB
-visibility bitmask + bent-cone GI gating) and R5b (the denoiser core: analytic
-sun gradient, A-SVGF traced gradients, dual fast/slow history, exposure-aware
-clamps) have landed**; the rest of R5 and R6 are still proposal. Written 2026-08-02 against the working tree at the
-RT-denoiser series (post "RT shadows: stop multiplexing ambient occlusion into
-the shadow mask"); R0's landed work packages are marked in §5.0 and R1's three
-packages in §5.2. As of R1c the probe field lights the frame — the first
-intentional image change of the plan.
+Status: **COMPLETE — every phase R0 through R6 has landed** (2026-08-02).
+R0 (foundations), R1 (probe-field GI), R2 (froxel-RIS local-light shadows),
+R3 (honest hit lighting), R4 (HZB + indirect dispatch in R4a, the screen-probe
+gather in R4b), R5 (SSILVB in R5a, the denoiser core in R5b, the Full-DI tier
+in R5c) and R6 (emissive mesh lights + area-light authoring). Each phase's
+landed note lives in its own section below, and each is written against the
+tree as it was when that phase shipped.
+
+Two things this status deliberately does NOT say. It does not say the system is
+finished — §5.7's closing note carries the standing follow-up list, and the
+individual "still open here" bullets under each phase are all still open. And
+it does not say the R6 stretch was taken: the SHaRC-shaped world hash radiance
+cache was gated on "a measured deficiency the probe field + screen feedback
+cannot cover", no such measurement exists, and it was therefore **not taken**.
+That gate is the §8 second-structure rule doing its job, not an omission.
+
+Written 2026-08-02 against the working tree at the RT-denoiser series (post
+"RT shadows: stop multiplexing ambient occlusion into the shadow mask"); R0's
+landed work packages are marked in §5.0 and R1's three packages in §5.2. As of
+R1c the probe field lights the frame — the first intentional image change of
+the plan.
 
 This is the plan of record for growing the current two-effect ray tracer
 (stochastic sun shadows + GGX reflections) into a **full ray-traced lighting
@@ -22,18 +33,35 @@ Like `docs/multithreading_plan.md`, this document is the *why* and the *what*
 in dependency order, not a sprint schedule. Phases are independently
 shippable; each leaves the tree working, tested, and documented.
 
-**Note on doc tooling:** this file deliberately stays out of
-`docs_coherence.test.cpp`'s `DOCS[]` list while phases are unlanded — it cites
-files that do not exist yet, which check (a) of that test would fail. The
-earlier plan was to add it once R1 landed; R1 has landed and that is **still
-wrong**, for a reason worth recording rather than silently deferring: §5.0 cites
-an STBN `.inc` that does not exist, so check (a) would fail on a document that is
-accurate about everything it claims. (§5.4's `rt_hit_shade.hlsli` was the other
-half of that argument until R3 created it.)
-The right trigger is "no unlanded phase cites a file that does not exist" —
-i.e. after R6, or an earlier split of this document into a landed-history half
-and a proposal half. Everything cited from the *current* tree below was
-verified by hand.
+**Note on doc tooling:** this file **still stays out of**
+`docs_coherence.test.cpp`'s `DOCS[]` list, and R6 is the point at which that
+decision has to be justified rather than deferred, because the trigger it was
+waiting on has now fired and the answer is still no.
+
+The trigger stated here was "no unlanded phase cites a file that does not
+exist — i.e. after R6". Every phase has now landed. But two citations in §5.0
+name files that were never created, because the work packages that would have
+created them were the two R0 bullets nothing downstream ended up needing:
+
+* the **STBN** `.inc` (`rtSample2D`'s blue-noise path). R2+IGN stayed the
+  sampler, and R5b's gradient work turned the R2 sequence's *replayability*
+  into a load-bearing property, which STBN would have had to preserve rather
+  than merely improve on.
+* **`render/raytracing/internal/`** (the vendored tinybvh HQ BLAS builder).
+  The binned-SAH build was never the bottleneck the harness found; the TLAS
+  refit was, and that landed instead.
+
+So check (a) would fail on a document that is accurate about everything it
+claims, which is the same bad trade it was in R1. The honest trigger is
+therefore narrower than "after R6" and is stated once, here, so the next
+reader does not have to re-derive it:
+
+> **Add this file to `DOCS[]` when §5.0's STBN and tinybvh bullets are either
+> implemented or struck** — i.e. when no bullet in this document, landed phase
+> or not, names a path the tree does not have. Splitting the document into a
+> landed-history half and a not-taken half would also do it.
+
+Everything cited from the *current* tree below was verified by hand.
 
 ---
 
@@ -1578,6 +1606,277 @@ seam in indirect); tier A/B screenshots.
   fixed-budget tile importance as a reservoir simplification; DGF's Vulkan
   extension.
 
+**Landed (R6, 2026-08-02) — emissive meshes are lights, lights have size, and
+the plan is complete.** Three separable pieces, in dependency order.
+
+**1. Emission in the hit data.** `TriangleAttributes` grew 64 → **80 bytes**:
+the same centroid-UV bake that produces `baseColor` now also produces
+`emissive`, plus a cached Rec.709 luma of it. `internal/model_material_proxy.hpp`
+gained `bake_rt_triangle_emissive`, which differs from the base-colour bake in
+three ways that all follow from what emission is — it runs with **no texture**
+(a factor alone is the normal case for procedural content, and refusing it
+would make this a glTF-only feature), it does **not** apply vertex colour
+(COLOR_0 modulates base colour; every forward shader's emissive term is
+`factor * texture` and this proxy exists to agree with that shader), and it
+bakes **nothing** when the factor is black, so 52 models pay one branch per
+mesh instead of 600 k zeroed vec3s.
+
+`rt_hit_shade.hlsli` adds the term, and adds it OUTSIDE the Lambertian divide
+and outside the albedo: emission is radiance leaving the surface on its own
+account. The consequence nobody had to build: a probe ray landing on an emitter
+deposits that radiance into the field, so **bounce FROM emissives is the
+existing recursion**, not new machinery. Memory: attributes went 12.8 → 16.0 MB
+on the playground village (+25%), paid only by hosts that asked for attributes
+at all; total acceleration 27.1 → 30.8 MB including the records below.
+
+Measured in isolation, by rebuilding with the term multiplied by zero and
+diffing the screenshots byte for byte:
+
+| Pin | bytes differing | max delta | aggregate |
+|---|---|---|---|
+| `RT=both RT_LOCAL=ratio` | 0.125% | 46 | `85.0 / 47.9` unchanged |
+| night, same | 0.348% | 148 | `36.2 / 58.8` unchanged |
+| `GI=probes` | **13.2%** | 49 | `84.6 / 46.8` → `84.7 / 46.7` |
+
+Which is the honest shape of it: in reflections emission is *intense and
+local* (a glowing orb reflected at night moves a byte by 148), through the
+probe field it is *faint and everywhere* (13% of the frame). Neither moves an
+aggregate luma much, and quoting only the aggregate would have made a real
+change look like a null result.
+
+**2. Emissive triangles as lights.** Two levels, which is what makes it
+affordable. Per MODEL at BLAS-build time: which triangles clear
+`k_emissive_min_power`, in model space (`render/raytracing/emissive_lights.hpp`).
+Per SCENE when the instance list changes: those pushed through each instance's
+transform into world space as 64-byte `EmissiveTriangle` records, capped, and
+given a Vose alias row each.
+
+*The threshold is deliberately low (1.0), and finding out why took a
+measurement.* The attractive formulation — "deliver at least X at a reference
+distance" — is wrong, because a per-triangle threshold cannot tell a small
+bright emitter from a large dim one once tessellation is involved: the
+playground's orbs total ~1400 power across 140 facets, so ~5 each, and any
+threshold that rejects a dim 1 m² panel also rejects every facet of the
+brightest object in the scene. The constant's only job is to keep the flatten
+off the ~600 k triangles that emit exactly nothing; deciding what is worth
+sampling is the CAP's job, where records can be compared against each other.
+
+*The alias row rides INSIDE the record.* Vose's table has exactly as many
+buckets as entries, so `aliasProb`/`aliasIndex` are two lanes of the 64-byte
+record and the pass spends ONE storage-buffer slot instead of two — not a
+nicety, since `rt_local_shadow.comp.hlsl` had spent all eight of SDL3 GPU's
+read-only slots before this phase existed (both new buffers therefore arrive as
+read-write slots that are only ever read, exactly as `prevReservoirs` does).
+`render/lighting/alias_table.hpp` is the CPU home, tested for construction
+determinism, in-range aliases, degenerate/empty/single cases, non-finite weight
+sanitization, and — the claim that matters — selection probability proportional
+to weight, asserted **exactly** by integrating the sampler over its own two
+uniforms rather than by drawing randoms and hoping.
+
+*Budget:* `k_max_emissive_records = 8192` (512 KB). Sized from measurement, not
+aesthetics: the village flattens to ~8.7 k records (4962 emitting model
+triangles across 52 models, instanced 2570 times — mostly the building pack's
+lit windows), so a 4096 cap would have discarded half of the scene this plan
+set out to light. Over budget keeps the brightest and reports the drop in
+`RtStats::emissive_records_dropped` (`emissive_dropped=514` on the playground),
+with the log line latched to fire once rather than per frame.
+
+*The rebuild is a refit, and this was not optional.* World-space records are
+stale whenever anything moves, and "anything moves" is every frame in a scene
+with one animated character — so the first version rebuilt all 8.7 k records
+per frame and put **`RTInstances` at 0.518 ms**, four times its 0.136 ms
+baseline, in the pass that was already the most expensive CPU pass in the frame.
+`refresh_emissive_records` re-transforms only the records whose own instance
+moved (the village's 8.6 k static windows are simply not touched; the orbs'
+~1.1 k are), from the MODEL-space source rather than the previous world-space
+record so a thousand frames of motion accumulate no drift, and rebuilds the
+alias table only when a power actually changed — which rigid motion never does.
+That brought it to **0.194 ms**. The cost of the optimization is one invariant
+worth knowing: each instance owns a CONTIGUOUS slice of the record array, which
+is why the over-budget cut is a power THRESHOLD applied as a stable filter
+rather than the sort it looks like it should be.
+
+**3. Multi-source RIS, and the tier split it forced.** The reservoir's candidate
+stage draws M_a analytic candidates from the froxel (as before) AND M_e = 2 from
+the alias table. The two streams' domains are disjoint and their integrals must
+be **summed, not averaged** — which is the whole subtlety, and getting it wrong
+is an energy error that looks exactly like "the lighting is a bit dark":
+
+> Feeding both into one reservoir under the shipped `1/M` normalization delivers
+> `(M_a·I_a + M_e·I_e)/(M_a+M_e)`, a convex COMBINATION of the two halves.
+> (Note the contrast with the TEMPORAL merge, where a convex combination is
+> exactly right, because there the two estimates are of the SAME integral.)
+
+The balance heuristic evaluated per candidate, `m_i(x) = p_i(x)/Σ_j p_j(x)`,
+has every cross term vanish under disjoint domains and collapses to `1/M_a` and
+`1/M_e`. Folding those in while KEEPING the shipped finalize leaves exactly one
+scalar per candidate:
+
+```
+analytic i:  w = (M_cur/M_a) · p̂(x_i) · listCount
+emissive j:  w = (M_cur/M_e) · p̂(y_j) · totalPower / power_j
+history:     w = M_prev · p̂_here(y_prev) · W_prev        (unchanged)
+W = wSum / ((M_a + M_e + M_prev) · p̂(y))                 (unchanged)
+```
+
+`render/lighting/reservoir.hpp`'s `ris_source_scale` is that scalar, and with
+one source it returns **exactly 1.0f** — which is why every pre-R6
+configuration reproduces its baseline bit for bit rather than merely closely.
+`emissive_lights.test.cpp` runs 400 k trials of the full estimator against a
+closed-form ground truth and pins the ratio to 1 ± 2%, and then pins the
+COUNTER-example: the same estimator with both scales at 1 converges to the
+convex combination, asserted at that specific wrong value so anyone
+reintroducing it fails rather than merely differing.
+
+*The emissive candidate's p̂ is evaluated at the triangle's CENTROID*, with a
+`max(d², area)` solid-angle clamp, and only the shadow ray samples a point on
+the surface (square-root parametrization, CPU-mirrored and tested for
+containment, for the correct mean AND the correct second moment). That is
+exactly the treatment the analytic path already gives a sphere — reservoir picks
+a light, target evaluates at its centre, `sampleCone` scatters the ray to make
+the penumbra — and choosing it keeps the two p̂ commensurable, keeps the 16-byte
+reservoir intact, and lets a carried-over reservoir be re-scored without
+remembering where last frame's ray went. Emission is **two-sided**, because
+every forward shader in this tree adds emission regardless of facing and a
+light that glows in the raster path but casts nothing would be exactly the
+silent disagreement the shared-arithmetic rule exists to prevent.
+
+*Source tagging.* Bit 31 of the reservoir's `lightIndex` says which domain the
+selection came from; it is free by construction (packed light indices ≤ 256,
+record indices ≤ 8192). An analytic index is resolved through the prev→current
+remap as before; an **emissive index is resolved through the record EPOCH**,
+which advances only on a TLAS topology rebuild. A rebuild therefore drops
+emissive history wholesale, and that is correct rather than a gap: the
+alternative is a reservoir pointing at an unrelated triangle, the exact failure
+the remap exists to prevent on the other side.
+
+*The gradient pass had to learn all of this too*, and finding that out was the
+one genuine near-miss of the phase. `rt_local_shadow_gradient.comp.hlsl` replays
+the previous frame's reservoir choice; a flagged index fed to
+`clusterRemapPrevLight` reads as out-of-range, which reads as "the light is
+gone", which reads as **gradient 1.0 for every emissive-lit stratum, every
+frame** — a permanent history reset precisely where the new lights are. It now
+takes the record buffer (a second read-write slot, same budget argument) and
+replays the emissive ray properly, `rtSample2D(prevCoord, frameIndex - 1)`
+returning exactly the pair the previous frame drew.
+
+**THE TIER SPLIT, stated prominently because it is the honest half of this
+phase: emissive mesh lights require the Full-DI tier.**
+
+The Ratio tier's entire output is a scalar V in
+`Σ(contribution × V) / Σ(contribution)`, which the forward pass multiplies its
+analytic point+spot subtotal by. That subtotal does not contain the emissive
+triangle and cannot: the forward shader has no emissive light list, no way to
+build one, and no budget for one. **A ratio estimator can only SCALE lighting
+the forward loop already evaluates — there is no value of V that ADDS a light.**
+Smuggling the emissive contribution into the numerator makes the mask a number
+that is no longer a visibility ratio, and the first thing that breaks is R5c's
+Ratio-vs-Full energy gate, which is the instrument keeping the two tiers honest
+against each other.
+
+So the CPU sends `emissiveCount = 0` in Ratio, and every RIS expression in the
+pass collapses to its R5c form bit for bit. What Ratio still gets, and it is not
+nothing: emissive surfaces **glow** (piece 1 — bright in reflections, at full
+intensity) and **feed GI** (a probe ray landing on one deposits its radiance
+into the field, and the field lights the frame). What they do not do in Ratio is
+cast their own direct shadows.
+
+**4. Area-light authoring.** `source_radius` on `PointLightDesc` /
+`SpotLightDesc`, world units, `0` = "use the engine default"
+(`RtLocalShadowSettings::source_radius`, 10). Explicitly NOT "a point light" — a
+hard local shadow is something no host has ever been able to ask for here and
+this field deliberately does not add it. `PointLight` had a declared `_pad1` and
+took the field for free at 48 bytes; **`SpotLight` was exactly full at 64 and
+grew to 80**, moving two shader stride literals (`loadSpotLight` in
+`cluster_light_load.hlsli`, the flat walk in `rt_hit_shade.hlsli`) with it. The
+alternative considered and rejected was packing a half float into the three
+bytes after `casts_shadows`: it keeps the stride, and it makes the one field a
+host authors in world units the one field stored at 11 bits of mantissa.
+`ClusterLightSample` carries it to the trace and to the gradient replay, which
+must resolve the same radius or it is sampling a different cone from the ray it
+is supposed to be reproducing.
+
+**5. Playground.** No new content was needed for the emissive half: the orbs
+(`emissive_factor` 2.4/1.7/0.55), the carried lantern (0.9/0.6/0.25) and the
+building pack's lit windows were already emissive, which is why piece 1 moved
+the traced pins the moment it landed rather than after a content change. What
+the playground gained is the AUTHORING proof: the orbs' point lights now carry
+`source_radius = 8` (the orb shell's actual radius, so the penumbra is the one
+that bulb would really cast) and the flashlight spot carries `60` (a rig-light
+softbox rather than a point). `[smoke] rt ...` gained
+`emissive_tris= emissive_records= emissive_dropped= emissive_di=`.
+
+**Measured**, playground village, 1600×900, Linux/Vulkan, RelWithDebInfo,
+3-run identical everywhere. Note that the traced rows move for TWO reasons —
+piece 1's emission in reflections, and piece 5's authored radii — and the
+`--smoke 30` default is untouched because neither reaches the raster path:
+
+| Invocation | before | after |
+|---|---|---|
+| `--smoke 30` (RT off) | `86.3 / 45.5` | `86.3 / 45.5` — **bit-identical** |
+| `RT=both RT_LOCAL=ratio` | `85.0 / 47.9` | `85.3 / 47.7` |
+| `RT=both RT_LOCAL=full` | `85.0 / 47.7` | `85.4 / 47.4` |
+| night, `TOD_HOUR=1 … ratio` | `36.2 / 58.8` | `35.5 / 57.4` |
+| night, `TOD_HOUR=1 … full` | `36.3 / 58.6` | `38.0 / 55.5` |
+| `GI=probes` | `84.6 / 46.8` | `84.7 / 46.7` |
+
+The night Full row is the one to read: **+2.5 luma with a NARROWER histogram**,
+which is what "eight thousand dim area lights were switched on" should look
+like — the near-black areas of a night village lift, the bright ones do not.
+
+`--rt-bench 150 RT=both RT_LOCAL=full`, against the same run with the records
+suppressed:
+
+| | records off | records on |
+|---|---|---|
+| `RTInstances` mean | 0.1358 ms | **0.1936 ms** |
+| `RTLocalShadows` mean | 0.0252 ms | 0.0230 ms |
+| frame render | 2.511 ms | 4.643 ms |
+| `present_wait` | 1.940 ms | 4.054 ms |
+| fps | 310 | 192 |
+
+Two readings, both worth stating plainly. `RTLocalShadows`' CPU record time does
+**not** move — the extra work is entirely inside the dispatch, which is what a
+uniform-branch tail on a compute shader should look like. And the real price is
+**~2.1 ms on the device**, which is a lot and is not mysterious: an emissive
+winner's shadow ray is aimed at a specific triangle that may be across the
+village, where an analytic light's ray is bounded by its own 320–1400 unit
+radius. Long any-hit traversals are the cost of shadowing area lights that are
+genuinely far away. The obvious next lever is a per-froxel emissive list so the
+draw is local rather than scene-wide; it is on the follow-up list below and was
+not needed to make the feature correct.
+
+Validated (`BRACKEN_GPU_DEBUG=1`) run clean. 1523 tests pass (+17).
+
+**Still open here, and this is the standing follow-up list for the whole plan.**
+The stretch cache was NOT taken — see the status header. What is recorded, in
+rough value order:
+
+1. **A directional basis for the Full-DI tier** (the third traced target above).
+   Still the single most valuable item: it is what would let `Full` become the
+   default recommendation instead of `Ratio`, and R5c's night A/B is the
+   evidence for it.
+2. **Per-froxel emissive candidate lists.** The ~2.1 ms above is a scene-wide
+   alias draw paying for long rays; binning emitters into the cluster grid the
+   way point lights are would localize both.
+3. **Split Radiance Cascades** (Freeman & Sannikov, July 2026) as a probe-field
+   replacement — re-evaluate on the original 12–18 month clock, i.e. mid-2027.
+   Nothing measured since the plan was written changes that verdict.
+4. **Adaptive screen-probe placement** (§5.5's indirect-dispatch consumer that
+   R4b did not build).
+5. **STBN sampling** (§5.0). Now constrained rather than merely deferred: R5b's
+   gradient replay requires the sampler be replayable, so any STBN path has to
+   preserve that property, and R2+IGN already has it.
+6. **tinybvh as an offline HQ BLAS builder** (§5.0). The harness never found the
+   binned-SAH build to be the bottleneck; the TLAS rebuild was, and the refit
+   answered it.
+7. **MegaLights-style tile importance** — still watched as the simplification to
+   reach for if reservoir complexity ever balloons; it has not.
+8. Per-light traced-shadow opt-out (R5c), hit-distance moments driving the DI
+   spatial radius (R5c), `max_accum_frames` above 16 for reflections under a
+   moving-camera A/B (R3), and the WP2 64-byte-node A/B through the harness plus
+   an Apple-device number (R0) — none of which R6 touched.
+
 ### 5.8 Dynamic & skinned geometry policy (cross-cutting)
 
 Explicit, per signal — today's silent bind-pose limitation becomes a stated
@@ -1637,7 +1936,7 @@ Dependency-ordered; each phase ships alone.
 | **R3** | `rt_hit_shade.hlsli`, CSM-at-hit, probe-at-hit, virtual reproj, rough→probe fallback | reflection interiors/shadows correct in pinned shots; orbit-ghosting metric improves; no reflection cost regression >10 % |
 | **R4** | ~~HZB + indirect dispatch wrapper~~ (**R4a, landed**), screen probes, probe-space filtering, mid-rough specular from probes (R4b) | R4a: every configuration bit-identical, `probes_screen` == `probes` luma with the `HZB` row present. R4b: `ProbesScreen` vs `Probes` A/B sharpness; handoff-seam scene clean; Silver budget held |
 | **R5** | ~~SSILVB/bent-cone (R5a), denoiser core — gradients, dual history, exposure-aware (R5b), Full-DI tier (R5c)~~ (**COMPLETE, 2026-08-02**) | lightning/toggle scene: history resets locally within 2 frames, no global flash-smear; contact-GI A/B. **Met**: R5b's sweep table shows the gradient response and the local signal's independence from the sun; R5c's Ratio-vs-Full energy gate lands inside 0.1 luma by day and by night |
-| **R6** | emissive mesh lights, area-light authoring, stretch cache decision | dusk-windows shot; emissive in reflections + probes; watch-list re-evaluation recorded here |
+| **R6** | ~~emissive mesh lights, area-light authoring, stretch cache decision~~ (**COMPLETE, 2026-08-02**) | night-village shot with lit windows lighting their own stonework; emissive in reflections + probes measured in isolation (0.125%/0.348%/13.2% of bytes); watch-list re-evaluation and the standing follow-up list recorded in §5.7. **Stretch NOT taken** — the SHaRC-shaped cache was gated on a measured deficiency and none exists |
 
 Standing rules for every phase: TSAN suite run after any job-system-adjacent
 work (HQ builder, probe update scheduling); every new cbuffer gets its
@@ -1701,6 +2000,15 @@ mesh SDFs, Brixelizer bricks, surfel GI (second-structure rule); NRD/DLSS-RR/
 FSR-RR/NRC/cooperative vectors (licenses, ML hardware, APIs we do not have);
 light BVHs and ReGIR below ~1 k lights; Area ReSTIR (rasterized primaries);
 checkerboard rendering (half-res + probes already cover the budget).
+
+**Confirmed at R6.** The one item on this list that carried a re-open gate — the
+SHaRC-shaped world hash radiance cache, admissible only "with a measured
+deficiency the probe field + screen feedback cannot cover" — was re-examined
+when R6 closed the plan and **stays out**. No such measurement was produced by
+any phase; the deficiencies the phases actually found were a demodulated tier
+with no light direction (R5c) and a scene-wide emissive draw paying for long
+rays (R6), neither of which a second world structure addresses. §5.7's closing
+list is where the real follow-ups live.
 
 ---
 

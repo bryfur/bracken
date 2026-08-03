@@ -26,7 +26,7 @@ constexpr const char* LOG_TAG = "lights";
 // loadSpotLight hardcode these strides and the shadow_slot byte offsets).
 static_assert(sizeof(PointLight) == 48, "PointLight must be 48 bytes (std140)");
 static_assert(offsetof(PointLight, shadow_slot) == 36, "PointLight::shadow_slot read at byte 36 by the shader");
-static_assert(sizeof(SpotLight) == 64, "SpotLight must be 64 bytes (std140)");
+static_assert(sizeof(SpotLight) == 80, "SpotLight must be 80 bytes (std140)");
 static_assert(offsetof(SpotLight, shadow_slot) == 56, "SpotLight::shadow_slot read at byte 56 by the shader");
 static_assert(sizeof(LightHeader) == 8, "LightHeader must be 8 bytes");
 // stable_id took over declared padding (contracts/light.hpp). These pin that
@@ -34,6 +34,11 @@ static_assert(sizeof(LightHeader) == 8, "LightHeader must be 8 bytes");
 // occupies are past every offset the shader loads.
 static_assert(offsetof(PointLight, stable_id) == 40, "PointLight::stable_id must sit in the old _pad1 bytes");
 static_assert(offsetof(SpotLight, stable_id) == 60, "SpotLight::stable_id must sit in the old _pad1 bytes");
+// R6's source_radius. PointLight had a spare declared pad and took it in place
+// (48 bytes, unchanged); SpotLight was full at 64 and GREW to 80, which is why
+// its stride literal moved in cluster_light_load.hlsli and rt_hit_shade.hlsli.
+static_assert(offsetof(PointLight, source_radius) == 44, "PointLight::source_radius read at byte 44");
+static_assert(offsetof(SpotLight, source_radius) == 64, "SpotLight::source_radius read at byte 64");
 
 // Single GPU layout combining headers + point payloads + spot payloads.
 // Layout: [u32 headerCount][u32 pointCount][u32 spotCount][u32 _pad]

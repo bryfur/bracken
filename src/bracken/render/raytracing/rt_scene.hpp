@@ -5,6 +5,8 @@
 #include "bracken/model_loader.hpp"
 #include "bracken/render/raytracing/bvh.hpp"
 #include "bracken/render/raytracing/bvh_gpu.hpp"
+#include "bracken/render/lighting/alias_table.hpp"
+#include "bracken/render/raytracing/emissive_lights.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -13,7 +15,17 @@
 
 namespace bracken::render::rt {
 
-/** Extra per-triangle data reflections need and shadows do not. */
+/**
+ * Extra per-triangle data reflections need and shadows do not.
+ *
+ * 80 bytes since R6, not 64: the emissive proxy joined it so that a traced hit
+ * on a glowing surface is bright in reflections and in probe rays without any
+ * of the light machinery below being involved. That is a ~25% growth of the
+ * largest single item in the acceleration budget (12.8 MB -> 16.0 MB on the
+ * playground village), paid only by hosts that asked for attributes at all.
+ * `emissive_luminance` is a cache of `target_luminance(emissive)`, which the
+ * BLAS-level light gather would otherwise recompute per triangle per build.
+ */
 struct TriangleAttributes {
     glm::vec3 n0{0.0f, 1.0f, 0.0f};
     float pad0 = 0.0f;
@@ -22,8 +34,10 @@ struct TriangleAttributes {
     glm::vec3 n2{0.0f, 1.0f, 0.0f};
     float pad2 = 0.0f;
     glm::vec4 base_color{1.0f};
+    glm::vec3 emissive{0.0f};
+    float emissive_luminance = 0.0f;
 };
-static_assert(sizeof(TriangleAttributes) == 64, "attributes must stay 16-byte aligned");
+static_assert(sizeof(TriangleAttributes) == 80, "attributes must stay 16-byte aligned");
 
 struct RtSceneStats {
     uint32_t models = 0;
@@ -44,7 +58,7 @@ struct RtSceneStats {
     std::size_t blas_bytes = 0;      ///< concatenated BLAS nodes + triangles
     std::size_t tlas_bytes = 0;      ///< TLAS nodes + instance records
     std::size_t attribute_bytes = 0; ///< per-triangle shading attributes; 0 without reflections
-    /// blas_bytes + tlas_bytes + attribute_bytes.
+    /// blas_bytes + tlas_bytes + attribute_bytes + emissive_bytes.
     std::size_t gpu_bytes = 0;
     /// How many times the TLAS has actually been rebuilt. Exposed because the
     /// dirty check is a PERFORMANCE contract, not just an internal detail: a
@@ -57,6 +71,24 @@ struct RtSceneStats {
     /// should read builds≈1, refits≈frames, and any drift back towards
     /// builds≈frames is the topology check failing to engage.
     uint32_t tlas_refits = 0;
+    /// Emissive triangles found across all MODELS (R6). Model-space, counted
+    /// once per BLAS build; the scene may instance each of them many times.
+    uint32_t emissive_triangles = 0;
+    /// Scene-level emissive light records actually uploaded this frame.
+    uint32_t emissive_records = 0;
+    /// Records the cap threw away on the MOST RECENT rebuild. A per-rebuild
+    /// figure rather than a running total, because the actionable question is
+    /// "how far over budget is this scene", and a total that climbs with the
+    /// frame count answers a different one. Non-zero means
+    /// `k_max_emissive_records` wants raising or the content wants fewer
+    /// emitters.
+    uint32_t emissive_records_dropped = 0;
+    /// Bumped every time the record SET is rebuilt from a topology change.
+    /// A record's index is stable only within one epoch, which is exactly the
+    /// condition under which a reservoir may carry an emissive choice across a
+    /// frame boundary.
+    uint32_t emissive_epoch = 0;
+    std::size_t emissive_bytes = 0;
 };
 
 /// A refit tree keeps the topology the instances had when they were last
@@ -169,6 +201,21 @@ public:
     [[nodiscard]] SDL_GPUBuffer* blas_nodes() const;
     [[nodiscard]] SDL_GPUBuffer* blas_triangles() const;
     [[nodiscard]] SDL_GPUBuffer* triangle_attributes() const;
+    /// The emissive light records + their alias rows (R6). Null when the scene
+    /// has no emitter above `k_emissive_min_power`, or when attributes were
+    /// never gathered — an emissive light IS an attribute, so `want_attributes`
+    /// gates both.
+    [[nodiscard]] SDL_GPUBuffer* emissive_records() const;
+    [[nodiscard]] uint32_t emissive_record_count() const noexcept {
+        return static_cast<uint32_t>(emissive_records_.size());
+    }
+    /// Sum of every record's `power` — the alias table's normalizing constant,
+    /// which the shader needs to turn a record's weight back into its pdf.
+    [[nodiscard]] float emissive_total_power() const noexcept { return emissive_total_power_; }
+    /// See `RtSceneStats::emissive_epoch`. Compare frame to frame to decide
+    /// whether an emissive record index carried over from last frame still
+    /// names the same triangle.
+    [[nodiscard]] uint32_t emissive_epoch() const noexcept { return stats_.emissive_epoch; }
 
 private:
     struct ModelEntry {
@@ -180,6 +227,40 @@ private:
         glm::vec3 bounds_min{0.0f};
         glm::vec3 bounds_max{0.0f};
         bool valid = false;
+        /// This model's emitting triangles in MODEL space (R6). Empty for the
+        /// overwhelming majority of models, which is why it lives here rather
+        /// than as a parallel array indexed by triangle.
+        std::vector<ModelEmissiveTriangle> emissive;
+    };
+
+    /**
+     * Rebuild the world-space emissive light records from the current TLAS
+     * instances. Called from set_instances after either the rebuild or the
+     * refit path, because a moved emitter's world triangles are stale either
+     * way; `topology_changed` is what decides whether record INDICES shift,
+     * i.e. whether the epoch advances and reservoir history must be dropped.
+     */
+    void rebuild_emissive_records(std::span<const std::pair<ModelHandle, glm::mat4>> instances,
+                                  bool topology_changed);
+    /// The refit half of the above: re-transform only the records belonging to
+    /// instances that ACTUALLY MOVED, in place, preserving every record index.
+    /// Returns false when the record ranges are unusable and a full rebuild is
+    /// the answer instead.
+    [[nodiscard]] bool refresh_emissive_records(
+        std::span<const std::pair<ModelHandle, glm::mat4>> instances);
+    /// Rebuild the power-weighted Vose table INTO `emissive_records_`. Called
+    /// on every full rebuild and, from the refresh path, only when a record's
+    /// power actually changed — which rigid motion never does.
+    void rebuild_emissive_alias();
+
+    /// One emissive-bearing instance and the contiguous slice of
+    /// `emissive_records_` it owns. Built at rebuild time, walked at refresh
+    /// time — which is what turns "re-transform every record every frame" into
+    /// "re-transform the orbs".
+    struct EmissiveInstance {
+        uint32_t input_index = 0;
+        uint32_t record_begin = 0;
+        uint32_t record_count = 0;
     };
 
     /// Case (c) of set_instances: throw the tree away and build a new one.
@@ -210,6 +291,26 @@ private:
     std::unique_ptr<gpu::GPUBuffer> attribute_buffer_;
     std::unique_ptr<gpu::GPUBuffer> tlas_node_buffer_;
     std::unique_ptr<gpu::GPUBuffer> tlas_instance_buffer_;
+    /// Scene-space emissive light records, alias rows included, in the order
+    /// the shader indexes them. Rebuilt whenever the instance list changes.
+    std::vector<EmissiveTriangle> emissive_records_;
+    std::vector<EmissiveInstance> emissive_instances_;
+    /// The model-space source of each record, parallel to `emissive_records_`.
+    /// The refresh path re-transforms from THIS rather than from the previous
+    /// world-space record, so a thousand frames of motion accumulate no error.
+    std::vector<ModelEmissiveTriangle> emissive_sources_;
+    std::unique_ptr<gpu::GPUBuffer> emissive_buffer_;
+    std::size_t emissive_capacity_ = 0;
+    float emissive_total_power_ = 0.0f;
+    bool emissive_dirty_ = false;
+    /// Latched so an over-budget scene logs once rather than once per frame —
+    /// the rebuild runs whenever anything moves, so the unlatched version was a
+    /// warning per frame forever.
+    bool emissive_over_budget_logged_ = false;
+    /// Scratch for the alias build; members so a per-frame rebuild allocates
+    /// nothing once warm, the same reason `convert_scratch_` is one.
+    std::vector<float> emissive_weight_scratch_;
+    std::vector<lighting::AliasEntry> emissive_alias_scratch_;
     /// Byte capacity of the two persistent TLAS buffers above. They are grown
     /// (reallocated) only when the instance count outgrows them, so a scene
     /// whose instance count is stable never reallocates.

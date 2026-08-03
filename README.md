@@ -25,7 +25,9 @@ glm-typed API over vendored Jolt Physics). It builds as a static library
   (cached-tile atlas, host opt-in per light — or, opt-in, one ray-traced
   reservoir shadow ray per pixel that gives EVERY local light a soft shadow
   with no budget at all, in either a visibility-ratio or a full demodulated-DI
-  tier), horizon-based GTAO (temporally
+  tier, with a per-light emitter radius as the penumbra dial and — in the
+  full-DI tier — emissive MESHES joining the light set, so lit windows shadow
+  the street they light), horizon-based GTAO (temporally
   accumulated, ambient-only), image-based lighting prefiltered live from the
   procedural sky (diffuse irradiance + GGX specular cubemaps + split-sum
   BRDF LUT, amortized regeneration on sky changes), histogram auto exposure

@@ -5,11 +5,16 @@
 #include "bracken/core/jobs/parallel_for.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
+#include "bracken/render/lighting/alias_table.hpp"
+#include "bracken/render/lighting/light_target.hpp"
 
 #include <glm/gtc/type_ptr.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <functional>
 
 namespace bracken::render::rt {
 namespace {
@@ -20,6 +25,11 @@ struct ModelGeometry {
     std::vector<uint32_t> indices;
     std::vector<glm::vec3> normals;
     std::vector<glm::vec4> triangle_colors;
+    /// Per-triangle emitted radiance, in lockstep with `triangle_colors`. All
+    /// zero when no mesh of the model emits, which is the common case; the
+    /// `any_emissive` flag below is what lets the gather skip the whole walk.
+    std::vector<glm::vec3> triangle_emissive;
+    bool any_emissive = false;
     bool has_cpu_geometry = false;
 };
 
@@ -75,6 +85,21 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
                 } else {
                     g.triangle_colors.push_back(mesh.material.base_color_factor);
                 }
+
+                // Emission, from the same per-triangle bake and with the same
+                // fallback shape: the mesh-wide factor when the proxy is absent
+                // (an untextured emissive mesh bakes the factor for every
+                // triangle, so absence here means the model was loaded without
+                // retention and only the factor survives).
+                glm::vec3 emissive(0.0f);
+                if (tri < mesh.rt_triangle_emissive.size()) {
+                    emissive = mesh.rt_triangle_emissive[tri];
+                } else {
+                    emissive = mesh.material.emissive_factor;
+                }
+                g.triangle_emissive.push_back(emissive);
+                g.any_emissive = g.any_emissive || emissive.r > 0.0f || emissive.g > 0.0f ||
+                                 emissive.b > 0.0f;
             }
         }
     }
@@ -163,6 +188,9 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
     blas_nodes_.clear();
     blas_triangles_.clear();
     attributes_.clear();
+    emissive_records_.clear();
+    emissive_total_power_ = 0.0f;
+    emissive_dirty_ = true;
     stats_ = {};
 
     // The BLAS set is about to be renumbered, so every offset in the current
@@ -264,13 +292,32 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
                         if (tri_index < p.geometry.triangle_colors.size()) {
                             a.base_color = p.geometry.triangle_colors[tri_index];
                         }
+                        if (tri_index < p.geometry.triangle_emissive.size()) {
+                            a.emissive = p.geometry.triangle_emissive[tri_index];
+                            a.emissive_luminance = lighting::target_luminance(a.emissive);
+                        }
+                    }
+                }
+
+                // R6: an emitting triangle is also a LIGHT, if it delivers
+                // enough power to be worth a candidate slot. The vertices come
+                // from the BVH triangle rather than from the index buffer
+                // because that is where they are already in origin+edge form,
+                // and because it guarantees the record names a triangle the
+                // shadow ray can actually hit.
+                if (a.emissive_luminance > 0.0f) {
+                    const float area = 0.5f * glm::length(glm::cross(tri.e1, tri.e2));
+                    if (a.emissive_luminance * area >= k_emissive_min_power) {
+                        entry.emissive.push_back(
+                            ModelEmissiveTriangle{tri.v0, tri.e1, tri.e2, a.emissive});
                     }
                 }
                 attributes_.push_back(a);
             }
         }
 
-        entries_[p.handle] = entry;
+        stats_.emissive_triangles += static_cast<uint32_t>(entry.emissive.size());
+        entries_[p.handle] = std::move(entry);
         stats_.models++;
     }
 
@@ -320,6 +367,17 @@ void RtScene::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> i
     if (!refitted) {
         rebuild_tlas(instances); // (c), and the fallback when a refit degraded
     }
+
+    // R6. The emissive records are WORLD SPACE, so they are stale whenever any
+    // instance moved — the refit case included, which is why this is not gated
+    // on `refitted`. What the topology decides is whether record INDICES move:
+    // a refit keeps the instance sequence, so record k is the same triangle it
+    // was last frame and a reservoir may carry it; a rebuild renumbers, so the
+    // epoch advances and emissive history is dropped. Dropping it is CORRECT
+    // rather than a limitation — the alternative is a reservoir pointing at
+    // whatever triangle now occupies index k, which is the exact failure the
+    // light remap exists to prevent for analytic lights.
+    rebuild_emissive_records(instances, !refitted);
 
     instance_hash_ = hashes.content;
     topology_hash_ = hashes.topology;
@@ -433,6 +491,222 @@ bool RtScene::refit_tlas_in_place(std::span<const std::pair<ModelHandle, glm::ma
     return true;
 }
 
+namespace {
+
+/// Place one model-space emissive triangle into world space through `transform`.
+/// One definition, called by both the rebuild and the refresh path, because the
+/// refresh's whole correctness claim is that it produces the record the rebuild
+/// would have.
+void emissive_place(const ModelEmissiveTriangle& src, const glm::mat4& transform,
+                    EmissiveTriangle& out) {
+    out.v0 = glm::vec3(transform * glm::vec4(src.v0, 1.0f));
+    // Edges are DIRECTIONS: transformed with w = 0, so translation does not
+    // apply and a scaled instance's area still comes out right below.
+    out.e1 = glm::vec3(transform * glm::vec4(src.e1, 0.0f));
+    out.e2 = glm::vec3(transform * glm::vec4(src.e2, 0.0f));
+    out.radiance = src.radiance;
+    out.area = 0.5f * glm::length(glm::cross(out.e1, out.e2));
+    out.power = lighting::target_luminance(out.radiance) * out.area;
+}
+
+} // namespace
+
+void RtScene::rebuild_emissive_records(
+    std::span<const std::pair<ModelHandle, glm::mat4>> instances, bool topology_changed) {
+    BRACKEN_PROFILE_ZONE("RtScene::rebuild_emissive_records");
+
+    if (stats_.emissive_triangles == 0) {
+        // No model emits. Keep the fast path a single integer compare: the
+        // overwhelming majority of scenes never allocate a record.
+        if (!emissive_records_.empty()) {
+            emissive_records_.clear();
+            emissive_sources_.clear();
+            emissive_instances_.clear();
+            emissive_total_power_ = 0.0f;
+            emissive_dirty_ = true;
+            stats_.emissive_epoch++;
+        }
+        stats_.emissive_records = 0;
+        return;
+    }
+
+    // THE REFIT ANALOGUE, and it is not an optimization so much as the
+    // difference between the feature being affordable and not. Every emitter's
+    // world triangles are stale whenever anything moves, and "anything moves"
+    // is every frame in a scene with one animated character. Rebuilding all
+    // ~8.7 k playground records each time cost 0.38 ms of MAIN-THREAD time in
+    // `RTInstances`, a pass that was already the most expensive CPU pass in the
+    // frame. Refreshing only the records whose own instance moved costs a
+    // fraction of that, and the village's 8.6 k static window triangles — which
+    // are the bulk — are simply not touched.
+    if (!topology_changed && refresh_emissive_records(instances)) {
+        stats_.emissive_records = static_cast<uint32_t>(emissive_records_.size());
+        return;
+    }
+
+    emissive_records_.clear();
+    emissive_sources_.clear();
+    emissive_instances_.clear();
+
+    // Walk the INPUT instance order rather than the TLAS slot order: the slot
+    // permutation is the builder's and changes with the tree, while the input
+    // order is the frame packet's and is what the topology hash certifies. Tying
+    // record indices to the packet is what makes "same topology => same record
+    // index" true.
+    for (std::size_t i = 0; i < instances.size(); ++i) {
+        const auto& [handle, transform] = instances[i];
+        auto it = entries_.find(handle);
+        if (it == entries_.end() || !it->second.valid || it->second.emissive.empty()) {
+            continue;
+        }
+        EmissiveInstance slice;
+        slice.input_index = static_cast<uint32_t>(i);
+        slice.record_begin = static_cast<uint32_t>(emissive_records_.size());
+        for (const ModelEmissiveTriangle& src : it->second.emissive) {
+            EmissiveTriangle rec;
+            emissive_place(src, transform, rec);
+            if (!(rec.power > 0.0f)) {
+                continue; // a degenerate instance transform collapsed it
+            }
+            emissive_records_.push_back(rec);
+            emissive_sources_.push_back(src);
+        }
+        slice.record_count = static_cast<uint32_t>(emissive_records_.size()) - slice.record_begin;
+        if (slice.record_count > 0) {
+            emissive_instances_.push_back(slice);
+        }
+    }
+
+    // OVER BUDGET: keep the brightest, and — load-bearingly — keep them IN
+    // ORDER. Sorting the survivors by power is the obvious reading of "keep the
+    // brightest" and it would destroy the property the refresh path above
+    // stands on: that each instance owns a CONTIGUOUS slice. So the cut is a
+    // power THRESHOLD (nth_element over a copy of the powers) applied as a
+    // stable filter, which drops exactly the records a sort would have dropped
+    // while leaving every slice contiguous.
+    stats_.emissive_records_dropped = 0;
+    if (emissive_records_.size() > k_max_emissive_records) {
+        const auto dropped = emissive_records_.size() - k_max_emissive_records;
+        stats_.emissive_records_dropped = static_cast<uint32_t>(dropped);
+
+        emissive_weight_scratch_.resize(emissive_records_.size());
+        for (std::size_t i = 0; i < emissive_records_.size(); ++i) {
+            emissive_weight_scratch_[i] = emissive_records_[i].power;
+        }
+        const auto cut = emissive_weight_scratch_.begin() +
+                         static_cast<std::ptrdiff_t>(k_max_emissive_records);
+        std::nth_element(emissive_weight_scratch_.begin(), cut, emissive_weight_scratch_.end(),
+                         std::greater<float>());
+        const float threshold = *cut;
+
+        std::size_t out = 0;
+        for (EmissiveInstance& slice : emissive_instances_) {
+            const uint32_t begin = slice.record_begin;
+            const uint32_t count = slice.record_count;
+            slice.record_begin = static_cast<uint32_t>(out);
+            uint32_t kept = 0;
+            for (uint32_t k = 0; k < count && out < k_max_emissive_records; ++k) {
+                const std::size_t from = static_cast<std::size_t>(begin) + k;
+                if (!(emissive_records_[from].power > threshold)) {
+                    continue;
+                }
+                emissive_records_[out] = emissive_records_[from];
+                emissive_sources_[out] = emissive_sources_[from];
+                ++out;
+                ++kept;
+            }
+            slice.record_count = kept;
+        }
+        emissive_records_.resize(out);
+        emissive_sources_.resize(out);
+        std::erase_if(emissive_instances_,
+                      [](const EmissiveInstance& s) { return s.record_count == 0; });
+
+        if (!emissive_over_budget_logged_) {
+            emissive_over_budget_logged_ = true;
+            BRACKEN_LOG_WARN("rt",
+                             "RtScene: {} emissive light records over the {} budget; keeping the "
+                             "brightest. Logged once; RtStats::emissive_records_dropped tracks it "
+                             "per rebuild.",
+                             dropped, k_max_emissive_records);
+        }
+    }
+
+    rebuild_emissive_alias();
+    stats_.emissive_records = static_cast<uint32_t>(emissive_records_.size());
+    emissive_dirty_ = true;
+    if (topology_changed) {
+        stats_.emissive_epoch++;
+    }
+}
+
+bool RtScene::refresh_emissive_records(
+    std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
+    BRACKEN_PROFILE_ZONE("RtScene::refresh_emissive_records");
+    if (emissive_instances_.empty() || emissive_records_.size() != emissive_sources_.size()) {
+        return false; // nothing built yet, or the two arrays disagree: rebuild
+    }
+    if (last_transforms_.size() != instances.size()) {
+        return false; // the caller's own refit precondition; do not guess
+    }
+
+    bool moved = false;
+    // Rigid motion preserves area, hence power, hence the alias table — so the
+    // table is only rebuilt when a power actually changes, which in practice
+    // means a SCALED emitter. A relative epsilon rather than an exact compare:
+    // re-transforming through a slightly different matrix perturbs the cross
+    // product in the last bits, and rebuilding an 8 k alias table because a
+    // float moved by 1 ULP would give the whole optimization back.
+    bool powers_changed = false;
+    for (const EmissiveInstance& slice : emissive_instances_) {
+        const uint32_t input = slice.input_index;
+        if (input >= instances.size()) {
+            return false;
+        }
+        const glm::mat4& transform = instances[input].second;
+        if (transform == last_transforms_[input]) {
+            continue;
+        }
+        moved = true;
+        for (uint32_t k = 0; k < slice.record_count; ++k) {
+            const std::size_t idx = static_cast<std::size_t>(slice.record_begin) + k;
+            const float before = emissive_records_[idx].power;
+            // From the MODEL-SPACE source, never from the previous world-space
+            // record: composing transforms frame after frame would accumulate
+            // drift for as long as the scene runs.
+            emissive_place(emissive_sources_[idx], transform, emissive_records_[idx]);
+            const float after = emissive_records_[idx].power;
+            if (std::abs(after - before) > 1e-3f * std::max(before, 1e-6f)) {
+                powers_changed = true;
+            }
+        }
+    }
+
+    if (!moved) {
+        return true; // nothing emissive moved; the uploaded buffer is still right
+    }
+    if (powers_changed) {
+        rebuild_emissive_alias();
+    }
+    emissive_dirty_ = true;
+    return true;
+}
+
+void RtScene::rebuild_emissive_alias() {
+    // Power-weighted Vose, built INTO the records — one bucket per record, so
+    // there is no second array and no second shader binding.
+    emissive_weight_scratch_.resize(emissive_records_.size());
+    for (std::size_t i = 0; i < emissive_records_.size(); ++i) {
+        emissive_weight_scratch_[i] = emissive_records_[i].power;
+    }
+    emissive_total_power_ =
+        lighting::build_alias_table(emissive_weight_scratch_, emissive_alias_scratch_);
+    for (std::size_t i = 0; i < emissive_records_.size(); ++i) {
+        emissive_records_[i].alias_prob = emissive_alias_scratch_[i].prob;
+        emissive_records_[i].alias_index = emissive_alias_scratch_[i].alias;
+    }
+}
+
 void RtScene::upload(gpu::GPUDevice& device, SDL_GPUCommandBuffer* cmd) {
     BRACKEN_PROFILE_ZONE("RtScene::upload");
 
@@ -489,12 +763,42 @@ void RtScene::upload(gpu::GPUDevice& device, SDL_GPUCommandBuffer* cmd) {
         }
     }
 
+    // Emissive records ride the same persistent-grow-only pattern the TLAS
+    // does, and for the same reason: they change whenever an emitter moves,
+    // which in a scene with a hovering orb is every frame.
+    if (emissive_dirty_ && !emissive_records_.empty()) {
+        const std::size_t bytes = emissive_records_.size() * sizeof(EmissiveTriangle);
+        if (cmd != nullptr) {
+            if (emissive_buffer_ == nullptr || emissive_capacity_ < bytes) {
+                emissive_capacity_ = bytes + bytes / 2;
+                // ComputeStorage, not Storage: rt_local_shadow.comp.hlsl reads
+                // this through a READ-WRITE slot (its eight read-only ones were
+                // spent before R6 existed), and SDL3 refuses a read-write
+                // binding on a buffer without COMPUTE_STORAGE_WRITE. Nothing
+                // ever writes it.
+                emissive_buffer_ = gpu::GPUBuffer::create_dynamic(
+                    device, gpu::GPUBuffer::Type::ComputeStorage, emissive_capacity_);
+            }
+            if (emissive_buffer_) {
+                emissive_buffer_->update(cmd, emissive_records_.data(), bytes);
+                emissive_dirty_ = false;
+            }
+        } else {
+            emissive_buffer_ = gpu::GPUBuffer::create_static(
+                device, gpu::GPUBuffer::Type::ComputeStorage, emissive_records_.data(), bytes);
+            emissive_capacity_ = bytes;
+            emissive_dirty_ = false;
+        }
+    }
+
+    stats_.emissive_bytes = emissive_records_.size() * sizeof(EmissiveTriangle);
     stats_.blas_bytes = blas_nodes_.size() * sizeof(BvhNodeGpu) +
                         blas_triangles_.size() * sizeof(BvhTriangle);
     stats_.attribute_bytes = attributes_.size() * sizeof(TriangleAttributes);
     stats_.tlas_bytes = tlas_gpu_nodes_.size() * sizeof(BvhNodeGpu) +
                         tlas_.instances.size() * sizeof(TlasInstance);
-    stats_.gpu_bytes = stats_.blas_bytes + stats_.attribute_bytes + stats_.tlas_bytes;
+    stats_.gpu_bytes =
+        stats_.blas_bytes + stats_.attribute_bytes + stats_.tlas_bytes + stats_.emissive_bytes;
 }
 
 SDL_GPUBuffer* RtScene::tlas_nodes() const {
@@ -511,6 +815,9 @@ SDL_GPUBuffer* RtScene::blas_triangles() const {
 }
 SDL_GPUBuffer* RtScene::triangle_attributes() const {
     return attribute_buffer_ ? attribute_buffer_->handle() : nullptr;
+}
+SDL_GPUBuffer* RtScene::emissive_records() const {
+    return (emissive_buffer_ && !emissive_records_.empty()) ? emissive_buffer_->handle() : nullptr;
 }
 
 } // namespace bracken::render::rt

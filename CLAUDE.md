@@ -123,7 +123,15 @@ multiplies the analytic cluster subtotal by one denoised visibility scalar, and
 `Full` (R5c) has the traced lights leave that loop entirely in favour of two
 DEMODULATED radiance targets remodulated per pixel in the forward shaders
 (`render/lighting/local_di.hpp` is the split's source of truth). Both cost the
-same one ray. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
+same one ray. **Emissive meshes are lights (R6)**: `emissive_lights.hpp` collects
+per-model emitting triangles at BLAS build, flattens them to world-space records
+with a Vose alias row each (`render/lighting/alias_table.hpp`, cap 8192,
+over-budget keeps the brightest and counts the drop), and the reservoir draws a
+SECOND candidate stream from them under multi-source RIS weights
+(`ris_source_scale`). **That half requires the `Full` tier** — a ratio estimator
+can only scale lighting the forward loop already evaluates, and it does not
+evaluate an emissive triangle; under `Ratio` emissive surfaces still glow and
+still feed GI, but cast no direct shadow. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer, **plus the surface's own emission**, which is what makes bounce FROM emissives fall out of the existing probe recursion). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
 | `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror — addressing, ray directions, the blend curve, and the sampler's cascade/weight math. **Complete as of R1c**: the field traces and accumulates itself, and `shaders/gi_sample.hlsli` replaces the DIFFUSE half of the ambient term in every scene fragment shader (three banded atlases, three sampler slots) plus the volumetric fog's in-scatter. Off by default (`gi_mode`); GI on builds the ray-tracing acceleration structure with attributes |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
 | `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
@@ -289,7 +297,12 @@ draws it.
   ≤ 6 tile re-renders per frame (`render/lighting/local_shadows.hpp`).
   The *budgets* live there; the light **structs** `PointLight`/`SpotLight`/
   `LightHeader` are `contracts/light.hpp` (host-facing data contract — the
-  frame packet carries them, so they must not drag the renderer in).
+  frame packet carries them, so they must not drag the renderer in), which is
+  also where the per-light **`source_radius`** area-light dial lives (0 = the
+  engine default; `PointLight` is 48 B and `SpotLight` grew to **80** to carry
+  it). Emissive mesh lights are budgeted separately in
+  `render/raytracing/emissive_lights.hpp`: `k_max_emissive_records = 8192`
+  scene-space records, threshold `k_emissive_min_power`.
   `render/lighting/light.hpp` includes it, so both spellings keep working.
 - Formats: swapchain `RGBA8_UNORM`, HDR scene `RGBA16F`, depth `D32_FLOAT` —
   the live values are `PipelineRegistry`'s members (`gpu/pipeline_registry.hpp`,
@@ -446,11 +459,17 @@ settings file. `--smoke 30` at commit `8f21a3d` — which predates the entire
 G-buffer/reflection series — produces the identical figure below, which is the
 evidence that no RT-series commit moved the RT-off path.
 
-| Invocation | mean_luma / stddev (pre-R5a) | at R5a |
+| Invocation | mean_luma / stddev (pre-R5a) | at R6 |
 |---|---|---|
 | `--smoke 30` (RT off) | `86.6 / 44.9` | `86.3 / 45.5` |
 | `--smoke 30 PLAYGROUND_AO=0` | `87.0 / 44.5` | `87.0 / 44.5` (unchanged — AO off) |
 | `--smoke 30 PLAYGROUND_AO=2` | `86.4 / 45.0` | `86.0 / 45.7` |
+
+**Every row above is unchanged from R5a through R6**, and that is a claim R6
+had to earn rather than inherit: emissive mesh lights (§5.7) touch only traced
+paths — the hit shader, the reservoir and the light structs — so nothing they
+do reaches a raster-only run. If one of these three moves after a change to
+`render/raytracing/`, something leaked into the forward pass.
 
 **R5a moved every AO-ON row on purpose** (SSILVB visibility bitmask + bent
 cone, docs/rt_lighting_plan.md §5.6): mean essentially unmoved, spread up.
@@ -465,11 +484,11 @@ Re-measured on the Linux/GCC/Vulkan checkout at R4b (this machine reads `86.5`
 where the Metal table above reads `86.6` — see the memory note on Metal-only
 baselines). The three the ray-tracing phases gate on:
 
-| Invocation | pre-R5a | at R5a |
-|---|---|---|
-| `--smoke 30` (RT off, GI off) | `86.5 / 44.9` | `86.3 / 45.5` |
-| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes` | `81.7 / 49.8` | `81.8 / 50.0` |
-| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes_screen` | `82.3 / 50.4` | `82.2 / 50.5` |
+| Invocation | pre-R5a | at R5a | at R6 |
+|---|---|---|---|
+| `--smoke 30` (RT off, GI off) | `86.5 / 44.9` | `86.3 / 45.5` | `86.3 / 45.5` |
+| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes` | `81.7 / 49.8` | `81.8 / 50.0` | `81.9 / 49.9` |
+| `--smoke 30 PLAYGROUND_RT=both PLAYGROUND_GI=probes_screen` | `82.3 / 50.4` | `82.2 / 50.5` | `82.3 / 50.5` |
 
 The GI rows moved for a second reason on top of the AO change: since R5a the
 diffuse GI term is gated by the AO pass's BENT CONE — sampled along the bent
@@ -480,13 +499,25 @@ The third stopped being a copy of the second at R4b, when `GiMode::ProbesScreen`
 gained the screen-probe gather (`render/gi/screen_probes.hpp`,
 docs/rt_lighting_plan.md §5.5) instead of behaving as `Probes`.
 
-| Invocation | pre-R5a | at R5a |
-|---|---|---|
-| `--smoke 30 PLAYGROUND_GI=probes` | `84.3 / 46.9` | `84.6 / 46.8` |
-| `PLAYGROUND_RT=both --smoke 30` | `83.9 / 47.9` | `83.7 / 48.4` |
-| `PLAYGROUND_RT=both PLAYGROUND_GI=probes --smoke 30` | `81.7 / 49.8` | `81.8 / 50.0` |
-| `PLAYGROUND_RT_LOCAL=ratio PLAYGROUND_RT=both --smoke 30` | `85.3 / 47.5` | `85.0 / 47.9` |
-| `PLAYGROUND_RT_LOCAL=full PLAYGROUND_RT=both --smoke 30` (R5c) | — | `85.0 / 47.7` |
+| Invocation | pre-R5a | at R5a | at R6 |
+|---|---|---|---|
+| `--smoke 30 PLAYGROUND_GI=probes` | `84.3 / 46.9` | `84.6 / 46.8` | `84.7 / 46.7` |
+| `PLAYGROUND_RT=both --smoke 30` | `83.9 / 47.9` | `83.7 / 48.4` | `83.7 / 48.4` |
+| `PLAYGROUND_RT=both PLAYGROUND_GI=probes --smoke 30` | `81.7 / 49.8` | `81.8 / 50.0` | `81.9 / 49.9` |
+| `PLAYGROUND_RT_LOCAL=ratio PLAYGROUND_RT=both --smoke 30` | `85.3 / 47.5` | `85.0 / 47.9` | `85.3 / 47.7` |
+| `PLAYGROUND_RT_LOCAL=full PLAYGROUND_RT=both --smoke 30` (R5c) | — | `85.0 / 47.7` | `85.4 / 47.4` |
+| night, `PLAYGROUND_TOD_HOUR=1 … RT_LOCAL=ratio` | — | `36.2 / 58.8` | `35.5 / 57.4` |
+| night, `PLAYGROUND_TOD_HOUR=1 … RT_LOCAL=full` | — | `36.3 / 58.6` | `38.0 / 55.5` |
+
+**R6 moved the traced rows for two separate reasons, and it is worth keeping
+them apart** (docs/rt_lighting_plan.md §5.7): emissive surfaces now GLOW in
+every traced hit (reflections and probe rays), and the playground now AUTHORS
+per-light emitter radii (`source_radius` 8 on the orbs, 60 on the flashlight),
+which widens the traced penumbras. The night `full` row is the headline —
+`+2.5` luma with a NARROWER histogram, because eight thousand dim area lights
+were switched on and they lift the near-black, not the bright. The `RT=both`
+row without a local tier is unchanged, which is the check that the emissive
+DI path is genuinely gated on the Full tier and not leaking.
 
 **R5c added the last row and it is a GATE, not a datum.** `Ratio` and `Full`
 are two estimates of the same lighting, so their means must agree — they land

@@ -145,6 +145,21 @@ struct Mesh {
      */
     std::vector<glm::vec4> rt_triangle_base_colors;
 
+    /**
+     * Compact EMISSIVE proxy for software RT hits, the same shape and the same
+     * lifetime rule as `rt_triangle_base_colors` above (R6, §5.7 of
+     * docs/rt_lighting_plan.md).
+     *
+     * `emissive_factor` multiplied by the emissive texture's centroid-UV sample
+     * where one exists, in LINEAR space. Kept separate from the base-colour
+     * proxy rather than widening it, because the two have different existence
+     * conditions: a mesh may be emissive with no texture at all (the
+     * playground's orbs are exactly that), while the base-colour bake requires
+     * one. Empty means "no triangle of this mesh emits", which is the common
+     * case and costs nothing.
+     */
+    std::vector<glm::vec3> rt_triangle_emissive;
+
     // Cached index count (valid after GPU upload, when CPU-side data is freed)
     uint32_t cached_index_count = 0;
 

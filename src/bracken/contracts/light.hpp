@@ -53,6 +53,11 @@ struct PointLightDesc {
     /// and what every existing call site gets). See the identity contract
     /// below the GPU structs.
     uint32_t stable_id = 0;
+    /// EMITTER SIZE in world units — the radius of the sphere the ray-traced
+    /// local-shadow pass samples a point on, and therefore this light's
+    /// penumbra-width dial. See the area-light contract below the GPU structs.
+    /// 0 = use the engine default (`RtLocalShadowSettings::source_radius`).
+    float source_radius = 0.0f;
 };
 
 struct SpotLightDesc {
@@ -69,6 +74,9 @@ struct SpotLightDesc {
     bool casts_shadows = false;
     /// PERSISTENT IDENTITY across frames. 0 = "engine assigns". See below.
     uint32_t stable_id = 0;
+    /// EMITTER SIZE in world units. 0 = engine default. See the area-light
+    /// contract below the GPU structs.
+    float source_radius = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
@@ -100,7 +108,11 @@ struct PointLight {
     // and it is non-zero from then on. Occupies what used to be declared
     // padding — sizeof/offsets are unchanged and no shader reads these bytes.
     uint32_t stable_id = 0;
-    float _pad1 = 0.0f;
+    // Emitter radius in world units, carried over from
+    // PointLightDesc::source_radius (R6). 0 = "use the engine default", which
+    // the traced pass resolves; the raster path never reads it. Occupies what
+    // used to be declared padding — sizeof/offsets are unchanged.
+    float source_radius = 0.0f;
 };
 
 struct SpotLight {
@@ -119,6 +131,18 @@ struct SpotLight {
     // Persistent identity — see PointLight::stable_id. Occupies what used to
     // be declared padding; sizeof/offsets unchanged.
     uint32_t stable_id = 0;
+    // Emitter radius (R6) — see PointLight::source_radius.
+    //
+    // THIS ONE COST A STRIDE. PointLight had a declared `_pad1` left over and
+    // took the field for free; SpotLight was exactly 64 bytes with nothing
+    // spare, so it GREW to 80. Two shader literals had to move with it
+    // (`loadSpotLight` in cluster_light_load.hlsli and the flat walk in
+    // rt_hit_shade.hlsli); the CPU side is all sizeof-driven. The alternative
+    // considered and rejected was packing a half float into the three bytes
+    // after `casts_shadows`: it keeps the stride, and it makes the one field a
+    // host authors in world units the one field stored at 11 bits of mantissa.
+    float source_radius = 0.0f;
+    float _pad1[3] = {0.0f, 0.0f, 0.0f};
 };
 
 // ---------------------------------------------------------------------------
@@ -171,6 +195,39 @@ struct SpotLight {
 inline constexpr float LIGHT_ID_POSITION_QUANTUM = 5.0f;
 inline constexpr float LIGHT_ID_COLOR_QUANTUM = 0.25f;
 inline constexpr float LIGHT_ID_INTENSITY_OCTAVE = 1.0f;
+
+// ---------------------------------------------------------------------------
+// Area lights (`source_radius`)
+//
+// A point light is a mathematical fiction: nothing in the world is a point, and
+// the reason shadows have soft edges is that emitters have SIZE. R2b's traced
+// local shadows already sampled a sphere cap around each light, which is what
+// gave them penumbras at all — but the cap's radius was one global constant for
+// every light in the scene, so a candle and a shop window cast identically soft
+// shadows.
+//
+// `source_radius` is that number, per light, in WORLD UNITS, and it is the ONLY
+// authoring surface an area light needs here: the solid-angle sampling was
+// already correct, this just tells it how wide the solid angle is.
+//
+//   * `0` (the default, and what every existing call site gets) means "use the
+//     engine default", `RtLocalShadowSettings::source_radius`. It is not
+//     "a point light": a true point light is a hard shadow, which no host has
+//     ever been able to ask for here and which this field deliberately does not
+//     add — a zero-radius emitter also makes the sampled cone degenerate.
+//   * The value is the emitter's RADIUS, not its range. `radius` above is how
+//     far the light reaches; this is how big the thing glowing is. At the
+//     playground's 100 units/metre, 10 is a candle flame, 40 a lantern globe,
+//     150 a shop window.
+//   * It affects TRACED shadows only (`LocalRtShadowMode` Ratio or Full). The
+//     rasterized atlas has no notion of emitter size and never will; a host
+//     that authors radii and then turns tracing off sees hard tile shadows, as
+//     it did before.
+//   * Wider is not free in noise: a larger cap spreads the one traced sample
+//     over more of the emitter, so a very large radius under a fast-moving
+//     camera converges more slowly. That is the honest cost of a soft shadow at
+//     one ray per pixel.
+// ---------------------------------------------------------------------------
 
 // 0 = point, 1 = spot. payload_index is the index into the corresponding
 // per-type array uploaded to the GPU.

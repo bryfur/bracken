@@ -923,6 +923,7 @@ void ModelLoader::upload_to_gpu(gpu::GPUDevice& device, TextureCache& textures, 
         // for a later software-RT build; the normal raster path pays nothing.
         if (retain_cpu_geometry) {
             internal::bake_rt_triangle_base_colors(mesh);
+            internal::bake_rt_triangle_emissive(mesh);
         }
 
         // Create index buffer

@@ -60,6 +60,39 @@
 // correct for coloured lights and for specular highlights the aggregate ratio
 // can only flatten. See render/lighting/local_di.hpp for the split itself.
 //
+// ---------------------------------------------------------------------------
+// EMISSIVE MESH LIGHTS (R6, docs/rt_lighting_plan.md §5.7) — AND WHY THEY ARE
+// A FULL-TIER FEATURE
+// ---------------------------------------------------------------------------
+//
+// A second candidate stream joins the froxel one: emissive triangles, drawn
+// from a scene-wide power-weighted alias table (rt_emissive.hlsli). The
+// reservoir, the ray and the estimator are otherwise unchanged; the RIS weights
+// carry the balance, and that derivation is written out at the draw site below.
+//
+// THEY ONLY WORK IN THE FULL-DI TIER, and this is a real limitation rather than
+// an unfinished corner. The Ratio tier's entire output is a scalar V in
+// `Sigma(contribution x V) / Sigma(contribution)`, which the forward pass
+// multiplies its analytic point+spot subtotal by. That subtotal does not
+// contain the emissive triangle and cannot: the forward shader has no emissive
+// light list, no way to build one, and no budget for one. A ratio estimator can
+// only SCALE lighting the forward loop already evaluates — there is no value of
+// V that ADDS a light. Any attempt to smuggle the emissive contribution into
+// the numerator makes the mask a number that is no longer a visibility ratio,
+// and the first thing it breaks is the R5c energy gate that keeps the two tiers
+// honest against each other.
+//
+// The Full tier has no such problem: it writes demodulated RADIANCE, and
+// radiance from any number of sources adds. So the CPU side sends
+// `emissiveCount = 0` in Ratio, which makes every expression below collapse to
+// the R5c one bit for bit.
+//
+// What Ratio still gets: emissive surfaces GLOW (rt_hit_shade.hlsli adds the
+// emission term to every traced hit, so they are bright in reflections) and
+// they FEED GI (a probe ray landing on one deposits its radiance into the probe
+// field, and the field lights the frame). What they do not do in Ratio is cast
+// their own direct shadows.
+//
 // ONE SHADER, NOT A VARIANT, and the reason is the sibling: R5b's
 // rt_local_shadow_gradient.comp.hlsl replays this pass's sampling decisions
 // exactly, and a second trace variant would have to be mirrored by a second
@@ -109,6 +142,19 @@ cbuffer RtLocalShadowUniforms : register(b0, space2) {
     /// needed it — a visibility bit has no view dependence — which is why it
     /// arrives with R5c rather than having been there all along.
     float3 cameraPosition;
+    /// R6 — emissive mesh lights. `emissiveCount` is 0 whenever the scene has
+    /// no emitter above the power threshold OR the tier is Ratio, and 0 is what
+    /// makes every weight below collapse to exactly the R5c expression.
+    uint emissiveCount;
+    /// Sum of every record's power — the alias table's normalizing constant,
+    /// so a record's discrete pdf is `power / emissiveTotalPower`.
+    float emissiveTotalPower;
+    /// M_e, emissive candidates drawn per pixel.
+    uint emissiveCandidateCount;
+    /// 0 when the record set was renumbered since last frame (a TLAS topology
+    /// rebuild), in which case an emissive index in the history names a
+    /// different triangle and the history must be dropped.
+    uint emissiveHistoryValid;
     float _pad0;
 };
 
@@ -163,6 +209,12 @@ SamplerState velocitySampler : register(s2, space0);
 #define CLUSTER_COMPUTE_PARAMS_BINDING 1
 #include "cluster_compute.hlsli"
 
+// R6's emissive record type, so the binding block below can declare its buffer.
+// The FUNCTIONS half comes after that declaration, and after
+// cluster_light_load.hlsli above has defined `clusterTargetLuminance`.
+#define RT_EMISSIVE_TYPES
+#include "rt_emissive.hlsli"
+
 /// One pixel's reservoir. Mirrors render::lighting::Reservoir (16 B) field for
 /// field — that header carries the rationale, including why p̂ is NOT stored.
 struct RtReservoir {
@@ -173,6 +225,18 @@ struct RtReservoir {
 };
 
 #define RT_RESERVOIR_NO_LIGHT 0xFFFFFFFFu
+
+/// SOURCE TAG (R6). A reservoir's selection now comes from one of two domains,
+/// and the estimator has to know which — an analytic packed light index and an
+/// emissive record index are both small integers and would otherwise be
+/// indistinguishable. Bit 31 is free by construction: packed light indices are
+/// bounded by MAX_LIGHTS (256) and record indices by k_max_emissive_records
+/// (8192), so neither can ever collide with the flag or with each other.
+///
+/// RT_RESERVOIR_NO_LIGHT is all-ones and therefore also has the flag set, which
+/// is why every test below checks it FIRST.
+#define RT_RESERVOIR_EMISSIVE_FLAG 0x80000000u
+#define RT_RESERVOIR_EMISSIVE_MASK 0x7FFFFFFFu
 
 // --- set 1: read-write storage textures, then read-write storage buffers ----
 
@@ -200,6 +264,15 @@ struct RtReservoir {
 /// two bindings every frame, both with cycle = false so the contents survive
 /// into the frame that reads them.
 [[vk::binding(4, 1)]] RWStructuredBuffer<RtReservoir> prevReservoirs : register(u4, space1);
+/// R6's emissive light records + their alias rows — READ ONLY, for the same
+/// reason `prevReservoirs` is: the eight read-only storage-buffer slots SDL3
+/// allows a compute pipeline were already spent to the last one before this
+/// phase existed. When the scene has no emitter this binds a 1-element stand-in
+/// and `emissiveCount` is 0, so nothing indexes it.
+[[vk::binding(5, 1)]] RWStructuredBuffer<EmissiveRecord> emissiveRecords : register(u5, space1);
+
+#define RT_EMISSIVE_FUNCTIONS
+#include "rt_emissive.hlsli"
 
 // The buffers and `tlasNodeCount` above are what the walks bind to.
 #define RT_TRACE_TRAVERSAL
@@ -275,7 +348,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
         // Reversed-Z: 0 is the far plane, so depth == 0 is sky. And with zero
         // binned lights every buffer below holds LAST frame's contents, which
         // is why clusterTotalLights() is checked before any of them is read.
-        if (depth > 0.0 && clusterTotalLights() > 0u) {
+        // R6 widened the second half of this test. `clusterTotalLights() > 0`
+        // still guards every froxel buffer read below — with zero binned lights
+        // they hold LAST frame's contents — but it must no longer gate the
+        // whole pass, because an emissive mesh is a light the cluster grid
+        // knows nothing about. A scene lit only by glowing windows has zero
+        // binned lights and is not dark.
+        if (depth > 0.0 && (clusterTotalLights() > 0u || emissiveCount > 0u)) {
             // The G-buffer's whole texel: RG = octahedral world normal,
             // B = roughness, A = metallic. Ratio only ever needed the normal;
             // the DI block needs the material half too, and it is the same
@@ -305,10 +384,67 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
             // would freeze the previous frame's lighting in place.
             diDiffuse.a = viewDepth;
 
-            const uint froxel = clusterFroxelIndex(uv, viewDepth);
-            const uint listCount = clusterFroxelLightCount(froxel);
+            uint froxel = 0u;
+            uint listCount = 0u;
+            if (clusterTotalLights() > 0u) {
+                froxel = clusterFroxelIndex(uv, viewDepth);
+                listCount = clusterFroxelLightCount(froxel);
+            }
 
-            if (listCount > 0u) {
+            // ---- the two candidate budgets --------------------------------
+            //
+            // M_a from the froxel, M_e from the emissive alias table.
+            // `emissiveCount` is 0 in the Ratio tier by construction (the CPU
+            // side never sends records there — see the tier note in
+            // docs/rt_lighting_plan.md §5.7), so M_e is 0, `mCur` is `mA`, both
+            // scale factors below are exactly 1.0, and every expression in this
+            // block reduces to the R5c one BIT FOR BIT rather than merely
+            // closely.
+            const uint mA = min(candidateCount, listCount);
+            const uint mE = min(emissiveCandidateCount, emissiveCount);
+            const float mCur = float(mA + mE);
+
+            // ---- MULTI-SOURCE RIS: where the balance actually lives --------
+            //
+            // Two candidate streams over DISJOINT domains — analytic lights and
+            // emissive records — whose integrals must be SUMMED, not averaged.
+            // That distinction is the whole subtlety here, and getting it wrong
+            // is an energy error rather than a noise one:
+            //
+            //   * The temporal merge below combines two estimates of the SAME
+            //     integral, so a confidence-weighted convex combination
+            //     (M_prev/(M_cur+M_prev) and friends) is exactly right, and it
+            //     is what R2b shipped.
+            //   * The two CURRENT streams estimate DIFFERENT integrals. Feeding
+            //     them into one reservoir with a shared 1/M normalization would
+            //     deliver (M_a*I_a + M_e*I_e)/(M_a+M_e) — a convex combination
+            //     of the two halves, i.e. the whole frame dimmed toward
+            //     whichever source was drawn more often.
+            //
+            // The fix is the balance heuristic evaluated per candidate:
+            // m_i(x) = p_i(x) / sum_j p_j(x) over all M draws. With disjoint
+            // domains every cross term is zero, so m collapses to 1/M_a for an
+            // analytic candidate and 1/M_e for an emissive one. Folding those
+            // into the stream weights and then keeping the SHIPPED finalize
+            // (W = wSum / (M_total * p̂)) means each weight carries a factor
+            // M_cur/M_source — which is these two scalars, and nothing else in
+            // the estimator changes.
+            //
+            //   analytic i:  w = (M_cur/M_a) * p̂(x_i) * listCount
+            //   emissive j:  w = (M_cur/M_e) * p̂(y_j) * totalPower / power_j
+            //   history:     w = M_prev * p̂_here(y_prev) * W_prev   (unchanged)
+            //   W = wSum / ((M_a + M_e + M_prev) * p̂(y))            (unchanged)
+            //
+            // Expectation check, which is the thing worth re-deriving if anyone
+            // touches this: E[sum of analytic weights]/M_total = I_a, likewise
+            // I_e, and the history term contributes the convex share the
+            // confidence weighting intends. Sum = I_a + I_e. The M_a and M_e
+            // cancel against the counts, which is why the code below is two
+            // multiplications rather than a restructured estimator.
+            const float sourceScaleA = mA > 0u ? mCur / float(mA) : 0.0;
+            const float sourceScaleE = mE > 0u ? mCur / float(mE) : 0.0;
+
+            if (mA + mE > 0u) {
                 // ---- 3. RIS over M uniform draws from the froxel list -------
                 // Source pdf is 1/listCount, so the RIS weight of a candidate
                 // is p̂ * listCount. Drawing WITH replacement is deliberate: it
@@ -317,7 +453,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                 // without replacement would need a different normalization for
                 // short lists.
                 uint rng = rtSeed(uint2(coord), frameIndex);
-                const uint m = min(candidateCount, listCount);
+                const uint m = mA;
                 const float listCountF = float(listCount);
 
                 uint y = RT_RESERVOIR_NO_LIGHT;
@@ -330,11 +466,47 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                     const uint packed = clusterFroxelLight(froxel, slot);
                     const float p = clusterLightTarget(packed, worldPos, normal);
                     mCount += 1.0;
-                    const float w = p * listCountF;
+                    const float w = p * listCountF * sourceScaleA;
                     if (w > 0.0) {
                         wSum += w;
                         if (rtNextFloat(rng) * wSum < w) {
                             y = packed;
+                            targetPdf = p;
+                        }
+                    }
+                }
+
+                // ---- 3b. EMISSIVE candidates from the alias table (R6) ------
+                //
+                // The distribution is GLOBAL — power over the whole scene, not
+                // over the pixel's froxel — because an emissive triangle is not
+                // binned into the cluster grid and cannot be: the grid holds
+                // point/spot lights with a range, and a triangle has neither.
+                // Power weighting is what keeps a global draw useful anyway:
+                // the bright emitters near the camera dominate the table, and a
+                // record on the far side of the village is drawn with
+                // proportionally tiny probability AND scores p̂ ~ 0 when it is.
+                // A per-froxel emissive list is the obvious next step and is
+                // recorded as such in the plan; it is not needed at this scale.
+                //
+                // Note the RNG discipline: these draws come AFTER the analytic
+                // loop and are skipped entirely when mE is 0, so the sample
+                // stream a no-emissive scene sees is untouched.
+                for (uint e = 0; e < mE; ++e) {
+                    const float u1 = rtNextFloat(rng);
+                    const float u2 = rtNextFloat(rng);
+                    const uint rec = rtEmissiveSampleIndex(emissiveCount, u1, u2);
+                    const EmissiveRecord er = emissiveRecords[rec];
+                    const float p = rtEmissiveTarget(er, worldPos, normal);
+                    mCount += 1.0;
+                    // Discrete source pdf: power / totalPower. Its reciprocal is
+                    // what turns p̂ into an unbiased RIS weight.
+                    const float pdf = er.power / max(emissiveTotalPower, 1e-6);
+                    const float w = pdf > 0.0 ? p * sourceScaleE / pdf : 0.0;
+                    if (w > 0.0) {
+                        wSum += w;
+                        if (rtNextFloat(rng) * wSum < w) {
+                            y = rec | RT_RESERVOIR_EMISSIVE_FLAG;
                             targetPdf = p;
                         }
                     }
@@ -356,13 +528,37 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                         const bool depthOk =
                             hist.depth > 0.0 && abs(hist.depth - viewDepth) <= 0.05 * max(viewDepth, 1.0);
 
-                        // The light index is LAST frame's packed index. Resolve
-                        // it, or drop the history: a vanished light must not
-                        // silently become whatever now occupies its slot.
+                        // The stored index is LAST frame's, in whichever of the
+                        // two domains its source tag names. Resolve it, or drop
+                        // the history — the same rule for both domains, with
+                        // two different translations:
+                        //
+                        //   analytic: through the prev->current light remap, so
+                        //     a vanished light does not silently become
+                        //     whatever now occupies its packed slot.
+                        //   emissive: through the record EPOCH. Record indices
+                        //     are stable while the TLAS topology is, and a
+                        //     topology rebuild renumbers them wholesale, so
+                        //     `emissiveHistoryValid` is a single frame-wide
+                        //     answer rather than a per-record table. Dropping
+                        //     the history on a rebuild is CORRECT and not a
+                        //     limitation: the alternative is a reservoir
+                        //     pointing at an unrelated triangle, which is
+                        //     exactly the failure the light remap exists to
+                        //     prevent on the other side.
                         uint mapped = RT_RESERVOIR_NO_LIGHT;
+                        bool histEmissive = false;
                         if (depthOk && hist.lightIndex != RT_RESERVOIR_NO_LIGHT &&
                             hist.sampleCount > 0.0) {
-                            mapped = clusterRemapPrevLight(hist.lightIndex);
+                            if ((hist.lightIndex & RT_RESERVOIR_EMISSIVE_FLAG) != 0u) {
+                                const uint rec = hist.lightIndex & RT_RESERVOIR_EMISSIVE_MASK;
+                                if (emissiveHistoryValid != 0u && rec < emissiveCount) {
+                                    mapped = rec;
+                                    histEmissive = true;
+                                }
+                            } else {
+                                mapped = clusterRemapPrevLight(hist.lightIndex);
+                            }
                         }
 
                         if (mapped != LIGHT_REMAP_INVALID && mapped != RT_RESERVOIR_NO_LIGHT) {
@@ -372,14 +568,18 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                             // the merge does not otherwise need: a light behind
                             // or out of range of the new surface evaluates to
                             // zero and contributes nothing but M.
-                            const float pHere = clusterLightTarget(mapped, worldPos, normal);
+                            const float pHere =
+                                histEmissive
+                                    ? rtEmissiveTarget(emissiveRecords[mapped], worldPos, normal)
+                                    : clusterLightTarget(mapped, worldPos, normal);
                             const float w = pHere * hist.weight * histM;
                             const float mBefore = mCount;
                             mCount += 1.0;
                             if (w > 0.0) {
                                 wSum += w;
                                 if (rtNextFloat(rng) * wSum < w) {
-                                    y = mapped;
+                                    y = histEmissive ? (mapped | RT_RESERVOIR_EMISSIVE_FLAG)
+                                                     : mapped;
                                     targetPdf = pHere;
                                 }
                             }
@@ -396,7 +596,46 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                 outRes.depth = viewDepth;
 
                 // ---- 5. one shadow ray at the winner -------------------------
-                if (y != RT_RESERVOIR_NO_LIGHT) {
+                //
+                // An EMISSIVE winner takes the branch below instead: the ray
+                // goes at a point sampled uniformly on the triangle, which is
+                // the same trick the sphere cap plays for an analytic light —
+                // scatter the ray across the emitter and the penumbra comes out
+                // of the sampling rather than out of a filter.
+                if (y != RT_RESERVOIR_NO_LIGHT &&
+                    (y & RT_RESERVOIR_EMISSIVE_FLAG) != 0u) {
+                    const EmissiveRecord er = emissiveRecords[y & RT_RESERVOIR_EMISSIVE_MASK];
+                    const float2 xi = rtSample2D(uint2(coord), frameIndex);
+                    const float3 pt = rtEmissiveSamplePoint(er, xi);
+                    const float3 toPt = pt - worldPos;
+                    const float dist = length(toPt);
+                    const float3 L = toPt / max(dist, 1e-4);
+                    const float ndotl = dot(normal, L);
+                    if (ndotl <= 0.0 || dist <= 1e-4) {
+                        lit = true; // the target function already scored this 0
+                    } else {
+                        const float slope = saturate(1.0 - ndotl);
+                        const float3 rayOrigin = worldPos +
+                                                 normal * (normalBias * (1.0 + slope * 4.0)) +
+                                                 L * depthBias;
+                        // THE EMITTER MUST NOT OCCLUDE ITS OWN LIGHT. Unlike an
+                        // analytic light, this one IS geometry in the TLAS, and
+                        // the ray is aimed exactly at a point on it — so an
+                        // any-hit walk to the full distance hits the emitter
+                        // every single time and every emissive light is fully
+                        // shadowed. Stopping short by a RELATIVE margin (rather
+                        // than the absolute bias the analytic path uses) is what
+                        // keeps that true across four orders of magnitude of
+                        // scene scale: 0.2% of the distance is under a
+                        // millimetre at arm's length and still clears the
+                        // triangle at 500 units. Anything genuinely between the
+                        // surface and the emitter is longer than that margin by
+                        // construction, so nothing real is missed.
+                        const float rayLen = min(dist * 0.998, dist - depthBias) - normalBias;
+                        lit = rayLen <= 0.0 ? true
+                                            : !sceneOccluded(rayOrigin, L, rayLen);
+                    }
+                } else if (y != RT_RESERVOIR_NO_LIGHT) {
                     const ClusterLightSample geom = clusterLightGeometry(y);
                     const float3 toLight = geom.position - worldPos;
                     const float dist = length(toLight);
@@ -406,7 +645,15 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                     // r / d, clamped at 1 for a surface inside the emitter —
                     // where cosThetaMax collapses to 0, the cone becomes the
                     // full hemisphere, and the answer is noise either way.
-                    const float sinThetaMax = min(lightSourceRadius / max(dist, 1e-4), 1.0);
+                    //
+                    // R6: the radius is PER LIGHT now
+                    // (contracts/light.hpp, `source_radius`), with 0 meaning
+                    // "the host did not author one" and falling back to the
+                    // pass's global default — which is what every light got
+                    // before this phase, so an unauthored scene is unchanged.
+                    const float emitterRadius =
+                        geom.source_radius > 0.0 ? geom.source_radius : lightSourceRadius;
+                    const float sinThetaMax = min(emitterRadius / max(dist, 1e-4), 1.0);
                     const float cosThetaMax = sqrt(saturate(1.0 - sinThetaMax * sinThetaMax));
 
                     const float ndotl = dot(normal, L);
@@ -444,7 +691,24 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                 // ray produced, so the two tiers cannot disagree about which
                 // light was picked or whether it was visible.
                 if (diMode >= 2u && y != RT_RESERVOIR_NO_LIGHT) {
-                    const ClusterLightShading sh = clusterLightShading(y, worldPos);
+                    // Both domains answer through the same three fields, in the
+                    // same units — which is the point of rt_emissive.hlsli
+                    // mirroring ClusterLightShading's shape rather than
+                    // inventing its own: everything below this line is
+                    // source-agnostic, so the emissive tier cannot drift from
+                    // the analytic one's demodulation.
+                    ClusterLightShading sh;
+                    if ((y & RT_RESERVOIR_EMISSIVE_FLAG) != 0u) {
+                        const EmissiveSample es =
+                            rtEmissiveShading(emissiveRecords[y & RT_RESERVOIR_EMISSIVE_MASK],
+                                              worldPos);
+                        sh.L = es.L;
+                        sh.radiance = es.radiance;
+                        sh.dist = es.dist;
+                        sh.valid = es.valid;
+                    } else {
+                        sh = clusterLightShading(y, worldPos);
+                    }
                     const float ndotl = max(dot(normal, sh.L), 0.0);
                     if (sh.valid && ndotl > 0.0) {
                         const float3 Vdir = normalize(cameraPosition - worldPos);

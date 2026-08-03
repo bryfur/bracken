@@ -416,7 +416,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // stable per-pixel value for calcShadow's PCSS disk rotation, which PCF
     // never reaches.
     float3 hitPos = rayOrigin + rayDir * hit.t;
-    float3 shaded = rtShadeHit(hitPos, hitNormal, attr.baseColor.rgb, float2(coord));
+    float3 shaded = rtShadeHit(hitPos, hitNormal, attr.baseColor.rgb, attr.emissive, float2(coord));
 
     // Fade with distance so a reflection that runs out of ray fades into the
     // sky rather than ending at a hard edge. Into the SAME sky a miss returns

@@ -849,11 +849,16 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // consequence: the previous frame's reservoirs ride a read-write slot they
      // are only ever read through. Two uniform buffers, b1 being ClusterGrid's
      // own ClusterParams pushed verbatim.
+     // R6 added a second read-write storage buffer: the emissive light records,
+     // so a reservoir that named an emissive triangle can be replayed at it.
+     // Without them a flagged index falls through the light remap as
+     // out-of-range and every emissive-lit stratum reports a full gradient
+     // forever — a permanent history reset exactly where the new lights are.
      .resources = {.num_samplers = 3,
                    .num_readonly_storage_textures = 1,
                    .num_readonly_storage_buffers = 8,
                    .num_readwrite_storage_textures = 1,
-                   .num_readwrite_storage_buffers = 1,
+                   .num_readwrite_storage_buffers = 2,
                    .num_uniform_buffers = 2}},
     {.name = "RtGradientReconstruct",
      .shader = "rt_gradient_reconstruct.comp.spv",
@@ -938,10 +943,16 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // precisely why they are outputs of this pass rather than inputs to a
      // second one. In Ratio mode they are 1x1 stand-ins and `diMode` is what
      // stops anything being written to them.
+     //
+     // R6 added a THIRD read-write storage buffer for the same reason and with
+     // the same shape: the emissive light records, read-only in the shader,
+     // riding a read-write slot because there is no read-only one left. Its
+     // Vose alias table rides INSIDE the records (one bucket per record), which
+     // is what kept this to one slot rather than two.
      .resources = {.num_samplers = 3,
                    .num_readonly_storage_buffers = 8,
                    .num_readwrite_storage_textures = 3,
-                   .num_readwrite_storage_buffers = 2,
+                   .num_readwrite_storage_buffers = 3,
                    .num_uniform_buffers = 2}},
     {.name = "RtDiTemporal",
      .shader = "rt_di_denoise_temporal.comp.spv",

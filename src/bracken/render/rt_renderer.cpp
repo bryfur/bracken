@@ -370,7 +370,11 @@ void RtRenderer::publish_scene_stats() {
     stats_.blas_bytes = s.blas_bytes;
     stats_.tlas_bytes = s.tlas_bytes;
     stats_.attribute_bytes = s.attribute_bytes;
+    stats_.emissive_bytes = s.emissive_bytes;
     stats_.acceleration_bytes = s.gpu_bytes;
+    stats_.emissive_triangles = s.emissive_triangles;
+    stats_.emissive_records = s.emissive_records;
+    stats_.emissive_records_dropped = s.emissive_records_dropped;
 }
 
 void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
@@ -818,14 +822,26 @@ bool RtRenderer::trace_local_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoi
     u.tlasNodeCount = scene_.tlas_node_count();
     u.hasGBuffer = normal_rough != nullptr ? 1u : 0u;
     u.historyValid = (d.history_valid && velocity != nullptr) ? 1u : 0u;
+    // Exactly what the trace resolved a dispatch ago — see the members.
+    u.emissiveCount = local_emissive_count_;
+    u.emissiveHistoryValid = local_emissive_history_valid_;
+    if (local_emissive_bound_ == nullptr && !ensure_emissive_dummy()) {
+        return false;
+    }
 
     const SDL_GPUStorageTextureReadWriteBinding rw_tex{.texture = d.gradient[0]->handle(),
                                                        .mip_level = 0, .layer = 0, .cycle = true,
                                                        .padding1 = 0, .padding2 = 0, .padding3 = 0};
     // cycle = false: this is the previous frame's reservoir state, read only.
-    const std::array<SDL_GPUStorageBufferReadWriteBinding, 1> rw_bufs{{
+    // The emissive records ride the second slot for the same budget reason the
+    // trace's third does, and are the SAME buffer the trace bound — a replay
+    // aimed at a different record set is not a replay.
+    const std::array<SDL_GPUStorageBufferReadWriteBinding, 2> rw_bufs{{
         {.buffer = local_reservoirs_[prev_reservoir]->handle(), .cycle = false,
          .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        {.buffer = local_emissive_bound_ != nullptr ? local_emissive_bound_
+                                                    : local_emissive_dummy_->handle(),
+         .cycle = false, .padding1 = 0, .padding2 = 0, .padding3 = 0},
     }};
     gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw_tex, 1}, rw_bufs);
     if (!pass) {
@@ -912,6 +928,26 @@ bool RtRenderer::ensure_di_dummies() {
     }
     if (!local_di_.dummy[0] || !local_di_.dummy[1]) {
         BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the local-DI stand-in textures");
+        return false;
+    }
+    return true;
+}
+
+bool RtRenderer::ensure_emissive_dummy() {
+    if (local_emissive_dummy_) {
+        return true;
+    }
+    if (device_ == nullptr) {
+        return false;
+    }
+    // One zeroed record. ComputeStorage because it binds to a READ-WRITE slot,
+    // for the reason the record buffer itself does (rt_local_shadow.comp.hlsl's
+    // eight read-only slots were spent before R6 existed).
+    const rt::EmissiveTriangle zero{};
+    local_emissive_dummy_ = gpu::GPUBuffer::create_static(
+        *device_, gpu::GPUBuffer::Type::ComputeStorage, &zero, sizeof(zero));
+    if (!local_emissive_dummy_) {
+        BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the emissive-record stand-in buffer");
         return false;
     }
     return true;
@@ -1197,6 +1233,30 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     u.diMode = want_di ? 2u : 0u;
     u.cameraPosition = params.camera_position;
 
+    // R6, emissive mesh lights. FULL TIER ONLY, and the gate is here rather
+    // than in the shader so the Ratio path is not merely equal but byte-for-byte
+    // the R5c one: with `emissiveCount` 0 every RIS weight in the pass reduces
+    // to its pre-R6 expression exactly. rt_local_shadow.comp.hlsl's header
+    // carries the argument for why a ratio estimator cannot represent a light
+    // the forward loop does not evaluate.
+    const uint32_t emissive_count = want_di ? scene_.emissive_record_count() : 0u;
+    const bool emissive_live = emissive_count > 0 && scene_.emissive_records() != nullptr &&
+                               scene_.emissive_total_power() > 0.0f;
+    u.emissiveCount = emissive_live ? emissive_count : 0u;
+    u.emissiveTotalPower = scene_.emissive_total_power();
+    u.emissiveCandidateCount = emissive_live ? std::max(settings.emissive_candidate_count, 1u) : 0u;
+    // A record's index is stable only within one topology epoch. A rebuild
+    // renumbers them, so an emissive index carried over from last frame names a
+    // different triangle and the history must be dropped — which is correct, not
+    // a gap: reusing it would shadow against an unrelated emitter, the exact
+    // failure the light remap prevents on the analytic side.
+    const uint32_t epoch = scene_.emissive_epoch();
+    u.emissiveHistoryValid = (emissive_live && local_emissive_epoch_ == epoch) ? 1u : 0u;
+    local_emissive_epoch_ = epoch;
+    local_emissive_count_ = u.emissiveCount;
+    local_emissive_history_valid_ = u.emissiveHistoryValid;
+    stats_.emissive_di_sampled = emissive_live;
+
     // The bits ping-pong (R5b): this frame writes the half the gradient pass is
     // not reading. cycle = false for exactly the reason the reservoirs use it.
     const int bits_next = 1 - local_shadow_.bits_index;
@@ -1224,10 +1284,23 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     // cycle = false on both: this is persistent state the NEXT frame reads
     // back, and a cycled allocation would hand the dispatch a fresh, undefined
     // buffer while leaving the one the ping-pong points at untouched.
-    const std::array<SDL_GPUStorageBufferReadWriteBinding, 2> rw_bufs{{
+    //
+    // The third is R6's emissive record buffer, read-only in the shader and in
+    // a read-write slot for the same budget reason. A scene with no emitter
+    // binds the 1-element stand-in — a storage-buffer descriptor may not be
+    // empty — and `emissiveCount = 0` is what stops anything indexing it.
+    if (!ensure_emissive_dummy()) {
+        return false;
+    }
+    SDL_GPUBuffer* emissive_buf =
+        emissive_live ? scene_.emissive_records() : local_emissive_dummy_->handle();
+    local_emissive_bound_ = emissive_buf;
+    const std::array<SDL_GPUStorageBufferReadWriteBinding, 3> rw_bufs{{
         {.buffer = local_reservoirs_[next]->handle(), .cycle = false,
          .padding1 = 0, .padding2 = 0, .padding3 = 0},
         {.buffer = local_reservoirs_[prev]->handle(), .cycle = false,
+         .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        {.buffer = emissive_buf, .cycle = false,
          .padding1 = 0, .padding2 = 0, .padding3 = 0},
     }};
     gpu::ComputePass pass = gpu::ComputePass::begin(cmd, rw_tex, rw_bufs);

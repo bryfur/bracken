@@ -1948,11 +1948,18 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
             std::cout << std::format(
                 "[smoke] rt shadows_traced={} reflections_traced={} local_shadows_traced={} "
                 "local_di_traced={} "
-                "shadow_rays={} reflection_rays={} local_shadow_rays={} accel={:.1f}MB\n",
+                "shadow_rays={} reflection_rays={} local_shadow_rays={} accel={:.1f}MB "
+                // R6: emissive MODEL triangles that cleared the power threshold,
+                // the scene-space records they flattened into, and whether those
+                // records actually fed the DI candidate draw (Full tier only —
+                // see the tier note in docs/rt_lighting_plan.md §5.7).
+                "emissive_tris={} emissive_records={} emissive_dropped={} emissive_di={}\n",
                 rt.shadows_traced, rt.reflections_traced, rt.local_shadows_traced,
                 rt.local_di_traced, rt.shadow_rays,
                 rt.reflection_rays, rt.local_shadow_rays,
-                static_cast<double>(rt.acceleration_bytes) / (1024.0 * 1024.0));
+                static_cast<double>(rt.acceleration_bytes) / (1024.0 * 1024.0),
+                rt.emissive_triangles, rt.emissive_records, rt.emissive_records_dropped,
+                rt.emissive_di_sampled);
             // The structure, itemized. `instances` is post-range-filter, so it
             // is what the rays actually see; `tlas_builds` should read 1 while
             // the instance SET is stable — a moving instance costs a
@@ -2626,7 +2633,18 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
         // Intensity is radiometric (inverse-square in world units): a warm
         // pool directly beneath the orb that fades out well inside the 320
         // radius — anything standing in the pool throws a visible local shadow.
-        fb.add_point_light({pos, 320.0f, {1.0f, 0.72f, 0.30f}, 12000.0f, true});
+        // `source_radius` (R6): the orb IS the emitter, and its shell is a
+        // radius-8 sphere, so authoring 8 here makes the traced penumbra the
+        // one this bulb would really cast instead of the engine's 10-unit
+        // default. Aggregate-initialized past stable_id, which stays 0 =
+        // "engine assigns".
+        fb.add_point_light({.position = pos,
+                            .radius = 320.0f,
+                            .color = {1.0f, 0.72f, 0.30f},
+                            .intensity = 12000.0f,
+                            .casts_shadows = true,
+                            .stable_id = 0,
+                            .source_radius = 8.0f});
 
         // Proximity bar above each orb — exercises 3D billboards.
         float d = glm::distance(glm::vec2(pos.x, pos.z), glm::vec2(player_pos_.x, player_pos_.z));
@@ -2657,7 +2675,15 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
                            .outer_angle = core::Degrees{32.0f},
                            .color = {0.9f, 0.95f, 1.0f},
                            .intensity = 200000.0f,
-                           .casts_shadows = true});
+                           .casts_shadows = true,
+                           .stable_id = 0,
+                           // A wide softbox rather than a point: 60 units is
+                           // 60 cm at this scale, which is what a rig light
+                           // reads as and what makes the character's second
+                           // ground shadow soften with distance instead of
+                           // staying a hard edge. The A/B against the 10-unit
+                           // default is visible at PLAYGROUND_TOD_HOUR=1.
+                           .source_radius = 60.0f});
     }
 
     for (const auto& pos : pending_pickup_bursts_) {
