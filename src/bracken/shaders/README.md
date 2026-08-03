@@ -348,6 +348,19 @@ reservoir (its light index resolved through the prev→current remap; a vanished
 light drops the history), merges **k = 3 spatial neighbours under pairwise MIS**
 (R7a), and casts ONE sphere-cap ray at the surviving winner.
 
+Since R6 a SECOND candidate stream joins the froxel one — emissive triangles
+(`rt_emissive.hlsli`) — and since **R8** that stream is froxel-local too: its
+source pdf is a MIXTURE of the pixel's per-froxel emissive list with the
+scene-wide power alias table R6 shipped, `emissiveFroxelShare` being the split.
+The list arrives as a FIFTH read-write storage buffer (`u8`, read-only in
+practice, same budget argument as the four before it): a flat `uint` table,
+`[count][record x 16]` ascending per froxel, built on the CPU by
+`render::rt::EmissiveClusterGrid` against the SAME froxel bounds the light
+binner uses. `emissiveFroxelShare = 0` collapses the mixture to R6's draw bit for
+bit and is the A/B control. `rt_local_shadow_gradient.comp` needed no change
+for it: a replay is handed a record index somebody else chose and never draws a
+candidate of its own.
+
 **It is DISPATCHED TWICE**, one pipeline, `stage` selecting the half: stage 0
 resamples into a scratch reservoir, stage 1 reuses that scratch spatially,
 traces and writes the DI targets. A spatial pass reads its neighbours' output

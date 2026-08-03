@@ -225,6 +225,13 @@ public:
     [[nodiscard]] uint32_t emissive_record_count() const noexcept {
         return static_cast<uint32_t>(emissive_records_.size());
     }
+    /// The same records on the CPU, in the SAME order (record index = index
+    /// here), for R8's froxel binner. Valid until the next
+    /// `set_instances`/`build_blas_for_models`; the binner consumes it inside
+    /// the frame that produced it and retains nothing.
+    [[nodiscard]] std::span<const EmissiveTriangle> emissive_record_data() const {
+        return emissive_records_;
+    }
     /// Sum of every record's `power` — the alias table's normalizing constant,
     /// which the shader needs to turn a record's weight back into its pdf.
     [[nodiscard]] float emissive_total_power() const noexcept { return emissive_total_power_; }

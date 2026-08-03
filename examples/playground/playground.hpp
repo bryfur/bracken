@@ -462,6 +462,11 @@ private:
     uint32_t rt_spatial_neighbors_ = 3;
     uint32_t rt_di_spatial_iterations_ = 2;
     bool rt_di_noise_probe_ = false;
+    // R8's pair, from PLAYGROUND_RT_EMISSIVE / PLAYGROUND_RT_EMISSIVE_LOCAL:
+    // M_e (0 = the emissive candidate stream off entirely) and the share of each
+    // draw taken from the per-froxel list (0 = R6's purely global alias draw).
+    uint32_t rt_emissive_candidates_ = 2;
+    float rt_emissive_froxel_share_ = 1.0f;
     static constexpr int RT_BENCH_WARMUP_FRAMES = 30; // pipeline/PSO/history warm-up, discarded
     /// Per-pass CPU record times, keyed by the pass name. The key is a
     /// std::string copy, not the PassTiming string_view: the view points at a

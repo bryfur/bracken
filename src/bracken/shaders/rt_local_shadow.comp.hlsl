@@ -113,10 +113,18 @@
 // A FULL-TIER FEATURE
 // ---------------------------------------------------------------------------
 //
-// A second candidate stream joins the froxel one: emissive triangles, drawn
-// from a scene-wide power-weighted alias table (rt_emissive.hlsli). The
-// reservoir, the ray and the estimator are otherwise unchanged; the RIS weights
-// carry the balance, and that derivation is written out at the draw site below.
+// A second candidate stream joins the froxel one: emissive triangles
+// (rt_emissive.hlsli). The reservoir, the ray and the estimator are otherwise
+// unchanged; the RIS weights carry the balance, and that derivation is written
+// out at the draw site below.
+//
+// SINCE R8 THAT STREAM IS FROXEL-LOCAL TOO. Its source pdf is a MIXTURE of the
+// pixel's per-froxel emissive list with the scene-wide power alias table R6
+// shipped, `q_f` of the draw going to the former (render/raytracing/
+// emissive_clusters.hpp owns the derivation and the CPU binner). A global draw
+// is unbiased and aims long rays; a purely local one is short-rayed and drops
+// records no list holds; the mixture is both unbiased and mostly local.
+// `emissiveFroxelShare = 0` is R6 bit for bit and is the A/B control.
 //
 // THEY ONLY WORK IN THE FULL-DI TIER, and this is a real limitation rather than
 // an unfinished corner. The Ratio tier's entire output is a scalar V in
@@ -217,7 +225,12 @@ cbuffer RtLocalShadowUniforms : register(b0, space2) {
     uint spatialNeighbors;
     /// Radius of the neighbour ring, in TRACED texels.
     float spatialRadius;
-    uint _pad0;
+    /// R8 — q_f, the share of each emissive candidate draw taken from the
+    /// pixel's PER-FROXEL list rather than from the scene-wide power alias
+    /// table. 0 collapses the mixture to its global component and reproduces
+    /// R6's draw bit for bit, which is what the A/B control leans on; it is also
+    /// what the CPU sends whenever the froxel table is not THIS frame's.
+    float emissiveFroxelShare;
 };
 
 // NOTE THE ABSENCE of the depthA/depthB pair every other depth-reading pass
@@ -352,8 +365,17 @@ struct RtReservoir {
 /// When the host emits no capsules this binds a 1-element stand-in and
 /// `shadowCapsuleCount` is 0, so nothing indexes it.
 [[vk::binding(7, 1)]] RWStructuredBuffer<ShadowCapsule> shadowCapsules : register(u7, space1);
+/// R8's per-froxel emissive candidate lists — READ ONLY, riding a read-write
+/// slot for the fourth time in this shader and for the fourth time because the
+/// eight read-only storage-buffer slots SDL3 allows a compute pipeline are spent
+/// to the last one (four acceleration + four cluster). A flat uint table,
+/// `RT_EMISSIVE_FROXEL_STRIDE` per froxel: [count][record...] ascending. Bound
+/// as a 1-element stand-in whenever `emissiveFroxelShare` is 0, which is also
+/// what stops anything indexing it.
+[[vk::binding(8, 1)]] RWStructuredBuffer<uint> emissiveFroxels : register(u8, space1);
 
 #define RT_EMISSIVE_FUNCTIONS
+#define RT_EMISSIVE_LISTS
 #include "rt_emissive.hlsli"
 
 // The buffers and `tlasNodeCount` above are what the walks bind to.
@@ -567,12 +589,22 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
             const float3 normal = surf.normal;
             const float viewDepth = surf.viewDepth;
 
-            uint froxel = 0u;
+            // The froxel index is pure arithmetic on clusterParams and reads no
+            // buffer, so it is computed unconditionally: R8's emissive list is
+            // indexed by it too, and a scene lit only by glowing windows has no
+            // binned analytic lights at all.
+            const uint froxel = clusterFroxelIndex(uv, viewDepth);
             uint listCount = 0u;
             if (clusterTotalLights() > 0u) {
-                froxel = clusterFroxelIndex(uv, viewDepth);
                 listCount = clusterFroxelLightCount(froxel);
             }
+            // R8: the emissive half of the candidate draw is a MIXTURE of this
+            // froxel's list and the scene-wide alias table. Zero share (Ratio,
+            // no records, or a table that is not this frame's) makes it the
+            // alias table alone, which is R6.
+            const uint emissiveListCount =
+                emissiveFroxelShare > 0.0 ? rtEmissiveFroxelCount(froxel) : 0u;
+
 
             // ---- the two candidate budgets --------------------------------
             //
@@ -659,37 +691,51 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                     }
                 }
 
-                // ---- 3b. EMISSIVE candidates from the alias table (R6) ------
+                // ---- 3b. EMISSIVE candidates, froxel-local (R6 + R8) --------
                 //
-                // The distribution is GLOBAL — power over the whole scene, not
-                // over the pixel's froxel — because an emissive triangle is not
-                // binned into the cluster grid and cannot be: the grid holds
-                // point/spot lights with a range, and a triangle has neither.
-                // Power weighting is what keeps a global draw useful anyway:
-                // the bright emitters near the camera dominate the table, and a
-                // record on the far side of the village is drawn with
-                // proportionally tiny probability AND scores p̂ ~ 0 when it is.
-                // A per-froxel emissive list is the obvious next step and is
-                // recorded as such in the plan; it is not needed at this scale.
+                // R6 drew these from a GLOBAL power-weighted alias table, which
+                // is unbiased and expensive in exactly one way: the winner is
+                // regularly a triangle across the village, and step 5 then aims
+                // a 2000-unit any-hit ray at it. §5.7's follow-up 2, measured at
+                // ~2 ms on the playground.
                 //
-                // Note the RNG discipline: these draws come AFTER the analytic
-                // loop and are skipped entirely when mE is 0, so the sample
+                // R8 makes the SOURCE PDF a mixture of that table with this
+                // pixel's PER-FROXEL emissive list:
+                //
+                //     p(x) = q_f [x in L_f]/|L_f| + q_g power(x)/totalPower
+                //
+                // NOT a third candidate stream under the multi-source weights
+                // above, because the two halves' domains OVERLAP — the brightest
+                // record near a pixel is in both — and a mixture is what handles
+                // that honestly: a record reachable both ways simply has both
+                // terms. Every record keeps a positive pdf, so the estimator
+                // stays unbiased over the FULL record set (a lighthouse no
+                // froxel list holds is still drawn, and its ray is still
+                // unbounded); what changes is that three draws in four now land
+                // on an emitter that actually reaches the pixel, which is what
+                // makes the winner near and the ray short.
+                //
+                // The derivation, the CPU mirror and the honest statement of
+                // what IS approximated (the per-froxel cap, not the estimator)
+                // live in render/raytracing/emissive_clusters.hpp.
+                //
+                // Note the RNG discipline, unchanged from R6: two uniforms per
+                // candidate whichever component it came from, drawn AFTER the
+                // analytic loop and skipped entirely when mE is 0, so the sample
                 // stream a no-emissive scene sees is untouched.
                 for (uint e = 0; e < mE; ++e) {
                     const float u1 = rtNextFloat(rng);
                     const float u2 = rtNextFloat(rng);
-                    const uint rec = rtEmissiveSampleIndex(emissiveCount, u1, u2);
-                    const EmissiveRecord er = emissiveRecords[rec];
-                    const float p = rtEmissiveTarget(er, worldPos, normal);
+                    const EmissiveDraw draw = rtEmissiveDrawMixture(
+                        froxel, emissiveListCount, emissiveFroxelShare, emissiveCount,
+                        emissiveTotalPower, u1, u2);
+                    const float p = rtEmissiveTarget(draw.rec, worldPos, normal);
                     mCount += 1.0;
-                    // Discrete source pdf: power / totalPower. Its reciprocal is
-                    // what turns p̂ into an unbiased RIS weight.
-                    const float pdf = er.power / max(emissiveTotalPower, 1e-6);
-                    const float w = pdf > 0.0 ? p * sourceScaleE / pdf : 0.0;
+                    const float w = draw.pdf > 0.0 ? p * sourceScaleE / draw.pdf : 0.0;
                     if (w > 0.0) {
                         wSum += w;
                         if (rtNextFloat(rng) * wSum < w) {
-                            y = rec | RT_RESERVOIR_EMISSIVE_FLAG;
+                            y = draw.index | RT_RESERVOIR_EMISSIVE_FLAG;
                             targetPdf = p;
                         }
                     }
@@ -938,20 +984,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                 const float3 rayOrigin = worldPos +
                                          normal * (normalBias * (1.0 + slope * 4.0)) +
                                          L * depthBias;
-                // THE EMITTER MUST NOT OCCLUDE ITS OWN LIGHT. Unlike an
-                // analytic light, this one IS geometry in the TLAS, and
-                // the ray is aimed exactly at a point on it — so an
-                // any-hit walk to the full distance hits the emitter
-                // every single time and every emissive light is fully
-                // shadowed. Stopping short by a RELATIVE margin (rather
-                // than the absolute bias the analytic path uses) is what
-                // keeps that true across four orders of magnitude of
-                // scene scale: 0.2% of the distance is under a
-                // millimetre at arm's length and still clears the
-                // triangle at 500 units. Anything genuinely between the
-                // surface and the emitter is longer than that margin by
-                // construction, so nothing real is missed.
-                const float rayLen = min(dist * 0.998, dist - depthBias) - normalBias;
+                // The self-occlusion margin lives in one shared
+                // function, because the gradient pass replays this ray
+                // and a replay that stops at a different distance is not
+                // one. R8 deliberately does NOT truncate it at the
+                // localization horizon — see rt_emissive.hlsli for the
+                // measurement that rejected that.
+                const float rayLen = rtEmissiveRayLength(dist, depthBias, normalBias);
                 lit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, L, rayLen);
             }
         } else if (y != RT_RESERVOIR_NO_LIGHT) {

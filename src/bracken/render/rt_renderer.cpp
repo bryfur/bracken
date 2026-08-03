@@ -4,6 +4,7 @@
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_debug.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
+#include "bracken/render/raytracing/emissive_clusters.hpp"
 #include "bracken/render/rt_denoise_math.hpp"
 
 #include <algorithm>
@@ -1082,6 +1083,27 @@ bool RtRenderer::ensure_emissive_dummy() {
     return true;
 }
 
+bool RtRenderer::ensure_emissive_froxel_dummy() {
+    if (local_emissive_froxel_dummy_) {
+        return true;
+    }
+    if (device_ == nullptr) {
+        return false;
+    }
+    // One zeroed froxel block (R8). Its own buffer rather than a reuse of the
+    // record stand-in above, because the two slots declare different element
+    // types and a stand-in that only works by nothing ever indexing it is the
+    // kind of thing that stops being true quietly.
+    const std::array<uint32_t, rt::k_emissive_froxel_stride> zero{};
+    local_emissive_froxel_dummy_ = gpu::GPUBuffer::create_static(
+        *device_, gpu::GPUBuffer::Type::ComputeStorage, zero.data(), sizeof(zero));
+    if (!local_emissive_froxel_dummy_) {
+        BRACKEN_LOG_ERROR("rt", "RtRenderer: could not create the emissive froxel-list stand-in buffer");
+        return false;
+    }
+    return true;
+}
+
 bool RtRenderer::ensure_di_targets(int traced_w, int traced_h) {
     if (device_ == nullptr || traced_w <= 0 || traced_h <= 0) {
         return false;
@@ -1476,12 +1498,13 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     // to its pre-R6 expression exactly. rt_local_shadow.comp.hlsl's header
     // carries the argument for why a ratio estimator cannot represent a light
     // the forward loop does not evaluate.
-    const uint32_t emissive_count = want_di ? scene_.emissive_record_count() : 0u;
+    const uint32_t emissive_count =
+        (want_di && settings.emissive_candidate_count > 0) ? scene_.emissive_record_count() : 0u;
     const bool emissive_live = emissive_count > 0 && scene_.emissive_records() != nullptr &&
                                scene_.emissive_total_power() > 0.0f;
     u.emissiveCount = emissive_live ? emissive_count : 0u;
     u.emissiveTotalPower = scene_.emissive_total_power();
-    u.emissiveCandidateCount = emissive_live ? std::max(settings.emissive_candidate_count, 1u) : 0u;
+    u.emissiveCandidateCount = emissive_live ? settings.emissive_candidate_count : 0u;
     // A record's index is stable only within one topology epoch. A rebuild
     // renumbers them, so an emissive index carried over from last frame names a
     // different triangle and the history must be dropped — which is correct, not
@@ -1498,6 +1521,26 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     u.spatialRadius = std::max(settings.spatial_radius, 1.0f);
     local_emissive_history_valid_ = u.emissiveHistoryValid;
     stats_.emissive_di_sampled = emissive_live;
+
+    // R8, the per-froxel emissive lists. `emissiveFroxelShare` is the whole
+    // switch: 0 collapses the shader's mixture to R6's global alias draw bit for
+    // bit, and it is what a frame with no table (binning skipped, allocation
+    // failed, the caller's A/B lever at 0) sends. There is deliberately no
+    // fallback that draws through a table which is not THIS frame's — a stale
+    // list names records that may have been renumbered.
+    if (!ensure_emissive_froxel_dummy()) {
+        return false;
+    }
+    const bool froxel_lists_live = emissive_live && clusters.emissive_froxels != nullptr &&
+                                   clusters.emissive_froxel_entries > 0 &&
+                                   settings.emissive_froxel_share > 0.0f;
+    u.emissiveFroxelShare = froxel_lists_live ? std::clamp(settings.emissive_froxel_share, 0.0f, 1.0f) : 0.0f;
+    SDL_GPUBuffer* emissive_froxel_buf = froxel_lists_live ? clusters.emissive_froxels
+                                                           : local_emissive_froxel_dummy_->handle();
+    stats_.emissive_froxel_local = froxel_lists_live;
+    stats_.emissive_froxels_filled = clusters.emissive_froxels_filled;
+    stats_.emissive_froxel_entries = clusters.emissive_froxel_entries;
+    stats_.emissive_froxel_dropped = clusters.emissive_froxel_dropped;
 
     // The bits ping-pong (R5b): this frame writes the half the gradient pass is
     // not reading. cycle = false for exactly the reason the reservoirs use it.
@@ -1540,6 +1583,10 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     // read-write slot for the third time and the same budget reason. Its
     // `capsule_binding()` substitutes the 1-element stand-in on a frame with no
     // capsules, exactly as the emissive dummy does.
+    //
+    // The FIFTH is R8's per-froxel emissive candidate table, same story again:
+    // read-only, read-write slot, 1-block stand-in when the table is not this
+    // frame's — with `emissiveFroxelShare = 0` stopping the shader indexing it.
     if (!ensure_emissive_dummy()) {
         return false;
     }
@@ -1593,7 +1640,7 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
 
     for (const StageBinding& sb : stages) {
         u.stage = sb.stage;
-        const std::array<SDL_GPUStorageBufferReadWriteBinding, 4> rw_bufs{{
+        const std::array<SDL_GPUStorageBufferReadWriteBinding, 5> rw_bufs{{
             {.buffer = sb.write, .cycle = false,
              .padding1 = 0, .padding2 = 0, .padding3 = 0},
             {.buffer = sb.read, .cycle = false,
@@ -1601,6 +1648,8 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
             {.buffer = emissive_buf, .cycle = false,
              .padding1 = 0, .padding2 = 0, .padding3 = 0},
             {.buffer = capsule_buf, .cycle = false,
+             .padding1 = 0, .padding2 = 0, .padding3 = 0},
+            {.buffer = emissive_froxel_buf, .cycle = false,
              .padding1 = 0, .padding2 = 0, .padding3 = 0},
         }};
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, rw_tex, rw_bufs);

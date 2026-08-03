@@ -132,7 +132,13 @@ per-model emitting triangles at BLAS build, flattens them to world-space records
 with a Vose alias row each (`render/lighting/alias_table.hpp`, cap 8192,
 over-budget keeps the brightest and counts the drop), and the reservoir draws a
 SECOND candidate stream from them under multi-source RIS weights
-(`ris_source_scale`). **That half requires the `Full` tier** — a ratio estimator
+(`ris_source_scale`). **R8 binned those records into the froxel grid too**
+(`render/raytracing/emissive_clusters.hpp`): the candidate's source pdf is a
+MIXTURE of the pixel's per-froxel list with that global table, and the shipped
+`emissive_froxel_share = 1` makes the froxel list the domain — which recovers
+1.2 ms of `present_wait` and gives up the far-field emissive fill. Every value in
+between is unbiased and recovers nothing; §5.7's R8 note carries the measurement
+and why it is a cliff. Since R8 those candidates are drawn from a MIXTURE of the pixel's PER-FROXEL emissive list (`render/raytracing/emissive_clusters.hpp` — the same froxel grid the light binner uses, borrowed rather than recomputed) with that global table; `emissive_froxel_share` is the split, 0 is R6 exactly. **That half requires the `Full` tier** — a ratio estimator
 can only scale lighting the forward loop already evaluates, and it does not
 evaluate an emissive triangle; under `Ratio` emissive surfaces still glow and
 still feed GI, but cast no direct shadow. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer, **plus the surface's own emission**, which is what makes bounce FROM emissives fall out of the existing probe recursion). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. **Skinned meshes are split by signal (§5.8)**: their BLAS is the bind pose, so the ANY-HIT walks flag and skip them and trace the frame's per-bone `ShadowCapsule` set instead (`contracts/shadow_capsule.hpp`, emitted by the host through `FrameSink::add_shadow_capsules`, intersection mirrored between `render/raytracing/capsule_occluder.hpp` and `shaders/rt_trace.hlsli`), while CLOSEST-HIT walks keep the bind-pose triangles so characters stay in reflections and probes. A skinned draw with no capsules casts NO traced shadow — the bind-pose fallback was removed, not retained. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
@@ -312,7 +318,11 @@ draws it.
   engine default; `PointLight` is 48 B and `SpotLight` grew to **80** to carry
   it). Emissive mesh lights are budgeted separately in
   `render/raytracing/emissive_lights.hpp`: `k_max_emissive_records = 8192`
-  scene-space records, threshold `k_emissive_min_power`.
+  scene-space records, threshold `k_emissive_min_power`; their per-froxel
+  candidate lists in `render/raytracing/emissive_clusters.hpp`
+  (`k_emissive_froxel_capacity = 16` records per froxel, a 235 KB flat table,
+  relevance threshold `k_emissive_froxel_min_contribution` capped at
+  `k_emissive_froxel_max_radius`).
   `render/lighting/light.hpp` includes it, so both spellings keep working.
 - Formats: swapchain `RGBA8_UNORM`, HDR scene `RGBA16F`, depth `D32_FLOAT` —
   the live values are `PipelineRegistry`'s members (`gpu/pipeline_registry.hpp`,
@@ -514,13 +524,34 @@ the R7 quality package did not reach the raster path:
 | night, `TOD_HOUR=1 … ratio` | `35.7 / 57.6` | `35.3 / 57.2` |
 | night, `TOD_HOUR=1 … full` | `38.2 / 55.7` | `37.0 / 54.4` |
 
+**R8 (per-froxel emissive candidate lists, §5.7's follow-up 2) moved the two
+Full rows and NOTHING else.** The five non-Full rows above are bit-identical,
+which is the gate saying the binning does not run outside the Full tier:
+
+| Invocation (`--smoke 30`) | at R7 | at R8 |
+|---|---|---|
+| `RT=both RT_LOCAL=full` | `85.6 / 47.2` | `85.5 / 47.3` |
+| night, `TOD_HOUR=1 … full` | `37.0 / 54.4` | `36.0 / 55.0` |
+
+The night row going DOWN is the package's stated cost, not a regression:
+`emissive_froxel_share = 1` makes a froxel's emissive list the candidate domain,
+and a village's glow is a sum over eight thousand dim windows that no bounded
+per-froxel list reaches. `PLAYGROUND_RT_EMISSIVE_LOCAL=0` restores R6's
+scene-wide draw and reproduces `37.0 / 54.4` exactly; `PLAYGROUND_RT_EMISSIVE=0`
+turns the emissive candidate stream off entirely, which is the records-off column
+of §5.7's cost table. Both are `SceneRenderer::RtLocalTuning` fields, same status
+as `PLAYGROUND_RT_SPATIAL`: measurement instruments, not quality levels.
+
 `PLAYGROUND_RT_SPATIAL=0` turns R7's spatial reservoir reuse off and reproduces
 the R6 Ratio pins BIT for bit (`85.3 / 47.6`, night `35.7 / 57.6`) — that is
 what the escape hatch is for, and it is the evidence that the reuse is the only
 thing that moved them. `PLAYGROUND_RT_DI_ITERS=1` likewise restores R5c's
-single-iteration DI filter. Both are `SceneRenderer::RtLocalTuning` fields
-rather than `GraphicsSettings`: they are measurement instruments, not quality
-levels a player would be shown.
+single-iteration DI filter, and R8 added `PLAYGROUND_RT_EMISSIVE=<M_e>` (0 = the
+emissive candidate stream off entirely, the records-off column of §5.7's cost
+table) and `PLAYGROUND_RT_EMISSIVE_LOCAL=<0..1>` (0 = R6's scene-wide alias
+draw). All four are `SceneRenderer::RtLocalTuning` fields rather than
+`GraphicsSettings`: they are measurement instruments, not quality levels a
+player would be shown.
 
 **The DI temporal-noise probe** (`--rt-bench`, printed as `[rtbench] di
 noise=`) is the one number the smoke test structurally cannot produce — a

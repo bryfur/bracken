@@ -10,6 +10,7 @@
 #include <glm/glm.hpp>
 #include <memory>
 #include <SDL3/SDL_gpu.h>
+#include <span>
 #include <vector>
 
 namespace bracken::core::jobs {
@@ -112,6 +113,17 @@ public:
 
     const ClusterParams& params() const { return params_; }
 
+    // Per-froxel view-space AABBs, CLUSTER_COUNT entries — the memoized table
+    // begin_frame() rebuilds when the projection or near/far changes. Exposed
+    // because the light binner is no longer the only one: the emissive record
+    // binner (render/raytracing/emissive_clusters.hpp) tests the SAME boxes, and
+    // recomputing them there would be a second copy of the unprojection that
+    // could disagree with this one about which froxel a point is in. EMPTY
+    // before the first begin_frame().
+    // Thread-safety: main-thread/Prepare, like every other accessor here — valid
+    // until the next begin_frame().
+    [[nodiscard]] std::span<const ClusterBounds> cluster_bounds() const { return cluster_bounds_; }
+
     // Test/debug accessors.
     const std::vector<PointLight>& point_lights() const { return points_; }
     const std::vector<SpotLight>& spot_lights() const { return spots_; }
@@ -127,12 +139,6 @@ public:
     uint32_t total_lights() const { return static_cast<uint32_t>(points_.size() + spots_.size()); }
 
 private:
-    // Linear cluster -> sphere/AABB params, computed in begin_frame() from camera.
-    struct ClusterBounds {
-        glm::vec3 view_min;
-        glm::vec3 view_max;
-    };
-
     // View-space light position/radius, rebuilt in build() each frame.
     struct ViewLight {
         glm::vec3 view_pos;

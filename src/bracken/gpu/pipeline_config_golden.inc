@@ -747,7 +747,7 @@ RtReflection
 RtReflectionTemporal
   cs        rt_reflection_denoise_temporal.comp.spv entry=CSMain samplers=6 ro_textures=0 ro_buffers=1 rw_textures=1 rw_buffers=0 uniform_buffers=1
 RtLocalShadow
-  cs        rt_local_shadow.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=8 rw_textures=4 rw_buffers=4 uniform_buffers=2
+  cs        rt_local_shadow.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=8 rw_textures=4 rw_buffers=5 uniform_buffers=2
 RtDiTemporal
   cs        rt_di_denoise_temporal.comp.spv entry=CSMain samplers=7 ro_textures=1 ro_buffers=1 rw_textures=3 rw_buffers=0 uniform_buffers=1
 RtDiSpatial

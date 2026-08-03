@@ -970,10 +970,17 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
     // is why its neighbourhood reads ride the reservoir slots that were already
     // here. One pipeline, two dispatches — see the shader's header for why the
     // gradient replay makes that the only sane arrangement.
+    //
+    // R8 added a FIFTH read-write storage buffer, again read-only and again for
+    // the budget: the per-froxel emissive candidate table. Five of SDL3's eight
+    // read-write slots, against eight of eight read-only — which is why every
+    // buffer this pass has gained since R5c has arrived on the read-write side.
+    // The gradient pass does NOT take it: a replay is handed a record index that
+    // was already chosen and never draws a candidate of its own.
     .resources = {.num_samplers = 3,
                    .num_readonly_storage_buffers = 8,
                    .num_readwrite_storage_textures = 4,
-                   .num_readwrite_storage_buffers = 4,
+                   .num_readwrite_storage_buffers = 5,
                    .num_uniform_buffers = 2}},
     {.name = "RtDiTemporal",
      .shader = "rt_di_denoise_temporal.comp.spv",

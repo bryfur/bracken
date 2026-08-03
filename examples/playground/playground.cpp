@@ -1660,11 +1660,25 @@ void PlaygroundGame::setup_smoke_run() {
     if (const char* env = SDL_getenv("PLAYGROUND_RT_DI_ITERS"); env != nullptr && env[0]) {
         rt_di_spatial_iterations_ = static_cast<uint32_t>(std::clamp(SDL_atoi(env), 1, 2));
     }
+    // PLAYGROUND_RT_EMISSIVE=<M_e> / PLAYGROUND_RT_EMISSIVE_LOCAL=<0..1>: the
+    // two A/B levers R8's cost table is measured with. `RT_EMISSIVE=0` is the
+    // records-OFF column (no emissive candidate stream at all, every RIS weight
+    // back to its R5c form); `RT_EMISSIVE_LOCAL=0` is R6's purely global alias
+    // draw with the froxel lists built but unused. Same status as
+    // PLAYGROUND_RT_SPATIAL: measurement instruments, not quality levels.
+    if (const char* env = SDL_getenv("PLAYGROUND_RT_EMISSIVE"); env != nullptr && env[0]) {
+        rt_emissive_candidates_ = static_cast<uint32_t>(std::clamp(SDL_atoi(env), 0, 16));
+    }
+    if (const char* env = SDL_getenv("PLAYGROUND_RT_EMISSIVE_LOCAL"); env != nullptr && env[0]) {
+        rt_emissive_froxel_share_ = std::clamp(static_cast<float>(SDL_atof(env)), 0.0f, 1.0f);
+    }
     {
         bracken::scene::SceneRenderer::RtLocalTuning tuning;
         tuning.spatial_neighbors = rt_spatial_neighbors_;
         tuning.di_spatial_iterations = rt_di_spatial_iterations_;
         tuning.di_noise_probe = rt_di_noise_probe_;
+        tuning.emissive_candidates = rt_emissive_candidates_;
+        tuning.emissive_froxel_share = rt_emissive_froxel_share_;
         scene_renderer().set_rt_local_tuning(tuning);
     }
     // PLAYGROUND_CAMERA="vx,vz,yaw,pitch,dist_m" pins the camera at a
@@ -1990,13 +2004,18 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
                 // the scene-space records they flattened into, and whether those
                 // records actually fed the DI candidate draw (Full tier only —
                 // see the tier note in docs/rt_lighting_plan.md §5.7).
-                "emissive_tris={} emissive_records={} emissive_dropped={} emissive_di={}\n",
+                "emissive_tris={} emissive_records={} emissive_dropped={} emissive_di={} "
+                // R8: what the per-froxel emissive bin produced, and whether the
+                // trace drew through it (false = R6's scene-wide alias draw).
+                "emissive_local={} emissive_froxels={} emissive_entries={} "
+                "emissive_froxel_dropped={}\n",
                 rt.shadows_traced, rt.reflections_traced, rt.local_shadows_traced,
                 rt.local_di_traced, rt.shadow_rays,
                 rt.reflection_rays, rt.local_shadow_rays,
                 static_cast<double>(rt.acceleration_bytes) / (1024.0 * 1024.0),
                 rt.emissive_triangles, rt.emissive_records, rt.emissive_records_dropped,
-                rt.emissive_di_sampled);
+                rt.emissive_di_sampled, rt.emissive_froxel_local, rt.emissive_froxels_filled,
+                rt.emissive_froxel_entries, rt.emissive_froxel_dropped);
             // The structure, itemized. `instances` is post-range-filter, so it
             // is what the rays actually see; `tlas_builds` should read 1 while
             // the instance SET is stable — a moving instance costs a

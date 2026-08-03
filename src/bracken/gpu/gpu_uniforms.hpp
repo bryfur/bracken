@@ -1321,7 +1321,15 @@ struct alignas(16) RtLocalShadowUniforms {
     uint32_t spatialNeighbors = 0;
     /// Neighbour ring radius, in traced texels.
     float spatialRadius = 8.0f;
-    uint32_t _pad0 = 0;
+    /// R8 — q_f, the share of each emissive candidate draw taken from the
+    /// pixel's PER-FROXEL emissive list rather than from the scene-wide power
+    /// alias table (docs/rt_lighting_plan.md §5.7 follow-up 2). Took the slot
+    /// that was `_pad0`, so the extent is unchanged.
+    ///
+    /// 0 collapses the mixture to its global component and reproduces R6's draw
+    /// bit for bit — which is both the A/B control and what the CPU sends on any
+    /// frame the froxel table is not this frame's.
+    float emissiveFroxelShare = 0.0f;
 };
 
 BRACKEN_HLSL_CBUFFER(RtLocalShadowUniforms, 160);
@@ -1346,7 +1354,7 @@ BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, shadowCapsuleCount, 140);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, stage, 144);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, spatialNeighbors, 148);
 BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, spatialRadius, 152);
-BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, _pad0, 156);
+BRACKEN_HLSL_FIELD(RtLocalShadowUniforms, emissiveFroxelShare, 156);
 
 /**
  * The Full-DI tier's temporal denoiser — matches

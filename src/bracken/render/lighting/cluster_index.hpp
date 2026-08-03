@@ -34,6 +34,21 @@ struct alignas(16) ClusterParams {
     glm::uvec4 maxPerCluster;
 };
 
+/**
+ * One froxel's VIEW-SPACE axis-aligned bounds — the memoized table
+ * `ClusterGrid::begin_frame` rebuilds whenever the projection or the near/far
+ * pair changes, and the thing every froxel binner in the tree tests against.
+ *
+ * Here rather than inside `ClusterGrid` because it has two binners now: the
+ * light one that owns the table, and `render::rt::EmissiveClusterGrid`, which
+ * borrows it. A view-space AABB needs no device and no SDL, so it belongs in
+ * the GPU-free half with the index math it is used alongside.
+ */
+struct ClusterBounds {
+    glm::vec3 view_min{0.0f};
+    glm::vec3 view_max{0.0f};
+};
+
 /// Positive view-space depth (distance forward of the camera) -> Z slice.
 /// Mirror of `clusterZSlice` in shaders/cluster_index.hlsli, operation for
 /// operation — including the `max(depth, near)` clamp and the floor/clamp

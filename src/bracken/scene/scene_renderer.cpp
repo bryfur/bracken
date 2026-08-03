@@ -230,6 +230,9 @@ bool SceneRenderer::init(render::RenderContext& context, float world_width, floa
     if (!cluster_grid_ready_) {
         BRACKEN_LOG_WARN(LOG_TAG, "Failed to initialize ClusterGrid (dynamic lighting disabled)");
     }
+    // Allocates nothing here: the table's buffer is created on the first frame
+    // that actually bins records, so a scene with no emitter never pays for it.
+    emissive_clusters_ready_ = emissive_clusters_.init(context_->device());
 
     return true;
 }
@@ -1237,6 +1240,32 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     refresh_raytracing_instances(frame, cmd, draw_camera.position,
                                                  rt_range_units(gfx.rt_max_instance_range));
                 }
+                // R8: bin those records into THIS frame's froxel grid
+                // (docs/rt_lighting_plan.md §5.7 follow-up 2). It has to be here
+                // and not in the frame's consolidated copy pass: the records are
+                // world-space and were only just brought up to date by the refit
+                // above, and a table describing last frame's records is exactly
+                // what the trace refuses to draw through.
+                //
+                // Timed on its own row rather than folded into RTInstances,
+                // because "how much main-thread time does the localization cost"
+                // is the question this package has to answer. The camera-relative
+                // grid is why it reruns every frame where the records themselves
+                // mostly do not.
+                if (emissive_clusters_ready_ && cluster_upload_needed &&
+                    gfx.rt_local_shadows == LocalRtShadowMode::Full &&
+                    rt_local_tuning_.emissive_froxel_share > 0.0f &&
+                    rt_local_tuning_.emissive_candidates > 0) {
+                    BRACKEN_PROFILE_ZONE_COLOR("RTEmissiveBins", 0x27AE60);
+                    BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "RTEmissiveBins");
+                    emissive_clusters_.build(rt_renderer_->scene().emissive_record_data(),
+                                             cluster_grid_.params(), cluster_grid_.cluster_bounds());
+                    emissive_clusters_.upload(cmd);
+                } else {
+                    emissive_clusters_.invalidate();
+                }
+            } else {
+                emissive_clusters_.invalidate();
             }
 
             // ===== Probe-field GI: scroll the clipmap to follow the camera,
@@ -1532,6 +1561,8 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 ls.spatial_radius = rt_local_tuning_.spatial_radius;
                 ls.di_spatial_iterations = rt_local_tuning_.di_spatial_iterations;
                 ls.di_noise_probe = rt_local_tuning_.di_noise_probe;
+                ls.emissive_candidate_count = rt_local_tuning_.emissive_candidates;
+                ls.emissive_froxel_share = std::clamp(rt_local_tuning_.emissive_froxel_share, 0.0f, 1.0f);
 
                 // The frame's binned light buffers. Handed over as one struct
                 // that knows when it is incomplete, because "trace against a
@@ -1549,6 +1580,17 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     cluster_bindings.params = &frame_cluster_params_;
                     cluster_bindings.params_size = sizeof(frame_cluster_params_);
                     cluster_bindings.total_lights = frame_cluster_params_.gridDim.w;
+                    // R8's emissive froxel table, only when THIS frame binned it.
+                    // `live()` false leaves the pointer null, which is what makes
+                    // the trace fall back to R6's global draw rather than sample
+                    // through a list that describes a different record set.
+                    if (emissive_clusters_.live()) {
+                        const auto& ec = emissive_clusters_.stats();
+                        cluster_bindings.emissive_froxels = emissive_clusters_.buffer();
+                        cluster_bindings.emissive_froxel_entries = ec.entries;
+                        cluster_bindings.emissive_froxels_filled = ec.froxels_filled;
+                        cluster_bindings.emissive_froxel_dropped = ec.entries_dropped;
+                    }
                 }
 
                 // Reflections need the prepass G-buffer; without it (allocation

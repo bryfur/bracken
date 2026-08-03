@@ -152,13 +152,34 @@ struct RtLocalShadowSettings {
      * `full_di` is false, and this field is inert there. The tier note in
      * rt_local_shadow.comp.hlsl's header carries the full argument.
      *
-     * 2 is the shipped default and the plan's lower bound. The draws come out
-     * of a scene-wide power-weighted alias table, so each one is already an
-     * importance-sampled choice rather than a uniform one; past ~4 the extra
-     * draws mostly re-pick the same bright emitters and the reservoir's
-     * temporal reuse is the cheaper way to buy the same convergence.
+     * 2 is the shipped default and the plan's lower bound. Each draw is already
+     * an importance-sampled choice rather than a uniform one (see
+     * `emissive_froxel_share`), so past ~4 the extra draws mostly re-pick the
+     * same bright emitters and the reservoir's temporal reuse is the cheaper
+     * way to buy the same convergence.
+     *
+     * **0 turns the emissive candidate stream off**, which is the A/B control
+     * §5.7's cost table is measured against: with no records sent every RIS
+     * weight in the pass collapses to its R5c form bit for bit.
      */
     uint32_t emissive_candidate_count = 2;
+    /**
+     * Fraction of each emissive candidate draw taken from the pixel's PER-FROXEL
+     * emissive list rather than from the scene-wide power-weighted alias table
+     * (R8, docs/rt_lighting_plan.md §5.7 follow-up 2).
+     *
+     * The two are a MIXTURE over the same domain, not two streams: a record can
+     * be reachable both ways and its sampling pdf is the sum of the two paths'
+     * contributions. That is what keeps the estimator unbiased over the FULL
+     * record set while still aiming three draws in four at emitters that are
+     * actually near the pixel — which is what shortens the shadow ray.
+     *
+     * **0 reproduces R6's purely global draw exactly** (the mixture collapses to
+     * its second component), and is the before column of that measurement. 1
+     * would drop the global component and with it the coverage guarantee for an
+     * emitter no froxel list holds, so it is not offered as a quality level.
+     */
+    float emissive_froxel_share = 1.0f;
     /// M — candidates drawn from the pixel's froxel before one survives. The
     /// froxel list is short (the playground's densest is single digits), so
     /// beyond ~8 the extra draws mostly re-pick lights already considered.
@@ -251,6 +272,21 @@ struct RtClusterBindings {
     /// picked last frame go?" — not the ids'. See cluster_compute.hlsli's
     /// CLUSTER_COMPUTE_WANT_STABLE_IDS.
     SDL_GPUBuffer* light_remap = nullptr;
+    /// R8's per-froxel EMISSIVE candidate table
+    /// (render/raytracing/emissive_clusters.hpp), or null when it was not built
+    /// this frame. Optional, deliberately: null makes the trace send
+    /// `emissiveFroxelShare = 0`, which is R6's global draw — correct, merely
+    /// noisier and longer-rayed. It is therefore NOT part of `complete()`.
+    SDL_GPUBuffer* emissive_froxels = nullptr;
+    /// Froxel-list entries the table actually holds. Zero is treated as null.
+    uint32_t emissive_froxel_entries = 0;
+    /// The other two halves of `rt::EmissiveClusterStats`, carried here for one
+    /// reason only: the binner belongs to the caller (it needs the light grid's
+    /// froxel bounds) and the stats LINE belongs to this renderer, so they ride
+    /// the struct that already crosses that boundary rather than growing a
+    /// second path. Reported verbatim in `RtStats`.
+    uint32_t emissive_froxels_filled = 0;
+    uint32_t emissive_froxel_dropped = 0;
     const void* params = nullptr;
     uint32_t params_size = 0;
     /// Lights the frame actually binned. Zero means the CPU skipped binning, in
@@ -417,6 +453,19 @@ struct RtStats {
     /// on RtLocalShadowSettings::full_di — a ratio estimator cannot represent a
     /// light the analytic forward loop does not evaluate.
     bool emissive_di_sampled = false;
+    /// R8, per-froxel emissive candidate lists (§5.7 follow-up 2). Mirrors
+    /// rt::EmissiveClusterStats: froxels holding at least one record, entries
+    /// packed across all of them, and record-froxel associations that did not
+    /// fit the per-froxel cap. A non-zero drop count is a QUALITY figure and not
+    /// an error — those records stay reachable through the global half of the
+    /// mixture — but it is reported rather than swallowed, per the no-silent-
+    /// drops rule. All three are 0 whenever the table was not built.
+    uint32_t emissive_froxels_filled = 0;
+    uint32_t emissive_froxel_entries = 0;
+    uint32_t emissive_froxel_dropped = 0;
+    /// Whether the trace actually drew through the froxel lists this frame
+    /// (`emissiveFroxelShare > 0`). False means R6's purely global draw.
+    bool emissive_froxel_local = false;
 
     /// A-SVGF gradient rays dispatched this frame, per signal — one thread per
     /// 3x3 stratum of the traced resolution, so exactly ceil(w/3)*ceil(h/3).
@@ -817,6 +866,9 @@ private:
     /// record slot when the scene has no emitter. A storage-buffer descriptor
     /// may not be empty; `emissiveCount = 0` is what stops it being indexed.
     [[nodiscard]] bool ensure_emissive_dummy();
+    /// Same, for R8's per-froxel emissive candidate table. One zeroed froxel
+    /// block; `emissiveFroxelShare = 0` is what stops it being indexed.
+    [[nodiscard]] bool ensure_emissive_froxel_dummy();
     /// Create (once) the one-element stand-in bound into the capsule slot on a
     /// frame with no capsules. Same rule as the emissive dummy: a storage-buffer
     /// descriptor may not be empty, and `shadowCapsuleCount = 0` is what stops
@@ -953,6 +1005,7 @@ private:
     uint32_t local_emissive_history_valid_ = 0;
     SDL_GPUBuffer* local_emissive_bound_ = nullptr;
     std::unique_ptr<gpu::GPUBuffer> local_emissive_dummy_;
+    std::unique_ptr<gpu::GPUBuffer> local_emissive_froxel_dummy_;
 
     // ---- analytic capsule occluders (docs/rt_lighting_plan.md §5.8) ----
     /// The frame's ShadowCapsules, uploaded once in the renderer's copy pass

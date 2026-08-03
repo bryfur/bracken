@@ -1134,6 +1134,45 @@ is stable within an epoch and meaningless across one, which is exactly the
 condition under which a reservoir may carry an emissive selection across a frame
 boundary — see "Local-light DI" below.
 
+#### Per-froxel emissive lists (R8)
+
+Records are also **binned into the froxel grid**, so the local-light pass draws
+emissive candidates from a short local list instead of a scene-wide table. The
+binner is `render::rt::EmissiveClusterGrid`
+(`render/raytracing/emissive_clusters.hpp`), owned by `SceneRenderer` next to
+`ClusterGrid` and run from the same place the TLAS refit is (the records are
+world-space and were only just refreshed there — the frame's consolidated copy
+pass has already closed by then, so its table rides `cmd` the way `RtScene`'s
+own buffers do). It is gated on the **Full** tier: nothing binds or costs
+anything under `Ratio`.
+
+- It borrows `ClusterGrid::cluster_bounds()` rather than recomputing froxel
+  boxes. Two binners disagreeing about where a froxel is would put a record in
+  one froxel and the pixel in another, which reads as "the lists are empty".
+- Selection is by unshadowed contribution `power / max(d^2, area)` at the froxel
+  centre, capped at **16 records per froxel**
+  (`k_emissive_froxel_capacity`); its inverse `sqrt(power / threshold)`, clamped
+  at `k_emissive_froxel_max_radius` (400 units), is the relevance radius that
+  makes the bin O(records x touched froxels).
+- One flat `uint` table, `[count][record x 16]` **ascending** per froxel
+  (235 KB at 3456 froxels), fixed stride so a froxel's block is addressable
+  without a prefix sum — which is what lets each binning chunk pack its own
+  froxels rather than needing a serial pack after the join.
+- **Deterministic at any worker count**: pass 1 (per-record froxel box) is a
+  pure per-element map, the survivors are compacted serially in ascending record
+  order, and pass 2 chunks by FROXEL so every bin has exactly one writer and sees
+  records in the same order a serial loop would. The top-k replaces only on a
+  STRICTLY greater score, so ties keep the lower record index.
+- Over-cap insertions are counted in `RtStats::emissive_froxel_dropped`, never
+  swallowed; `emissive_froxels_filled` / `emissive_froxel_entries` report what
+  the table holds. CPU cost is measured on its own `RTEmissiveBins` pass row
+  (0.283 ms for 8192 records on the playground).
+- **`live()` is the whole degradation path.** A frame that skips the bin calls
+  `invalidate()`, the renderer then sends `emissiveFroxelShare = 0`, and the
+  shader's mixture collapses to R6's global alias draw — bit for bit. There is
+  deliberately no path that samples through a table describing a different record
+  set.
+
 ### The two traced effects
 
 Both are **one sample per pixel, stochastic, and denoised**, which makes the
@@ -1196,9 +1235,18 @@ Per pixel:
    where `accumulateClusterLights` skips it.
 
    **In the `Full` tier only (R6), a SECOND stream joins it**: M_e = 2 emissive
-   records drawn from the scene-wide power-weighted alias table, scored by
-   `rtEmissiveTarget` — deliberately the same physical quantity, so the two
-   streams are commensurable. The two domains are disjoint and their integrals
+   records scored by `rtEmissiveTarget` — deliberately the same physical
+   quantity, so the two streams are commensurable. Since **R8** those records are
+   drawn from a MIXTURE of the pixel's per-froxel emissive list with the
+   scene-wide power alias table, `p(x) = q_f [x in L_f]/|L_f| + q_g
+   power(x)/totalPower`, `q_f = RtLocalShadowSettings::emissive_froxel_share`.
+   The two halves OVERLAP and a record reachable both ways carries both terms —
+   which is what dedupe means for a mixture, and why this stayed ONE stream and
+   `ris_source_scale` did not change. `q_f = 0` reproduces R6 bit for bit and is
+   the A/B control; the shipped `1.0` makes the froxel list the candidate domain,
+   which recovers 1.2 ms of `present_wait` and gives up the far-field emissive
+   fill (docs/rt_lighting_plan.md §5.7's R8 note has the full measurement,
+   including why every value in between recovers nothing). The two domains are disjoint and their integrals
    must be SUMMED, not averaged, so each candidate's weight carries a
    balance-heuristic factor (`ris_source_scale`, `render/lighting/reservoir.hpp`)
    of `M_current / M_source`. With one source that factor is exactly `1.0f`,

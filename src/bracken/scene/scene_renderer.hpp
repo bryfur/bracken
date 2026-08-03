@@ -12,6 +12,7 @@
 #include "bracken/contracts/render_stats.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
+#include "bracken/render/raytracing/emissive_clusters.hpp"
 #include "bracken/render/gi/gi_bindings.hpp"
 #include "bracken/render/gi/probe_volume.hpp"
 #include "bracken/render/gi/screen_probes.hpp"
@@ -228,6 +229,17 @@ public:
         /// Measure the Full-DI tier's frame-to-frame noise (R7). Off by
         /// default: it is a whole dispatch spent on a diagnostic.
         bool di_noise_probe = false;
+        /// M_e — emissive-mesh candidates drawn per pixel (R6). **0 turns the
+        /// emissive candidate stream off entirely**, which is the A/B control
+        /// the §5.7 cost figures are measured against: with no records sent,
+        /// every RIS weight in the trace collapses to its R5c form bit for bit.
+        uint32_t emissive_candidates = 2;
+        /// Fraction of each emissive candidate draw taken from the pixel's
+        /// PER-FROXEL list rather than from the scene-wide power alias table
+        /// (R8, docs/rt_lighting_plan.md §5.7's follow-up 2). **0 reproduces
+        /// R6's purely global draw exactly** — the mixture collapses to its
+        /// second component — which is the before column of that measurement.
+        float emissive_froxel_share = 1.0f;
     };
     void set_rt_local_tuning(const RtLocalTuning& tuning) { rt_local_tuning_ = tuning; }
     [[nodiscard]] const RtLocalTuning& rt_local_tuning() const { return rt_local_tuning_; }
@@ -557,6 +569,15 @@ private:
     std::unique_ptr<gpu::GPUTexture> water_depth_copy_;
     render::lighting::ClusterGrid cluster_grid_;
     bool cluster_grid_ready_ = false;
+    // R8's second froxel binner (docs/rt_lighting_plan.md §5.7 follow-up 2):
+    // emissive light records into the SAME froxel grid the lights were binned
+    // into, so the traced local-light pass draws its emissive candidates from a
+    // local list instead of a scene-wide alias table. Owned here rather than by
+    // RtRenderer because it borrows `cluster_grid_.cluster_bounds()` — the two
+    // binners must agree about where a froxel is, and the only way to guarantee
+    // that is to test the same boxes.
+    render::rt::EmissiveClusterGrid emissive_clusters_;
+    bool emissive_clusters_ready_ = false;
     std::unique_ptr<render::lighting::LocalShadowMap> local_shadows_;
 
     // ========== GPU Resources ==========

@@ -254,8 +254,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     // ---- replay: an EMISSIVE record, the previous frame's sample ----------
     //
-    // Transliterated from the trace's own emissive branch, down to the relative
-    // ray-length margin that stops the emitter occluding itself. `rtSample2D`
+    // Transliterated from the trace's own emissive branch, down to the shared
+    // `rtEmissiveRayLength` self-occlusion margin. `rtSample2D`
     // at (prevCoord, frameIndex - 1) returns EXACTLY the pair the previous
     // frame drew — the replayability requirement §2 of the plan states — so
     // this is a replay of the ray that ran, not a fresh sample of the same
@@ -273,7 +273,10 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             const float slope = saturate(1.0 - ndotl);
             const float3 rayOrigin =
                 worldPos + normal * (normalBias * (1.0 + slope * 4.0)) + L * depthBias;
-            const float rayLen = min(dist * 0.998, dist - depthBias) - normalBias;
+            // The SHARED length. A replay that stopped at a different
+            // distance than the trace did would report a gradient on those
+            // strata forever.
+            const float rayLen = rtEmissiveRayLength(dist, depthBias, normalBias);
             emissiveLit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, L, rayLen);
         }
         gradientOut[stratum] = abs((emissiveLit ? 1.0 : 0.0) - prevLit);

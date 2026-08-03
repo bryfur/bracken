@@ -8,6 +8,11 @@ MIS (§5.3), the directional basis for the Full-DI tier (§5.7's first
 follow-up), a second a-trous iteration of the DI spatial filter, and the
 `[rtbench] di noise` probe that makes all three measurable. R7 closed the two
 oldest deferred items in this document; §5.3 and §5.7 carry its landed notes.
+**R8** (2026-08-02) then took §5.7's follow-up 2, per-froxel emissive candidate
+lists: it recovered a bit over half of R6's 2.11 ms emissive-DI cost and gave up
+the far-field emissive fill to do it, which makes it the first item in this plan
+that is a measured TRADE rather than a win — read its landed note before
+revisiting the area.
 R0 (foundations), R1 (probe-field GI), R2 (froxel-RIS local-light shadows),
 R3 (honest hit lighting), R4 (HZB + indirect dispatch in R4a, the screen-probe
 gather in R4b), R5 (SSILVB in R5a, the denoiser core in R5b, the Full-DI tier
@@ -2042,9 +2047,10 @@ rough value order:
    above).~~ **DONE — R7b, 2026-08-02**; the landed note is at the end of this
    section. It was the single most valuable item and it delivered what it
    promised: the cobbles have their bump lighting back.
-2. **Per-froxel emissive candidate lists.** The ~2.1 ms above is a scene-wide
-   alias draw paying for long rays; binning emitters into the cluster grid the
-   way point lights are would localize both.
+2. ~~**Per-froxel emissive candidate lists.**~~ **DONE — R8, 2026-08-02**; the
+   landed note is at the end of this section. It recovered a bit over half of
+   the 2.11 ms and cost 1.0 luma of far-field emissive fill, and the reason it
+   is a trade rather than a win is worth reading before anyone revisits it.
 3. **Split Radiance Cascades** (Freeman & Sannikov, July 2026) as a probe-field
    replacement — re-evaluate on the original 12–18 month clock, i.e. mid-2027.
    Nothing measured since the plan was written changes that verdict.
@@ -2133,6 +2139,123 @@ G-buffer's geometric one.
   by hand. `Ratio` remains the recommendation for the Silver tier and below;
   `Full` is now the right choice for any scene where local lights carry the
   image, which at night is all of them.
+
+**Landed (R8, 2026-08-02) — per-froxel emissive candidate lists. Half the 2.11
+ms comes back; the other half turns out to be structural.**
+
+Emissive records are now binned into the SAME 16x9x24 froxel grid the light
+binner uses (`render/raytracing/emissive_clusters.hpp`, driven from
+`SceneRenderer` right after the TLAS refit because the records are world-space
+and were only just refreshed). Per froxel, a budgeted list of at most
+**16 record indices**, chosen by unshadowed contribution `power / max(d^2, area)`
+at the froxel centre — the same expression `emissive_target` computes with both
+cosines at 1, so it is directly commensurable with the analytic path's target
+function, and its inverse is a RELEVANCE RADIUS that plays the role a point
+light's authored `radius` plays for the light binner. One flat `uint` table,
+`[count][record x 16]` ascending per froxel, 235 KB, uploaded per frame.
+
+**The candidate draw became a MIXTURE, not a third stream.** R6's multi-source
+RIS weights need disjoint domains, and the two emissive halves overlap by
+construction — the record most likely to be in the global fallback is exactly
+the one most likely to be in the local list. So the emissive stream stays ONE
+stream and its source pdf becomes
+
+    p(x) = q_f * [x in L_f] / |L_f|  +  q_g * power(x) / totalPower
+
+with `q_f = RtLocalShadowSettings::emissive_froxel_share`. A record reachable
+both ways carries both terms; that is what dedupe means for a mixture, and it is
+why `ris_source_scale` did not have to change at all — there is still exactly one
+emissive stream, and with `q_f = 0` the pdf is `power/totalPower` times an exact
+1.0, i.e. R6 bit for bit. `emissive_clusters.test.cpp` pins the pmf summing to 1
+over every record, the draw frequencies matching the stated pdf by integration
+over both uniforms, the share-0 collapse being EXACT rather than close, and the
+estimator converging to the whole-record-set sum at intermediate shares.
+
+**THE CENTRAL MEASUREMENT, and it is not the intuitive one.** Every intermediate
+`q_f` is unbiased over the full record set and recovers NOTHING:
+
+| `q_f` | night luma | frame render | device cost of the records |
+|---|---|---|---|
+| 0 (R6) | `37.0` | 4.724 ms | **2.11 ms** |
+| 0.75 | `37.2` | 4.240 ms | ~2.0 ms |
+| 0.90 | `37.4` | 4.249 ms | ~2.0 ms |
+| 0.97 | `37.9` | 4.199 ms | ~2.0 ms |
+| **1.0 (shipped)** | `36.0` | **3.78 ms** | **0.89 ms** + 0.29 ms CPU |
+
+A CLIFF, NOT A SLOPE. The pass is 8x4 threads per tile; one thread walking the
+whole acceleration structure sets the cost of all 32, and at any nonzero global
+rate nearly every tile contains one. **Tile-stratifying the global half** (a
+quarter of tiles pay, the rest run local) was implemented and measured WORSE than
+either end — 4.65 ms — because R7a's spatial reservoir reuse reaches across tile
+boundaries and propagates the far records, and the long rays with them. So the
+recovery is only available at `q_f = 1`, where a froxel's list IS the candidate
+domain: the same contract point and spot lights have had since R2b.
+
+**What that costs, stated plainly: 1.0 luma of far-field emissive fill at the
+night pin.** A village's glow is a sum over eight thousand dim windows and no
+bounded per-froxel list reaches it. That was verified rather than assumed —
+packing every froxel to 64 entries measures `35.6`, WORSE than 16, so it was
+never a coverage problem — and it is why `emissive_froxel_share` ships as a
+documented dial rather than a constant. In exchange the DI temporal noise probe
+drops **3.2x (0.00045 -> 0.00014)**: a froxel list is a far better importance
+function for the near field than a scene-wide power table, which is also why the
+intermediate shares read BRIGHTER than R6 rather than merely equal.
+
+**Two things that were tried and rejected, with their numbers, so nobody repeats
+them.** Truncating the emissive shadow ray at the localization horizon is the
+obvious companion to bounding the binning there, it is cheap, and it leaks:
+`37.0 -> 43.8` mean luma, light through walls. And drawing the froxel list
+PROPORTIONAL to the same score that put a record in it — a per-froxel CDF in a
+second half-block, the textbook improvement — cost 0.4 ms of device time for no
+change in either mean luma or the noise probe, because the list is short and the
+reservoir re-weights by p̂ regardless. The list is drawn uniformly and stores one
+index per entry.
+
+**The CPU cost is 0.283 ms** on the playground's 8192 records against 3456
+froxels, on the main thread, in its own `RTEmissiveBins` pass row. Getting there
+took three specific things and the first version cost 1.20 ms without them: a
+four-plane view-space frustum pre-cull before the eight matrix-vector products
+that bound a record's tile range, a serial COMPACTION of the survivors so the
+binning chunks re-walk hundreds of records instead of thousands, and chunking by
+ONE Z slice instead of three (the load is wildly uneven — the near slices hold
+everything a village emits — and at 8 chunks the pass saturated at 1.1 ms no
+matter how many workers were free). Binning is deterministic at any worker
+count: every froxel is written by exactly one chunk, records are walked in
+ascending index, and the top-k replaces only on a STRICTLY greater score, so ties
+keep the lower record index. Over-cap insertions are counted, never swallowed
+(`RtStats::emissive_froxel_dropped`; the playground reports 7586 against 2706
+entries in 232 froxels).
+
+**Measured**, playground village, 1600x900, Linux/Vulkan, RelWithDebInfo, 3-run
+identical, `--rt-bench 150` back to back in one session (the machine had drifted
+~10% slower than the figures recorded at R6, which is why the R6 column here does
+not match §5.7's table above — compare within this block):
+
+| | records off | R6 global draw | R8 froxel-local |
+|---|---|---|---|
+| frame render | 2.609 ms | 4.724 ms | **3.762 ms** |
+| `present_wait` | 2.072 ms | 4.140 ms | **2.912 ms** |
+| `RTEmissiveBins` (CPU) | — | — | 0.283 ms |
+| `RTInstances` (CPU) | 0.180 ms | 0.185 ms | 0.180 ms |
+| fps | 305 | 188 | **226** |
+| `di noise` | 0.00009 | 0.00045 | **0.00014** |
+
+Screenshot pins: RT off, `RT=both`, `GI=probes` and both Ratio rows are
+**bit-identical** — the binning does not run outside the Full tier and the
+uniform's new field took the slot that was `_pad0`. Full by day `85.6 -> 85.5`,
+Full by night `37.0 -> 36.0`. The local gradient fire rate moves 0.0230 ->
+0.0293 with `local_accum` unchanged at 24.0, which is a reservoir switching
+lights slightly more often as froxel membership changes and not the permanent
+history reset a broken replay would show. Validated (`BRACKEN_GPU_DEBUG=1`) run
+clean. 1572 tests pass (+13).
+
+**Still open here.** The far-field fill `q_f = 1` gives up is genuinely lost, and
+the only structure that could return it without the long rays is a spatially
+coherent far-field approximation — a many-light aggregate (a light tree over the
+records, an irradiance-volume term, or the probe field carrying emissive DI
+rather than only emissive bounce). That is a phase, not a tweak, and nothing
+measured here suggests it is urgent: the probe field ALREADY carries the emissive
+bounce, so the deficit shows only in the direct term.
 
 ### 5.8 Dynamic & skinned geometry policy (cross-cutting)
 
@@ -2281,6 +2404,7 @@ Dependency-ordered; each phase ships alone.
 | **R6** | ~~emissive mesh lights, area-light authoring, stretch cache decision~~ (**COMPLETE, 2026-08-02**) | night-village shot with lit windows lighting their own stonework; emissive in reflections + probes measured in isolation (0.125%/0.348%/13.2% of bytes); watch-list re-evaluation and the standing follow-up list recorded in §5.7. **Stretch NOT taken** — the SHaRC-shaped cache was gated on a measured deficiency and none exists |
 
 | **R7** | ~~spatial reservoir reuse (pairwise MIS), the Full-DI directional basis, a second a-trous iteration, the `di noise` probe~~ (**COMPLETE, 2026-08-02**) | the two oldest deferred items in this document closed. **Met**: `spatial_neighbors = 0` reproduces every pre-R7 pin bit for bit; brute-force unbiasedness gate on the pairwise weights; `di noise` down 23–24 % under a moving camera; night cobbles have their relief back at 1.2 luma LOWER mean. **Not met and recorded**: `local_grad_fire` rose 0.0192 → 0.0205 |
+| **R8** | ~~per-froxel emissive candidate lists (§5.7 follow-up 2)~~ (**COMPLETE, 2026-08-02**) | **Met**: emissive-DI device cost 2.11 → 0.89 ms, `present_wait` 4.14 → 2.91 ms, fps 188 → 226, `di noise` 0.00045 → 0.00014, CPU bin 0.283 ms, every non-Full pin bit-identical, `emissive_froxel_share = 0` reproduces R6 exactly. **Not met and recorded**: the night Full pin fell 37.0 → 36.0 — the far-field emissive fill a bounded per-froxel list cannot hold. Also recorded: ray truncation at the horizon (37.0 → 43.8, light through walls), tile-stratified global draws (4.65 ms, worse than either end) and a per-froxel CDF draw (0.4 ms for nothing) were all implemented, measured and REJECTED |
 
 Standing rules for every phase: TSAN suite run after any job-system-adjacent
 work (HQ builder, probe update scheduling); every new cbuffer gets its
