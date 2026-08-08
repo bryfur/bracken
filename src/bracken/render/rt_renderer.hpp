@@ -603,6 +603,12 @@ public:
         /// difference instead of having to be removed from either.
         glm::mat4 view_proj_unjittered{1.0f};
         glm::mat4 prev_view_proj_unjittered{1.0f};
+        /// Previous frame's VIEW matrix. The local gradient replay needs this
+        /// specifically: the reservoir stores a true view depth, not a
+        /// linearized device depth, so its "was this the same surface?" test
+        /// re-measures the world point with the previous camera directly rather
+        /// than going back through a projection.
+        glm::mat4 prev_view{1.0f};
         glm::vec3 camera_position{0.0f};
         /// Unit view direction. `calcShadow` selects a cascade by VIEW depth,
         /// and a reflection-ray hit has to be projected onto this to have one.

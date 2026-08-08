@@ -4,12 +4,26 @@
  * For geometry that is never a mirror -- grass blades. Writes the same
  * velocity as prepass_velocity.frag.hlsl and a roughness of 1, which puts
  * these pixels above any sane RtReflectionSettings::max_roughness so the
- * reflection pass skips them without tracing a ray. The normal is a
- * placeholder that is never read as a result.
+ * reflection pass skips them without tracing a ray.
  *
  * This exists because a render pass and every pipeline inside it must agree on
  * attachment count: with the G-buffer attached, grass needs SOME second-target
  * write even though it has nothing useful to say.
+ *
+ * THE NORMAL IS A CONSTANT +Y AND IS READ. The header used to claim it is
+ * "never read as a result", which was true when the G-buffer served only the
+ * reflection pass and false afterwards -- rt_shadow, rt_local_shadow's
+ * `surfaceAt`, both gradient replays, the DI spatial filter's bilateral weight
+ * and screen-probe placement all decode it. prepass_gbuffer_masked.frag.hlsl
+ * had the identical comment and the identical constant, and there it was doing
+ * real damage, so it now carries a real normal.
+ *
+ * Kept constant HERE on purpose: grass blades genuinely are near-vertical
+ * quads whose interpolated normal is close to up, the error is bounded and
+ * unbiased across a tuft rather than per-card as it was for foliage, and the
+ * grass vertex format would have to grow to fix it. If the DI filter's normal
+ * weight ever needs to separate grass from the ground it stands on, this is the
+ * line to change -- but it is a trade-off now, not an oversight.
  */
 
 struct PSInput {

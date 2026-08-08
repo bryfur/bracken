@@ -869,7 +869,10 @@ bool RtRenderer::trace_sun_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoise
     u.historyValid = (d.history_valid && velocity != nullptr) ? 1u : 0u;
     u.depthA = params.depth_a;
     u.depthB = params.depth_b;
-    u.depthRejectRelative = GRADIENT_DEPTH_REJECT_RELATIVE;
+    u.depthRejectRelative = SUN_GRADIENT_DEPTH_REJECT_RELATIVE;
+    // The replay's depth test asks where this world point WAS, so it needs the
+    // camera it was seen with — not this frame's.
+    u.prevViewProjUnjittered = params.prev_view_proj_unjittered;
     // Exactly what the trace used, one dispatch ago (§5.8).
     u.shadowCapsuleCount = capsule_count_;
 
@@ -939,6 +942,10 @@ bool RtRenderer::trace_local_gradient(SDL_GPUCommandBuffer* cmd, VisibilityDenoi
     u.emissiveCount = local_emissive_count_;
     u.emissiveHistoryValid = local_emissive_history_valid_;
     u.shadowCapsuleCount = capsule_count_; // exactly what the trace used
+    u.depthRejectRelative = LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE;
+    // The replay asks where this world point WAS, so it needs the camera it was
+    // seen with. Passing this frame's made the test measure camera motion.
+    u.prevView = params.prev_view;
     if (local_emissive_bound_ == nullptr && !ensure_emissive_dummy()) {
         return false;
     }
@@ -1189,6 +1196,8 @@ void RtRenderer::denoise_local_di(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& de
         u.maxAccumFrames = std::max(settings.di_max_accum_frames, 1.0f);
         u.clampSigma = std::max(settings.di_clamp_sigma, 0.0f);
         u.lightingReset = params.lighting_reset;
+        // No velocity buffer means no reprojection is possible, and claiming
+        // otherwise would carry every texel straight through camera motion.
         // No velocity buffer means no reprojection is possible, and claiming
         // otherwise would carry every texel straight through camera motion.
         u.historyValid = (local_di_.history_valid && velocity != nullptr) ? 1u : 0u;

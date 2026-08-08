@@ -868,6 +868,11 @@ private:
     };
     FrameCameraMatrices frame_cam_{};
     glm::mat4 prev_view_proj_unjittered_{1.0f}; // last rendered frame's unjittered VP
+    /// Last rendered frame's VIEW matrix, latched in lockstep with the one
+    /// above. The local A-SVGF gradient replay needs it because the reservoir
+    /// records a true view depth rather than a linearized device depth, so it
+    /// cannot re-derive "where was this point last frame" from the VP pair.
+    glm::mat4 prev_view_{1.0f};
 
     // ---- R5b: the analytic sun gradient (docs/rt_lighting_plan.md §5.6) ----
     //

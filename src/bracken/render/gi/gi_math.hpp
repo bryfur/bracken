@@ -582,6 +582,25 @@ inline constexpr float PROBE_RELOCATE_BACKFACE_FRACTION = 0.25f;
 /// Backface fraction above which relocation has failed and the probe is written
 /// off as interior (PROBE_CLASS_INSIDE_GEOMETRY).
 inline constexpr float PROBE_INSIDE_BACKFACE_FRACTION = 0.75f;
+
+/// LEAVE thresholds, forming a dwell band with the two ENTER thresholds above.
+///
+/// Both verdicts are derived from a fraction of a 64-RAY BINOMIAL, whose
+/// standard deviation at the 0.75 knee is sqrt(0.75*0.25/64) ~ 0.054. A bare
+/// threshold on a statistic that noisy flips a probe's classification back and
+/// forth on consecutive updates for no change in the world at all — and a probe
+/// entering or leaving PROBE_CLASS_INSIDE_GEOMETRY is a whole member appearing
+/// or disappearing from every sampler's 8-probe trilinear cage, which
+/// `sample_cascade` then renormalizes over the survivors. One probe's verdict
+/// therefore redistributes weight across the entire cell, which is why this
+/// reads as flicker rather than as a single wrong probe.
+///
+/// The bands are ~2.8 sigma wide, so a probe genuinely sitting at the knee
+/// settles instead of oscillating, while a probe that is really inside
+/// geometry (fractions near 1) still crosses in one update. Hysteresis costs a
+/// read of the verdict the classify pass already writes.
+inline constexpr float PROBE_RELOCATE_BACKFACE_LEAVE = 0.10f;
+inline constexpr float PROBE_INSIDE_BACKFACE_LEAVE = 0.60f;
 /// Relocation offsets are clamped to this fraction of the cascade spacing.
 /// Below 0.5 by construction: a probe that could move a full spacing would
 /// cross into its neighbour's cell and the trilinear weights at sample time
@@ -657,12 +676,15 @@ inline constexpr float SAMPLE_WEIGHT_SUM_FLOOR = 0.30f;
 /// reason as the bounce sampler in `gi_probe_trace.comp.hlsl`.
 inline constexpr float SAMPLE_BACKFACE_WEIGHT_FLOOR = 0.02f;
 
-/// Chebyshev variance floor, as a fraction of spacing^2. The moments are
-/// accumulated from a handful of rays per update, so a texel that has seen one
-/// consistent distance reports a variance of ~0 and the bound collapses to a
-/// hard binary test that flickers as the ray set rotates. Flooring it keeps the
-/// test soft. Scaled by spacing^2 because the moments are distances in world
-/// units and a coarse cascade's are four times larger.
+/// Chebyshev variance floor, in units of spacing^2. The moments are accumulated
+/// from a handful of rays per update, so a texel that has seen one consistent
+/// distance reports a variance of ~0 and the bound collapses to a hard binary
+/// test that flickers as the ray set rotates. Flooring it keeps the test soft.
+///
+/// No longer multiplied by spacing^2 at the use site: the stored moments are
+/// themselves normalized by spacing (they overflowed fp16 otherwise — see
+/// gi_probe_blend_visibility.comp.hlsl), so the whole test is scale-invariant
+/// and this constant is applied directly. Same number, same meaning.
 inline constexpr float SAMPLE_CHEBYSHEV_MIN_VARIANCE = 1e-4f;
 /// Slack, in spacings, before the Chebyshev test starts attenuating at all. The
 /// stored mean is itself a filtered estimate; without slack, a shading point at
@@ -682,13 +704,14 @@ inline constexpr float SAMPLE_CHEBYSHEV_BIAS_FRACTION = 0.02f;
  */
 [[nodiscard]] inline float chebyshev_visibility(float dist, float mean, float mean_squared,
                                                 float spacing) {
-    const float bias = SAMPLE_CHEBYSHEV_BIAS_FRACTION * spacing;
-    if (dist <= mean + bias) {
+    const float dist_n = dist / std::max(spacing, 1e-6f);
+    const float bias = SAMPLE_CHEBYSHEV_BIAS_FRACTION;
+    if (dist_n <= mean + bias) {
         return 1.0f;
     }
-    const float floor_variance = SAMPLE_CHEBYSHEV_MIN_VARIANCE * spacing * spacing;
+    const float floor_variance = SAMPLE_CHEBYSHEV_MIN_VARIANCE;
     const float variance = std::max(mean_squared - mean * mean, floor_variance);
-    const float d = dist - (mean + bias);
+    const float d = dist_n - (mean + bias);
     const float v = variance / (variance + d * d);
     // Cubed, per DDGI: the raw bound is far too permissive at the one-sample-
     // per-texel-per-update rates a probe field actually runs at, and light that
@@ -708,7 +731,10 @@ struct ProbeReading {
     float classification = PROBE_CLASS_OK;
     /// The octahedral irradiance tap along the shading normal.
     glm::vec3 irradiance{0.0f};
-    /// Visibility moments (mean, mean^2) toward the shading point.
+    /// Visibility moments (mean, mean^2) toward the shading point, NORMALIZED BY
+    /// CASCADE SPACING — the atlas is R16G16_FLOAT and raw squared world
+    /// distances overflow it on cascades 1 and 2. See
+    /// `gi_probe_blend_visibility.comp.hlsl`, which is what writes them.
     glm::vec2 moments{0.0f, 0.0f};
 };
 

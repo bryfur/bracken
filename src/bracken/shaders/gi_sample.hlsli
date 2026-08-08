@@ -159,14 +159,19 @@ float2 giTapVisibility(int cascade, int slot, float3 dir) {
 /// This is what makes a sparse grid usable indoors: without it, a probe on the
 /// far side of a wall is trilinearly nearby and leaks its radiance through.
 /// CPU mirror: `chebyshev_visibility`.
+/// `moments` are NORMALIZED BY `spacing` (gi_probe_blend_visibility.comp.hlsl
+/// explains why the atlas cannot hold them raw), so the whole test runs in units
+/// of spacing and the two constants below stop being scaled by it — they always
+/// meant "a fraction of spacing" and now say so directly.
 float giChebyshev(float dist, float2 moments, float spacing) {
-    float bias = GI_SAMPLE_CHEBYSHEV_BIAS_FRACTION * spacing;
-    if (dist <= moments.x + bias) {
+    float distN = dist / max(spacing, 1e-6);
+    float bias = GI_SAMPLE_CHEBYSHEV_BIAS_FRACTION;
+    if (distN <= moments.x + bias) {
         return 1.0;
     }
-    float floorVariance = GI_SAMPLE_CHEBYSHEV_MIN_VARIANCE * spacing * spacing;
+    float floorVariance = GI_SAMPLE_CHEBYSHEV_MIN_VARIANCE;
     float variance = max(moments.y - moments.x * moments.x, floorVariance);
-    float d = dist - (moments.x + bias);
+    float d = distN - (moments.x + bias);
     float v = variance / (variance + d * d);
     // Cubed, per DDGI: the raw bound is far too permissive at the
     // one-sample-per-texel-per-update rates a probe field actually runs at, and

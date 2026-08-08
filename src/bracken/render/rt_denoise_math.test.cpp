@@ -4,7 +4,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <span>
 
 // The R5b denoiser core (docs/rt_lighting_plan.md §5.6). Every curve here is
 // transliterated into shaders/rt_denoise.hlsli, where it cannot be tested; this
@@ -166,8 +169,25 @@ TEST(RtDenoiseMath, FireThresholdBracketsTheDilationCore) {
 TEST(RtDenoiseMath, GradientDepthTestIsFarTighterThanTheDenoisers) {
     // 0.05 is the temporal pass's own `depthRejectRelative`. The gradient asks a
     // strictly stronger question and must not inherit the looser answer.
-    EXPECT_LT(GRADIENT_DEPTH_REJECT_RELATIVE, 0.05f / 10.0f);
-    EXPECT_GT(GRADIENT_DEPTH_REJECT_RELATIVE, 0.0f);
+    for (const float knee :
+         {SUN_GRADIENT_DEPTH_REJECT_RELATIVE, LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE}) {
+        EXPECT_LT(knee, 0.05f / 10.0f);
+        EXPECT_GT(knee, 0.0f);
+    }
+}
+
+TEST(RtDenoiseMath, SunAndLocalGradientKneesAreDeliberatelyDifferent) {
+    // Pinned as exact values, not bounds, because the divergence is a decision
+    // and the failure mode it guards against is silent drift back together.
+    //
+    // The sun replay linearizes device depth through depth_linear.hlsli, so the
+    // 2026-08-02 sign fix changed its ruler and its knee was RE-MEASURED to
+    // 0.0004. The local replay compares two true view depths taken straight from
+    // the view matrix and never touched that formula, so its 0.0005 was never
+    // mis-scaled and re-syncing it would tighten an unbroken test by 20%.
+    EXPECT_FLOAT_EQ(SUN_GRADIENT_DEPTH_REJECT_RELATIVE, 0.0004f);
+    EXPECT_FLOAT_EQ(LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE, 0.0005f);
+    EXPECT_LT(SUN_GRADIENT_DEPTH_REJECT_RELATIVE, LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +281,82 @@ TEST(RtDenoiseMath, FireflyCeilingTakesWhicheverTermIsLooser) {
             EXPECT_GE(c, REFLECTION_FIREFLY_PERCEPTUAL_FLOOR * exposure_scene_scale(ev));
         }
     }
+}
+
+namespace {
+
+/// Mean and standard deviation of `values`, exactly as the denoisers' 3x3
+/// windows compute them: population moments, `sqrt(max(m2 - m1*m1, 0))`.
+struct Window {
+    float mean;
+    float sigma;
+};
+[[nodiscard]] Window window_stats(std::span<const float> values) {
+    float m1 = 0.0f;
+    float m2 = 0.0f;
+    for (const float v : values) {
+        m1 += v;
+        m2 += v * v;
+    }
+    const auto n = static_cast<float>(values.size());
+    const float mean = m1 / n;
+    return {.mean = mean, .sigma = std::sqrt(std::max(m2 / n - mean * mean, 0.0f))};
+}
+
+} // namespace
+
+TEST(RtDenoiseMath, FireflyCeilingCannotFireAgainstAWindowContainingTheSample) {
+    // The defect this pins, and the reason the firefly clamp has to take
+    // LEAVE-ONE-OUT statistics (rt_di_denoise_temporal.comp.hlsl's RtDiWindow,
+    // rt_reflection_denoise_temporal.comp.hlsl's `looMean`/`looSigma`).
+    //
+    // Samuelson's inequality: every member of an n-sample set lies within
+    // `mean +- sigma*sqrt(n-1)`. For the 9 taps of a 3x3 window that is
+    // `mean + 2.83*sigma`, which is strictly below the `mean + 4*sigma` the
+    // relative ceiling asks for. So a sample tested against a window it is
+    // itself a member of can NEVER be judged a firefly, whatever its value.
+    const float samuelson = std::sqrt(8.0f); // sqrt(n - 1), n = 9
+    EXPECT_LT(samuelson, REFLECTION_FIREFLY_SIGMA)
+        << "the relative firefly test is only satisfiable if the sample is excluded";
+
+    // The worst case the clamp exists for: one enormous sample among 8 dark
+    // neighbours. Exposure 0 and a firefly far above the perceptual floor, so
+    // the absolute term is not what decides this.
+    const float firefly = 5000.0f;
+    const std::array<float, 9> with_centre{firefly, 0.0f, 0.0f, 0.0f, 0.0f,
+                                           0.0f,    0.0f, 0.0f, 0.0f};
+    const std::array<float, 8> without_centre{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const Window full = window_stats(with_centre);
+    const Window loo = window_stats(without_centre);
+
+    // Included in its own statistics, the firefly sits comfortably under the
+    // ceiling -- the branch is dead.
+    EXPECT_GE(reflection_firefly_ceiling(full.mean, full.sigma, 0.0f), firefly);
+    // Excluded, it is caught, and rescaled to the absolute perceptual floor.
+    EXPECT_LT(reflection_firefly_ceiling(loo.mean, loo.sigma, 0.0f), firefly);
+}
+
+TEST(RtDenoiseMath, LeaveOneOutCeilingStillPassesASampleItsNeighboursSupport) {
+    // The other half of the contract: excluding the centre must not turn the
+    // clamp into an energy sink. A sample consistent with its neighbourhood
+    // survives, so a genuinely bright reflection is not denoised out of
+    // existence -- which is what REFLECTION_FIREFLY_PERCEPTUAL_FLOOR's comment
+    // promises and what the `max` with the absolute term protects.
+    const std::array<float, 8> neighbours{38.0f, 42.0f, 40.0f, 39.0f,
+                                          41.0f, 40.0f, 43.0f, 37.0f};
+    const Window loo = window_stats(neighbours);
+    // mean 40, sigma sqrt(3.5) ~ 1.871, so the relative ceiling sits at
+    // 40 + 4*1.871 ~ 47.5 -- comfortably above the window's own spread, which is
+    // the headroom REFLECTION_FIREFLY_SIGMA's comment is buying.
+    EXPECT_NEAR(loo.mean, 40.0f, 1e-4f);
+    EXPECT_NEAR(loo.sigma, std::sqrt(3.5f), 1e-4f);
+    for (const float sample : {38.0f, 40.0f, 44.0f, 46.0f}) {
+        EXPECT_GE(reflection_firefly_ceiling(loo.mean, loo.sigma, 0.0f), sample)
+            << "sample " << sample << " is within its neighbourhood and must not be clamped";
+    }
+    // Two orders of magnitude out is not, and that is the case R5b built it for.
+    EXPECT_LT(reflection_firefly_ceiling(loo.mean, loo.sigma, 0.0f), 4000.0f);
 }
 
 TEST(RtDenoiseMath, ScreenProbeCeilingOnlyEverLoosensTheRelativeOne) {

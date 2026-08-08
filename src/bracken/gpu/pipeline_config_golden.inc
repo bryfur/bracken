@@ -692,7 +692,7 @@ DepthPrepassGrassGBuffer
   vbuffer   slot=0 pitch=64 rate=VERTEX step=0
   vattr     location=0 slot=0 format=FLOAT3 offset=0
 DepthPrepassModelMaskedGBuffer
-  vs        prepass_model_masked.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  vs        prepass_model_masked_gbuffer.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=1
   fs        prepass_gbuffer_masked.frag.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
@@ -701,9 +701,10 @@ DepthPrepassModelMaskedGBuffer
   targets2  color2=R8G8B8A8_UNORM
   vbuffer   slot=0 pitch=64 rate=VERTEX step=0
   vattr     location=0 slot=0 format=FLOAT3 offset=0
-  vattr     location=1 slot=0 format=FLOAT2 offset=24
+  vattr     location=1 slot=0 format=FLOAT3 offset=12
+  vattr     location=2 slot=0 format=FLOAT2 offset=24
 DepthPrepassInstancedModelMaskedGBuffer
-  vs        prepass_instanced_masked.vert.spv samplers=0 storage_textures=0 storage_buffers=1 uniform_buffers=1
+  vs        prepass_instanced_masked_gbuffer.vert.spv samplers=0 storage_textures=0 storage_buffers=1 uniform_buffers=1
   fs        prepass_gbuffer_masked.frag.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
@@ -712,7 +713,8 @@ DepthPrepassInstancedModelMaskedGBuffer
   targets2  color2=R8G8B8A8_UNORM
   vbuffer   slot=0 pitch=64 rate=VERTEX step=0
   vattr     location=0 slot=0 format=FLOAT3 offset=0
-  vattr     location=1 slot=0 format=FLOAT2 offset=24
+  vattr     location=1 slot=0 format=FLOAT3 offset=12
+  vattr     location=2 slot=0 format=FLOAT2 offset=24
 Water
   vs        water.vert.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
   fs        water.frag.spv samplers=5 storage_textures=0 storage_buffers=0 uniform_buffers=1

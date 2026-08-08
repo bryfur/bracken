@@ -197,8 +197,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // ---- how much history this pixel is allowed to keep ---------------
         float gradient = 0.0;
         if (gradientValid != 0u) {
-            const int2 g = clamp(coord / RT_GRADIENT_STRATUM, int2(0, 0), int2(stratumCount) - 1);
-            gradient = gradientTexture.Load(int3(g, 0));
+            gradient = rtGradientSample(gradientTexture, coord, stratumCount);
         }
         const float reset = saturate(max(lightingReset, gradient));
 
@@ -207,52 +206,79 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             InterlockedAdd(g_gradientFired, 1u);
         }
 
+        // The tile classifier's verdict. 2 = mixed; anything else means the 3x3
+        // TILE neighbourhood was unanimous this frame.
+        //
+        // This USED TO BYPASS HISTORY ENTIRELY on a unanimous tile, writing
+        // `float4(sample, sample*sample, maxAccumFrames, linearDepth)` — a
+        // 32-sample confidence stamped from ONE stochastic bit, ignoring the
+        // `reset` computed just above, at 8x4-tile granularity. Two things went
+        // wrong with that, and together they are the blocky moving shadow:
+        //
+        //  * Temporal RESPONSE became discontinuous across a tile edge. A
+        //    unanimous tile converged instantly while the mixed tile beside it
+        //    converged at alpha = 1/32, so as a capsule shadow's umbra swept the
+        //    ground the boundary between the two regimes was a visible 8x4
+        //    staircase that moved with the character and stopped when it did.
+        //    rt_shadow_denoise_filter.comp.hlsl:82-90 carries a scar from the
+        //    same quantization ("16x8 rectangles all over the frame") — that one
+        //    was fixed in the filter and left standing here.
+        //  * A tile that flipped back to mixed one frame later carried 32 frames
+        //    of fabricated evidence for a single bit, so the accumulator crawled
+        //    back at 1/32 and the filter, reading variance 0 and confidence 1,
+        //    would not blur the stale value away either.
+        //
+        // Every pixel now takes the accumulation path, so `reset` applies
+        // everywhere and the count is always something that was actually
+        // measured. A unanimous region costs nothing to accumulate: every frame's
+        // sample agrees, so the EMA sits on the answer instead of converging to
+        // it. The classifier's real consumer is the FILTER, which still early-outs
+        // on it via WaveActiveAllTrue.
         const uint verdict = tileClass.Load(int3(int2(tile), 0));
-        if (verdict != 2u) {
-            // A uniform neighbourhood carries no variance and needs no history:
-            // write the converged answer directly. This also stops the
-            // accumulator from dragging a stale penumbra across a region that
-            // has become fully lit. The fast history is written to match, so it
-            // does not go stale under a tile that flips back to mixed.
-            historyOut[coord] = float4(sample, sample * sample, maxAccumFrames, linearDepth);
-            fastHistoryOut[coord] = float2(sample, RT_FAST_HISTORY_WINDOW);
-        } else {
-            float mean = sample;
-            float moment2 = sample * sample;
-            float count = 1.0;
-            float fastMean = sample;
-            float fastCount = 1.0;
+        const bool mixed = verdict == 2u;
 
-            if (historyValid != 0u) {
-                const float2 velocity = velocityTexture.SampleLevel(velocitySampler, uv, 0);
-                const float2 prevUv = uv - velocity; // velocity = curr - prev (velocity_math.hpp)
+        float mean = sample;
+        float moment2 = sample * sample;
+        float count = 1.0;
+        float fastMean = sample;
+        float fastCount = 1.0;
 
-                if (all(prevUv >= 0.0) && all(prevUv <= 1.0)) {
-                    const float4 hist = historyIn.SampleLevel(historySampler, prevUv, 0);
+        if (historyValid != 0u) {
+            const float2 velocity = velocityTexture.SampleLevel(velocitySampler, uv, 0);
+            const float2 prevUv = uv - velocity; // velocity = curr - prev (velocity_math.hpp)
 
-                    // Reject history across a depth discontinuity. Without this,
-                    // a disocclusion drags the occluder's shadow along behind it
-                    // — the classic ghost trailing anything that moves.
-                    const float depthDelta = abs(hist.a - linearDepth);
-                    const bool depthOk =
-                        linearDepth > 0.0 && depthDelta <= depthRejectRelative * max(linearDepth, 1.0);
+            if (all(prevUv >= 0.0) && all(prevUv <= 1.0)) {
+                const float4 hist = historyIn.SampleLevel(historySampler, prevUv, 0);
 
-                    if (depthOk) {
-                        count = rtApplyReset(min(hist.b + 1.0, maxAccumFrames), reset);
-                        const float alpha = 1.0 / count;
-                        mean = lerp(hist.r, sample, alpha);
-                        moment2 = lerp(hist.g, sample * sample, alpha);
+                // Reject history across a depth discontinuity. Without this,
+                // a disocclusion drags the occluder's shadow along behind it
+                // — the classic ghost trailing anything that moves.
+                const float depthDelta = abs(hist.a - linearDepth);
+                const bool depthOk =
+                    linearDepth > 0.0 && depthDelta <= depthRejectRelative * max(linearDepth, 1.0);
 
-                        const float2 fastHist =
-                            fastHistoryIn.SampleLevel(fastHistorySampler, prevUv, 0);
-                        fastCount = rtApplyReset(
-                            min(fastHist.y + 1.0, RT_FAST_HISTORY_WINDOW), reset);
-                        fastMean = lerp(fastHist.x, sample, 1.0 / fastCount);
+                if (depthOk) {
+                    count = rtApplyReset(min(hist.b + 1.0, maxAccumFrames), reset);
+                    const float alpha = 1.0 / count;
+                    mean = lerp(hist.r, sample, alpha);
+                    moment2 = lerp(hist.g, sample * sample, alpha);
 
-                        // The fast clamp. Shifting the second moment by the same
-                        // amount keeps variance = moment2 - mean^2 exactly what
-                        // it was, so the spatial filter downstream does not read
-                        // a negative variance out of a clamped mean.
+                    const float2 fastHist =
+                        fastHistoryIn.SampleLevel(fastHistorySampler, prevUv, 0);
+                    fastCount = rtApplyReset(
+                        min(fastHist.y + 1.0, RT_FAST_HISTORY_WINDOW), reset);
+                    fastMean = lerp(fastHist.x, sample, 1.0 / fastCount);
+
+                    // The fast clamp, and the one thing the verdict still gates
+                    // here: on a unanimous neighbourhood the fast window and the
+                    // accumulated mean agree by construction, so there is no
+                    // disagreement for it to catch.
+                    //
+                    // Shifting the second moment by the same amount keeps
+                    // variance = moment2 - mean^2 exactly what it was, so the
+                    // spatial filter downstream does not read a negative
+                    // variance out of a clamped mean.
+                    if (mixed) {
                         const float margin = rtFastHistoryMargin(fastMean, fastCount);
                         const float clamped = clamp(mean, fastMean - margin, fastMean + margin);
                         moment2 += clamped * clamped - mean * mean;
@@ -260,13 +286,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                     }
                 }
             }
-
-            historyOut[coord] = float4(mean, moment2, count, linearDepth);
-            fastHistoryOut[coord] = float2(fastMean, fastCount);
-
-            InterlockedAdd(g_accumSum, uint(round(count)));
-            InterlockedAdd(g_accumPixels, 1u);
         }
+
+        historyOut[coord] = float4(mean, moment2, count, linearDepth);
+        fastHistoryOut[coord] = float2(fastMean, fastCount);
+
+        InterlockedAdd(g_accumSum, uint(round(count)));
+        InterlockedAdd(g_accumPixels, 1u);
     }
 
     GroupMemoryBarrierWithGroupSync();

@@ -46,6 +46,34 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
         // therefore casts a bind-pose shadow that follows it around the world
         // without animating. Doing better means re-skinning and refitting the
         // BVH per frame; this at least gives the character a shadow.
+        // SHADOW-ONLY PROXIES DO NOT BELONG IN THE ACCELERATION STRUCTURE.
+        //
+        // `shadow_only` marks a mesh the main pass never draws — for procedural
+        // trees, a low-poly ellipsoid standing in for thousands of leaf quads so
+        // the RASTER shadow pass avoids alpha-test overdraw (tree_generator.cpp).
+        // That trade does not exist here: the traced walk has the real leaf
+        // cards in the same BLAS, so including the proxy meant a tree cast its
+        // shadow TWICE, from two different silhouettes — a doubling the raster
+        // path never has, because there the two are mutually exclusive by
+        // construction (`cast_shadows=false` removes the leaves from exactly the
+        // pass the proxy is drawn in).
+        //
+        // It is worse than a double shadow, because a BLAS is shared by both
+        // walk types: closest-hit rays saw the proxy too, so reflections and GI
+        // probes were shading an invisible grey ellipsoid floating in a canopy.
+        //
+        // Dropping it fixes both, and is the whole of the fix here — the
+        // converse flag is deliberately NOT acted on. `cast_shadows=false` leaf
+        // cards must stay: they are the real, visible geometry, so a closest-hit
+        // ray has to find them, and suppressing them for any-hit walks alone
+        // needs a PER-TRIANGLE flag rather than a gather-time skip (one model's
+        // meshes share one BLAS). That flag is the same `BvhTriangle` byte the
+        // alpha-cutout work wants, and both should land together — until then a
+        // leaf card occludes as a solid quad, which is the reported
+        // tree-shadow-is-too-dark behaviour and is tracked with it.
+        if (mesh.shadow_only) {
+            continue;
+        }
         const std::size_t vertex_count =
             mesh.vertices.empty() ? mesh.skinned_vertices.size() : mesh.vertices.size();
         if (mesh.indices.empty() || vertex_count == 0) {

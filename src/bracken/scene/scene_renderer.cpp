@@ -814,6 +814,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
         if (!have_prev_view_proj_) {
             // First rendered frame: previous == current => zero camera velocity.
             prev_view_proj_unjittered_ = frame_cam_.view_proj_unjittered;
+            prev_view_ = frame_cam_.view;
         }
         draw_camera.projection = frame_cam_.proj_jittered;
         draw_camera.view_projection = frame_cam_.view_proj_jittered;
@@ -1481,6 +1482,9 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 // motion vector directly comparable with it.
                 rt_frame_params.view_proj_unjittered = frame_cam_.view_proj_unjittered;
                 rt_frame_params.prev_view_proj_unjittered = prev_view_proj_unjittered_;
+                // The local gradient's replay compares true view depths, so it
+                // needs the previous VIEW rather than the previous VP pair.
+                rt_frame_params.prev_view = prev_view_;
                 rt_frame_params.camera_position = draw_camera.position;
                 // Third ROW of the view matrix is the camera's -forward in
                 // world space; calcShadow needs a view depth for the hit.
@@ -1945,6 +1949,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
         }
         motion_history_.end_frame();
         prev_view_proj_unjittered_ = frame_cam_.view_proj_unjittered;
+        prev_view_ = frame_cam_.view;
         have_prev_view_proj_ = true;
         // Palette double-buffer swap: this frame's palettes become next
         // frame's "previous" palettes (only valid if anything was uploaded).

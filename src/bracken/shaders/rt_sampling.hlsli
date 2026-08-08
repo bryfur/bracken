@@ -1,10 +1,14 @@
 #ifndef BRACKEN_RT_SAMPLING_HLSLI
 #define BRACKEN_RT_SAMPLING_HLSLI
 
-// interleavedGradientNoise — the per-pixel decorrelating hash. This file used
-// to carry a byte-identical private copy, which was fine until R3 gave the
-// reflection pass both this include AND shadow_common.hlsli (which includes
-// lighting.hlsli for the same function) and the two collided. One definition.
+// This file used to carry a byte-identical private copy of
+// interleavedGradientNoise, which was fine until R3 gave the reflection pass
+// both this include AND shadow_common.hlsli (which includes lighting.hlsli for
+// the same function) and the two collided. One definition.
+//
+// rtSample2D no longer calls it — its per-pixel offset has to be 2D and a
+// scalar hash cannot be — but the include stays: sixteen shaders include this
+// header and several reach lighting.hlsli through it.
 #include "lighting.hlsli"
 
 // Sampling and packing shared by the ray-traced shadow/reflection passes and
@@ -29,15 +33,6 @@ float2 r2Sequence(uint index) {
     return frac(float2(0.7548776662466927, 0.5698402909980532) * float(index));
 }
 
-/// The per-pixel, per-frame 2D sample point. Both components are rotated by
-/// the SAME per-pixel offset so the pixel's whole sequence is shifted rather
-/// than its two axes being decorrelated from each other, which would destroy
-/// the low-discrepancy property that makes R2 worth using.
-float2 rtSample2D(uint2 pixel, uint frameIndex) {
-    const float offset = interleavedGradientNoise(float2(pixel));
-    return frac(r2Sequence(frameIndex) + offset);
-}
-
 /// Seed a per-pixel, per-frame random STREAM.
 ///
 /// rtSample2D answers "the one sample this pixel takes this frame", and is the
@@ -57,6 +52,32 @@ uint rtSeed(uint2 pixel, uint frameIndex) {
     h ^= h >> 15; h *= 0x846ca68bu;
     h ^= h >> 16;
     return h;
+}
+
+/// The per-pixel, per-frame 2D sample point.
+///
+/// A per-pixel Cranley-Patterson rotation of the R2 sequence: the pixel's whole
+/// sequence is translated on the unit torus, which is measure-preserving and
+/// leaves R2's low-discrepancy property intact across that pixel's frames.
+///
+/// THE OFFSET MUST BE 2D, and it used to be one scalar broadcast into both
+/// lanes. That is a legal rotation per pixel — the temporal half of this file's
+/// header contract was always satisfied — but it put every pixel on screen onto
+/// the SAME diagonal line {(t, t + c) mod 1} at any fixed frame, because the
+/// two lanes differed by the frame's constant `r2.y - r2.x` and nothing else.
+/// So the frame's spatial sample set was one-dimensional: neighbouring pixels
+/// picked points perfectly correlated along one axis, which is exactly the
+/// failure the header's second sentence warns about, and the spatial filters
+/// (both a-trous DI passes, the shadow filter) average over those neighbours.
+///
+/// Still a pure function of (pixel, frameIndex) — that is what the A-SVGF
+/// gradient replay of §5.7 and the deterministic smoke gate both require, and
+/// it is why the offset is hashed from the pixel alone rather than carried in a
+/// history texture.
+float2 rtSample2D(uint2 pixel, uint frameIndex) {
+    const uint h = rtSeed(pixel, 0u);
+    const float2 offset = float2(h & 0xffffu, h >> 16u) * (1.0 / 65536.0);
+    return frac(r2Sequence(frameIndex) + offset);
 }
 
 /// Next uniform float in [0, 1) from a stream seeded by rtSeed. PCG-XSH-RR's

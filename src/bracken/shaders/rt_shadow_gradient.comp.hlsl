@@ -75,6 +75,10 @@ cbuffer RtShadowGradientUniforms : register(b0, space2) {
     /// or every capsule-shadowed stratum reports a permanent gradient.
     uint shadowCapsuleCount;
     uint _pad1;
+    /// PREVIOUS frame's unjittered view-projection. The depth test below needs
+    /// to know where this world point WAS on screen last frame, not where it is
+    /// now — see the test itself.
+    float4x4 prevViewProjUnjittered;
 };
 
 // --- set 0: sampled textures, then read-only storage textures, then buffers --
@@ -206,13 +210,45 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     const float depth = sceneDepth.Load(int3(depthCoord, 0));
     const float linearDepth = depth > 0.0 ? linearizeDepth(depth) : 0.0;
 
+    // This pixel's world position. Needed by the depth test immediately below
+    // AND by the replay ray further down, so it is reconstructed once here
+    // rather than twice.
+    float2 ndc = (float2(coord) + 0.5) / float2(tracedSize) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    const float4 world = mul(invViewProj, float4(ndc, depth, 1.0));
+    const float3 worldPos = world.xyz / world.w;
+
     // Is it the SAME surface the previous frame saw there? The history's alpha
-    // is the linear view depth it was written with, and the test is the exact
-    // one the temporal pass applies to decide whether to keep that history —
-    // so a gradient can only fire where history would in fact have been used.
+    // is the linear view depth it was written with, so the quantity to compare
+    // against is what THIS world point's view depth WAS under the previous
+    // frame's camera — not what it is under this one.
+    //
+    // Those two differ by the camera's own motion, and that is not a rounding
+    // detail: at the playground's 420-unit camera boom the tolerance is
+    // 0.0004 * 420 = 0.17 world units while a follow camera translates 2.3-5.0
+    // units per frame at WALK/RUN speed, 14x to 30x more, before mouse-look
+    // rotation is counted. So the old form rejected essentially every stratum
+    // the moment the camera moved. Since this traced gradient is the ONLY
+    // mechanism that can invalidate history for an occluder that moved while
+    // the surface beneath it did not, that left §5.8's capsule shadow — the
+    // character's own — lagging at the 32-frame accumulation time constant
+    // exactly while walking, which is what made it read as blocky rather than
+    // soft. Measured before this fix, static vs PLAYGROUND_RT_BENCH_ORBIT=1:
+    // sun_grad_fire 0.0086 -> 0.0032, local_grad_fire 0.0278 -> 0.0054, while
+    // `di noise` moved the other way, 0.00014 -> 0.00400.
+    //
+    // The 0.0004 knee keeps meaning exactly what rt_denoise_math.hpp says it
+    // means — "is this LITERALLY the point the previous frame traced?" — and
+    // becomes invariant to the camera, which is the only thing it used to
+    // measure.
+    const float4 prevClip = mul(prevViewProjUnjittered, float4(worldPos, 1.0));
+    const float expectedPrevDepth =
+        prevClip.w > 0.0 ? linearizeDepth(prevClip.z / prevClip.w) : 0.0;
+
     const float4 hist = historyIn.SampleLevel(historySampler, prevUv, 0);
-    const bool depthOk = linearDepth > 0.0 &&
-                         abs(hist.a - linearDepth) <= depthRejectRelative * max(linearDepth, 1.0);
+    const bool depthOk = linearDepth > 0.0 && expectedPrevDepth > 0.0 &&
+                         abs(hist.a - expectedPrevDepth) <=
+                             depthRejectRelative * max(linearDepth, 1.0);
     if (!depthOk) {
         gradientOut[stratum] = 0.0;
         return;
@@ -245,11 +281,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         if (ndotl <= 0.0) {
             replayLit = false;
         } else {
-            float2 ndc = (float2(coord) + 0.5) / float2(tracedSize) * 2.0 - 1.0;
-            ndc.y = -ndc.y;
-            const float4 world = mul(invViewProj, float4(ndc, depth, 1.0));
-            const float3 worldPos = world.xyz / world.w;
-
             const float slope = saturate(1.0 - ndotl);
             const float3 rayOrigin = worldPos + normal * (normalBias * (1.0 + slope * 4.0)) +
                                      toLight * depthBias;

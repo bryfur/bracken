@@ -259,6 +259,7 @@ inline constexpr float DI_DIELECTRIC_F0 = 0.04f;
 /// form.
 inline constexpr float DI_RELIEF_MIN_COSINE = 0.05f;
 
+
 /// Ceiling on the relief factor. 4x is two stops: enough that a cobble edge
 /// turned toward a flashlight reads as a lit edge, little enough that a
 /// half-resolution 1-spp estimate is never multiplied into a firefly. The

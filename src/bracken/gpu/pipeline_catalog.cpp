@@ -663,6 +663,8 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
     // ray-traced reflections (render/rt_renderer.hpp). Only created when a game
     // turns reflections on. Grass and MASK foliage write a constant roughness
     // of 1 -- they are never mirror surfaces, so the reflection pass skips them
+    // (their NORMALS are another matter: those are read by five traced passes
+    // besides reflections, which is why the MASK rows below carry a real one)
     // without tracing, and they need no normal plumbed through their vertex
     // stage. `.fs` gains one uniform buffer on the rows that send a real
     // roughness factor.
@@ -739,21 +741,27 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},
+    // The MASK G-buffer rows take their OWN vertex shader and a layout carrying
+    // the normal. They shared the velocity-only variant until 2026-08-08, when
+    // the fragment stopped writing a constant oct(+Y) — see
+    // prepass_gbuffer_masked.frag.hlsl for what was reading that constant. The
+    // velocity-only rows above keep the narrower layout: they have no second
+    // attachment, so plumbing a normal through them would be pure bandwidth.
     {.name = "DepthPrepassModelMaskedGBuffer",
-     .vertex_shader = "prepass_model_masked.vert.spv",
+     .vertex_shader = "prepass_model_masked_gbuffer.vert.spv",
      .fragment_shader = "prepass_gbuffer_masked.frag.spv",
      .vs = k_ubo1,
      .fs = k_ubo1_samp1,
-     .vertex_layout = VertexLayout::Vertex3DPositionTexcoord,
+     .vertex_layout = VertexLayout::Vertex3DPositionNormalTexcoord,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},
     {.name = "DepthPrepassInstancedModelMaskedGBuffer",
-     .vertex_shader = "prepass_instanced_masked.vert.spv",
+     .vertex_shader = "prepass_instanced_masked_gbuffer.vert.spv",
      .fragment_shader = "prepass_gbuffer_masked.frag.spv",
      .vs = k_ubo1_sb1,
      .fs = k_ubo1_samp1,
-     .vertex_layout = VertexLayout::Vertex3DPositionTexcoord,
+     .vertex_layout = VertexLayout::Vertex3DPositionNormalTexcoord,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::Velocity,
      .color2 = TargetFormat::NormalRoughness},

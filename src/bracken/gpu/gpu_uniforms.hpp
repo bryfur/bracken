@@ -1550,9 +1550,24 @@ struct alignas(16) RtShadowGradientUniforms {
     /// slot that was `_pad0`, so the extent is unchanged.
     uint32_t shadowCapsuleCount = 0;
     uint32_t _pad1 = 0;
+    /**
+     * Previous frame's unjittered view-projection, for the replay's depth test.
+     *
+     * The test asks "is this the same surface the previous frame saw here?", and
+     * the only honest way to ask it is to project THIS frame's world position
+     * with the PREVIOUS frame's camera and compare that against the depth the
+     * history recorded. Comparing the history's depth against this frame's view
+     * depth instead measures the camera's own per-frame depth change, which at
+     * the playground's 420-unit camera boom is 2-5 world units against a
+     * tolerance of 0.17 — so the gradient collapsed under any camera motion and
+     * history was never invalidated for a moving occluder's shadow. Measured
+     * before the fix: `local_grad_fire` 0.0278 pinned vs 0.0054 orbiting, while
+     * `di noise` went the other way, 0.00014 vs 0.00400.
+     */
+    glm::mat4 prevViewProjUnjittered{1.0f};
 };
 
-BRACKEN_HLSL_CBUFFER(RtShadowGradientUniforms, 144);
+BRACKEN_HLSL_CBUFFER(RtShadowGradientUniforms, 208);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, invViewProj, 0);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, sunDirection, 64);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, rayMaxDistance, 76);
@@ -1570,6 +1585,7 @@ BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, depthB, 128);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, depthRejectRelative, 132);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, shadowCapsuleCount, 136);
 BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, _pad1, 140);
+BRACKEN_HLSL_FIELD(RtShadowGradientUniforms, prevViewProjUnjittered, 144);
 
 /**
  * A-SVGF gradient trace for the LOCAL visibility signal — matches
@@ -1599,11 +1615,27 @@ struct alignas(16) RtLocalShadowGradientUniforms {
     /// §5.8 — same contract as the sun gradient's: the replay must see the
     /// trace's capsules. Took the slot that was `_pad0`.
     uint32_t shadowCapsuleCount = 0;
-    uint32_t _pad1 = 0;
+    /// `LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE`. A uniform since 2026-08-08 —
+    /// it used to be a bare `#define` in the shader, which is how it silently
+    /// diverged from the sun's after that constant was re-measured. The
+    /// divergence is correct; having two definitions of it was not.
+    float depthRejectRelative = 0.0005f;
     uint32_t _pad2 = 0;
+    /**
+     * Previous frame's VIEW matrix, for the replay's depth test.
+     *
+     * The sun gradient needs a view-PROJECTION here because its history stores a
+     * linearized device depth; this one needs the plain view matrix, because the
+     * reservoir's `depth` lane is a true view depth
+     * (`-mul(clusterParams.view, float4(worldPos, 1)).z`) and never passes
+     * through `depth_linear.hlsli` at all. Same defect either way: comparing
+     * last frame's recorded depth against THIS frame's view depth measures the
+     * camera's motion, not the surface's.
+     */
+    glm::mat4 prevView{1.0f};
 };
 
-BRACKEN_HLSL_CBUFFER(RtLocalShadowGradientUniforms, 128);
+BRACKEN_HLSL_CBUFFER(RtLocalShadowGradientUniforms, 192);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, invViewProj, 0);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, tracedSize, 64);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, stratumCount, 72);
@@ -1617,8 +1649,9 @@ BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, historyValid, 104);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, emissiveCount, 108);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, emissiveHistoryValid, 112);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, shadowCapsuleCount, 116);
-BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad1, 120);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, depthRejectRelative, 120);
 BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, _pad2, 124);
+BRACKEN_HLSL_FIELD(RtLocalShadowGradientUniforms, prevView, 128);
 
 /**
  * Dense reconstruction of the sparse gradient — matches

@@ -286,6 +286,10 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float3 m1 = 0.0;
     float3 m2 = 0.0;
     float valid = 0.0;
+    // The centre's own contribution, kept aside so the firefly test can be run
+    // against the neighbours ALONE — see below.
+    float3 centre = 0.0;
+    float centreValid = 0.0;
     [unroll]
     for (int dy = -1; dy <= 1; ++dy) {
         [unroll]
@@ -298,6 +302,10 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             m1 += n.rgb;
             m2 += n.rgb * n.rgb;
             valid += 1.0;
+            if (dx == 0 && dy == 0) {
+                centre = n.rgb;
+                centreValid = 1.0;
+            }
         }
     }
 
@@ -314,9 +322,30 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         // ---- firefly clamp -----------------------------------------------
         // Rescales the whole colour rather than clamping per channel, so a
         // clamped sample keeps its hue instead of drifting toward white.
+        //
+        // The statistics here LEAVE THE CENTRE OUT, and that is load-bearing
+        // rather than fastidious: Samuelson's inequality bounds every member of
+        // an n-sample set by `mean + sigma*sqrt(n-1)`, so a value included in
+        // its own 9-tap window can never exceed `mean + 2.83*sigma` — while
+        // RT_REFLECTION_FIREFLY_SIGMA is 4.0 and the ceiling then takes a `max`
+        // with an absolute floor that can only raise it. Tested against the full
+        // window this branch was unsatisfiable for every possible input, which
+        // is why the fireflies R5b built it for were never actually bounded.
+        //
+        // `mean`/`sigma` above keep the whole window: they clamp HISTORY, which
+        // is an independent quantity and does belong in the box.
+        const float looValid = max(valid - centreValid, 0.0);
+        float3 looMean = 0.0;
+        float3 looSigma = 0.0;
+        if (looValid > 0.0) {
+            looMean = (m1 - centre) / looValid;
+            looSigma = sqrt(max((m2 - centre * centre) / looValid - looMean * looMean, 0.0));
+        }
+        looSigma = max(looSigma, float3(sigmaFloor, sigmaFloor, sigmaFloor));
+
         const float currentLuma = luminance(current.rgb);
         const float ceiling =
-            rtReflectionFireflyCeiling(luminance(mean), luminance(sigma), adaptedEv);
+            rtReflectionFireflyCeiling(luminance(looMean), luminance(looSigma), adaptedEv);
         if (currentLuma > ceiling && currentLuma > 1e-6) {
             current.rgb *= ceiling / currentLuma;
         }

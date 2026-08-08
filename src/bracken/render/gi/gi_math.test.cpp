@@ -1022,11 +1022,14 @@ TEST(GiSample, DeadProbesAreExcludedAndTheSurvivorsRenormalise) {
 
 TEST(GiSample, ChebyshevOccludesPastTheMeanAndPassesInFrontOfIt) {
     const float sp = cascade_spacing(0);
-    // A probe that consistently sees a wall 100 units away.
-    const float mean = 100.0f;
-    const float mean2 = mean * mean + 25.0f;
+    // A probe that consistently sees a wall 100 units away. The stored moments
+    // are NORMALIZED BY SPACING — see ProbeReading::moments — so the wall's mean
+    // is 100/sp and its variance 25/sp^2. `dist` stays in world units.
+    const float wall = 100.0f;
+    const float mean = wall / sp;
+    const float mean2 = mean * mean + 25.0f / (sp * sp);
     EXPECT_FLOAT_EQ(chebyshev_visibility(50.0f, mean, mean2, sp), 1.0f);
-    EXPECT_FLOAT_EQ(chebyshev_visibility(mean, mean, mean2, sp), 1.0f);
+    EXPECT_FLOAT_EQ(chebyshev_visibility(wall, mean, mean2, sp), 1.0f);
     EXPECT_LT(chebyshev_visibility(400.0f, mean, mean2, sp), 0.05f);
     // Monotonically non-increasing in distance, which is what makes it usable
     // as a weight at all — a non-monotone occlusion term produces rings.
@@ -1039,7 +1042,54 @@ TEST(GiSample, ChebyshevOccludesPastTheMeanAndPassesInFrontOfIt) {
     // The variance floor is what keeps a texel that has only ever seen one
     // distance from collapsing into a hard binary test that flickers as the ray
     // set rotates.
-    EXPECT_GT(chebyshev_visibility(mean + 0.5f * sp, mean, mean * mean, sp), 0.0f);
+    EXPECT_GT(chebyshev_visibility(wall + 0.5f * sp, mean, mean * mean, sp), 0.0f);
+}
+
+TEST(GiSample, VisibilityMomentsStayInsideHalfFloatOnEveryCascade) {
+    // WHY THIS TEST EXISTS. The visibility atlas is R16G16_FLOAT (probe_volume.cpp),
+    // whose finite maximum is 65504, and the moments used to be stored as raw
+    // world distances. The clamp is PROBE_VISIBILITY_DISTANCE_SCALE * spacing
+    // over spacings of 150 / 300 / 600, so the SECOND moment reached 50625 /
+    // 202500 / 810000 and the two coarse cascades saturated to infinity — after
+    // which `mean2 - mean^2` is NaN or negative, pins at the variance floor, and
+    // the Chebyshev bound degenerates into the hard binary test that flickers as
+    // the ray set rotates. Normalizing by spacing bounds the pair by
+    // (1.5, 2.25) on every cascade, with three orders of magnitude to spare.
+    constexpr float HALF_MAX = 65504.0f;
+    for (int c = 0; c < CASCADE_COUNT; ++c) {
+        const float sp = cascade_spacing(c);
+        const float clamp_world = PROBE_VISIBILITY_DISTANCE_SCALE * sp;
+        const float mean = clamp_world / sp;
+        const float mean2 = mean * mean;
+        EXPECT_FLOAT_EQ(mean, PROBE_VISIBILITY_DISTANCE_SCALE) << "cascade " << c;
+        EXPECT_LT(mean2, HALF_MAX / 1000.0f)
+            << "cascade " << c << " second moment must have orders of magnitude of headroom";
+        // And the test still answers softly at the clamp rather than collapsing:
+        // a point at the clamp distance is exactly what the probe measured.
+        EXPECT_FLOAT_EQ(chebyshev_visibility(clamp_world, mean, mean2, sp), 1.0f);
+    }
+}
+
+TEST(GiSample, ChebyshevIsScaleInvariantAcrossCascades) {
+    // The payoff of normalizing: the same geometry expressed in each cascade's
+    // own units must give the same visibility. Before normalization the bias and
+    // variance floor were multiplied by spacing and spacing^2 at the use site
+    // against world-unit moments, which was also scale-invariant in exact
+    // arithmetic — the difference is that it is now scale-invariant in fp16 too.
+    const float mean = 0.5f;             // half a spacing away, whichever cascade
+    const float mean2 = mean * mean + 0.01f;
+    float reference = -1.0f;
+    for (int c = 0; c < CASCADE_COUNT; ++c) {
+        const float sp = cascade_spacing(c);
+        const float v = chebyshev_visibility(1.2f * sp, mean, mean2, sp);
+        if (reference < 0.0f) {
+            reference = v;
+        } else {
+            EXPECT_NEAR(v, reference, 1e-6f) << "cascade " << c;
+        }
+    }
+    EXPECT_GT(reference, 0.0f);
+    EXPECT_LT(reference, 1.0f) << "1.2 spacings is past a wall at 0.5, so it must attenuate";
 }
 
 TEST(GiSample, TheCascadeBlendIsContinuousAcrossABoundary) {
@@ -1134,13 +1184,16 @@ TEST(GiSample, RelocatedProbesAreSampledWhereTheyActuallySat) {
     struct OffsetField {
         glm::vec3 offset{0.0f};
         ProbeReading operator()(int cascade, const glm::ivec3& a, int, const glm::vec3&) const {
-            (void)cascade;
             ProbeReading r;
             // A wall 120 units out in every direction. The biased sample point
             // sits ~70 units under probe (0,1,0), inside that; pushing that
             // probe up by the maximum relocation puts it ~138 units away, i.e.
             // outside, which is the whole point of the test.
-            r.moments = {120.0f, 120.0f * 120.0f};
+            //
+            // Moments are stored NORMALIZED BY SPACING (ProbeReading::moments),
+            // so the wall goes in as 120/spacing rather than 120.
+            const float wall = 120.0f / cascade_spacing(cascade);
+            r.moments = {wall, wall * wall};
             const bool target = a == TARGET;
             r.irradiance = target ? glm::vec3(1.0f) : glm::vec3(0.0f);
             if (target) {

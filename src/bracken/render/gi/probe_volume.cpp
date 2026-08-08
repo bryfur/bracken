@@ -264,6 +264,27 @@ void ProbeVolume::update(SDL_GPUCommandBuffer* cmd, const glm::vec3& camera_posi
     bool any_dirty = false;
     for (int c = 0; c < CASCADE_COUNT; ++c) {
         Cascade& cascade = cascades_[static_cast<std::size_t>(c)];
+        // A CASCADE MAY ONLY SCROLL ON A FRAME IT CAN RE-TRACE.
+        //
+        // `cpu.update` re-homes the lattice to the camera and invalidates every
+        // probe that scrolled in, but only cascades satisfying this same
+        // predicate get traced below (probe_schedule.hpp's rota — cascade 1
+        // every other frame, cascade 2 every fourth). Scrolling on the frames in
+        // between moved the field's base out from under contents that could not
+        // be refreshed for up to three more frames, so the newly-homed probes
+        // were sampled while still carrying their seed. The sampler's trilinear
+        // cage spans eight of them, so one stale corner is visible across a
+        // whole cell — and it appears and clears on the rota's period, which is
+        // the frequency the GI flicker was reported at.
+        //
+        // Cascade 0 traces every frame and is unaffected by this guard, which is
+        // what keeps the near field tracking the camera exactly as before.
+        if (!gi_cascade_updates_on_frame(c, frame_counter_)) {
+            GiCascadeStats& skipped = stats_.per_cascade[static_cast<std::size_t>(c)];
+            skipped.base = cascade.cpu.base();
+            skipped.probes_invalidated = 0;
+            continue;
+        }
         const std::uint32_t invalidated = cascade.cpu.update(camera_position);
 
         GiCascadeStats& cs = stats_.per_cascade[static_cast<std::size_t>(c)];

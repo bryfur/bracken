@@ -138,16 +138,50 @@ SamplerState directionHistorySampler : register(s6, space0);
 [[vk::image_format("rg16f")]]
 [[vk::binding(2, 1)]] RWTexture2D<float2> directionOut : register(u2, space1);
 
-/// Neighbourhood mean and standard deviation of one 3x3 window, over texels the
-/// trace answered for. `validMask` comes from the DIFFUSE alpha for both
-/// targets, because it is one validity statement about the texel and not two.
-void neighbourhood(int2 coord, out float3 diffuseMean, out float3 diffuseSigma,
-                   out float3 specMean, out float3 specSigma, out float valid) {
+/// One 3x3 window's statistics, in two forms — and which form you may use is
+/// not a matter of taste.
+///
+/// `mean`/`sigma` are over the WHOLE window, centre included, and drive the
+/// HISTORY clamp box. Bounding last frame's estimate by this frame's
+/// neighbourhood is the standard TAA construction and the centre belongs in it:
+/// history and the window are independent quantities.
+///
+/// `looMean`/`looSigma` LEAVE THE CENTRE OUT, and only these may judge whether
+/// the centre is a firefly. Testing a sample against statistics it contributed
+/// to is not a weak test, it is an impossible one: Samuelson's inequality bounds
+/// every member of an n-sample set by `mean + sigma*sqrt(n-1)`, so across these
+/// 9 taps no value can exceed `mean + 2.83*sigma` — while
+/// RT_REFLECTION_FIREFLY_SIGMA is 4.0 and `rtReflectionFireflyCeiling` then
+/// takes a `max` with an absolute floor that can only raise it further. The
+/// relative half of the R5b clamp could not fire on ANY input, at any exposure,
+/// in any scene, which is why the fireflies it was built for outlived it.
+struct RtDiWindow {
+    float3 diffuseMean;
+    float3 diffuseSigma;
+    float3 specMean;
+    float3 specSigma;
+    float valid;
+    float3 diffuseLooMean;
+    float3 diffuseLooSigma;
+    float3 specLooMean;
+    float3 specLooSigma;
+    float looValid;
+};
+
+/// Statistics of one 3x3 window, over texels the trace answered for. Validity
+/// comes from the DIFFUSE alpha for both targets, because it is one validity
+/// statement about the texel and not two.
+RtDiWindow neighbourhood(int2 coord) {
     float3 d1 = 0.0;
     float3 d2 = 0.0;
     float3 s1 = 0.0;
     float3 s2 = 0.0;
-    valid = 0.0;
+    float valid = 0.0;
+    // The centre's own contribution, kept aside so it can be subtracted back
+    // out exactly rather than re-gathered in a second pass.
+    float3 centreD = 0.0;
+    float3 centreS = 0.0;
+    float centreValid = 0.0;
     [unroll]
     for (int dy = -1; dy <= 1; ++dy) {
         [unroll]
@@ -163,18 +197,44 @@ void neighbourhood(int2 coord, out float3 diffuseMean, out float3 diffuseSigma,
             s1 += s;
             s2 += s * s;
             valid += 1.0;
+            if (dx == 0 && dy == 0) {
+                centreD = d.rgb;
+                centreS = s;
+                centreValid = 1.0;
+            }
         }
     }
-    diffuseMean = 0.0;
-    diffuseSigma = 0.0;
-    specMean = 0.0;
-    specSigma = 0.0;
+
+    RtDiWindow w;
+    w.diffuseMean = 0.0;
+    w.diffuseSigma = 0.0;
+    w.specMean = 0.0;
+    w.specSigma = 0.0;
+    w.valid = valid;
+    w.diffuseLooMean = 0.0;
+    w.diffuseLooSigma = 0.0;
+    w.specLooMean = 0.0;
+    w.specLooSigma = 0.0;
+    w.looValid = max(valid - centreValid, 0.0);
+
     if (valid > 0.0) {
-        diffuseMean = d1 / valid;
-        diffuseSigma = sqrt(max(d2 / valid - diffuseMean * diffuseMean, 0.0));
-        specMean = s1 / valid;
-        specSigma = sqrt(max(s2 / valid - specMean * specMean, 0.0));
+        w.diffuseMean = d1 / valid;
+        w.diffuseSigma = sqrt(max(d2 / valid - w.diffuseMean * w.diffuseMean, 0.0));
+        w.specMean = s1 / valid;
+        w.specSigma = sqrt(max(s2 / valid - w.specMean * w.specMean, 0.0));
     }
+    if (w.looValid > 0.0) {
+        const float3 ld1 = d1 - centreD;
+        const float3 ld2 = d2 - centreD * centreD;
+        const float3 ls1 = s1 - centreS;
+        const float3 ls2 = s2 - centreS * centreS;
+        w.diffuseLooMean = ld1 / w.looValid;
+        w.diffuseLooSigma =
+            sqrt(max(ld2 / w.looValid - w.diffuseLooMean * w.diffuseLooMean, 0.0));
+        w.specLooMean = ls1 / w.looValid;
+        w.specLooSigma = sqrt(max(ls2 / w.looValid - w.specLooMean * w.specLooMean, 0.0));
+    }
+    return w;
 }
 
 /// The R5b firefly clamp, rescaling the whole colour so a clamped sample keeps
@@ -211,12 +271,12 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     const float adaptedEv = rtAdaptedEv(exposureState[0], exposureEnabled, manualExposureEv);
 
-    float3 diffuseMean;
-    float3 diffuseSigma;
-    float3 specMean;
-    float3 specSigma;
-    float valid;
-    neighbourhood(coord, diffuseMean, diffuseSigma, specMean, specSigma, valid);
+    const RtDiWindow win = neighbourhood(coord);
+    const float valid = win.valid;
+    float3 diffuseMean = win.diffuseMean;
+    float3 diffuseSigma = win.diffuseSigma;
+    float3 specMean = win.specMean;
+    float3 specSigma = win.specSigma;
 
     if (valid > 0.0) {
         // The one absolute term in an otherwise scale-free clamp, and therefore
@@ -227,8 +287,15 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         diffuseSigma = max(diffuseSigma, sigmaFloor.xxx);
         specSigma = max(specSigma, sigmaFloor.xxx);
 
-        current.rgb = clampFirefly(current.rgb, diffuseMean, diffuseSigma, adaptedEv);
-        currentSpec.rgb = clampFirefly(currentSpec.rgb, specMean, specSigma, adaptedEv);
+        // The firefly test takes the LEAVE-ONE-OUT statistics — see RtDiWindow.
+        // With `looValid == 0` (an isolated traced texel) both are zero and the
+        // ceiling falls back to `4*sigmaFloor` against the absolute perceptual
+        // floor, which is the right answer when there is no neighbouring
+        // evidence that a bright centre is real.
+        current.rgb = clampFirefly(current.rgb, win.diffuseLooMean,
+                                   max(win.diffuseLooSigma, sigmaFloor.xxx), adaptedEv);
+        currentSpec.rgb = clampFirefly(currentSpec.rgb, win.specLooMean,
+                                       max(win.specLooSigma, sigmaFloor.xxx), adaptedEv);
     }
 
     // How much history this texel is allowed to keep. Same two-source max the
@@ -236,8 +303,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // local traced gradient the reconstruction dilated over this stratum.
     float gradient = 0.0;
     if (gradientValid != 0u) {
-        const int2 g = clamp(coord / RT_GRADIENT_STRATUM, int2(0, 0), int2(stratumCount) - 1);
-        gradient = gradientTexture.Load(int3(g, 0));
+        gradient = rtGradientSample(gradientTexture, coord, stratumCount);
     }
     const float reset = saturate(max(lightingReset, gradient));
 
@@ -253,6 +319,52 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         const float2 prevUv = uv - velocity; // velocity = curr - prev (velocity_math.hpp)
         if (all(prevUv >= 0.0) && all(prevUv <= 1.0)) {
             const float4 hist = diffuseHistory.SampleLevel(diffuseHistorySampler, prevUv, 0);
+
+            // NO GEOMETRIC HISTORY VALIDATION HAPPENS HERE, and that is a known
+            // gap rather than an oversight (docs/rt_lighting_plan.md §5.9).
+            // History is accepted on `prevUv` being on screen and `hist.a > 0`,
+            // nothing else, so `count` does not reset on disocclusion — and
+            // `count` is what gates R7c's 3->1 filter-radius ramp and its second
+            // a-trous iteration, both of which therefore cannot fire on the
+            // pixels they were built for.
+            //
+            // A depth gate was BUILT AND REVERTED on 2026-08-08, and the reasons
+            // are worth recording because the next attempt should not repeat
+            // either of them.
+            //
+            // It worked, mechanically: the previous frame's `RtReservoir::depth`
+            // lane is last frame's true view depth at that texel, `current.a` is
+            // this frame's (`diDiffuse.a = surf.viewDepth`), and comparing them
+            // at the standard 0.05 needs no linearization at all. It read the
+            // previous reservoir buffer as a second read-only storage buffer.
+            //
+            // It was reverted for ONE sound reason and one unsound one:
+            //
+            //  * SOUND: no quality improvement was demonstrable. `di noise` is a
+            //    TEMPORAL statistic, and a denoiser that correctly discards
+            //    history necessarily has more temporal variation than one that
+            //    wrongly keeps it — so the probe moved the wrong way for
+            //    structural reasons (0.00014 -> 0.00016 pinned, 0.00384 ->
+            //    0.00435 orbiting) while the compensating SPATIAL win, which is
+            //    the entire point of letting `count` reset, has no probe at all.
+            //    Until there is one, this cannot be evaluated on evidence.
+            //  * UNSOUND: it looked like it cost 10-15% of frame time. That
+            //    figure is NOT TRUSTWORTHY and should not be quoted. It was
+            //    taken with `--rt-bench 120`, which on this machine completes in
+            //    ~0.2 s — far too short for the GPU to leave its 255 MHz idle
+            //    clock — and against a baseline measured hours earlier. The
+            //    RT-OFF bench, whose output is bit-identical and whose code path
+            //    none of this touches, drifted from 954 to 853 fps over the same
+            //    session, which is the size of the effect being attributed.
+            //    Any re-measurement needs long runs (`--rt-bench 3000`) taken
+            //    back to back on a quiet machine.
+            //
+            // The right shape is probably still a DEDICATED R16F depth history
+            // for this signal — one cheap texture write here and one cached,
+            // filterable read at `prevUv`, rather than a scattered 16-byte
+            // random-access buffer index — because it also avoids depending on
+            // the visibility denoiser's history, which the Full tier is supposed
+            // to stop running at all.
             if (hist.a > 0.0 && valid > 0.0) {
                 const float4 histSpec =
                     specularHistory.SampleLevel(specularHistorySampler, prevUv, 0);

@@ -224,8 +224,33 @@ inline constexpr float GRADIENT_DILATION_RING2 = 0.3f;
  * (see gpu_uniforms.hpp): they document an INTENT — 5% relative — and this one
  * documents a MEASUREMENT, and only a measurement has to be re-taken when the
  * ruler changes.
+ *
+ * SUN-ONLY, and the name says so since 2026-08-08. This value reaches exactly
+ * one consumer, `RtShadowGradientUniforms::depthRejectRelative`. The LOCAL
+ * gradient has its own, deliberately different — see
+ * `LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE`.
  */
-inline constexpr float GRADIENT_DEPTH_REJECT_RELATIVE = 0.0004f;
+inline constexpr float SUN_GRADIENT_DEPTH_REJECT_RELATIVE = 0.0004f;
+
+/**
+ * The same knee for the LOCAL (point/spot) gradient replay — and it is 0.0005,
+ * not the sun's 0.0004, on purpose.
+ *
+ * The 2026-08-02 depth-linearization fix re-measured the sun's value because
+ * that replay's ruler had been wrong: it linearizes device depth through
+ * `depth_linear.hlsli`, so the inverted `depthA` sign had made its effective
+ * threshold a curve rather than a constant. The local replay never used that
+ * ruler. `rt_local_shadow_gradient.comp.hlsl` compares the reservoir's `depth`
+ * lane against `-mul(clusterParams.view, float4(worldPos, 1)).z` — TWO TRUE VIEW
+ * DEPTHS, never linearized, never scaled by the broken formula. Its calibration
+ * was therefore untouched by that fix, and resyncing it to 0.0004 would tighten
+ * by 20% a test that was never mis-scaled.
+ *
+ * Kept as a separate named constant rather than a bare literal in the shader so
+ * the divergence is a decision on the record instead of drift. Both are uniforms
+ * now, so there is one definition of each.
+ */
+inline constexpr float LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE = 0.0005f;
 
 /**
  * Reconstructed gradient above which a pixel counts as "fired" for the bench

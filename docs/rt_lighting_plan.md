@@ -2396,6 +2396,165 @@ shadow.
 
 ---
 
+### 5.9 Q1 — the quality audit (2026-08-08)
+
+A nine-lens adversarial audit of the whole traced stack, prompted by three
+reported artefacts: a **blocky character shadow under motion**, **flickery GI**,
+and a **very noisy Full-DI tier**. What follows is what landed and, just as
+importantly, what did not.
+
+**READ THIS BEFORE QUOTING A TIMING NUMBER FROM `--rt-bench`.** The default
+`--rt-bench 120` completes in roughly 0.2 s. On a machine whose GPU idles at
+255 MHz against a 3090 MHz boost clock, that is over before the card has ramped,
+so the reported `frame render` / `present_wait` are dominated by clock state and
+are not a measurement of anything. During this audit the RT-OFF bench — whose
+screenshot is bit-identical and whose code path none of the work touches —
+drifted from 954 fps to 853 fps across one session, which is larger than most of
+the effects being attributed. **One reverted change (the DI history gate below)
+was reverted partly on a cost figure taken this way, and that figure was wrong.**
+Use `--rt-bench 3000`, take the A and B back to back on a quiet machine, and
+treat anything under ~10% as noise unless it reproduces. The DENOISE COUNTERS in
+the same output (`sun_grad_fire`, `local_grad_fire`, `sun_accum`, `di noise`) are
+algorithmic and deterministic — those reproduce to the digit across runs and
+sessions, and every quality conclusion in this section rests on them rather than
+on a clock.
+
+**Two defects were provable rather than plausible**, and both had survived
+because the thing they broke was invisible to the mean-luma pins:
+
+* **R5b's firefly clamp could not fire, on any input, ever.** Both temporal
+  denoisers built a 3×3 mean/σ *including the centre texel* and then tested that
+  centre at `REFLECTION_FIREFLY_SIGMA = 4`. Samuelson's inequality bounds every
+  member of an n-sample set by `mean + σ√(n−1)`, i.e. `mean + 2.83σ` for 9 taps,
+  and the ceiling then takes a `max` with an absolute floor that can only raise
+  it. Fixed by leave-one-out statistics for the firefly test only — the history
+  clamp box keeps the full window, because history is an independent quantity
+  and does belong in it. Pinned by `RtDenoiseMath.FireflyCeilingCannotFireAgainst\
+  AWindowContainingTheSample`.
+* **The GI visibility atlas overflowed fp16.** `R16G16_FLOAT`, raw squared world
+  distances, clamp `1.5 × spacing` over spacings 150/300/600 → second moments to
+  810 000 against a 65 504 maximum. Cascades 1–2 saturated; cascade 0 lost the
+  variance to catastrophic cancellation (ULP 32 at a magnitude of 40 000, against
+  a variance floor of 2.25). Moments are normalized by spacing now, which makes
+  the Chebyshev test exactly scale-invariant and lets `SAMPLE_CHEBYSHEV_*` stop
+  being multiplied by spacing at the use site. Three mirror sites, changed
+  together.
+
+**The A-SVGF gradient was measuring the camera.** Both replays compared the
+history's recorded depth against *this* frame's view depth. See architecture.md
+for the numbers; the short version is that the only mechanism able to invalidate
+history for a moving occluder over a static floor switched off whenever the
+camera moved, and `sun_accum` *rose* under motion. Fixed by projecting the world
+point with the previous frame's camera. The static bench is unchanged — that is
+the calibration gate — and the orbiting figures invert.
+
+**The G-buffer was lying about foliage, and this is the cross-subsystem one.**
+`prepass_gbuffer_masked.frag.hlsl` wrote a hardcoded `oct(+Y)` under a comment
+saying the normal "is never read as a result". True when the G-buffer served
+only the reflection pass; false once `rt_shadow`, `rt_local_shadow`'s
+`surfaceAt` (which feeds the **reservoir's target function**), both gradient
+replays, the DI spatial filter's bilateral weight and screen-probe placement
+began decoding it. 27 of the playground's 52 `.glb`s are `alphaMode:MASK`. The
+sharpest consequence was that `local_di.hlsli`'s relief factor divides by the
+geometric cosine on the stated invariant that it is "the same cosine the trace
+already applied" — so on a leaf card the trace applied `cos(+Y, L)` while the
+remodulation divided by `cos(N_geo, L)`, off by ~4.5× into the `RELIEF_MAX`
+clamp, at full resolution, after every denoiser, varying per card. **That is the
+most direct account of why Full is noisy where Ratio is not**: Ratio has no
+relief term and no per-pixel remodulation. The MASK G-buffer pipelines now take
+their own vertex shader carrying a real normal. On the static bench, where every
+gradient fired is spurious by construction, `sun_grad_fire` fell 0.0086 → 0.0056
+and `local_grad_fire` 0.0280 → 0.0230 — the replay and the trace now agree about
+what surface they are on.
+
+**Also landed.** `rtSample2D` broadcast one scalar into both axes of its
+Cranley–Patterson offset, so at any fixed frame every pixel on screen sampled the
+diagonal `y − x = const` — the per-pixel sequence was fine, the frame's *spatial*
+sample set was one-dimensional, and the à-trous passes average over exactly those
+neighbours. The uniform-tile branch in the shadow temporal pass no longer
+bypasses history (it stamped a 32-frame confidence from one stochastic bit at
+8×4-tile granularity, and ignored `reset`); the gradient is fetched bilinearly
+rather than point-sampled per 3×3 stratum; the two gradient depth knees are
+separate named constants, because the local replay compares two true view depths
+and was never mis-scaled by the 2026-08-02 fix, so re-syncing it to the sun's
+re-measured 0.0004 would tighten an unbroken test. `shadow_only` proxy meshes are
+out of the BLAS: a procedural tree was casting its leaf cards *and* its proxy
+ellipsoid, and closest-hit rays were shading an invisible ellipsoid in
+reflections and GI.
+
+**Still open, in priority order.**
+
+* **Alpha-cutout geometry is still absent from every traced walk.** `gather()`
+  reads no `alpha_mode` / `alpha_cutoff`, and `triangleHit` is pure
+  Möller–Trumbore, so a leaf card occludes as a solid quad in sun shadow, local
+  DI, reflections and probe rays. The cheapest sound design is a per-triangle
+  average opacity **baked at BLAS build** into `BvhTriangle::pad0` — zero extra
+  bytes, zero extra bindings, and it works in the shadows-only configuration
+  where the attribute buffer does not exist — sampled with ~8 stratified
+  barycentric taps so it is genuine coverage rather than one centroid tap
+  reporting 1.0 for a card that is half gap. Note the ordering argument: a
+  Bernoulli test per leaf hit ADDS variance, so it wants the DI noise work below
+  to land first. Prerequisite: `model_loader.cpp`'s LOD copy block drops
+  `alpha_mode`, `double_sided` and `texture_pixels`.
+* **The DI temporal pass has no geometric history validation at all** — it
+  accepts reprojected history on `prevUv ∈ [0,1]` and `hist.a > 0`, nothing else.
+  `count` therefore never resets under motion, so the R7c radius ramp and the
+  second à-trous iteration never fire on the pixels they were built for. Gate it
+  on the previous reservoir's `depth` lane at the standard 0.05. This is the
+  second of the two invalidation paths, and the one still open.
+* **No ReSTIR visibility reuse.** The shadow ray is traced and its answer
+  discarded; `p̂` stays unshadowed, so a pixel in a lantern's shadow re-selects
+  and re-confirms the occluded light for up to ~120 effective samples. Apply the
+  traced bit to the reservoir weight with RTXDI's boiling-filter decay. This
+  changes the estimator's fixed point, so the Ratio↔Full energy gate (§5.3, the
+  two means within ~0.1 luma) is the check.
+* **GI probe-update stability, partly addressed and NOT demonstrated to help.**
+  Three changes landed: the visibility moments take a fixed EMA instead of the
+  irradiance blend's change-adaptive one (they describe geometry, so every delta
+  the curve reacted to was Monte Carlo noise, and reacting by shortening the
+  window is positive feedback); probe classification gained dwell bands (a
+  64-ray binomial has σ≈0.054 at the 0.75 knee, and one probe entering or
+  leaving `INSIDE_GEOMETRY` adds or removes a whole member of every sampler's
+  8-probe cage); and a cascade may no longer scroll on a frame it cannot
+  re-trace. **The irradiance half of `giBlend`'s adaptive hysteresis was NOT
+  touched** — gating its delta by an estimated σ needs a second moment
+  accumulated in the ray loop, and that is still open.
+* **A differential GI flicker probe now exists, and it says the GI work made
+  frame-to-frame variation LARGER.** Method: `--smoke N` and `--smoke N+1`
+  capture consecutive frames of a deterministic self-driving run, so the raw
+  delta (~13.4/255) is dominated by camera and character motion — but that
+  motion is bit-identical between a `GI=off` and a `GI=probes` run, so the
+  EXCESS is what GI contributes. Measured over three frame pairs, with `GI=off`
+  reproducing 13.4203 in every build (which is what validates the method):
+
+  | build | GI-off | GI-on | excess |
+  |---|---|---|---|
+  | before the GI package | 13.4203 | 13.5446 | **+0.1243** |
+  | after | 13.4203 | 13.5726 | **+0.1523** |
+  | after, minus the scroll guard | 13.4203 | 13.5721 | +0.1518 |
+
+  The scroll guard is neutral (third row), so the rise belongs to the fp16
+  normalization and the hysteresis changes. The most likely reading is not a
+  regression but the fix working: a saturated fp16 second moment made
+  `giChebyshev` return a CONSTANT, which is stable and wrong, and it now returns
+  a value that actually tracks the geometry. **But this proxy cannot separate
+  "responds correctly to a moving camera" from "flickers", so it does not
+  settle the question and the reported flicker should NOT be assumed fixed.**
+  A real probe — a per-probe temporal-variance statistic accumulated on the GPU,
+  the way `rt_di_noise.comp.hlsl` does for DI — is what this needs, and it should
+  be built before any further GI tuning, because every remaining item here is
+  otherwise unfalsifiable.
+* `src/bracken/render/raytracing/internal/` is an **untracked** tinyBVH SBVH
+  stub: a header, a 420 KB vendored library, no `.cpp`, no caller, no test, no
+  build reference. The audit's verdict was DELETE — its spatial splits duplicate
+  triangle *references*, and `rt_scene.cpp` builds the R6 emissive table by
+  iterating `blas.triangles`, so each split emitter would be pushed k times at
+  full weight and the **brightest** area lights would be over-weighted k-fold.
+  Left in place pending the owner's call, since it is untracked and deleting it
+  is irreversible.
+
+---
+
 ## 6. Scalability ladder
 
 Per-effect toggles stay orthogonal (house style); the table is the *intended*

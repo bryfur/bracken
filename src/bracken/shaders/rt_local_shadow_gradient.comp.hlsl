@@ -55,8 +55,13 @@ cbuffer RtLocalShadowGradientUniforms : register(b0, space2) {
     /// §5.8 — the capsule set the trace used. The replay MUST see the same one
     /// or every capsule-shadowed stratum reports a permanent gradient.
     uint shadowCapsuleCount;
-    uint _pad1;
+    /// LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE (0.0005, deliberately not the sun's
+    /// 0.0004 — see the constant's own doc). A uniform since 2026-08-08; it was
+    /// a bare `#define` here, which is how it silently diverged.
+    float depthRejectRelative;
     uint _pad2;
+    /// PREVIOUS frame's view matrix, for the depth test below.
+    float4x4 prevView;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 0)]]
@@ -213,13 +218,25 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         prevReservoirs[uint(prevCoord.y) * tracedSize.x + uint(prevCoord.x)];
 
     // The reservoir merge's disocclusion test, TIGHTENED by two orders of
-    // magnitude — see RT_GRADIENT_DEPTH_REJECT_RELATIVE. The merge asks whether
-    // the stored reservoir is reusable; this asks whether the stored BIT was
-    // measured at the same point, which is a strictly stronger question and is
-    // the difference between reporting a lighting change and reporting the TAA
-    // jitter moving the sample half a pixel along a leaf.
-    if (!(hist.depth > 0.0 &&
-          abs(hist.depth - viewDepth) <= RT_GRADIENT_DEPTH_REJECT_RELATIVE * max(viewDepth, 1.0))) {
+    // magnitude — see LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE. The merge asks
+    // whether the stored reservoir is reusable; this asks whether the stored BIT
+    // was measured at the same point, which is a strictly stronger question and
+    // is the difference between reporting a lighting change and reporting the
+    // TAA jitter moving the sample half a pixel along a leaf.
+    //
+    // `hist.depth` was measured under the PREVIOUS frame's camera, so that is
+    // the camera this world point has to be re-measured with. Comparing it
+    // against `viewDepth` — this frame's — measured the camera's own per-frame
+    // motion instead, which at a 420-unit boom is 2-5 world units against a
+    // 0.21-unit tolerance. The replay therefore went silent under exactly the
+    // condition it exists for: `local_grad_fire` measured 0.0278 with the camera
+    // pinned and 0.0054 orbiting, a 5.1x collapse, while `di noise` rose 29x
+    // over the same pair. The DI temporal pass has no other invalidation
+    // mechanism, so both of its escape routes failed together.
+    const float expectedPrevViewDepth = -mul(prevView, float4(worldPos, 1.0)).z;
+    if (!(hist.depth > 0.0 && expectedPrevViewDepth > 0.0 &&
+          abs(hist.depth - expectedPrevViewDepth) <=
+              depthRejectRelative * max(viewDepth, 1.0))) {
         gradientOut[stratum] = 0.0;
         return;
     }

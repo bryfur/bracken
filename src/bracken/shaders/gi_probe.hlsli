@@ -256,6 +256,10 @@ float3 giBlend(float3 oldValue, float3 newValue, float reset) {
 
 #define GI_RELOCATE_BACKFACE_FRACTION 0.25
 #define GI_INSIDE_BACKFACE_FRACTION 0.75
+/// The LEAVE half of each dwell band — see gi_math.hpp for why a bare threshold
+/// on a 64-ray binomial oscillates and what that does to the trilinear cage.
+#define GI_RELOCATE_BACKFACE_LEAVE 0.10
+#define GI_INSIDE_BACKFACE_LEAVE 0.60
 #define GI_MAX_OFFSET_FRACTION 0.45
 #define GI_VISIBILITY_DISTANCE_SCALE 1.5
 #define GI_VISIBILITY_SHARPNESS 50.0

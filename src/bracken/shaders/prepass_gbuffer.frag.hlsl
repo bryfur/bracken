@@ -32,7 +32,8 @@
  * shades.
  */
 
-#include "pbr.hlsli" // specularAARoughness
+#include "oct_encode.hlsli" // octEncode
+#include "pbr.hlsli"        // specularAARoughness
 
 struct PSInput {
     float4 position : SV_Position;
@@ -62,16 +63,6 @@ cbuffer PrepassGBufferUniforms {
 Texture2D metallicRoughnessTexture;
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
 SamplerState metallicRoughnessSampler;
-
-// Octahedral normal encoding (Cigolle et al. 2014). Unit vector -> [0,1]^2.
-float2 octEncode(float3 n) {
-    n /= (abs(n.x) + abs(n.y) + abs(n.z));
-    float2 e = n.xy;
-    if (n.z < 0.0) {
-        e = (1.0 - abs(n.yx)) * select(n.xy >= 0.0, float2(1.0, 1.0), float2(-1.0, -1.0));
-    }
-    return e * 0.5 + 0.5;
-}
 
 PSOutput PSMain(PSInput input) {
     PSOutput output;

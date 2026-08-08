@@ -92,6 +92,31 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
         float3 c0, c1, c2;
         giRayRotation(giFrameIndex, c0, c1, c2);
 
+        // DISTANCES ARE STORED NORMALIZED BY CASCADE SPACING, and that is a
+        // correctness requirement rather than tidiness. The atlas is
+        // R16G16_FLOAT, whose maximum is 65504, while `giDistanceClamp` is
+        // 1.5 * spacing over spacings of 150 / 300 / 600 — so a raw second
+        // moment reaches 50625 / 202500 / 810000 and cascades 1 and 2 SATURATE
+        // TO INFINITY outright. On the clamping branch
+        // `moments.y - moments.x * moments.x` goes negative, pins at the
+        // variance floor, and the Chebyshev bound collapses into exactly the
+        // hard binary test that SAMPLE_CHEBYSHEV_MIN_VARIANCE's comment says it
+        // exists to prevent. Cascade 0 does not overflow but loses the variance
+        // to catastrophic cancellation: at dist 200 the second moment is ~40000
+        // where the fp16 ULP is 32, so the subtraction carries an absolute error
+        // of ~20 against a floor of 2.25, and one ULP of drift in the EMA swings
+        // that probe's cage weight by two orders of magnitude. Probes then drop
+        // in and out of the 8-probe cage while giSampleCascade renormalizes over
+        // the survivors, which redistributes the swing instead of damping it.
+        //
+        // Normalized, the stored pair is bounded by (1.5, 2.25) and every term
+        // in the Chebyshev test is in units of spacing, which makes the test
+        // exactly scale-invariant — the bias and variance-floor constants keep
+        // meaning "a fraction of spacing" and simply stop being multiplied by it
+        // on both sides.
+        const float spacing = giCascadeSpacing(int(giCascadeIndex));
+        const float invSpacing = 1.0 / max(spacing, 1e-6);
+
         float2 sum = float2(0, 0);
         float wsum = 0.0;
         for (uint r = 0; r < giRayCount; ++r) {
@@ -103,7 +128,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
             }
             // abs(): a backface hit is still an occluder at that distance. The
             // sign carries the classification signal, not a distance.
-            float dist = min(abs(giRayResults[probeIndex * giRayCount + r].w), giDistanceClamp);
+            float dist =
+                min(abs(giRayResults[probeIndex * giRayCount + r].w), giDistanceClamp) * invSpacing;
             sum += w * float2(dist, dist * dist);
             wsum += w;
         }
@@ -114,15 +140,32 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
             // No ray went this way on this update. An unfilled probe has no
             // previous value worth keeping, so seed it with "nothing in the
             // way" rather than with whatever its slot's last occupant saw.
-            result = fresh ? float2(giDistanceClamp, giDistanceClamp * giDistanceClamp) : previous;
+            const float clampN = giDistanceClamp * invSpacing;
+            result = fresh ? float2(clampN, clampN * clampN) : previous;
         } else {
             float2 estimate = sum / wsum;
-            // The same change-adaptive EMA as the irradiance blend, so the two
-            // halves of a probe never describe different moments in time.
-            // Reset floor 0.0, deliberately: these moments describe GEOMETRY, and
-            // the sun moving does not move a wall. The floor is declared in this
-            // pass's cbuffer only because the two blends share one struct.
-            result = fresh ? estimate : giBlend(float3(previous, 0.0), float3(estimate, 0.0), 0.0).xy;
+            // A FIXED EMA, not the irradiance blend's change-adaptive one, and
+            // the comment that used to sit here is the argument for the change:
+            // these moments describe GEOMETRY, and the sun moving does not move
+            // a wall.
+            //
+            // The adaptive curve exists to let a probe catch up quickly when the
+            // LIGHTING changes, by collapsing the hysteresis in proportion to
+            // `|new - old| / |old|`. Applied to geometry there is no such event
+            // to catch up to, so every delta it reacts to is the Monte Carlo
+            // noise of a different ray subset landing in this texel's narrow
+            // cos^50 cone — and reacting to that noise by shortening the window
+            // makes the next estimate noisier still. That is positive feedback,
+            // and it is worst exactly where the estimator is weakest: `delta` is
+            // normalized by `max(|old|, 1e-4)`, so a texel whose stored distance
+            // is small sees the largest relative deltas from the smallest
+            // absolute wobble.
+            //
+            // Holding the window open at GI_HYSTERESIS_MAX lets the moments
+            // converge monotonically, which is all a static wall ever needs. A
+            // wall that genuinely moves is a scrolled-in probe (`fresh`) or a
+            // rebuilt scene, and both take the left-hand branch.
+            result = fresh ? estimate : lerp(estimate, previous, GI_HYSTERESIS_MAX);
         }
 
         giVisibility[tileOrigin + tileLocal] = result;

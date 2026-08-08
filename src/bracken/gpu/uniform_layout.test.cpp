@@ -429,6 +429,11 @@ const UniformRow UNIFORM_TABLE[] = {
     ROW("prepass_skinned_gbuffer.vert.spv", 1, 0, gpu::PrepassModelUniforms),
     ROW("prepass_instanced_gbuffer.vert.spv", 1, 0, gpu::PrepassCameraUniforms),
     ROW("prepass_terrain_gbuffer.vert.spv", 1, 0, gpu::PrepassCameraUniforms),
+    // The MASK G-buffer variants, split out of the velocity-only ones on
+    // 2026-08-08 so they can carry a real normal (see
+    // prepass_gbuffer_masked.frag.hlsl). Same bodies, same CPU structs.
+    ROW("prepass_model_masked_gbuffer.vert.spv", 1, 0, gpu::PrepassModelUniforms),
+    ROW("prepass_instanced_masked_gbuffer.vert.spv", 1, 0, gpu::PrepassCameraUniforms),
     ROW("prepass_gbuffer.frag.spv", 3, 0, gpu::PrepassGBufferUniforms),
     ROW("prepass_gbuffer_masked.frag.spv", 3, 0, gpu::PrepassMaskedUniforms),
     ROW("shadow_depth.vert.spv", 1, 0, gpu::ShadowTransformUniforms),

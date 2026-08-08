@@ -44,16 +44,7 @@ struct PSOutput {
     float4 normalRough : SV_Target1;
 };
 
-// Octahedral normal encoding (Cigolle et al. 2014) — must match the decode in
-// rt_reflection.comp.hlsl and the encode in prepass_gbuffer.frag.hlsl.
-float2 octEncode(float3 n) {
-    n /= (abs(n.x) + abs(n.y) + abs(n.z));
-    float2 e = n.xy;
-    if (n.z < 0.0) {
-        e = (1.0 - abs(n.yx)) * select(n.xy >= 0.0, float2(1.0, 1.0), float2(-1.0, -1.0));
-    }
-    return e * 0.5 + 0.5;
-}
+#include "oct_encode.hlsli" // octEncode — must match rt_trace.hlsli's decode
 
 PSOutput PSMain(PSInput input) {
     PSOutput output;

@@ -70,11 +70,45 @@ float rtGradientDilationWeight(int dx, int dy) {
     return 0.0;
 }
 
-/// See `GRADIENT_DEPTH_REJECT_RELATIVE` for why this is 100x tighter than the
-/// denoiser's own depth test, and for the measurement that set it.
-#define RT_GRADIENT_DEPTH_REJECT_RELATIVE 0.0005
+// The gradient replay's depth-reject knee used to live here as a bare literal,
+// which is how it silently diverged from its CPU counterpart when that one was
+// re-measured on 2026-08-02. There are two of them and they are legitimately
+// different — `SUN_GRADIENT_DEPTH_REJECT_RELATIVE` (0.0004, linearized device
+// depth) and `LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE` (0.0005, true view depths,
+// never mis-scaled and so never re-measured) — and both now reach their shader
+// as a uniform, so each has exactly one definition. See rt_denoise_math.hpp.
 
 #define RT_GRADIENT_FIRE_THRESHOLD 0.5
+
+/// The reconstructed A-SVGF gradient at a traced pixel, BILINEARLY.
+///
+/// The gradient lives at stratum resolution (traced / RT_GRADIENT_STRATUM), and
+/// both temporal passes used to point-fetch it with `coord / RT_GRADIENT_STRATUM`
+/// — one reset value stamped flat across each 3x3 stratum. Composed with
+/// rt_gradient_reconstruct.comp.hlsl's three-plateau Chebyshev dilation
+/// (1.0 / 0.6 / 0.3, so reset values 0.000 / 0.925 / 0.955 / 0.969) that is a
+/// four-level staircase in 6x6-screen-pixel blocks running along every moving
+/// shadow edge — a second, finer blocking grid beating against the 8x4 tile grid
+/// the temporal pass used to quantize on. Interpolating costs three extra loads
+/// in a half-resolution pass and makes the reset field continuous.
+///
+/// Stratum `g` covers traced pixels `[g*S, g*S + S-1]`, so its centre sits at
+/// `g*S + (S-1)/2` and the continuous stratum coordinate of a traced pixel is
+/// `(coord - (S-1)/2) / S`. Factored here rather than duplicated at the two call
+/// sites so the sun and DI denoisers cannot drift apart on it.
+float rtGradientSample(Texture2D<float> gradientTexture, int2 coord, uint2 stratumCount) {
+    const float s = float(RT_GRADIENT_STRATUM);
+    const float2 gf = (float2(coord) - (s - 1.0) * 0.5) / s;
+    const int2 g0 = int2(floor(gf));
+    const float2 w = saturate(gf - float2(g0));
+    const int2 lo = int2(0, 0);
+    const int2 hi = int2(stratumCount) - 1;
+    const float g00 = gradientTexture.Load(int3(clamp(g0, lo, hi), 0));
+    const float g10 = gradientTexture.Load(int3(clamp(g0 + int2(1, 0), lo, hi), 0));
+    const float g01 = gradientTexture.Load(int3(clamp(g0 + int2(0, 1), lo, hi), 0));
+    const float g11 = gradientTexture.Load(int3(clamp(g0 + int2(1, 1), lo, hi), 0));
+    return lerp(lerp(g00, g10, w.x), lerp(g01, g11, w.x), w.y);
+}
 
 /// Which pixel of a 3x3 stratum carries this frame's gradient ray. A pure
 /// function of the stratum coordinate and the frame counter, so the choice is

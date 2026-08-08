@@ -75,8 +75,14 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // A freshly scrolled-in probe inherits nothing: its slot's offset belongs
     // to a different point in the world.
     float3 previousOffset = float3(0, 0, 0);
+    // The previous VERDICT, for the dwell bands below. A scrolled-in probe has
+    // no history of its own, so it starts OK and has to earn its way in — the
+    // same rule as its offset.
+    float previousClass = GI_CLASS_OK;
     if ((probe.flags & GI_UPDATE_FLAG_UNINITIALIZED) == 0u) {
-        previousOffset = giProbeOffset[texel].xyz;
+        const float4 prev = giProbeOffset[texel];
+        previousOffset = prev.xyz;
+        previousClass = prev.w;
     }
 
     float3 c0, c1, c2;
@@ -104,7 +110,21 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float classification = GI_CLASS_OK;
     bool relocated = false;
 
-    if (fraction > GI_RELOCATE_BACKFACE_FRACTION) {
+    // BOTH VERDICTS GET A DWELL BAND (gi_math.hpp carries the derivation).
+    // `fraction` is a 64-ray binomial estimate whose sigma at the 0.75 knee is
+    // ~0.054, so a bare threshold flips a probe's classification on consecutive
+    // updates with nothing in the world changing — and one probe entering or
+    // leaving GI_CLASS_INSIDE_GEOMETRY adds or removes a whole member of every
+    // sampler's 8-probe cage, whose weights are then renormalized over the
+    // survivors. That is why a single oscillating probe modulates a whole cell.
+    const bool wasInside = previousClass == GI_CLASS_INSIDE_GEOMETRY;
+    const bool wasRelocated = length(previousOffset) > 1e-4;
+    const float relocateThreshold =
+        wasRelocated ? GI_RELOCATE_BACKFACE_LEAVE : GI_RELOCATE_BACKFACE_FRACTION;
+    const float insideThreshold =
+        wasInside ? GI_INSIDE_BACKFACE_LEAVE : GI_INSIDE_BACKFACE_FRACTION;
+
+    if (fraction > relocateThreshold) {
         float len = length(backfaceSum);
         float3 away = len > 1e-4 ? -backfaceSum / len : float3(0.0, 1.0, 0.0);
         offset = previousOffset + away * (0.25 * giProbeSpacing);
@@ -119,7 +139,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         // half a cell will get it out. Mark it; the blend passes stop writing
         // it and gi_sample.hlsli drops it from the trilinear cage rather than
         // letting it leak a wall's interior into the street.
-        if (fraction > GI_INSIDE_BACKFACE_FRACTION && length(previousOffset) >= giMaxOffset * 0.99) {
+        if (fraction > insideThreshold && length(previousOffset) >= giMaxOffset * 0.99) {
             classification = GI_CLASS_INSIDE_GEOMETRY;
         }
     }

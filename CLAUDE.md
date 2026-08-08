@@ -553,19 +553,52 @@ past `far/2` — is closed. The formula now lives in exactly one place,
 RelWithDebInfo, 3-run identical), and the whole eleven-row matrix is here rather
 than spread over the historical tables above:
 
-| Invocation (`--smoke 30`) | at R8 | at depth-fix |
-|---|---|---|
-| RT off | `86.3 / 45.5` | `86.3 / 45.5` (BIT-identical) |
-| `PLAYGROUND_AO=0` | `87.0 / 44.5` | `87.0 / 44.5` |
-| `PLAYGROUND_AO=2` | `86.0 / 45.7` | `86.0 / 45.7` |
-| `PLAYGROUND_RT=both` | `83.7 / 48.3` | `83.7 / 48.3` |
-| `PLAYGROUND_GI=probes` | `84.7 / 46.7` | `84.7 / 46.7` |
-| `RT=both GI=probes` | `81.9 / 49.8` | `81.9 / 49.8` |
-| `RT=both GI=probes_screen` | `82.3 / 50.4` | `82.3 / 50.4` |
-| `RT=both RT_LOCAL=ratio` | `85.3 / 47.5` | `85.3 / 47.5` |
-| `RT=both RT_LOCAL=full` | `85.5 / 47.3` | `85.5 / 47.3` |
-| night, `TOD_HOUR=1 … ratio` | `35.3 / 57.2` | **`35.4 / 57.4`** |
-| night, `TOD_HOUR=1 … full` | `36.0 / 55.0` | `36.0 / 55.0` |
+| Invocation (`--smoke 30`) | at R8 | at depth-fix | at Q1 |
+|---|---|---|---|
+| RT off | `86.3 / 45.5` | `86.3 / 45.5` (BIT-identical) | `86.3 / 45.5` (BIT-identical) |
+| `PLAYGROUND_AO=0` | `87.0 / 44.5` | `87.0 / 44.5` | `87.0 / 44.5` |
+| `PLAYGROUND_AO=2` | `86.0 / 45.7` | `86.0 / 45.7` | `86.0 / 45.7` |
+| `PLAYGROUND_RT=both` | `83.7 / 48.3` | `83.7 / 48.3` | `83.6 / 48.3` |
+| `PLAYGROUND_GI=probes` | `84.7 / 46.7` | `84.7 / 46.7` | `84.6 / 46.8` |
+| `RT=both GI=probes` | `81.9 / 49.8` | `81.9 / 49.8` | `81.8 / 49.9` |
+| `RT=both GI=probes_screen` | `82.3 / 50.4` | `82.3 / 50.4` | `81.6 / 51.1` |
+| `RT=both RT_LOCAL=ratio` | `85.3 / 47.5` | `85.3 / 47.5` | `85.2 / 47.5` |
+| `RT=both RT_LOCAL=full` | `85.5 / 47.3` | `85.5 / 47.3` | `85.5 / 47.2` |
+| night, `TOD_HOUR=1 … ratio` | `35.3 / 57.2` | **`35.4 / 57.4`** | `35.3 / 56.8` |
+| night, `TOD_HOUR=1 … full` | `36.0 / 55.0` | `36.0 / 55.0` | **`35.5 / 53.9`** |
+
+**"Q1" is the 2026-08-08 quality package** (the audit in
+docs/rt_lighting_plan.md §5.9). The three raster rows are BIT-identical, which
+is the standing gate that none of it reached the forward pass. Every traced row
+moved slightly and two moved properly:
+
+* **night `full` `36.0 / 55.0` → `35.5 / 53.9`** — mean down and the histogram
+  a full point NARROWER. Both are the point: R5b's firefly clamp was
+  mathematically unable to fire (it tested a sample against a 3×3 window
+  containing that sample, which Samuelson's inequality caps at `mean + 2.83σ`
+  against a `4σ` ceiling), so the energy it removes now is energy that was
+  never supposed to be there.
+* **`GI=probes_screen` `82.3 / 50.4` → `81.7 / 51.2`** — the largest move in
+  the table, and it is the visibility atlas. It is `R16G16_FLOAT` and stored
+  raw squared world distances against a clamp of `1.5 × spacing`, so cascade 1
+  and 2 second moments (202 500 and 810 000) saturated fp16's 65 504 outright
+  and cascade 0 lost its variance to catastrophic cancellation. The moments are
+  normalized by cascade spacing now, which makes the whole Chebyshev test
+  scale-invariant and bounds the pair at `(1.5, 2.25)`.
+
+The instrument that actually moved is `--rt-bench`'s denoise counters, not this
+table — see the gradient note in architecture.md. **`di noise` is still ~0.0039
+orbiting** against 0.00014 pinned: the camera-invariant gradient closed one of
+the DI temporal pass's two invalidation paths, and the other (it accepts
+reprojected history on nothing but `prevUv ∈ [0,1]`) is still open — a fix for it
+was built and reverted, and the shader carries the reasons.
+
+**Do not quote a TIMING number from `--rt-bench 120`.** It completes in ~0.2 s,
+before a GPU idling at 255 MHz has ramped to its 3 GHz boost clock, so
+`frame render` / `present_wait` from it measure clock state rather than the
+renderer; the RT-off bench drifted 954 → 853 fps over one session on
+bit-identical output. Use `--rt-bench 3000`, A/B back to back. The denoise
+counters in the same output are algorithmic and reproduce to the digit.
 
 **A row not moving is not a row not changing**, and this is the one package
 where the distinction matters: the traced screenshots differ over 9–12% of their

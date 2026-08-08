@@ -1487,8 +1487,9 @@ is why every recorded smoke baseline is bit-identical across R5b.
    deliberately reports nothing.
 
 The gradient's own depth-continuity test is **two orders of magnitude tighter**
-than the denoiser's (`GRADIENT_DEPTH_REJECT_RELATIVE` = 0.0005 against 0.05),
-and that is not a tuning detail. The denoiser asks "is this history reusable?";
+than the denoiser's (`SUN_GRADIENT_DEPTH_REJECT_RELATIVE` = 0.0004 and
+`LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE` = 0.0005, against 0.05), and that is not
+a tuning detail. The denoiser asks "is this history reusable?";
 the gradient asks "is this literally the point I traced last frame?". With TAA
 on, the jitter moves each pixel's reconstructed world position by up to half a
 pixel per frame, and in geometry as high-frequency as the playground's canopies
@@ -1497,6 +1498,24 @@ loose tolerance the *static* scene reports a 3.3% gradient fire rate that is
 entirely jitter (with TAA off, 0.14%) and the sun's mean accumulation window
 collapses from 26.6 frames to 10.3 for no signal. At the tight tolerance the
 static rate is 0.9% and the window holds at 17.9.
+
+Both replays compare against the **expected previous** view depth of the world
+point — this frame's position projected with the previous frame's camera — and
+not against this frame's own view depth (fixed 2026-08-08). The latter measures
+the CAMERA's per-frame depth change, which at the playground's 420-unit camera
+boom is 2.3–5.0 world units against a 0.17-unit tolerance, so the test rejected
+almost every stratum the instant the camera moved. Because the traced gradient
+is the only mechanism that can invalidate history for an occluder that moved
+while the surface under it did not, that silenced it exactly when it was needed:
+measured static vs `PLAYGROUND_RT_BENCH_ORBIT=1`, `sun_grad_fire` went 0.0086 →
+0.0032 and `local_grad_fire` 0.0278 → 0.0054, while `sun_accum` rose 17.99 →
+21.22 — history getting *longer* under motion — and `di noise` rose 29×. After
+the fix the static figures are unchanged (which is the calibration gate) and the
+orbiting ones invert: 0.0177 and 0.0509, with `sun_accum` falling to 15.26. The
+sun replay needs the previous view-**projection** (its history stores a
+linearized device depth); the local replay needs the previous **view** matrix
+(the reservoir's `depth` lane is a true view depth and never passes through
+`depth_linear.hlsli`), which is why `FrameParams` carries both.
 
 **Exposure-aware clamps.** Scene luminance swings by ~10³ over a day/night
 cycle and the composite pass divides that back out with `exp2(adapted EV)`, so
