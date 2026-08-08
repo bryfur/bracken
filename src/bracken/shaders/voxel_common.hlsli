@@ -97,12 +97,37 @@ float3 voxelSampleUvw(int cascade, float3 world) {
  * sample and a mip tap reaches further, so a sample accepted at the window edge
  * would filter against texels belonging to the opposite side of the torus.
  */
+int voxelSelectCascadeForFootprint(float3 world, float3 camera, float footprint);
+
 int voxelSelectCascade(float3 world, float3 camera) {
+    return voxelSelectCascadeForFootprint(world, camera, 0.0);
+}
+
+/**
+ * The finest cascade that contains `world` with room for a filter footprint of
+ * `footprint` WORLD UNITS to stay inside the window.
+ *
+ * THIS IS THE SEAM FIX, and the seam it fixes is not subtle: storage is a torus,
+ * so a tap whose bilinear/trilinear footprint crosses the window edge wraps and
+ * reads THE OPPOSITE SIDE OF THE WORLD. The fixed two-voxel margin was sized for
+ * a mip-0 tap, but a cone widens as it travels and samples coarser levels — a
+ * tap at mip 3 reaches eight voxels, four times past that margin — so cones at
+ * distance were reading wrapped geometry and painting a hard line across the
+ * world at the cascade's window boundary.
+ *
+ * Asking for the footprint makes the margin scale with the level actually being
+ * sampled, so a wide cone is pushed out to a coarser cascade (whose window is
+ * twice as big) instead of wrapping inside a fine one.
+ */
+int voxelSelectCascadeForFootprint(float3 world, float3 camera, float footprint) {
     [unroll]
     for (int c = 0; c < VOXEL_CASCADE_COUNT; ++c) {
-        float half = voxelCascadeHalfExtent(c) - VOXEL_CASCADE_MARGIN * voxelSize(c);
+        // The base margin covers the trilinear tap itself; the footprint term
+        // covers how far the cone's chosen mip reaches beyond it.
+        float margin = VOXEL_CASCADE_MARGIN * voxelSize(c) + footprint;
+        float halfExtent = voxelCascadeHalfExtent(c) - margin;
         float3 d = abs(world - camera);
-        if (all(d <= half)) {
+        if (halfExtent > 0.0 && all(d <= halfExtent)) {
             return c;
         }
     }

@@ -36,6 +36,7 @@ bool VoxelGi::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
         return false;
     }
     dirty_.fill(true); // nothing has been voxelized yet
+    relight_.fill(true);
     return true;
 }
 
@@ -44,6 +45,7 @@ void VoxelGi::shutdown() {
     volume_.shutdown();
     pipelines_ = nullptr;
     dirty_.fill(false);
+    relight_.fill(false);
     next_cascade_ = 0;
     stats_ = VoxelGiStats{};
 }
@@ -52,6 +54,7 @@ void VoxelGi::build_models(const ModelManager& models) {
     scene_.build_models(models);
     // New geometry invalidates every cascade's contents, not just its window.
     dirty_.fill(true);
+    relight_.fill(true);
 }
 
 void VoxelGi::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances) {
@@ -59,6 +62,7 @@ void VoxelGi::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>> i
     scene_.set_instances(instances);
     if (scene_.instance_count() != before) {
         dirty_.fill(true);
+        relight_.fill(true);
     }
 }
 
@@ -85,16 +89,24 @@ bool VoxelGi::update(SDL_GPUCommandBuffer* cmd, const VoxelGiFrameParams& params
         for (int c = 0; c < VOXEL_CASCADE_COUNT; ++c) {
             if (volume_.stats().per_cascade[static_cast<std::size_t>(c)].voxels_invalidated > 0) {
                 dirty_[static_cast<std::size_t>(c)] = true;
+                relight_[static_cast<std::size_t>(c)] = true;
             }
         }
     }
+    // LIGHTING-ONLY DIRT IS A SEPARATE SET. A sun move leaves the geometry
+    // perfectly valid and only the radiance stale, so folding it into `dirty_`
+    // made every time-of-day change pay a full revoxelization it did not need —
+    // and in the playground the sun moves every frame.
     if (params.lighting_changed) {
-        dirty_.fill(true);
+        relight_.fill(true);
     }
 
     std::uint32_t dirty_count = 0;
-    for (const bool d : dirty_) {
-        dirty_count += d ? 1u : 0u;
+    for (int c = 0; c < VOXEL_CASCADE_COUNT; ++c) {
+        dirty_count += (dirty_[static_cast<std::size_t>(c)] ||
+                        relight_[static_cast<std::size_t>(c)])
+                           ? 1u
+                           : 0u;
     }
     stats_.cascades_dirty = dirty_count;
     if (dirty_count == 0) {
@@ -108,14 +120,20 @@ bool VoxelGi::update(SDL_GPUCommandBuffer* cmd, const VoxelGiFrameParams& params
     // dirty flag.
     for (int i = 0; i < VOXEL_CASCADE_COUNT; ++i) {
         const int c = (next_cascade_ + i) % VOXEL_CASCADE_COUNT;
-        if (!dirty_[static_cast<std::size_t>(c)]) {
+        const bool needs_voxels = dirty_[static_cast<std::size_t>(c)];
+        if (!needs_voxels && !relight_[static_cast<std::size_t>(c)]) {
             continue;
         }
-        if (!rebuild_cascade(cmd, c, params)) {
+        // Geometry only when the WINDOW moved; lighting every time either is
+        // stale. Injection is O(volume) and cheap; voxelization is
+        // O(instances x triangles) and is not.
+        if (!rebuild_cascade(cmd, c, params, needs_voxels)) {
             return false;
         }
         dirty_[static_cast<std::size_t>(c)] = false;
-        stats_.cascade_revoxelized = c;
+        relight_[static_cast<std::size_t>(c)] = false;
+        stats_.cascade_revoxelized = needs_voxels ? c : -1;
+        stats_.cascade_relit = c;
         next_cascade_ = (c + 1) % VOXEL_CASCADE_COUNT;
         break;
     }
@@ -123,7 +141,7 @@ bool VoxelGi::update(SDL_GPUCommandBuffer* cmd, const VoxelGiFrameParams& params
 }
 
 bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
-                              const VoxelGiFrameParams& params) {
+                              const VoxelGiFrameParams& params, bool revoxelize) {
     BRACKEN_PROFILE_ZONE("VoxelGi::rebuild_cascade");
 
     const gpu::GPUComputePipeline* clear =
@@ -146,7 +164,8 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
     // ---- 1. clear ---------------------------------------------------------
     // Required, not hygiene: the voxelizer composites with InterlockedMax, which
     // is monotone, so without this a voxel could only ever get more opaque.
-    {
+    // Skipped with the geometry, since there is nothing to re-accumulate.
+    if (revoxelize) {
         const SDL_GPUStorageTextureReadWriteBinding rw{.texture = albedo->handle(),
                                                        .mip_level = 0, .layer = 0, .cycle = false,
                                                        .padding1 = 0, .padding2 = 0, .padding3 = 0};
@@ -160,7 +179,7 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
     }
 
     // ---- 2. voxelize ------------------------------------------------------
-    {
+    if (revoxelize) {
         gpu::VoxelVoxelizeUniforms u{};
         u.cascade = cascade;
         u.base = base;
@@ -260,22 +279,33 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
         u.sunIntensity = params.sun_intensity;
         u.skyColor = params.sky_color;
         u.skyFloor = params.sky_floor;
+        u.lightCount = params.light_count;
+        u.lightCapacity = params.light_capacity;
 
-        const SDL_GPUStorageTextureReadWriteBinding rw{.texture = radiance->handle(),
-                                                       .mip_level = 0, .layer = 0, .cycle = false,
-                                                       .padding1 = 0, .padding2 = 0, .padding3 = 0};
-        gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
+        const std::array<SDL_GPUStorageTextureReadWriteBinding, 2> rw{{
+            {.texture = albedo->handle(), .mip_level = 0, .layer = 0, .cycle = false,
+             .padding1 = 0, .padding2 = 0, .padding3 = 0},
+            {.texture = radiance->handle(), .mip_level = 0, .layer = 0, .cycle = false,
+             .padding1 = 0, .padding2 = 0, .padding3 = 0},
+        }};
+        gpu::ComputePass pass = gpu::ComputePass::begin(cmd, rw, {});
         if (!pass) {
             return false;
         }
         pass.bind_pipeline(*inject);
+        if (params.light_data == nullptr) {
+            // A binding slot cannot be left empty, so the honest answer is to
+            // skip the pass rather than bind nothing and fault.
+            BRACKEN_LOG_WARN(LOG_TAG, "VoxelGi: cascade {} has no light buffer to inject", cascade);
+            return true;
+        }
         const std::array<SDL_GPUTextureSamplerBinding, 2> textures{{
             {params.shadow_atlas, params.shadow_cmp_sampler},
             {params.shadow_atlas, params.shadow_raw_sampler},
         }};
         pass.bind_samplers(0, textures);
-        SDL_GPUTexture* albedo_ro = albedo->handle();
-        pass.bind_storage_textures(0, {&albedo_ro, 1});
+        SDL_GPUBuffer* lights = params.light_data;
+        pass.bind_storage_buffers(0, {&lights, 1});
         pass.push_uniforms(0, &u, sizeof(u));
         pass.dispatch(volume_groups, volume_groups, volume_groups);
         pass.end();

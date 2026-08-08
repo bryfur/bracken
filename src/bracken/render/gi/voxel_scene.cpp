@@ -12,14 +12,34 @@ namespace bracken::render::gi {
 namespace {
 constexpr const char* LOG_TAG = "gi";
 
-/// Linear [0,1] -> the RGBA8 the voxelizer unpacks. The alpha lane is written
-/// opaque and currently ignored on the way back out; RG4's emissive support
-/// claims it.
-[[nodiscard]] std::uint32_t pack_rgba8(const glm::vec3& c) {
+/// Radiance an emissive byte of 255 stands for. MUST match
+/// VOXEL_EMISSIVE_SCALE in voxel_inject.comp.hlsl — the shader multiplies by it
+/// to undo what this divides by.
+constexpr float VOXEL_EMISSIVE_SCALE = 8.0f;
+
+/**
+ * Pack a triangle's material into the word the voxelizer stores verbatim.
+ *
+ * RGB is base colour. THE HIGH BYTE IS EMISSIVE INTENSITY, not opacity —
+ * coverage is already implied by the voxel existing at all, so the byte is spent
+ * on the one thing that cannot be inferred. Emission is HDR and eight bits are
+ * not, so it is stored as a fraction of `VOXEL_EMISSIVE_SCALE`.
+ *
+ * Writing 0xFF here (the obvious "opaque") makes EVERY SURFACE IN THE WORLD an
+ * emitter at full scale, which is exactly what it looks like: the night frame
+ * went from 35.8 to 96.8 mean luma. The byte means emission now.
+ */
+[[nodiscard]] std::uint32_t pack_voxel(const glm::vec3& albedo, const glm::vec3& emissive) {
     const auto q = [](float v) {
         return static_cast<std::uint32_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
     };
-    return (0xFFu << 24) | (q(c.b) << 16) | (q(c.g) << 8) | q(c.r);
+    // Emitted radiance is a colour, but the voxel stores one intensity and tints
+    // it by the albedo — an emitter's colour is its albedo in every asset this
+    // engine loads (a lantern's glass is orange because it IS orange). The
+    // maximum channel rather than luminance, so a saturated red emitter is not
+    // dimmed by having no green.
+    const float intensity = std::max({emissive.r, emissive.g, emissive.b}) / VOXEL_EMISSIVE_SCALE;
+    return (q(intensity) << 24) | (q(albedo.b) << 16) | (q(albedo.g) << 8) | q(albedo.r);
 }
 
 } // namespace
@@ -82,13 +102,20 @@ void VoxelScene::build_models(const ModelManager& models) {
                 if (tri < mesh.rt_triangle_base_colors.size()) {
                     albedo = glm::vec3(mesh.rt_triangle_base_colors[tri]);
                 }
+                // The same per-triangle emissive proxy R6 bakes for the traced
+                // path, so a glowing window contributes to the bounce in either
+                // GI mode rather than only when ray tracing is on.
+                glm::vec3 emissive{mesh.material.emissive_factor};
+                if (tri < mesh.rt_triangle_emissive.size()) {
+                    emissive = mesh.rt_triangle_emissive[tri];
+                }
 
                 const glm::vec3 p0 = position_at(i0);
                 VoxelTriangle t;
                 t.v0 = p0;
                 t.e1 = position_at(i1) - p0;
                 t.e2 = position_at(i2) - p0;
-                t.packed_albedo = pack_rgba8(albedo);
+                t.packed_albedo = pack_voxel(albedo, emissive);
                 triangles_.push_back(t);
             }
         }

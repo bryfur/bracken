@@ -568,7 +568,8 @@ than spread over the historical tables above:
 | night, `TOD_HOUR=1 … full` | `36.0 / 55.0` | `35.5 / 53.9` | `35.6 / 53.7` |
 
 **A fourth GI mode landed 2026-08-08: `GiMode::VoxelProbes`, the RASTER path**
-(`PLAYGROUND_GI=voxel`, `80.4 / 49.7`). It fills the SAME probe field by CONE
+(`PLAYGROUND_GI=voxel`, `81.5 / 48.3`; night `50.9 / 71.8` against `35.8 / 59.8`
+with GI off). It fills the SAME probe field by CONE
 TRACING a voxel radiance clipmap instead of by tracing rays, so everything
 downstream — the octahedral atlases, the blend, the Chebyshev leak test,
 classification, relocation, the cascade blend, the fog in-scatter — is shared and
@@ -577,6 +578,13 @@ is the check) and gets the sun's visibility from the cascaded shadow map the
 raster path already renders. ~33 MB of volumes on top of the probe field's 30.
 Darker and wider than `probes` because voxel occlusion is chunkier and errs
 toward occluding; see docs/rt_lighting_plan.md §7.
+
+**JUDGE THIS MODE BY `auto_ev`, NOT BY `mean_luma`.** Auto-exposure absorbs a
+brightness error and lands the mean back near where it started, so a mode that
+is three stops too bright still reports a plausible mean — this one read
+`98.4 / 47.4` while being visibly blown out. The exposure tells the truth:
+GI off `0.47`, `probes` `0.56`, `voxel` `0.81`. A voxel row far from the traced
+row is a units bug, whatever the mean says.
 
 **`SDL_GenerateMipmapsForGPUTexture` FAULTS ON A 3D TEXTURE** and takes the
 process down inside the driver with no diagnostic. That one call is why the

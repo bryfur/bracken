@@ -147,6 +147,51 @@ TEST(VoxelMath, SelectedCascadeAlwaysHasMarginToFilterIn) {
     }
 }
 
+TEST(VoxelMath, AWideConeIsPushedToACoarserCascadeRatherThanWrapping) {
+    // THE SEAM BUG, pinned. Storage is a torus, so a tap whose filter footprint
+    // crosses the window edge reads the opposite side of the world — which drew
+    // a hard black line across the map at the cascade boundary. A fixed margin
+    // covers a mip-0 tap and nothing wider; the footprint term is what makes it
+    // scale with the level a cone actually samples.
+    const glm::vec3 camera(0.0f);
+    // A point comfortably inside cascade 0 for a pinpoint tap...
+    const float inside = voxel_cascade_half_extent(0) - 4.0f * voxel_size(0);
+    const glm::vec3 p = camera + glm::vec3(inside, 0.0f, 0.0f);
+    EXPECT_EQ(voxel_select_cascade_for_footprint(p, camera, 0.0f), 0);
+    // ...is NOT safe for a cone whose footprint reaches past the window edge,
+    // and must be answered by a coarser cascade instead of wrapping.
+    const int coarse = voxel_select_cascade_for_footprint(p, camera, 8.0f * voxel_size(0));
+    EXPECT_GT(coarse, 0) << "a wide cone must not be answered by the cascade it would wrap in";
+}
+
+TEST(VoxelMath, EveryConeSampleStaysInsideItsCascadeWithItsFootprint) {
+    // The property the fix has to guarantee, checked against the WINDOW rather
+    // than against the selection rule, so the two cannot agree with each other
+    // and not with reality. Walks a real cone: widening footprint, increasing
+    // distance, exactly as voxel_cone_trace does.
+    const glm::vec3 camera(1234.0f, 60.0f, -900.0f);
+    const glm::vec3 dir = glm::normalize(glm::vec3(0.5f, 0.2f, -0.84f));
+    const float tan_half = std::tan(glm::radians(30.0f));
+    for (float t = VOXEL_BASE_SIZE; t < voxel_cascade_half_extent(VOXEL_CASCADE_COUNT - 1);
+         t += voxel_cone_step(t, tan_half)) {
+        const glm::vec3 world = camera + dir * t;
+        const float diameter = voxel_cone_diameter(t, tan_half);
+        const int c = voxel_select_cascade_for_footprint(world, camera, diameter);
+        if (c < 0) {
+            break; // left the clipmap; the cone terminates
+        }
+        const glm::ivec3 base = voxel_cascade_base(c, camera);
+        // The sample AND its whole footprint must be inside the window.
+        const float half = diameter * 0.5f;
+        for (const glm::vec3 corner :
+             {glm::vec3(-half, -half, -half), glm::vec3(half, half, half)}) {
+            const glm::ivec3 coord = voxel_coord_at(c, world + corner);
+            EXPECT_TRUE(voxel_in_window(coord, base))
+                << "cone footprint escaped cascade " << c << " at t=" << t;
+        }
+    }
+}
+
 TEST(VoxelMath, ConeWidensAndSelectsCoarserMips) {
     const float tan_half = std::tan(glm::radians(30.0f));
     float previous_mip = -1.0f;

@@ -201,22 +201,37 @@ inline constexpr float VOXEL_CASCADE_MARGIN = 2.0f;
  * The finest cascade whose window contains `world` with `VOXEL_CASCADE_MARGIN`
  * voxels to spare, or -1 when even the coarsest does not.
  *
- * The margin is not politeness: a trilinear tap reaches half a voxel past the
- * sample point and a mip tap reaches further, so a sample accepted right at the
- * window edge would filter against texels belonging to the opposite side of the
- * torus. Selecting by MARGIN rather than by containment is what keeps a cone
- * that crosses a cascade boundary from picking up a seam.
+ * The margin is not politeness: storage is a TORUS, so a tap whose footprint
+ * crosses the window edge wraps and reads the opposite side of the world.
+ *
+ * A FIXED margin is not enough, and that was a real bug rather than a
+ * hypothetical: two voxels covers a mip-0 trilinear tap, but a cone widens as it
+ * travels and samples coarser levels — a tap at mip 3 reaches eight voxels, four
+ * times past that — so cones at distance read wrapped geometry and painted a
+ * hard black line across the world at the window boundary. `footprint` (the
+ * cone's diameter in world units) makes the margin scale with the level actually
+ * sampled, pushing a wide cone out to a coarser cascade whose window is twice as
+ * big instead of letting it wrap inside a fine one.
  */
-[[nodiscard]] inline int voxel_select_cascade(const glm::vec3& world,
-                                              const glm::vec3& camera) noexcept {
+[[nodiscard]] inline int voxel_select_cascade_for_footprint(const glm::vec3& world,
+                                                            const glm::vec3& camera,
+                                                            float footprint) noexcept {
     for (int c = 0; c < VOXEL_CASCADE_COUNT; ++c) {
-        const float half = voxel_cascade_half_extent(c) - VOXEL_CASCADE_MARGIN * voxel_size(c);
+        // The base margin covers the trilinear tap itself; `footprint` covers
+        // how far the cone's chosen MIP reaches beyond it.
+        const float margin = VOXEL_CASCADE_MARGIN * voxel_size(c) + footprint;
+        const float half = voxel_cascade_half_extent(c) - margin;
         const glm::vec3 d = glm::abs(world - camera);
-        if (d.x <= half && d.y <= half && d.z <= half) {
+        if (half > 0.0f && d.x <= half && d.y <= half && d.z <= half) {
             return c;
         }
     }
     return -1;
+}
+
+[[nodiscard]] inline int voxel_select_cascade(const glm::vec3& world,
+                                              const glm::vec3& camera) noexcept {
+    return voxel_select_cascade_for_footprint(world, camera, 0.0f);
 }
 
 // ---------------------------------------------------------------------------

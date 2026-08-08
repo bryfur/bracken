@@ -172,15 +172,18 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     [loop] while (t < voxelMaxDistance && accum.a < VOXEL_CONE_TERMINATE_ALPHA) {
         const float3 world = origin + dir * t;
 
-        // Finest cascade that still contains the sample with filtering margin.
-        // -1 means the cone has left the clipmap entirely, and there is nothing
-        // further out to find.
-        const int cascade = voxelSelectCascade(world, voxelCameraPosition);
+        // Finest cascade that contains the sample AND has room for this cone's
+        // filter footprint. Passing the diameter is what stops a wide cone from
+        // sampling a coarse mip near a window edge, where the torus wrap would
+        // hand it the opposite side of the world — the black seam that used to
+        // run across the map. -1 means the cone has left the clipmap entirely.
+        const float diameter = voxelConeDiameter(t, tanHalf);
+        const int cascade =
+            voxelSelectCascadeForFootprint(world, voxelCameraPosition, diameter);
         if (cascade < 0 || !voxelWorldInWindow(cascade, world)) {
             break;
         }
 
-        const float diameter = voxelConeDiameter(t, tanHalf);
         const float mip = voxelConeMip(diameter, cascade);
         float4 s = voxelSampleCascade(cascade, world, mip);
 

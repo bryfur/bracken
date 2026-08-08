@@ -1384,6 +1384,21 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     // perfectly black; the probe field applies the real sky
                     // term, and this only stops the volume from zeroing it.
                     vp.sky_floor = 0.15f;
+                    // Lanterns light the bounce. Without these the clipmap has
+                    // only the sun in it, so after dusk it goes black and takes
+                    // the GI term with it.
+                    vp.light_data = cluster_grid_.light_data_buffer();
+                    vp.light_count = cluster_grid_.total_lights();
+                    vp.light_capacity = render::lighting::MAX_LIGHTS;
+                    // The sky CAPTURE, not the irradiance convolution — the same
+                    // texture the traced probe path samples on a ray miss, so
+                    // the two GI modes agree about what the sky is worth.
+                    vp.sky_cube = (ibl_ && ibl_->is_ready()) ? ibl_->capture_map() : nullptr;
+                    vp.sky_cube_fallback =
+                        dummy_black_cube_ ? dummy_black_cube_->handle() : nullptr;
+                    vp.sky_sampler = (ibl_ && ibl_->cube_sampler() != nullptr)
+                                         ? ibl_->cube_sampler()
+                                         : default_sampler_;
                     // The same signal the denoisers use for a sun jump: injected
                     // radiance is stale the moment the sun moves.
                     vp.lighting_changed = lighting_reset_ > 0.01f;

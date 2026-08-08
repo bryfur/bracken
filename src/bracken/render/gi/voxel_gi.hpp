@@ -71,6 +71,21 @@ struct VoxelGiFrameParams {
     glm::vec3 sky_color{0.0f};
     float sky_floor = 0.0f;
 
+    /// The frame's clustered lights, so lanterns light the bounce. WITHOUT
+    /// these a voxel's only illumination is the sun, so after dusk the whole
+    /// clipmap goes black and takes the GI term with it.
+    SDL_GPUBuffer* light_data = nullptr;
+    std::uint32_t light_count = 0;
+    std::uint32_t light_capacity = 0;
+
+    /// IBL sky CAPTURE (raw radiance) for the ambient term — the same texture
+    /// the traced probe path samples on a miss, so the two modes agree about
+    /// what the sky is worth. `sky_cube_fallback` must always be valid: a
+    /// binding slot cannot be left empty.
+    SDL_GPUTexture* sky_cube = nullptr;
+    SDL_GPUTexture* sky_cube_fallback = nullptr;
+    SDL_GPUSampler* sky_sampler = nullptr;
+
     /// True when the sun or sky moved enough that injected radiance is stale.
     bool lighting_changed = false;
 };
@@ -97,6 +112,9 @@ struct VoxelConeTraceParams {
 struct VoxelGiStats {
     /// Which cascade revoxelized this frame, or -1.
     int cascade_revoxelized = -1;
+    /// Which cascade was re-lit this frame, or -1. A relight without a
+    /// revoxelization is the steady state under a moving sun.
+    int cascade_relit = -1;
     std::uint32_t cascades_dirty = 0;
     std::uint64_t voxelize_work_items = 0;
     std::uint32_t cone_probes = 0;
@@ -135,15 +153,21 @@ public:
 
 private:
     /// Clear + voxelize + inject one cascade.
+    /// Clear + voxelize (only when `revoxelize`) + inject + mip one cascade.
     bool rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
-                         const VoxelGiFrameParams& params);
+                         const VoxelGiFrameParams& params, bool revoxelize);
 
     gpu::PipelineRegistry* pipelines_ = nullptr;
     VoxelVolume volume_;
     VoxelScene scene_;
 
-    /// Per-cascade "contents no longer match the window or the lighting".
+    /// Per-cascade "the GEOMETRY no longer matches the window".
     std::array<bool, VOXEL_CASCADE_COUNT> dirty_{};
+    /// Per-cascade "the geometry is fine but the RADIANCE is stale". Kept apart
+    /// from `dirty_` because a sun move needs only reinjection, which is
+    /// O(volume) and cheap, where revoxelization is O(instances x triangles) and
+    /// is not — and in the playground the sun moves every frame.
+    std::array<bool, VOXEL_CASCADE_COUNT> relight_{};
     /// Round-robin cursor, so a permanently-scrolling cascade 0 cannot starve
     /// the coarser ones.
     int next_cascade_ = 0;

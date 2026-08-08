@@ -1078,9 +1078,11 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // Two samplers: the CSM atlas twice, comparison and raw, because this
      // includes shadow_common.hlsli verbatim rather than reimplementing the
      // cascade math. Two read-write volumes: albedo in, radiance out.
-     .resources = {.num_samplers = 2,
-                   .num_readonly_storage_textures = 1,  // albedo in
-                   .num_readwrite_storage_textures = 1, // radiance out
+     // Albedo is bound READ-WRITE despite only being read: a 3D texture bound as
+     // a read-only storage texture reads back as ZERO on this backend, silently.
+     .resources = {.num_samplers = 2,                  // the CSM atlas, comparison and raw
+                   .num_readonly_storage_buffers = 1,   // the frame's clustered lights
+                   .num_readwrite_storage_textures = 2, // albedo in, radiance out
                    .num_uniform_buffers = 1}},
     {.name = "VoxelMip",
      .shader = "voxel_mip.comp.spv",

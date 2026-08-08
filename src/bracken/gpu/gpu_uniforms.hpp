@@ -2113,10 +2113,15 @@ struct alignas(16) VoxelInjectUniforms {
     glm::vec3 sunColor{1.0f};
     float _pad1 = 0.0f;
     glm::vec3 skyColor{0.0f};
-    float _pad2 = 0.0f;
+    /// Lights in the bound cluster buffer, and the capacity its offsets were
+    /// built with — the two differ, because the layout is sized by capacity.
+    uint32_t lightCount = 0;
+    uint32_t lightCapacity = 0;
+    uint32_t _pad2 = 0;
+    glm::vec2 _pad3{0.0f};
 };
 
-BRACKEN_HLSL_CBUFFER(VoxelInjectUniforms, 432);
+BRACKEN_HLSL_CBUFFER(VoxelInjectUniforms, 448);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, shadowLightViewProjection, 0);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascadeSplits, 256);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascadeTexelWorld, 272);

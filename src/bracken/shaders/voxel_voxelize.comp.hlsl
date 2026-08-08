@@ -57,7 +57,10 @@ cbuffer VoxelVoxelizeUniforms : register(b0, space2) {
 /// per triangle. Mirrors `render::gi::VoxelTriangle`.
 struct VoxelTriangle {
     float3 v0;
-    uint packedAlbedo;   // RGBA8, the baked per-triangle base colour
+    /// RGB = the baked per-triangle base colour. ALPHA = emissive INTENSITY, as
+    /// a fraction of VOXEL_EMISSIVE_SCALE — see voxel_inject.comp.hlsl for why
+    /// emission rides here instead of in a volume of its own.
+    uint packedAlbedo;
     float3 e1;
     uint _triPad0;
     float3 e2;
@@ -95,11 +98,11 @@ struct VoxelInstance {
 // breaks ties among equally opaque ones. Reading it back as colour is a shift
 // and a mask; the injection pass does that once per voxel.
 
-uint voxelPack(float3 albedo, float opacity) {
-    uint3 c = uint3(saturate(albedo) * 255.0 + 0.5);
-    uint a = uint(saturate(opacity) * 255.0 + 0.5);
-    return (a << 24) | (c.b << 16) | (c.g << 8) | c.r;
-}
+// The triangle's packed record IS the voxel's packed record — colour in the low
+// three bytes, emissive intensity in the high one — so the voxelizer stores it
+// verbatim and `max` orders contested voxels by EMISSION first. That is the
+// right way to lose information when a lantern and a wall share a cell: the
+// light source wins.
 
 // ---------------------------------------------------------------------------
 // Work decomposition
@@ -156,11 +159,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
-    const float3 albedo = float3(float((tri.packedAlbedo >> 0) & 0xFFu),
-                                 float((tri.packedAlbedo >> 8) & 0xFFu),
-                                 float((tri.packedAlbedo >> 16) & 0xFFu)) /
-                          255.0;
-    const uint packed = voxelPack(albedo, 1.0);
+    const uint packed = tri.packedAlbedo;
 
     // SAMPLE COUNT FROM AREA. One sample per voxel-face area, floored at 1 (a
     // triangle smaller than a voxel still needs to exist) and capped so a single

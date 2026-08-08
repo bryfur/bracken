@@ -2656,19 +2656,55 @@ The repro that settled all of it is ~150 lines of C against system SDL3: create 
 device, a 3D texture, a compute pipeline, dispatch, wait. Worth rebuilding rather
 than reasoning about, the next time SDL3 behaves unexpectedly.
 
+### What injection actually computes
+
+`albedo * (sun + localLight) / pi + emissive`, operation-for-operation the units
+`rt_hit_shade.hlsli`'s `rtShadeHit` returns. The two GI sources feed ONE probe
+field, so they must agree about units or the same scene reads at two
+brightnesses — and this is not a small error when it is wrong: omitting the
+`/pi` put the mode three stops over the traced path.
+
+* **The sun** is shadowed by the CSM, with `shadowEnabled` clamped to PCF.
+* **Local lights** come from the same clustered buffer `rt_hit_shade.hlsli`
+  reads, unshadowed, with the same windowed inverse-square falloff. This is what
+  makes NIGHT work: without it a voxel's only illumination is the sun, so after
+  dusk the clipmap goes black and takes the GI term with it.
+* **Emission** rides the packed record's high byte as an intensity tinted by the
+  albedo — an emitter's colour is its albedo in every asset this engine loads.
+  Writing `0xFF` there (the obvious "opaque") makes every surface in the world an
+  emitter, which is exactly what it looks like.
+* **NO SKY.** A voxel has no visibility information, so injecting the sky's mean
+  radiance lights every voxel equally, including the ones inside buildings. The
+  CONE applies sky weighted by `1 - accum.a` — the fraction that reached open air
+  — and that term is visibility-aware because the cone had to get past the
+  geometry to earn it. Injecting it as well counts it twice, un-occluded.
+
+### Two failure modes worth not rediscovering
+
+* **A 3D texture bound as a compute pass's READ-ONLY storage texture reads back
+  as ZERO** on this backend — silently, no error, no fault. It makes the whole
+  clipmap look empty and the voxelizer look broken. Bind it read-write even when
+  the pass only reads it.
+* **SDL3's binding model is POSITIONAL and packed, and DXC strips unused
+  resources.** Removing the last use of a bound texture leaves a HOLE in the
+  packed order and every binding after it shifts. The engine logs
+  "declared resource counts do not match SPIR-V" when this happens and then uses
+  the reflected counts, so it does not crash — it just binds the wrong things.
+  Grep for that message after changing any shader's bindings.
+
 ### Still open
 
-* **Injection is isotropic.** A voxel has no normal, so `N·L` is replaced by the
-  mean cosine over a sphere of orientations. This is the standard VXGI
-  approximation and is why the mode is soft and slightly over-bright at grazing
-  sun angles. Anisotropic mips (six directional levels, so a cone approaching a
-  wall edge-on does not see through it) are the known quality upgrade.
-* **Sky is a constant** on cone escape; the traced path samples the IBL capture.
-  This is the single biggest quality gap between the two modes.
-* **Emissive voxels.** `VoxelTriangle` carries the lane; nothing fills it.
-* **Lighting-only reinjection.** A sun move currently redirties the geometry too,
-  so it pays a revoxelization it does not need.
-* **Local lights are not injected** — only the sun and a sky floor.
+* **Anisotropic mips.** One box-filtered chain means a cone approaching a wall
+  edge-on can see through it. Six directional chains are the standard fix and
+  cost 6x the radiance memory; a two-chain (up/down) compromise is probably the
+  right trade here and is not built.
+* **Cone sky is a constant** (`EnvironmentState::ambient_sky`) where the traced
+  path samples the IBL capture. Correct in shape, approximate in value.
+* **Local lights are unshadowed in the voxel volume.** A lamp behind a wall
+  still lights the voxels beyond it. Acceptable in a second bounce, and the same
+  call `rt_hit_shade.hlsli` makes.
+* **Skinned geometry contributes its bind pose**, which at a 25-unit voxel is
+  the right trade and is why characters are not re-voxelized per frame.
 
 ---
 
