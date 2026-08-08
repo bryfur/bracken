@@ -43,10 +43,8 @@ cbuffer VoxelVoxelizeUniforms : register(b0, space2) {
     uint voxelWorkCount;
     /// Instances in `voxelInstances`, for the binary search below.
     uint voxelInstanceCount;
-    /// Emissive multiplier, so an emissive surface seeds the radiance volume
-    /// even before any light is injected. 0 disables.
-    float voxelEmissiveScale;
     uint _voxelPad0;
+    uint _voxelPad1;
 };
 
 /// One model-space triangle plus the material proxy the RT path already bakes
@@ -55,9 +53,9 @@ struct VoxelTriangle {
     float3 v0;
     uint packedAlbedo;   // RGBA8, the baked per-triangle base colour
     float3 e1;
-    uint packedEmissive; // RGB9E5-ish; 0 when the triangle does not emit
+    uint _triPad0;
     float3 e2;
-    float _pad;
+    float _triPad1;
 };
 
 /// Mirrors `render::gi::VoxelInstance`. `firstTriangle`/`triangleCount` name a

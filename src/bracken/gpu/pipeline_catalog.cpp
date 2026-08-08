@@ -1032,6 +1032,45 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
                    .num_readwrite_storage_textures = 1,
                    .num_readwrite_storage_buffers = 1,
                    .num_uniform_buffers = 1}},
+    {.name = "VoxelClear",
+     .shader = "voxel_clear.comp.spv",
+     .entry_point = "CSMain",
+     // Required rather than tidy: the voxelizer composites with InterlockedMax,
+     // which is monotone, so without a clear a voxel could only ever get more
+     // opaque and geometry that scrolled away would leave its occlusion behind.
+     .resources = {.num_readwrite_storage_textures = 1}},
+    {.name = "VoxelVoxelize",
+     .shader = "voxel_voxelize.comp.spv",
+     .entry_point = "CSMain",
+     // The RASTER GI path's voxelization (RG1). Deliberately narrow: two
+     // read-only storage buffers (the shared model-space triangles and the
+     // placement list) and one read-write 3D storage texture. It reads no
+     // lighting and no acceleration structure at all — the whole point of this
+     // path is that it runs with rt_shadows and rt_reflections off.
+     .resources = {.num_readonly_storage_buffers = 2,
+                   .num_readwrite_storage_textures = 1,
+                   .num_uniform_buffers = 1}},
+    {.name = "VoxelInject",
+     .shader = "voxel_inject.comp.spv",
+     .entry_point = "CSMain",
+     // Two samplers: the CSM atlas twice, comparison and raw, because this
+     // includes shadow_common.hlsli verbatim rather than reimplementing the
+     // cascade math. Two read-write volumes: albedo in, radiance out.
+     .resources = {.num_samplers = 2,
+                   .num_readwrite_storage_textures = 2,
+                   .num_uniform_buffers = 1}},
+    {.name = "VoxelConeTrace",
+     .shader = "voxel_cone_trace.comp.spv",
+     .entry_point = "CSMain",
+     // Three sampled 3D volumes (one per cascade — HLSL cannot index an array
+     // of textures without a bindless path, so the cascade choice is a branch),
+     // the shared probe-update schedule, and the probe field's ray-results
+     // buffer. That last binding is the entire integration surface with the
+     // ray-traced path: same buffer, same contract.
+     .resources = {.num_samplers = 3,
+                   .num_readonly_storage_buffers = 1,
+                   .num_readwrite_storage_buffers = 1,
+                   .num_uniform_buffers = 1}},
     {.name = "GiProbeTrace",
      .shader = "gi_probe_trace.comp.spv",
      .entry_point = "CSMain",

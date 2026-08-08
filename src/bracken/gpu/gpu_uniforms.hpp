@@ -2044,10 +2044,8 @@ struct alignas(16) VoxelVoxelizeUniforms {
     uint32_t workCount = 0;
     /// Instances, for the shader's binary search over the prefix sums.
     uint32_t instanceCount = 0;
-    /// Emissive multiplier, so an emissive surface seeds the radiance volume
-    /// before any light is injected. 0 disables.
-    float emissiveScale = 1.0f;
     uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
 };
 
 BRACKEN_HLSL_CBUFFER(VoxelVoxelizeUniforms, 32);
@@ -2055,8 +2053,97 @@ BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, cascade, 0);
 BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, base, 4);
 BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, workCount, 16);
 BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, instanceCount, 20);
-BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, emissiveScale, 24);
-BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, _pad0, 28);
+BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, _pad0, 24);
+BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, _pad1, 28);
+
+/**
+ * VoxelInjectUniforms (set 2, b0) — voxel_inject.comp.hlsl.
+ *
+ * Leading 176 bytes are the shadow_common.hlsli block, embedded verbatim and in
+ * the same order GiProbeTraceUniforms carries it — that file names its uniforms
+ * and the including shader owns their slots, so every consumer repeats the
+ * block.
+ */
+struct alignas(16) VoxelInjectUniforms {
+    glm::mat4 shadowLightViewProjection[4]{};
+    glm::vec4 cascadeSplits{0.0f};
+    glm::vec4 cascadeTexelWorld{0.0f};
+    glm::vec4 cascadeDepthRange{0.0f};
+    float shadowMapResolution = 0.0f;
+    float lightSize = 0.0f;
+    float shadowEnabled = 0.0f;
+    float lastActiveSplit = 0.0f;
+    float fadeStart = 0.0f;
+    float fadeEnd = 0.0f;
+    float _shadowPad0 = 0.0f;
+    float _shadowPad1 = 0.0f;
+
+    int32_t cascade = 0;
+    glm::ivec3 base{0};
+    /// A voxel has no pixel and therefore no view depth; giving it the same
+    /// projection a fragment at that world point would get is what makes the
+    /// two select the same shadow cascade.
+    glm::vec3 cameraPosition{0.0f};
+    float sunIntensity = 1.0f;
+    glm::vec3 cameraForward{0.0f, 0.0f, -1.0f};
+    float skyFloor = 0.0f;
+    glm::vec3 sunDirection{0.0f, -1.0f, 0.0f};
+    float _pad0 = 0.0f;
+    glm::vec3 sunColor{1.0f};
+    float _pad1 = 0.0f;
+    glm::vec3 skyColor{0.0f};
+    float _pad2 = 0.0f;
+};
+
+BRACKEN_HLSL_CBUFFER(VoxelInjectUniforms, 432);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, shadowLightViewProjection, 0);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascadeSplits, 256);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascadeTexelWorld, 272);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascadeDepthRange, 288);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascade, 336);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, base, 340);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cameraPosition, 352);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, sunIntensity, 364);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cameraForward, 368);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, skyFloor, 380);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, sunDirection, 384);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, sunColor, 400);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, skyColor, 416);
+
+/**
+ * VoxelConeTraceUniforms (set 2, b0) — voxel_cone_trace.comp.hlsl.
+ *
+ * The raster GI path's replacement for GiProbeTraceUniforms. It writes the same
+ * ray-results contract into the same buffer, so `rayCount` and `rayMaxDistance`
+ * must carry the ray-traced path's values or the visibility moments would
+ * change meaning between GI modes.
+ */
+struct alignas(16) VoxelConeTraceUniforms {
+    uint32_t probeCount = 0;
+    uint32_t rayCount = 0;
+    uint32_t frameIndex = 0;
+    float rayMaxDistance = 6000.0f;
+
+    glm::vec3 cameraPosition{0.0f};
+    float maxDistance = 0.0f;
+
+    glm::vec3 skyColor{0.0f};
+    float bounceScale = 1.0f;
+
+    /// The three cascade base corners; xyz used, w padding.
+    glm::ivec4 cascadeBases[3]{};
+};
+
+BRACKEN_HLSL_CBUFFER(VoxelConeTraceUniforms, 96);
+BRACKEN_HLSL_FIELD(VoxelConeTraceUniforms, probeCount, 0);
+BRACKEN_HLSL_FIELD(VoxelConeTraceUniforms, rayCount, 4);
+BRACKEN_HLSL_FIELD(VoxelConeTraceUniforms, frameIndex, 8);
+BRACKEN_HLSL_FIELD(VoxelConeTraceUniforms, rayMaxDistance, 12);
+BRACKEN_HLSL_FIELD(VoxelConeTraceUniforms, cameraPosition, 16);
+BRACKEN_HLSL_FIELD(VoxelConeTraceUniforms, maxDistance, 28);
+BRACKEN_HLSL_FIELD(VoxelConeTraceUniforms, skyColor, 32);
+BRACKEN_HLSL_FIELD(VoxelConeTraceUniforms, bounceScale, 44);
+BRACKEN_HLSL_FIELD(VoxelConeTraceUniforms, cascadeBases, 48);
 
 struct alignas(16) GiProbeBlendUniforms {
     uint32_t probeCount = 0;

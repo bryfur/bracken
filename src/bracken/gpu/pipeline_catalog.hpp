@@ -205,6 +205,10 @@ enum class ComputePipelineType {
     // inside one GIProbes timer scope, in this order, once per cascade whose
     // turn the rota gives it.
     GiProbeTrace,           ///< One ray per (scheduled probe, ray slot) over the same BVH; hit shading v1
+    VoxelClear,             ///< Raster GI: zero one clipmap cascade before revoxelizing it
+    VoxelVoxelize,          ///< Raster GI: fill one clipmap cascade's albedo+opacity from scene triangles
+    VoxelInject,            ///< Raster GI: light every occupied voxel into the radiance volume
+    VoxelConeTrace,         ///< Raster GI: cone-trace the clipmap into the probe field's ray results
     GiProbeBlend,           ///< Cosine-weighted fold of the ray set into the irradiance atlas + border
     GiProbeBlendVisibility, ///< Sharp-lobe fold of ray distances into the visibility moments + border
     GiProbeClassify,        ///< Backface fraction -> probe relocation offset + inside-geometry verdict
