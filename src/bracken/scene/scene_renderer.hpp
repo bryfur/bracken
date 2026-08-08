@@ -15,6 +15,7 @@
 #include "bracken/render/raytracing/emissive_clusters.hpp"
 #include "bracken/render/gi/gi_bindings.hpp"
 #include "bracken/render/gi/probe_volume.hpp"
+#include "bracken/render/gi/voxel_gi.hpp"
 #include "bracken/render/gi/screen_probes.hpp"
 #include "bracken/render/hzb.hpp"
 #include "bracken/render/rt_renderer.hpp"
@@ -598,6 +599,15 @@ private:
     /// uninitialized), which is exactly what a fresh allocation would be
     /// anyway — the atlases hold no valid contents across a shutdown.
     std::unique_ptr<render::gi::ProbeVolume> probe_volume_;
+    /// The RASTER ray source (GiMode::VoxelProbes). Allocated on the same
+    /// lazy/latched policy as the probe field and destroyed the moment the mode
+    /// leaves VoxelProbes — ~35 MB of volumes is not something to keep resident
+    /// for a mode the host is not using.
+    std::unique_ptr<render::gi::VoxelGi> voxel_gi_;
+    bool voxel_gi_init_failed_ = false;
+    /// Model set the voxel scene was built from, so the (expensive) gather runs
+    /// when the models change rather than every frame.
+    std::size_t voxel_gi_model_count_ = 0;
     /// Latched allocation failure, so a device that cannot give us the atlases
     /// costs one attempt rather than one per frame. Cleared when gi_mode goes
     /// back to Off, which is the only way to ask for a retry.
@@ -660,6 +670,12 @@ private:
     /// Reused across frames so rebuilding the TLAS from the packet does not
     /// allocate every frame.
     std::vector<std::pair<ModelHandle, glm::mat4>> rt_instances_scratch_;
+    /// The same list for the RASTER GI path, gathered independently because
+    /// `rt_instances_scratch_` is filled inside the ray-tracing block that
+    /// GiMode::VoxelProbes deliberately skips. Sharing it would have made the
+    /// voxel clipmap silently empty whenever ray tracing was off — which is the
+    /// only configuration the mode exists for.
+    std::vector<std::pair<ModelHandle, glm::mat4>> voxel_instances_scratch_;
 
     /// Build (or rebuild) the acceleration structure if ray tracing needs one
     /// and the current one will not do. Called from the frame, so turning a

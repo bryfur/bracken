@@ -1,5 +1,7 @@
 #include "bracken/render/gi/probe_volume.hpp"
 
+#include "bracken/render/gi/voxel_gi.hpp"
+
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_compute.hpp"
@@ -334,12 +336,17 @@ void ProbeVolume::trace(SDL_GPUCommandBuffer* cmd, const ProbeUpdateParams& para
     }
     poll_counter_readback();
 
-    if (cmd == nullptr || params.pipelines == nullptr || params.scene == nullptr ||
-        !params.scene->ready() || !params.scene->has_attributes()) {
-        // GI needs the acceleration structure WITH attributes, like every other
-        // traced feature. The caller builds it; if it is not there yet the
-        // honest answer is to trace nothing this frame rather than to shade
-        // hits with no material.
+    if (cmd == nullptr || params.pipelines == nullptr) {
+        return;
+    }
+    // The RAY source needs the acceleration structure WITH attributes, like
+    // every other traced feature: probe rays shade what they hit, and a hit with
+    // no material is worse than no hit. The RASTER source needs none of it —
+    // that is the entire point of GiMode::VoxelProbes — so the requirement is
+    // conditional on which source is actually going to run.
+    const bool raster_source = params.voxel != nullptr && params.voxel->ready();
+    if (!raster_source &&
+        (params.scene == nullptr || !params.scene->ready() || !params.scene->has_attributes())) {
         return;
     }
     BRACKEN_PROFILE_ZONE("ProbeVolume::trace");
@@ -408,8 +415,11 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
         params.pipelines->get_compute_pipeline(gpu::ComputePipelineType::GiProbeBlendVisibility);
     const auto* classify_pipeline =
         params.pipelines->get_compute_pipeline(gpu::ComputePipelineType::GiProbeClassify);
-    if (trace_pipeline == nullptr || blend_pipeline == nullptr || visibility_pipeline == nullptr ||
-        classify_pipeline == nullptr) {
+    // The RAY source's pipeline is only required when it is the one that runs;
+    // the raster source brings its own and needs no BVH walk compiled at all.
+    const bool raster_source = params.voxel != nullptr && params.voxel->ready();
+    if ((!raster_source && trace_pipeline == nullptr) || blend_pipeline == nullptr ||
+        visibility_pipeline == nullptr || classify_pipeline == nullptr) {
         return 0;
     }
 
@@ -417,7 +427,31 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
     const float max_offset = PROBE_MAX_OFFSET_FRACTION * spacing;
 
     // ---- 1. trace -------------------------------------------------------
-    {
+    //
+    // TWO SOURCES, ONE CONTRACT. Either the BVH walk below or the voxel cone
+    // trace fills `ray_results_` with float4(radiance, distance) per (probe,
+    // ray) — negative distance for "started inside geometry", `rayMaxDistance`
+    // for a miss. Everything after this block is identical either way, which is
+    // what makes the raster path an alternative RAY SOURCE rather than a second
+    // GI system.
+    if (raster_source) {
+        VoxelConeTraceParams cone{};
+        cone.camera_position = params.camera_position;
+        cone.probe_updates = list->handle();
+        cone.ray_results = ray_results_->handle();
+        cone.probe_count = count;
+        cone.ray_count = rays_per_probe;
+        cone.frame_index = static_cast<std::uint32_t>(frame_counter_);
+        // The ray-traced path's value, deliberately: the visibility moments
+        // downstream interpret this distance, so the two sources must agree
+        // about what "nothing in the way" means or the same wall would leak
+        // differently depending on the GI mode.
+        cone.ray_max_distance = params.ray_max_distance;
+        // 1.0, matching the traced path's `u.bounceScale` below: the field's own
+        // EMA is what carries multi-bounce, so the source must not pre-scale.
+        cone.bounce_scale = 1.0f;
+        params.voxel->cone_trace(cmd, cone);
+    } else {
         gpu::GiProbeTraceUniforms u{};
         u.shadow = params.shadow;
         // PCF, never PCSS: a probe ray's visibility is integrated over dozens

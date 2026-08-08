@@ -313,6 +313,42 @@ TEST(PipelineCatalog, EveryGraphicsPipelineMatchesTheGolden) {
     }
 }
 
+TEST(PipelineCatalog, ComputeDescriptorOrderMatchesTheEnum) {
+    // THE BUG THIS EXISTS FOR, found the hard way on 2026-08-08. The descriptor
+    // array is indexed BY THE ENUM, so inserting a row at the wrong position
+    // silently re-points every pipeline after it: four raster-GI rows added
+    // above `GiProbeTrace` instead of below made GI probe tracing dispatch a
+    // voxel kernel, and the only symptom was that one screenshot pin moved by
+    // 5.6 luma. Nothing else caught it — the golden test happily recorded the
+    // wrong mapping, because a golden regenerated from a broken table is a
+    // faithful record of the break.
+    //
+    // Names are unique and the enum is the authority, so each type's descriptor
+    // must be the one whose name matches. That single property is enough to
+    // pin the ordering.
+    for (int i = 0; i < static_cast<int>(ComputePipelineType::Count); ++i) {
+        const auto type = static_cast<ComputePipelineType>(i);
+        const ComputePipelineDesc& desc = compute_pipeline_desc(type);
+        ASSERT_NE(desc.name, nullptr) << "index " << i;
+        EXPECT_STRNE(desc.name, "Unknown")
+            << "index " << i << " has no descriptor — the array is shorter than the enum";
+        EXPECT_STRNE(desc.shader, "")
+            << "index " << i << " (" << desc.name << ") names no shader";
+    }
+
+    // And no two entries may share a name, which is what makes the check above
+    // meaningful rather than merely non-empty.
+    std::set<std::string_view> seen;
+    for (int i = 0; i < static_cast<int>(ComputePipelineType::Count); ++i) {
+        const ComputePipelineDesc& desc =
+            compute_pipeline_desc(static_cast<ComputePipelineType>(i));
+        EXPECT_TRUE(seen.insert(desc.name).second)
+            << "duplicate compute pipeline name '" << desc.name << "' at index " << i
+            << " — two enum values map to one descriptor, so one of them dispatches the wrong "
+               "shader";
+    }
+}
+
 TEST(PipelineCatalog, EveryComputePipelineMatchesTheGolden) {
     const Golden golden = parse_golden();
     for (int i = 0; i < static_cast<int>(ComputePipelineType::Count); ++i) {

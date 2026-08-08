@@ -26,6 +26,8 @@ class RtScene;
 
 namespace bracken::render::gi {
 
+class VoxelGi;
+
 namespace gpu = bracken::gpu;
 
 /** Per-cascade accounting: what the structure costs, and what it traced. */
@@ -91,9 +93,22 @@ struct GiStats {
  */
 struct ProbeUpdateParams {
     gpu::PipelineRegistry* pipelines = nullptr;
-    /// The acceleration structure. GI REQUIRES it, with attributes: probe rays
-    /// shade what they hit. Null (or not ready) skips the whole update.
+    /// The acceleration structure. The RAY-TRACED source requires it, with
+    /// attributes, because probe rays shade what they hit. Null (or not ready)
+    /// skips the whole update — UNLESS `voxel` below is set, in which case there
+    /// is no ray tracing in this path at all and no structure is needed.
     const rt::RtScene* scene = nullptr;
+    /**
+     * The RASTER ray source (GiMode::VoxelProbes). When non-null the trace step
+     * cone-traces a voxel clipmap instead of walking the BVH, writing the same
+     * `float4(radiance, distance)` contract into the same buffer — so every
+     * other step of the update is byte-for-byte the path it always was.
+     *
+     * Mutually exclusive with `scene` in practice, and deliberately not enforced
+     * here: `trace` picks the voxel source whenever it is present, so a caller
+     * that supplies both gets the raster answer rather than an assertion.
+     */
+    VoxelGi* voxel = nullptr;
 
     GiQuality quality = GiQuality::Medium;
     glm::vec3 camera_position{0.0f};

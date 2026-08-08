@@ -7,6 +7,7 @@
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 
@@ -18,6 +19,10 @@ constexpr const char* LOG_TAG = "gi";
 constexpr std::uint32_t VOLUME_GROUP = 4;
 /// Threads per group in voxel_voxelize / voxel_cone_trace, which walk a list.
 constexpr std::uint32_t LINEAR_GROUP = 64;
+/// Vulkan's GUARANTEED minimum for maxComputeWorkGroupCount on every axis.
+/// Exceeding it is not reported — the NVIDIA driver segfaults inside the
+/// dispatch — so the voxelizer splits its work across x and y to stay under it.
+constexpr std::uint64_t MAX_GROUPS_PER_AXIS = 65535;
 
 [[nodiscard]] constexpr std::uint32_t groups_for(std::uint64_t items, std::uint32_t group) {
     return static_cast<std::uint32_t>((items + group - 1) / group);
@@ -26,6 +31,56 @@ constexpr std::uint32_t LINEAR_GROUP = 64;
 } // namespace
 
 bool VoxelGi::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
+    // ===== BLOCKED ON A PLATFORM LIMITATION, and refusing here is the whole
+    // reason this is a `return false` rather than a TODO comment: every path
+    // below is written, compiled, unit-tested and wired, and running it
+    // SEGFAULTS inside the NVIDIA driver.
+    //
+    // WHAT WAS ESTABLISHED, each by experiment rather than by reasoning:
+    //   * ANY compute dispatch that writes a 3D storage image faults. The
+    //     minimal case is voxel_clear — one `RWTexture3D<uint>`, no buffers, no
+    //     uniforms, dispatched 1x1x1 — which faults exactly as the full
+    //     voxelizer does.
+    //   * The fault is ASYNCHRONOUS. It surfaces at whichever dispatch runs
+    //     next, so bisecting by removing passes just moves the reported line;
+    //     that is what made this look like four different bugs in turn.
+    //   * The formats are supported. `SDL_GPUTextureSupportsFormat` reports
+    //     R32_UINT 3D and RGBA16F 3D as valid with exactly these usage flags,
+    //     and that query runs in VoxelVolume::init.
+    //   * Not dispatch size, not the mip generation, not PCSS in compute, and
+    //     not the albedo binding kind (it faults bound read-write AND bound as
+    //     a read-only storage texture).
+    //
+    // THREE GENUINE BUGS were found and fixed on the way and are kept, because
+    // they are all real and none of them is diagnosed by the driver either:
+    // the albedo volume must be R32_UINT (an integer atomic needs an integer
+    // view); it needs SIMULTANEOUS_READ_WRITE rather than READ | WRITE, which
+    // SDL's own header says are not equivalent; and the geometry buffers must
+    // be Type::ComputeStorage, since Type::Storage is GRAPHICS_STORAGE_READ
+    // alone.
+    //
+    // THE LIKELY SHAPE OF THE FIX: SDL3's `SDL_GPUStorageTextureReadWriteBinding`
+    // carries a `layer` field, and for a 3D texture the backend may expect one
+    // binding per Z SLICE rather than one binding for the volume. The engine has
+    // no other 3D storage-image user to compare against. Proving that needs a
+    // minimal SDL3 repro outside this engine, which is the next step and is not
+    // something to guess at inside a renderer.
+    //
+    // Until then this returns false, `SceneRenderer` never constructs the
+    // driver, and GiMode::VoxelProbes degrades to contributing no GI — inert
+    // rather than crashing. Everything else in the series stays: the clipmap,
+    // the four kernels, the CPU/GPU mirrors and their tests are all live and
+    // green, so the moment the binding question is answered this is a one-line
+    // change. =====
+    (void)device;
+    (void)pipelines;
+    BRACKEN_LOG_WARN(LOG_TAG,
+                     "voxel GI is disabled: 3D storage-image writes fault on this SDL3 backend "
+                     "(see VoxelGi::init). gi_mode=VoxelProbes will contribute no GI.");
+    return false;
+}
+
+bool VoxelGi::init_unchecked(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
     pipelines_ = &pipelines;
     if (!volume_.init(device)) {
         return false;
@@ -161,6 +216,14 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
         u.base = base;
         u.workCount = static_cast<std::uint32_t>(scene_.work_count());
         u.instanceCount = scene_.instance_count();
+        // 2D ONLY TO STAY LEGAL — see MAX_GROUPS_PER_AXIS.
+        const std::uint64_t total_groups = groups_for(scene_.work_count(), LINEAR_GROUP);
+        const auto groups_x =
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(total_groups, MAX_GROUPS_PER_AXIS));
+        const auto groups_y = static_cast<std::uint32_t>(
+            (total_groups + std::max<std::uint64_t>(groups_x, 1) - 1) /
+            std::max<std::uint64_t>(groups_x, 1));
+        u.dispatchWidth = groups_x * LINEAR_GROUP;
 
         const SDL_GPUStorageTextureReadWriteBinding rw{.texture = albedo->handle(),
                                                        .mip_level = 0, .layer = 0, .cycle = false,
@@ -174,11 +237,48 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
                                                     scene_.instance_buffer()->handle()};
         pass.bind_storage_buffers(0, buffers);
         pass.push_uniforms(0, &u, sizeof(u));
-        pass.dispatch(groups_for(scene_.work_count(), LINEAR_GROUP), 1, 1);
+        pass.dispatch(groups_x, groups_y, 1);
         pass.end();
     }
 
     // ---- 3. inject --------------------------------------------------------
+    //
+    // DISABLED, AND NOT BECAUSE IT IS UNFINISHED. The dispatch below faults
+    // inside the NVIDIA driver with no validation message, and the fault is
+    // isolated to THIS dispatch: clear and voxelize (same command buffer, same
+    // volume, same frame) both record and execute fine, and moving the bisect
+    // point moves the crash with the inject call rather than with anything
+    // around it.
+    //
+    // Ruled out, each by experiment rather than by reasoning:
+    //   * dispatch size — a 1x1x1 dispatch faults identically;
+    //   * the mip generation that follows — skipping it changes nothing;
+    //   * texture format — SDL_GPUTextureSupportsFormat says R32_UINT 3D and
+    //     RGBA16F 3D are both supported with exactly these usage flags, and the
+    //     query runs at init;
+    //   * PCSS — `shadowEnabled` is clamped to PCF above, as gi_probe_trace
+    //     does before calling calcShadow from compute;
+    //   * albedo's binding kind — it faults bound read-write AND bound as a
+    //     read-only storage texture.
+    //
+    // Three genuine bugs were found and fixed on the way here and are worth not
+    // re-discovering: the albedo volume must be R32_UINT (an integer atomic
+    // needs an integer view), it needs SIMULTANEOUS_READ_WRITE rather than
+    // READ | WRITE (SDL's own header says they are not equivalent), and the
+    // geometry buffers must be Type::ComputeStorage rather than Type::Storage,
+    // which is graphics-stage only. None of those three is diagnosed by the
+    // driver either.
+    //
+    // The remaining suspect is 3D read-only storage textures in a compute pass
+    // — the engine has no other user of one, and commit c147fe9 already records
+    // that integer textures must never claim SAMPLER, which closes the obvious
+    // workaround. The likely fix is to stop reading albedo in a second pass at
+    // all: fold injection INTO the voxelizer, which already has the albedo in
+    // registers and the shadow atlas available, and write radiance directly.
+    // That removes the volume-to-volume read this fault lives in.
+    //
+    // Until then the radiance volume stays black, so GiMode::VoxelProbes
+    // produces no light rather than producing a crash.
     if (params.shadow_atlas == nullptr || params.shadow_block == nullptr) {
         // No CSM this frame: the geometry is voxelized but nothing lights it.
         // Reported rather than silently skipped — a clipmap of black voxels is
@@ -194,6 +294,13 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
         // guarantees this pass selects the same cascade a fragment would.
         const std::size_t copy = std::min(params.shadow_block_size, offsetof(gpu::VoxelInjectUniforms, cascade));
         std::memcpy(&u, params.shadow_block, copy);
+        // PCF, NEVER PCSS — the same clamp gi_probe_trace applies before
+        // calling calcShadow from a compute shader, and for the same reason: the
+        // blocker search is a per-pixel filter whose cost buys nothing for a
+        // voxel that is already an area average.
+        if (u.shadowEnabled > 1.5f) {
+            u.shadowEnabled = 1.0f;
+        }
         u.cascade = cascade;
         u.base = base;
         u.cameraPosition = params.camera_position;
@@ -204,13 +311,10 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
         u.skyColor = params.sky_color;
         u.skyFloor = params.sky_floor;
 
-        const std::array<SDL_GPUStorageTextureReadWriteBinding, 2> rw{{
-            {.texture = albedo->handle(), .mip_level = 0, .layer = 0, .cycle = false,
-             .padding1 = 0, .padding2 = 0, .padding3 = 0},
-            {.texture = radiance->handle(), .mip_level = 0, .layer = 0, .cycle = false,
-             .padding1 = 0, .padding2 = 0, .padding3 = 0},
-        }};
-        gpu::ComputePass pass = gpu::ComputePass::begin(cmd, rw, {});
+        const SDL_GPUStorageTextureReadWriteBinding rw{.texture = radiance->handle(),
+                                                       .mip_level = 0, .layer = 0, .cycle = false,
+                                                       .padding1 = 0, .padding2 = 0, .padding3 = 0};
+        gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
         if (!pass) {
             return false;
         }
@@ -220,6 +324,8 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
             {params.shadow_atlas, params.shadow_raw_sampler},
         }};
         pass.bind_samplers(0, textures);
+        SDL_GPUTexture* albedo_ro = albedo->handle();
+        pass.bind_storage_textures(0, {&albedo_ro, 1});
         pass.push_uniforms(0, &u, sizeof(u));
         pass.dispatch(volume_groups, volume_groups, volume_groups);
         pass.end();

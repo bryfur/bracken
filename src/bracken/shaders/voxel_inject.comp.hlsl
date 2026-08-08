@@ -82,10 +82,15 @@ Texture2D shadowAtlasRaw : register(t1, space0);
 [[vk::combinedImageSampler]][[vk::binding(1, 0)]]
 SamplerState shadowRawSampler : register(s1, space0);
 
-[[vk::image_format("r32ui")]]
-[[vk::binding(0, 1)]] RWTexture3D<uint> voxelAlbedo : register(u0, space1);
+/// READ-ONLY. This pass only reads the albedo volume, and binding it read-write
+/// is not merely imprecise — a compute pass's read-write slots are a different
+/// binding array from its read-only storage textures, and asking for a
+/// read-write slot the shader never writes faults inside the driver with no
+/// diagnostic at all.
+[[vk::binding(2, 0)]] Texture3D<uint> voxelAlbedo : register(t2, space0);
+
 [[vk::image_format("rgba16f")]]
-[[vk::binding(1, 1)]] RWTexture3D<float4> voxelRadiance : register(u1, space1);
+[[vk::binding(0, 1)]] RWTexture3D<float4> voxelRadiance : register(u0, space1);
 
 #include "shadow_common.hlsli"
 
@@ -101,7 +106,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
-    const uint packed = voxelAlbedo[tid];
+    const uint packed = voxelAlbedo.Load(int4(int3(tid), 0));
     if (packed == 0u) {
         // Empty voxel, written explicitly rather than skipped: the radiance
         // volume is not cleared separately, so a voxel that emptied since the

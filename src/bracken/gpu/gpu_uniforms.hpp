@@ -2044,7 +2044,11 @@ struct alignas(16) VoxelVoxelizeUniforms {
     uint32_t workCount = 0;
     /// Instances, for the shader's binary search over the prefix sums.
     uint32_t instanceCount = 0;
-    uint32_t _pad0 = 0;
+    /// Threads per row of the 2D dispatch (groups_x * 64). The dispatch is 2D
+    /// only to stay inside Vulkan's guaranteed 65535 groups per dimension — a
+    /// village is millions of (instance, triangle) pairs, and the flat 1D form
+    /// made the driver segfault rather than report the limit.
+    uint32_t dispatchWidth = 0;
     uint32_t _pad1 = 0;
 };
 
@@ -2053,7 +2057,7 @@ BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, cascade, 0);
 BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, base, 4);
 BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, workCount, 16);
 BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, instanceCount, 20);
-BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, _pad0, 24);
+BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, dispatchWidth, 24);
 BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, _pad1, 28);
 
 /**

@@ -105,7 +105,19 @@ struct VoxelGiStats {
 
 class VoxelGi {
 public:
+    /**
+     * Allocate and arm the driver.
+     *
+     * CURRENTLY ALWAYS FAILS, deliberately and loudly — 3D storage-image writes
+     * fault on this SDL3 backend. The implementation carries the full
+     * investigation: what was ruled out, the three real bugs found on the way,
+     * and what the next step is. `init_unchecked` is the same function without
+     * the refusal, kept so the path can be exercised the moment the platform
+     * question is settled.
+     */
     [[nodiscard]] bool init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines);
+    /// `init` without the platform refusal. See `init`.
+    [[nodiscard]] bool init_unchecked(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines);
     void shutdown();
     [[nodiscard]] bool ready() const { return volume_.ready(); }
 

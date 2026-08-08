@@ -7,18 +7,25 @@ namespace bracken::render::gi {
 namespace {
 constexpr const char* LOG_TAG = "gi";
 
-/// Voxelization writes it, injection reads it. No SAMPLER bit: nothing ever
-/// filters the albedo volume, so asking for one would only constrain the format
-/// choice on some backends.
+/// SIMULTANEOUS_READ_WRITE, and the SDL header is explicit that this is "NOT
+/// equivalent to READ | WRITE". The voxelizer composites with InterlockedMax,
+/// which is a read-modify-write of the bound storage image, and the plain
+/// WRITE bit does not cover that. Getting it wrong is not diagnosed: the clear
+/// pass (write only) runs fine and the voxelize dispatch faults inside the
+/// driver, which looks like a bad dispatch size rather than a bad usage flag.
+///
+/// No SAMPLER bit: nothing ever filters the albedo volume, so asking for one
+/// would only constrain the format choice on some backends.
 constexpr SDL_GPUTextureUsageFlags ALBEDO_USAGE =
-    SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ;
+    SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE |
+    SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE;
 
 /// Injection writes the base level, the mip pass writes the rest, and the cones
 /// SAMPLE it — the one volume that genuinely needs filtering, because the whole
 /// technique is "one filtered tap stands in for a cone's cross-section".
-constexpr SDL_GPUTextureUsageFlags RADIANCE_USAGE = SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE |
-                                                    SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ |
-                                                    SDL_GPU_TEXTUREUSAGE_SAMPLER;
+constexpr SDL_GPUTextureUsageFlags RADIANCE_USAGE =
+    SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE |
+    SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE | SDL_GPU_TEXTUREUSAGE_SAMPLER;
 } // namespace
 
 VoxelVolume::~VoxelVolume() {
@@ -31,11 +38,38 @@ bool VoxelVolume::init(gpu::GPUDevice& device) {
     }
     device_ = &device;
 
+    // Ask rather than assume: the SDL header carries a literal
+    // "FIXME: Check universal support for SIMULTANEOUS_READ_WRITE", so 3D +
+    // R32_UINT + atomics is exactly the combination worth querying before a
+    // dispatch faults inside the driver with no diagnostic.
+    {
+        SDL_GPUDevice* raw = device.handle();
+        const bool albedo_ok = SDL_GPUTextureSupportsFormat(
+            raw, SDL_GPU_TEXTUREFORMAT_R32_UINT, SDL_GPU_TEXTURETYPE_3D, ALBEDO_USAGE);
+        const bool radiance_ok = SDL_GPUTextureSupportsFormat(
+            raw, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTURETYPE_3D, RADIANCE_USAGE);
+        BRACKEN_LOG_INFO(LOG_TAG, "voxel format support: albedo(R32_UINT 3D rw)={} radiance(RGBA16F 3D rw+sampler)={}",
+                         albedo_ok, radiance_ok);
+        if (!albedo_ok || !radiance_ok) {
+            BRACKEN_LOG_ERROR(LOG_TAG,
+                              "VoxelVolume: the driver does not support the 3D storage formats "
+                              "voxel GI needs; gi_mode=VoxelProbes cannot run here");
+            return false;
+        }
+    }
+
     for (int c = 0; c < VOXEL_CASCADE_COUNT; ++c) {
         Cascade& cascade = cascades_[static_cast<std::size_t>(c)];
         cascade.albedo = gpu::GPUTexture::create_3d(
             device, VOXEL_RESOLUTION, VOXEL_RESOLUTION, VOXEL_RESOLUTION,
-            SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, ALBEDO_USAGE, /*mipmaps=*/false);
+            // R32_UINT, not RGBA8: the voxelizer's only order-independent
+            // write is an INTEGER ATOMIC (InterlockedMax over a packed RGBA8
+            // with opacity in the high byte), and an atomic needs an integer
+            // view. Same four bytes per texel either way, so the memory table is
+            // unchanged — but declaring the shader's image format as r32ui over
+            // an RGBA8_UNORM texture is a mismatch the driver does not report,
+            // it simply faults inside the dispatch.
+            SDL_GPU_TEXTUREFORMAT_R32_UINT, ALBEDO_USAGE, /*mipmaps=*/false);
         cascade.radiance = gpu::GPUTexture::create_3d(
             device, VOXEL_RESOLUTION, VOXEL_RESOLUTION, VOXEL_RESOLUTION,
             SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, RADIANCE_USAGE, /*mipmaps=*/true);

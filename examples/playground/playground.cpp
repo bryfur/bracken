@@ -213,7 +213,7 @@ bool PlaygroundGame::on_init() {
     if (const char* rl = SDL_getenv("PLAYGROUND_RT_LOCAL"); rl != nullptr) {
         rt_local_mode_ = rl;
     }
-    // PLAYGROUND_GI=probes|probes_screen|off, read here for the same reason
+    // PLAYGROUND_GI=probes|probes_screen|voxel|off, read here for the same reason
     // PLAYGROUND_RT is: the setting has to be pinned before init_renderer()
     // could load a persisted one.
     if (const char* gi = SDL_getenv("PLAYGROUND_GI"); gi != nullptr) {
@@ -1543,6 +1543,10 @@ void PlaygroundGame::apply_gi_mode(bracken::GraphicsSettings& gs) const {
         gs.gi_mode = bracken::GiMode::Probes;
     } else if (gi_mode_ == "probes_screen") {
         gs.gi_mode = bracken::GiMode::ProbesScreen;
+    } else if (gi_mode_ == "voxel") {
+        // The RASTER path: the same probe field fed by a voxel clipmap instead
+        // of by rays, so it runs with no acceleration structure at all.
+        gs.gi_mode = bracken::GiMode::VoxelProbes;
     } else {
         gs.gi_mode = bracken::GiMode::Off;
     }

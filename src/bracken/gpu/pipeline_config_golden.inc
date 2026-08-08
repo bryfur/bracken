@@ -756,16 +756,16 @@ RtDiSpatial
   cs        rt_di_denoise_spatial.comp.spv entry=CSMain samplers=5 ro_textures=0 ro_buffers=0 rw_textures=3 rw_buffers=0 uniform_buffers=1
 RtDiNoise
   cs        rt_di_noise.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=0 rw_textures=1 rw_buffers=1 uniform_buffers=1
+GiProbeTrace
+  cs        gi_probe_trace.comp.spv entry=CSMain samplers=4 ro_textures=2 ro_buffers=7 rw_textures=0 rw_buffers=1 uniform_buffers=1
 VoxelClear
   cs        voxel_clear.comp.spv entry=CSMain samplers=0 ro_textures=0 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=0
 VoxelVoxelize
   cs        voxel_voxelize.comp.spv entry=CSMain samplers=0 ro_textures=0 ro_buffers=2 rw_textures=1 rw_buffers=0 uniform_buffers=1
 VoxelInject
-  cs        voxel_inject.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=0 rw_textures=2 rw_buffers=0 uniform_buffers=1
+  cs        voxel_inject.comp.spv entry=CSMain samplers=2 ro_textures=1 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 VoxelConeTrace
   cs        voxel_cone_trace.comp.spv entry=CSMain samplers=3 ro_textures=0 ro_buffers=1 rw_textures=0 rw_buffers=1 uniform_buffers=1
-GiProbeTrace
-  cs        gi_probe_trace.comp.spv entry=CSMain samplers=4 ro_textures=2 ro_buffers=7 rw_textures=0 rw_buffers=1 uniform_buffers=1
 GiProbeBlend
   cs        gi_probe_blend.comp.spv entry=CSMain samplers=0 ro_textures=1 ro_buffers=2 rw_textures=1 rw_buffers=0 uniform_buffers=1
 GiProbeBlendVisibility

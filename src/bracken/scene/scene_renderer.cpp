@@ -1223,6 +1223,14 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // would return immediately, and the setting would silently do
             // nothing. =====
             const bool gi_active = gfx.gi_mode != GiMode::Off;
+            // ...but the RASTER GI mode is exempt from every sentence above.
+            // GiMode::VoxelProbes fills the same probe field from a voxel
+            // clipmap, so it needs no BVH, no attributes and none of the ~30 MB
+            // — which is the entire reason it exists. Keeping it out of
+            // `gi_wants_rt` is what makes "GI without ray tracing" true rather
+            // than merely differently spelled.
+            const bool gi_raster = gfx.gi_mode == GiMode::VoxelProbes;
+            const bool gi_wants_rt = gi_active && !gi_raster;
             // Local-light shadows join the same gate: they trace the same BVH
             // and therefore need the same acceleration structure built. They do
             // NOT need triangle ATTRIBUTES — a shadow ray asks a yes/no
@@ -1233,8 +1241,8 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             render::RtRenderer::FrameParams rt_frame_params;
             render::RtReflectionSettings rt_reflection_settings;
             bool rt_reflection_resolve_ready = false;
-            if ((rt_traces_active || gi_active) && rt_renderer_ && cmd) {
-                ensure_raytracing_scene(gfx.rt_reflections || gi_active);
+            if ((rt_traces_active || gi_wants_rt) && rt_renderer_ && cmd) {
+                ensure_raytracing_scene(gfx.rt_reflections || gi_wants_rt);
                 {
                     // Timed separately from the traces: this is the CPU-side
                     // TLAS work (range filter, content hash, and the rebuild
@@ -1298,6 +1306,90 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                         BRACKEN_LOG_WARN(LOG_TAG, "GI probe field unavailable; gi_mode has no effect");
                     }
                 }
+                // ===== The RASTER ray source (GiMode::VoxelProbes). =====
+                //
+                // Allocated on the same lazy/latched policy as the probe field
+                // and torn down the moment the mode leaves VoxelProbes: ~35 MB
+                // of volumes is not worth keeping resident for a mode the host
+                // is not using.
+                if (gi_raster && !voxel_gi_ && !voxel_gi_init_failed_) {
+                    auto voxel = std::make_unique<render::gi::VoxelGi>();
+                    if (voxel->init(context_->device(), *pipeline_registry_)) {
+                        voxel_gi_ = std::move(voxel);
+                        voxel_gi_model_count_ = 0; // force the first gather
+                    } else {
+                        voxel_gi_init_failed_ = true;
+                        BRACKEN_LOG_WARN(LOG_TAG,
+                                         "voxel GI unavailable; gi_mode=VoxelProbes falls back to "
+                                         "an untraced field");
+                    }
+                } else if (!gi_raster && (voxel_gi_ || voxel_gi_init_failed_)) {
+                    voxel_gi_.reset();
+                    voxel_gi_init_failed_ = false;
+                    voxel_gi_model_count_ = 0;
+                }
+
+                if (voxel_gi_) {
+                    BRACKEN_PROFILE_ZONE_COLOR("VoxelGI", 0x16A085);
+                    BRACKEN_GPU_SCOPE(cmd, "VoxelGI");
+                    BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "VoxelGI");
+
+                    // The geometry gather is expensive and the model set almost
+                    // never changes, so it is keyed off the model count rather
+                    // than run per frame. Placements are re-hashed every frame
+                    // and early-out when unchanged.
+                    if (model_manager_ && model_manager_->model_count() != voxel_gi_model_count_) {
+                        voxel_gi_->build_models(*model_manager_);
+                        voxel_gi_model_count_ = model_manager_->model_count();
+                    }
+                    // Gathered here rather than reused from the ray-tracing
+                    // block: that block does not run in this mode, so sharing
+                    // its scratch would leave the clipmap empty in exactly the
+                    // configuration VoxelProbes exists for. Unfiltered by range
+                    // — the clipmap does its own culling per cascade window, and
+                    // the coarsest one wants the whole map.
+                    voxel_instances_scratch_.clear();
+                    const auto voxel_models = frame.model_commands();
+                    voxel_instances_scratch_.reserve(voxel_models.size());
+                    for (const ModelDrawCommand& draw : voxel_models) {
+                        if (draw.model_handle != INVALID_MODEL_HANDLE) {
+                            voxel_instances_scratch_.emplace_back(draw.model_handle, draw.transform);
+                        }
+                    }
+                    // Skinned draws contribute their BIND POSE, which is the
+                    // right call at a 25-unit voxel: a character's own bounce is
+                    // negligible and re-voxelizing it per frame is not.
+                    for (const SkinnedDrawCommand& draw : frame.skinned_commands()) {
+                        if (draw.model_handle != INVALID_MODEL_HANDLE) {
+                            voxel_instances_scratch_.emplace_back(draw.model_handle, draw.transform);
+                        }
+                    }
+                    voxel_gi_->set_instances(voxel_instances_scratch_);
+                    voxel_gi_->upload(context_->device());
+
+                    render::gi::VoxelGiFrameParams vp;
+                    vp.camera_position = draw_camera.position;
+                    vp.camera_forward = -glm::vec3(draw_camera.view[0][2], draw_camera.view[1][2],
+                                                   draw_camera.view[2][2]);
+                    vp.shadow_atlas = shadow_map_->atlas_texture();
+                    vp.shadow_cmp_sampler = shadow_map_->shadow_compare_sampler();
+                    vp.shadow_raw_sampler = shadow_map_->shadow_sampler();
+                    vp.shadow_block = &frame_shadow_uniforms_;
+                    vp.shadow_block_size = sizeof(frame_shadow_uniforms_);
+                    vp.sun_direction = env_.sun_dir;
+                    vp.sun_color = env_.sun_color;
+                    vp.sun_intensity = gfx.sun_intensity;
+                    vp.sky_color = env_.ambient_sky;
+                    // A small floor so a voxel the sun cannot reach is not
+                    // perfectly black; the probe field applies the real sky
+                    // term, and this only stops the volume from zeroing it.
+                    vp.sky_floor = 0.15f;
+                    // The same signal the denoisers use for a sun jump: injected
+                    // radiance is stale the moment the sun moves.
+                    vp.lighting_changed = lighting_reset_ > 0.01f;
+                    voxel_gi_->update(cmd, vp);
+                }
+
                 if (probe_volume_) {
                     BRACKEN_PROFILE_ZONE_COLOR("GIProbes", 0x27AE60);
                     BRACKEN_GPU_SCOPE(cmd, "GIProbes");
@@ -1334,8 +1426,17 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     gi_params.light_data = cluster_grid_.light_data_buffer();
                     gi_params.light_count = cluster_grid_.total_lights();
                     gi_params.light_capacity = render::lighting::MAX_LIGHTS;
-                    if (gi_params.sky_cube_fallback != nullptr && gi_params.sky_sampler != nullptr &&
-                        gi_params.shadow_atlas != nullptr && gi_params.light_data != nullptr) {
+                    gi_params.voxel = voxel_gi_.get();
+                    // The sky cube, the sky sampler and the light buffer are
+                    // the RAY source's inputs — it shades what it hits. The
+                    // raster source shades nothing (the radiance is already in
+                    // the volume), so requiring them would make VoxelProbes fail
+                    // for the wrong reasons on a frame with no IBL yet.
+                    const bool ray_inputs_ready =
+                        gi_params.sky_cube_fallback != nullptr && gi_params.sky_sampler != nullptr &&
+                        gi_params.light_data != nullptr;
+                    if (gi_params.shadow_atlas != nullptr &&
+                        (ray_inputs_ready || (voxel_gi_ && voxel_gi_->ready()))) {
                         probe_volume_->trace(cmd, gi_params);
                     }
                 }

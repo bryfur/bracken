@@ -1032,6 +1032,28 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
                    .num_readwrite_storage_textures = 1,
                    .num_readwrite_storage_buffers = 1,
                    .num_uniform_buffers = 1}},
+    {.name = "GiProbeTrace",
+     .shader = "gi_probe_trace.comp.spv",
+     .entry_point = "CSMain",
+     // The widest binding block in the engine, and every entry earns its slot.
+     // Sampled: the CSM atlas twice (comparison + raw, because it includes
+     // shadow_common.hlsli verbatim rather than reimplementing the cascade
+     // math), the IBL sky-capture cube for ray misses, and the BANDED
+     // irradiance atlas for the previous-frame bounce — one texture holding
+     // every cascade since R1c (gi_math.hpp), where R1b bound three.
+     // Read-only storage textures: the relocation/classification plane and the
+     // probe-state plane, both banded for the same reason, so the bounce can
+     // reject a slot whose previous occupant has not been overwritten yet.
+     // Read-only storage buffers: the four acceleration-structure buffers, the
+     // per-triangle attributes that make a hit shadeable, the
+     // clustered-lighting byte buffer, and the frame's update list. One
+     // read-write buffer out: the per-ray radiance + signed distance the three
+     // passes below consume.
+     .resources = {.num_samplers = 4,
+                   .num_readonly_storage_textures = 2,
+                   .num_readonly_storage_buffers = 7,
+                   .num_readwrite_storage_buffers = 1,
+                   .num_uniform_buffers = 1}},
     {.name = "VoxelClear",
      .shader = "voxel_clear.comp.spv",
      .entry_point = "CSMain",
@@ -1057,7 +1079,8 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // includes shadow_common.hlsli verbatim rather than reimplementing the
      // cascade math. Two read-write volumes: albedo in, radiance out.
      .resources = {.num_samplers = 2,
-                   .num_readwrite_storage_textures = 2,
+                   .num_readonly_storage_textures = 1,  // albedo in
+                   .num_readwrite_storage_textures = 1, // radiance out
                    .num_uniform_buffers = 1}},
     {.name = "VoxelConeTrace",
      .shader = "voxel_cone_trace.comp.spv",
@@ -1069,28 +1092,6 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // ray-traced path: same buffer, same contract.
      .resources = {.num_samplers = 3,
                    .num_readonly_storage_buffers = 1,
-                   .num_readwrite_storage_buffers = 1,
-                   .num_uniform_buffers = 1}},
-    {.name = "GiProbeTrace",
-     .shader = "gi_probe_trace.comp.spv",
-     .entry_point = "CSMain",
-     // The widest binding block in the engine, and every entry earns its slot.
-     // Sampled: the CSM atlas twice (comparison + raw, because it includes
-     // shadow_common.hlsli verbatim rather than reimplementing the cascade
-     // math), the IBL sky-capture cube for ray misses, and the BANDED
-     // irradiance atlas for the previous-frame bounce — one texture holding
-     // every cascade since R1c (gi_math.hpp), where R1b bound three.
-     // Read-only storage textures: the relocation/classification plane and the
-     // probe-state plane, both banded for the same reason, so the bounce can
-     // reject a slot whose previous occupant has not been overwritten yet.
-     // Read-only storage buffers: the four acceleration-structure buffers, the
-     // per-triangle attributes that make a hit shadeable, the
-     // clustered-lighting byte buffer, and the frame's update list. One
-     // read-write buffer out: the per-ray radiance + signed distance the three
-     // passes below consume.
-     .resources = {.num_samplers = 4,
-                   .num_readonly_storage_textures = 2,
-                   .num_readonly_storage_buffers = 7,
                    .num_readwrite_storage_buffers = 1,
                    .num_uniform_buffers = 1}},
     {.name = "GiProbeBlend",

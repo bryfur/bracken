@@ -173,7 +173,14 @@ void VoxelScene::upload(gpu::GPUDevice& device) {
     BRACKEN_PROFILE_ZONE("VoxelScene::upload");
 
     if (triangles_dirty_ && !triangles_.empty()) {
-        triangle_buffer_ = gpu::GPUBuffer::create_static(device, gpu::GPUBuffer::Type::Storage,
+        // ComputeStorage, NOT Storage. `Type::Storage` is GRAPHICS_STORAGE_READ
+        // alone — a fragment shader's SSBO — and these are read by a COMPUTE
+        // shader, which needs COMPUTE_STORAGE_READ. Binding a graphics-only
+        // buffer into a compute pass is not diagnosed: the driver faults inside
+        // the dispatch, which looks like a bad dispatch size or a bad texture
+        // format long before it looks like a buffer usage flag.
+        triangle_buffer_ = gpu::GPUBuffer::create_static(device,
+                                                         gpu::GPUBuffer::Type::ComputeStorage,
                                                          triangles_.data(),
                                                          triangles_.size() * sizeof(VoxelTriangle));
         triangles_dirty_ = false;
@@ -181,7 +188,8 @@ void VoxelScene::upload(gpu::GPUDevice& device) {
     if (instances_dirty_ && !instances_.empty()) {
         // Recreated rather than mapped: the list changes only when the scene's
         // placement set does, which for a village is once at load.
-        instance_buffer_ = gpu::GPUBuffer::create_static(device, gpu::GPUBuffer::Type::Storage,
+        instance_buffer_ = gpu::GPUBuffer::create_static(device,
+                                                         gpu::GPUBuffer::Type::ComputeStorage,
                                                          instances_.data(),
                                                          instances_.size() * sizeof(VoxelInstance));
         instances_dirty_ = false;

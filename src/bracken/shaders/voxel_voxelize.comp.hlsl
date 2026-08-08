@@ -43,7 +43,13 @@ cbuffer VoxelVoxelizeUniforms : register(b0, space2) {
     uint voxelWorkCount;
     /// Instances in `voxelInstances`, for the binary search below.
     uint voxelInstanceCount;
-    uint _voxelPad0;
+    /// Threads per ROW of the dispatch (groupsX * 64).
+    ///
+    /// The dispatch is 2D purely to stay legal: work is (instances x
+    /// triangles), which for a village is millions, and Vulkan only guarantees
+    /// 65535 groups per dimension — a flat 1D dispatch over ~9M items asks for
+    /// ~137k and the driver SEGFAULTS rather than reporting it.
+    uint voxelDispatchWidth;
     uint _voxelPad1;
 };
 
@@ -119,7 +125,7 @@ uint voxelFindInstance(uint work) {
 
 [numthreads(64, 1, 1)]
 void CSMain(uint3 tid : SV_DispatchThreadID) {
-    const uint work = tid.x;
+    const uint work = tid.y * voxelDispatchWidth + tid.x;
     if (work >= voxelWorkCount || voxelInstanceCount == 0) {
         return;
     }

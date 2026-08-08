@@ -179,6 +179,17 @@ enum class LocalRtShadowMode : int {
  * valid value and clamps like any other; it simply does not yet do the extra
  * thing its name promises.
  *
+ * `VoxelProbes` fills the SAME probe field from a voxel radiance clipmap
+ * instead of from rays (`render/gi/voxel_gi.hpp`). It is the RASTER
+ * alternative: no BVH, no acceleration structure, and it runs with
+ * `rt_shadows` and `rt_reflections` off — the sun's visibility comes from the
+ * cascaded shadow map the raster path already renders, which is the whole
+ * economy of the technique. Everything downstream of the probe field is
+ * identical to `Probes`, because the two modes differ only in what fills the
+ * ray-results buffer. Expect softer, leakier light than `Probes` (a voxel is a
+ * volume element and has no normal, so the cosine is an isotropic mean) in
+ * exchange for needing no ray tracing at all.
+ *
  * `Off` is the default and is the pre-GI engine exactly: ambient comes from the
  * IBL sky probe or the hemisphere fallback, as it always has.
  */
@@ -186,6 +197,7 @@ enum class GiMode : int {
     Off = 0,
     Probes = 1,
     ProbesScreen = 2,
+    VoxelProbes = 3,
 };
 
 /**
