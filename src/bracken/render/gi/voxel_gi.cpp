@@ -31,56 +31,6 @@ constexpr std::uint64_t MAX_GROUPS_PER_AXIS = 65535;
 } // namespace
 
 bool VoxelGi::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
-    // ===== BLOCKED ON A PLATFORM LIMITATION, and refusing here is the whole
-    // reason this is a `return false` rather than a TODO comment: every path
-    // below is written, compiled, unit-tested and wired, and running it
-    // SEGFAULTS inside the NVIDIA driver.
-    //
-    // WHAT WAS ESTABLISHED, each by experiment rather than by reasoning:
-    //   * ANY compute dispatch that writes a 3D storage image faults. The
-    //     minimal case is voxel_clear — one `RWTexture3D<uint>`, no buffers, no
-    //     uniforms, dispatched 1x1x1 — which faults exactly as the full
-    //     voxelizer does.
-    //   * The fault is ASYNCHRONOUS. It surfaces at whichever dispatch runs
-    //     next, so bisecting by removing passes just moves the reported line;
-    //     that is what made this look like four different bugs in turn.
-    //   * The formats are supported. `SDL_GPUTextureSupportsFormat` reports
-    //     R32_UINT 3D and RGBA16F 3D as valid with exactly these usage flags,
-    //     and that query runs in VoxelVolume::init.
-    //   * Not dispatch size, not the mip generation, not PCSS in compute, and
-    //     not the albedo binding kind (it faults bound read-write AND bound as
-    //     a read-only storage texture).
-    //
-    // THREE GENUINE BUGS were found and fixed on the way and are kept, because
-    // they are all real and none of them is diagnosed by the driver either:
-    // the albedo volume must be R32_UINT (an integer atomic needs an integer
-    // view); it needs SIMULTANEOUS_READ_WRITE rather than READ | WRITE, which
-    // SDL's own header says are not equivalent; and the geometry buffers must
-    // be Type::ComputeStorage, since Type::Storage is GRAPHICS_STORAGE_READ
-    // alone.
-    //
-    // THE LIKELY SHAPE OF THE FIX: SDL3's `SDL_GPUStorageTextureReadWriteBinding`
-    // carries a `layer` field, and for a 3D texture the backend may expect one
-    // binding per Z SLICE rather than one binding for the volume. The engine has
-    // no other 3D storage-image user to compare against. Proving that needs a
-    // minimal SDL3 repro outside this engine, which is the next step and is not
-    // something to guess at inside a renderer.
-    //
-    // Until then this returns false, `SceneRenderer` never constructs the
-    // driver, and GiMode::VoxelProbes degrades to contributing no GI — inert
-    // rather than crashing. Everything else in the series stays: the clipmap,
-    // the four kernels, the CPU/GPU mirrors and their tests are all live and
-    // green, so the moment the binding question is answered this is a one-line
-    // change. =====
-    (void)device;
-    (void)pipelines;
-    BRACKEN_LOG_WARN(LOG_TAG,
-                     "voxel GI is disabled: 3D storage-image writes fault on this SDL3 backend "
-                     "(see VoxelGi::init). gi_mode=VoxelProbes will contribute no GI.");
-    return false;
-}
-
-bool VoxelGi::init_unchecked(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
     pipelines_ = &pipelines;
     if (!volume_.init(device)) {
         return false;
@@ -333,13 +283,45 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
     }
 
     // ---- 4. mips ----------------------------------------------------------
-    // The cone trace's entire economy is one filtered tap at the mip whose
-    // voxels match the cone's width, so the chain is the technique rather than
-    // an optimization. SDL3's generator is used rather than a hand-rolled
-    // reduction because a box filter IS what a cone wants here — an
-    // anisotropic chain (six directional mips, so a cone approaching a wall
-    // edge-on does not see through it) is the known quality upgrade and is RG4.
-    SDL_GenerateMipmapsForGPUTexture(cmd, radiance->handle());
+    //
+    // BUILT HERE, one dispatch per level, because
+    // SDL_GenerateMipmapsForGPUTexture FAULTS on a 3D texture. The volume can be
+    // created mipmapped and bound read-write at mip 0 perfectly well — both were
+    // verified in isolation — but SDL's generator is a blit chain that does not
+    // handle the third dimension and takes the process down inside the driver
+    // with no diagnostic at all. That one call was the whole reason this path
+    // looked unrunnable.
+    //
+    // The chain is the technique, not an optimization: a cone takes ONE filtered
+    // tap at the level whose voxels match its width, which is what makes it cost
+    // tens of samples instead of the thousands of rays it stands for.
+    const gpu::GPUComputePipeline* mip =
+        pipelines_->get_compute_pipeline(gpu::ComputePipelineType::VoxelMip);
+    if (mip == nullptr) {
+        return false;
+    }
+    for (int level = 1; level < radiance->mip_levels(); ++level) {
+        const int dst = std::max(VOXEL_RESOLUTION >> level, 1);
+        gpu::VoxelMipUniforms mu{};
+        mu.dstSize = glm::uvec3(static_cast<std::uint32_t>(dst));
+        mu.srcLevel = static_cast<float>(level - 1);
+
+        const SDL_GPUStorageTextureReadWriteBinding rw{.texture = radiance->handle(),
+                                                       .mip_level = static_cast<Uint32>(level),
+                                                       .layer = 0, .cycle = false,
+                                                       .padding1 = 0, .padding2 = 0, .padding3 = 0};
+        gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
+        if (!pass) {
+            return false;
+        }
+        pass.bind_pipeline(*mip);
+        const SDL_GPUTextureSamplerBinding src{radiance->handle(), volume_.sampler()};
+        pass.bind_samplers(0, {&src, 1});
+        pass.push_uniforms(0, &mu, sizeof(mu));
+        const auto groups = groups_for(static_cast<std::uint64_t>(dst), VOLUME_GROUP);
+        pass.dispatch(groups, groups, groups);
+        pass.end();
+    }
     return true;
 }
 

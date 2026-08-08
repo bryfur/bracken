@@ -465,6 +465,7 @@ const UniformRow UNIFORM_TABLE[] = {
     // Raster GI (render/gi/voxel_*): the voxel radiance clipmap.
     ROW("voxel_voxelize.comp.spv", 2, 0, gpu::VoxelVoxelizeUniforms),
     ROW("voxel_inject.comp.spv", 2, 0, gpu::VoxelInjectUniforms),
+    ROW("voxel_mip.comp.spv", 2, 0, gpu::VoxelMipUniforms),
     ROW("voxel_cone_trace.comp.spv", 2, 0, gpu::VoxelConeTraceUniforms),
     ROW("gi_probe_blend.comp.spv", 2, 0, gpu::GiProbeBlendUniforms),
     ROW("gi_probe_blend_visibility.comp.spv", 2, 0, gpu::GiProbeBlendUniforms),

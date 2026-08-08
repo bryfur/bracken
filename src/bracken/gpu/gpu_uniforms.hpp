@@ -2061,6 +2061,23 @@ BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, dispatchWidth, 24);
 BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, _pad1, 28);
 
 /**
+ * VoxelMipUniforms (set 2, b0) — voxel_mip.comp.hlsl.
+ *
+ * One dispatch per level. Exists because SDL_GenerateMipmapsForGPUTexture
+ * FAULTS on a 3D texture — see the shader.
+ */
+struct alignas(16) VoxelMipUniforms {
+    /// Resolution of the level being written.
+    glm::uvec3 dstSize{0, 0, 0};
+    /// Level being read; the destination is this + 1.
+    float srcLevel = 0.0f;
+};
+
+BRACKEN_HLSL_CBUFFER(VoxelMipUniforms, 16);
+BRACKEN_HLSL_FIELD(VoxelMipUniforms, dstSize, 0);
+BRACKEN_HLSL_FIELD(VoxelMipUniforms, srcLevel, 12);
+
+/**
  * VoxelInjectUniforms (set 2, b0) — voxel_inject.comp.hlsl.
  *
  * Leading 176 bytes are the shadow_common.hlsli block, embedded verbatim and in

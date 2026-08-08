@@ -1,0 +1,7 @@
+#version 450
+// Minimal 3D storage-image write: one binding, no buffers, no uniforms.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(set = 1, binding = 0, r32ui) uniform uimage3D vol;
+void main() {
+    imageStore(vol, ivec3(gl_GlobalInvocationID), uvec4(1u, 0u, 0u, 0u));
+}

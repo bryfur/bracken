@@ -208,6 +208,7 @@ enum class ComputePipelineType {
     VoxelClear,             ///< Raster GI: zero one clipmap cascade before revoxelizing it
     VoxelVoxelize,          ///< Raster GI: fill one clipmap cascade's albedo+opacity from scene triangles
     VoxelInject,            ///< Raster GI: light every occupied voxel into the radiance volume
+    VoxelMip,               ///< Raster GI: one level of the radiance volume's mip chain (SDL's generator faults on 3D)
     VoxelConeTrace,         ///< Raster GI: cone-trace the clipmap into the probe field's ray results
     GiProbeBlend,           ///< Cosine-weighted fold of the ray set into the irradiance atlas + border
     GiProbeBlendVisibility, ///< Sharp-lobe fold of ray distances into the visibility moments + border

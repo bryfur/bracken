@@ -2601,6 +2601,77 @@ reflections and GI.
 
 ---
 
+## 7. Raster GI — the voxel path (RG, 2026-08-08)
+
+A second RAY SOURCE for the probe field, not a second GI system. The field meets
+its source at exactly one buffer — `ray_results_`, `float4(radiance, distance)`
+per (probe, ray) — and `GiMode::VoxelProbes` fills it by CONE TRACING a voxel
+radiance clipmap. Everything downstream is shared: atlases, blend, Chebyshev,
+classification, relocation, cascade blend, fog. No BVH, no acceleration
+structure, and the sun's visibility comes from the CSM the raster path already
+renders, which is the whole economy of the technique.
+
+**Shape.** Three nested 96³ cascades, torus-addressed and camera-scrolled, 25 →
+100 world units per voxel, ~33 MB. Per cascade an RGBA8 albedo+opacity (no mips,
+only injection reads it) and an RGBA16F radiance (mipmapped — that is what the
+cones sample). No normal volume: injection runs from the triangle and already has
+one. Four compute passes — clear, voxelize, inject, mip — with AT MOST ONE
+CASCADE rebuilt per frame, round-robin, so a moving camera cannot make the cost
+unbounded.
+
+**Voxelization is compute**, because SDL3 GPU offers neither geometry shaders
+(dominant-axis swizzle) nor conservative rasterization. Coverage is
+area-proportional surface sampling rather than exact triangle-box overlap: the
+textbook SAT test costs the triangle's AABB VOLUME, and terrain triangles span
+hundreds of voxels, so cost would be set by the largest primitive rather than the
+average. Composited with `InterlockedMax` over a packed RGBA8 with opacity in the
+high byte — order-independent, therefore reproducible, which a field whose value
+is temporal stability requires.
+
+**The cone half-angle is derived, not tuned**: `rayCount` directions over the
+sphere gives `cos θ = 1 − 2/rayCount`, which keeps gathered energy independent of
+the quality tier.
+
+### Platform findings, all established against a minimal standalone SDL3 program
+
+These cost a session between them and none is diagnosed by the driver:
+
+* **`SDL_GenerateMipmapsForGPUTexture` FAULTS ON A 3D TEXTURE.** This was the
+  blocker. A volume can be created mipmapped and bound read-write at mip 0
+  perfectly well; SDL's generator is a blit chain that does not handle the third
+  dimension. Build the chain in compute (`voxel_mip.comp.hlsl`) — which the cone
+  tracer wants anyway, and which is where anisotropic mips will go.
+* **The fault is ASYNCHRONOUS**, surfacing at whichever dispatch runs next. That
+  is what made one bug look like four in succession, and it is why bisecting by
+  removing passes just moves the reported line. Bisect by removing everything
+  AFTER a suspect, not before.
+* An integer atomic needs an integer view: the albedo volume must be `R32_UINT`,
+  not `R8G8B8A8_UNORM`.
+* `COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE` is **not** `READ | WRITE`; SDL's own
+  header says so, and a read-modify-write needs the former.
+* `GPUBuffer::Type::Storage` is `GRAPHICS_STORAGE_READ` alone. A buffer a COMPUTE
+  shader reads must be `Type::ComputeStorage`.
+
+The repro that settled all of it is ~150 lines of C against system SDL3: create a
+device, a 3D texture, a compute pipeline, dispatch, wait. Worth rebuilding rather
+than reasoning about, the next time SDL3 behaves unexpectedly.
+
+### Still open
+
+* **Injection is isotropic.** A voxel has no normal, so `N·L` is replaced by the
+  mean cosine over a sphere of orientations. This is the standard VXGI
+  approximation and is why the mode is soft and slightly over-bright at grazing
+  sun angles. Anisotropic mips (six directional levels, so a cone approaching a
+  wall edge-on does not see through it) are the known quality upgrade.
+* **Sky is a constant** on cone escape; the traced path samples the IBL capture.
+  This is the single biggest quality gap between the two modes.
+* **Emissive voxels.** `VoxelTriangle` carries the lane; nothing fills it.
+* **Lighting-only reinjection.** A sun move currently redirties the geometry too,
+  so it pays a revoxelization it does not need.
+* **Local lights are not injected** — only the sun and a sky floor.
+
+---
+
 ## 6. Scalability ladder
 
 Per-effect toggles stay orthogonal (house style); the table is the *intended*

@@ -1082,6 +1082,15 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
                    .num_readonly_storage_textures = 1,  // albedo in
                    .num_readwrite_storage_textures = 1, // radiance out
                    .num_uniform_buffers = 1}},
+    {.name = "VoxelMip",
+     .shader = "voxel_mip.comp.spv",
+     .entry_point = "CSMain",
+     // One sampled read of the source level, one read-write write of the
+     // destination. Exists because SDL_GenerateMipmapsForGPUTexture faults on a
+     // 3D texture — see the shader.
+     .resources = {.num_samplers = 1,
+                   .num_readwrite_storage_textures = 1,
+                   .num_uniform_buffers = 1}},
     {.name = "VoxelConeTrace",
      .shader = "voxel_cone_trace.comp.spv",
      .entry_point = "CSMain",

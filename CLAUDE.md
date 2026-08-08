@@ -567,6 +567,24 @@ than spread over the historical tables above:
 | night, `TOD_HOUR=1 … ratio` | **`35.4 / 57.4`** | `35.3 / 56.8` | `35.3 / 56.8` |
 | night, `TOD_HOUR=1 … full` | `36.0 / 55.0` | `35.5 / 53.9` | `35.6 / 53.7` |
 
+**A fourth GI mode landed 2026-08-08: `GiMode::VoxelProbes`, the RASTER path**
+(`PLAYGROUND_GI=voxel`, `80.4 / 49.7`). It fills the SAME probe field by CONE
+TRACING a voxel radiance clipmap instead of by tracing rays, so everything
+downstream — the octahedral atlases, the blend, the Chebyshev leak test,
+classification, relocation, the cascade blend, the fog in-scatter — is shared and
+unchanged. It builds NO acceleration structure (`accel=0.0MB` in the smoke line
+is the check) and gets the sun's visibility from the cascaded shadow map the
+raster path already renders. ~33 MB of volumes on top of the probe field's 30.
+Darker and wider than `probes` because voxel occlusion is chunkier and errs
+toward occluding; see docs/rt_lighting_plan.md §7.
+
+**`SDL_GenerateMipmapsForGPUTexture` FAULTS ON A 3D TEXTURE** and takes the
+process down inside the driver with no diagnostic. That one call is why the
+raster path looked unrunnable for a whole session. A 3D volume can be created
+mipmapped and bound read-write at mip 0 perfectly well — both verified against a
+minimal standalone SDL3 program — but never call SDL's generator on one; build
+the chain with a compute shader (`voxel_mip.comp.hlsl`).
+
 **"Q2" is alpha-cutout coverage in traced visibility**, and it is the largest
 image move in either package: every DAYLIT traced row gains about a full luma
 and loses spread, because a leaf card stopped occluding as a solid quad. Until

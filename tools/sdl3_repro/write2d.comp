@@ -1,0 +1,8 @@
+#version 450
+// The CONTROL: identical shape, 2D. If this runs and the 3D one faults, the
+// difference is the dimensionality and nothing else.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 1, binding = 0, r32ui) uniform uimage2D img;
+void main() {
+    imageStore(img, ivec2(gl_GlobalInvocationID.xy), uvec4(1u, 0u, 0u, 0u));
+}
