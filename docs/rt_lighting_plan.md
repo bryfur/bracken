@@ -2524,12 +2524,36 @@ reflections and GI.
   second à-trous iteration never fire on the pixels they were built for. Gate it
   on the previous reservoir's `depth` lane at the standard 0.05. This is the
   second of the two invalidation paths, and the one still open.
-* **No ReSTIR visibility reuse.** The shadow ray is traced and its answer
-  discarded; `p̂` stays unshadowed, so a pixel in a lantern's shadow re-selects
-  and re-confirms the occluded light for up to ~120 effective samples. Apply the
-  traced bit to the reservoir weight with RTXDI's boiling-filter decay. This
-  changes the estimator's fixed point, so the Ratio↔Full energy gate (§5.3, the
-  two means within ~0.1 luma) is the check.
+* **No ReSTIR visibility reuse — ATTEMPTED 2026-08-08 AND REVERTED, and the
+  energy gate is what caught it.** The shadow ray is traced and its answer
+  discarded; `p̂` stays unshadowed, so a pixel with two lights in range, one
+  occluded, stays locked on the occluded one for up to ~120 effective samples
+  (`history_max_m_ratio` 20 × 6 candidates) and reads black until RIS happens to
+  draw the other. That is low-frequency temporal blotching, not the
+  high-frequency noise a denoiser removes.
+
+  Two formulations were considered and BOTH are wrong in a way worth recording:
+
+  - **Zero `W`, keep `sampleCount`** — the tempting one-liner, and biased. The
+    finalize computes `W = wSum / (M · p̂(y))`, so a history contributing zero
+    weight but ~120 to `M` divides the next frame's fresh candidates by twenty
+    times what they should be and every shadow edge darkens.
+  - **Retire the reservoir whole** (`NO_LIGHT`, `W = 0`, `M = 0`) — unbiased in
+    expectation, and what was actually built. It fails for a different reason: at
+    night MOST pixels are occluded by something, so most pixels lose their
+    accumulation every frame, the estimator collapses toward 1 spp, and the
+    asymmetric firefly clamp downstream turns that variance into ENERGY.
+    Measured: the night Ratio↔Full gap went from 0.3 luma to **4.4**
+    (36.2 vs 40.6), against a documented tolerance of ~0.1 and a "something is
+    wrong" threshold of ~1.5. Daylight was fine (86.0 vs 86.3), which is exactly
+    why the night pin exists.
+
+  The correct version is the one the literature actually specifies: fold
+  visibility into `p̂` for the REUSE path while keeping the M accounting honest,
+  which needs the UNBIASED (MIS-weighted) temporal variant rather than the
+  conventional `wSum / (M · p̂)` finalize this pass uses today. The spatial stage
+  already runs pairwise MIS (R7a); the temporal stage does not. Doing that first
+  is the prerequisite, and it is a larger change than this bullet implies.
 * **GI probe-update stability, partly addressed and NOT demonstrated to help.**
   Three changes landed: the visibility moments take a fixed EMA instead of the
   irradiance blend's change-adaptive one (they describe geometry, so every delta
