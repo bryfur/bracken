@@ -2027,6 +2027,37 @@ BRACKEN_HLSL_FIELD(GiProbeTraceUniforms, _pad2, 524);
  * which is a compile-time constant in each shader (and therefore not a uniform
  * that could disagree with the atlas it writes).
  */
+/**
+ * VoxelVoxelizeUniforms (set 2, b0) — voxel_voxelize.comp.hlsl.
+ *
+ * The RASTER GI path's voxelization dispatch (RG1). One dispatch per cascade,
+ * flat over (instance, triangle) pairs.
+ */
+struct alignas(16) VoxelVoxelizeUniforms {
+    /// Which cascade this dispatch fills.
+    int32_t cascade = 0;
+    /// Its base corner in whole voxels. Every write is tested against this
+    /// window — torus addressing would otherwise wrap a triangle from the far
+    /// side of the map onto a texel near the camera, with full confidence.
+    glm::ivec3 base{0, 0, 0};
+    /// Total (instance, triangle) pairs — the dispatch's flat extent.
+    uint32_t workCount = 0;
+    /// Instances, for the shader's binary search over the prefix sums.
+    uint32_t instanceCount = 0;
+    /// Emissive multiplier, so an emissive surface seeds the radiance volume
+    /// before any light is injected. 0 disables.
+    float emissiveScale = 1.0f;
+    uint32_t _pad0 = 0;
+};
+
+BRACKEN_HLSL_CBUFFER(VoxelVoxelizeUniforms, 32);
+BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, cascade, 0);
+BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, base, 4);
+BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, workCount, 16);
+BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, instanceCount, 20);
+BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, emissiveScale, 24);
+BRACKEN_HLSL_FIELD(VoxelVoxelizeUniforms, _pad0, 28);
+
 struct alignas(16) GiProbeBlendUniforms {
     uint32_t probeCount = 0;
     uint32_t rayCount = 0;
