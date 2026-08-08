@@ -962,6 +962,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
 
         const uint y = outRes.lightIndex;
 
+        // Alpha-cutout decisions for this pixel's shadow ray, decorrelated from
+        // both the reservoir stream and the cone sample so a leaf's coverage
+        // test does not correlate with which light was chosen. Replayable by
+        // construction — rt_local_shadow_gradient re-derives it with
+        // frameIndex - 1 at the previous pixel.
+        const uint cutoutSeed = rtSeed(uint2(coord), frameIndex ^ 0x5bf03635u);
+
         // ---- 5. one shadow ray at the FINAL winner ----------------------
         //
         // An EMISSIVE winner takes the branch below instead: the ray
@@ -991,7 +998,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                 // localization horizon — see rt_emissive.hlsli for the
                 // measurement that rejected that.
                 const float rayLen = rtEmissiveRayLength(dist, depthBias, normalBias);
-                lit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, L, rayLen);
+                lit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, L, rayLen, cutoutSeed);
             }
         } else if (y != RT_RESERVOIR_NO_LIGHT) {
             const ClusterLightSample geom = clusterLightGeometry(y);
@@ -1037,7 +1044,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                     // Stop short of the emitter itself. The light is not
                     // geometry, but whatever it is mounted on usually is.
                     const float rayLen = max(dist - depthBias - normalBias, 0.0);
-                    lit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, rayDir, rayLen);
+                    lit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, rayDir, rayLen, cutoutSeed);
                 }
             }
         }

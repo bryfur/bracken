@@ -2484,18 +2484,40 @@ reflections and GI.
 
 **Still open, in priority order.**
 
-* **Alpha-cutout geometry is still absent from every traced walk.** `gather()`
-  reads no `alpha_mode` / `alpha_cutoff`, and `triangleHit` is pure
-  Möller–Trumbore, so a leaf card occludes as a solid quad in sun shadow, local
-  DI, reflections and probe rays. The cheapest sound design is a per-triangle
-  average opacity **baked at BLAS build** into `BvhTriangle::pad0` — zero extra
-  bytes, zero extra bindings, and it works in the shadows-only configuration
-  where the attribute buffer does not exist — sampled with ~8 stratified
-  barycentric taps so it is genuine coverage rather than one centroid tap
-  reporting 1.0 for a card that is half gap. Note the ordering argument: a
-  Bernoulli test per leaf hit ADDS variance, so it wants the DI noise work below
-  to land first. Prerequisite: `model_loader.cpp`'s LOD copy block drops
-  `alpha_mode`, `double_sided` and `texture_pixels`.
+* ~~Alpha-cutout geometry absent from every traced walk~~ — **LANDED
+  2026-08-08 (Q2), and it is the largest image change of the whole audit.**
+  `internal::bake_rt_triangle_opacity` measures each triangle's coverage at load
+  over 8 stratified barycentric taps against the material's `alpha_cutoff` — 
+  COVERAGE, not a centroid tap, because opacity after an alpha TEST is a step
+  function and one tap returns 0 or 1 and nothing between, so a half-gap leaf
+  card would have reported 1.0 and the feature would have measured as doing
+  nothing. It rides `BvhTriangle::opacity` (the old `pad0`): zero extra bytes,
+  zero extra bindings, and — the reason it beats the `TriangleAttributes` buffer
+  — it exists in the shadows-only configuration where `want_attributes` is false
+  and that buffer is never built. Filled after `build_blas` by `prim_id`, which
+  is the SOURCE triangle ordinal and therefore survives any reordering.
+
+  The any-hit walk applies it stochastically (`cutoutPasses`): the triangle
+  occludes with probability `opacity`, so a canopy casts a shadow of the right
+  DENSITY and the dappling lands in the estimator where the shadow denoiser
+  already running turns it into soft light. A hard threshold would make every
+  leaf on a card identical and leave no variance to average. The seed is passed
+  BY VALUE down `sceneOccluded` → `instancesOccluded` → `blasOccluded` rather
+  than carried as `inout` state, mixed with the instance ordinal (so two copies
+  of one tree do not resolve identically) and with `primId`; both gradient
+  replays re-derive it at `(prevCoord, frameIndex - 1)`. That last part is
+  load-bearing and was verified: `sun_grad_fire` held at 0.0057 against 0.0056,
+  where a replay disagreeing with its trace would have reported a full gradient
+  on every foliage stratum.
+
+  Measured: every daylit traced row gained ~1 luma and lost spread; RT-off stayed
+  bit-identical. Still open here — `cast_shadows == false` is not honoured (leaf
+  cards are real visible geometry a closest-hit ray must find, so it needs a
+  per-triangle flag, and the coverage above is the better answer anyway); the
+  raster mip-widening term is deliberately not reproduced; and `model_loader`'s
+  LOD copy block still drops `alpha_mode`/`double_sided`/`texture_pixels`, so LOD
+  levels bake as opaque.
+
 * **The DI temporal pass has no geometric history validation at all** — it
   accepts reprojected history on `prevUv ∈ [0,1]` and `hist.a > 0`, nothing else.
   `count` therefore never resets under motion, so the R7c radius ramp and the

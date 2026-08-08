@@ -265,6 +265,14 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
+    // The PREVIOUS pixel's cutout seed at the PREVIOUS frame — exactly what
+    // rt_local_shadow.comp.hlsl used when it produced the bit being compared
+    // against. Same requirement, and same failure mode if it is wrong, as the
+    // capsule buffer and the emissive records above: a replay that resolves a
+    // leaf card differently from the trace reports a full gradient on every
+    // foliage stratum, every frame, forever.
+    const uint cutoutSeed = rtSeed(uint2(prevCoord), (frameIndex - 1u) ^ 0x5bf03635u);
+
     const uint2 prevTile = uint2(prevCoord) / RT_TILE_SIZE;
     const uint2 prevInTile = uint2(prevCoord) % RT_TILE_SIZE;
     const float prevLit = rtUnpackVisibility(prevShadowBits.Load(int3(int2(prevTile), 0)), prevInTile);
@@ -294,7 +302,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             // distance than the trace did would report a gradient on those
             // strata forever.
             const float rayLen = rtEmissiveRayLength(dist, depthBias, normalBias);
-            emissiveLit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, L, rayLen);
+            emissiveLit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, L, rayLen, cutoutSeed);
         }
         gradientOut[stratum] = abs((emissiveLit ? 1.0 : 0.0) - prevLit);
         return;
@@ -327,7 +335,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             replayLit = false;
         } else {
             const float rayLen = max(dist - depthBias - normalBias, 0.0);
-            replayLit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, rayDir, rayLen);
+            replayLit = rayLen <= 0.0 ? true : !sceneOccluded(rayOrigin, rayDir, rayLen, cutoutSeed);
         }
     }
 

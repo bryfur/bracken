@@ -94,7 +94,10 @@ struct BvhNodeGpu {
 
 struct BvhTriangle {
     float3 v0;
-    float pad0;
+    /// Alpha-cutout coverage in [0, 1]; 1 = solid. Was `pad0`. Mirrors
+    /// `BvhTriangle::opacity` in render/raytracing/bvh.hpp — this struct is
+    /// uploaded by raw memcpy, so the two must agree bit for bit.
+    float opacity;
     float3 e1;
     uint primId;
     float3 e2;
@@ -182,6 +185,40 @@ bool slabTest(float3 boundsMin, float3 boundsMax, float3 origin, float3 invDir, 
     tNear = max(max(tsmall.x, tsmall.y), max(tsmall.z, 0.0));
     float tFar = min(min(tbig.x, tbig.y), min(tbig.z, tMax));
     return tNear <= tFar;
+}
+
+/// STOCHASTIC ALPHA TEST for a cutout triangle, the any-hit half of the opacity
+/// bake in `internal/model_material_proxy.hpp`.
+///
+/// `tri.opacity` is the fraction of the triangle that survives the material's
+/// alpha test, measured at BLAS build over stratified barycentric taps. Here it
+/// is a probability: the triangle occludes with probability `opacity`, so a leaf
+/// card that is 40% leaf blocks 40% of the rays that hit it and the shadow it
+/// casts has the right DENSITY without the trace ever sampling a texture.
+///
+/// Why stochastic rather than a threshold. A hard `opacity > 0.5` makes every
+/// leaf on a card identical — a canopy either casts a solid shadow or none —
+/// and no amount of denoising recovers the dappling, because there is no
+/// variance to average. Sampling it puts the dappling in the estimator, where
+/// the shadow denoiser that is already running turns it into soft light.
+///
+/// `seed` is hashed with the triangle's own id so the decision is per triangle
+/// per ray, and it is passed BY VALUE all the way down rather than carried as
+/// `inout` state. That is what keeps the A-SVGF gradient replay exact: a replay
+/// that re-derives the same seed makes bit-identical alpha decisions, and one
+/// that did not would report a full gradient on every cutout pixel forever.
+bool cutoutPasses(float opacity, uint primId, uint seed) {
+    if (opacity >= 1.0) {
+        return true;
+    }
+    if (opacity <= 0.0) {
+        return false;
+    }
+    uint h = seed ^ (primId * 2654435761u);
+    h ^= h >> 16; h *= 0x7feb352du;
+    h ^= h >> 15; h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return (float(h) * (1.0 / 4294967296.0)) < opacity;
 }
 
 // Möller-Trumbore against a triangle already stored as origin + two edges, so
@@ -328,7 +365,8 @@ float3 octDecode(float2 e) {
 // overhead. Both boxes are in hand either way now — the layout gives the
 // ordering away for free — but taking it would still cost the compare and the
 // swap, and buy nothing a boolean answer can see.
-bool blasOccluded(uint nodeOffset, uint triangleOffset, float3 origin, float3 dir, float tMax) {
+bool blasOccluded(uint nodeOffset, uint triangleOffset, float3 origin, float3 dir, float tMax,
+                  uint seed) {
     float3 invDir = 1.0 / dir;
 
     uint stack[BLAS_STACK];
@@ -349,8 +387,9 @@ bool blasOccluded(uint nodeOffset, uint triangleOffset, float3 origin, float3 di
         // order), so this is a linear scan of adjacent memory.
         if (goLeft && node.lcount != 0) {
             for (uint i = 0; i < node.lcount; ++i) {
-                if (triangleHit(blasTriangles[triangleOffset + node.lchild + i], origin, dir,
-                                tMax)) {
+                BvhTriangle t = blasTriangles[triangleOffset + node.lchild + i];
+                if (triangleHit(t, origin, dir, tMax) &&
+                    cutoutPasses(t.opacity, t.primId, seed)) {
                     return true;
                 }
             }
@@ -358,8 +397,9 @@ bool blasOccluded(uint nodeOffset, uint triangleOffset, float3 origin, float3 di
         }
         if (goRight && node.rcount != 0) {
             for (uint i = 0; i < node.rcount; ++i) {
-                if (triangleHit(blasTriangles[triangleOffset + node.rchild + i], origin, dir,
-                                tMax)) {
+                BvhTriangle t = blasTriangles[triangleOffset + node.rchild + i];
+                if (triangleHit(t, origin, dir, tMax) &&
+                    cutoutPasses(t.opacity, t.primId, seed)) {
                     return true;
                 }
             }
@@ -386,7 +426,8 @@ bool blasOccluded(uint nodeOffset, uint triangleOffset, float3 origin, float3 di
 // One TLAS leaf's instance window, as an any-hit query. Factored out because
 // with both children in the node a leaf can now appear on either side, and
 // this loop is the one thing that would otherwise be written twice.
-bool instancesOccluded(uint firstInstance, uint count, float3 origin, float3 dir, float tMax) {
+bool instancesOccluded(uint firstInstance, uint count, float3 origin, float3 dir, float tMax,
+                       uint seed) {
     for (uint i = 0; i < count; ++i) {
         TlasInstance inst = tlasInstances[firstInstance + i];
 
@@ -413,8 +454,12 @@ bool instancesOccluded(uint firstInstance, uint count, float3 origin, float3 dir
         if (scale < 1e-8) {
             continue;
         }
+        // The instance ordinal is mixed in so two copies of the same tree do
+        // not make identical cutout decisions for the same ray — `primId` is a
+        // per-MODEL ordinal, so without this a ray through two instances of one
+        // asset would see perfectly correlated leaves.
         if (blasOccluded(tlasNodeOffset(inst), inst.blasTriangleOffset, mOrigin, mDir / scale,
-                         tMax * scale)) {
+                         tMax * scale, seed ^ ((firstInstance + i) * 0x9E3779B9u))) {
             return true;
         }
     }
@@ -459,7 +504,7 @@ bool capsulesOccluded(float3 origin, float3 dir, float tMin, float tMax) {
 
 // Walk the TLAS in world space, descending into a BLAS only for instances the
 // ray actually enters.
-bool sceneOccluded(float3 origin, float3 dir, float tMax) {
+bool sceneOccluded(float3 origin, float3 dir, float tMax, uint seed) {
     // The analytic occluders first: they answer for the animated characters the
     // TLAS deliberately no longer holds for this query, and a hit here costs a
     // dozen quadratics instead of a tree descent.
@@ -485,13 +530,13 @@ bool sceneOccluded(float3 origin, float3 dir, float tMax) {
 
         // Still unordered, same reason as blasOccluded.
         if (goLeft && node.lcount != 0) {
-            if (instancesOccluded(node.lchild, node.lcount, origin, dir, tMax)) {
+            if (instancesOccluded(node.lchild, node.lcount, origin, dir, tMax, seed)) {
                 return true;
             }
             goLeft = false;
         }
         if (goRight && node.rcount != 0) {
-            if (instancesOccluded(node.rchild, node.rcount, origin, dir, tMax)) {
+            if (instancesOccluded(node.rchild, node.rcount, origin, dir, tMax, seed)) {
                 return true;
             }
             goRight = false;

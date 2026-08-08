@@ -553,19 +553,31 @@ past `far/2` — is closed. The formula now lives in exactly one place,
 RelWithDebInfo, 3-run identical), and the whole eleven-row matrix is here rather
 than spread over the historical tables above:
 
-| Invocation (`--smoke 30`) | at R8 | at depth-fix | at Q1 |
+| Invocation (`--smoke 30`) | at depth-fix | at Q1 | at Q2 (alpha cutout) |
 |---|---|---|---|
-| RT off | `86.3 / 45.5` | `86.3 / 45.5` (BIT-identical) | `86.3 / 45.5` (BIT-identical) |
+| RT off | `86.3 / 45.5` | `86.3 / 45.5` | `86.3 / 45.5` (BIT-identical throughout) |
 | `PLAYGROUND_AO=0` | `87.0 / 44.5` | `87.0 / 44.5` | `87.0 / 44.5` |
 | `PLAYGROUND_AO=2` | `86.0 / 45.7` | `86.0 / 45.7` | `86.0 / 45.7` |
-| `PLAYGROUND_RT=both` | `83.7 / 48.3` | `83.7 / 48.3` | `83.6 / 48.3` |
-| `PLAYGROUND_GI=probes` | `84.7 / 46.7` | `84.7 / 46.7` | `84.6 / 46.8` |
-| `RT=both GI=probes` | `81.9 / 49.8` | `81.9 / 49.8` | `81.8 / 49.9` |
-| `RT=both GI=probes_screen` | `82.3 / 50.4` | `82.3 / 50.4` | `81.6 / 51.1` |
-| `RT=both RT_LOCAL=ratio` | `85.3 / 47.5` | `85.3 / 47.5` | `85.2 / 47.5` |
-| `RT=both RT_LOCAL=full` | `85.5 / 47.3` | `85.5 / 47.3` | `85.5 / 47.2` |
-| night, `TOD_HOUR=1 … ratio` | `35.3 / 57.2` | **`35.4 / 57.4`** | `35.3 / 56.8` |
-| night, `TOD_HOUR=1 … full` | `36.0 / 55.0` | `36.0 / 55.0` | **`35.5 / 53.9`** |
+| `PLAYGROUND_RT=both` | `83.7 / 48.3` | `83.6 / 48.3` | **`84.5 / 47.4`** |
+| `PLAYGROUND_GI=probes` | `84.7 / 46.7` | `84.6 / 46.8` | `84.6 / 46.8` |
+| `RT=both GI=probes` | `81.9 / 49.8` | `81.8 / 49.9` | **`82.7 / 48.9`** |
+| `RT=both GI=probes_screen` | `82.3 / 50.4` | `81.6 / 51.1` | **`82.6 / 50.1`** |
+| `RT=both RT_LOCAL=ratio` | `85.3 / 47.5` | `85.2 / 47.5` | **`86.2 / 46.5`** |
+| `RT=both RT_LOCAL=full` | `85.5 / 47.3` | `85.5 / 47.2` | **`86.5 / 46.2`** |
+| night, `TOD_HOUR=1 … ratio` | **`35.4 / 57.4`** | `35.3 / 56.8` | `35.3 / 56.8` |
+| night, `TOD_HOUR=1 … full` | `36.0 / 55.0` | `35.5 / 53.9` | `35.6 / 53.7` |
+
+**"Q2" is alpha-cutout coverage in traced visibility**, and it is the largest
+image move in either package: every DAYLIT traced row gains about a full luma
+and loses spread, because a leaf card stopped occluding as a solid quad. Until
+this landed, turning RT shadows ON made a tree's shadow DENSER than the
+rasterized cascade it replaces — the cascade alpha-tests
+(`shadow_depth.frag.hlsl`) and the traced walk did not. The night rows barely
+move, which is the check that this is a sun-shadow effect: at 01:00 the canopy
+is not between anything and a light. Per-triangle coverage is baked at BLAS
+build into `BvhTriangle::opacity` (the old `pad0` — zero extra bytes, zero extra
+bindings, and it exists in the shadows-only configuration where the reflection
+attribute buffer does not) and applied as a stochastic any-hit test.
 
 **"Q1" is the 2026-08-08 quality package** (the audit in
 docs/rt_lighting_plan.md §5.9). The three raster rows are BIT-identical, which

@@ -215,7 +215,11 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                 if (dot(normal, rayDir) <= 0.0) {
                     lit = false;
                 } else {
-                    lit = !sceneOccluded(rayOrigin, rayDir, rayMaxDistance);
+                    // Cutout decisions decorrelated from the cone sample's own
+                    // sequence, and replayable: the gradient re-derives this
+                    // exact value with frameIndex - 1.
+                    const uint cutoutSeed = rtSeed(uint2(coord), frameIndex ^ 0x5bf03635u);
+                    lit = !sceneOccluded(rayOrigin, rayDir, rayMaxDistance, cutoutSeed);
                 }
             }
         }

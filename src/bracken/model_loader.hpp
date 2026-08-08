@@ -160,6 +160,33 @@ struct Mesh {
      */
     std::vector<glm::vec3> rt_triangle_emissive;
 
+    /**
+     * Per-triangle OPACITY proxy for software RT visibility — the fraction of
+     * the triangle that survives the alpha test, in [0, 1].
+     *
+     * Alpha-cutout geometry is most of a natural scene's silhouette (27 of the
+     * playground's 52 `.glb` assets are `alphaMode:MASK`, i.e. all the foliage)
+     * and until this existed every traced walk treated a leaf card as a SOLID
+     * QUAD. The rasterized cascade it replaces alpha-tests
+     * (`shadow_depth.frag.hlsl`), so this was a regression the traced tiers
+     * inherited silently: turning on RT shadows made a tree's shadow denser than
+     * turning them off.
+     *
+     * EMPTY MEANS FULLY OPAQUE, the same convention `rt_triangle_emissive` uses
+     * for "does not emit" — so an opaque mesh costs one branch rather than a
+     * vector of 1.0s, and a model loaded without geometry retention degrades to
+     * the pre-existing behaviour rather than to holes.
+     *
+     * Baked at load, in `internal::bake_rt_triangle_opacity`, because the source
+     * texture is released after upload and the trace kernels have no way to
+     * sample one anyway: SDL3 GPU has no bindless texture array, and
+     * `rt_local_shadow` is already at the eight-read-only-slot ceiling. This
+     * rides `BvhTriangle::pad0`, which costs zero bytes and zero bindings and
+     * therefore works in the shadows-only configuration where the reflection
+     * attribute buffer does not exist at all.
+     */
+    std::vector<float> rt_triangle_opacity;
+
     // Cached index count (valid after GPU upload, when CPU-side data is freed)
     uint32_t cached_index_count = 0;
 

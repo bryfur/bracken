@@ -293,7 +293,15 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             if (dot(normal, rayDir) <= 0.0) {
                 replayLit = false;
             } else {
-                replayLit = !sceneOccluded(rayOrigin, rayDir, rayMaxDistance);
+                // The PREVIOUS pixel's seed at the PREVIOUS frame — the same
+                // pair that produced `prevLit`. A replay that made different
+                // cutout decisions would report a full gradient on every
+                // foliage stratum forever, which is the exact failure the
+                // capsule buffer and the emissive records were both added to
+                // prevent.
+                const uint cutoutSeed =
+                    rtSeed(uint2(prevCoord), (frameIndex - 1u) ^ 0x5bf03635u);
+                replayLit = !sceneOccluded(rayOrigin, rayDir, rayMaxDistance, cutoutSeed);
             }
         }
     }

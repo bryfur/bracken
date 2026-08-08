@@ -53,7 +53,22 @@ static_assert(sizeof(BvhNode) == 32, "BvhNode must stay 32 bytes: two per cache 
  */
 struct BvhTriangle {
     glm::vec3 v0{0.0f};
-    float pad0 = 0.0f;
+    /**
+     * ALPHA-CUTOUT COVERAGE in [0, 1]. 1 = a solid triangle, which is the
+     * default and what `build_blas` leaves here.
+     *
+     * This was `pad0`: sixteen bytes of the 48 exist only to keep the struct
+     * 16-byte aligned for the GPU, and the any-hit walks needed exactly one
+     * per-triangle scalar to stop treating a leaf card as a solid quad. Putting
+     * it here costs ZERO bytes, ZERO new bindings, and — the reason it beats the
+     * `TriangleAttributes` buffer — it exists in the shadows-only configuration,
+     * where `want_attributes` is false and that buffer is never built.
+     *
+     * `build_blas` does not fill it; `RtScene` does, after the build, keyed by
+     * `prim_id` (which is the SOURCE triangle ordinal, so the mapping survives
+     * any reordering the builder does).
+     */
+    float opacity = 1.0f;
     glm::vec3 e1{0.0f}; ///< v1 - v0
     uint32_t prim_id = 0;
     glm::vec3 e2{0.0f}; ///< v2 - v0

@@ -29,7 +29,15 @@ struct ModelGeometry {
     /// zero when no mesh of the model emits, which is the common case; the
     /// `any_emissive` flag below is what lets the gather skip the whole walk.
     std::vector<glm::vec3> triangle_emissive;
+    /// Per-triangle opacity in [0, 1], in lockstep with `indices / 3`. Unlike
+    /// the two above it is gathered UNCONDITIONALLY, not under
+    /// `want_attributes`: it rides `BvhTriangle::opacity` rather than the
+    /// attribute buffer, and the configuration that needs it most — shadows on,
+    /// reflections off — is exactly the one where no attribute buffer exists.
+    /// `any_cutout` false means every triangle is opaque and the fill is skipped.
+    std::vector<float> triangle_opacity;
     bool any_emissive = false;
+    bool any_cutout = false;
     bool has_cpu_geometry = false;
 };
 
@@ -94,6 +102,16 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
             }
         }
         const std::size_t triangle_count = mesh.indices.size() / 3;
+        // `cast_shadows == false` is NOT honoured here, and that is the one
+        // remaining half of the raster contract this gather does not implement.
+        // Those meshes are the real, visible leaf cards: a closest-hit ray must
+        // find them or reflections and GI lose the canopy, so suppressing them
+        // for ANY-HIT walks alone needs a per-triangle flag rather than a
+        // gather-time skip. The opacity below is the better answer anyway — it
+        // makes a leaf card occlude in proportion to how much of it is actually
+        // leaf, which is what the raster flag was approximating by turning the
+        // whole mesh off and substituting a proxy.
+        const bool mesh_cutout = !mesh.rt_triangle_opacity.empty();
         for (std::size_t tri = 0; tri < triangle_count; ++tri) {
             const uint32_t i0 = mesh.indices[tri * 3 + 0];
             const uint32_t i1 = mesh.indices[tri * 3 + 1];
@@ -101,6 +119,17 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
             g.indices.push_back(base + i0);
             g.indices.push_back(base + i1);
             g.indices.push_back(base + i2);
+
+            // Opacity is gathered for EVERY model, opaque or not, so the
+            // per-triangle array stays indexable by `prim_id` without a second
+            // mapping. `any_cutout` is what lets an all-opaque model skip the
+            // fill entirely, and it is the common case.
+            const float opacity =
+                mesh_cutout && tri < mesh.rt_triangle_opacity.size()
+                    ? mesh.rt_triangle_opacity[tri]
+                    : 1.0f;
+            g.triangle_opacity.push_back(opacity);
+            g.any_cutout = g.any_cutout || opacity < 1.0f;
             if (want_attributes) {
                 if (tri < mesh.rt_triangle_base_colors.size()) {
                     g.triangle_colors.push_back(mesh.rt_triangle_base_colors[tri]);
@@ -278,8 +307,24 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
     core::jobs::parallel_for(core::jobs::JobSystem::instance(), std::size_t{0}, pending.size(),
                              [&pending](std::size_t begin, std::size_t end) {
                                  for (std::size_t i = begin; i < end; ++i) {
-                                     pending[i].blas = build_blas(pending[i].geometry.positions,
-                                                                  pending[i].geometry.indices);
+                                     Pending& p = pending[i];
+                                     p.blas = build_blas(p.geometry.positions, p.geometry.indices);
+                                     // Alpha-cutout coverage, keyed by prim_id
+                                     // — the SOURCE triangle ordinal, so this
+                                     // survives whatever order the builder
+                                     // emitted leaves in. Skipped entirely for
+                                     // an all-opaque model, which is most of
+                                     // them; `build_blas` already left 1.0.
+                                     if (!p.geometry.any_cutout) {
+                                         continue;
+                                     }
+                                     const std::vector<float>& op =
+                                         p.geometry.triangle_opacity;
+                                     for (BvhTriangle& t : p.blas.triangles) {
+                                         if (t.prim_id < op.size()) {
+                                             t.opacity = op[t.prim_id];
+                                         }
+                                     }
                                  }
                              });
 
