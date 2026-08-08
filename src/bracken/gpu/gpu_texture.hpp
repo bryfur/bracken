@@ -168,6 +168,38 @@ public:
                                                    SDL_GPUTextureUsageFlags usage, bool mipmaps = false);
 
     /**
+     * @brief Create a 3D (volume) texture.
+     *
+     * The one thing 2D_ARRAY cannot do and the reason this exists: a 3D texture
+     * FILTERS ACROSS THE THIRD AXIS. An array is a stack of independent slices,
+     * so a trilinear tap between two of them has to be assembled by hand from
+     * two bilinear taps; a volume gets it in one fetch, in the texture unit,
+     * with the mip chain participating. Voxel cone tracing takes tens of
+     * filtered samples per cone and several cones per probe, so that difference
+     * is the difference between the technique being affordable and not.
+     *
+     * `depth` is `layer_count_or_depth` — SDL3 GPU overloads the field by
+     * texture type, which is why it is named that way rather than `layers`.
+     *
+     * Contents are undefined until written. With
+     * SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE a compute pass can bind it as
+     * a read-write storage image; add SAMPLER to read it back filtered.
+     *
+     * @param device The GPU device
+     * @param width Volume width in texels
+     * @param height Volume height in texels
+     * @param depth Volume depth in texels
+     * @param format SDL GPU texture format
+     * @param usage SDL GPU texture usage flags
+     * @param mipmaps Allocate the full mip chain (log2(max extent) + 1 levels)
+     * @return Unique pointer to the texture, or nullptr on failure
+     */
+    [[nodiscard]] static std::unique_ptr<GPUTexture> create_3d(GPUDevice& device, int width, int height,
+                                                               int depth, SDL_GPUTextureFormat format,
+                                                               SDL_GPUTextureUsageFlags usage,
+                                                               bool mipmaps = false);
+
+    /**
      * @brief Get the number of array layers (1 for non-array textures, 6 for cubemaps)
      */
     int layers() const { return layers_; }

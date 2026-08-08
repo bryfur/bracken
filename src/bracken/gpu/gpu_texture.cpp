@@ -591,6 +591,53 @@ std::unique_ptr<GPUTexture> GPUTexture::create_cube(GPUDevice& device, int size,
     return texture;
 }
 
+std::unique_ptr<GPUTexture> GPUTexture::create_3d(GPUDevice& device, int width, int height, int depth,
+                                                  SDL_GPUTextureFormat format,
+                                                  SDL_GPUTextureUsageFlags usage, bool mipmaps) {
+    if (width <= 0 || height <= 0 || depth <= 0) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_3d: invalid extent {}x{}x{}", width, height,
+                          depth);
+        return nullptr;
+    }
+
+    auto texture = std::unique_ptr<GPUTexture>(new GPUTexture());
+    texture->device_ = &device;
+    texture->width_ = width;
+    texture->height_ = height;
+    // SDL3 GPU overloads one field for both meanings, and so does this class:
+    // `layers_` holds the DEPTH for a 3D texture. Kept rather than adding a
+    // parallel member so every existing `layers()` caller keeps working and
+    // there is one number describing the third axis instead of two that can
+    // disagree.
+    texture->layers_ = depth;
+    texture->format_ = format;
+    texture->is_render_target_ =
+        (usage & (SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET)) !=
+        0;
+    // A volume's chain halves on all three axes, so it is driven by the LARGEST
+    // extent — calculate_mip_levels takes two, so feed it the max twice.
+    const int largest = std::max({width, height, depth});
+    texture->mip_levels_ = mipmaps ? calculate_mip_levels(largest, largest) : 1;
+
+    SDL_GPUTextureCreateInfo tex_info = {};
+    tex_info.type = SDL_GPU_TEXTURETYPE_3D;
+    tex_info.format = format;
+    tex_info.usage = usage;
+    tex_info.width = static_cast<Uint32>(width);
+    tex_info.height = static_cast<Uint32>(height);
+    tex_info.layer_count_or_depth = static_cast<Uint32>(depth);
+    tex_info.num_levels = texture->mip_levels_;
+
+    texture->texture_ = device.create_texture(tex_info);
+    if (!texture->texture_) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUTexture::create_3d: Failed to create {}x{}x{} texture: {}",
+                          width, height, depth, SDL_GetError());
+        return nullptr;
+    }
+
+    return texture;
+}
+
 std::unique_ptr<GPUTexture> GPUTexture::create_depth_stencil(GPUDevice& device, int width, int height) {
     auto texture = std::unique_ptr<GPUTexture>(new GPUTexture());
     texture->device_ = &device;
