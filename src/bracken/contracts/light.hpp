@@ -65,8 +65,13 @@ struct SpotLightDesc {
     float radius = 0.0f;
     glm::vec3 direction{0.0f, -1.0f, 0.0f};
     /// Cone half-angles from the axis; inner is the full-brightness core,
-    /// outer the cutoff. inner <= outer (an inverted pair is not rejected —
-    /// it simply produces no falloff band).
+    /// outer the cutoff. A transposed pair (inner > outer) is NORMALIZED by
+    /// the builder — the narrower angle becomes the core — rather than
+    /// rejected: taken verbatim it would drive the shader's
+    /// `smoothstep(outer_cos, inner_cos, ...)` with edge0 > edge1, which is
+    /// undefined per the GLSL.std.450 spec and in practice INVERTS the light
+    /// (black on the axis, full brightness everywhere else out to the radius,
+    /// including behind it).
     core::Degrees inner_angle{};
     core::Degrees outer_angle{};
     glm::vec3 color{1.0f};

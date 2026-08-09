@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
@@ -45,15 +46,24 @@ public:
      * @param cmd         Active command buffer (no render pass should be active)
      * @param registry    Pipeline registry for bloom pipelines
      * @param scene_color The offscreen scene color texture to extract bloom from
-     * @param threshold   POST-exposure luminance above which pixels bloom: the
-     *                    prefilter thresholds scene luminance * exposure, so
-     *                    what blooms stays stable as exposure changes
-     * @param exposure    The composite pass's exposure setting; only the
-     *                    threshold decision uses it (bloom output stays in
-     *                    pre-exposure scene units — composite applies exposure)
+     * @param threshold   POST-exposure luminance above which pixels bloom. The
+     *                    prefilter thresholds scene luminance against the SAME
+     *                    product the composite applies — the manual bias times
+     *                    `exp2(adapted EV)` — so what blooms is what will be
+     *                    bright on screen rather than what is bright in the
+     *                    scene buffer.
+     * @param exposure    The composite pass's manual exposure bias.
+     * @param exposure_buffer AutoExposure's state SSBO, or null when auto
+     *                    exposure is off/unavailable. Non-null IS the flag: a
+     *                    zeroed filler is bound in its place so the shader's
+     *                    always-declared slot stays valid. Only the threshold
+     *                    decision uses either factor — bloom output stays in
+     *                    pre-exposure scene units, because composite applies
+     *                    exposure to the summed bloom.
      */
     void render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, SDL_GPUTexture* scene_color,
-                float threshold = 1.0f, float exposure = 1.0f);
+                float threshold = 1.0f, float exposure = 1.0f,
+                SDL_GPUBuffer* exposure_buffer = nullptr);
 
     /**
      * Get the final bloom result texture for the composite pass.
@@ -76,6 +86,12 @@ private:
     int mip_count_ = 4;
 
     SDL_GPUSampler* linear_sampler_ = nullptr;
+
+    /// Zeroed filler for the prefilter's always-declared exposure SSBO slot,
+    /// read only when `autoExposureEnabled` is set. Bloom owns its own rather
+    /// than borrowing PostProcessStack's: that one is private to another unit,
+    /// and 16 bytes is cheaper than an accessor coupling the two passes.
+    std::unique_ptr<gpu::GPUBuffer> dummy_exposure_buffer_;
 
     int width_ = 0;
     int height_ = 0;

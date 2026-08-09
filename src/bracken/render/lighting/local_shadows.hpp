@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bracken/contracts/frustum.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
 #include "bracken/gpu/gpu_texture.hpp"
@@ -32,10 +33,12 @@ namespace gpu = bracken::gpu;
 // shadow-casting lights (host opt-in: casts_shadows) by a deterministic
 // priority score with eviction hysteresis, assigns atlas tiles, and decides
 // which tiles actually re-render (change detection + a per-frame tile-update
-// cap with round-robin fairness — worst case degrades to a stale tile, never
-// a hitch). LocalShadowMap wraps the selector with the GPU resources (atlas,
-// comparison sampler, per-tile slot SSBO). The receiver side lives in
-// cluster_lighting.hlsli (LocalShadowSlot mirror + sampling).
+// cap, round-robin at BOTH granularities: which group is serviced first, and
+// which of a point group's six faces it starts on — so the worst case
+// degrades to a stale tile, never a hitch and never a tile that stops
+// re-rendering altogether). LocalShadowMap wraps the selector with the GPU
+// resources (atlas, comparison sampler, per-tile slot SSBO). The receiver
+// side lives in cluster_lighting.hlsli (LocalShadowSlot mirror + sampling).
 // ============================================================================
 
 // ---- pure helpers (CPU mirrors of cluster_lighting.hlsli; unit-tested) ----
@@ -44,9 +47,28 @@ namespace gpu = bracken::gpu;
 /// vector. Mirrors localShadowCubeFace() in cluster_lighting.hlsli.
 [[nodiscard]] int local_shadow_cube_face(const glm::vec3& light_to_point);
 
+/// Bitmask of cube faces (bit i = face i, matching local_shadow_cube_face)
+/// whose tile a caster sphere can appear in. `to_caster` is
+/// caster_center - light_position. CONSERVATIVE: never drops a face the
+/// sphere touches (the tile's FOV widening is folded in); may report an extra
+/// face near a frustum corner, because the test is the intersection of the
+/// pyramid's four side half-spaces rather than the pyramid itself. Returns
+/// POINT_FULL_MASK when the light is inside the caster.
+[[nodiscard]] uint8_t local_shadow_caster_face_mask(const glm::vec3& to_caster, float caster_radius,
+                                                    int tile_resolution);
+
 /// Priority score for shadow selection: intensity * radius / distance
 /// (distance clamped to >= 1 so lights at the camera don't explode).
 [[nodiscard]] float local_shadow_light_score(float intensity, float radius, float distance);
+
+// An out-of-view light contributes no pixels (the cluster binner drops it), so
+// it must not hold a shadow slot against a visible one. A soft factor on the
+// score rather than a cull: a light grazing the frustum edge should not pop.
+// The test sphere is DILATED so the 1.0 <-> k_offscreen_score_scale flip
+// happens where the light no longer matters — the flip is 4x, far outside the
+// 25% eviction hysteresis, and each flip costs a full 6-tile re-render.
+inline constexpr float k_offscreen_score_scale = 0.25f;
+inline constexpr float k_offscreen_test_dilation = 1.25f;
 
 /// Near plane for a local shadow map, derived from the light radius.
 [[nodiscard]] float local_shadow_near_plane(float radius);
@@ -105,7 +127,8 @@ struct LocalShadowTileRequest {
  * asc); incumbents are matched to this frame's lights by nearest position of
  * the same type (lights are immediate-mode, so continuity is positional);
  * slot iteration for the tile-update cap is a fixed ring walked round-robin
- * from a persistent cursor.
+ * from a persistent cursor, and each point group walks its six faces from a
+ * persistent cursor of its own.
  */
 class LocalShadowSelector {
 public:
@@ -114,9 +137,11 @@ public:
     /// A light is only marked shadowed once every tile it needs holds
     /// content for the current assignment (fresh assignments render
     /// all-or-nothing under the cap, so they never sample garbage).
+    /// `view_frustum` (optional) demotes lights that light nothing on screen —
+    /// see k_offscreen_score_scale; nullptr keeps the pure distance ranking.
     void update(std::vector<PointLight>& points, std::vector<SpotLight>& spots, const glm::vec3& camera_pos,
                 std::span<const LocalShadowDynamicCaster> dynamic_casters, const LocalShadowConfig& config,
-                int tile_resolution);
+                int tile_resolution, const scene::Frustum* view_frustum = nullptr);
 
     /// Drop every cached tile (atlas recreated / resolution changed):
     /// assignments survive but re-render before their lights are shadowed.
@@ -147,6 +172,14 @@ private:
         float score = 0.0f;
         uint8_t dirty_mask = 0; // tiles needing re-render (bit i = face i)
         uint8_t valid_mask = 0; // tiles whose content matches this assignment
+        // Next face to service. The per-frame tile cap can cut a point group
+        // short; restarting at face 0 every time would re-render faces 0..k
+        // forever and starve the rest (a moving light re-dirties all six every
+        // frame, so `dirty_mask` is not a record of what is still owed).
+        uint8_t face_cursor = 0;
+        // Faces a dynamic caster occupied LAST frame. A caster that left a
+        // face must dirty the face it left, or its silhouette stays baked in.
+        uint8_t prev_caster_mask = 0;
     };
 
     // Matching + fill + eviction for one light type (defined in the .cpp;
@@ -154,7 +187,7 @@ private:
     template <typename LightT>
     void assign_groups(std::span<Group> groups, int budget, std::vector<LightT>& lights,
                        const glm::vec3& camera_pos, std::span<const LocalShadowDynamicCaster> dynamic_casters,
-                       float hysteresis);
+                       float hysteresis, int tile_resolution, const scene::Frustum* view_frustum);
     // Tile-update cap scheduling (round-robin) + shadow_slot publication.
     void schedule_and_publish(std::vector<PointLight>& points, std::vector<SpotLight>& spots, int point_budget,
                               int spot_budget, const LocalShadowConfig& config, int tile_resolution);
@@ -199,7 +232,8 @@ public:
 
     /// Per-frame selection + caching (see LocalShadowSelector::update).
     void update(std::vector<PointLight>& points, std::vector<SpotLight>& spots, const glm::vec3& camera_pos,
-                std::span<const LocalShadowDynamicCaster> dynamic_casters, const LocalShadowConfig& config);
+                std::span<const LocalShadowDynamicCaster> dynamic_casters, const LocalShadowConfig& config,
+                const scene::Frustum* view_frustum = nullptr);
 
     /// Record the slot-data SSBO upload into the frame's consolidated copy
     /// pass (no-op when nothing changed).

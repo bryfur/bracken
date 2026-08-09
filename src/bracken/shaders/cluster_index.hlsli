@@ -81,6 +81,14 @@ float pointFalloff(float dist, float radius) {
     return (win * win) / max(dist * dist, 1e-4);
 }
 
+// PRECONDITION: inner_cos >= outer_cos. `smoothstep` is UNDEFINED per the
+// GLSL.std.450 spec for edge0 >= edge1, and on the usual
+// saturate((x-e0)/(e1-e0)) lowering a transposed pair INVERTS the light —
+// black on the axis, full brightness over the rest of the radius sphere,
+// including behind. The pair is normalized where both angles are still visible
+// (FrameBuilder::Lane::add_spot_light, scene/frame_builder.cpp); the CPU mirror
+// is spot_cone_factor in render/lighting/light_target.hpp, and the binner's
+// cone cull falls back to sphere binning rather than trust a transposed pair.
 float spotConeFactor(float3 L_to_surface, float3 spotDir, float inner_cos, float outer_cos) {
     float cd = dot(spotDir, -L_to_surface);
     return smoothstep(outer_cos, inner_cos, cd);

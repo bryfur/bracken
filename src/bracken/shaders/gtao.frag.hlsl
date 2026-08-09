@@ -29,8 +29,9 @@
  * `gtao_slab_span` in render/gtao.hpp for the full comparison.
  *
  * Slice rotation / step offset are jittered per pixel (IGN) and per frame
- * (golden-ratio sequence) — the temporal pass integrates the rotating pattern
- * over time.
+ * (2-D R2 sequence, render/gtao.hpp detail::temporal_sequence — two rationally
+ * independent scales, so the two axes jitter independently) — the temporal pass
+ * integrates the rotating pattern over time.
  *
  * OUTPUT (RGBA8, shaders/bent_cone.hlsli owns the encoding):
  *   R  AO, 1 = unoccluded
@@ -174,9 +175,22 @@ float4 PSMain(PSInput input) : SV_Target {
     // screen march.
     float screenRadiusUV = effRadius * projection[0][0] * 0.5 / max(-viewPos.z, 0.1);
     screenRadiusUV = clamp(screenRadiusUV, 2.0 * invScreenSize.x, 0.2);
+    // UV IS NOT ISOTROPIC: a UV unit spans the full width in x and the full
+    // height in y, so `screenRadiusUV` is the exact world radius along X ONLY.
+    // P11/P00 == width/height for glm::perspective(fovy, aspect, ...), so
+    // scaling the V step by it makes the sampling footprint a circle in view
+    // space (and in pixels) instead of an ellipse reaching 1/aspect as far
+    // vertically. It is also what makes the marched azimuth equal `phi` — the
+    // slice-plane quantities below (orthoDirectionVec / axisVec /
+    // projectedNormalVec / n / tangentVec) are all built from
+    // (cosPhi, sinPhi, 0), so without this they describe a plane the depth taps
+    // never swept (15.6 deg off at phi = 45 deg, 16:9).
+    float aspectYX = projection[1][1] / max(projection[0][0], 1e-6);
 
-    // Spatial (IGN) + temporal (golden ratio) jitter for slice rotation and
-    // step offset. Two decorrelated IGN lattices via the transposed pixel.
+    // Spatial (IGN) + temporal (R2) jitter for slice rotation and step offset.
+    // Two decorrelated IGN lattices via the transposed pixel; the two temporal
+    // scales are rationally independent (render/gtao.hpp detail::TEMPORAL_R2_*),
+    // so the pair covers the unit square rather than one line in it.
     float noiseSlice = frac(interleavedGradientNoise(input.position.xy) + temporalRotation);
     float noiseStep = frac(interleavedGradientNoise(input.position.yx + 17.317) + temporalOffset);
 
@@ -200,8 +214,8 @@ float4 PSMain(PSInput input) : SV_Target {
         float cosPhi = cos(phi);
         float sinPhi = sin(phi);
 
-        // Screen y is down, view y is up.
-        float2 omegaUV = float2(cosPhi, -sinPhi) * screenRadiusUV;
+        // Screen y is down, view y is up; `aspectYX` undoes UV's anisotropy.
+        float2 omegaUV = float2(cosPhi, -sinPhi * aspectYX) * screenRadiusUV;
         float3 directionVec = float3(cosPhi, sinPhi, 0.0);
 
         // Project the normal into the slice plane (plane containing V and
@@ -249,10 +263,21 @@ float4 PSMain(PSInput input) : SV_Target {
                 float backAngle =
                     acos(clamp(dot(backDelta, V) / max(length(backDelta), 1e-5), -1.0, 1.0));
 
-                // Radius falloff SHRINKS the occluder's angular extent to zero
-                // instead of attenuating a horizon: at the edge of the
-                // sampling sphere the span is sub-sector and marks nothing, so
-                // occlusion fades out continuously exactly as it did before.
+                // Radius falloff SHRINKS the occluder's angular extent toward
+                // zero instead of attenuating a horizon (pre-R5a lerped the
+                // horizon COSINE, which the arc integral made continuous; a
+                // bitmask has no partial-coverage state to lerp).
+                //
+                // NOT continuous, and deliberately so: markSectors rounds any
+                // non-zero span UP to a whole sector, so the shrinking slab
+                // marks 3, 2, 1, 1, ... 1 sectors and then steps to 0 the
+                // instant `weight` saturates at dist >= effRadius. That step is
+                // one sector — at most 0.049 of a slice (the sector weight
+                // peaks at theta = +/-pi/4), so <= ~1.6% AO with 3 slices, and
+                // within the +/-1-sector quantisation gtao.test.cpp's
+                // brute-force bound already allows. Making it fade would need a
+                // second, weighted accumulator beside the mask; dropping the
+                // sample early only MOVES the step, it does not shrink it.
                 float weight = saturate(dist * falloffMul + falloffAdd);
                 backAngle = lerp(frontAngle, backAngle, weight);
 
@@ -286,7 +311,11 @@ float4 PSMain(PSInput input) : SV_Target {
                                -cosNorm * SECTOR_COS_HALF + sinN * SECTOR_SIN_HALF);
 
         float sliceVis = 0.0;
-        float3 sliceDir = float3(0.0, 0.0, 0.0);
+        // Accumulate the first moment in the slice's own 2-D (V, tangentVec)
+        // basis and transform ONCE per slice: V and tangentVec are invariant
+        // over the 32 sectors, so expanding dirMid to 3-D inside the loop is
+        // 15 scalar ops per sector where 4 will do.
+        float2 sliceDir2 = float2(0.0, 0.0);
 
         [unroll]
         for (int k = 0; k < SECTOR_COUNT; ++k) {
@@ -298,7 +327,7 @@ float4 PSMain(PSInput input) : SV_Target {
 
             float w = (cNext - prevC) * (((occluded >> uint(k)) & 1u) != 0u ? 0.0 : 1.0);
             sliceVis += w;
-            sliceDir += w * (dirMid.x * V + dirMid.y * tangentVec);
+            sliceDir2 += w * dirMid;
 
             psi = psiNext;
             theta = thetaNext;
@@ -308,7 +337,7 @@ float4 PSMain(PSInput input) : SV_Target {
         }
 
         visibility += projectedNormalVecLength * sliceVis;
-        bentSum += projectedNormalVecLength * sliceDir;
+        bentSum += projectedNormalVecLength * (sliceDir2.x * V + sliceDir2.y * tangentVec);
     }
 
     // Mean resultant length of the visibility lobe -> cone half-angle ->

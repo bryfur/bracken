@@ -38,10 +38,13 @@ constexpr float PI_PBR = 3.14159265358979323846f;
 // ---------------------------------------------------------------------------
 
 float ndf_ggx(float ndoth, float roughness) {
-    const float a = roughness * roughness;
-    const float a2 = a * a;
-    const float d = (ndoth * ndoth) * (a2 - 1.0f) + 1.0f;
-    return a2 / std::max(PI_PBR * d * d, 1e-7f);
+    // Filament's factored form, matching pbr.hlsli. Kept longhand rather than
+    // shared, so this stays an INDEPENDENT transliteration of the shader.
+    const float a = std::max(roughness * roughness, 1e-3f);
+    const float sin2 = std::max(1.0f - ndoth * ndoth, 0.0f);
+    const float a_noh = ndoth * a;
+    const float k = a / (sin2 + a_noh * a_noh);
+    return k * k * (1.0f / PI_PBR);
 }
 
 float visibility_smith_ggx(float ndotv, float ndotl, float roughness) {
@@ -177,6 +180,43 @@ const Sample SAMPLES[] = {
 // the true Fresnel from the stored Schlick fraction instead of approximating it
 // at normal incidence. A tier that had to approximate here would need a
 // percent-level band and would show it as a colour shift on every metal.
+// GGX is a NORMALIZED microfacet distribution: the integral of D*cos over the
+// hemisphere is 1 at every roughness. Nothing in this suite checked that, and
+// that is exactly how `ndfGGX` shipped for the life of the project with a
+// `max(PI * d * d, 1e-7)` denominator clamp that ate the whole lobe below
+// perceptual roughness 0.1156 — 7x of the specular energy gone at 0.06, 110x at
+// 0.03, and all of it at 0. Both estimators shared the function, so the Ratio /
+// Full identity above held perfectly against an equally broken reference; only
+// an ABSOLUTE check like this one can catch it.
+//
+// The substitution is u = sin^2(theta_h), under which the hemisphere integral
+// of D*cos collapses to PI * integral over u in [0,1] of D(u).
+TEST(LocalDi, NdfGgxIsNormalizedAtEveryRoughness) {
+    constexpr int k_samples = 1 << 21;
+    for (const float roughness : {0.05f, 0.1f, 0.25f, 0.5f, 0.75f, 1.0f}) {
+        double energy = 0.0;
+        for (int i = 0; i < k_samples; ++i) {
+            const double u = (i + 0.5) / k_samples;
+            const auto ndoth = static_cast<float>(std::sqrt(std::max(1.0 - u, 0.0)));
+            energy += static_cast<double>(ndf_ggx(ndoth, roughness)) * PI_PBR / k_samples;
+        }
+        EXPECT_NEAR(energy, 1.0, 0.02) << "roughness " << roughness;
+    }
+}
+
+// The peak of a normalized GGX lobe is 1 / (PI * alpha^2). The old denominator
+// clamp replaced it with a flat plateau of alpha^2 / 1e-7 — 189x too low at
+// roughness 0.06 — so pin the peak directly as well: it localizes a regression
+// to the NDF rather than to the quadrature above.
+TEST(LocalDi, NdfGgxPeakMatchesTheAnalyticMaximum) {
+    for (const float roughness : {0.05f, 0.1f, 0.25f, 0.5f, 1.0f}) {
+        const float alpha = roughness * roughness;
+        const float expected = 1.0f / (PI_PBR * alpha * alpha);
+        EXPECT_NEAR(ndf_ggx(1.0f, roughness), expected, expected * 1e-3f)
+            << "roughness " << roughness;
+    }
+}
+
 TEST(LocalDi, DemodulatedSplitReproducesTheAnalyticEvaluation) {
     const glm::vec3 radiance{3.0f, 2.5f, 1.5f}; // color * intensity * atten * cone
     for (const Sample& s : SAMPLES) {

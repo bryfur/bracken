@@ -103,9 +103,14 @@
 // the bounce sampler in gi_probe_trace.comp.hlsl.
 #define GI_SAMPLE_BACKFACE_FLOOR 0.02
 
-// Chebyshev variance floor as a fraction of spacing^2 (the moments are world
-// distances, so a coarse cascade's are four times larger), and the slack before
-// the test attenuates at all. Without the floor a texel that has seen one
+// Chebyshev variance floor, in units of spacing^2, and the slack before the
+// test attenuates at all, in spacings. NEITHER is multiplied by spacing at the
+// use site: the stored moments are themselves normalized by cascade spacing
+// (gi_probe_blend_visibility.comp.hlsl explains why the R16G16_FLOAT atlas
+// cannot hold raw squared world distances), which makes the whole test
+// scale-invariant and bounds the stored pair at (1.5, 2.25) on every cascade.
+// CPU mirror: SAMPLE_CHEBYSHEV_MIN_VARIANCE / _BIAS_FRACTION in
+// render/gi/gi_math.hpp. Without the floor a texel that has seen one
 // consistent distance reports ~0 variance and the bound collapses into a hard
 // binary test that flickers as the ray set rotates; without the slack, a
 // shading point at the same distance as the surface its own probe measured

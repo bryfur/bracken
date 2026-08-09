@@ -37,10 +37,13 @@ void GraphicsSettings::clamp_to_valid_ranges() {
     rt_local_shadows = clamp_enum(rt_local_shadows, LocalRtShadowMode::Off, LocalRtShadowMode::Full);
     rt_local_shadow_resolution =
         clamp_enum(rt_local_shadow_resolution, RtResolution::Full, RtResolution::Quarter);
-    // ProbesScreen is a real enumerator and clamps like one, even though it
-    // behaves as Probes until phase R4 — a settings file that already holds it
-    // must survive the version that implements it unchanged.
-    gi_mode = clamp_enum(gi_mode, GiMode::Off, GiMode::ProbesScreen);
+    // Every declared GiMode is a first-class on-disk value, including
+    // VoxelProbes (the raster path — GI without ray tracing). A clamp that
+    // stopped short of the newest enumerator would silently rewrite a player's
+    // chosen mode on load and then persist the downgrade on shutdown, which is
+    // exactly what a bound left at ProbesScreen did to VoxelProbes. RAISE THIS
+    // BOUND WHEN A MODE IS ADDED.
+    gi_mode = clamp_enum(gi_mode, GiMode::Off, GiMode::VoxelProbes);
     gi_quality = clamp_enum(gi_quality, GiQuality::Low, GiQuality::High);
     shadow_distance = std::clamp(shadow_distance, 200.0f, 20000.0f);
     // Budget bounds mirror render::lighting::LOCAL_SHADOW_MAX_{POINT,SPOT}_BUDGET

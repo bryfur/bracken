@@ -52,6 +52,14 @@ struct GiBudget {
     return {64u, static_cast<std::uint32_t>(PROBES_PER_CASCADE) / 4u};
 }
 
+/// The blend passes cache the whole rotated direction set in groupshared memory
+/// sized by `MAX_PROBE_RAYS`, which lives in gi_math.hpp because the shaders
+/// mirror that header and not this one. This is the pin that keeps the two
+/// tables from drifting apart.
+static_assert(gi_budget(GiQuality::High).rays_per_probe <=
+                  static_cast<std::uint32_t>(MAX_PROBE_RAYS),
+              "the blend passes' groupshared ray cache is sized by MAX_PROBE_RAYS");
+
 /**
  * THE ROTA. Cascade 0 updates every frame; cascade c > 0 updates every 2^c
  * frames, phased so that no two coarse cascades ever land on the same frame.

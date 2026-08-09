@@ -4,9 +4,14 @@
 // Reflections are the expensive half of ray tracing, so the gating matters
 // more than the tracing:
 //
-//  * QUARTER RESOLUTION by default. A reflection is a low-frequency signal on
-//    everything except a mirror, so it survives being traced sparsely and
-//    upsampled far better than a shadow does.
+//  * RESOLUTION IS A DIAL, AND IT IS FULL BY DEFAULT. The trace runs at
+//    `GraphicsSettings::rt_reflection_resolution`; Half and Quarter are the
+//    perf dial for weaker GPUs, and what makes that dial cheap is that a
+//    reflection is a low-frequency signal on everything except a mirror, so it
+//    survives being traced sparsely and upsampled far better than a shadow
+//    does. `contracts/graphics_settings.hpp` (the RT block) carries why the
+//    defaults moved off Quarter — read the two together rather than letting
+//    them drift again.
 //  * ROUGHNESS GATE. Above `maxRoughness` the lobe is wide enough that the
 //    prefiltered IBL probe the engine already has is indistinguishable from a
 //    traced result, and vastly cheaper. Only smooth surfaces trace.
@@ -40,6 +45,11 @@
 // below needs the struct to declare its attribute buffer.
 #define RT_HIT_SHADE_TYPES
 #include "rt_hit_shade.hlsli"
+
+// Fraction of the ray range over which a hit fades to sky, measured from the
+// FAR end. See the fade at the bottom of CSMain for why it is a tail and not a
+// ramp from the origin.
+static const float RT_REFLECTION_FADE_WINDOW = 0.2;
 
 // ---------------------------------------------------------------------------
 // Uniforms (set 2, b0) — mirrors gpu::RtReflectionUniforms.
@@ -356,17 +366,42 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         const float3 hTangent = sampleGGXVndf(vTangent, alpha, xi);
         const float3 h = hTangent.x * tangent + hTangent.y * bitangent + hTangent.z * normal;
         rayDir = reflect(viewDir, h);
-        // A sampled half-vector can still put the ray under the horizon on a
-        // grazing pixel. Fall back to the mirror direction rather than tracing
-        // a ray that starts by entering the surface it came from.
+        // A sampled half-vector can still put the ray under the horizon, and
+        // tracing a ray that starts by entering the surface it came from is not
+        // an option. Note this is ROUGHNESS-driven, not grazing-driven — ~6% of
+        // samples at roughness 0.5 and ~11% at 0.6, and above 0.5 the share
+        // actually FALLS toward grazing incidence, because sampling the visible
+        // normals is precisely what fixed the grazing case.
+        //
+        // Collapsing those samples onto the mirror axis is not free. The
+        // resolve is a split-sum, so what this pass accumulates is a NORMALIZED
+        // directional average of the lobe; substituting the mirror direction
+        // does not add energy, it puts that whole share of the lobe's weight on
+        // one perfectly coherent direction — a sharp ghost inside a blurred
+        // reflection, which the temporal clamp cannot remove because it is
+        // persistent and spatially smooth. So: redraw once from a decorrelated
+        // stream (rtSample2D is a fixed function of pixel+frame and cannot
+        // supply a second draw), which leaves the mirror substitution firing on
+        // ~p^2 of pixels, where the correlation is invisible.
         if (dot(rayDir, normal) <= 0.0) {
-            rayDir = reflect(viewDir, normal);
+            uint retrySeed = rtSeed(uint2(coord), frameIndex ^ 0x7f4a7c15u);
+            const float2 xi2 = float2(rtNextFloat(retrySeed), rtNextFloat(retrySeed));
+            const float3 h2Tangent = sampleGGXVndf(vTangent, alpha, xi2);
+            const float3 h2 = h2Tangent.x * tangent + h2Tangent.y * bitangent + h2Tangent.z * normal;
+            const float3 retryDir = reflect(viewDir, h2);
+            rayDir = dot(retryDir, normal) > 0.0 ? retryDir : reflect(viewDir, normal);
         }
     }
 
     float3 rayOrigin = worldPos + normal * normalBias;
 
-    Hit hit = sceneClosest(rayOrigin, rayDir, rayMaxDistance);
+    // The cutout stream, distinct from `rtSample2D`'s GGX draw above (which
+    // seeds at rtSeed(pixel, 0)). A leaf card is 40% leaf, and until this was
+    // threaded down the closest-hit walk it reflected — and blocked probe rays
+    // — as a solid quad, even though the coverage the any-hit walk uses is
+    // baked into every triangle in every configuration.
+    const uint cutoutSeed = rtSeed(uint2(coord), frameIndex ^ 0x5bf03635u);
+    Hit hit = sceneClosest(rayOrigin, rayDir, rayMaxDistance, cutoutSeed);
 
     // Normalized so the target stays format-independent and the consumer only
     // ever needs `rayMaxDistance` to recover metres. A miss is 1.0 rather than
@@ -418,12 +453,21 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float3 hitPos = rayOrigin + rayDir * hit.t;
     float3 shaded = rtShadeHit(hitPos, hitNormal, attr.baseColor.rgb, attr.emissive, float2(coord));
 
-    // Fade with distance so a reflection that runs out of ray fades into the
-    // sky rather than ending at a hard edge. Into the SAME sky a miss returns
-    // (R3) — with a flat `skyColor` here and a directional cube tap there, a
-    // ray that ran out of range and a ray that escaped disagreed about what
-    // they were looking at.
-    float fade = saturate(1.0 - hit.t / rayMaxDistance);
+    // Fade over the LAST FIFTH of the ray range only, so a reflection that
+    // genuinely runs out of ray fades into the sky rather than ending at a hard
+    // edge — and a hit anywhere short of that keeps its shaded radiance intact.
+    // A linear fade from t = 0 (what this was until now) pulled EVERY
+    // mid-distance reflection toward sky instead: at the playground's 100
+    // units/metre and a 4000-unit range, a building 10 m away came back 25%
+    // sky. Into the SAME sky a miss returns (R3) — with a flat `skyColor` here
+    // and a directional cube tap there, a ray that ran out of range and a ray
+    // that escaped disagreed about what they were looking at.
+    //
+    // Edges are passed low-to-high because SPIR-V's GLSL.std.450 SmoothStep is
+    // UNDEFINED for e0 >= e1 (render/rt_reflection_math.hpp says the same about
+    // its own `rt_smoothstep`). At hit.t == rayMaxDistance the argument is 0, so
+    // fade is exactly 0 and the hit returns exactly what a miss returns.
+    float fade = smoothstep(0.0, RT_REFLECTION_FADE_WINDOW, 1.0 - hit.t / rayMaxDistance);
     if (waterDetail.y > 0.5) {
         // For water alpha is the hand-off to SSR/IBL. Fade the traced result's
         // authority, not its radiance, so the existing fallback fills misses

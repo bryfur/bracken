@@ -56,8 +56,13 @@ namespace bracken::render::lighting {
 [[nodiscard]] inline float spot_cone_factor(const glm::vec3& l_to_surface, const glm::vec3& spot_dir,
                                             float inner_cos, float outer_cos) {
     const float cd = glm::dot(spot_dir, -l_to_surface);
-    // HLSL smoothstep(edge0, edge1, x), with edge0 > edge1 handled the same way
-    // the hardware does: t is clamped to [0,1] after the divide.
+    // HLSL smoothstep(edge0, edge1, x). Callers reach this with
+    // inner_cos >= outer_cos — `FrameBuilder::Lane::add_spot_light`
+    // (scene/frame_builder.cpp) normalizes a transposed pair, because the
+    // shader's smoothstep is UNDEFINED for edge0 > edge1 — so the denominator
+    // is non-negative; the guard below only covers the degenerate equal-angle
+    // cone, which the shader also leaves undefined and this mirror resolves as
+    // a hard edge.
     const float denom = inner_cos - outer_cos;
     if (std::abs(denom) < 1e-8f) {
         return cd >= inner_cos ? 1.0f : 0.0f;

@@ -6,7 +6,7 @@
 //
 //     giRayResults[probe * rayCount + ray] = float4(radiance, distance)
 //
-// with `distance` = rayMaxDistance on a miss and NEGATIVE when the sample
+// with `distance` = rayMaxDistance on a miss and NEGATIVE for a direction that
 // starts inside geometry (which is what the classify pass counts as a backface
 // and uses to decide a probe is buried). Everything downstream is untouched and
 // shared with the ray-traced path: the blend, the Chebyshev visibility moments,
@@ -59,8 +59,13 @@ cbuffer VoxelConeTraceUniforms : register(b0, space2) {
     /// capture for this; a constant is the honest V1 stand-in and is the single
     /// biggest quality gap between the two paths.
     float3 voxelSkyColor;
-    /// Global multiplier on gathered radiance. 1 is energy-preserving; the
-    /// field's own bounce accumulation is what carries multi-bounce.
+    /// Global multiplier on gathered radiance. 1 is energy-preserving and is
+    /// what the traced source passes, so neither source pre-scales what it
+    /// reports. It does NOT buy multi-bounce here: the traced path's bounce
+    /// series comes from `rtHitAmbient` re-entering the probe field at every
+    /// hit, and this source has no equivalent term — the volume it samples was
+    /// injected from direct light only. The field's temporal EMA is a filter
+    /// over successive ray sets, not a transport series.
     float voxelBounceScale;
 
     /// The three cascade base corners, xyz used.
@@ -158,11 +163,26 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // probe is inside a wall and must be relocated or written off. Answering it
     // from the volume directly is both cheaper and more reliable than the
     // traced path's backface test.
+    //
+    // STILL OPEN: the relocation loop this feeds is not closed on this path.
+    // gi_probe_trace.comp.hlsl traces from `worldPosition + giProbeOffset`;
+    // this shader binds no offset texture and traces from the bare lattice
+    // point, so classify's verdict never changes the evidence it was formed
+    // from — and gi_sample.hlsli still places the probe at its RELOCATED
+    // position when it samples what was gathered at the un-relocated one.
+    // Closing it needs a cascade index in this cbuffer and a fourth set-0
+    // binding.
     bool startedInside = false;
+    // Voxel size of the cascade the probe itself landed in. A coarse cascade's
+    // voxels are 2x/4x wider AND its probes 2x/4x further apart, so "the hit is
+    // within one voxel" has to be measured in that cascade's units or the
+    // coarse cascades would never flag anything.
+    float originVoxel = VOXEL_BASE_SIZE;
     {
         const int c = voxelSelectCascade(origin, voxelCameraPosition);
         if (c >= 0 && voxelWorldInWindow(c, origin)) {
             startedInside = voxelSampleCascade(c, origin, 0.0).a > 0.5;
+            originVoxel = voxelSize(c);
         }
     }
 
@@ -191,8 +211,16 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         // fraction for a voxel-sized step; a step that crosses several voxels
         // must occlude proportionally more or a widening cone would see through
         // walls simply because it was taking longer strides.
+        //
+        // The sample is PREMULTIPLIED (see voxelConeAccumulate), so rgb has to
+        // be rescaled by the same factor as alpha or it stops meaning
+        // "coverage x radiance". The reciprocal clamp is what keeps that
+        // rescale from exploding a near-empty tap: rgb may be lifted at most
+        // back to its own un-premultiplied radiance, never past it.
         const float step = voxelConeStep(t, tanHalf);
-        s.a = saturate(s.a * (step / voxelSize(cascade)));
+        const float lengthScale = step / voxelSize(cascade);
+        s.rgb *= min(lengthScale, 1.0 / max(s.a, 1e-5));
+        s.a = saturate(s.a * lengthScale);
 
         accum = voxelConeAccumulate(accum, s);
 
@@ -213,7 +241,24 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // path gets this from the IBL capture, and matching it properly is RG4.
     radiance += voxelSkyColor * (1.0 - accum.a);
 
-    if (startedInside) {
+    // BURIAL IS PER DIRECTION, not per probe. The centre tap above is the GATE
+    // — it is what distinguishes a probe inside geometry from one merely close
+    // to a wall, and dropping it would make every probe a voxel above the
+    // terrain flag half its cones and relocate off a FRONT face, which is not
+    // what DDGI relocation is for. But flagging ALL of a gated probe's
+    // directions makes the classify pass's evidence useless: it sums the
+    // directions of the negative rays, and the sum of a whole spherical
+    // Fibonacci set cancels to near zero, so the probe is pushed along an
+    // essentially arbitrary vector that is re-rotated every update.
+    //
+    // Flagging only the directions that hit within a voxel restores a real
+    // resultant (a probe straddling a wall face flags the half of its cones
+    // that are in the wall, so the step is out of it) and lets the directions
+    // that escaped keep reporting their radiance, instead of blackening the
+    // whole tile for however many updates classify takes to write the probe
+    // off.
+    const bool buriedRay = startedInside && hitDistance >= 0.0 && hitDistance <= originVoxel;
+    if (buriedRay) {
         // Negative distance is the classify pass's "inside geometry" signal.
         // The radiance is zeroed for the same reason the traced path zeroes a
         // backface hit: a probe inside a wall must not pick up the wall's own

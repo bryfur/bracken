@@ -158,6 +158,14 @@ float4 PSMain(PSInput input) : SV_Target {
     float cosAngle = dot(rayDir, lightDirection);
     float phase = 0.25 + 0.75 * pow(max(0.0, cosAngle), 8.0);
 
+    // The day-dimming ramp `hazeSunColor` (fog.hlsli) ends with, transliterated
+    // rather than called: calling it would need a second uniform (fogSunColor)
+    // and would bring its warm forward-scatter lobe with it, which this flat
+    // ambient fraction deliberately does not have. `lightDirection` is toSun,
+    // exactly the argument hazeSunColor takes. 1.0 with the sun above ~24 deg,
+    // 0.04 once it is down — loop-invariant, so it is hoisted here.
+    float ambientDayDim = lerp(0.04, 1.0, saturate(lightDirection.y * 2.0 + 0.2));
+
     // Ray march through the volume (numSteps = the pass's cost knob)
     int numSteps = 24;
     float endDist = isSky ? maxDist : min(rayLength, maxDist);
@@ -184,8 +192,15 @@ float4 PSMain(PSInput input) : SV_Target {
             // that function shares `hazeSunColor` with the skybox's aerial haze
             // — which is what makes ground fog and sky meet exactly at the
             // horizon. The volumetric layer stays inside that agreement by
-            // being a fixed FRACTION of the same `fogColor`, so it can never
-            // pull the fog band away from the colour the sky is drawing.
+            // being a fixed FRACTION of the same `fogColor` AFTER the same
+            // day-dimming ramp (`ambientDayDim` above). The ramp is the
+            // load-bearing half: `hazeSunColor`'s last line is where surface
+            // fog and the sky's haze darken together through dusk, so a layer
+            // that took `fogColor` raw was 5x the band it is supposed to sit
+            // inside once the sun was down — a flat grey wash over a night
+            // scene whose extinction had already saturated. Above ~24 deg sun
+            // elevation the ramp is exactly 1.0, so daylight output is
+            // bit-identical to the undimmed form.
             //
             // So GI does NOT replace the colour: it becomes a per-channel GAIN
             // around 1, measured against the very hemisphere ambient the probe
@@ -193,10 +208,12 @@ float4 PSMain(PSInput input) : SV_Target {
             // includes everything past cascade 2, i.e. the horizon itself —
             // giSampleVolume returns that hemisphere mean exactly, the ratio is
             // exactly 1, and this term is bit-identical to the pre-R1c
-            // `fogColor * 0.2`. The contract therefore holds by construction
-            // rather than by tuning, and what GI buys is what it should: fog
-            // that darkens under an eave and warms in a lamp-lit street.
-            float3 ambientFog = fogColor * VOLUMETRIC_AMBIENT_SCALE;
+            // `fogColor * 0.2 * ambientDayDim`. The contract therefore holds by
+            // construction rather than by tuning, and what GI buys is what it
+            // should: fog that darkens under an eave and warms in a lamp-lit
+            // street. The dimming is applied to the BASE colour so the GI gain
+            // (a ratio around 1) still multiplies it unchanged.
+            float3 ambientFog = fogColor * VOLUMETRIC_AMBIENT_SCALE * ambientDayDim;
             if (giEnabled > 0.5) {
                 float3 reference = max((ambientSky + ambientGround) * 0.5, 1e-4);
                 float3 gain = giSampleVolume(pos, ambientSky, ambientGround) / reference;

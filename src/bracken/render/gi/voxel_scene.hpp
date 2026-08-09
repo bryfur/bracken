@@ -50,9 +50,17 @@ namespace bracken::render::gi {
  */
 struct VoxelTriangle {
     glm::vec3 v0{0.0f};
-    /// RGBA8 of the triangle's baked base colour. The alpha lane is unused for
-    /// now; RG4's emissive support is what will claim it.
-    std::uint32_t packed_albedo = 0xFFFFFFFFu;
+    /// The triangle's baked material, packed into the word the voxelizer stores
+    /// VERBATIM: base colour in the low three bytes, HIGH BYTE = emissive
+    /// intensity as a fraction of `VOXEL_EMISSIVE_SCALE` (voxel_scene.cpp),
+    /// which must equal `VOXEL_EMISSIVE_SCALE` in voxel_inject.comp.hlsl — the
+    /// two halves of one quantization and there is no test that pins them.
+    ///
+    /// The default is white and NON-emissive. `0xFFFFFFFF` would be a full-scale
+    /// emitter, which is what the high byte meaning emission costs the obvious
+    /// spelling — the same mistake, made once for real, took the night frame
+    /// from 35.8 to 96.8 mean luma.
+    std::uint32_t packed_albedo = 0x00FFFFFFu;
     glm::vec3 e1{0.0f};
     std::uint32_t _pad0 = 0;
     glm::vec3 e2{0.0f};

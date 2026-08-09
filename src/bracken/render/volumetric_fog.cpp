@@ -41,9 +41,9 @@ bool VolumetricFog::init(gpu::GPUDevice& device, int width, int height) {
 void VolumetricFog::shutdown() {
     fog_texture_.reset();
 
-    if (device_ && linear_sampler_) {
-        device_->release_sampler(linear_sampler_);
-        linear_sampler_ = nullptr;
+    if (device_ && depth_sampler_) {
+        device_->release_sampler(depth_sampler_);
+        depth_sampler_ = nullptr;
     }
 
     device_ = nullptr;
@@ -75,18 +75,41 @@ void VolumetricFog::create_textures(int width, int height) {
 }
 
 void VolumetricFog::create_sampler() {
+    // POINT-SAMPLED, and that is the whole point of this sampler existing.
+    // Its only consumer is the full-res depth texture at slot 0, read at a
+    // HALF-res pixel centre — a UV that lands exactly between four full-res
+    // texels. A filtered tap there returns the mean of four DEVICE depths,
+    // which (device depth being ~near/t) is a harmonic mean of view distances:
+    // a surface that does not exist. Two things break on it. `worldPosFromDepth`
+    // puts the ray end between the foreground and the background, so the march's
+    // `endDist` is wrong at every silhouette; and `isSky` (`depth <= 0.0`, the
+    // reversed-Z far plane) is false for any tap straddling geometry against
+    // sky, so shafts stop at a phantom surface exactly along the edges they are
+    // most visible against. It also disagrees with `composite.frag.hlsl`, whose
+    // joint bilateral upsample weights this texel against a NEAREST tap of the
+    // same depth buffer — the filter's premise is that the fog texel was
+    // computed for the depth it reads. Every other depth read in the tree is
+    // point-sampled (gtao.cpp, post_process_stack.cpp) for the same reason.
+    //
+    // Residual, deliberately not fixed here: at exactly the half-texel boundary
+    // which of the two texels wins is a float-rounding tie-break. Both passes
+    // compute the same UV so they agree in practice, and either choice is a
+    // REAL surface, which is what matters. The robust form is a dedicated
+    // half-res depth target reduced with MAX device depth (nearest-to-camera
+    // under reversed-Z) shared by this pass and the composite — a new target,
+    // a new reduction pass and a composite binding change.
     SDL_GPUSamplerCreateInfo info = {};
-    info.min_filter = SDL_GPU_FILTER_LINEAR;
-    info.mag_filter = SDL_GPU_FILTER_LINEAR;
+    info.min_filter = SDL_GPU_FILTER_NEAREST;
+    info.mag_filter = SDL_GPU_FILTER_NEAREST;
     info.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
     info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
-    linear_sampler_ = device_->create_sampler(info);
+    depth_sampler_ = device_->create_sampler(info);
 }
 
 bool VolumetricFog::is_ready() const {
-    return fog_texture_ && (linear_sampler_ != nullptr);
+    return fog_texture_ && (depth_sampler_ != nullptr);
 }
 
 SDL_GPUTexture* VolumetricFog::fog_texture() const {
@@ -191,7 +214,7 @@ void VolumetricFog::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& reg
     // they are read.
     SDL_GPUTextureSamplerBinding bindings[4] = {};
     bindings[0].texture = depth_texture;
-    bindings[0].sampler = linear_sampler_;
+    bindings[0].sampler = depth_sampler_;
     bindings[1].texture = shadow_map.atlas_texture();
     bindings[1].sampler = shadow_map.shadow_sampler();
     int binding_count = 2;

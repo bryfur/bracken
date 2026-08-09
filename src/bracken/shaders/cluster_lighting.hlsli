@@ -8,8 +8,13 @@
 // CLUSTER_SSBO_BINDING_BASE to the including shader's fragment sampler count
 // PLUS its storage-texture count BEFORE including this file, and
 // CLUSTER_SAMPLER_COUNT to the sampler count alone when the two differ.
-// SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4) then maps slots 0..3
-// onto these bindings.
+// The CPU call binds FIVE (SceneRenderer::bind_cluster_lights,
+// scene/scene_renderer_shadow.cpp): slots 0..3 are the bindings THIS header
+// owns, and slot 4 is the R4b screen-probe SH declared by gi_screen_sample.hlsli
+// at CLUSTER_SSBO_BINDING_BASE + 4. Slots 3 and 4 are backfilled with the light
+// data buffer when local shadows / screen probes are unavailable — a slot must
+// hold a valid buffer, and neither is read then (shadow_slot == -1,
+// giScreenEnabled == 0).
 //
 // This header also owns the LOCAL (point/spot) shadow bindings: the shadow
 // atlas + comparison sampler pair is expected at the including shader's LAST
@@ -189,6 +194,15 @@ float3 accumulateClusterLights(float3 P, float3 N, float3 V,
             float dist = length(to_light);
             if (dist > pl.radius) continue;
             float3 L = to_light / max(dist, 1e-4);
+            // The THIRD structural zero of this loop, and the only one that was
+            // not hoisted: evaluatePBR returns float3(0,0,0) for NdotL <= 0
+            // (pbr.hlsli), so a back-facing pixel used to pay a float4x4
+            // transform and four SampleCmpLevelZero taps for a visibility term
+            // that is then multiplied by zero. Roughly half of any lit sphere's
+            // surface is in that half. The predicate is pbr.hlsli's verbatim,
+            // not a re-derivation, so the two cannot drift and the NaN
+            // behaviour is identical rather than merely equivalent.
+            if (max(dot(N, L), 0.0) <= 0.0) continue;
             float att = pointFalloff(dist, pl.radius);
             float shadow = localLightShadow(pl.shadow_slot, true, pl.position, pl.radius, P, N, L, dist);
             if (shadow <= 0.0) continue;
@@ -200,6 +214,7 @@ float3 accumulateClusterLights(float3 P, float3 N, float3 V,
             float dist = length(to_light);
             if (dist > sl.radius) continue;
             float3 L = to_light / max(dist, 1e-4);
+            if (max(dot(N, L), 0.0) <= 0.0) continue; // see the point branch
             float att = pointFalloff(dist, sl.radius);
             float cone = spotConeFactor(L, sl.direction, sl.inner_cos, sl.outer_cos);
             if (cone <= 0.0) continue;

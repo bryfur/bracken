@@ -198,10 +198,15 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex) {
         GiScreenProbe probe = probes[probeIndex];
         float3 dir = giSpTexelDirection(int(texel), frameIndex);
         float3 anchor = probe.worldPosition + probe.normal * normalBias;
-        // Resume where the screen gave up. The screen march already proved
-        // there is nothing between the anchor and here, so re-tracing it would
-        // be work whose answer is known — and worse, a self-hit risk against
-        // the anchor's own surface.
+        // Resume where the screen gave up. The march hands off a distance it
+        // has PROVEN clear, never merely the distance it stopped at: for a ray
+        // that escaped the screen or ran out of steps that is the whole segment
+        // it walked, and for a ray it rejected (thickness, or a reprojection it
+        // could not read) it is deliberately backed off to the last clear
+        // sample, so the surface the march found is still inside this ray's
+        // segment and the BVH is the one that adjudicates it. Re-tracing the
+        // proven part would be work whose answer is known — and worse, a
+        // self-hit risk against the anchor's own surface.
         float3 origin = anchor + dir * resume;
 
         Hit hit = sceneClosest(origin, dir, rayMaxDistance);

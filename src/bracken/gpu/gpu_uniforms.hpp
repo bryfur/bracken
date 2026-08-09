@@ -1060,24 +1060,35 @@ BRACKEN_HLSL_FIELD(ParticleInstanceData, color, 64);
 
 /**
  * Bloom downsample pass fragment uniforms (set 3, b0)
- * threshold is compared against POST-exposure luminance (the shader multiplies
- * scene luminance by `exposure` before thresholding), so what blooms is stable
- * when the exposure setting changes; the extracted color stays in pre-exposure
- * scene units because the composite pass applies exposure to the summed bloom.
+ *
+ * threshold is compared against POST-exposure luminance, and post-exposure
+ * means BOTH factors the composite applies: the manual `exposure` bias here and
+ * the adapted EV the auto-exposure pass writes into its state SSBO. The shader
+ * reads that SSBO (slot 1, the composite's own `exposureState` layout) and
+ * folds `exp2(EV)` in when `autoExposureEnabled` is set — without it the cut
+ * was scene-referred while the display was not, which switched bloom off at
+ * night (adapted EV +3.5..+4 = an 11-16x factor the prefilter never saw). The
+ * extracted color still leaves in PRE-exposure scene units, because the
+ * composite pass applies exposure to the summed bloom.
  */
 struct alignas(16) BloomDownsampleUniforms {
     glm::vec2 srcTexelSize;
     float threshold = 0.8f;
     float isFirstPass = 1.0f;
     float exposure = 1.0f;
-    float _padding[3] = {0.0f, 0.0f, 0.0f};
+    /// 1 when the bound SSBO holds a LIVE adapted EV. The pointer being
+    /// non-null is what sets it: the slot always binds something, because
+    /// SDL3 GPU leaves an undeclared-but-bound descriptor undefined.
+    float autoExposureEnabled = 0.0f;
+    float _padding[2] = {0.0f, 0.0f};
 };
 BRACKEN_HLSL_CBUFFER(BloomDownsampleUniforms, 32);
 BRACKEN_HLSL_FIELD(BloomDownsampleUniforms, srcTexelSize, 0);
 BRACKEN_HLSL_FIELD(BloomDownsampleUniforms, threshold, 8);
 BRACKEN_HLSL_FIELD(BloomDownsampleUniforms, isFirstPass, 12);
 BRACKEN_HLSL_FIELD(BloomDownsampleUniforms, exposure, 16);
-BRACKEN_HLSL_FIELD(BloomDownsampleUniforms, _padding, 20);
+BRACKEN_HLSL_FIELD(BloomDownsampleUniforms, autoExposureEnabled, 20);
+BRACKEN_HLSL_FIELD(BloomDownsampleUniforms, _padding, 24);
 
 /**
  * Bloom upsample pass fragment uniforms (set 3, b0)
@@ -2080,10 +2091,12 @@ BRACKEN_HLSL_FIELD(VoxelMipUniforms, srcLevel, 12);
 /**
  * VoxelInjectUniforms (set 2, b0) — voxel_inject.comp.hlsl.
  *
- * Leading 176 bytes are the shadow_common.hlsli block, embedded verbatim and in
- * the same order GiProbeTraceUniforms carries it — that file names its uniforms
- * and the including shader owns their slots, so every consumer repeats the
- * block.
+ * The leading 336 bytes ARE `ShadowDataUniforms`, field for field and in order —
+ * only the two trailing pads are renamed `_shadowPad0`/`_shadowPad1`, because
+ * `_pad0`/`_pad1` are reused later in this struct. shadow_common.hlsli names its
+ * uniforms and the including shader owns their slots, so every consumer repeats
+ * the block; the shader declares them under exactly those names, which is what
+ * lets this pass call the forward pass's own `calcShadow()`.
  */
 struct alignas(16) VoxelInjectUniforms {
     glm::mat4 shadowLightViewProjection[4]{};
@@ -2126,6 +2139,14 @@ BRACKEN_HLSL_FIELD(VoxelInjectUniforms, shadowLightViewProjection, 0);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascadeSplits, 256);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascadeTexelWorld, 272);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascadeDepthRange, 288);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, shadowMapResolution, 304);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, lightSize, 308);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, shadowEnabled, 312);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, lastActiveSplit, 316);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, fadeStart, 320);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, fadeEnd, 324);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, _shadowPad0, 328);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, _shadowPad1, 332);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cascade, 336);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, base, 340);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cameraPosition, 352);
@@ -2133,8 +2154,19 @@ BRACKEN_HLSL_FIELD(VoxelInjectUniforms, sunIntensity, 364);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, cameraForward, 368);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, skyFloor, 380);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, sunDirection, 384);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, _pad0, 396);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, sunColor, 400);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, _pad1, 412);
 BRACKEN_HLSL_FIELD(VoxelInjectUniforms, skyColor, 416);
+// lightCount/lightCapacity are LIVE scalars the shader derives its cluster
+// strides from (`pointBase = 16 + capacity*8`), so leaving them unpinned left
+// the walk of voxelLightData unprotected: uniform_layout.test.cpp compares
+// SPIR-V EXTENT against sizeof and is blind to member order, so a size-
+// preserving reorder of this tail passed every existing guard.
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, lightCount, 428);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, lightCapacity, 432);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, _pad2, 436);
+BRACKEN_HLSL_FIELD(VoxelInjectUniforms, _pad3, 440);
 
 /**
  * VoxelConeTraceUniforms (set 2, b0) — voxel_cone_trace.comp.hlsl.

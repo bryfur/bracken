@@ -22,6 +22,11 @@ constexpr ShaderResources k_ubo1_sb1{.num_storage_buffers = 1, .num_uniform_buff
 constexpr ShaderResources k_ubo1_sb2{.num_storage_buffers = 2, .num_uniform_buffers = 1};
 constexpr ShaderResources k_ubo2_sb1{.num_storage_buffers = 1, .num_uniform_buffers = 2};
 constexpr ShaderResources k_ubo1_samp1{.num_samplers = 1, .num_uniform_buffers = 1};
+/// `bloom_downsample.frag`: the source mip, plus AutoExposure's state buffer —
+/// the prefilter's threshold is post-exposure and the adapted EV is half of
+/// that product. `bloom_upsample.frag` never thresholds and keeps k_ubo1_samp1.
+constexpr ShaderResources k_ubo1_sb1_samp1{
+    .num_samplers = 1, .num_storage_buffers = 1, .num_uniform_buffers = 1};
 constexpr ShaderResources k_ubo1_samp2{.num_samplers = 2, .num_uniform_buffers = 1};
 constexpr ShaderResources k_ubo1_samp4{.num_samplers = 4, .num_uniform_buffers = 1};
 constexpr ShaderResources k_ubo1_samp5{.num_samplers = 5, .num_uniform_buffers = 1};
@@ -335,7 +340,7 @@ constexpr std::array<PipelineDesc, static_cast<size_t>(PipelineType::Count)> k_p
      .vertex_shader = "fullscreen.vert.spv",
      .fragment_shader = "bloom_downsample.frag.spv",
      .vs = k_none,
-     .fs = k_ubo1_samp1,
+     .fs = k_ubo1_sb1_samp1,
      .vertex_layout = VertexLayout::None,
      .cull_mode = SDL_GPU_CULLMODE_NONE,
      .color = TargetFormat::RGBA16F,

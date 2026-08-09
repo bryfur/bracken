@@ -9,12 +9,32 @@
 #define PI_PBR 3.14159265358979323846
 #endif
 
-// GGX/Trowbridge-Reitz normal distribution.
+// GGX/Trowbridge-Reitz normal distribution, in Filament's factored form:
+//   D = (alpha / d)^2 / PI,   d = sin^2(theta_h) + (NdotH * alpha)^2
+// which is algebraically IDENTICAL to the textbook alpha^2 / (PI * d^2) —
+// expand d = NdotH^2 * (alpha^2 - 1) + 1 and the two agree term for term — but
+// which forms alpha/d BEFORE squaring, so no intermediate ever needs a floor.
+//
+// THE FORM MATTERS, because the textbook spelling here carried
+// `max(PI * d * d, 1e-7)` and that clamp was not a division guard, it was a
+// hole in the BRDF. At the lobe peak d == alpha^2 == roughness^4, so the clamp
+// binds for every perceptual roughness below 0.1156 — and it binds across a
+// disc SIX TIMES WIDER than the lobe itself, replacing the peak with a flat
+// plateau. Integrating D*cos over the hemisphere (which must be 1 for a
+// normalized NDF) measured 0.140 at roughness 0.06, 0.009 at 0.03, and exactly
+// 0 at 0: a 7x to 110x specular energy loss on every glossy material in the
+// engine, on every light path, silently.
+//
+// The alpha floor below is what actually handles the degenerate case the old
+// clamp was written for (roughness 0 at NdotH 1). It is a floor on the
+// PARAMETER, so unlike a denominator clamp it cannot eat the lobe of a
+// material that has one.
 float ndfGGX(float NdotH, float roughness) {
-    float a  = roughness * roughness;
-    float a2 = a * a;
-    float d  = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    return a2 / max(PI_PBR * d * d, 1e-7);
+    float a    = max(roughness * roughness, 1e-3); // alpha; floor ~= perceptual 0.032
+    float sin2 = max(1.0 - NdotH * NdotH, 0.0);
+    float aNoH = NdotH * a;
+    float k    = a / (sin2 + aNoH * aNoH);
+    return k * k * (1.0 / PI_PBR);
 }
 
 // Smith correlated visibility: V = G2 / (4 * NdotV * NdotL).

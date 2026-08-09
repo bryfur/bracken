@@ -233,6 +233,37 @@ struct GtaoSlabSpan {
     return std::clamp(1.0f - c * c, 0.0f, 1.0f);
 }
 
+// ---------------------------------------------------------------------------
+// Per-frame temporal jitter
+// ---------------------------------------------------------------------------
+
+/**
+ * 2-D Roberts/R2 low-discrepancy sequence (Roberts 2018): 1/ρ and 1/ρ² for the
+ * plastic number ρ. The SAME pair as `shaders/rt_sampling.hlsli` and
+ * `render/gi/screen_probe_math.hpp`.
+ *
+ * The two scales must be rationally INDEPENDENT together with 1, and that is
+ * the whole point of them. The previous pair (φ⁻¹, 1 − φ⁻¹) summed to exactly
+ * 1.0 in binary32 (Sterbenz), so `temporalOffset == 1 − temporalRotation` on
+ * every frame and the shader's (noiseSlice, noiseStep) pair was pinned to the
+ * anti-diagonal of the unit square: noiseSlice + noiseStep == frac(IGN1 + IGN2),
+ * a per-pixel CONSTANT. Each axis passed any uniformity test on its own while
+ * the temporal accumulation converged to a line integral indexed by that
+ * constant instead of to the 2-D integral it is estimating, leaving a
+ * stationary per-pixel residual no number of frames removes. 1/ρ has an
+ * irreducible cubic minimal polynomial, so no such relation exists for R2.
+ */
+inline constexpr float TEMPORAL_R2_A = 0.7548776662466927f; // 1/ρ
+inline constexpr float TEMPORAL_R2_B = 0.5698402909980532f; // 1/ρ²
+
+/// `frac(frame * scale)`, the per-frame jitter both AO axes are offset by.
+[[nodiscard]] inline float temporal_sequence(uint64_t frame_index, float scale) {
+    // Accumulate in double: at frame 4095 the float product is ~3000, where one
+    // ulp is 2.4e-4 and the low bits of the fractional part are already gone.
+    const double x = static_cast<double>(frame_index % 4096u) * static_cast<double>(scale);
+    return static_cast<float>(x - std::floor(x));
+}
+
 } // namespace detail
 
 /**
@@ -259,14 +290,15 @@ struct GtaoSlabSpan {
  *   1. GTAO           depth -> raw AO+cone (RGBA8); per slice a 32-sector
  *                     occlusion bitmask marked by constant-thickness slabs,
  *                     integrated with the cosine weight of the arc integral it
- *                     replaces; per-pixel IGN + per-frame golden-ratio jitter,
- *                     depth-reconstructed edge-aware normals.
+ *                     replaces; per-pixel IGN + per-frame R2 jitter
+ *                     (detail::temporal_sequence), depth-reconstructed
+ *                     edge-aware normals.
  *   2. GTAOTemporal   raw + history + velocity + depth -> TWO targets: the new
  *                     RGBA16F history (AO, oct.xy, aperture) and an RG16F
  *                     depth history (linear view Z) for next frame's
  *                     disocclusion test. The two are separate because five
- *                     quantities do not fit in four linearly filterable
- *                     channels, and every one of them is linearly filtered.
+ *                     quantities do not fit in four filterable channels, and
+ *                     every one of them is filtered.
  *   3-4. BlurAO       depth-aware separable blur of all four channels
  *                     (history stays unfiltered so the blur never compounds).
  *   5. GTAOUpsample   joint-bilateral upsample to the full-res RGBA8 AO
@@ -274,8 +306,10 @@ struct GtaoSlabSpan {
  *                     working res.
  * The bent normal is decoded, filtered as a direction and re-encoded at every
  * one of those stages — averaging octahedral coordinates across the fold seam
- * is not averaging directions. The aperture, a projected solid angle, filters
- * linearly as it stands.
+ * is not averaging directions. That is also why NO stage reads the AO chain
+ * through a hardware LINEAR sampler: stage 2's reprojection builds its bilinear
+ * filter from 4 nearest taps by hand for exactly this reason. The aperture, a
+ * projected solid angle, filters linearly as it stands.
  *
  * History is INVALID (temporal pass outputs the current frame) on the first
  * frame and after resize()/set_half_res()/invalidate_history() — the

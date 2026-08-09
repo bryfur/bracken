@@ -148,7 +148,9 @@ int2 giBorderSource(int2 tileLocal, int payload) {
     const int py = clamp(tileLocal.y - GI_BORDER, 0, last);
 
     if ((left || right) && (top || bottom)) {
-        return int2(left ? 0 : last, top ? 0 : last);
+        // The edge fold applied on both axes: the diagonal past a square corner
+        // passes through the -Z pole into the opposite azimuth quadrant.
+        return int2(left ? last : 0, top ? last : 0);
     }
     if (top || bottom) {
         return int2(last - px, top ? 0 : last);
@@ -225,6 +227,14 @@ float3 giRayDirection(uint index, uint count, uint frameIndex) {
 #define GI_HYSTERESIS_MAX 0.97
 #define GI_HYSTERESIS_MIN 0.70
 #define GI_CHANGE_SATURATION 1.0
+/// Standard errors of the update's OWN estimate subtracted from the observed
+/// delta before the curve reads it as a lighting change. Without it the curve
+/// is driven by the Monte Carlo noise of a 32-96 ray estimate whose directions
+/// rotate every frame, and the window never reaches GI_HYSTERESIS_MAX at all —
+/// the same positive feedback gi_probe_blend_visibility.comp.hlsl argues
+/// against for the moments, with a larger n_eff. CPU mirror:
+/// `PROBE_BLEND_NOISE_K`, which carries the derivation of the value.
+#define GI_BLEND_NOISE_K 1.0
 
 /// Hysteresis for a normalized (scale-free) new-vs-old delta, and R5b's global
 /// reset floor from the analytic sun gradient.
@@ -245,8 +255,14 @@ float giBlendHysteresis(float delta, float reset) {
 }
 
 /// One EMA step. CPU mirror: `probe_blend`.
-float3 giBlend(float3 oldValue, float3 newValue, float reset) {
-    float delta = length(newValue - oldValue) / max(length(oldValue), 1e-4);
+///
+/// `sigma` is the standard error of `newValue` itself, computed by the caller
+/// from the second moment of the same weighted ray sum. It enters as a SOFT
+/// THRESHOLD on the disagreement, so a delta the estimator's own noise fully
+/// explains reads as no change; `sigma == 0` is exactly the pre-gate curve.
+float3 giBlend(float3 oldValue, float3 newValue, float reset, float sigma) {
+    float signal = max(0.0, length(newValue - oldValue) - GI_BLEND_NOISE_K * max(sigma, 0.0));
+    float delta = signal / max(length(oldValue), 1e-4);
     return lerp(newValue, oldValue, giBlendHysteresis(delta, reset));
 }
 
@@ -263,5 +279,19 @@ float3 giBlend(float3 oldValue, float3 newValue, float reset) {
 #define GI_MAX_OFFSET_FRACTION 0.45
 #define GI_VISIBILITY_DISTANCE_SCALE 1.5
 #define GI_VISIBILITY_SHARPNESS 50.0
+/// Minimum mean resultant length, per backface ray, for the relocation
+/// direction to mean anything. CPU mirror: `PROBE_RELOCATE_MIN_COHERENCE`.
+#define GI_RELOCATE_MIN_COHERENCE 0.10
+
+/// pow(c, GI_VISIBILITY_SHARPNESS) <= 1e-8  <=>  c <= this. Lets the visibility
+/// blend reject the ~85% of rays outside a texel's 46-degree lobe with a compare
+/// instead of a log2/exp2 pair. Recompute as pow(1e-8, 1/sharpness) if
+/// GI_VISIBILITY_SHARPNESS is ever retuned.
+#define GI_VISIBILITY_WEIGHT_CUTOFF 0.6918309709
+
+/// Ceiling on giRayCount, and the size of the blend passes' groupshared
+/// direction cache. CPU mirror: `MAX_PROBE_RAYS`, pinned against
+/// gi_budget(GiQuality::High) by a static_assert in probe_schedule.hpp.
+#define GI_MAX_PROBE_RAYS 96
 
 #endif // BRACKEN_GI_PROBE_HLSLI

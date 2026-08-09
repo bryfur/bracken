@@ -18,6 +18,13 @@
 // a BVH walk on is already sitting in a texture, paid for by the direct
 // lighting pass.
 //
+// WITH ONE CAVEAT, and it is the reason `voxelSunVisibility` exists below: that
+// texture covers the VIEW, and this volume is a camera-centred box that reaches
+// well behind and past it. `calcShadow`'s out-of-frustum escapes both return
+// FULL LIGHT, which is correct for a fragment and wrong for a voxel, so the
+// cascade a voxel falls in is looked up directly rather than through the view
+// depth. What no cascade covers at all is VOXEL_SUN_UNKNOWN_VISIBILITY.
+//
 // NO NORMAL IS STORED, so N.L cannot be evaluated per voxel — and that is a
 // property of the representation, not an omission. A voxel is a volume element:
 // it holds whatever geometry passed through it, facing every which way. The
@@ -64,10 +71,12 @@ cbuffer VoxelInjectUniforms : register(b0, space2) {
     float _voxelInjectPad0;
     float3 voxelSunColor;
     float _voxelInjectPad1;
-    /// Ambient floor colour, so a voxel the sun cannot reach is not perfectly
-    /// black — otherwise the first bounce in shadow is zero and interiors read
-    /// as caves. The probe field applies the real sky term; this is only what
-    /// stops the voxel volume from being the thing that zeroes it.
+    /// UNREAD, along with `voxelSkyFloor` above, and deliberately still here:
+    /// this cbuffer is a byte-for-byte mirror of `gpu::VoxelInjectUniforms` and
+    /// removing a field is a layout change. Injecting sky was tried and removed
+    /// — see the "NO SKY TERM HERE" block below — because a voxel carries no
+    /// visibility and the cone applies the same sky weighted by how much of
+    /// itself reached open air.
     float3 voxelSkyColor;
     /// Lights in `voxelLightData`, and the capacity its offsets were built with.
     /// The two differ: the buffer is laid out for the capacity, not the count.
@@ -114,9 +123,16 @@ SamplerState shadowRawSampler : register(s1, space0);
 
 /// Mean of `max(dot(n, l), 0)` over a uniform sphere of orientations — the
 /// isotropic stand-in for the per-voxel cosine a volume element cannot have.
-/// Using it rather than 1 is what stops voxel GI from being twice as bright as
-/// the surface lighting it is supposed to be bouncing.
-#define VOXEL_LAMBERT_AVERAGE 0.5
+/// Using it rather than 1 is what stops voxel GI from being four times as
+/// bright as the surface lighting it is supposed to be bouncing.
+///
+/// (1/4pi) * integral over the sphere of max(n.l, 0) = (1/4pi) * pi = 1/4. The
+/// tempting 0.5 is the mean of the cosine over the LIT HEMISPHERE only, which
+/// is a different quantity and not the one a voxel full of geometry facing
+/// every direction wants. The parity target is `rtShadeHit`, whose sun term is
+/// `sunColor * saturate(dot(N, toSun)) * vis`, and the orientation-average of
+/// that is a quarter.
+#define VOXEL_LAMBERT_AVERAGE 0.25
 
 /// Radiance an emissive byte of 255 stands for. Emission is HDR and eight bits
 /// are not, so the byte is a fraction of this ceiling — high enough that a
@@ -124,6 +140,82 @@ SamplerState shadowRawSampler : register(s1, space0);
 /// is invisible against it.
 #define VOXEL_EMISSIVE_SCALE 8.0
 #define VOXEL_PI 3.141592653589793
+
+/// Sun visibility for a voxel no cascade covers at all — the far corners of the
+/// coarsest cascade, outside every shadow map's footprint.
+///
+/// 1.0, which is what the code did for the whole out-of-domain volume before the
+/// cascade scan below existed. It is the right answer for open terrain, which is
+/// most of what is out there, and it is deliberately NOT the "conservative" 0.5:
+/// a blanket half would darken the correct majority to fix the incorrect
+/// minority and would put a hard seam at the boundary of a region the scan has
+/// already emptied. If this is ever changed it must be measured on the two
+/// GiMode::VoxelProbes pins, by auto_ev.
+#define VOXEL_SUN_UNKNOWN_VISIBILITY 1.0
+
+/// Does `cascade`'s shadow map actually cover this world point?
+///
+/// `calcShadow` is written for FRAGMENTS, which are inside the view frustum by
+/// construction, and both of its escapes return FULL LIGHT: a view depth past
+/// `lastActiveSplit`, and a light-space projection outside [0,1]. A voxel is not
+/// a fragment. The clipmap is a camera-CENTRED box — cascade 0 spans +/-1200
+/// world units in every direction and cascade 2 +/-4800 — so roughly half of it
+/// sits BEHIND the camera at a NEGATIVE view depth, which `selectShadowCascade`
+/// routes to cascade 0, whose ortho window is fitted around the nearest frustum
+/// slice in FRONT of the camera and cannot contain it. Every such voxel was
+/// injected as fully sunlit, which made the clipmap's contents depend on where
+/// the camera happened to be pointing when that cascade was last relit.
+///
+/// The atlas usually does have the answer: shadow casters are culled against the
+/// LIGHT frustum rather than the camera's, and the last cascade is fitted as a
+/// bounding sphere of the whole far slice, so its quadrant genuinely contains
+/// occluders behind the viewer. This is the test that lets injection go and find
+/// the cascade that covers the point instead of taking calcShadow's escape.
+///
+/// Mirrors `sampleShadowCascade`'s projection exactly, normal-offset bias
+/// included. The y flip does not change a bounds test and is kept only so the
+/// two cannot drift apart.
+bool voxelShadowCascadeContains(int cascade, float3 world, float3 N) {
+    float4 lightSpacePos =
+        mul(shadowLightViewProjection[cascade], float4(world + N * cascadeTexelWorld[cascade], 1.0));
+    float3 sc = lightSpacePos.xyz / lightSpacePos.w;
+    sc.x = sc.x * 0.5 + 0.5;
+    sc.y = 1.0 - (sc.y * 0.5 + 0.5);
+    return sc.x >= 0.0 && sc.x <= 1.0 && sc.y >= 0.0 && sc.y <= 1.0 && sc.z >= 0.0 && sc.z <= 1.0;
+}
+
+/// Sun visibility for a voxel, over the whole clipmap rather than over the view
+/// frustum.
+float voxelSunVisibility(float3 world, float3 toLight, float viewDepth) {
+    if (shadowEnabled < 0.5) {
+        return 1.0; // shadows off is shadows off
+    }
+    // IN DOMAIN: exactly what a fragment at this point receives, cascade blend
+    // and distance fade included. Bit-identical to what this pass always did,
+    // which is the point — the fix must not move the voxels that were right.
+    const int cascade = selectShadowCascade(viewDepth);
+    if (viewDepth >= 0.0 && viewDepth < lastActiveSplit &&
+        voxelShadowCascadeContains(cascade, world, toLight)) {
+        return calcShadow(world, toLight, toLight, viewDepth, float2(0.0, 0.0));
+    }
+    // OUT OF DOMAIN: take the first cascade that covers the point. Scanning all
+    // four is safe even when fewer are active — get_shadow_uniforms clones the
+    // last active cascade's matrix into the inactive slots, so a clone can only
+    // match when the cascade it was cloned from already matched at a lower
+    // index, and the ascending scan returns there first.
+    //
+    // N == L, so NdotL is 1, the slope term vanishes and the receiver bias is
+    // the isotropic 0.5*texelWorld/depthRange — the right choice for a volume
+    // element and the same direction of error the normal-offset argument above
+    // makes.
+    [unroll]
+    for (int c = 0; c < 4; ++c) {
+        if (voxelShadowCascadeContains(c, world, toLight)) {
+            return sampleShadowCascade(c, world, toLight, 1.0, float2(0.0, 0.0), shadowEnabled);
+        }
+    }
+    return VOXEL_SUN_UNKNOWN_VISIBILITY;
+}
 
 /// Smooth windowed inverse-square falloff. Operation-identical to
 /// `rtHitPointFalloff` and to `pointFalloff` in clusters.hlsli — a voxel and a
@@ -168,22 +260,18 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     const int3 absolute = voxelBase + local;
     const float3 world = voxelCenter(voxelCascade, absolute);
 
-    // A voxel has no surface normal. Handing `calcShadow` the direction toward
-    // the light for both N and L makes its normal-offset bias push the sample
-    // toward the light, which is the right direction for a volume element: it
-    // errs toward "lit" rather than toward self-shadowing an occupied cell.
+    // A voxel has no surface normal. Handing the shadow lookup the direction
+    // toward the light for both N and L makes its normal-offset bias push the
+    // sample toward the light, which is the right direction for a volume
+    // element: it errs toward "lit" rather than toward self-shadowing an
+    // occupied cell.
     const float3 toLight = -voxelSunDirection;
     const float viewDepth = dot(world - voxelCameraPosition, voxelCameraForward);
-    const float shadow = calcShadow(world, toLight, toLight, viewDepth, float2(0.0, 0.0));
+    const float shadow = voxelSunVisibility(world, toLight, viewDepth);
 
     const float3 sun = voxelSunColor * (voxelSunIntensity * shadow * VOXEL_LAMBERT_AVERAGE);
 
     // ---- sky ---------------------------------------------------------------
-    // A voxel sees the whole sphere, so the honest ambient is the sky's average
-    // radiance rather than one authored constant. The capture's TOP MIP is that
-    // average — sampling any direction at the coarsest level returns the whole
-    // cube filtered down to one texel, which is exactly the isotropic term a
-    // volume element wants and costs one tap.
     // NO SKY TERM HERE, and that is the fix for a real over-brightness rather
     // than a saving. A voxel has no visibility information, so injecting the
     // sky's mean radiance lights every voxel equally — including the ones deep
@@ -245,12 +333,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     }
 
     // Outgoing radiance = what arrived, times what the surface reflects, PLUS
-    // what the surface emits on its own. The 1/PI that turns irradiance into
-    // radiance for a Lambertian surface is deliberately NOT applied: the probe
-    // field this feeds carries "cosine-weighted mean incoming radiance"
-    // (gi_sample.hlsli's stated unit) and the cone integral that fills it
-    // normalizes by its own weight sum, so a 1/PI here would only have to be
-    // undone there.
+    // what the surface emits on its own.
+    //
     // EMISSIVE rides the albedo volume's own alpha byte as an INTENSITY, tinted
     // by the albedo. A separate volume would cost another 3.5 MB per cascade to
     // carry a channel that is zero almost everywhere, and an emitter's colour is
@@ -263,22 +347,27 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     const float emissiveIntensity = float((packed >> 24) & 0xFFu) / 255.0;
     const float3 emissive = albedo * (emissiveIntensity * VOXEL_EMISSIVE_SCALE);
 
-    // LAMBERTIAN OUTGOING RADIANCE, operation-for-operation what
-    // rt_hit_shade.hlsli's rtShadeHit returns: `albedo * E / pi + emissive`,
-    // where E is IRRADIANCE. `sun` and `localLight` are irradiance (they carry
-    // the isotropic cosine in place of N.L); `sky` is already radiance and its
-    // pi cancels, so it sits outside the divide.
+    // LAMBERTIAN OUTGOING RADIANCE, term for term what rt_hit_shade.hlsli's
+    // rtShadeHit returns MINUS its third irradiance term: `albedo * E / pi +
+    // emissive`, where E is IRRADIANCE. `sun` and `localLight` are irradiance
+    // (they carry the isotropic cosine in place of N.L), so the /pi converts
+    // them.
     //
     // The /pi is not optional and leaving it out is not a small error: it made
     // the night frame land 11 luma above the no-GI baseline, where the traced
     // path barely moves. The two GI sources feed ONE probe field, so they must
     // agree about units or the same scene reads at two brightnesses.
-    // LAMBERTIAN OUTGOING RADIANCE, operation-for-operation what
-    // rt_hit_shade.hlsli's rtShadeHit returns: `albedo * E / pi + emissive`,
-    // where E is IRRADIANCE. `sun` and `localLight` carry the isotropic cosine
-    // in place of N.L, so they are irradiance and the /pi converts them.
     //
-    // The /pi is not optional: the two GI sources feed ONE probe field, so they
-    // must agree about units or the same scene reads at two brightnesses.
+    // THE MISSING TERM is rtShadeHit's `GI_PI * bounceScale * rtHitAmbient(...)`
+    // — the probe field re-entering itself, which is what makes the traced field
+    // multi-bounce. This pass binds no probe atlas, so the voxel field is
+    // SINGLE-bounce: interiors and courtyards, where the second bounce is most
+    // of the light, come out short. Closing it means feeding the previous
+    // frame's irradiance atlas back in here.
+    //
+    // The alpha is 1 for any occupied voxel and 0 for an empty one, so mip-0
+    // coverage is BINARY — every fractional alpha in the volume is produced by
+    // the mip chain. The cone compositor reads this pair as PREMULTIPLIED
+    // (voxel_common.hlsli), which is what the box-filtered chain makes of it.
     voxelRadiance[tid] = float4(albedo * ((sun + localLight) / VOXEL_PI) + emissive, 1.0);
 }

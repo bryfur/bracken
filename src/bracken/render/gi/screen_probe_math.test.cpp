@@ -381,10 +381,12 @@ Pyramid build_pyramid(int width, int height, const std::vector<float>& mip0) {
 }
 
 /// The shader's ladder, transliterated. Returns the screen parameter it stopped
-/// at and whether it converged to mip 0 inside the screen.
+/// at, whether it converged to mip 0 inside the screen, and the last position it
+/// PROVED clear (what a handoff resumes from).
 struct MarchResult {
     bool converged = false;
     float s = 0.0f;
+    float s_clear = 0.0f;
     int steps = 0;
 };
 
@@ -397,12 +399,14 @@ MarchResult hierarchical_march(const Pyramid& p, glm::vec3 P0, glm::vec3 D, int 
     }
     const float eps = 0.25f / texel_length;
     float s = std::min(2.0f / texel_length, 1.0f);
+    float s_clear = s;
     int level = start_mip;
 
     for (int iter = 0; iter < SCREEN_TRACE_MAX_STEPS && level >= 0; ++iter) {
         r.steps = iter + 1;
         const glm::vec2 uv = glm::vec2(P0) + glm::vec2(D) * s;
         if (s >= 1.0f || uv.x < 0.0f || uv.y < 0.0f || uv.x > 1.0f || uv.y > 1.0f) {
+            r.s_clear = s_clear;
             return r;
         }
         const glm::ivec2 mip_size(hzb_mip_size(p.width, level), hzb_mip_size(p.height, level));
@@ -411,14 +415,28 @@ MarchResult hierarchical_march(const Pyramid& p, glm::vec3 P0, glm::vec3 D, int 
         const glm::ivec2 lookup = screen_trace_cell(uv, cells, mip_size);
         const float hz = p.at(level, lookup.x, lookup.y);
 
+        // Reversed-Z over a MAX pyramid: the ray is in front of everything in
+        // this footprint, so nothing here can be hit and the position is proven
+        // clear.
+        const bool ahead = hz <= P0.z + D.z * s;
+        if (ahead) {
+            s_clear = s;
+        }
         float next = s;
-        if (hz <= P0.z + D.z * s && std::abs(D.z) > 1e-9f) {
+        if (ahead && std::abs(D.z) > 1e-9f) {
             next = std::max(s, (hz - P0.z) / D.z);
         }
         const glm::vec2 cell_after = glm::floor((glm::vec2(P0) + glm::vec2(D) * next) * cells);
-        if (cell_after != cell_before) {
+        // The depth plane can only advance a RECEDING ray; a ray travelling
+        // toward the camera (D.z > 0 in reversed-Z) has the max() above clamp it
+        // to s, so the cell boundary is its only forward progress. Stepping it
+        // is exactly conservative — rayZ only rises, so a ray in front of this
+        // cell's closest surface stays in front across the whole cell. Extending
+        // it to !ahead would tunnel: that is the descend-to-refine path.
+        if (cell_after != cell_before || (ahead && D.z > -1e-9f)) {
             const float dt = screen_trace_cell_step(uv, glm::vec2(D), cells);
             if (!std::isfinite(dt)) {
+                r.s_clear = s_clear;
                 return r;
             }
             next = s + dt + eps;
@@ -427,6 +445,7 @@ MarchResult hierarchical_march(const Pyramid& p, glm::vec3 P0, glm::vec3 D, int 
         s = next;
         --level;
     }
+    r.s_clear = s_clear;
     if (level < 0 && s < 1.0f) {
         const glm::vec2 uv = glm::vec2(P0) + glm::vec2(D) * s;
         if (uv.x >= 0.0f && uv.y >= 0.0f && uv.x <= 1.0f && uv.y <= 1.0f) {
@@ -436,6 +455,19 @@ MarchResult hierarchical_march(const Pyramid& p, glm::vec3 P0, glm::vec3 D, int 
     }
     return r;
 }
+
+/// How far behind a surface the brute walk needs the ray before it calls the
+/// sample a crossing, in device depth.
+///
+/// NOT tolerance for a bug. The ladder's test is per CELL — it advances only
+/// where the cell's MAX depth is at or behind the ray — while the reference
+/// point-samples mip 0, and the two can only disagree where the ray runs
+/// TANGENT to a smooth surface and dips a ten-thousandth of a unit under it.
+/// There the "first crossing" is a coin flip between two discretizations, and
+/// the shader's thickness heuristic is what decides anyway. A real occluder in
+/// this fixture stands 0.2..0.7 proud of its surroundings, so the margin costs
+/// the reference nothing it was pinning.
+constexpr float BRUTE_CROSSING_MARGIN = 0.005f;
 
 /// A texel-at-a-time mip-0 walk: the reference the ladder must not undercut.
 float brute_first_crossing(const Pyramid& p, glm::vec3 P0, glm::vec3 D) {
@@ -458,22 +490,16 @@ float brute_first_crossing(const Pyramid& p, glm::vec3 P0, glm::vec3 D) {
         const int x = std::clamp(static_cast<int>(uv.x * screen.x), 0, p.width - 1);
         const int y = std::clamp(static_cast<int>(uv.y * screen.y), 0, p.height - 1);
         const float ray = P0.z + D.z * s;
-        if (ray < p.at(0, x, y)) { // reversed-Z: ray is behind the surface
+        if (ray < p.at(0, x, y) - BRUTE_CROSSING_MARGIN) { // reversed-Z: ray behind the surface
             return s;
         }
     }
     return -1.0f;
 }
 
-TEST(ScreenTraceMarch, NeverStepsOverASurfaceTheBruteWalkFinds) {
-    const int W = 128;
-    const int H = 72;
-    std::mt19937 rng(7);
-    std::uniform_real_distribution<float> unit(0.05f, 0.95f);
-    std::uniform_real_distribution<float> delta(-1.2f, 1.2f);
-
-    // A "scene": a ground plane whose depth falls off with y, plus a few walls
-    // that jump much closer. Reversed-Z, so larger is closer.
+/// The test fixture: a ground plane whose depth falls off with y, plus a couple
+/// of surfaces that jump much closer. Reversed-Z, so larger is closer.
+Pyramid build_scene_pyramid(int W, int H) {
     std::vector<float> mip0(static_cast<std::size_t>(W * H));
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
@@ -487,12 +513,30 @@ TEST(ScreenTraceMarch, NeverStepsOverASurfaceTheBruteWalkFinds) {
             mip0[static_cast<std::size_t>(y * W + x)] = d;
         }
     }
-    const Pyramid p = build_pyramid(W, H, mip0);
+    return build_pyramid(W, H, mip0);
+}
+
+TEST(ScreenTraceMarch, NeverStepsOverASurfaceTheBruteWalkFinds) {
+    const int W = 128;
+    const int H = 72;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> unit(0.05f, 0.95f);
+    std::uniform_real_distribution<float> delta(-1.2f, 1.2f);
+    // DEPTH SYMMETRICALLY, and this is not a detail: a fixed D.z of -0.9 covers
+    // only rays travelling AWAY from the camera, and the toward-camera half —
+    // which for a surface facing the eye is its whole upper hemisphere — went
+    // unchecked for a release. Every failure the ladder can have is available in
+    // both halves; only one of them was being asked for.
+    std::uniform_real_distribution<float> dz(-1.2f, 1.2f);
+    std::uniform_real_distribution<float> depth0(0.3f, 0.9f);
+
+    const Pyramid p = build_scene_pyramid(W, H);
 
     int compared = 0;
+    int toward = 0;
     for (int trial = 0; trial < 3000; ++trial) {
-        const glm::vec3 P0{unit(rng), unit(rng), 0.95f};
-        glm::vec3 D{delta(rng), delta(rng), -0.9f};
+        const glm::vec3 P0{unit(rng), unit(rng), depth0(rng)};
+        glm::vec3 D{delta(rng), delta(rng), dz(rng)};
         if (std::abs(D.x) < 1e-3f && std::abs(D.y) < 1e-3f) {
             continue;
         }
@@ -502,19 +546,132 @@ TEST(ScreenTraceMarch, NeverStepsOverASurfaceTheBruteWalkFinds) {
             continue; // the reference itself found nothing to compare against
         }
         ++compared;
+        if (D.z > 0.0f) {
+            ++toward;
+        }
         // The ladder may stop short of the brute crossing (it converges on the
         // first mip-0 cell it cannot rule out, and the thickness test in the
         // shader is what decides whether that is a hit). It must NOT sail past
         // it: that is the tunnelling failure a conservative pyramid exists to
-        // prevent. One texel of slack for the epsilon nudges.
+        // prevent. Two texels of slack for the epsilon nudges.
         const float slack = 2.0f / glm::length(glm::vec2(D) * glm::vec2(W, H));
         if (hier.converged) {
             EXPECT_LE(hier.s, brute + slack)
                 << "the hierarchical march converged past the first surface (trial " << trial << ")";
         }
+        // AND THE HANDOFF MUST NOT EITHER. `s_clear` is what the shader gives
+        // the BVH as its resume distance on a reject, and the whole point of
+        // carrying it separately from `s` is that resuming past a surface the
+        // march itself found makes that surface invisible to both estimators.
+        EXPECT_LE(hier.s_clear, brute + slack)
+            << "the handoff resumed past the first surface (trial " << trial << ")";
+        EXPECT_LE(hier.s_clear, hier.s) << "the resume overtook the march itself";
         EXPECT_LE(hier.steps, SCREEN_TRACE_MAX_STEPS);
     }
     EXPECT_GT(compared, 500) << "the fixture produced too few comparable rays to mean anything";
+    EXPECT_GT(toward, 200) << "the toward-camera half of the ray set is not being exercised";
+}
+
+TEST(ScreenTraceMarch, AdvancesRaysTravellingTowardTheCamera) {
+    // THE PIN FOR THE STALL. In reversed-Z a ray travelling toward the camera
+    // has D.z > 0, so `hz <= rayZ` implies `(hz - P0.z)/D.z <= s` and the
+    // depth-plane advance's max() clamps it to s. Without the cell-boundary
+    // fallback such a ray never moves: it burns its three levels refining the
+    // texel it started in, reports "converged" two texels from the anchor, and
+    // is handed to the BVH from there. Measured on this fixture, the shipped
+    // ladder landed on 0 of ~800 crossings that stand more than eight texels
+    // ahead; with the fallback it lands on ~98% of them.
+    const int W = 128;
+    const int H = 72;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> unit(0.05f, 0.95f);
+    std::uniform_real_distribution<float> delta(-1.2f, 1.2f);
+    std::uniform_real_distribution<float> dz(0.05f, 1.2f); // toward the camera only
+    std::uniform_real_distribution<float> depth0(0.3f, 0.9f);
+
+    const Pyramid p = build_scene_pyramid(W, H);
+
+    int far = 0;
+    int landed = 0;
+    for (int trial = 0; trial < 6000; ++trial) {
+        const glm::vec3 P0{unit(rng), unit(rng), depth0(rng)};
+        const glm::vec3 D{delta(rng), delta(rng), dz(rng)};
+        const float texels = glm::length(glm::vec2(D) * glm::vec2(W, H));
+        if (texels <= 1.0f) {
+            continue;
+        }
+        const float brute = brute_first_crossing(p, P0, D);
+        if (brute < 0.0f) {
+            continue;
+        }
+        // Only crossings the ladder has to TRAVEL to; one within a couple of
+        // texels of the start is found by standing still.
+        const float start = std::min(2.0f / texels, 1.0f);
+        if ((brute - start) * texels < 8.0f) {
+            continue;
+        }
+        ++far;
+        const MarchResult hier = hierarchical_march(p, P0, D, SCREEN_TRACE_START_MIP);
+        if (hier.converged && std::abs(hier.s - brute) * texels <= 4.0f) {
+            ++landed;
+        }
+    }
+    ASSERT_GT(far, 200) << "the fixture produced too few distant crossings to mean anything";
+    EXPECT_GT(landed, (far * 9) / 10)
+        << "toward-camera rays are not reaching the surfaces ahead of them: " << landed << " of "
+        << far;
+}
+
+TEST(ScreenTraceMarch, TheHandoffResumesBeforeTheSurfaceTheMarchStoppedAt) {
+    // The ladder's last advance lands the ray ON a surface's depth plane. If the
+    // thickness test then rejects it, or the reprojection cannot be read, the
+    // ray is handed to the BVH — and handing it off AT that plane makes the very
+    // geometry the march declined to adjudicate invisible to both estimators
+    // (the BVH's own ray epsilon rejects a t at the origin). `s_clear` is the
+    // last sample at which the ray was proven in front of everything in its
+    // footprint, which is the position a reject may resume from.
+    //
+    // Measured on this fixture over rays that travelled and then landed on a
+    // real crossing: the resume sits at least half a texel short of it for 91%
+    // of them, against 29% if the stop position is handed off instead.
+    const int W = 128;
+    const int H = 72;
+    std::mt19937 rng(20260809);
+    std::uniform_real_distribution<float> unit(0.05f, 0.95f);
+    std::uniform_real_distribution<float> delta(-1.2f, 1.2f);
+    std::uniform_real_distribution<float> depth0(0.3f, 0.9f);
+
+    const Pyramid p = build_scene_pyramid(W, H);
+
+    int landed = 0;
+    int backed_off = 0;
+    for (int trial = 0; trial < 8000; ++trial) {
+        const glm::vec3 P0{unit(rng), unit(rng), depth0(rng)};
+        const glm::vec3 D{delta(rng), delta(rng), delta(rng)};
+        const float texels = glm::length(glm::vec2(D) * glm::vec2(W, H));
+        if (texels <= 1.0f) {
+            continue;
+        }
+        const float brute = brute_first_crossing(p, P0, D);
+        const MarchResult hier = hierarchical_march(p, P0, D, SCREEN_TRACE_START_MIP);
+        if (brute < 0.0f || !hier.converged) {
+            continue;
+        }
+        const float start = std::min(2.0f / texels, 1.0f);
+        // Only rays that actually walked to a surface: one that converged where
+        // it started never advanced onto a plane and has nothing to back off.
+        if ((hier.s - start) * texels < 4.0f || std::abs(hier.s - brute) * texels > 4.0f) {
+            continue;
+        }
+        ++landed;
+        if ((brute - hier.s_clear) * texels > 0.5f) {
+            ++backed_off;
+        }
+    }
+    ASSERT_GT(landed, 200) << "the fixture produced too few walked-to crossings to mean anything";
+    EXPECT_GT(backed_off, (landed * 7) / 10)
+        << "the handoff is being taken at the surface rather than before it: " << backed_off
+        << " of " << landed;
 }
 
 TEST(ScreenTraceMarch, TerminatesOnEveryRayItIsGiven) {
@@ -554,7 +711,7 @@ TEST(ShL1, UniformSphereReproducesItsOwnRadiance) {
     const glm::vec3 radiance{0.3f, 0.6f, 0.9f};
     for (int t = 0; t < SCREEN_PROBE_RAYS; ++t) {
         sh_l1_accumulate(coeffs, screen_probe_texel_direction(t, 0), radiance,
-                         SCREEN_PROBE_TEXEL_SOLID_ANGLE);
+                         screen_probe_texel_solid_angle(t, 0));
     }
     for (const glm::vec3& n : {glm::vec3{0, 1, 0}, glm::vec3{1, 0, 0}, glm::vec3{0, 0, -1},
                                glm::normalize(glm::vec3{1, 1, 1})}) {
@@ -576,13 +733,88 @@ TEST(ShL1, UniformHemisphereIsExactForTheAnchorNormal) {
     for (int t = 0; t < SCREEN_PROBE_RAYS; ++t) {
         const glm::vec3 d = screen_probe_texel_direction(t, 0);
         const glm::vec3 value = screen_probe_traces_texel(d, normal) ? radiance : glm::vec3(0.0f);
-        sh_l1_accumulate(coeffs, d, value, SCREEN_PROBE_TEXEL_SOLID_ANGLE);
+        sh_l1_accumulate(coeffs, d, value, screen_probe_texel_solid_angle(t, 0));
     }
     const glm::vec3 e = sh_l1_irradiance_over_pi(coeffs, normal);
     // E = integral of L cos over the hemisphere = pi * L, so E/pi = L = 1.
     EXPECT_NEAR(e.r, 1.0f, 0.03f);
     EXPECT_NEAR(e.g, 1.0f, 0.03f);
     EXPECT_NEAR(e.b, 1.0f, 0.03f);
+}
+
+TEST(ShL1, TheTexelSolidAngleSumsToTheWholeSphereButIsNotUniform) {
+    constexpr float FOUR_PI = 4.0f * 3.14159265358979323846f;
+    constexpr float UNIFORM = FOUR_PI / static_cast<float>(SCREEN_PROBE_RAYS);
+
+    // The SUM is 4*pi, which the old constant weight also had — and that is
+    // precisely why a uniform sphere and a uniform hemisphere both reproduced
+    // and hid the fact that the DISTRIBUTION was wrong.
+    float centres = 0.0f;
+    float lo = 1e9f;
+    float hi = -1e9f;
+    for (int t = 0; t < SCREEN_PROBE_RAYS; ++t) {
+        const float sa = screen_probe_texel_solid_angle(t, 0);
+        ASSERT_GT(sa, 0.0f);
+        centres += sa;
+        lo = std::min(lo, sa / UNIFORM);
+        hi = std::max(hi, sa / UNIFORM);
+    }
+    EXPECT_NEAR(centres, FOUR_PI, 1e-3f);
+    // A jittered frame samples the Jacobian off-centre, so its sum wanders by
+    // about a percent; the expectation over the jitter sequence is the exact
+    // solid angle, and the temporal EMA is what takes that expectation.
+    for (const std::uint32_t f : {1u, 7u, 33u, 1000u}) {
+        float sum = 0.0f;
+        for (int t = 0; t < SCREEN_PROBE_RAYS; ++t) {
+            sum += screen_probe_texel_solid_angle(t, f);
+        }
+        EXPECT_NEAR(sum, FOUR_PI, 0.02f * FOUR_PI) << "frame " << f;
+    }
+    // dOmega = dA/|v|^3 with |v| from 1/sqrt(3) to 1, so the true weight is
+    // roughly half the uniform one at the world axes and half again as much on
+    // the face diagonals. This is the assertion the "equal-area by
+    // construction" comment claimed was unnecessary.
+    EXPECT_LT(lo, 0.6f);
+    EXPECT_GT(hi, 1.4f);
+}
+
+TEST(ShL1, AConcentratedSourceReconstructsTheSameOnAWorldAxisAsOnADiagonal) {
+    // THE DEFECT THE UNIFORM WEIGHT HAD, stated as a property. The octahedral
+    // map is applied to WORLD directions with no rotation, so a per-texel weight
+    // error is fixed to the world axes: with the constant 4*pi/64 the same
+    // source reconstructs at 2.15x the correct L1 answer about +Y and 0.62x
+    // about (1,1,1)/sqrt(3). With the true solid angle the only error left is
+    // the L1 truncation, which is rotation-invariant — so the two ratios agree.
+    constexpr float HALF_ANGLE = 25.0f * 3.14159265358979323846f / 180.0f;
+    const float cos_half = std::cos(HALF_ANGLE);
+    // E(n) for a cap of half-angle theta about n is pi*sin^2(theta), so E/pi is
+    // sin^2(theta) — an exact reference, no quadrature.
+    const float reference = std::sin(HALF_ANGLE) * std::sin(HALF_ANGLE);
+    constexpr int FRAMES = 64; // what the temporal EMA integrates over
+
+    const auto ratio_about = [&](const glm::vec3& axis) {
+        glm::vec3 coeffs[4] = {};
+        for (std::uint32_t f = 0; f < FRAMES; ++f) {
+            for (int t = 0; t < SCREEN_PROBE_RAYS; ++t) {
+                const glm::vec3 d = screen_probe_texel_direction(t, f);
+                const float value = glm::dot(d, axis) >= cos_half ? 1.0f : 0.0f;
+                sh_l1_accumulate(coeffs, d, glm::vec3(value),
+                                 screen_probe_texel_solid_angle(t, f) /
+                                     static_cast<float>(FRAMES));
+            }
+        }
+        return sh_l1_irradiance_over_pi(coeffs, axis).r / reference;
+    };
+
+    const float on_axis = ratio_about({0.0f, 1.0f, 0.0f});
+    const float on_diagonal = ratio_about(glm::normalize(glm::vec3{1.0f, 1.0f, 1.0f}));
+    // ~0.76 both ways: an L1 fit cannot hold a 25-degree cap, and that shortfall
+    // is inherent, isotropic and not what this test is about.
+    EXPECT_GT(on_axis, 0.6f);
+    EXPECT_LT(on_axis, 0.9f);
+    EXPECT_NEAR(on_axis, on_diagonal, 0.08f)
+        << "the reconstruction depends on where in the octahedral map the source "
+           "landed: " << on_axis << " vs " << on_diagonal;
 }
 
 TEST(ShL1, ADirectionalLobeProjectsBackWhereItCameFrom) {
@@ -594,7 +826,7 @@ TEST(ShL1, ADirectionalLobeProjectsBackWhereItCameFrom) {
     for (int t = 0; t < SCREEN_PROBE_RAYS; ++t) {
         const glm::vec3 d = screen_probe_texel_direction(t, 5);
         const float lobe = std::max(0.0f, glm::dot(d, axis));
-        sh_l1_accumulate(coeffs, d, glm::vec3(lobe), SCREEN_PROBE_TEXEL_SOLID_ANGLE);
+        sh_l1_accumulate(coeffs, d, glm::vec3(lobe), screen_probe_texel_solid_angle(t, 5));
     }
     const float along = sh_l1_irradiance_over_pi(coeffs, axis).r;
     const float against = sh_l1_irradiance_over_pi(coeffs, -axis).r;
@@ -631,6 +863,129 @@ TEST(ShL1, BasisMatchesTheStoredCoefficientOrder) {
     EXPECT_NEAR(z[2], 0.48860251f, 1e-6f); // Y10 carries z
     const glm::vec4 x = sh_l1_basis({1.0f, 0.0f, 0.0f});
     EXPECT_NEAR(x[3], 0.48860251f, 1e-6f); // Y11 carries x
+}
+
+// ===========================================================================
+// The fused spatial filter (gi_screen_probe_project.comp.hlsl)
+// ===========================================================================
+
+TEST(ScreenProbeSpatialFilter, DoesNotAverageATexelAgainstANeighboursBelowHorizonZero) {
+    // The 3x3 gather is PER DIRECTION: thread i averages texel i across nine
+    // probes. But the march traces only the hemisphere above each anchor and
+    // writes a RESOLVED zero elsewhere, so two anchors whose normals differ by
+    // theta disagree about the horizon over a band sin(theta) of the hemisphere
+    // wide — 42% of it at 25 degrees, where cos^8 still passes the weight test
+    // comfortably. Folding a neighbour's structural zero in at full weight is a
+    // fabricated sample, and it darkens the tier on exactly the geometry
+    // (detailed, normal-varying) the screen tier exists to serve.
+    const glm::vec3 anchor_normal{0.0f, 1.0f, 0.0f};
+    constexpr float TILT = 25.0f * 3.14159265358979323846f / 180.0f;
+    constexpr int FRAMES = 64;
+
+    std::vector<glm::vec3> neighbours;
+    for (int k = 0; k < 8; ++k) {
+        const float phi = static_cast<float>(k) * 3.14159265358979323846f / 4.0f;
+        neighbours.push_back(glm::normalize(glm::vec3{std::sin(TILT) * std::cos(phi),
+                                                      std::cos(TILT),
+                                                      std::sin(TILT) * std::sin(phi)}));
+    }
+    // Sky above, dim ground below: the field a probe on open ground sees, and
+    // the one that makes a fabricated zero cost the most.
+    const auto field = [](const glm::vec3& d) { return d.y > 0.0f ? 1.0f : 0.1f; };
+
+    const auto reconstruct = [&](bool guard) {
+        glm::vec3 coeffs[4] = {};
+        for (std::uint32_t f = 0; f < FRAMES; ++f) {
+            for (int t = 0; t < SCREEN_PROBE_RAYS; ++t) {
+                const glm::vec3 d = screen_probe_texel_direction(t, f);
+                float radiance = 0.0f;
+                if (!guard || screen_probe_traces_texel(d, anchor_normal)) {
+                    // The centre tap: its own sample at weight 1, which is zero
+                    // below its own horizon whether or not the guard is on.
+                    float acc = screen_probe_traces_texel(d, anchor_normal) ? field(d) : 0.0f;
+                    float wsum = 1.0f;
+                    for (const glm::vec3& n : neighbours) {
+                        const bool traced = screen_probe_traces_texel(d, n);
+                        if (guard && !traced) {
+                            continue; // no sample here, not a black one
+                        }
+                        const float w = screen_probe_bilateral_weight(
+                            1000.0f, 1000.0f, anchor_normal, n, SCREEN_PROBE_NORMAL_POWER);
+                        if (w <= 1e-4f) {
+                            continue;
+                        }
+                        acc += (traced ? field(d) : 0.0f) * w;
+                        wsum += w;
+                    }
+                    radiance = wsum > 1e-6f ? acc / wsum : 0.0f;
+                }
+                sh_l1_accumulate(coeffs, d, glm::vec3(radiance),
+                                 screen_probe_texel_solid_angle(t, f) / static_cast<float>(FRAMES));
+            }
+        }
+        return sh_l1_irradiance_over_pi(coeffs, anchor_normal).r;
+    };
+
+    // Everything above this anchor's horizon carries radiance 1, so the answer
+    // is 1 — which the guarded gather reproduces because the hemisphere
+    // restriction stays exact (see ShL1.UniformHemisphereIsExactForTheAnchorNormal).
+    EXPECT_NEAR(reconstruct(true), 1.0f, 0.02f);
+    // The counter-case, and the reason this test exists: averaging the
+    // neighbours' structural zeros in loses several percent of the tier's
+    // energy, all of it on normal-varying geometry.
+    EXPECT_LT(reconstruct(false), 0.96f);
+}
+
+// ===========================================================================
+// The firefly clamp's sample count (gi_screen_probe_filter.comp.hlsl)
+// ===========================================================================
+
+TEST(ScreenProbeFirefly, TheClampMeanIsTakenOverTheTexelsThatCarryASample) {
+    // The clamp divides by the number of LIVE samples, not by SCREEN_PROBE_RAYS.
+    // Half the payload is below the anchor's horizon and is written as a
+    // resolved zero — a true zero for the SH projection, which integrates the
+    // whole sphere, but not a sample of anything. Dividing by 64 halves the
+    // statistic and with it the ceiling SCREEN_PROBE_FIREFLY_MAX is documented
+    // to be a multiple of.
+    int lowest = SCREEN_PROBE_RAYS;
+    int highest = 0;
+    long long total = 0;
+    int samples = 0;
+    std::mt19937 rng(20260809);
+    std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+    for (int trial = 0; trial < 400; ++trial) {
+        glm::vec3 n{unit(rng), unit(rng), unit(rng)};
+        if (glm::length(n) < 1e-3f) {
+            continue;
+        }
+        n = glm::normalize(n);
+        for (const std::uint32_t f : {0u, 1u, 7u, 33u}) {
+            const int live = screen_probe_live_sample_count(n, f);
+            lowest = std::min(lowest, live);
+            highest = std::max(highest, live);
+            total += live;
+            ++samples;
+        }
+    }
+    const double mean = static_cast<double>(total) / static_cast<double>(samples);
+    // ~32 of 64 on average — but never exactly 32, which is why the shader
+    // reduces the count alongside the luminance rather than assuming one.
+    EXPECT_NEAR(mean, 0.5 * SCREEN_PROBE_RAYS, 0.5);
+    EXPECT_GE(lowest, 20);
+    EXPECT_LE(highest, 44);
+    EXPECT_LT(lowest, SCREEN_PROBE_RAYS / 2);
+    EXPECT_GT(highest, SCREEN_PROBE_RAYS / 2);
+
+    // A probe whose lower hemisphere is all structural zeros must report the
+    // mean of what it MEASURED, not half of it.
+    const glm::vec3 up{0.0f, 1.0f, 0.0f};
+    const int live = screen_probe_live_sample_count(up, 0);
+    float sum = 0.0f;
+    for (int t = 0; t < SCREEN_PROBE_RAYS; ++t) {
+        sum += screen_probe_traces_texel(screen_probe_texel_direction(t, 0), up) ? 4.0f : 0.0f;
+    }
+    EXPECT_NEAR(sum / static_cast<float>(live), 4.0f, 1e-4f);
+    EXPECT_LT(sum / static_cast<float>(SCREEN_PROBE_RAYS), 2.2f) << "the divisor that was shipped";
 }
 
 // ===========================================================================

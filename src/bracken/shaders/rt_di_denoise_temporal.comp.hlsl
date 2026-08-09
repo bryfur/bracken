@@ -359,12 +359,38 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             //    Any re-measurement needs long runs (`--rt-bench 3000`) taken
             //    back to back on a quiet machine.
             //
-            // The right shape is probably still a DEDICATED R16F depth history
-            // for this signal — one cheap texture write here and one cached,
-            // filterable read at `prevUv`, rather than a scattered 16-byte
-            // random-access buffer index — because it also avoids depending on
-            // the visibility denoiser's history, which the Full tier is supposed
-            // to stop running at all.
+            // The next attempt needs NO new texture, which is worth knowing
+            // because "a dedicated R16F depth history" was the cost this note
+            // used to quote. `local_di_.filtered[0].a` ALREADY IS a linear view
+            // depth: rt_di_denoise_spatial writes `isFinal ? centerDepth :
+            // count`, and its final iteration runs strictly AFTER this dispatch
+            // inside the same denoise_local_di — so at this point the target
+            // still holds LAST frame's depth, in the same units and from the
+            // same linearization as `current.a`. Two things it must respect:
+            //
+            //  * `filtered[]` carries no SAMPLER usage (ensure_di_targets asks
+            //    for storage read/write only), so it binds as a second READ-ONLY
+            //    STORAGE TEXTURE and is point-`Load`ed at `prevUv`. Filtering
+            //    depth across a silhouette manufactures an intermediate value
+            //    that passes a test neither side would — the same argument the
+            //    direction history makes for its NEAREST sampler.
+            //  * The comparison must be made under the PREVIOUS camera. A fixed
+            //    relative window between last frame's depth and this frame's is
+            //    the error rt_local_shadow_gradient.comp.hlsl documents at
+            //    length: at a 420-unit boom the camera's own motion is several
+            //    world units per frame, which is under 1% at 500 units but 25%
+            //    against a 20-unit foreground prop — so the gate would reject
+            //    GOOD history exactly in the near field, pin `count` at 1, and
+            //    put the foreground permanently on the widest radius at
+            //    `alpha = 1`. Louder, not quieter. Reconstruct the view-space
+            //    point from `current.a` and the pixel's NDC, push it through a
+            //    `prevViewFromView` uniform, and test THAT against the stored
+            //    depth at the standard 0.05 relative window.
+            //
+            // And it must ship with an escape hatch whose 0 reproduces this
+            // image bit for bit, so the cost A/B is one build rather than two
+            // sessions — which is the half of the 2026-08-08 measurement that
+            // made it worthless.
             if (hist.a > 0.0 && valid > 0.0) {
                 const float4 histSpec =
                     specularHistory.SampleLevel(specularHistorySampler, prevUv, 0);

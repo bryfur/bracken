@@ -63,9 +63,9 @@ bool VoxelVolume::init(gpu::GPUDevice& device) {
         cascade.albedo = gpu::GPUTexture::create_3d(
             device, VOXEL_RESOLUTION, VOXEL_RESOLUTION, VOXEL_RESOLUTION,
             // R32_UINT, not RGBA8: the voxelizer's only order-independent
-            // write is an INTEGER ATOMIC (InterlockedMax over a packed RGBA8
-            // with opacity in the high byte), and an atomic needs an integer
-            // view. Same four bytes per texel either way, so the memory table is
+            // write is an INTEGER ATOMIC (InterlockedMax over a packed word with
+            // emissive intensity in the high byte), and an atomic needs an
+            // integer view. Same four bytes per texel either way, so the memory table is
             // unchanged — but declaring the shader's image format as r32ui over
             // an RGBA8_UNORM texture is a mismatch the driver does not report,
             // it simply faults inside the dispatch.

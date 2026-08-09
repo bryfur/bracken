@@ -142,8 +142,12 @@ struct ProbeUpdateParams {
     std::uint32_t light_count = 0;
     std::uint32_t light_capacity = 0;
 
-    /// How far a probe ray may see. Longer catches distant sky occlusion and
-    /// costs traversal; the default is the reflection trace's range.
+    /// How far a probe ray may see, as a CEILING. Longer catches distant sky
+    /// occlusion and costs traversal; the default is the reflection trace's
+    /// range. Each cascade then takes the smaller of this and
+    /// `PROBE_RAY_REACH_PROBES` of its own spacing (gi_math.hpp), so the finest
+    /// cascade does not pay for reach its own window never uses — only the
+    /// coarsest one actually sees this number.
     float ray_max_distance = 4000.0f;
 
     /**

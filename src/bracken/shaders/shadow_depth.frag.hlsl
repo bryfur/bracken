@@ -4,6 +4,11 @@
  * Supports alpha-tested shadows for transparent textures (leaves, etc.).
  * When hasTexture is set and texture alpha < 0.5, the pixel is discarded
  * so light passes through transparent parts.
+ *
+ * Known divergence from the forward/prepass alpha test: the cutoff here is a
+ * literal 0.5, not the material's `alphaCutoff` (the pack foliage authors
+ * 0.35), because ShadowFragUniforms has no channel to carry it. The cascade is
+ * therefore slightly LESS permissive than the surfaces it shadows.
  */
 
 struct PSInput {
@@ -29,6 +34,13 @@ SamplerState baseColorSampler;
 void PSMain(PSInput input) {
     if (hasTexture == 1) {
         float alpha = baseColorTexture.Sample(baseColorSampler, input.texCoord).a;
+        // Same mip-coverage boost as model.frag.hlsl / prepass_gbuffer_masked:
+        // box-filtered mips AVERAGE alpha, so a minified leaf card erodes out
+        // of the far cascades while it still draws solid on screen — the
+        // canopy's shadow perforates at exactly the distance its silhouette
+        // does not.
+        float mip = baseColorTexture.CalculateLevelOfDetailUnclamped(baseColorSampler, input.texCoord);
+        alpha *= 1.0 + max(mip, 0.0) * 0.35;
         if (alpha < 0.5) discard;
     }
 }

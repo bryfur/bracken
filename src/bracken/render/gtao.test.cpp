@@ -1,7 +1,10 @@
 #include "bracken/render/gtao.hpp"
+#include "bracken/render/gi/gi_math.hpp" // oct_encode/oct_decode: the CPU mirror of bent_cone.hlsli
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <glm/glm.hpp>
 #include <gtest/gtest.h>
 #include <random>
 #include <vector>
@@ -456,4 +459,119 @@ TEST(GtaoUniformDefaults, AoAndBlurMaxDistanceAgree) {
     const GTAOUniforms ao{};
     const BlurUniforms blur{};
     EXPECT_FLOAT_EQ(ao.maxDistance, blur.maxDistance);
+}
+
+// =============================================================================
+// Per-frame temporal jitter — detail::temporal_sequence
+//
+// The shader offsets its two INDEPENDENT jitter axes (slice rotation, step
+// offset) by these two values, so what matters is the joint distribution of the
+// PAIR, not either marginal. The pair this replaced — (phi^-1, 1 - phi^-1) —
+// passed every per-axis uniformity test while summing to exactly 1.0 in
+// binary32 on every frame, which pinned the sampler to one line of the unit
+// square. Test the pair.
+// =============================================================================
+
+TEST(GtaoTemporalJitter, PairCoversTheUnitSquare) {
+    // 8x8 occupancy over 256 frames. A complementary pair fills only the 8
+    // anti-diagonal cells; two rationally independent scales fill all 64.
+    bool cell[8][8] = {};
+    for (uint64_t f = 0; f < 256; ++f) {
+        const float a = detail::temporal_sequence(f, detail::TEMPORAL_R2_A);
+        const float b = detail::temporal_sequence(f, detail::TEMPORAL_R2_B);
+        cell[std::min(7, static_cast<int>(a * 8.0f))][std::min(7, static_cast<int>(b * 8.0f))] = true;
+    }
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            EXPECT_TRUE(cell[i][j]) << "cell " << i << "," << j;
+        }
+    }
+}
+
+// The exact failure mode, stated as an invariant: c1 + c2 == 1 in binary32 is
+// what collapses the 2-D jitter space to a line.
+TEST(GtaoTemporalJitter, ScalesAreNotComplementary) {
+    EXPECT_NE(detail::TEMPORAL_R2_A + detail::TEMPORAL_R2_B, 1.0f);
+    for (uint64_t f = 1; f < 512; ++f) {
+        const float sum = detail::temporal_sequence(f, detail::TEMPORAL_R2_A) +
+                          detail::temporal_sequence(f, detail::TEMPORAL_R2_B);
+        if (std::abs(sum - 1.0f) > 1e-3f) {
+            SUCCEED();
+            return;
+        }
+    }
+    FAIL() << "the two axes summed to 1 on every frame — the pair is a line, not a square";
+}
+
+// Each axis is still a jitter in [0, 1).
+TEST(GtaoTemporalJitter, StaysInUnitInterval) {
+    for (uint64_t f = 0; f < 4200; ++f) {
+        for (const float scale : {detail::TEMPORAL_R2_A, detail::TEMPORAL_R2_B}) {
+            const float v = detail::temporal_sequence(f, scale);
+            EXPECT_GE(v, 0.0f) << "frame " << f;
+            EXPECT_LT(v, 1.0f) << "frame " << f;
+        }
+    }
+}
+
+// =============================================================================
+// Why the AO chain never reads its own texture through a hardware LINEAR
+// sampler (shaders/bent_cone.hlsli, gtao_temporal.frag.hlsl).
+//
+// GB is an octahedral pair. `render::gi::oct_encode`/`oct_decode` are the CPU
+// mirror of `bentOctEncode`/`bentOctDecode` — the same Cigolle et al. mapping —
+// so this pins the property the shaders honour, not a re-implementation of it.
+// =============================================================================
+
+namespace {
+
+float degrees_between(const glm::vec3& a, const glm::vec3& b) {
+    const float c = std::clamp(glm::dot(glm::normalize(a), glm::normalize(b)), -1.0f, 1.0f);
+    return std::acos(c) * 180.0f / PI;
+}
+
+} // namespace
+
+// Two neighbours straddling the encoding's fold seam ({n.z < 0, n.x == 0}): the
+// directions are 2.3 degrees apart, their ENCODED coordinates are at opposite
+// ends of the unit square, and the midpoint of the coordinates decodes to a
+// direction perpendicular to both.
+TEST(GtaoBentNormalFilter, AveragingOctahedralCoordinatesAcrossTheSeamIsNotAveragingDirections) {
+    const glm::vec3 a = glm::normalize(glm::vec3(0.02f, 0.3f, -0.95f));
+    const glm::vec3 b = glm::normalize(glm::vec3(-0.02f, 0.3f, -0.95f));
+    ASSERT_LT(degrees_between(a, b), 5.0f) << "the two inputs must be near-identical directions";
+
+    const glm::vec3 coordinate_mean = gi::oct_decode((gi::oct_encode(a) + gi::oct_encode(b)) * 0.5f);
+    EXPECT_GT(degrees_between(coordinate_mean, a), 70.0f);
+    EXPECT_GT(degrees_between(coordinate_mean, b), 70.0f);
+
+    // Decode, average, renormalise, re-encode — what every stage of the AO
+    // chain does — lands on the bisector instead.
+    const glm::vec3 direction_mean = glm::normalize(a + b);
+    EXPECT_LT(degrees_between(direction_mean, a), 2.0f);
+    EXPECT_LT(degrees_between(direction_mean, b), 2.0f);
+}
+
+// The pole case, where the four texels a bilinear tap would mix land on four
+// different corners of the unit square: their mean decodes to the OPPOSITE
+// direction, not a nearby one.
+TEST(GtaoBentNormalFilter, CoordinateAveragingAtTheFoldPoleInvertsTheDirection) {
+    glm::vec2 sum(0.0f);
+    for (const float sx : {1.0f, -1.0f}) {
+        for (const float sy : {1.0f, -1.0f}) {
+            sum += gi::oct_encode(glm::normalize(glm::vec3(sx * 0.03f, sy * 0.03f, -0.999f)));
+        }
+    }
+    const glm::vec3 coordinate_mean = gi::oct_decode(sum * 0.25f);
+    EXPECT_GT(degrees_between(coordinate_mean, glm::vec3(0.0f, 0.0f, -1.0f)), 170.0f);
+}
+
+// The control: the SAME averaging is harmless on the +Z side, which is why this
+// shows up as a defect confined to surfaces facing world -Z rather than as
+// uniform mush.
+TEST(GtaoBentNormalFilter, CoordinateAveragingIsHarmlessAwayFromTheSeam) {
+    const glm::vec3 a = glm::normalize(glm::vec3(0.02f, 0.3f, 0.95f));
+    const glm::vec3 b = glm::normalize(glm::vec3(-0.02f, 0.3f, 0.95f));
+    const glm::vec3 coordinate_mean = gi::oct_decode((gi::oct_encode(a) + gi::oct_encode(b)) * 0.5f);
+    EXPECT_LT(degrees_between(coordinate_mean, glm::normalize(a + b)), 2.0f);
 }

@@ -226,7 +226,7 @@ Composite
   targets   blend=None color=R8G8B8A8_UNORM has_depth=false depth=D32_FLOAT samples=1
 BloomDownsample
   vs        fullscreen.vert.spv samplers=0 storage_textures=0 storage_buffers=0 uniform_buffers=0
-  fs        bloom_downsample.frag.spv samplers=1 storage_textures=0 storage_buffers=0 uniform_buffers=1
+  fs        bloom_downsample.frag.spv samplers=1 storage_textures=0 storage_buffers=1 uniform_buffers=1
   raster    primitive=TRIANGLELIST fill=FILL cull=NONE front=COUNTER_CLOCKWISE
   bias      enable=false constant=0 slope=0 clamp=0 depth_clip=true
   depth     test=false write=false compare=GREATER_OR_EQUAL stencil=false

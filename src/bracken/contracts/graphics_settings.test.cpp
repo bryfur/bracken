@@ -63,17 +63,19 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
     EXPECT_EQ(s.rt_local_shadows, LocalRtShadowMode::Off);
     EXPECT_EQ(s.rt_local_shadow_resolution, RtResolution::Half);
     // Diffuse GI is OFF by default: the probe field costs ~30 MB of atlases the
-    // moment it exists, and until phase R1b it buys nothing. gi_quality is
-    // stored regardless (R1b reads it) so the file format does not change again.
+    // moment it exists, plus a per-frame ray budget. gi_quality selects that
+    // budget (probe_schedule.hpp's gi_budget()) and is stored regardless.
     EXPECT_EQ(s.gi_mode, GiMode::Off);
     EXPECT_EQ(s.gi_quality, GiQuality::Medium);
 }
 
-// GiMode::ProbesScreen is declared before it does anything (it behaves as
-// Probes until phase R4). That is only safe if it is a first-class value now —
-// a clamp that rejected it would silently rewrite a forward-looking settings
-// file back to Probes, which is exactly the migration this pre-declaration
-// exists to avoid.
+// Every declared GiMode has to survive the file, because the clamp in
+// clamp_to_valid_ranges() is the only thing between an on-disk integer and the
+// renderer — and load() runs it unconditionally. A bound that stops short of
+// the newest enumerator rewrites a player's chosen mode on load, and
+// shutdown_renderer()'s auto-save then persists the downgrade. That is what
+// happened to VoxelProbes, so the out-of-range case below pins the TOP real
+// enumerator rather than a fixed one.
 TEST_F(GraphicsSettingsTest, GiSettingsRoundTripAndClamp) {
     GraphicsSettings written;
     written.gi_mode = GiMode::ProbesScreen;
@@ -85,6 +87,19 @@ TEST_F(GraphicsSettingsTest, GiSettingsRoundTripAndClamp) {
     ASSERT_TRUE(read.load(TEST_FILE));
     EXPECT_EQ(read.gi_mode, GiMode::ProbesScreen);
     EXPECT_EQ(read.gi_quality, GiQuality::High);
+
+    // The raster mode is the newest enumerator and the one the clamp used to
+    // eat. Walk every GiMode through the file, so adding a mode without raising
+    // the bound fails here instead of in a player's settings file.
+    for (int i = 0; i <= static_cast<int>(GiMode::VoxelProbes); ++i) {
+        const auto mode = static_cast<GiMode>(i);
+        GraphicsSettings mode_written;
+        mode_written.gi_mode = mode;
+        ASSERT_TRUE(mode_written.save(TEST_FILE));
+        GraphicsSettings mode_read;
+        ASSERT_TRUE(mode_read.load(TEST_FILE));
+        EXPECT_EQ(mode_read.gi_mode, mode) << "gi_mode=" << i << " did not survive the round trip";
+    }
 
     // ...and back to Off, so a file holding 0 really clears it.
     GraphicsSettings off;
@@ -105,7 +120,7 @@ TEST_F(GraphicsSettingsTest, GiSettingsRoundTripAndClamp) {
     }
     GraphicsSettings clamped;
     ASSERT_TRUE(clamped.load(TEST_FILE));
-    EXPECT_EQ(clamped.gi_mode, GiMode::ProbesScreen);
+    EXPECT_EQ(clamped.gi_mode, GiMode::VoxelProbes);
     EXPECT_EQ(clamped.gi_quality, GiQuality::Low);
 }
 

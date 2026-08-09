@@ -163,6 +163,11 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
             if (texelLength > 1.0 && historyValid > 0.5) {
                 float sEps = 0.25 / texelLength;
                 float s = min(2.0 / texelLength, 1.0); // start clear of the anchor's own surface
+                // The last screen parameter PROVEN free of any surface. `s` is
+                // not that: the advance below lands the ray ON a depth plane,
+                // so a reject there means the crossing is between sClear and s.
+                // This is what a handoff resumes from — see below.
+                float sClear = s;
                 int level = GI_SP_START_MIP;
                 bool escaped = false;
 
@@ -184,17 +189,44 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
                     float2 cellBefore = floor(uv * cells);
                     float hz = hzb.Load(int3(giSpCell(uv, cells, mipSize), level)).r;
 
-                    float sNext = s;
                     // REVERSED-Z, and the pyramid is a MAX (render/hzb.hpp): a
                     // larger stored value is a CLOSER surface, so `hz <= rayZ`
                     // means the ray is in front of everything in the footprint
-                    // and may be advanced all the way to that depth plane.
-                    if (hz <= P0.z + D.z * s && abs(D.z) > 1e-9) {
+                    // and may be advanced all the way to that depth plane. A
+                    // sky texel (hz == 0) is subsumed: device depth along the
+                    // ray is positive wherever the ray is in front of the far
+                    // plane. Nothing in this footprint can be hit from here, so
+                    // this position is also the last one proven clear.
+                    bool ahead = hz <= P0.z + D.z * s;
+                    if (ahead) {
+                        sClear = s;
+                    }
+
+                    float sNext = s;
+                    if (ahead && abs(D.z) > 1e-9) {
                         sNext = max(s, (hz - P0.z) / D.z);
                     }
 
                     float2 cellAfter = floor((P0.xy + D.xy * sNext) * cells);
-                    if (any(cellAfter != cellBefore)) {
+                    // THE DEPTH PLANE CAN ONLY ADVANCE A RECEDING RAY. In
+                    // reversed-Z a ray travelling TOWARD the camera has D.z > 0,
+                    // so `hz <= rayZ` gives (hz - P0.z)/D.z <= s and the max()
+                    // above clamps the advance to s — leaving the cell boundary
+                    // as that ray's only forward progress. Without this term
+                    // such a ray marches ZERO distance, spends its three levels
+                    // refining the texel it started in, and is handed to the BVH
+                    // from the anchor; on a surface facing the camera that is
+                    // the whole upper hemisphere. A ray with |D.z| below the
+                    // guard above stalls for the same reason and is covered by
+                    // the same term.
+                    //
+                    // Stepping there is exactly conservative: rayZ only rises
+                    // with s, so a ray already in front of this cell's CLOSEST
+                    // surface stays in front for the whole traversal and nothing
+                    // in the footprint can be hit. Do NOT extend this to
+                    // !ahead — that is the descend-to-refine path, and stepping
+                    // it tunnels through every surface the ladder exists to find.
+                    if (any(cellAfter != cellBefore) || (ahead && D.z > -1e-9)) {
                         // The depth-plane advance left this cell, so it is not
                         // evidence about the next one: clamp to the boundary and
                         // coarsen. +2 here against the -1 below is a NET +1 —
@@ -218,7 +250,12 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
                         // ray that arrives behind it is a hit only within an
                         // assumed slab. Beyond the slab the ray passed BEHIND
                         // something the screen cannot see around, and the honest
-                        // answer is the BVH's — see the handoff below.
+                        // answer is the BVH's — which is why the handoff below
+                        // resumes at `sClear`, BEFORE the crossing, so the BVH
+                        // gets to adjudicate the occluder rather than starting
+                        // past it. The same branch also catches a sky texel and
+                        // a ray more than a unit IN FRONT of the surface; there
+                        // `sClear` is the sample itself and nothing is given up.
                         if (hz > 0.0 && rayZ >= surfaceZ - 1.0 &&
                             rayZ <= surfaceZ + giSpThickness(surfaceZ)) {
                             float t = worldTAtScreenS(s, h0.w, h1.w);
@@ -261,13 +298,24 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
                                 }
                             }
                             if (!isHit) {
-                                resumeDistance = worldDistance;
+                                // The march FOUND this surface and only failed
+                                // to read its radiance (off-screen last frame,
+                                // or the depth-continuity guard rejected the
+                                // reprojection). Resuming at `worldDistance`
+                                // would start the BVH ray on or past it and no
+                                // estimator would ever see it — so resume at the
+                                // last proven-clear sample instead.
+                                resumeDistance =
+                                    saturate(worldTAtScreenS(sClear, h0.w, h1.w)) * tMax;
                             }
                         } else {
-                            resumeDistance = saturate(worldTAtScreenS(s, h0.w, h1.w)) * tMax;
+                            resumeDistance = saturate(worldTAtScreenS(sClear, h0.w, h1.w)) * tMax;
                         }
                     }
                 } else {
+                    // ESCAPED or out of steps: every advance on the way here was
+                    // justified, so `s` itself is proven clear and the whole
+                    // segment behind it can be skipped.
                     resumeDistance = saturate(worldTAtScreenS(min(s, 1.0), h0.w, h1.w)) * tMax;
                 }
             }

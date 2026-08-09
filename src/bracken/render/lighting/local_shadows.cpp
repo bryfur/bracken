@@ -69,6 +69,9 @@ struct LightTraits<PointLight> {
     static bool shadow_relevant_changed(const PointLight& a, const PointLight& b) {
         return a.position != b.position || a.radius != b.radius;
     }
+    static uint8_t caster_mask(const glm::vec3& to_caster, float caster_radius, int tile_resolution) {
+        return local_shadow_caster_face_mask(to_caster, caster_radius, tile_resolution);
+    }
 };
 
 template <>
@@ -80,6 +83,9 @@ struct LightTraits<SpotLight> {
         return a.position != b.position || a.radius != b.radius || a.direction != b.direction ||
                a.outer_cos != b.outer_cos;
     }
+    // A spot owns one tile: anything inside its sphere is inside that tile's
+    // only candidate face.
+    static uint8_t caster_mask(const glm::vec3&, float, int) { return SPOT_FULL_MASK; }
 };
 
 } // namespace
@@ -97,6 +103,34 @@ int local_shadow_cube_face(const glm::vec3& d) {
         return d.y > 0.0f ? 2 : 3;
     }
     return d.z > 0.0f ? 4 : 5;
+}
+
+uint8_t local_shadow_caster_face_mask(const glm::vec3& to_caster, float caster_radius, int tile_resolution) {
+    const float rc = std::max(caster_radius, 0.0f);
+    if (glm::dot(to_caster, to_caster) <= rc * rc) {
+        return POINT_FULL_MASK; // the light is inside the caster: every face sees it
+    }
+    // A face's frustum is a SQUARE PYRAMID, not a 45-degree cone — its corner
+    // reaches atan(sqrt(2)) = 54.7 deg, and point_face_fovy widens it further.
+    // Testing an inscribed cone would reject faces the caster genuinely
+    // occupies, leaving its silhouette baked into a live tile, so the test is
+    // the pyramid's four side planes. They all pass through the light, so the
+    // usual "signed distance >= -radius" collapses to two comparisons per face
+    // once the shared 1/sqrt(1+s^2) plane-normal denominator is folded into
+    // the right-hand side.
+    const float s = std::tan(point_face_fovy(tile_resolution) * 0.5f);
+    const float slack = -rc * std::sqrt(1.0f + s * s);
+    uint8_t mask = 0;
+    for (int face = 0; face < 6; ++face) {
+        const int axis = face >> 1; // 0:x 1:y 2:z, sign from bit 0 — see face_forward()
+        const float pf = (face & 1) ? -to_caster[axis] : to_caster[axis];
+        const float pa = to_caster[(axis + 1) % 3];
+        const float pb = to_caster[(axis + 2) % 3];
+        if (s * pf - std::abs(pa) >= slack && s * pf - std::abs(pb) >= slack) {
+            mask |= static_cast<uint8_t>(1u << face);
+        }
+    }
+    return mask;
 }
 
 float local_shadow_light_score(float intensity, float radius, float distance) {
@@ -147,7 +181,8 @@ glm::mat4 local_spot_view_proj(const glm::vec3& pos, const glm::vec3& dir, float
 template <typename LightT>
 void LocalShadowSelector::assign_groups(std::span<Group> groups, int budget, std::vector<LightT>& lights,
                                         const glm::vec3& camera_pos,
-                                        std::span<const LocalShadowDynamicCaster> dynamic_casters, float hysteresis) {
+                                        std::span<const LocalShadowDynamicCaster> dynamic_casters, float hysteresis,
+                                        int tile_resolution, const scene::Frustum* view_frustum) {
     using T = LightTraits<LightT>;
 
     // Groups beyond the active budget are dropped (budget setting shrank).
@@ -160,10 +195,21 @@ void LocalShadowSelector::assign_groups(std::span<Group> groups, int budget, std
 
     score_scratch_.assign(static_cast<size_t>(light_count), 0.0f);
     for (int i = 0; i < light_count; ++i) {
-        if (candidate_ok(lights[i])) {
-            score_scratch_[i] = local_shadow_light_score(lights[i].intensity, lights[i].radius,
-                                                         glm::length(lights[i].position - camera_pos));
+        if (!candidate_ok(lights[i])) {
+            continue;
         }
+        float score = local_shadow_light_score(lights[i].intensity, lights[i].radius,
+                                               glm::length(lights[i].position - camera_pos));
+        // Demote lights whose sphere lights nothing on screen. Applied HERE
+        // rather than at fill time on purpose: incumbents re-read
+        // score_scratch_ in step A, so step D's eviction margin compares like
+        // with like — an off-screen incumbent must be 1/(scale*dilation) =
+        // 3.2x more important in raw terms to hold its slot.
+        if (view_frustum && !view_frustum->intersects_sphere(lights[i].position,
+                                                             lights[i].radius * k_offscreen_test_dilation)) {
+            score *= k_offscreen_score_scale;
+        }
+        score_scratch_[i] = score;
     }
 
     // A) Match incumbents to this frame's lights by nearest position of the
@@ -269,16 +315,32 @@ void LocalShadowSelector::assign_groups(std::span<Group> groups, int budget, std
         }
         const LightT& cur = lights[grp.light_index];
         if (T::shadow_relevant_changed(cur, T::stored(grp))) {
-            grp.dirty_mask = T::FULL;
+            grp.dirty_mask = T::FULL; // the light moved: every face really changed
+            grp.prev_caster_mask = 0; // nothing left for the departure test to add
         } else {
+            // Only the faces the caster can actually appear in: a sphere at
+            // distance d with radius rc subtends asin(rc/d), which reaches one
+            // face for most of the sphere and all six only when the light is
+            // inside it. Dirtying all six burned up to 6x the frame's tile cap
+            // on faces that did not change.
+            uint8_t now_mask = 0;
             for (const auto& caster : dynamic_casters) {
                 const float r = caster.radius + cur.radius;
                 const glm::vec3 d = caster.center - cur.position;
-                if (glm::dot(d, d) <= r * r) {
-                    grp.dirty_mask = T::FULL;
+                if (glm::dot(d, d) > r * r) {
+                    continue;
+                }
+                now_mask |= T::caster_mask(d, caster.radius, tile_resolution);
+                if (now_mask == T::FULL) {
                     break;
                 }
             }
+            // OR, never assign: dirty bits deferred by the tile cap are only
+            // cleared when the face actually renders, so they must survive.
+            // The previous frame's mask is folded in because a caster that
+            // LEFT a face must dirty the face it left.
+            grp.dirty_mask |= static_cast<uint8_t>(now_mask | grp.prev_caster_mask);
+            grp.prev_caster_mask = now_mask;
         }
         T::stored(grp) = cur;
     }
@@ -321,7 +383,10 @@ void LocalShadowSelector::schedule_and_publish(std::vector<PointLight>& points, 
 
     // Ring of active groups: point groups first, then spots. The persistent
     // cursor makes the tile-update cap round-robin fair — a starved group
-    // catches up on later frames instead of never rendering.
+    // catches up on later frames instead of never rendering. Fairness at group
+    // granularity is not enough on its own: a group that is only ever reached
+    // with fewer than its face count left would re-render its low-index faces
+    // forever, so each group carries a face cursor too (see the face loop).
     const int ring_size = point_budget + spot_budget;
     int budget_left = std::max(config.max_tile_updates_per_frame, 0);
     int last_serviced = -1;
@@ -358,7 +423,16 @@ void LocalShadowSelector::schedule_and_publish(std::vector<PointLight>& points, 
                     continue; // all-or-nothing for fresh assignments
                 }
                 const int faces = is_spot ? 1 : 6;
-                for (int f = 0; f < faces && budget_left > 0; ++f) {
+                // Round-robin the FACES, not just the groups. A group that is
+                // only ever reached with fewer than `faces` tiles left would
+                // otherwise re-render faces 0..k every frame and never the
+                // rest — step E rewrites dirty_mask = FULL for a moving light,
+                // so `need` is not the residue of last frame's partial
+                // service. start_face is SNAPSHOTTED: face_cursor is written
+                // inside the loop, and re-reading it there would skip faces.
+                const int start_face = static_cast<int>(grp.face_cursor) % faces;
+                for (int i = 0; i < faces && budget_left > 0; ++i) {
+                    const int f = (start_face + i) % faces;
                     const uint8_t bit = static_cast<uint8_t>(1u << f);
                     if ((need & bit) == 0) {
                         continue;
@@ -370,6 +444,7 @@ void LocalShadowSelector::schedule_and_publish(std::vector<PointLight>& points, 
                     }
                     grp.dirty_mask &= static_cast<uint8_t>(~bit);
                     grp.valid_mask |= bit;
+                    grp.face_cursor = static_cast<uint8_t>((f + 1) % faces);
                     slot_data_dirty_ = true;
                     ++tiles_rendered_total_;
                     --budget_left;
@@ -406,7 +481,8 @@ void LocalShadowSelector::schedule_and_publish(std::vector<PointLight>& points, 
 void LocalShadowSelector::update(std::vector<PointLight>& points, std::vector<SpotLight>& spots,
                                  const glm::vec3& camera_pos,
                                  std::span<const LocalShadowDynamicCaster> dynamic_casters,
-                                 const LocalShadowConfig& config, int tile_resolution) {
+                                 const LocalShadowConfig& config, int tile_resolution,
+                                 const scene::Frustum* view_frustum) {
     BRACKEN_PROFILE_ZONE_COLOR("LocalShadowSelector::update", 0xE67E22);
     requests_.clear();
     shadowed_points_ = 0;
@@ -422,8 +498,10 @@ void LocalShadowSelector::update(std::vector<PointLight>& points, std::vector<Sp
         l.shadow_slot = -1;
     }
 
-    assign_groups<PointLight>(point_groups_, point_budget, points, camera_pos, dynamic_casters, config.hysteresis);
-    assign_groups<SpotLight>(spot_groups_, spot_budget, spots, camera_pos, dynamic_casters, config.hysteresis);
+    assign_groups<PointLight>(point_groups_, point_budget, points, camera_pos, dynamic_casters, config.hysteresis,
+                              tile_resolution, view_frustum);
+    assign_groups<SpotLight>(spot_groups_, spot_budget, spots, camera_pos, dynamic_casters, config.hysteresis,
+                             tile_resolution, view_frustum);
     schedule_and_publish(points, spots, point_budget, spot_budget, config, tile_resolution);
 }
 
@@ -538,8 +616,8 @@ bool LocalShadowMap::is_ready() const {
 void LocalShadowMap::update(std::vector<PointLight>& points, std::vector<SpotLight>& spots,
                             const glm::vec3& camera_pos,
                             std::span<const LocalShadowDynamicCaster> dynamic_casters,
-                            const LocalShadowConfig& config) {
-    selector_.update(points, spots, camera_pos, dynamic_casters, config, tile_resolution());
+                            const LocalShadowConfig& config, const scene::Frustum* view_frustum) {
+    selector_.update(points, spots, camera_pos, dynamic_casters, config, tile_resolution(), view_frustum);
 }
 
 void LocalShadowMap::upload(SDL_GPUCopyPass* copy_pass) {

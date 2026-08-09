@@ -124,22 +124,43 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     const float insideThreshold =
         wasInside ? GI_INSIDE_BACKFACE_LEAVE : GI_INSIDE_BACKFACE_FRACTION;
 
-    if (fraction > relocateThreshold) {
-        float len = length(backfaceSum);
-        float3 away = len > 1e-4 ? -backfaceSum / len : float3(0.0, 1.0, 0.0);
-        offset = previousOffset + away * (0.25 * giProbeSpacing);
-        float offsetLen = length(offset);
-        if (offsetLen > giMaxOffset) {
-            offset *= giMaxOffset / max(offsetLen, 1e-6);
-        }
-        relocated = true;
+    // IS THERE A DIRECTION TO GO AT ALL? `-normalize(backfaceSum)` is only
+    // meaningful while the backfaces occupy PART of the sphere. A probe fully
+    // enclosed in geometry flags every ray, and the resultant of the whole
+    // rotated Fibonacci set is not zero — it is numerical residue of length
+    // ~0.06-0.10 over 32-96 unit vectors, three orders of magnitude clear of any
+    // "is it zero" epsilon, pointing wherever giRayRotation put it THIS frame.
+    // Nudging along that is a random walk, and gi_sample.hlsli reads the walking
+    // offset as the probe's position for both the Chebyshev distance and the
+    // backface weight. gi_math.hpp's PROBE_RELOCATE_MIN_COHERENCE carries the
+    // derivation of the threshold.
+    const float len = length(backfaceSum);
+    const bool coherent = backfaces > 0u && len > GI_RELOCATE_MIN_COHERENCE * float(backfaces);
 
-        // Already nudged as far as it is allowed to go and STILL mostly looking
-        // at backfaces: this probe is inside something, and no offset inside
-        // half a cell will get it out. Mark it; the blend passes stop writing
-        // it and gi_sample.hlsli drops it from the trilinear cage rather than
-        // letting it leak a wall's interior into the street.
-        if (fraction > insideThreshold && length(previousOffset) >= giMaxOffset * 0.99) {
+    if (fraction > relocateThreshold) {
+        if (coherent) {
+            float3 away = -backfaceSum / max(len, 1e-6);
+            offset = previousOffset + away * (0.25 * giProbeSpacing);
+            float offsetLen = length(offset);
+            if (offsetLen > giMaxOffset) {
+                offset *= giMaxOffset / max(offsetLen, 1e-6);
+            }
+            relocated = true;
+        }
+
+        // Relocation cannot help this probe: either it has already gone as far
+        // as it is allowed to go and is STILL mostly looking at backfaces, or
+        // there is no direction to go in. Both are "inside something". Mark it;
+        // the blend passes stop writing it and gi_sample.hlsli drops it from the
+        // trilinear cage rather than letting it leak a wall's interior into the
+        // street.
+        //
+        // The !coherent arm is not an optimization: with the guard above, an
+        // enclosed probe's offset never reaches the clamp, so gating the verdict
+        // on the clamp alone would leave it GI_CLASS_OK forever — at full weight
+        // in every cage, contributing the black radiance a buried probe measures.
+        if (fraction > insideThreshold &&
+            (!coherent || length(previousOffset) >= giMaxOffset * 0.99)) {
             classification = GI_CLASS_INSIDE_GEOMETRY;
         }
     }

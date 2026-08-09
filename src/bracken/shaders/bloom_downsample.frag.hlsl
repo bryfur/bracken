@@ -16,20 +16,29 @@ cbuffer BloomDownsampleUniforms : register(b0, space3) {
     float2 srcTexelSize;   // 1.0 / source resolution
     float threshold;       // post-exposure luminance threshold (first pass only)
     float isFirstPass;     // 1.0 for first pass (apply threshold), 0.0 otherwise
-    float exposure;        // composite-pass exposure, applied before thresholding
+    float exposure;        // composite-pass MANUAL exposure bias
+    float autoExposureEnabled; // 1 when exposureState below holds a live EV
     // The CPU struct (gpu::BloomDownsampleUniforms) pads to 32 bytes and the
     // engine pushes all 32, so the cbuffer declares the pad too — same
     // convention as ShadowFragUniforms / UIFragmentUniforms. Named scalars,
-    // not float[3]: a cbuffer array would stride at 16 B per element.
+    // not float[2]: a cbuffer array would stride at 16 B per element.
     float _padding0;
     float _padding1;
-    float _padding2;
 };
 
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
 Texture2D srcTexture : register(t0, space2);
 [[vk::combinedImageSampler]][[vk::binding(0, 2)]]
 SamplerState srcSampler : register(s0, space2);
+
+// Auto-exposure state written by exposure_adapt.comp, the SAME buffer and the
+// same layout composite.frag.hlsl reads: x = adapted EV, y = target EV,
+// z = avg log2 luminance, w = valid. Storage buffers follow the samplers in
+// space2, so with one sampler above this is slot 1 (composite has four
+// samplers and lands on t4). Only read when autoExposureEnabled — the slot
+// binds a zeroed dummy when auto exposure is off or unavailable.
+[[vk::binding(1, 2)]]
+StructuredBuffer<float4> exposureState : register(t1, space2);
 
 float bloomLuminance(float3 c) {
     return dot(c, float3(0.2126, 0.7152, 0.0722));
@@ -45,10 +54,19 @@ float karisWeight(float3 c) {
 // The threshold decision is made in POST-exposure luminance so "what blooms"
 // tracks what will actually be bright after the composite pass applies
 // exposure (an exposure-dropped night scene stops blooming mid-grey surfaces).
+// POST-exposure means BOTH of composite's factors — the manual bias AND the
+// adapted EV — because composite multiplies by `exposure * exp2(EV)`. Seeing
+// only the bias is what made this cut scene-referred: at a night-adapted
+// EV of +4 the effective threshold was 16x its nominal value, four stops past
+// display white, so nothing but the emitters themselves bloomed.
 // The returned color stays in pre-exposure scene units — composite multiplies
 // bloom by exposure later, so exposure must not be baked in twice.
 float3 applyThreshold(float3 color) {
-    float lum = bloomLuminance(color) * exposure;
+    float exposureMul = exposure;
+    if (autoExposureEnabled > 0.5) {
+        exposureMul *= exp2(exposureState[0].x);
+    }
+    float lum = bloomLuminance(color) * exposureMul;
     float knee = threshold * 0.5;
     float soft = lum - threshold + knee;
     soft = clamp(soft, 0.0, 2.0 * knee);

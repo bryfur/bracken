@@ -29,14 +29,20 @@
  * WHAT IS STORED, AND WHAT IS NOT
  * ---------------------------------------------------------------------------
  *
- *   albedo_[c]    RGBA8, no mip chain. rgb = surface albedo, a = opacity
- *                 coverage. Written by voxelization, read ONLY by injection —
- *                 hence no mips, which is a third of the memory saved.
- *   radiance_[c]  RGBA16F, WITH a mip chain. rgb = outgoing radiance,
- *                 a = opacity. This is what the cones sample, and the mip
- *                 chain is not an optimization but the technique: a cone takes
- *                 ONE filtered tap at the mip whose voxels match its width,
- *                 standing in for the thousands of rays it represents.
+ *   albedo_[c]    R32_UINT, no mip chain. One packed word: RGB = surface albedo
+ *                 in the low three bytes, HIGH BYTE = emissive intensity as a
+ *                 fraction of VOXEL_EMISSIVE_SCALE. Coverage is implied by
+ *                 occupancy rather than stored, which is what frees the byte.
+ *                 Written by voxelization, read ONLY by injection — hence no
+ *                 mips, which is a third of the memory saved.
+ *   radiance_[c]  RGBA16F, WITH a mip chain. rgb = outgoing radiance
+ *                 PREMULTIPLIED by a = coverage, which is 1 or 0 at mip 0 and
+ *                 fractional above it because the chain is an unweighted box
+ *                 average over children whose empty half is black. This is what
+ *                 the cones sample, and the mip chain is not an optimization but
+ *                 the technique: a cone takes ONE filtered tap at the mip whose
+ *                 voxels match its width, standing in for the thousands of rays
+ *                 it represents.
  *
  * There is deliberately no normal volume — see `VOXEL_RESOLUTION`.
  *

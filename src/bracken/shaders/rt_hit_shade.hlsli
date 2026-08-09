@@ -81,6 +81,22 @@
 //   float  giAmbientFallback;   // see rtHitAmbient
 //   int4   giCascadeBase[GI_CASCADE_COUNT];
 //   uint   giLightCount;  uint giLightCapacity;
+//
+// and, ONLY from a shader that also defines RT_HIT_SHADE_AMBIENT_LIFT before
+// the functions phase:
+//
+//   float  ambientStrength;     // GraphicsSettings::ambient_strength — see the
+//                               // ambient-lift note in rtShadeHit
+//
+// NOTHING DEFINES THAT MACRO TODAY, and the reason is a split across a
+// CPU/GPU boundary rather than a judgement about the shading: the reflection
+// pass is the caller that owes the lift (its radiance is consumed without a
+// forward-pass one), but `RtReflectionUniforms` has no `ambientStrength` field
+// yet — offset 504 is still `_pad0`, i.e. a hard 0, and defining the macro
+// against that would take the ambient in shadow to black instead of lifting it.
+// Turning it on is three edits and no layout change: rename that pad on both
+// sides, set it from `GraphicsSettings::ambient_strength` in the reflection
+// pass's FrameParams, and define the macro in rt_reflection.comp.hlsl.
 
 #if !defined(RT_HIT_SHADE_TYPES) && !defined(RT_HIT_SHADE_FUNCTIONS)
 #error "Define RT_HIT_SHADE_TYPES or RT_HIT_SHADE_FUNCTIONS before including rt_hit_shade.hlsli"
@@ -131,6 +147,16 @@ struct TriangleAttributes {
 // shader so a consumer of this file cannot forget it and silently get an
 // unshadowed sun back.
 #include "shadow_common.hlsli"
+
+// pointFalloff() + spotConeFactor(), the SAME two curves the forward clustered
+// loop applies. This file used to carry its own copy of each, under a comment
+// that named a file which has not held them since R2a. They are worth exactly
+// one definition: a ray hit and a pixel must agree about how far a lamp
+// reaches, or a reflection brightens at a distance the direct term has already
+// cut off. cluster_index.hlsli is binding-free by construction, which is what
+// makes including it here — from a pass that deliberately does NOT bind the
+// froxel grid — free.
+#include "cluster_index.hlsli"
 
 // ---------------------------------------------------------------------------
 // Miss: the sky
@@ -271,17 +297,6 @@ uint rtHitPointLightsBase() { return 16u + giLightCapacity * 8u; }
 uint rtHitSpotLightsBase() { return 16u + giLightCapacity * (8u + 48u); }
 // SpotLight's stride is 80 bytes since R6 (source_radius), PointLight's still 48.
 
-/// Smooth windowed inverse-square falloff. Operation-identical to
-/// `pointFalloff` in clusters.hlsli — a ray hit and a pixel must agree about
-/// how far a lamp reaches, or a reflection brightens at a distance the direct
-/// term has already cut off.
-float rtHitPointFalloff(float dist, float radius) {
-    float r = saturate(dist / max(radius, 1e-4));
-    float r2 = r * r;
-    float win = saturate(1.0 - r2 * r2);
-    return (win * win) / max(dist * dist, 1e-4);
-}
-
 /// IRRADIANCE (not radiance) at `P` from every packet light in range.
 /// No shadow test: ray-traced local-light shadows are the froxel-RIS pass's
 /// (R2b), which is screen-space and cannot answer for a world-space hit. An
@@ -307,7 +322,7 @@ float3 rtHitLocalLights(float3 P, float3 N) {
             if (ndotl <= 0.0) {
                 continue;
             }
-            acc += asfloat(b.xyz) * asfloat(b.w) * rtHitPointFalloff(dist, radius) * ndotl;
+            acc += asfloat(b.xyz) * asfloat(b.w) * pointFalloff(dist, radius) * ndotl;
         } else {
             uint base = rtHitSpotLightsBase() + header.y * 80u;
             uint4 a = lightDataBuf.Load4(base);
@@ -326,11 +341,13 @@ float3 rtHitLocalLights(float3 P, float3 N) {
             if (ndotl <= 0.0) {
                 continue;
             }
-            float cone = smoothstep(asfloat(c.w), asfloat(b.w), dot(asfloat(b.xyz), -L));
+            // b.xyz = direction, b.w = inner_cos, c.w = outer_cos — the
+            // SpotLightGPU layout cluster_index.hlsli declares.
+            float cone = spotConeFactor(L, asfloat(b.xyz), asfloat(b.w), asfloat(c.w));
             if (cone <= 0.0) {
                 continue;
             }
-            acc += asfloat(c.xyz) * asfloat(d.x) * rtHitPointFalloff(dist, radius) * ndotl * cone;
+            acc += asfloat(c.xyz) * asfloat(d.x) * pointFalloff(dist, radius) * ndotl * cone;
         }
     }
     return acc;
@@ -377,11 +394,37 @@ float3 rtShadeHit(float3 P, float3 N, float3 albedo, float3 emissive, float2 noi
     float viewDepth = dot(P - cameraPosition, cameraForward);
     float vis = calcShadow(P, N, toSun, viewDepth, noise);
 
+    // THE AMBIENT LIFT, and which callers owe it.
+    //
+    // The forward pass does not add its ambient at full strength in shadow: all
+    // four scene shaders compute `ambientLift = lerp(ambientStrength, 1.0,
+    // shadow)` and scale every ambient term by it. A caller whose radiance is
+    // consumed WITHOUT a forward-pass lift therefore has to apply the lift here
+    // or the same surface comes back ~2x brighter in the traced signal than it
+    // is when drawn directly — with ambientStrength's default of 0.45, roughly
+    // 2.2x from the lift alone in full shadow, and in full shadow the ambient
+    // is essentially the whole radiance.
+    //
+    // The GI callers must NOT define this: the probe field and the screen probes
+    // are TRANSPORT quantities, and the forward pass lifts them when it samples
+    // them, so lifting here would double-apply it — and for probe rays it would
+    // break the bounce series' convergence argument as well. The reflection
+    // pass is the odd one out and opts in on its own.
+    //
+    // The hit's AO is genuinely unavailable (the forward ambient also carries
+    // `min(screenAO, ORM AO)`, and a ray hit has neither), so it stays omitted
+    // whichever branch runs.
+#ifdef RT_HIT_SHADE_AMBIENT_LIFT
+    float ambientLift = lerp(ambientStrength, 1.0, vis);
+#else
+    float ambientLift = 1.0;
+#endif
+
     // IRRADIANCE at the hit. The ambient is stored as mean radiance, so it
     // becomes irradiance by multiplying by pi (see the units note at the top).
     float3 E = sunColor * ndotl * vis;
     E += rtHitLocalLights(P, N);
-    E += GI_PI * bounceScale * rtHitAmbient(P + N * normalBias, N);
+    E += GI_PI * bounceScale * ambientLift * rtHitAmbient(P + N * normalBias, N);
 
     // Lambertian outgoing radiance, plus what the surface emits on its own.
     return albedo * E / GI_PI + emissive;

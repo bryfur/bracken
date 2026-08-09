@@ -200,11 +200,25 @@ inline constexpr float DI_DIELECTRIC_F0 = 0.04f;
 // The ratio form keeps the inflation OUT of the denoised signal and applies it
 // per pixel, at full resolution, where it can be bounded.
 //
-// THE ENERGY IDENTITY IS THEREFORE TRIVIAL and exact: an unbumped texel has
-// `N_shading == N_geometric`, `relief == 1`, and the whole expression is R5c's
-// term for term. That is what `di_relief_factor` is tested against, and it is
-// why terrain and grass — which carry no normal map — come out of this phase
-// bit-identical in both arithmetic and pixels.
+// THE ENERGY IDENTITY IS THEREFORE TRIVIAL and exact ABOVE THE FLOOR: an
+// unbumped texel has `N_shading == N_geometric`, and wherever
+// `dot(N_geometric, L) >= DI_RELIEF_MIN_COSINE` the numerator and denominator
+// are the same number, `relief == 1`, and the whole expression is R5c's term for
+// term. That is what `di_relief_factor` is tested against, and it is why terrain
+// and grass — which carry no normal map — come out of this phase bit-identical
+// in both arithmetic and pixels.
+//
+// BELOW the floor the identity does not hold, and the reason is structural
+// rather than incidental: `DI_RELIEF_MIN_COSINE` sits in the DENOMINATOR ONLY,
+// so once the geometric cosine drops under it the denominator stops tracking the
+// numerator. An equal-normals texel then fades linearly, `c / 0.05`, over
+// `[0, 0.05]`, and is gated to zero at `c <= 0`. That is approximation 5 below —
+// bounded, one-sided (it can only darken) and pinned by
+// `local_di.test.cpp`'s `EqualNormalsGiveExactlyUnity`, which loops down to the
+// floor inclusive and then asserts the fade explicitly. A flat-normal material
+// at a grazing light therefore loses the tail of its Full-tier local term rather
+// than keeping R5c's; it is the same direction of error as approximation 3, at
+// the same angles, for the same reason.
 //
 // WHAT THE TWO COSINES MEAN, precisely, because they are not the same quantity:
 //
@@ -219,7 +233,7 @@ inline constexpr float DI_DIELECTRIC_F0 = 0.04f;
 // trace answers "which light, and is it visible", the forward answers "how does
 // this texel face it".
 //
-// THE APPROXIMATIONS, all four, named rather than buried:
+// THE APPROXIMATIONS, all five, named rather than buried:
 //
 //  1. ONLY THE COSINE IS CORRECTED. `D`, `Vis`, the Burley shape and the
 //     Schlick fraction `f` stay evaluated against the geometric normal at
@@ -250,6 +264,15 @@ inline constexpr float DI_DIELECTRIC_F0 = 0.04f;
 //     black. The visible artefact is a softened, slightly wrong bump direction on
 //     the few texels where the reservoir genuinely disagrees across the filter
 //     footprint; it is bounded, local, and strictly better than no direction.
+//  5. THE SUB-FLOOR BAND IS NOT THE IDENTITY. Because the floor is in the
+//     denominator only, a texel whose GEOMETRIC cosine is under
+//     `DI_RELIEF_MIN_COSINE` gets `relief < 1` even where the normal map is
+//     flat, fading to 0 at 0. The lost energy is the tail of a term the trace
+//     itself barely applied — `E` already carries that same small cosine — so
+//     the absolute error is small, and it darkens rather than brightens, which
+//     is the safe half. It is written down here because "relief is exactly 1 for
+//     equal normals" is the sentence a future change to this file will be
+//     checked against, and unqualified it is false.
 
 /// Floor under the geometric cosine in the relief denominator. Not an epsilon
 /// for numerical safety — 0.05 is orders of magnitude above any float hazard —
@@ -257,6 +280,13 @@ inline constexpr float DI_DIELECTRIC_F0 = 0.04f;
 /// worth dividing by. With DI_RELIEF_MAX it bounds the amplification at a
 /// grazing light, which is the failure mode that killed the divide-the-cosine-out
 /// form.
+///
+/// It has a SECOND effect, and it is not free: living in the denominator alone,
+/// it also stops the equal-normals case cancelling, so an un-normal-mapped texel
+/// under this cosine fades as `c / 0.05` instead of holding at 1 (approximation
+/// 5 above). And it is what keeps `0/0` out of the expression at a fully grazing
+/// texel — `clamp` of a NaN is not reliably 0 in HLSL, so the floor is
+/// load-bearing numerically as well as perceptually.
 inline constexpr float DI_RELIEF_MIN_COSINE = 0.05f;
 
 
@@ -281,8 +311,12 @@ inline constexpr float DI_DIRECTION_MIN_LENGTH_SQ = 1e-8f;
  * `ndotl_geometric` is `dot(N_geometric, L)` — the cosine the trace already
  * applied, recomputed at full resolution from the interpolated vertex normal and
  * the denoised direction. `ndotl_shading` is the normal-mapped one. Exactly 1
- * when they agree, which is the energy identity and the reason terrain, grass
- * and every un-normal-mapped material are bit-identical to R5c.
+ * when they agree AND `ndotl_geometric >= DI_RELIEF_MIN_COSINE`, which is the
+ * energy identity and the reason terrain, grass and every un-normal-mapped
+ * material are bit-identical to R5c wherever the light is not grazing. Below the
+ * floor equal normals no longer cancel — it is in the denominator only — so the
+ * factor fades to 0 across `[0, DI_RELIEF_MIN_COSINE]` and is 0 at or below
+ * zero; `local_di.test.cpp` pins both the identity and the fade.
  */
 [[nodiscard]] inline float di_relief_factor(float ndotl_geometric,
                                             float ndotl_shading) noexcept {

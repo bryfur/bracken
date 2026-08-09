@@ -231,8 +231,9 @@ TEST(VoxelMath, ConeStepIsBoundedBelowSoTracingTerminates) {
 
 TEST(VoxelMath, AccumulateIsFrontToBackAndSaturates) {
     const glm::vec4 clear(0.0f);
-    // An empty sample changes nothing.
-    EXPECT_EQ(voxel_cone_accumulate(clear, glm::vec4(1.0f, 1.0f, 1.0f, 0.0f)), clear);
+    // An empty sample changes nothing. PREMULTIPLIED, so an empty sample is
+    // (0,0,0,0) — which is literally what injection writes into an empty voxel.
+    EXPECT_EQ(voxel_cone_accumulate(clear, glm::vec4(0.0f, 0.0f, 0.0f, 0.0f)), clear);
 
     // A fully opaque sample takes the whole result...
     const glm::vec4 opaque =
@@ -250,11 +251,36 @@ TEST(VoxelMath, AccumulateIsFrontToBackAndSaturates) {
     // Alpha is monotone and never exceeds 1 over a long march.
     glm::vec4 accum(0.0f);
     for (int i = 0; i < 500; ++i) {
-        const glm::vec4 next = voxel_cone_accumulate(accum, glm::vec4(1.0f, 1.0f, 1.0f, 0.05f));
+        const glm::vec4 next =
+            voxel_cone_accumulate(accum, glm::vec4(0.05f, 0.05f, 0.05f, 0.05f));
         EXPECT_GE(next.a, accum.a);
         EXPECT_LE(next.a, 1.0f + 1e-5f);
         accum = next;
     }
+}
+
+TEST(VoxelMath, AFractionalCoverageSampleConvergesOnItsRadianceNotOnCoverageTimesIt) {
+    // THE PREMULTIPLY PIN. Everything above mip 0 stores coverage * radiance in
+    // rgb and coverage in a, because voxel_mip.comp.hlsl box-averages children
+    // whose empty half is black. Multiplying by alpha again in the compositor
+    // costs a factor of the tap's own coverage — invisible at mip 0 inside solid
+    // geometry, and 2^-m out where a widening cone does all of its long-range
+    // gathering. This is what a distant mip tap of a lit wall looks like.
+    const glm::vec3 radiance(0.8f, 0.6f, 0.4f);
+    const float coverage = 0.25f;
+
+    glm::vec4 accum(0.0f);
+    for (int i = 0; i < 64; ++i) {
+        accum = voxel_cone_accumulate(
+            accum, glm::vec4(coverage * radiance.r, coverage * radiance.g, coverage * radiance.b,
+                             coverage));
+    }
+    // Saturated: the accumulated colour is the radiance the samples stood for,
+    // NOT coverage * radiance.
+    EXPECT_NEAR(accum.a, 1.0f, 1e-3f);
+    EXPECT_NEAR(accum.r, radiance.r, 1e-2f);
+    EXPECT_NEAR(accum.g, radiance.g, 1e-2f);
+    EXPECT_NEAR(accum.b, radiance.b, 1e-2f);
 }
 
 TEST(VoxelMath, HitAlphaIsBelowTerminationSoADistanceIsAlwaysRecorded) {
@@ -266,10 +292,10 @@ TEST(VoxelMath, HitAlphaIsBelowTerminationSoADistanceIsAlwaysRecorded) {
 }
 
 TEST(VoxelMath, ClipmapMemoryIsWithinBudget) {
-    // EXACTLY what VoxelVolume allocates: an RGBA8 albedo+opacity per cascade
-    // with no mip chain (only injection reads it) and an RGBA16F radiance per
-    // cascade WITH one (that is what the cones sample). No normal volume — see
-    // VOXEL_RESOLUTION.
+    // EXACTLY what VoxelVolume allocates: an R32_UINT packed albedo+emissive per
+    // cascade with no mip chain (only injection reads it) and an RGBA16F
+    // radiance per cascade WITH one (that is what the cones sample). No normal
+    // volume — see VOXEL_RESOLUTION.
     const std::uint64_t albedo = voxel_cascade_bytes(4, false) * VOXEL_CASCADE_COUNT;
     const std::uint64_t radiance = voxel_cascade_bytes(8, true) * VOXEL_CASCADE_COUNT;
     const double mb = static_cast<double>(albedo + radiance) / (1024.0 * 1024.0);
@@ -283,6 +309,85 @@ TEST(VoxelMath, ClipmapMemoryIsWithinBudget) {
     // mipmapping the radiance volume is affordable at all.
     EXPECT_LT(voxel_cascade_bytes(8, true), voxel_cascade_bytes(8, false) * 8 / 7 + 4096);
     EXPECT_GT(voxel_cascade_bytes(8, true), voxel_cascade_bytes(8, false));
+}
+
+// ---------------------------------------------------------------------------
+// Relight staleness. The predicate that decides a cascade's INJECTED radiance
+// no longer matches the lighting, which has to be measured against what that
+// cascade last received rather than against the previous frame — a per-frame
+// delta cannot see a 24-minute day at all.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The playground's sun: 24 game-minutes per real day, so 0.25 deg/s, so this
+/// much per frame at 60 Hz. The number the whole design turns on.
+constexpr float SUN_DEG_PER_FRAME = 0.25f / 60.0f;
+
+[[nodiscard]] glm::vec3 sun_dir_at(float degrees) {
+    const float r = glm::radians(degrees);
+    return {std::cos(r), -std::sin(r), 0.0f};
+}
+
+} // namespace
+
+TEST(VoxelRelight, StaticLightingIsNeverStale) {
+    // The property that keeps the mode's pins reproducible: a smoke run holds
+    // the sun still, so the predicate must not fire and the relight schedule
+    // must be exactly what it was before this existed.
+    const glm::vec3 dir = sun_dir_at(40.0f);
+    const glm::vec3 sun(2.0f, 1.9f, 1.7f);
+    const glm::vec3 sky(0.30f, 0.36f, 0.48f);
+    EXPECT_FALSE(voxel_relight_needed(dir, dir, sun, sun, sky, sky));
+}
+
+TEST(VoxelRelight, TimeOfDayDriftAccumulatesIntoStalenessAndOnlyThen) {
+    // A per-frame test cannot see this drift; an accumulated one must, and must
+    // take about as long as the threshold says.
+    const glm::vec3 sun(2.0f, 1.9f, 1.7f);
+    const glm::vec3 sky(0.30f, 0.36f, 0.48f);
+    const glm::vec3 base = sun_dir_at(40.0f);
+
+    int frames = 0;
+    while (frames < 10000 &&
+           !voxel_relight_needed(base, sun_dir_at(40.0f + static_cast<float>(frames) *
+                                                            SUN_DEG_PER_FRAME),
+                                 sun, sun, sky, sky)) {
+        ++frames;
+    }
+    // One degree at 0.00417 deg/frame is ~240 frames, i.e. ~4 seconds.
+    EXPECT_GT(frames, 200);
+    EXPECT_LT(frames, 300);
+}
+
+TEST(VoxelRelight, AStepInSunRadianceIsStale) {
+    const glm::vec3 dir = sun_dir_at(40.0f);
+    const glm::vec3 sky(0.30f, 0.36f, 0.48f);
+    const glm::vec3 sun(2.0f, 2.0f, 2.0f);
+    EXPECT_TRUE(voxel_relight_needed(dir, dir, sun, sun * 1.2f, sky, sky));
+    // ...and a change well under the threshold is not.
+    EXPECT_FALSE(voxel_relight_needed(dir, dir, sun, sun * 1.005f, sky, sky));
+}
+
+TEST(VoxelRelight, ASunDecayingTowardZeroDoesNotRelightForever) {
+    // NIGHT.sun is exactly {0,0,0}, so a pure RELATIVE test diverges as the
+    // denominator vanishes and re-lights every frame across dusk out of an
+    // absolute change that no longer matters. The floor is what stops it.
+    const glm::vec3 dir = sun_dir_at(-5.0f);
+    const glm::vec3 sky(0.05f, 0.06f, 0.09f);
+    const glm::vec3 last(0.001f, 0.001f, 0.001f);
+    const glm::vec3 now(0.0005f, 0.0005f, 0.0005f); // halved, and irrelevant
+    EXPECT_FALSE(voxel_relight_needed(dir, dir, last, now, sky, sky));
+}
+
+TEST(VoxelRelight, TheSkyAloneCanMakeACascadeStale) {
+    // The night case, and the reason the predicate takes the sky at all: after
+    // dusk the sun's radiance is zero AND stationary, so a sun-only test freezes
+    // the clipmap for the whole night while ambient_sky is still moving.
+    const glm::vec3 dir = sun_dir_at(-30.0f);
+    const glm::vec3 sun(0.0f);
+    const glm::vec3 sky(0.30f, 0.36f, 0.48f);
+    EXPECT_TRUE(voxel_relight_needed(dir, dir, sun, sun, sky, sky * 0.5f));
 }
 
 // ---------------------------------------------------------------------------

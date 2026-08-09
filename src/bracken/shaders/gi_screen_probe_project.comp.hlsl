@@ -12,6 +12,12 @@
 // wall's radiance onto the floor beside it, while averaging what nine probes
 // saw IN THE SAME DIRECTION is a variance reduction on one estimate.
 //
+// Which is why the gather also asks whether a neighbour SAW that direction at
+// all: every probe traces only the hemisphere above its own anchor, so a
+// neighbour tilted away carries a structural zero there rather than a dark
+// sample, and averaging one in is a fabricated sample, not a variance
+// reduction. Both halves of that test are below.
+//
 // It lives here rather than in the filter pass because SDL3 GPU has no
 // intra-pass synchronization — a 3x3 gather needs its neighbours' temporal
 // results complete, which only a later pass can guarantee — and because this
@@ -61,8 +67,21 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
     GiScreenProbe probe = probes[probeIndex];
     const bool valid = (probe.flags & GI_SP_FLAG_VALID) != 0u;
 
+    // Hoisted above the gather, which needs it too. Same (texel, frameIndex)
+    // the march used — screen_probes.cpp hands every pass one frame index — so
+    // this reproduces the march's `traced` predicate exactly
+    // (gi_screen_probe_march.comp.hlsl's `dot(dir, probe.normal) > 0`).
+    float texelSolidAngle;
+    const float3 dir = giSpTexelDirectionSolidAngle(texel, frameIndex, texelSolidAngle);
+
     float3 radiance = float3(0, 0, 0);
-    if (valid) {
+    // BELOW THIS ANCHOR'S HORIZON THE ANSWER IS A HARD ZERO, not an average.
+    // Tracing only the upper hemisphere is exact rather than approximate
+    // (screen_probe_math.hpp's `screen_probe_traces_texel`, proved by
+    // ShL1.UniformHemisphereIsExactForTheAnchorNormal) precisely BECAUSE the
+    // lower hemisphere carries zero — so a neighbour that did trace this
+    // direction must not be allowed to fill it in.
+    if (valid && dot(dir, probe.normal) > 0.0) {
         float wsum = 0.0;
         float3 acc = float3(0, 0, 0);
         [unroll]
@@ -75,6 +94,18 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
                 }
                 GiScreenProbe n = probes[giSpIndex(nc, probeGrid)];
                 if ((n.flags & GI_SP_FLAG_VALID) == 0u) {
+                    continue;
+                }
+                // The march traces only the hemisphere above each anchor and
+                // writes a RESOLVED zero everywhere else. A neighbour whose
+                // normal puts this direction below ITS horizon therefore has no
+                // sample here, not a black one — and folding that in at full
+                // bilateral weight is a fabricated sample, not a variance
+                // reduction. Two anchors whose normals differ by theta disagree
+                // over a band sin(theta) of the hemisphere wide, which at the
+                // 25 degrees cos^8 still passes comfortably is 42% of it. The
+                // centre tap satisfies this by construction (guarded above).
+                if (dot(dir, n.normal) <= 0.0) {
                     continue;
                 }
                 float4 sample = filteredAtlas.Load(int3(giSpRadianceTexel(nc, texel), 0));
@@ -96,11 +127,10 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
     }
 
     // ---- L1 projection ----------------------------------------------------
-    float3 dir = giSpTexelDirection(texel, frameIndex);
     float4 basis = giSpShBasis(dir);
     [unroll]
     for (int k = 0; k < 4; ++k) {
-        gsSh[k][groupIndex] = radiance * (basis[k] * GI_SP_TEXEL_SOLID_ANGLE);
+        gsSh[k][groupIndex] = radiance * (basis[k] * texelSolidAngle);
     }
     GroupMemoryBarrierWithGroupSync();
 

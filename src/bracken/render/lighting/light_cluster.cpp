@@ -6,6 +6,7 @@
 #include "bracken/core/jobs/parallel_for.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
+#include "bracken/render/lighting/light_target.hpp"
 
 #include <algorithm>
 #include <array>
@@ -180,6 +181,9 @@ bool ClusterGrid::init(gpu::GPUDevice& device, uint32_t max_lights) {
     light_indices_.reserve(CLUSTER_COUNT * 4);
     bins_.assign(CLUSTER_COUNT, {});
     for (auto& b : bins_) b.reserve(8);
+    // Deliberately NOT reserved: a bin's score row is allocated only if that
+    // bin ever overflows, which no shipped scene does (see bin_chunk).
+    bin_scores_.assign(CLUSTER_COUNT, {});
 
     light_data_buf_ =
         gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Storage, light_data_buffer_size(max_lights_));
@@ -216,6 +220,7 @@ void ClusterGrid::shutdown() {
     cluster_offsets_.clear();
     light_indices_.clear();
     bins_.clear();
+    bin_scores_.clear();
     view_lights_.clear();
     light_ranges_.clear();
     chunk_truncated_.clear();
@@ -245,6 +250,9 @@ void ClusterGrid::begin_frame(core::jobs::JobSystem& js, const scene::CameraStat
     if (bins_.size() != CLUSTER_COUNT) {
         bins_.assign(CLUSTER_COUNT, {});
     }
+    if (bin_scores_.size() != CLUSTER_COUNT) {
+        bin_scores_.assign(CLUSTER_COUNT, {});
+    }
 
     points_.clear();
     spots_.clear();
@@ -253,6 +261,11 @@ void ClusterGrid::begin_frame(core::jobs::JobSystem& js, const scene::CameraStat
     // cluster_offsets_ is NOT cleared here: it keeps last build()'s packing so
     // build() can diff against it (the upload dirty check) and rewrites it.
     for (auto& bin : bins_) bin.clear();
+    // clear(), not resize(0)-and-keep: `empty()` is the "this bin has not
+    // overflowed yet" sentinel bin_chunk reads, so it has to be true again
+    // every frame. The capacity survives, so a bin that overflows every frame
+    // allocates once.
+    for (auto& scores : bin_scores_) scores.clear();
     warned_truncation_ = false;
     lights_dropped_ = 0;
     cluster_lights_dropped_ = 0;
@@ -487,6 +500,44 @@ bool ClusterGrid::sphere_intersects_aabb(const glm::vec3& center, float radius, 
     return glm::dot(d, d) <= radius * radius;
 }
 
+// Conservative infinite-cone / box test, trig-free: the box is replaced by its
+// BOUNDING SPHERE, and the cone's lateral surface is a line in the (axial,
+// perpendicular) half-plane through the apex, so the signed distance from that
+// centre to the surface is `perp*cos - axial*sin`. Outside by more than the
+// bounding radius means no point of the box is inside the cone.
+//
+// Conservative twice over — the froxel's AABB is already a superset of the
+// froxel, and the AABB's bounding sphere a superset of the AABB — which is the
+// property that matters: the fragment shader re-tests the cone exactly
+// (`spotConeFactor` then `if (cone <= 0.0) continue;`), so an over-inclusive
+// bin only wastes work, while an under-inclusive one would punch a
+// froxel-shaped hole in the light pool. The cone's LENGTH is not tested here:
+// the sphere/AABB refine that runs alongside it already bounds the range.
+bool ClusterGrid::cone_intersects_aabb(const ViewLight& vl, const ClusterBounds& cb) {
+    const glm::vec3 center = 0.5f * (cb.view_min + cb.view_max);
+    const float bounding_radius = 0.5f * glm::length(cb.view_max - cb.view_min);
+    const glm::vec3 v = center - vl.view_pos;
+    const float axial = glm::dot(v, vl.view_dir);
+    const float perp = std::sqrt(std::max(0.0f, glm::dot(v, v) - axial * axial));
+    if (vl.cos_outer * perp - axial * vl.sin_outer > bounding_radius) {
+        return false; // outside the cone's lateral surface
+    }
+    return axial >= -bounding_radius; // and not wholly behind the apex
+}
+
+// The eviction metric (see bin_chunk). It is deliberately the light's
+// luminance times the range window at the froxel's CLOSEST point rather than a
+// scene-wide power proxy: what a froxel loses when a light is dropped is that
+// light's CONTRIBUTION THERE, and total power ranks a distant floodlight above
+// the torch in the player's hand. `point_falloff` is the same curve the
+// forward loop and the RIS target function evaluate (light_target.hpp), so the
+// ranking cannot disagree with the integrand about which light matters.
+float ClusterGrid::bin_score(const ViewLight& vl, const ClusterBounds& cb) {
+    const glm::vec3 closest = glm::clamp(vl.view_pos, cb.view_min, cb.view_max);
+    const float dist = glm::length(vl.view_pos - closest);
+    return vl.lum * point_falloff(dist, vl.radius);
+}
+
 void ClusterGrid::build() {
     build(core::jobs::JobSystem::instance());
 }
@@ -514,19 +565,47 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
     view_lights_.resize(light_count);
     for (size_t i = 0; i < light_count; ++i) {
         const auto& h = headers_[i];
+        auto& vl = view_lights_[i];
         glm::vec3 world_pos(0.0f);
         float radius = 0.0f;
+        glm::vec3 color(0.0f);
+        float intensity = 0.0f;
         if (h.type == LIGHT_TYPE_POINT) {
             const auto& p = points_[h.payload_index];
             world_pos = p.position;
             radius = p.radius;
+            color = p.color;
+            intensity = p.intensity;
+            // A point light IS its sphere; cos_outer <= 0 turns the cone test off.
+            vl.view_dir = glm::vec3(0.0f, 0.0f, -1.0f);
+            vl.cos_outer = 0.0f;
+            vl.sin_outer = 1.0f;
         } else {
             const auto& s = spots_[h.payload_index];
             world_pos = s.position;
             radius = s.radius;
+            color = s.color;
+            intensity = s.intensity;
+            // Rotation only — the axis is a direction, so no translation row.
+            const glm::vec3 dir = glm::mat3(view) * s.direction;
+            const float len = glm::length(dir);
+            vl.view_dir = len > 1e-6f ? dir / len : glm::vec3(0.0f, 0.0f, -1.0f);
+            // The cone test is only valid for a WELL-FORMED cone: half-angle
+            // under 90 degrees, and inner inside outer. A transposed pair
+            // (inner_cos < outer_cos) drives the shader's
+            // smoothstep(outer_cos, inner_cos, .) with edge0 > edge1, whose
+            // lit set is the COMPLEMENT of the cone — culling to the cone
+            // there would remove froxels the forward loop does light.
+            // FrameBuilder::add_spot_light normalizes the pair, so this is a
+            // guard rather than a supported authoring mode; falling back to
+            // the sphere keeps it merely wasteful instead of wrong.
+            const bool cone_usable = s.outer_cos > 0.0f && s.inner_cos >= s.outer_cos;
+            vl.cos_outer = cone_usable ? s.outer_cos : 0.0f;
+            vl.sin_outer = cone_usable ? std::sqrt(std::max(0.0f, 1.0f - s.outer_cos * s.outer_cos)) : 1.0f;
         }
-        view_lights_[i].view_pos = glm::vec3(view * glm::vec4(world_pos, 1.0f));
-        view_lights_[i].radius = radius;
+        vl.view_pos = glm::vec3(view * glm::vec4(world_pos, 1.0f));
+        vl.radius = radius;
+        vl.lum = target_luminance(color * intensity);
     }
 
     // Per-light cluster-range insertion: instead of testing every one of the
@@ -569,14 +648,28 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
 
         // X/Y tile range from the NDC bounds of the sphere's view-space AABB
         // corners (the projective image of a convex box is the hull of its
-        // projected corners, so this bounds every lit point). If the sphere
-        // reaches the near plane its projection is unbounded — fall back to the
-        // full range and let the sphere/AABB refine reject clusters.
+        // projected corners, so this bounds every lit point). The box is first
+        // CLIPPED to z <= -near: no froxel lives nearer than the near plane, so
+        // the clipped box still contains every sphere point a froxel can touch,
+        // and every corner then has w = -z >= near > 0.
+        //
+        // For a light entirely beyond the near plane the clip is a no-op
+        // (depth_min >= near implies view_pos.z + radius <= -near), so that
+        // path is byte-identical to what it always was. What the clip buys is
+        // the light BESIDE the camera — view depth under its own radius, so the
+        // old code surrendered the whole X/Y range — which the sideways reject
+        // below can now discard outright instead of testing twenty whole Z
+        // slices of froxels it never reaches. It does NOT help a light the
+        // camera is standing inside: there the clipped box still spans the full
+        // radius laterally at z = -near, projects past the screen edges, and
+        // clamps back to the full range, which is the correct answer (such a
+        // light really does touch most of the grid).
         uint32_t x0 = 0, x1 = CLUSTER_DIM_X - 1;
         uint32_t y0 = 0, y1 = CLUSTER_DIM_Y - 1;
-        if (depth_min >= near_z) {
-            const glm::vec3 bb_min = vl.view_pos - glm::vec3(vl.radius);
-            const glm::vec3 bb_max = vl.view_pos + glm::vec3(vl.radius);
+        const glm::vec3 bb_min = vl.view_pos - glm::vec3(vl.radius);
+        glm::vec3 bb_max = vl.view_pos + glm::vec3(vl.radius);
+        bb_max.z = std::min(bb_max.z, -near_z);
+        if (bb_max.z >= bb_min.z) { // guaranteed by the depth_max < near_z reject above
             glm::vec2 ndc_min(std::numeric_limits<float>::max());
             glm::vec2 ndc_max(std::numeric_limits<float>::lowest());
             bool projected = true;
@@ -610,11 +703,12 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
 
     // Per-cluster insertion chunked by cluster index (§4.3): a chunk owns the
     // disjoint cluster subrange [chunk_begin, chunk_end) and is the ONLY
-    // writer of those clusters' bins — no merge, no contention. Within a
-    // chunk lights are walked in ascending index order, so each bin receives
-    // exactly the sequence the serial light-major loop produced (including
-    // the MAX_LIGHTS_PER_CLUSTER cutoff keeping the lowest indices):
-    // bit-identical at any worker count / any grain (§6.2).
+    // writer of those clusters' bins (and of their eviction scores) — no
+    // merge, no contention. Within a chunk lights are walked in ascending
+    // index order, so each bin receives exactly the sequence the serial
+    // light-major loop produced, and the eviction below sees the same
+    // candidates in the same order: bit-identical at any worker count / any
+    // grain (§6.2).
     const std::size_t chunk_count = (CLUSTER_COUNT + BIN_GRAIN - 1) / BIN_GRAIN;
     chunk_truncated_.assign(chunk_count, 0);
     auto bin_chunk = [&](std::size_t chunk_begin, std::size_t chunk_end) {
@@ -643,12 +737,51 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
                         if (!sphere_intersects_aabb(vl.view_pos, vl.radius, cb.view_min, cb.view_max)) {
                             continue;
                         }
+                        // A spot is its cone, not its bounding sphere. Points
+                        // and ill-formed cones set cos_outer <= 0 and skip this.
+                        if (vl.cos_outer > 0.0f && !cone_intersects_aabb(vl, cb)) {
+                            continue;
+                        }
                         auto& bin = bins_[c];
                         if (bin.size() < MAX_LIGHTS_PER_CLUSTER) {
                             bin.push_back(static_cast<uint32_t>(i));
-                        } else {
-                            ++truncated_local;
+                            continue;
                         }
+                        // OVER BUDGET. Submission order is uncorrelated with
+                        // how much a light matters HERE, so arrival order can
+                        // drop the brightest light in the froxel and keep 128
+                        // dim ones. Keep the top MAX_LIGHTS_PER_CLUSTER by
+                        // per-froxel contribution instead, as a streaming
+                        // replace-min (exact top-k for a single pass) —
+                        // operation for operation the policy R8 already uses
+                        // one budget over, for the same reason
+                        // (render/raytracing/emissive_clusters.cpp).
+                        //
+                        // Scores are filled on a bin's FIRST refusal, never on
+                        // insertion: a scene that stays under the cap — every
+                        // scene the engine ships with — pays nothing for this
+                        // and allocates nothing.
+                        auto& scores = bin_scores_[c];
+                        if (scores.empty()) {
+                            scores.resize(MAX_LIGHTS_PER_CLUSTER);
+                            for (uint32_t k = 0; k < MAX_LIGHTS_PER_CLUSTER; ++k) {
+                                scores[k] = bin_score(view_lights_[bin[k]], cb);
+                            }
+                        }
+                        uint32_t worst = 0;
+                        for (uint32_t k = 1; k < MAX_LIGHTS_PER_CLUSTER; ++k) {
+                            if (scores[k] < scores[worst]) {
+                                worst = k; // ties keep the lower slot = the earlier arrival
+                            }
+                        }
+                        const float score = bin_score(vl, cb);
+                        if (score > scores[worst]) { // STRICT: a tie keeps the incumbent
+                            bin[worst] = static_cast<uint32_t>(i);
+                            scores[worst] = score;
+                        }
+                        // Counted either way: one light's worth of this
+                        // froxel's lighting could not be kept.
+                        ++truncated_local;
                     }
                 }
             }
@@ -678,7 +811,7 @@ void ClusterGrid::build(core::jobs::JobSystem& js) {
     if (cluster_lights_dropped_ != 0 && !warned_truncation_) {
         BRACKEN_LOG_WARN(LOG_TAG,
                          "ClusterGrid: {} light insertion(s) dropped by MAX_LIGHTS_PER_CLUSTER={}; those clusters "
-                         "are lit by only their first {} lights",
+                         "are lit by only their {} highest-contribution lights",
                          cluster_lights_dropped_, MAX_LIGHTS_PER_CLUSTER, MAX_LIGHTS_PER_CLUSTER);
         warned_truncation_ = true;
     }

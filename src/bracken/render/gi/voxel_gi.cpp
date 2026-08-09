@@ -37,6 +37,7 @@ bool VoxelGi::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipelines) {
     }
     dirty_.fill(true); // nothing has been voxelized yet
     relight_.fill(true);
+    injected_.fill({}); // no cascade has received any lighting to be stale against
     return true;
 }
 
@@ -46,6 +47,7 @@ void VoxelGi::shutdown() {
     pipelines_ = nullptr;
     dirty_.fill(false);
     relight_.fill(false);
+    injected_.fill({});
     next_cascade_ = 0;
     stats_ = VoxelGiStats{};
 }
@@ -73,6 +75,7 @@ void VoxelGi::upload(gpu::GPUDevice& device) {
 bool VoxelGi::update(SDL_GPUCommandBuffer* cmd, const VoxelGiFrameParams& params) {
     BRACKEN_PROFILE_ZONE("VoxelGi::update");
     stats_.cascade_revoxelized = -1;
+    stats_.cascade_relit = -1; // same reason as the line above: it means THIS frame
     stats_.injected = false;
     stats_.voxelize_work_items = scene_.work_count();
 
@@ -95,10 +98,25 @@ bool VoxelGi::update(SDL_GPUCommandBuffer* cmd, const VoxelGiFrameParams& params
     }
     // LIGHTING-ONLY DIRT IS A SEPARATE SET. A sun move leaves the geometry
     // perfectly valid and only the radiance stale, so folding it into `dirty_`
-    // made every time-of-day change pay a full revoxelization it did not need —
-    // and in the playground the sun moves every frame.
-    if (params.lighting_changed) {
-        relight_.fill(true);
+    // would make every time-of-day change pay a full revoxelization it does not
+    // need.
+    //
+    // MEASURED AGAINST WHAT EACH CASCADE WAS LAST INJECTED WITH, not against the
+    // previous frame. `lighting_changed` is a per-frame cut detector, and real
+    // time-of-day drift does not register on one: a 24-minute day moves the sun
+    // 0.004 degrees per frame, an order under the smallest per-frame threshold
+    // worth having. Wired to that flag alone the clipmap's radiance was only
+    // ever refreshed when a cascade happened to SCROLL, which for a standing
+    // player is never. The flag is kept as an immediate override for a genuine
+    // cut.
+    const glm::vec3 sun_radiance = params.sun_color * params.sun_intensity;
+    for (int c = 0; c < VOXEL_CASCADE_COUNT; ++c) {
+        const InjectedLighting& last = injected_[static_cast<std::size_t>(c)];
+        if (params.lighting_changed || !last.valid ||
+            voxel_relight_needed(last.sun_dir, params.sun_direction, last.sun_radiance,
+                                 sun_radiance, last.sky_color, params.sky_color)) {
+            relight_[static_cast<std::size_t>(c)] = true;
+        }
     }
 
     std::uint32_t dirty_count = 0;
@@ -132,6 +150,16 @@ bool VoxelGi::update(SDL_GPUCommandBuffer* cmd, const VoxelGiFrameParams& params
         }
         dirty_[static_cast<std::size_t>(c)] = false;
         relight_[static_cast<std::size_t>(c)] = false;
+        // ARM THE BASELINE ONLY WHERE INJECTION ACTUALLY RAN. `rebuild_cascade`
+        // returns true without injecting when there is no shadow atlas or no
+        // light buffer, and recording a baseline there would claim the cascade
+        // holds radiance it never received. Clearing `relight_` unconditionally
+        // is still right, and is self-healing once the baseline is gated: the
+        // next frame compares against the stale baseline and re-arms.
+        if (stats_.injected) {
+            injected_[static_cast<std::size_t>(c)] = {params.sun_direction, sun_radiance,
+                                                      params.sky_color, true};
+        }
         stats_.cascade_revoxelized = needs_voxels ? c : -1;
         stats_.cascade_relit = c;
         next_cascade_ = (c + 1) % VOXEL_CASCADE_COUNT;
@@ -212,42 +240,13 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
 
     // ---- 3. inject --------------------------------------------------------
     //
-    // DISABLED, AND NOT BECAUSE IT IS UNFINISHED. The dispatch below faults
-    // inside the NVIDIA driver with no validation message, and the fault is
-    // isolated to THIS dispatch: clear and voxelize (same command buffer, same
-    // volume, same frame) both record and execute fine, and moving the bisect
-    // point moves the crash with the inject call rather than with anything
-    // around it.
+    // Reads the albedo volume and writes the outgoing radiance a cone
+    // integrates. PCF shadows only — the same clamp gi_probe_trace applies
+    // before calling calcShadow from a compute shader.
     //
-    // Ruled out, each by experiment rather than by reasoning:
-    //   * dispatch size — a 1x1x1 dispatch faults identically;
-    //   * the mip generation that follows — skipping it changes nothing;
-    //   * texture format — SDL_GPUTextureSupportsFormat says R32_UINT 3D and
-    //     RGBA16F 3D are both supported with exactly these usage flags, and the
-    //     query runs at init;
-    //   * PCSS — `shadowEnabled` is clamped to PCF above, as gi_probe_trace
-    //     does before calling calcShadow from compute;
-    //   * albedo's binding kind — it faults bound read-write AND bound as a
-    //     read-only storage texture.
-    //
-    // Three genuine bugs were found and fixed on the way here and are worth not
-    // re-discovering: the albedo volume must be R32_UINT (an integer atomic
-    // needs an integer view), it needs SIMULTANEOUS_READ_WRITE rather than
-    // READ | WRITE (SDL's own header says they are not equivalent), and the
-    // geometry buffers must be Type::ComputeStorage rather than Type::Storage,
-    // which is graphics-stage only. None of those three is diagnosed by the
-    // driver either.
-    //
-    // The remaining suspect is 3D read-only storage textures in a compute pass
-    // — the engine has no other user of one, and commit c147fe9 already records
-    // that integer textures must never claim SAMPLER, which closes the obvious
-    // workaround. The likely fix is to stop reading albedo in a second pass at
-    // all: fold injection INTO the voxelizer, which already has the albedo in
-    // registers and the shadow atlas available, and write radiance directly.
-    // That removes the volume-to-volume read this fault lives in.
-    //
-    // Until then the radiance volume stays black, so GiMode::VoxelProbes
-    // produces no light rather than producing a crash.
+    // This pass spent a session looking unrunnable, and the fault was never
+    // here: it was SDL_GenerateMipmapsForGPUTexture on a 3D texture, recorded
+    // under "4. mips" below.
     if (params.shadow_atlas == nullptr || params.shadow_block == nullptr) {
         // No CSM this frame: the geometry is voxelized but nothing lights it.
         // Reported rather than silently skipped — a clipmap of black voxels is
@@ -379,6 +378,11 @@ bool VoxelGi::cone_trace(SDL_GPUCommandBuffer* cmd, const VoxelConeTraceParams& 
     u.frameIndex = params.frame_index;
     u.rayMaxDistance = params.ray_max_distance;
     u.cameraPosition = params.camera_position;
+    // The escape term. Unwritten it defaults to zero, which is not "an
+    // approximate sky" but no sky at all — every cone that left the clipmap
+    // returned black, and the two ray sources disagreed about what a miss is
+    // worth.
+    u.skyColor = params.sky_color;
     u.bounceScale = params.bounce_scale;
     // A cone may march to the edge of the coarsest cascade and no further —
     // past that there is no data, only the sky term applied on exit.

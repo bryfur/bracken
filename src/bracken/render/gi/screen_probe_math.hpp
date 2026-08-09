@@ -114,6 +114,18 @@ inline constexpr int SCREEN_PROBE_ANCHOR_ATTEMPTS = 9;
  * because it is the pixel whose interpolation weight is highest for the whole
  * tile; the rest walk outward so a tile whose centre is sky but whose corner is
  * a rooftop still gets a probe rather than falling to the world field.
+ *
+ * AND WHEN THE CENTRE IS NOT CHOSEN, the forward gather does not learn of it.
+ * `gi_screen_sample.hlsli` builds its bilinear cage on the TILE LATTICE — each
+ * probe treated as sitting at its tile's centre — so a probe anchored up to 8
+ * pixels off centre has its radiance interpolated as if measured at the centre.
+ * The offset IS recorded (`screen_probe_pack_flags`) and the temporal filter
+ * does use it; `gpu::GiScreenProbeSh` simply does not publish it. The depth and
+ * normal terms bound the damage: across a silhouette the off-tile taps are
+ * rejected and the survivor is renormalized, so what is really mis-set is the
+ * cage weight feeding `SCREEN_PROBE_WEIGHT_FLOOR` — how much this tier is
+ * TRUSTED — by up to ~0.3 along sky-bordering silhouettes, not a lateral mixing
+ * of two probes' radiance.
  */
 [[nodiscard]] constexpr glm::ivec2 screen_probe_anchor_offset(int attempt) {
     constexpr int H = SCREEN_PROBE_TILE / 2;      // 8
@@ -408,12 +420,66 @@ inline constexpr float SCREEN_PROBE_NORMAL_BIAS = 1.0f;
     return {Y0, Y1 * n.y, Y1 * n.z, Y1 * n.x};
 }
 
-/// The solid angle one octahedral texel of a full-sphere `SCREEN_PROBE_OCT`^2
-/// map subtends, treated as uniform. The octahedral mapping is equal-area by
-/// construction, which is exactly why it is the projection used here and not,
-/// say, a lat-long grid whose poles would need a per-texel weight.
-inline constexpr float SCREEN_PROBE_TEXEL_SOLID_ANGLE =
-    4.0f * 3.14159265358979323846f / static_cast<float>(SCREEN_PROBE_RAYS);
+/// Area of one octahedral texel in the [-1,1]^2 square the map is defined on.
+inline constexpr float SCREEN_PROBE_TEXEL_AREA =
+    (2.0f / static_cast<float>(SCREEN_PROBE_OCT)) * (2.0f / static_cast<float>(SCREEN_PROBE_OCT));
+
+/**
+ * `oct_decode`'s fold WITHOUT the normalize: a point on |x|+|y|+|z| = 1.
+ *
+ * Spelled out here rather than taken from `gi_math.hpp` because the world field
+ * has no use for the un-normalized vector and this is the only consumer; the
+ * fold itself is `oct_decode`'s, texel for texel, and the two must not drift.
+ */
+[[nodiscard]] inline glm::vec3 screen_probe_oct_decode_raw(const glm::vec2& e_in) {
+    const glm::vec2 e = e_in * 2.0f - 1.0f;
+    glm::vec3 n{e.x, e.y, 1.0f - std::abs(e.x) - std::abs(e.y)};
+    const float t = std::max(0.0f, std::min(1.0f, -n.z));
+    n.x += n.x >= 0.0f ? -t : t;
+    n.y += n.y >= 0.0f ? -t : t;
+    return n;
+}
+
+/**
+ * The solid angle texel `texel` subtends on frame `frame_index`.
+ *
+ * NOT A CONSTANT, and the comment that used to stand here claiming it was —
+ * "the octahedral mapping is equal-area by construction" — was false. Square ->
+ * octahedron does preserve area (the fold is a reflection, Jacobian 1), but the
+ * RADIAL octahedron -> sphere step does not: on the face z = 1 - x - y the
+ * surface element is sqrt(3) dx dy and the projected solid angle is
+ * (n_hat . v_hat) / |v|^2 times that, with n_hat . v = 1/sqrt(3), which leaves
+ *
+ *     dOmega = dA / |v|^3
+ *
+ * for `v` the un-normalized folded vector. |v| runs from 1 at the six
+ * octahedron vertices to 1/sqrt(3) at the eight face centres, so over the 8x8
+ * texels the true solid angle spans 0.54x .. 1.46x of 4*pi/64 — over-weighting
+ * the world-axis texels and under-weighting the face diagonals, in a pattern
+ * fixed to the WORLD axes because the map is applied to world directions with
+ * no rotation.
+ *
+ * The SUM over the sphere is 4*pi either way, which is exactly why a uniform
+ * sphere and a uniform hemisphere both reproduce and why this survived: the
+ * error is a redistribution, visible only as a direction-dependent gain on a
+ * directional source (measured at +61% on a world axis against -53% on a
+ * diagonal for a 10-degree cap, versus a direction-INVARIANT -25% — the
+ * inherent L1 truncation — with the weight below).
+ *
+ * Evaluated at the JITTERED sample rather than the texel centre: E[dA/|v|^3]
+ * over the jitter sequence is the texel's true solid angle, so the estimator the
+ * temporal EMA converges to is unbiased. Shader mirror:
+ * `giSpTexelDirectionSolidAngle`.
+ */
+[[nodiscard]] inline float screen_probe_texel_solid_angle(int texel, std::uint32_t frame_index) {
+    const int tx = texel % SCREEN_PROBE_OCT;
+    const int ty = texel / SCREEN_PROBE_OCT;
+    const glm::vec2 jitter = screen_probe_jitter(frame_index);
+    const glm::vec2 oct = (glm::vec2(static_cast<float>(tx), static_cast<float>(ty)) + jitter) /
+                          static_cast<float>(SCREEN_PROBE_OCT);
+    const float len = glm::length(screen_probe_oct_decode_raw(oct));
+    return SCREEN_PROBE_TEXEL_AREA / (len * len * len);
+}
 
 /**
  * Accumulate one sample into an L1 projection.
@@ -474,8 +540,37 @@ inline constexpr float SCREEN_PROBE_TEMPORAL_ALPHA = 0.1f;
  * then, dividing by the probe's own mean is the honest exposure-independent
  * approximation, and it costs one groupshared reduction the pass was already
  * doing.
+ *
+ * THE MEAN IS OVER THE LIVE SAMPLES — the texels this probe actually traced and
+ * resolved, `screen_probe_live_sample_count` of them, not all
+ * `SCREEN_PROBE_RAYS`. The lower hemisphere is written as resolved zeros (a true
+ * zero for the SH projection, which integrates the whole sphere) and averaging
+ * those in halves the statistic, and with it this ceiling: a clamp is a robust
+ * location estimate and must be taken over the distribution OF THE SAMPLES.
  */
 inline constexpr float SCREEN_PROBE_FIREFLY_MAX = 8.0f;
+
+/**
+ * How many of a probe's texels carry a sample on frame `frame_index`, given the
+ * anchor normal: the divisor the firefly clamp's mean is taken over.
+ *
+ * ~32 of 64 by construction and bounded 25..40 over normals and jitter, which is
+ * the spread the *count* has to be computed rather than assumed. Mirrors the
+ * `traced` predicate `gi_screen_probe_filter.comp.hlsl` recomputes from the
+ * march's own (`screen_probe_traces_texel`); the shader ANDs it with "the BVH
+ * pass wrote this texel", which has no CPU-side counterpart.
+ */
+[[nodiscard]] inline int screen_probe_live_sample_count(const glm::vec3& anchor_normal,
+                                                        std::uint32_t frame_index) {
+    int live = 0;
+    for (int texel = 0; texel < SCREEN_PROBE_RAYS; ++texel) {
+        if (screen_probe_traces_texel(screen_probe_texel_direction(texel, frame_index),
+                                      anchor_normal)) {
+            ++live;
+        }
+    }
+    return live;
+}
 
 /// Relative camera-distance tolerance for accepting a probe (temporal history,
 /// spatial neighbour, or forward interpolation). Relative because a 20 cm depth

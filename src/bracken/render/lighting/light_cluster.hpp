@@ -62,8 +62,12 @@ public:
 
     // Lights refused since the last begin_frame() (see add_point_light).
     [[nodiscard]] uint32_t lights_dropped() const { return lights_dropped_; }
-    // Light-to-cluster insertions the last build() refused because a bin was
-    // already at MAX_LIGHTS_PER_CLUSTER (see RenderStats/FrameDiagnostics).
+    // Light-to-cluster insertions the last build() could not keep in full
+    // because a bin was already at MAX_LIGHTS_PER_CLUSTER (see
+    // RenderStats/FrameDiagnostics). A refused insertion may still have
+    // EVICTED a dimmer incumbent — the bin keeps the highest-contribution
+    // lights, not the earliest — but one light's worth of the froxel's
+    // lighting was lost either way, which is the number a host acts on.
     [[nodiscard]] uint32_t cluster_lights_dropped() const { return cluster_lights_dropped_; }
 
     // CPU-side bin lights into clusters; populates the per-cluster offset/count
@@ -74,10 +78,11 @@ public:
     // §4.3): each chunk owns a disjoint cluster subrange, walks the (small)
     // per-frame light list in ascending index order, and inserts into only
     // its own clusters' bins — every bin is written by exactly one chunk, so
-    // per-bin light order (and the truncation cutoff) is identical to the
-    // serial light-major loop: bit-identical output at any worker count
-    // (§6.2). The conservative per-light cluster-range precompute runs once,
-    // serially, before the fan-out; offsets/index packing stays serial
+    // per-bin light order (and which lights survive MAX_LIGHTS_PER_CLUSTER)
+    // is identical to the serial light-major loop: bit-identical output at
+    // any worker count (§6.2). The conservative per-light cluster-range
+    // precompute runs once, serially, before the fan-out; offsets/index
+    // packing stays serial
     // (order-dependent dirty diff). At <= 8 dynamic lights or with an
     // uninitialized pool the whole range runs as ONE inline chunk (same code
     // path — granularity control, not a second path).
@@ -139,10 +144,31 @@ public:
     uint32_t total_lights() const { return static_cast<uint32_t>(points_.size() + spots_.size()); }
 
 private:
-    // View-space light position/radius, rebuilt in build() each frame.
+    // View-space light bounds + the two things the refine needs beyond a
+    // sphere, rebuilt in build() each frame.
+    //
+    // A spot used to be binned as its full radius SPHERE, which is how a 32
+    // degree cone ended up in 94% of the froxel grid instead of 8% — the solid
+    // angle ratio (1 - cos 32)/2 says 7.6%, and the measurement agreed. Every
+    // one of those froxels costs the fragment loop a header + an 80-byte
+    // SpotLight load + a `spotConeFactor` that returns zero, and costs the
+    // traced Full-DI tier a RIS candidate draw with p̂ = 0 (the froxel list is
+    // that pass's candidate domain, rt_local_shadow.comp.hlsl).
     struct ViewLight {
         glm::vec3 view_pos;
         float radius;
+        // Spot axis in VIEW space; (0,0,-1) and unused for points.
+        glm::vec3 view_dir;
+        // Cone half-angle cosine/sine, precomputed once per light so the
+        // per-froxel test is trig-free. cos_outer <= 0 means "no cone test" —
+        // a point light, a half-angle at or past 90 degrees, or a spot whose
+        // cone pair is not well-formed (see build()).
+        float cos_outer;
+        float sin_outer;
+        // Rec.709 luminance of color * intensity — the light's brightness with
+        // distance left out, half of the per-froxel eviction score. Computed
+        // here because build() already has the payload in hand.
+        float lum;
     };
 
     // Conservative cluster-index box of one light (build() scratch,
@@ -167,6 +193,13 @@ private:
     bool reject_over_cap();
     static bool sphere_intersects_aabb(const glm::vec3& center, float radius, const glm::vec3& aabb_min,
                                        const glm::vec3& aabb_max);
+    // Conservative spot-cone reject, ANDed with the sphere test above. Only
+    // meaningful when vl.cos_outer > 0; see ViewLight and build().
+    static bool cone_intersects_aabb(const ViewLight& vl, const ClusterBounds& cb);
+    // A light's peak possible contribution anywhere in one froxel: its
+    // luminance times the forward loop's own range window evaluated at the
+    // froxel's CLOSEST point. Only ever called on the overflow path.
+    static float bin_score(const ViewLight& vl, const ClusterBounds& cb);
 
     gpu::GPUDevice* device_ = nullptr;
     uint32_t max_lights_ = MAX_LIGHTS;
@@ -179,6 +212,10 @@ private:
     std::vector<uint32_t> cluster_offsets_;     // 2 * CLUSTER_COUNT (offset, count) flat
     std::vector<uint32_t> light_indices_;       // packed indices into headers_
     std::vector<std::vector<uint32_t>> bins_;   // scratch, CLUSTER_COUNT entries
+    // Parallel to bins_, and EMPTY for every bin that never overflowed: the
+    // eviction scores are filled lazily, on a bin's first refused insertion,
+    // so a scene that stays under the cap allocates and evaluates nothing.
+    std::vector<std::vector<float>> bin_scores_;
     std::vector<ViewLight> view_lights_;        // scratch, reused across frames
     std::vector<LightRange> light_ranges_;      // scratch, per-light conservative cluster box
     // Per-chunk truncation partials for the binning fan-out: each chunk

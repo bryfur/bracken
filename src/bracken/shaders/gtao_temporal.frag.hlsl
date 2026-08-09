@@ -9,17 +9,24 @@
  *   target 0  RGBA16F  AO, octahedral world bent normal (GB), cone aperture
  *   target 1  RG16F    R = this frame's linear view depth, for next frame's
  *                      disocclusion test (G unused)
- * Nothing here can be bit-packed: the history is sampled with a LINEAR filter
- * at arbitrary sub-texel reprojection positions, and a packed channel does not
- * survive that. RGBA16F rather than RGBA8 because a 0.9-feedback accumulation
- * against an 8-bit grid stalls — a per-frame delta under half an LSB never
- * lands and the history freezes.
+ * Nothing here can be bit-packed: the history is filtered at arbitrary
+ * sub-texel reprojection positions, and a packed channel does not survive that.
+ * RGBA16F rather than RGBA8 because a 0.9-feedback accumulation against an
+ * 8-bit grid stalls — a per-frame delta under half an LSB never lands and the
+ * history freezes.
  *
- * The bent normal is blended as a DIRECTION (decode both ends, lerp, normalise,
- * re-encode), never as a pair of octahedral coordinates: those are
- * discontinuous across the fold seam, and averaging across it points the bent
- * normal at neither input. The aperture is a projected solid angle and blends
- * linearly as it stands.
+ * The history sampler is NEAREST and the bilinear filter is built BY HAND from
+ * 4 taps, because GB is a pair of OCTAHEDRAL COORDINATES: those are
+ * discontinuous across the fold seam, and a hardware filter averaging them
+ * across it points the bent normal at neither input — for a wall facing world
+ * -Z it can land 73 degrees off, and at the -Z pole it returns the exact
+ * opposite direction. So the bent normal is filtered and then blended as a
+ * DIRECTION (decode every tap, weight, normalise, lerp, re-encode), which is
+ * what blur_ao and gtao_upsample already do and what bent_cone.hlsli requires
+ * of every stage in the chain. AO and the aperture are linear quantities, so
+ * the same manual weights reproduce what the hardware filter gave them; the
+ * depth history keeps its linear sampler and is tapped at those same texel
+ * CENTRES, which is the same thing again.
  *
  * Reprojection follows the engine velocity convention (prepass RG16F,
  * UV-space delta, current minus previous: prev_uv = uv - velocity,
@@ -102,23 +109,62 @@ PSOutput PSMain(PSInput input) {
         return output;
     }
 
+    float3 currDir = bentOctDecode(curr.gb);
+
     float feedback = 0.0;
-    float4 prev = curr;
+    float prevAo = curr.r;
+    float prevAperture = curr.a;
+    float3 prevDir = currDir;
     if (historyValid > 0.5) {
         float2 velocity = velocityTexture.SampleLevel(velocitySampler, uv, 0).xy;
         float2 prevUV = uv - velocity;
         if (all(prevUV >= 0.0) && all(prevUV <= 1.0)) {
-            prev = historyTexture.SampleLevel(historySampler, prevUV, 0);
-            float prevZ = depthHistoryTexture.SampleLevel(depthHistorySampler, prevUV, 0).x;
+            // The 4 history texels around the reprojected position, with the
+            // bilinear weights the hardware would have used. Done by hand
+            // because GB is an OCTAHEDRAL PAIR: the hardware would average the
+            // coordinates, and across the fold seam that points at neither
+            // input (bent_cone.hlsli). AO / aperture / depth reproduce the
+            // hardware filter; the direction is decoded per tap, weighted and
+            // renormalised, exactly as blur_ao and gtao_upsample already do.
+            // Taps can land half a texel outside [0,1] at the frame border,
+            // which is what CLAMP_TO_EDGE is for.
+            float2 pos = prevUV / invScreenSize - 0.5;
+            float2 base = floor(pos);
+            float2 f = pos - base;
+            float2 uv00 = (base + 0.5) * invScreenSize;
+            float2 tapUV[4];
+            tapUV[0] = uv00;
+            tapUV[1] = uv00 + float2(invScreenSize.x, 0.0);
+            tapUV[2] = uv00 + float2(0.0, invScreenSize.y);
+            tapUV[3] = uv00 + invScreenSize;
+
+            float4 w = float4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y),
+                              (1.0 - f.x) * f.y, f.x * f.y);
+
+            prevAo = 0.0;
+            prevAperture = 0.0;
+            float3 dirSum = float3(0.0, 0.0, 0.0);
+            float prevZ = 0.0;
+            [unroll]
+            for (int i = 0; i < 4; ++i) {
+                float4 s = historyTexture.SampleLevel(historySampler, tapUV[i], 0);
+                prevAo += s.r * w[i];
+                prevAperture += s.a * w[i];
+                dirSum += bentOctDecode(s.gb) * w[i];
+                prevZ += depthHistoryTexture.SampleLevel(depthHistorySampler, tapUV[i], 0).x * w[i];
+            }
+            // Four taps that cancel is exactly the case the seam used to
+            // produce; the current frame is the honest fallback, never zero.
+            prevDir = bentNormalize(dirSum, currDir);
+
             float relDiff = abs(prevZ - currZ) / max(currZ, 1e-3);
             feedback = feedbackMax * saturate(1.0 - relDiff * depthRejectScale);
         }
     }
 
-    float ao = lerp(curr.r, prev.r, feedback);
-    float aperture = lerp(curr.a, prev.a, feedback);
-    float3 currDir = bentOctDecode(curr.gb);
-    float3 dir = bentNormalize(lerp(currDir, bentOctDecode(prev.gb), feedback), currDir);
+    float ao = lerp(curr.r, prevAo, feedback);
+    float aperture = lerp(curr.a, prevAperture, feedback);
+    float3 dir = bentNormalize(lerp(currDir, prevDir, feedback), currDir);
 
     output.history = float4(ao, bentOctEncode(dir), aperture);
     return output;

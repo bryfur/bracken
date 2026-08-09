@@ -426,8 +426,11 @@ std::uint32_t for_each_entering_probe(const glm::ivec3& old_base, const glm::ive
     const int py = std::clamp(tile_local.y - PROBE_BORDER_TEXELS, 0, last);
 
     if ((left || right) && (top || bottom)) {
-        // Corner: the antipode of the octahedron's corner is the opposite corner.
-        return {left ? 0 : last, top ? 0 : last};
+        // Corner: applying the edge fold on BOTH axes. The diagonal continuation
+        // past a square corner passes through the -Z pole and comes back out in
+        // the opposite azimuth quadrant, so tile corner (0,0) replicates payload
+        // (last, last) — not (0,0), which would be clamp-to-edge.
+        return {left ? last : 0, top ? last : 0};
     }
     if (top || bottom) {
         return {last - px, top ? 0 : last};
@@ -441,6 +444,43 @@ std::uint32_t for_each_entering_probe(const glm::ivec3& old_base, const glm::ive
 // ---------------------------------------------------------------------------
 // Probe ray directions
 // ---------------------------------------------------------------------------
+
+/// Ceiling on a probe's ray count — `gi_budget(GiQuality::High).rays_per_probe`,
+/// pinned to it by a static_assert in `probe_schedule.hpp` (which is where the
+/// budgets live; this header may not include GraphicsSettings). It sizes the
+/// blend passes' groupshared direction cache, so it is a shader constant as
+/// much as a CPU one: mirrored as GI_MAX_PROBE_RAYS in `shaders/gi_probe.hlsli`.
+inline constexpr int MAX_PROBE_RAYS = 96;
+
+/**
+ * How far a probe ray may fly, in PROBES of its own cascade.
+ *
+ * A single flat range for all three cascades is what the field shipped with,
+ * and it is the wrong shape: the trace is traversal-bound, so cost scales with
+ * reach, and cascade 0's probes are 150 units apart while cascade 2's are 600.
+ * A cascade-0 probe has no use for a ray that outruns its own window — the
+ * points it answers for all lie within `GRID/2 - 1 - margin - fade` probes of
+ * the window centre, and beyond that the blend has already handed the pixel to
+ * the coarser cascade, whose probes DO carry the long rays.
+ *
+ * 12 probes is the window's half-extent along X/Z, i.e. deliberately more than
+ * the ~9.5 probes the cascade's confidence actually reaches, so the truncation
+ * cannot bite inside the region the cascade answers for. It is applied as a
+ * CEILING against `ProbeUpdateParams::ray_max_distance`, never as a floor, so
+ * the coarsest cascade keeps the caller's range exactly.
+ *
+ * A ray that now ends early is a MISS, and a miss takes the sky radiance and
+ * records `rayMaxDistance` as its distance — the same path a ray into open sky
+ * always took. Terminating early must never read as a black hit; that would
+ * darken the whole field rather than shorten it.
+ */
+inline constexpr float PROBE_RAY_REACH_PROBES = 12.0f;
+
+/// Trace range for one cascade: `PROBE_RAY_REACH_PROBES` of its own spacing,
+/// capped at the range the caller asked for.
+[[nodiscard]] inline float cascade_ray_max_distance(int cascade, float requested) {
+    return std::min(requested, PROBE_RAY_REACH_PROBES * cascade_spacing(cascade));
+}
 
 /**
  * Spherical Fibonacci: `count` directions spread over the whole sphere with no
@@ -542,6 +582,35 @@ inline constexpr float PROBE_HYSTERESIS_MIN = 0.70f;
 /// Relative change at which the hysteresis has fully collapsed to the floor.
 inline constexpr float PROBE_CHANGE_SATURATION = 1.0f;
 
+/**
+ * How many standard errors of the UPDATE'S OWN ESTIMATE are subtracted from the
+ * observed delta before the curve above reads it as "the lighting changed".
+ *
+ * Without this the curve is driven by Monte Carlo noise. `new_value` is one
+ * update's cosine-weighted mean over 32-96 rays whose directions are re-rotated
+ * every frame, so `|new - old|` has a strictly positive floor for a perfectly
+ * static scene — the estimator's own dispersion. Feeding that floor into a
+ * curve whose job is to shorten the window shortens it permanently: the field
+ * never runs at PROBE_HYSTERESIS_MAX, it settles wherever the noise puts it,
+ * and the shorter window then lets MORE noise through, which is the positive
+ * feedback `gi_probe_blend_visibility.comp.hlsl` argues against at length for
+ * the visibility moments. The irradiance half is the same argument with a
+ * larger n_eff (~24 effective samples at 64 rays, against ~1.2 for the cos^50
+ * visibility lobe), which is why it is a smaller effect here and not a
+ * non-effect.
+ *
+ * 1.0 rather than 2.0 deliberately. The sigma the blend pass supplies is an
+ * IID weighted standard error applied to a rigidly-rotated spherical-Fibonacci
+ * set — randomised QMC, whose true error is roughly half the iid figure — so
+ * the gate already bites at about 2 sigma_true. Raising k to 2 would put it at
+ * ~4 sigma_true and triple the number of updates a genuine 1.3x lighting change
+ * takes to be adopted. The one event that must not be slowed is the sun, and it
+ * does not go through this path at all: `reset` enters as a ceiling.
+ *
+ * Mirrored as GI_BLEND_NOISE_K in `shaders/gi_probe.hlsli`.
+ */
+inline constexpr float PROBE_BLEND_NOISE_K = 1.0f;
+
 /// Hysteresis for a normalized new-vs-old delta. `delta` is
 /// |new - old| / max(|old|, epsilon), so it is scale-free: a courtyard at 0.02
 /// and a sunlit wall at 20.0 respond to a doubling at the same rate.
@@ -563,10 +632,19 @@ inline constexpr float PROBE_CHANGE_SATURATION = 1.0f;
 
 /// One EMA step of the adaptive blend, per colour channel set. Mirrors
 /// `giBlend()` in `shaders/gi_probe.hlsli`.
+///
+/// `sigma` is the standard error of `new_value` itself — the blend pass
+/// computes it from the second moment of the same weighted ray sum that
+/// produced `new_value`. `PROBE_BLEND_NOISE_K * sigma` is subtracted from the
+/// observed disagreement as a SOFT THRESHOLD, so a delta the estimator's own
+/// noise fully explains reads as no change at all. `sigma == 0` is exactly the
+/// pre-gate curve, which is what keeps every existing caller and test honest.
 [[nodiscard]] inline glm::vec3 probe_blend(const glm::vec3& old_value, const glm::vec3& new_value,
-                                           float reset = 0.0f) {
+                                           float reset = 0.0f, float sigma = 0.0f) {
     const float old_mag = glm::length(old_value);
-    const float delta = glm::length(new_value - old_value) / std::max(old_mag, 1e-4f);
+    const float observed = glm::length(new_value - old_value);
+    const float signal = std::max(0.0f, observed - PROBE_BLEND_NOISE_K * std::max(sigma, 0.0f));
+    const float delta = signal / std::max(old_mag, 1e-4f);
     const float hysteresis = probe_blend_hysteresis(delta, reset);
     return new_value + (old_value - new_value) * hysteresis;
 }
@@ -607,6 +685,32 @@ inline constexpr float PROBE_INSIDE_BACKFACE_LEAVE = 0.60f;
 /// would be nonsense.
 inline constexpr float PROBE_MAX_OFFSET_FRACTION = 0.45f;
 
+/**
+ * MINIMUM COHERENCE of the backface set, as a mean resultant length per
+ * backface ray, for the nudge direction to carry any information.
+ *
+ * The nudge is `-normalize(sum of the backface ray directions)`. That is
+ * well-posed only while the backfaces occupy part of the sphere: a probe
+ * entirely enclosed in geometry flags EVERY ray, and the resultant of the whole
+ * rotated spherical-Fibonacci set is not zero but numerical residue — |sum| is
+ * ~0.06-0.10 over 32-96 unit vectors, three orders of magnitude above any
+ * "is it zero" epsilon, pointing in a direction that re-randomizes with
+ * `probe_ray_rotation` every update. Nudging along it is a random walk, and
+ * `sample_cascade` reads the walking offset as the probe's position for both
+ * the Chebyshev distance and the backface direction.
+ *
+ * The resultant of N unit vectors spread over a spherical cap of half-angle a
+ * has mean length N*(1+cos a)/2, so this threshold rejects a backface set
+ * spanning more than ~90 degrees of the sphere while leaving every genuinely
+ * one-sided set — which is every probe relocation can actually help — well
+ * clear of it. 0.10 rather than something tighter is deliberate: the traced
+ * source has the same degeneracy for a fully-enclosed probe, and every traced
+ * GI pin is a regression gate.
+ *
+ * Mirrored as GI_RELOCATE_MIN_COHERENCE in `shaders/gi_probe.hlsli`.
+ */
+inline constexpr float PROBE_RELOCATE_MIN_COHERENCE = 0.10f;
+
 /// Ray hit distances are clamped to this multiple of the cascade spacing before
 /// they enter the visibility moments. Chebyshev only ever compares a sample's
 /// distance-to-probe against the stored mean, and a sample is at most ~1
@@ -619,6 +723,65 @@ inline constexpr float PROBE_VISIBILITY_DISTANCE_SCALE = 1.5f;
 /// take a much narrower cone of rays than the irradiance texels do — the
 /// DDGI-standard trade.
 inline constexpr float PROBE_VISIBILITY_SHARPNESS = 50.0f;
+
+/// One classify-pass verdict. Mirrors what `gi_probe_classify.comp.hlsl` writes
+/// into the offset plane, plus the counter it bumps.
+struct ProbeRelocation {
+    glm::vec3 offset{0.0f};
+    float classification = PROBE_CLASS_OK;
+    bool relocated = false;
+};
+
+/**
+ * The relocation/classification step, as a pure function. Mirrors the body of
+ * `gi_probe_classify.comp.hlsl`; `backface_sum` is the unweighted sum of the
+ * ray directions that came back with a negative distance, and `was_inside` is
+ * the verdict already stored for this probe (the dwell band's other half).
+ *
+ * The COHERENCE GUARD is the whole reason this is worth mirroring: a probe with
+ * no direction to escape in must be written off rather than nudged along
+ * numerical residue, and that write-off has to happen even though the offset
+ * never reaches the clamp — otherwise the probe stays PROBE_CLASS_OK forever,
+ * at full weight in every trilinear cage, contributing the black radiance a
+ * buried probe measures.
+ */
+[[nodiscard]] inline ProbeRelocation probe_relocation_step(const glm::vec3& previous_offset,
+                                                           const glm::vec3& backface_sum,
+                                                           std::uint32_t backfaces,
+                                                           std::uint32_t ray_count, float spacing,
+                                                           float max_offset, bool was_inside) {
+    ProbeRelocation out;
+    out.offset = previous_offset;
+
+    const float fraction =
+        ray_count > 0u ? static_cast<float>(backfaces) / static_cast<float>(ray_count) : 0.0f;
+    const bool was_relocated = glm::length(previous_offset) > 1e-4f;
+    const float relocate_threshold =
+        was_relocated ? PROBE_RELOCATE_BACKFACE_LEAVE : PROBE_RELOCATE_BACKFACE_FRACTION;
+    const float inside_threshold =
+        was_inside ? PROBE_INSIDE_BACKFACE_LEAVE : PROBE_INSIDE_BACKFACE_FRACTION;
+
+    const float len = glm::length(backface_sum);
+    const bool coherent =
+        backfaces > 0u && len > PROBE_RELOCATE_MIN_COHERENCE * static_cast<float>(backfaces);
+
+    if (fraction > relocate_threshold) {
+        if (coherent) {
+            const glm::vec3 away = -backface_sum / std::max(len, 1e-6f);
+            out.offset = previous_offset + away * (0.25f * spacing);
+            const float offset_len = glm::length(out.offset);
+            if (offset_len > max_offset) {
+                out.offset *= max_offset / std::max(offset_len, 1e-6f);
+            }
+            out.relocated = true;
+        }
+        if (fraction > inside_threshold &&
+            (!coherent || glm::length(previous_offset) >= max_offset * 0.99f)) {
+            out.classification = PROBE_CLASS_INSIDE_GEOMETRY;
+        }
+    }
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // SAMPLING — the CPU mirror of shaders/gi_sample.hlsli

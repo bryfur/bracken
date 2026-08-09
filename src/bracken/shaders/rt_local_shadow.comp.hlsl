@@ -123,8 +123,10 @@
 // shipped, `q_f` of the draw going to the former (render/raytracing/
 // emissive_clusters.hpp owns the derivation and the CPU binner). A global draw
 // is unbiased and aims long rays; a purely local one is short-rayed and drops
-// records no list holds; the mixture is both unbiased and mostly local.
-// `emissiveFroxelShare = 0` is R6 bit for bit and is the A/B control.
+// records no list holds; at any share BELOW 1 the mixture is both unbiased and
+// mostly local. `emissiveFroxelShare = 0` is R6 bit for bit and is the A/B
+// control; the SHIPPED 1 takes the purely local end on purpose, and the draw
+// site below says what that costs.
 //
 // THEY ONLY WORK IN THE FULL-DI TIER, and this is a real limitation rather than
 // an unfinished corner. The Ratio tier's entire output is a scalar V in
@@ -708,12 +710,15 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : S
                 // above, because the two halves' domains OVERLAP — the brightest
                 // record near a pixel is in both — and a mixture is what handles
                 // that honestly: a record reachable both ways simply has both
-                // terms. Every record keeps a positive pdf, so the estimator
-                // stays unbiased over the FULL record set (a lighthouse no
-                // froxel list holds is still drawn, and its ray is still
-                // unbounded); what changes is that three draws in four now land
-                // on an emitter that actually reaches the pixel, which is what
-                // makes the winner near and the ray short.
+                // terms. AT `emissiveFroxelShare < 1` every record keeps a
+                // positive pdf, so the estimator is unbiased over the FULL
+                // record set — a lighthouse no froxel list holds is still drawn,
+                // and its ray is still unbounded. THE SHIPPED SHARE IS 1: `q_g`
+                // is zero, this froxel's list IS the candidate domain (the
+                // contract analytic point and spot lights have had since R2b),
+                // every draw lands on an emitter that reaches the pixel — which
+                // is what makes the winner near and the ray short — and the
+                // far-field fill is the documented price.
                 //
                 // The derivation, the CPU mirror and the honest statement of
                 // what IS approximated (the per-froxel cap, not the estimator)

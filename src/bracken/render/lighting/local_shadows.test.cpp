@@ -3,8 +3,10 @@
 #include "bracken/render/lighting/local_shadows.hpp"
 
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace {
@@ -150,6 +152,46 @@ TEST(LocalShadowMath, SpotViewProjCoversOuterCone) {
     }
 }
 
+// ---- caster -> cube-face mask -------------------------------------------
+
+TEST(LocalShadowMath, CasterFaceMaskCoversOnlyTheFacesTheSphereTouches) {
+    // Straight down +X, well clear of the seams: one face.
+    EXPECT_EQ(local_shadow_caster_face_mask({100.0f, 0.0f, 0.0f}, 20.0f, TILE_RES), 0x01u);
+    // On the +X/+Y edge: both faces, and only those two.
+    EXPECT_EQ(local_shadow_caster_face_mask({100.0f, 100.0f, 0.0f}, 1.0f, TILE_RES), 0x05u);
+    // Light inside the caster: every face sees it.
+    EXPECT_EQ(local_shadow_caster_face_mask({5.0f, 0.0f, 0.0f}, 10.0f, TILE_RES), 0x3Fu);
+}
+
+// A face frustum is a square PYRAMID whose corner reaches atan(sqrt(2)) =
+// 54.7 deg, not a 45-deg cone. (1, 0.9, 0.9) is 51.9 deg off +X — inside the
+// +X tile, outside an inscribed cone. Rejecting it would leave the caster's
+// silhouette baked into a live tile, which is worse than the old
+// dirty-everything behaviour.
+TEST(LocalShadowMath, CasterFaceMaskAcceptsThePyramidCornerNotAnInscribedCone) {
+    const uint8_t mask = local_shadow_caster_face_mask({1.0f, 0.9f, 0.9f}, 0.0f, TILE_RES);
+    EXPECT_NE(mask & 0x01u, 0u);
+    EXPECT_EQ(mask, 0x01u); // and it is the +X face alone
+}
+
+// Property: a point caster's mask must always contain the face the
+// dominant-axis rule selects for it — otherwise the shader samples a tile the
+// dirty analysis never refreshed.
+TEST(LocalShadowMath, CasterFaceMaskAgreesWithCubeFaceSelection) {
+    for (int x = -3; x <= 3; ++x) {
+        for (int y = -3; y <= 3; ++y) {
+            for (int z = -3; z <= 3; ++z) {
+                if (x == 0 && y == 0 && z == 0) continue;
+                const glm::vec3 d = glm::normalize(glm::vec3(x, y, z)) * 250.0f;
+                const int face = local_shadow_cube_face(d);
+                const uint8_t mask = local_shadow_caster_face_mask(d, 0.0f, TILE_RES);
+                EXPECT_NE(mask & static_cast<uint8_t>(1u << face), 0u)
+                    << "dir " << x << "," << y << "," << z << " face " << face;
+            }
+        }
+    }
+}
+
 TEST(LocalShadowMath, ScoreFavorsBrightCloseLights) {
     EXPECT_GT(local_shadow_light_score(10.0f, 300.0f, 100.0f), local_shadow_light_score(10.0f, 300.0f, 500.0f));
     EXPECT_GT(local_shadow_light_score(10.0f, 300.0f, 100.0f), local_shadow_light_score(2.0f, 300.0f, 100.0f));
@@ -235,12 +277,49 @@ TEST(LocalShadowSelector, DynamicCasterInsideRadiusDirtiesTiles) {
     f.run(points, spots);
     ASSERT_EQ(f.sel.tiles_rendered_last_frame(), 0);
 
-    // A skinned/moving caster inside the light sphere forces a re-render...
+    // A skinned/moving caster inside the light sphere forces a re-render — of
+    // the faces it can actually appear in, not all six. At 100 units out along
+    // +X a radius-20 caster subtends ~11 deg: one face.
     f.run(points, spots, {{{200.0f, 0.0f, 0.0f}, 20.0f}});
-    EXPECT_EQ(f.sel.tiles_rendered_last_frame(), 6);
+    EXPECT_EQ(f.sel.tiles_rendered_last_frame(), 1);
+    ASSERT_FALSE(f.sel.tile_requests().empty());
+    EXPECT_EQ(f.sel.tile_requests()[0].tile, 0); // group 0, +X face
 
-    // ...but one far outside does not.
+    // Gone from the sphere entirely: one last render of the face it left...
     f.run(points, spots, {{{2000.0f, 0.0f, 0.0f}, 20.0f}});
+    EXPECT_EQ(f.sel.tiles_rendered_last_frame(), 1);
+
+    // ...and then nothing.
+    f.run(points, spots, {{{2000.0f, 0.0f, 0.0f}, 20.0f}});
+    EXPECT_EQ(f.sel.tiles_rendered_last_frame(), 0);
+}
+
+TEST(LocalShadowSelector, DynamicCasterDirtiesTheFaceItLeavesAsWellAsTheOneItEnters) {
+    SelectorFixture f;
+    std::vector<PointLight> points = {make_point({0, 0, 0}, 300.0f)};
+    std::vector<SpotLight> spots;
+    f.run(points, spots);
+    f.run(points, spots);
+    ASSERT_EQ(f.sel.tiles_rendered_last_frame(), 0);
+
+    // +X face only.
+    f.run(points, spots, {{{100.0f, 0.0f, 0.0f}, 10.0f}});
+    EXPECT_EQ(f.sel.tiles_rendered_last_frame(), 1);
+    EXPECT_EQ(f.sel.tile_requests()[0].tile, 0);
+
+    // Crossed to +Y: the face it entered AND the face it left, or its
+    // silhouette stays baked into the +X tile.
+    f.run(points, spots, {{{0.0f, 100.0f, 0.0f}, 10.0f}});
+    EXPECT_EQ(f.sel.tiles_rendered_last_frame(), 2);
+
+    // Parked on +Y: only that face keeps refreshing.
+    f.run(points, spots, {{{0.0f, 100.0f, 0.0f}, 10.0f}});
+    EXPECT_EQ(f.sel.tiles_rendered_last_frame(), 1);
+    EXPECT_EQ(f.sel.tile_requests()[0].tile, 2);
+
+    f.run(points, spots); // departure
+    EXPECT_EQ(f.sel.tiles_rendered_last_frame(), 1);
+    f.run(points, spots);
     EXPECT_EQ(f.sel.tiles_rendered_last_frame(), 0);
 }
 
@@ -362,6 +441,84 @@ TEST(LocalShadowSelector, MovingLightsShareTheCapFairly) {
         EXPECT_EQ(f.sel.shadowed_point_lights(), 2);
     }
     EXPECT_EQ(f.sel.tiles_rendered_total() - before, 24u);
+}
+
+// The tile cap is spent by a face loop. Restarting that loop at face 0 every
+// time makes a group that is only ever reached with a PARTIAL slice re-render
+// its low-index faces forever and never the rest — permanent starvation, not
+// staleness, because a moving light re-dirties all six faces every frame and
+// the residue of last frame's partial service is not what `need` carries.
+// Shipped defaults reproduce it: the spot eats one tile of the cap, so exactly
+// one point group is only ever reached with five tiles left.
+TEST(LocalShadowSelector, EveryCubeFaceRefreshesUnderAPartialTileSlice) {
+    SelectorFixture f; // defaults: 4 point + 2 spot, cap 6
+    std::vector<PointLight> points = {
+        make_point({100, 50, 0}, 300.0f, 8.0f), make_point({200, 50, 0}, 300.0f, 7.0f),
+        make_point({300, 50, 0}, 300.0f, 6.0f), make_point({400, 50, 0}, 300.0f, 5.0f),
+    };
+    std::vector<SpotLight> spots = {make_spot({0, 200, 0}, {0, -1, 0})};
+    for (int i = 0; i < 12; ++i) f.run(points, spots); // warm up to all-valid
+    ASSERT_EQ(f.sel.shadowed_point_lights(), 4);
+    ASSERT_EQ(f.sel.shadowed_spot_lights(), 1);
+
+    // Let the service cadence settle before measuring: the starved face gets
+    // one last render on the way in, and counting that would hide the bug.
+    for (int frame = 0; frame < 20; ++frame) {
+        for (auto& p : points) p.position.y += 0.5f;
+        spots[0].position.x += 0.5f;
+        f.run(points, spots);
+    }
+    uint64_t seen = 0;
+    for (int frame = 0; frame < 60; ++frame) {
+        for (auto& p : points) p.position.y += 0.5f;
+        spots[0].position.x += 0.5f;
+        f.run(points, spots);
+        for (const auto& r : f.sel.tile_requests()) seen |= (1ull << r.tile);
+    }
+    for (int tile = 0; tile < 4 * 6; ++tile) {
+        EXPECT_NE(seen & (1ull << tile), 0ull) << "tile " << tile << " never re-rendered";
+    }
+    EXPECT_NE(seen & (1ull << LOCAL_SHADOW_SPOT_TILE_BASE), 0ull);
+}
+
+TEST(LocalShadowSelector, OffscreenLightsLoseSlotsToVisibleOnes) {
+    // Camera at the origin looking down -Z. Frustum::extract_from_matrix is
+    // depth-convention agnostic, so a standard-Z projection is fine here.
+    const glm::mat4 proj = glm::perspective(glm::radians(60.0f), 16.0f / 9.0f, 1.0f, 4000.0f);
+    const glm::mat4 view = glm::lookAt(glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, -1.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    bracken::scene::Frustum frustum;
+    frustum.extract_from_matrix(proj * view);
+
+    LocalShadowConfig cfg;
+    cfg.point_budget = 1;
+    cfg.max_tile_updates_per_frame = 100;
+
+    // Behind the camera by more than radius * k_offscreen_test_dilation, so
+    // the dilated sphere genuinely misses the frustum: raw score 8*300/600 = 4
+    // against 8*300/900 = 2.67 for the one in front, and 1.0 once demoted.
+    std::vector<PointLight> points = {
+        make_point({0, 0, 600}, 300.0f, 8.0f),
+        make_point({0, 0, -900}, 300.0f, 8.0f),
+    };
+    std::vector<SpotLight> spots;
+
+    // No frustum: the pure distance ranking takes the nearer light, whether or
+    // not it lights a single visible pixel.
+    LocalShadowSelector blind;
+    blind.update(points, spots, {0, 0, 0}, {}, cfg, TILE_RES);
+    EXPECT_EQ(points[0].shadow_slot, 0);
+    EXPECT_EQ(points[1].shadow_slot, -1);
+
+    LocalShadowSelector sighted;
+    sighted.update(points, spots, {0, 0, 0}, {}, cfg, TILE_RES, &frustum);
+    EXPECT_EQ(points[0].shadow_slot, -1);
+    EXPECT_EQ(points[1].shadow_slot, 0);
+
+    // A weight, not a cull: unopposed, the off-screen light still gets the slot.
+    std::vector<PointLight> alone = {make_point({0, 0, 600}, 300.0f, 8.0f)};
+    LocalShadowSelector solo;
+    solo.update(alone, spots, {0, 0, 0}, {}, cfg, TILE_RES, &frustum);
+    EXPECT_EQ(alone[0].shadow_slot, 0);
 }
 
 TEST(LocalShadowSelector, SlotDataWrittenForRenderedTiles) {

@@ -172,16 +172,24 @@ float voxelConeStep(float t, float tanHalfAngle) {
 }
 
 /**
- * Front-to-back alpha compositing, one cone step. `accum` is (rgb premultiplied
- * radiance, a occlusion).
+ * Front-to-back alpha compositing, one cone step. BOTH arguments are
+ * PREMULTIPLIED: rgb is coverage x radiance, a is coverage.
  *
- * Standard over-operator: a sample contributes only what the samples in front
- * of it left unblocked, which is what stops a cone that hit a wall from
- * reporting the room behind it.
+ * The sample's convention is not a choice — it is what the volume stores.
+ * Injection writes (radiance, 1) for an occupied voxel and (0, 0) for an empty
+ * one, and voxel_mip.comp.hlsl reduces that with an UNWEIGHTED box average, so
+ * a level-m texel holds (coverage * meanRadiance, coverage): the empty children
+ * averaged in as black and attenuated the colour already. A trilinear tap
+ * straddling a surface does the same thing at mip 0.
+ *
+ * So the over-operator must NOT apply the sample's alpha to its colour a second
+ * time. Doing that costs a factor of the tap's own coverage — 1 at mip 0 deep
+ * inside geometry, which is why it hid, and 2^-m out in the widening cone,
+ * which is where all the long-range bounce is.
  */
 float4 voxelConeAccumulate(float4 accum, float4 sample) {
     float transmittance = 1.0 - accum.a;
-    return float4(accum.rgb + transmittance * sample.a * sample.rgb,
+    return float4(accum.rgb + transmittance * sample.rgb,
                   accum.a + transmittance * sample.a);
 }
 

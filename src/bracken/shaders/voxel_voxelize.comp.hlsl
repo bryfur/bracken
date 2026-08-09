@@ -92,17 +92,17 @@ struct VoxelInstance {
 // ---------------------------------------------------------------------------
 //
 // The volume is declared r32ui rather than rgba8 because the only
-// order-independent write available is an integer atomic, and `max` over a
-// packed RGBA8 with OPACITY IN THE HIGH BYTE orders by opacity first — so the
-// winner of a contested voxel is the most opaque contributor, and colour only
-// breaks ties among equally opaque ones. Reading it back as colour is a shift
-// and a mask; the injection pass does that once per voxel.
-
+// order-independent write available here is an INTEGER ATOMIC, and an atomic
+// needs an integer view. Reading it back as colour is a shift and a mask; the
+// injection pass does that once per voxel.
+//
 // The triangle's packed record IS the voxel's packed record — colour in the low
 // three bytes, emissive intensity in the high one — so the voxelizer stores it
 // verbatim and `max` orders contested voxels by EMISSION first. That is the
 // right way to lose information when a lantern and a wall share a cell: the
-// light source wins.
+// light source wins. Among non-emitters every high byte is zero, so `max` falls
+// through to B, then G, then R — the winner of a contested voxel of equally
+// unlit surfaces is simply the bluest one, which is arbitrary and is fine.
 
 // ---------------------------------------------------------------------------
 // Work decomposition

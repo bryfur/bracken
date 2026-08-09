@@ -1140,13 +1140,13 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
             // march, and occlusion culling if it ever lands) runs later in the
             // frame.
             //
-            // GATED ON ITS FUTURE CONSUMER. Nothing reads the pyramid in this
-            // package, so building it unconditionally would be a screen-sized
-            // allocation and eleven dispatches that no configuration benefits
-            // from. `GiMode::ProbesScreen` — which behaves exactly as `Probes`
-            // until R4b — is the one mode that will consume it, so it is the
-            // one mode that builds it. Every other configuration, including the
-            // default, is untouched: not a byte allocated, one enum compare. =====
+            // GATED ON ITS CONSUMER. `GiMode::ProbesScreen` is the one mode that
+            // reads the pyramid — R4b's screen-probe march traces it before it
+            // touches the BVH — so it is the one mode that builds it. Building
+            // it unconditionally would be a screen-sized allocation and eleven
+            // dispatches no other configuration benefits from. Every other
+            // configuration, including the default, is untouched: not a byte
+            // allocated, one enum compare. =====
             const bool hzb_wanted = gfx.gi_mode == GiMode::ProbesScreen && frame_prepass_active_ &&
                                     post_->offscreen_depth() != nullptr && cmd != nullptr;
             if (hzb_wanted) {
@@ -1686,7 +1686,38 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 ls.spatial_radius = rt_local_tuning_.spatial_radius;
                 ls.di_spatial_iterations = rt_local_tuning_.di_spatial_iterations;
                 ls.di_noise_probe = rt_local_tuning_.di_noise_probe;
-                ls.emissive_candidate_count = rt_local_tuning_.emissive_candidates;
+                // Emissive mesh lights are DIRECT lighting for the reservoir
+                // (R6) and, at the same time, first-hit radiance in the probe
+                // field: a probe ray that lands on a glowing window deposits
+                // that window's emission into the atlas (rt_hit_shade.hlsli),
+                // and the forward pass reads the field as the WHOLE diffuse
+                // ambient. rt_hit_shade's "this is a SECONDARY hit, so it cannot
+                // double-count" argument holds for a REFLECTION ray and not for
+                // a probe ray — a probe is an interpolation point on the same
+                // emitter -> receiver path the reservoir evaluates, not a bounce
+                // vertex. So with the field live the two estimators are additive
+                // over one transport and emissive geometry is counted twice.
+                //
+                // Partition it the cheap exact way: while the field is live the
+                // FIELD owns emissive transport and this stream drops it. That
+                // is the mechanism the Ratio tier already uses — emissiveCount 0
+                // collapses cleanly in rt_local_shadow.comp.hlsl — and it costs
+                // the per-pixel SHADOWED emissive direct term: blurry
+                // probe-interpolated emissive instead of a crisp contact shadow
+                // from a lit window. Scaling the probe DEPOSIT to zero instead
+                // would remove emissive bounce, the emissive fog in-scatter and
+                // R8's far-field fill along with the double count, which is
+                // worse; §5.7's "give probe hits an emissive-record irradiance
+                // term" is the partition that costs neither, and it is a phase.
+                //
+                // Keyed on the field being live rather than on gi_mode, so a
+                // frame whose probe volume failed to allocate keeps its emissive
+                // direct lighting. R8's froxel binning above still runs in that
+                // case and its table simply goes unsampled — wasted work, not a
+                // wrong picture.
+                const bool gi_owns_emissive = gi_active && frame_gi_.enabled > 0.0f;
+                ls.emissive_candidate_count =
+                    gi_owns_emissive ? 0 : rt_local_tuning_.emissive_candidates;
                 ls.emissive_froxel_share = std::clamp(rt_local_tuning_.emissive_froxel_share, 0.0f, 1.0f);
 
                 // The frame's binned light buffers. Handed over as one struct
@@ -1954,7 +1985,13 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     BRACKEN_PROFILE_ZONE_COLOR("Bloom", 0x16A085);
                     BRACKEN_GPU_SCOPE(cmd, "Bloom");
                     BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "Bloom");
-                    bloom_->render(cmd, *pipeline_registry_, scene_in, gfx.bloom_threshold, gfx.exposure);
+                    // The prefilter's cut is POST-exposure, and the adapted EV
+                    // is the larger half of that product — so it gets the same
+                    // state buffer under the same gate the composite pass uses.
+                    // Ordering holds by construction: AutoExposure::render was
+                    // recorded into this command buffer immediately above.
+                    bloom_->render(cmd, *pipeline_registry_, scene_in, gfx.bloom_threshold, gfx.exposure,
+                                   auto_exposure_active ? auto_exposure_->state_buffer() : nullptr);
                 }
                 bloom_tex = bloom_->bloom_texture();
             }

@@ -654,12 +654,15 @@ TEST(GiMath, BorderReplicatesTheOctahedralWrap) {
     constexpr int P = IRRADIANCE_PAYLOAD_TEXELS;
     constexpr int T = P + 2 * PROBE_BORDER_TEXELS;
 
-    // Corners take the OPPOSITE corner (the octahedron's -Z point is all four
-    // square corners, so they are the same direction).
-    EXPECT_EQ(probe_border_source({0, 0}, P), glm::ivec2(0, 0));
-    EXPECT_EQ(probe_border_source({T - 1, 0}, P), glm::ivec2(P - 1, 0));
-    EXPECT_EQ(probe_border_source({0, T - 1}, P), glm::ivec2(0, P - 1));
-    EXPECT_EQ(probe_border_source({T - 1, T - 1}, P), glm::ivec2(P - 1, P - 1));
+    // Corners take the OPPOSITE corner, which is NOT clamp-to-edge. All four
+    // square corners are the same POINT on the sphere (the -Z pole), but the
+    // payload texels around them sit in four different azimuth quadrants, so the
+    // diagonal continuation past tile corner (0,0) comes back out at (P-1, P-1).
+    // Returning (0,0) here is the clamp-to-edge bug this test exists to catch.
+    EXPECT_EQ(probe_border_source({0, 0}, P), glm::ivec2(P - 1, P - 1));
+    EXPECT_EQ(probe_border_source({T - 1, 0}, P), glm::ivec2(0, P - 1));
+    EXPECT_EQ(probe_border_source({0, T - 1}, P), glm::ivec2(P - 1, 0));
+    EXPECT_EQ(probe_border_source({T - 1, T - 1}, P), glm::ivec2(0, 0));
 
     // Edges MIRROR along the edge — not clamp-to-edge, which is the bug this
     // test exists to catch: walking off the top of the octahedron's square
@@ -690,6 +693,64 @@ TEST(GiMath, BorderReplicatesTheOctahedralWrap) {
             EXPECT_GE(s.y, 0);
             EXPECT_LT(s.x, P);
             EXPECT_LT(s.y, P);
+        }
+    }
+}
+
+TEST(GiMath, BorderMatchesTheOctahedronsOwnGluing) {
+    // An INDEPENDENT reference for the whole ring, derived from the sphere
+    // rather than from the branch structure of probe_border_source: the
+    // octahedral square's edges are glued to themselves, so leaving through
+    // x = 1 at (1+s, y) is the same direction as re-entering at (1-s, -y). Fold
+    // the border texel's e-space centre back into the domain, decode it, and the
+    // payload texel it must replicate is simply the one pointing closest to it.
+    //
+    // The fold is NOT the same thing as evaluating oct_decode outside [-1,1]^2 —
+    // that gives a different vector and would certify the clamp-to-edge bug.
+    const auto fold = [](glm::vec2 e) {
+        if (e.x > 1.0f) {
+            e = {2.0f - e.x, -e.y};
+        } else if (e.x < -1.0f) {
+            e = {-2.0f - e.x, -e.y};
+        }
+        if (e.y > 1.0f) {
+            e = {-e.x, 2.0f - e.y};
+        } else if (e.y < -1.0f) {
+            e = {-e.x, -2.0f - e.y};
+        }
+        return e;
+    };
+
+    for (const int P : {IRRADIANCE_PAYLOAD_TEXELS, VISIBILITY_PAYLOAD_TEXELS}) {
+        const int T = P + 2 * PROBE_BORDER_TEXELS;
+        for (int y = 0; y < T; ++y) {
+            for (int x = 0; x < T; ++x) {
+                const bool border = x < PROBE_BORDER_TEXELS || x >= T - PROBE_BORDER_TEXELS ||
+                                    y < PROBE_BORDER_TEXELS || y >= T - PROBE_BORDER_TEXELS;
+                if (!border) {
+                    continue;
+                }
+                const glm::vec2 e{
+                    2.0f * (static_cast<float>(x - PROBE_BORDER_TEXELS) + 0.5f) / static_cast<float>(P) -
+                        1.0f,
+                    2.0f * (static_cast<float>(y - PROBE_BORDER_TEXELS) + 0.5f) / static_cast<float>(P) -
+                        1.0f};
+                const glm::vec3 want = oct_decode(fold(e) * 0.5f + 0.5f);
+
+                glm::ivec2 best{0, 0};
+                float best_dot = -2.0f;
+                for (int py = 0; py < P; ++py) {
+                    for (int px = 0; px < P; ++px) {
+                        const float d = glm::dot(probe_texel_direction({px, py}, P), want);
+                        if (d > best_dot) {
+                            best_dot = d;
+                            best = {px, py};
+                        }
+                    }
+                }
+                EXPECT_EQ(probe_border_source({x, y}, P), best)
+                    << "payload " << P << " border texel (" << x << ", " << y << ")";
+            }
         }
     }
 }
@@ -751,6 +812,184 @@ TEST(GiMath, BlendConvergesAtBothHysteresisExtremes) {
         }
     }
     EXPECT_GT(slow, 40) << "a 5% change must not be adopted at the fast rate";
+}
+
+TEST(GiMath, ZeroSigmaLeavesTheBlendCurveExactlyWhereItWas) {
+    // The gate is opt-in by construction: every caller that cannot estimate its
+    // own standard error passes 0 and gets the pre-gate curve to the bit.
+    const glm::vec3 old_value(0.4f, 0.9f, 1.7f);
+    const glm::vec3 estimate(0.9f, 0.3f, 2.4f);
+    for (const float reset : {0.0f, 0.35f, 1.0f}) {
+        const glm::vec3 a = probe_blend(old_value, estimate, reset);
+        const glm::vec3 b = probe_blend(old_value, estimate, reset, 0.0f);
+        EXPECT_FLOAT_EQ(a.x, b.x);
+        EXPECT_FLOAT_EQ(a.y, b.y);
+        EXPECT_FLOAT_EQ(a.z, b.z);
+    }
+}
+
+TEST(GiMath, TheBlendsNoiseGateHoldsTheWindowOpenOnAStaticProbe) {
+    // THE DEFECT THIS PINS. `new_value` is one update's estimate over a ray set
+    // that is re-rotated every frame, so |new - old| has a strictly positive
+    // floor even for a bit-static scene: the estimator's own dispersion. Fed raw
+    // into the change-adaptive curve, that floor reads as "the lighting changed"
+    // and collapses the accumulation window permanently — the field never runs
+    // at PROBE_HYSTERESIS_MAX at all. Both sides are asserted, because a test
+    // that only checks the gated number pins nothing about the gate.
+    constexpr float SIGMA_REL = 0.15f; // a realistic per-update relative error
+    const glm::vec3 truth(1.0f, 1.0f, 1.0f);
+
+    const auto mean_hysteresis = [&](bool gated) {
+        std::uint32_t rng = 12345u;
+        glm::vec3 value = truth;
+        double sum = 0.0;
+        int samples = 0;
+        for (int i = 0; i < 20000; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            // Uniform on [-sqrt(3), sqrt(3)]: zero mean, unit variance.
+            const float u =
+                (static_cast<float>(rng >> 8) / 8388608.0f - 1.0f) * 1.7320508f;
+            const glm::vec3 estimate = truth * (1.0f + SIGMA_REL * u);
+            const float sigma = gated ? SIGMA_REL * glm::length(estimate) : 0.0f;
+            const glm::vec3 blended = probe_blend(value, estimate, 0.0f, sigma);
+            // h back out of the EMA: blended = new + (old - new) * h.
+            if (std::abs(value.x - estimate.x) > 1e-5f) {
+                sum += static_cast<double>((blended.x - estimate.x) / (value.x - estimate.x));
+                ++samples;
+            }
+            value = blended;
+        }
+        return static_cast<float>(sum / static_cast<double>(samples));
+    };
+
+    const float ungated = mean_hysteresis(false);
+    const float gated = mean_hysteresis(true);
+    EXPECT_LT(ungated, 0.95f) << "the ungated curve must demonstrably collapse on pure noise, "
+                                 "or this test is not exercising the defect";
+    EXPECT_GT(gated, 0.95f) << "the gate must recover most of the documented window";
+    EXPECT_GT(gated, ungated + 0.015f);
+    EXPECT_LE(gated, PROBE_HYSTERESIS_MAX);
+}
+
+// --- Relocation and classification -----------------------------------------
+
+TEST(GiMath, TheFullRayDirectionSetHasNoResultantWorthNudgingAlong) {
+    // The premise of the coherence guard, stated as a number: a probe that flags
+    // EVERY ray hands the classifier the resultant of the whole rotated
+    // Fibonacci set, whose length is numerical residue and whose direction
+    // re-randomizes every frame. This is the regression that would catch a
+    // future change to the direction set re-opening the hole.
+    for (const int rays : {32, 64, 96}) {
+        for (std::uint32_t frame = 0; frame < 8; ++frame) {
+            glm::vec3 sum(0.0f);
+            for (int i = 0; i < rays; ++i) {
+                sum += probe_ray_direction(i, rays, frame);
+            }
+            EXPECT_LT(glm::length(sum), PROBE_RELOCATE_MIN_COHERENCE * static_cast<float>(rays))
+                << rays << " rays, frame " << frame;
+        }
+    }
+}
+
+TEST(GiMath, AnEnclosedProbeIsWrittenOffRatherThanRandomWalked) {
+    constexpr int RAYS = 64;
+    const float spacing = cascade_spacing(0);
+    const float max_offset = PROBE_MAX_OFFSET_FRACTION * spacing;
+
+    // Two consecutive frames, because the failure mode being closed is a WALK:
+    // the resultant's direction changes with the ray rotation, so the old code
+    // moved the probe somewhere different on every update while the sampler read
+    // that moving offset as the probe's position.
+    for (const std::uint32_t frame : {7u, 8u}) {
+        glm::vec3 sum(0.0f);
+        for (int i = 0; i < RAYS; ++i) {
+            sum += probe_ray_direction(i, RAYS, frame);
+        }
+        const ProbeRelocation r = probe_relocation_step(glm::vec3(0.0f), sum, RAYS, RAYS, spacing,
+                                                        max_offset, /*was_inside=*/false);
+        EXPECT_FALSE(r.relocated);
+        EXPECT_FLOAT_EQ(glm::length(r.offset), 0.0f);
+        // And it must still be written off — gating the verdict on the offset
+        // reaching the clamp would leave an enclosed probe PROBE_CLASS_OK
+        // forever, at full weight in every cage, contributing black.
+        EXPECT_FLOAT_EQ(r.classification, PROBE_CLASS_INSIDE_GEOMETRY);
+    }
+}
+
+TEST(GiMath, AOneSidedBackfaceSetStillNudgesAwayFromIt) {
+    constexpr int RAYS = 64;
+    const float spacing = cascade_spacing(0);
+    const float max_offset = PROBE_MAX_OFFSET_FRACTION * spacing;
+
+    // A probe flush against a wall on its +X side: the rays into +X come back as
+    // backfaces, the rest do not. This is the case relocation exists for, and
+    // the guard must not touch it.
+    glm::vec3 sum(0.0f);
+    std::uint32_t backfaces = 0;
+    for (int i = 0; i < RAYS; ++i) {
+        const glm::vec3 d = probe_ray_direction(i, RAYS, 3u);
+        if (d.x > 0.0f) {
+            sum += d;
+            ++backfaces;
+        }
+    }
+    ASSERT_GT(static_cast<float>(backfaces) / static_cast<float>(RAYS),
+              PROBE_RELOCATE_BACKFACE_FRACTION);
+    ASSERT_LT(static_cast<float>(backfaces) / static_cast<float>(RAYS),
+              PROBE_INSIDE_BACKFACE_FRACTION);
+
+    const ProbeRelocation r = probe_relocation_step(glm::vec3(0.0f), sum, backfaces, RAYS, spacing,
+                                                    max_offset, /*was_inside=*/false);
+    EXPECT_TRUE(r.relocated);
+    EXPECT_LT(r.offset.x, 0.0f) << "the nudge is away from the occluding shell";
+    EXPECT_NEAR(glm::length(r.offset), 0.25f * spacing, 1e-2f);
+    EXPECT_FLOAT_EQ(r.classification, PROBE_CLASS_OK);
+}
+
+TEST(GiMath, RelocationStopsAtTheOffsetClampAndThenWritesTheProbeOff) {
+    constexpr int RAYS = 64;
+    const float spacing = cascade_spacing(0);
+    const float max_offset = PROBE_MAX_OFFSET_FRACTION * spacing;
+
+    // Coherent, still mostly backfaces, and already at the clamp: the pre-guard
+    // write-off path, which the guard must leave exactly as it was.
+    glm::vec3 sum(0.0f);
+    std::uint32_t backfaces = 0;
+    for (int i = 0; i < RAYS; ++i) {
+        const glm::vec3 d = probe_ray_direction(i, RAYS, 3u);
+        if (d.x > -0.6f) {
+            sum += d;
+            ++backfaces;
+        }
+    }
+    ASSERT_GT(static_cast<float>(backfaces) / static_cast<float>(RAYS),
+              PROBE_INSIDE_BACKFACE_FRACTION);
+    const glm::vec3 at_clamp(-max_offset, 0.0f, 0.0f);
+    const ProbeRelocation r = probe_relocation_step(at_clamp, sum, backfaces, RAYS, spacing,
+                                                    max_offset, /*was_inside=*/false);
+    EXPECT_TRUE(r.relocated);
+    EXPECT_NEAR(glm::length(r.offset), max_offset, 1e-2f);
+    EXPECT_FLOAT_EQ(r.classification, PROBE_CLASS_INSIDE_GEOMETRY);
+}
+
+// --- Per-cascade ray reach -------------------------------------------------
+
+TEST(GiMath, RayReachIsPerCascadeAndOnlyEverACeiling) {
+    // The finest cascade gives up reach it cannot use; the coarsest keeps the
+    // caller's range exactly. Never longer than asked for, on any cascade.
+    constexpr float REQUESTED = 4000.0f;
+    EXPECT_FLOAT_EQ(cascade_ray_max_distance(0, REQUESTED), 12.0f * 150.0f);
+    EXPECT_FLOAT_EQ(cascade_ray_max_distance(1, REQUESTED), 12.0f * 300.0f);
+    EXPECT_FLOAT_EQ(cascade_ray_max_distance(2, REQUESTED), REQUESTED);
+    for (int c = 0; c < CASCADE_COUNT; ++c) {
+        EXPECT_LE(cascade_ray_max_distance(c, REQUESTED), REQUESTED);
+        // And it must clear the range the visibility moments can even represent,
+        // or a miss would record as an occluder at the clamp distance.
+        EXPECT_GT(cascade_ray_max_distance(c, REQUESTED),
+                  PROBE_VISIBILITY_DISTANCE_SCALE * cascade_spacing(c));
+    }
+    // A caller asking for less than a cascade's own reach still gets less.
+    EXPECT_FLOAT_EQ(cascade_ray_max_distance(0, 500.0f), 500.0f);
 }
 
 // --- The update rota -------------------------------------------------------

@@ -25,6 +25,19 @@ static const float2 shadowPoissonDisk[12] = {
     float2(-0.321940, -0.932615), float2(-0.791559, -0.597705)
 };
 
+// |shadowPoissonDisk[j]| for the first 8 entries — the ones the PCSS blocker
+// search taps. It needs each tap's radius to size that tap's receiver-plane
+// rejection; the 12-tap compare loop below does not.
+static const float shadowPoissonRadius[8] = {
+    0.520665, 0.843360, 0.832628, 0.653175,
+    0.981894, 0.674214, 0.926368, 0.912177
+};
+
+// Widest penumbra the PCSS filter may produce, in shadow-map texels. The
+// blocker search uses the SAME radius by construction: a blocker the search
+// cannot see is a penumbra the filter must not be asked to draw.
+static const float PCSS_MAX_PENUMBRA_TEXELS = 16.0;
+
 int selectShadowCascade(float depth) {
     if (depth < cascadeSplits.x) return 0;
     if (depth < cascadeSplits.y) return 1;
@@ -89,27 +102,50 @@ float sampleShadowCascade(int cascade, float3 worldPos, float3 N, float NdotL, f
     float cosA = cos(angle);
     float2x2 rot = float2x2(cosA, -sinA, sinA, cosA);
 
-    // Blocker search (raw taps): search width = worst-case penumbra at this
-    // receiver, i.e. tan(sun angle) * light-space distance to the near plane.
-    float searchTexels = clamp(sc.z * depthRange * lightSize / texelWorld, 2.0, 12.0);
+    // Blocker search (raw taps) at the filter's ceiling. The textbook width -
+    // tan(sun angle) * light-space distance to the near plane - is unusable
+    // here: this cascade's near plane is a CASTER-REACH plane sitting
+    // radius + CASTER_HEIGHT_BUDGET / max(|light_dir.y|, MIN_SUN_ELEVATION_SIN)
+    // up-sun (render/shadow_map.cpp), i.e. never less than 1500 world units
+    // above any receiver, so the bound comes out at 40-200 texels in cascade 0
+    // and saturates any clamp it could be given.
+    float searchTexels = PCSS_MAX_PENUMBRA_TEXELS;
     float blockerSum = 0.0;
     int blockerCount = 0;
     [unroll]
     for (int j = 0; j < 8; j++) {
         float2 tapUV = clamp(uv + mul(rot, shadowPoissonDisk[j]) * searchTexels * atlasTexel, uvMin, uvMax);
         float d = shadowAtlasRaw.SampleLevel(shadowRawSampler, tapUV, 0).r;
-        if (d < refZ) {
+        // A tap r texels out reads the RECEIVER'S OWN plane r*tanTheta texels
+        // shallower, and refZ's 1.5-texel slope term is sized for the 3x3 tent
+        // above, not for a 16-texel search. Without a per-tap threshold every
+        // sloped lit pixel counts itself as its own blocker, the early-out
+        // below never fires, and the self-taps (the deepest samples in the
+        // set) drag avgBlocker toward the receiver and narrow every penumbra.
+        // Every radius here is >= 8.3 texels, so this is always looser than
+        // refZ - it can only reject the receiver's own plane, never a blocker
+        // refZ would have caught.
+        float tapRef = sc.z - (0.5 + shadowPoissonRadius[j] * searchTexels * tanTheta)
+                              * texelWorld / depthRange;
+        if (d < tapRef) {
             blockerSum += d;
             blockerCount++;
         }
     }
-    if (blockerCount == 0) return 1.0;
+    if (blockerCount == 0) {
+        // Nothing outside the receiver's own plane band: at most a sub-texel
+        // penumbra, which the 12-tap loop would clamp to a 1-texel filter
+        // anyway. One hardware-PCF compare still keeps the contact shadows the
+        // plane rejection cannot tell apart from the receiver; returning 1.0
+        // outright would peter-pan them.
+        return shadowAtlas.SampleCmpLevelZero(shadowCmpSampler, clamp(uv, uvMin, uvMax), refZ);
+    }
 
     // Directional-light penumbra: width grows with the world-space gap
     // between receiver and average blocker times tan(sun angular radius).
     float avgBlocker = blockerSum / float(blockerCount);
     float penumbraTexels = (sc.z - avgBlocker) * depthRange * lightSize / texelWorld;
-    float filterTexels = clamp(penumbraTexels, 1.0, 16.0);
+    float filterTexels = clamp(penumbraTexels, 1.0, PCSS_MAX_PENUMBRA_TEXELS);
 
     float shadow = 0.0;
     [unroll]

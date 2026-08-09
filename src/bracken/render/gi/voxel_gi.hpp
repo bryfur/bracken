@@ -86,7 +86,11 @@ struct VoxelGiFrameParams {
     SDL_GPUTexture* sky_cube_fallback = nullptr;
     SDL_GPUSampler* sky_sampler = nullptr;
 
-    /// True when the sun or sky moved enough that injected radiance is stale.
+    /// A HARD CUT in the lighting — a teleport, a level change, a host slamming
+    /// the environment. An immediate override, NOT the primary staleness
+    /// signal: ordinary time-of-day drift is far too slow to register on a
+    /// per-frame detector, so the drift case is detected inside `VoxelGi`
+    /// against the lighting each cascade was last injected with.
     bool lighting_changed = false;
 };
 
@@ -106,6 +110,13 @@ struct VoxelConeTraceParams {
     /// Must be the ray-traced path's value — the visibility moments downstream
     /// would otherwise change meaning between GI modes.
     float ray_max_distance = 6000.0f;
+    /// Radiance a cone returns for the fraction of itself that escaped the
+    /// clipmap. Must be what the traced source's `rtHitSkyRadiance` returns for
+    /// a miss, or the two ray sources write different units into the SAME
+    /// `ray_results_` buffer. Direction-independent, where the traced path's
+    /// miss is not — a cone escaping DOWNWARD past the coarsest cascade gets
+    /// sky rather than ground.
+    glm::vec3 sky_color{0.0f};
     float bounce_scale = 1.0f;
 };
 
@@ -166,8 +177,21 @@ private:
     /// Per-cascade "the geometry is fine but the RADIANCE is stale". Kept apart
     /// from `dirty_` because a sun move needs only reinjection, which is
     /// O(volume) and cheap, where revoxelization is O(instances x triangles) and
-    /// is not — and in the playground the sun moves every frame.
+    /// is not.
     std::array<bool, VOXEL_CASCADE_COUNT> relight_{};
+
+    /// The lighting each cascade was last INJECTED with, which is what staleness
+    /// is measured against. A PER-FRAME delta cannot do this job: a 24-minute
+    /// day moves the sun 0.004 degrees per frame, under any threshold worth
+    /// having, so a per-frame test never fires and the clipmap's radiance is
+    /// only ever refreshed when a cascade happens to scroll.
+    struct InjectedLighting {
+        glm::vec3 sun_dir{0.0f};
+        glm::vec3 sun_radiance{0.0f};
+        glm::vec3 sky_color{0.0f};
+        bool valid = false;
+    };
+    std::array<InjectedLighting, VOXEL_CASCADE_COUNT> injected_{};
     /// Round-robin cursor, so a permanently-scrolling cascade 0 cannot starve
     /// the coarser ones.
     int next_cascade_ = 0;

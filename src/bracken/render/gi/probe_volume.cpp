@@ -425,6 +425,16 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
 
     const float spacing = cascade_spacing(cascade_index);
     const float max_offset = PROBE_MAX_OFFSET_FRACTION * spacing;
+    // PER CASCADE, not one flat range for all three. The trace is
+    // traversal-bound, so its cost scales with reach, and a cascade-0 probe has
+    // no use for a ray that outruns its own 3600-unit window — the blend has
+    // already handed everything past it to the coarser cascades, whose probes do
+    // carry the long rays. gi_math.hpp's PROBE_RAY_REACH_PROBES carries the
+    // derivation; it is a ceiling on `params.ray_max_distance`, so the coarsest
+    // cascade keeps the caller's range exactly. Both ray sources take it, which
+    // they must: the visibility moments downstream interpret this distance, so
+    // the two must agree about what "nothing in the way" means.
+    const float ray_max = cascade_ray_max_distance(cascade_index, params.ray_max_distance);
 
     // ---- 1. trace -------------------------------------------------------
     //
@@ -446,9 +456,20 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
         // downstream interpret this distance, so the two sources must agree
         // about what "nothing in the way" means or the same wall would leak
         // differently depending on the GI mode.
-        cone.ray_max_distance = params.ray_max_distance;
-        // 1.0, matching the traced path's `u.bounceScale` below: the field's own
-        // EMA is what carries multi-bounce, so the source must not pre-scale.
+        // Per-CASCADE reach, not one flat scene-wide number — see `ray_max`
+        // above. The traced branch below is bounded the same way, which is what
+        // keeps the two sources writing the same units into `ray_results_`.
+        cone.ray_max_distance = ray_max;
+        // What a cone that escaped the clipmap is worth, and it has to be the
+        // same thing the traced branch's miss is worth (`u.ambientSky` below) —
+        // the two write ONE buffer, so a sky the cone source values differently
+        // is a units disagreement, not a stylistic one.
+        cone.sky_color = params.environment.ambient_sky;
+        // 1.0, matching the traced path's `u.bounceScale` below: neither source
+        // may pre-scale what it reports. Note that the traced path earns its
+        // multi-bounce from `rtHitAmbient` re-entering the field at every hit;
+        // the cone source has no equivalent term and is SINGLE-bounce, so this
+        // 1.0 is a no-op here rather than the other half of a bounce series.
         cone.bounce_scale = 1.0f;
         params.voxel->cone_trace(cmd, cone);
     } else {
@@ -465,7 +486,7 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
         }
         u.cameraPosition = params.camera_position;
         u.cameraForward = params.camera_forward;
-        u.rayMaxDistance = params.ray_max_distance;
+        u.rayMaxDistance = ray_max;
         u.probeSpacing = spacing;
         u.maxOffset = max_offset;
         u.sunDirection = params.environment.sun_dir;
@@ -532,7 +553,7 @@ std::uint32_t ProbeVolume::trace_cascade(SDL_GPUCommandBuffer* cmd, const ProbeU
     blend.probeCount = count;
     blend.rayCount = rays_per_probe;
     blend.distanceClamp = PROBE_VISIBILITY_DISTANCE_SCALE * spacing;
-    blend.rayMaxDistance = params.ray_max_distance;
+    blend.rayMaxDistance = ray_max;
     blend.frameIndex = static_cast<std::uint32_t>(frame_counter_);
     blend.cascadeIndex = static_cast<std::uint32_t>(cascade_index);
     // R5b's analytic sun gradient. Read by the IRRADIANCE blend only — see the

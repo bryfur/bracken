@@ -5,6 +5,7 @@
 #include "bracken/render/lighting/cluster_index.hpp"
 #include "bracken/render/lighting/light.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
+#include "bracken/render/lighting/light_target.hpp"
 
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/ext/matrix_transform.hpp>
@@ -299,22 +300,9 @@ namespace {
 // binning consumes the LINEAR near/far passed to begin_frame and only uses
 // invProjection for frustum rays, so it must behave identically whether the
 // projection is standard-Z or reversed-Z.
-void check_binned_clusters_cover_lit_fragments(const CameraState& cam, float near_plane, float far_plane) {
+void check_point_light_coverage(const CameraState& cam, float near_plane, float far_plane,
+                                const std::vector<PointLight>& lights) {
     std::mt19937 rng(2024);
-    std::uniform_real_distribution<float> px(-30.0f, 30.0f);
-    std::uniform_real_distribution<float> py(-10.0f, 10.0f);
-    std::uniform_real_distribution<float> pz(-80.0f, -1.0f);
-    std::uniform_real_distribution<float> pr(0.5f, 6.0f);
-    std::vector<PointLight> lights;
-    for (int i = 0; i < 64; ++i) {
-        PointLight p{};
-        p.position = glm::vec3(px(rng), py(rng), pz(rng));
-        p.radius = pr(rng);
-        p.color = glm::vec3(1.0f);
-        p.intensity = 1.0f;
-        lights.push_back(p);
-    }
-
     CpuOnlyClusterGrid cg;
     cg.run(cam, 1920, 1080, near_plane, far_plane, lights, {});
 
@@ -353,6 +341,24 @@ void check_binned_clusters_cover_lit_fragments(const CameraState& cam, float nea
     EXPECT_GT(checked, 0);
 }
 
+void check_binned_clusters_cover_lit_fragments(const CameraState& cam, float near_plane, float far_plane) {
+    std::mt19937 rng(2024);
+    std::uniform_real_distribution<float> px(-30.0f, 30.0f);
+    std::uniform_real_distribution<float> py(-10.0f, 10.0f);
+    std::uniform_real_distribution<float> pz(-80.0f, -1.0f);
+    std::uniform_real_distribution<float> pr(0.5f, 6.0f);
+    std::vector<PointLight> lights;
+    for (int i = 0; i < 64; ++i) {
+        PointLight p{};
+        p.position = glm::vec3(px(rng), py(rng), pz(rng));
+        p.radius = pr(rng);
+        p.color = glm::vec3(1.0f);
+        p.intensity = 1.0f;
+        lights.push_back(p);
+    }
+    check_point_light_coverage(cam, near_plane, far_plane, lights);
+}
+
 } // namespace
 
 TEST(ClusterGrid, BinnedClustersCoverAllLitFragments) {
@@ -374,6 +380,239 @@ TEST(ClusterGrid, BinnedClustersCoverAllLitFragmentsReversedZ) {
     cam.view_projection = cam.projection * cam.view;
     cam.position = glm::vec3(0.0f);
     check_binned_clusters_cover_lit_fragments(cam, near_plane, far_plane);
+}
+
+TEST(ClusterGrid, BinnedClustersCoverLitFragmentsForLightsStraddlingTheNearPlane) {
+    // The range precompute clips the light's view-space AABB to z <= -near
+    // before projecting it, which is what lets the "outside the frustum
+    // sideways" reject fire for a light BESIDE the camera. Getting that clip
+    // wrong narrows the X/Y tile range and punches a rectangular hole in the
+    // light pool, so pin the coverage property on exactly those lights:
+    // every one of these has view depth under its own radius, so every one
+    // takes the clipped path.
+    const float near_plane = 0.1f;
+    const float far_plane = 100.0f;
+    const CameraState cam = make_camera(1920, 1080, 60.0f, 16.0f / 9.0f, near_plane, far_plane);
+
+    std::vector<PointLight> lights;
+    const auto add = [&lights](glm::vec3 pos, float radius) {
+        PointLight p{};
+        p.position = pos;
+        p.radius = radius;
+        p.color = glm::vec3(1.0f);
+        p.intensity = 1.0f;
+        lights.push_back(p);
+    };
+    add({0.0f, 0.0f, -2.0f}, 50.0f);    // camera inside the sphere, on axis
+    add({0.0f, 0.0f, 1.0f}, 30.0f);     // apex slightly BEHIND the camera
+    add({40.0f, 0.0f, -5.0f}, 60.0f);   // beside the camera, far off axis right
+    add({-40.0f, 0.0f, -5.0f}, 60.0f);  // ... and left
+    add({0.0f, 25.0f, -3.0f}, 40.0f);   // ... and above
+    add({18.0f, -12.0f, -0.5f}, 25.0f); // straddling the near plane diagonally
+    check_point_light_coverage(cam, near_plane, far_plane, lights);
+}
+
+TEST(ClusterGrid, SlicingTheCameraPlanesLeavesNoUnreachableSliceAtEitherEnd) {
+    // begin_frame's near/far are Z-SLICE parameters, and the exponential
+    // distribution spends slices where they are given. Handing it a near that
+    // is far in front of the camera's own near plane buys 8 of 24 slices that
+    // no fragment can ever occupy, and a far short of the camera's far stops
+    // binning local lights at that distance while the same geometry is still
+    // rasterized past it. This pins the property the CALLER
+    // (SceneRenderer::render, which owns the begin_frame call) has to preserve:
+    // fed the camera's own planes, both ends of the grid are reachable.
+    const float near_plane = 5.0f;      // CameraModeConfig::near_plane
+    const float far_plane = 15000.0f;   // CameraModeConfig::far_plane
+    CameraState cam;
+    cam.view = glm::mat4(1.0f);
+    // Reversed-Z, as the engine builds it (near/far swapped in the call).
+    cam.projection = glm::perspective(glm::radians(55.0f), 16.0f / 9.0f, far_plane, near_plane);
+    cam.view_projection = cam.projection * cam.view;
+    cam.position = glm::vec3(0.0f);
+
+    CpuOnlyClusterGrid cg;
+    cg.run(cam, 1600, 900, near_plane, far_plane, {}, {});
+    const ClusterParams& cp = cg.g.params();
+    EXPECT_EQ(cluster_z_slice(near_plane * 1.001f, cp), 0u)
+        << "slice 0 must start AT the camera near plane, not in front of it";
+    EXPECT_EQ(cluster_z_slice(far_plane * 0.999f, cp), CLUSTER_DIM_Z - 1)
+        << "the last slice must reach the camera far plane";
+
+    // ...and a light out past a typical draw distance is still binned, because
+    // the geometry it lights is still being drawn out there.
+    PointLight distant{};
+    distant.position = glm::vec3(0.0f, 0.0f, -6000.0f);
+    distant.radius = 400.0f;
+    distant.color = glm::vec3(1.0f);
+    distant.intensity = 1.0f;
+    cg.run(cam, 1600, 900, near_plane, far_plane, {distant}, {});
+    EXPECT_FALSE(cg.g.light_indices().empty()) << "a light at depth 6000 inside a 15000-unit grid must reach a froxel";
+}
+
+namespace {
+
+// The spot-cone half of the coverage contract, and the one that matters most:
+// the binner now culls a spot to its CONE rather than its bounding sphere, and
+// a cone test that is not conservative produces a froxel-shaped hole in the
+// light pool — the failure mode this subsystem is worst at diagnosing.
+void check_spot_light_coverage(const CameraState& cam, float near_plane, float far_plane,
+                               const std::vector<SpotLight>& lights) {
+    std::mt19937 rng(90210);
+    CpuOnlyClusterGrid cg;
+    cg.run(cam, 1920, 1080, near_plane, far_plane, {}, lights);
+
+    const glm::mat4 inv_proj = glm::inverse(cam.projection);
+    const auto& offsets = cg.g.cluster_offsets();
+    const auto& indices = cg.g.light_indices();
+
+    std::uniform_real_distribution<float> ndc(-0.9f, 0.9f);
+    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+    int checked = 0;
+    for (int s = 0; s < 4000; ++s) {
+        const float nx = ndc(rng);
+        const float ny = ndc(rng);
+        const float depth = near_plane * 1.5f * std::pow(far_plane * 0.9f / (near_plane * 1.5f), unit(rng));
+        const glm::vec3 frag = view_pos_from_ndc(inv_proj, nx, ny, depth);
+
+        const glm::vec2 screen_uv(nx * 0.5f + 0.5f, 1.0f - (ny * 0.5f + 0.5f));
+        const uint32_t cidx = shader_cluster_index(screen_uv, depth, cg.g.params());
+        const uint32_t off = offsets[cidx * 2 + 0];
+        const uint32_t cnt = offsets[cidx * 2 + 1];
+
+        for (uint32_t j = 0; j < lights.size(); ++j) {
+            const SpotLight& sl = lights[j];
+            const glm::vec3 to_light = sl.position - frag;
+            const float dist = glm::length(to_light);
+            if (dist >= sl.radius * 0.95f) {
+                continue;
+            }
+            // The forward loop's own predicate (light_target.hpp mirrors
+            // shaders/cluster_index.hlsli): a spot lights this fragment iff the
+            // cone factor is non-zero. Margin for the same FP reason the radius
+            // test has one.
+            const glm::vec3 l = to_light / std::max(dist, 1e-4f);
+            if (spot_cone_factor(l, sl.direction, sl.inner_cos, sl.outer_cos) <= 0.0f ||
+                glm::dot(sl.direction, -l) <= sl.outer_cos + 1e-3f) {
+                continue;
+            }
+            const auto begin = indices.begin() + off;
+            const bool found = std::find(begin, begin + cnt, j) != begin + cnt;
+            EXPECT_TRUE(found) << "spot " << j << " lights fragment at ndc(" << nx << ", " << ny << ") depth " << depth
+                               << " but the cone cull removed it from cluster " << cidx;
+            ++checked;
+        }
+    }
+    EXPECT_GT(checked, 0);
+}
+
+SpotLight make_cone(glm::vec3 pos, glm::vec3 dir, float radius, float outer_deg, float inner_deg) {
+    SpotLight s{};
+    s.position = pos;
+    s.radius = radius;
+    s.direction = glm::normalize(dir);
+    s.inner_cos = std::cos(glm::radians(inner_deg));
+    s.outer_cos = std::cos(glm::radians(outer_deg));
+    s.color = glm::vec3(1.0f);
+    s.intensity = 1.0f;
+    return s;
+}
+
+} // namespace
+
+TEST(ClusterGrid, SpotConeCullRemovesFroxelsTheConeMissesAndKeepsTheOnesItHits) {
+    // A spot binned as its bounding SPHERE lands in ~12x the froxels its cone
+    // can reach, and every one of those costs the fragment loop an 80-byte
+    // SpotLight load plus a spotConeFactor that returns zero.
+    const float near_plane = 0.1f;
+    const float far_plane = 100.0f;
+    const CameraState cam = make_camera(1920, 1080, 60.0f, 16.0f / 9.0f, near_plane, far_plane);
+
+    // Probe froxel: 15 units to the RIGHT of the light, same depth.
+    const glm::vec3 light_pos(0.0f, 0.0f, -20.0f);
+    const float depth = 20.0f;
+    // NDC of the probe point, so the shader-side lookup names the same froxel.
+    const glm::vec4 clip = cam.projection * glm::vec4(15.0f, 0.0f, -depth, 1.0f);
+    ASSERT_GT(clip.w, 0.0f);
+    const glm::vec2 probe_ndc = glm::vec2(clip) / clip.w;
+    ASSERT_LT(std::abs(probe_ndc.x), 1.0f) << "the probe must be on screen for the froxel to exist";
+    const glm::vec2 probe_uv(probe_ndc.x * 0.5f + 0.5f, 1.0f - (probe_ndc.y * 0.5f + 0.5f));
+
+    const auto count_at_probe = [&](const SpotLight& s) {
+        CpuOnlyClusterGrid cg;
+        cg.run(cam, 1920, 1080, near_plane, far_plane, {}, {s});
+        const uint32_t cidx = shader_cluster_index(probe_uv, depth, cg.g.params());
+        return cg.g.cluster_offsets()[cidx * 2 + 1];
+    };
+
+    // Same light, same 30-degree cone, three directions. Aimed at the probe it
+    // must be binned there; aimed elsewhere it must not.
+    EXPECT_GE(count_at_probe(make_cone(light_pos, {1.0f, 0.0f, 0.0f}, 20.0f, 30.0f, 18.0f)), 1u)
+        << "a spot whose cone contains the froxel must still be binned into it";
+    EXPECT_EQ(count_at_probe(make_cone(light_pos, {-1.0f, 0.0f, 0.0f}, 20.0f, 30.0f, 18.0f)), 0u)
+        << "a spot aimed away from the froxel contributes exactly zero there and must be culled";
+    EXPECT_EQ(count_at_probe(make_cone(light_pos, {0.0f, -1.0f, 0.0f}, 20.0f, 30.0f, 18.0f)), 0u)
+        << "...and so must one aimed perpendicular to it";
+
+    // The cull only fires on a WELL-FORMED cone. A default-constructed
+    // SpotLight carries inner_cos == outer_cos == 0 (a 90-degree cutoff with no
+    // falloff band), which has no usable cone test: it must bin exactly as it
+    // did before the cull existed, so no pre-existing test can move.
+    SpotLight defaults{};
+    defaults.position = light_pos;
+    defaults.radius = 20.0f;
+    defaults.direction = glm::vec3(-1.0f, 0.0f, 0.0f);
+    defaults.color = glm::vec3(1.0f);
+    defaults.intensity = 1.0f;
+    EXPECT_EQ(defaults.outer_cos, 0.0f);
+    EXPECT_GE(count_at_probe(defaults), 1u) << "a default-cone spot must bin exactly as the bounding sphere did";
+}
+
+TEST(ClusterGrid, TransposedSpotConeFallsBackToSphereBinning) {
+    // FrameBuilder::Lane::add_spot_light normalizes a transposed pair, but a
+    // SpotLight reaching the grid another way might carry one. Its lit set is
+    // then the COMPLEMENT of the cone (the shader's smoothstep runs with
+    // edge0 > edge1), so culling to the cone would remove froxels the forward
+    // loop lights. The binner must notice and bin the sphere instead.
+    const float near_plane = 0.1f;
+    const float far_plane = 100.0f;
+    const CameraState cam = make_camera(1920, 1080, 60.0f, 16.0f / 9.0f, near_plane, far_plane);
+    const float depth = 20.0f;
+
+    SpotLight inverted = make_cone({0.0f, 0.0f, -20.0f}, {-1.0f, 0.0f, 0.0f}, 20.0f, 20.0f, 12.0f);
+    std::swap(inverted.inner_cos, inverted.outer_cos); // inner 20 deg, outer 12 deg
+
+    CpuOnlyClusterGrid cg;
+    cg.run(cam, 1920, 1080, near_plane, far_plane, {}, {inverted});
+    const glm::vec4 clip = cam.projection * glm::vec4(15.0f, 0.0f, -depth, 1.0f);
+    const glm::vec2 probe_ndc = glm::vec2(clip) / clip.w;
+    const glm::vec2 probe_uv(probe_ndc.x * 0.5f + 0.5f, 1.0f - (probe_ndc.y * 0.5f + 0.5f));
+    const uint32_t cidx = shader_cluster_index(probe_uv, depth, cg.g.params());
+    EXPECT_GE(cg.g.cluster_offsets()[cidx * 2 + 1], 1u);
+}
+
+TEST(ClusterGrid, SpotBinsCoverEveryFragmentInsideTheCone) {
+    const float near_plane = 0.1f;
+    const float far_plane = 100.0f;
+    const CameraState cam = make_camera(1920, 1080, 60.0f, 16.0f / 9.0f, near_plane, far_plane);
+
+    std::mt19937 rng(31337);
+    std::uniform_real_distribution<float> px(-25.0f, 25.0f);
+    std::uniform_real_distribution<float> py(-12.0f, 12.0f);
+    std::uniform_real_distribution<float> pz(-70.0f, -3.0f);
+    std::uniform_real_distribution<float> pr(6.0f, 30.0f);
+    std::uniform_real_distribution<float> pd(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> outer(10.0f, 75.0f);
+
+    std::vector<SpotLight> lights;
+    for (int i = 0; i < 48; ++i) {
+        glm::vec3 dir(pd(rng), pd(rng), pd(rng));
+        if (glm::dot(dir, dir) < 1e-4f) {
+            dir = glm::vec3(0.0f, -1.0f, 0.0f);
+        }
+        const float outer_deg = outer(rng);
+        lights.push_back(make_cone(glm::vec3(px(rng), py(rng), pz(rng)), dir, pr(rng), outer_deg, outer_deg * 0.6f));
+    }
+    check_spot_light_coverage(cam, near_plane, far_plane, lights);
 }
 
 namespace {
@@ -466,8 +705,10 @@ TEST(ClusterGrid, ParallelBuildBitIdenticalAcrossWorkerCounts) {
 
 TEST(ClusterGrid, ParallelBuildTruncationBitIdentical) {
     // 150 identical overlapping lights force the MAX_LIGHTS_PER_CLUSTER
-    // cutoff: the parallel per-cluster form must keep exactly the same lowest
-    // light indices as the inline path.
+    // cutoff: the parallel per-cluster form must keep exactly the same lights
+    // as the inline path. Identical lights all score identically at any froxel
+    // and the eviction rule is STRICTLY greater, so "the same" is still "the
+    // lowest indices" here — which is the point of using identical lights.
     std::vector<PointLight> lights(150);
     for (auto& p : lights) {
         p.position = glm::vec3(0.0f, 0.0f, -10.0f);
@@ -497,8 +738,9 @@ TEST(ClusterGrid, ParallelBuildTruncationBitIdentical) {
 }
 
 TEST(ClusterGrid, PerClusterCountNeverExceedsCap) {
-    // 150 identical overlapping lights: every touched cluster must truncate at
-    // MAX_LIGHTS_PER_CLUSTER, keeping the lowest light indices.
+    // 150 identical overlapping lights: every touched cluster must stop at
+    // MAX_LIGHTS_PER_CLUSTER. Identical lights tie on contribution and the
+    // eviction is strictly-greater, so the survivors are the lowest indices.
     std::vector<PointLight> lights;
     for (int i = 0; i < 150; ++i) {
         PointLight p{};
@@ -520,6 +762,93 @@ TEST(ClusterGrid, PerClusterCountNeverExceedsCap) {
         max_count = std::max(max_count, cnt);
     }
     EXPECT_EQ(max_count, MAX_LIGHTS_PER_CLUSTER);
+}
+
+// ===========================================================================
+// Over-budget eviction policy (MAX_LIGHTS_PER_CLUSTER)
+// ===========================================================================
+
+TEST(ClusterGrid, OverBudgetBinKeepsTheBrightestLightsNotTheEarliest) {
+    // Submission order is uncorrelated with how much a light matters, so
+    // arrival-order truncation can drop the brightest light in the frame. With
+    // 150 coincident lights of strictly increasing intensity the only correct
+    // survivors are the top MAX_LIGHTS_PER_CLUSTER by intensity — everything
+    // else about them is equal, so contribution reduces to brightness here.
+    std::vector<PointLight> lights;
+    for (uint32_t i = 0; i < 150; ++i) {
+        PointLight p{};
+        p.position = glm::vec3(0.0f, 0.0f, -10.0f);
+        p.radius = 3.0f;
+        p.color = glm::vec3(1.0f);
+        p.intensity = 1.0f + static_cast<float>(i); // strictly increasing
+        lights.push_back(p);
+    }
+
+    CpuOnlyClusterGrid cg;
+    cg.run(make_camera(1920, 1080), 1920, 1080, 0.1f, 100.0f, lights, {});
+
+    const auto& offsets = cg.g.cluster_offsets();
+    const auto& indices = cg.g.light_indices();
+    const uint32_t dropped = 150u - MAX_LIGHTS_PER_CLUSTER; // 22
+    int full_bins = 0;
+    for (uint32_t c = 0; c < CLUSTER_COUNT; ++c) {
+        const uint32_t cnt = offsets[c * 2 + 1];
+        if (cnt != MAX_LIGHTS_PER_CLUSTER) {
+            continue;
+        }
+        ++full_bins;
+        const uint32_t off = offsets[c * 2 + 0];
+        std::set<uint32_t> kept(indices.begin() + off, indices.begin() + off + cnt);
+        EXPECT_EQ(kept.size(), MAX_LIGHTS_PER_CLUSTER) << "eviction must not duplicate a light into a bin";
+        EXPECT_EQ(*kept.begin(), dropped) << "the " << dropped << " dimmest lights are the ones that lose their slot";
+        EXPECT_EQ(*kept.rbegin(), 149u) << "the brightest light in the frame must never be the one dropped";
+    }
+    EXPECT_GT(full_bins, 0) << "the test scene must actually overflow a bin";
+    EXPECT_GT(cg.g.cluster_lights_dropped(), 0u) << "refused insertions are still counted";
+}
+
+TEST(ClusterGrid, EvictionRanksByContributionHereNotByTotalPower) {
+    // The metric has to be per-FROXEL, not a scene-wide power proxy: what a
+    // froxel loses when a light is dropped is that light's contribution THERE.
+    // 128 distant floodlights (100x the intensity, 12x the radius) fill the
+    // bin, and then a dim torch arrives sitting inside the froxel. Total power
+    // ranks the floodlights far above the torch; contribution at this froxel
+    // ranks the torch four orders of magnitude above them, and the torch is the
+    // one the player would notice going out.
+    const float depth = 11.0f;
+    const CameraState cam = make_camera(1920, 1080);
+
+    std::vector<PointLight> lights;
+    for (int i = 0; i < static_cast<int>(MAX_LIGHTS_PER_CLUSTER); ++i) {
+        PointLight flood{};
+        flood.position = glm::vec3(0.0f, 0.0f, -60.0f);
+        flood.radius = 60.0f;
+        flood.color = glm::vec3(1.0f);
+        flood.intensity = 100.0f;
+        lights.push_back(flood);
+    }
+    PointLight torch{};
+    torch.position = glm::vec3(0.0f, 0.0f, -depth);
+    torch.radius = 5.0f;
+    torch.color = glm::vec3(1.0f);
+    torch.intensity = 1.0f;
+    lights.push_back(torch); // arrives LAST — arrival order drops it outright
+    const uint32_t torch_index = static_cast<uint32_t>(lights.size() - 1);
+
+    CpuOnlyClusterGrid cg;
+    cg.run(cam, 1920, 1080, 0.1f, 100.0f, lights, {});
+
+    // The froxel the torch sits in, named through the shader-side lookup.
+    const glm::vec2 probe_uv(0.5f, 0.5f);
+    const uint32_t cidx = shader_cluster_index(probe_uv, depth, cg.g.params());
+    const auto& offsets = cg.g.cluster_offsets();
+    const uint32_t off = offsets[cidx * 2 + 0];
+    const uint32_t cnt = offsets[cidx * 2 + 1];
+    ASSERT_EQ(cnt, MAX_LIGHTS_PER_CLUSTER) << "the froxel must be over budget for eviction to run at all";
+    const auto& indices = cg.g.light_indices();
+    const auto begin = indices.begin() + off;
+    EXPECT_NE(std::find(begin, begin + cnt, torch_index), begin + cnt)
+        << "a near dim light must outrank a far bright one at the froxel it is standing in";
 }
 
 // ===========================================================================

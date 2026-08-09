@@ -1,7 +1,8 @@
 // rt_reflection_denoise_temporal.comp.hlsl — temporal accumulation for the
 // GGX-sampled reflection signal.
 //
-// One thread per TRACED (quarter-res by default) texel. The trace sends one
+// One thread per TRACED texel — one per screen pixel at the default Full
+// `rt_reflection_resolution`, and fewer at Half/Quarter. The trace sends one
 // importance-sampled ray per pixel into the specular lobe instead of one mirror
 // ray, which is the correct integrand and is far too noisy to show directly.
 // This is what makes it viewable.

@@ -63,6 +63,13 @@ cbuffer GiProbeBlendUniforms : register(b0, space2) {
 
 /// The payload the border ring replicates.
 groupshared float3 gPayload[GI_IRRADIANCE_PAYLOAD][GI_IRRADIANCE_PAYLOAD];
+/// THE ROTATED DIRECTION SET, computed once per group instead of once per
+/// (texel, ray). It depends only on `r`, `giRayCount` and `giFrameIndex`, all
+/// group-uniform, yet every payload thread used to regenerate all of it — a
+/// frac/divide/sqrt/sin/cos per pair, 36 x 64 x 1728 x 2 of them on the rota's
+/// worst frame. The visibility blend pays the same cost against a 196-texel
+/// tile, which is where the bulk of it is.
+groupshared float3 gRayDir[GI_MAX_PROBE_RAYS];
 
 [numthreads(GI_IRRADIANCE_TILE, GI_IRRADIANCE_TILE, 1)]
 void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
@@ -83,6 +90,24 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
         return;
     }
 
+    // THE PRELOAD SITS BETWEEN THE TWO GROUP-UNIFORM EARLY RETURNS AND THE
+    // isPayload SPLIT, so every surviving thread reaches this barrier. The
+    // direction set is one per group; the loop strides because 8x8 threads have
+    // to cover up to GI_MAX_PROBE_RAYS directions. The rotation MUST be the one
+    // the trace used, which is why the frame counter is a uniform of both passes
+    // and not re-derived from anything local.
+    const uint rayCount = min(giRayCount, (uint)GI_MAX_PROBE_RAYS);
+    {
+        float3 c0, c1, c2;
+        giRayRotation(giFrameIndex, c0, c1, c2);
+        const uint threads = uint(GI_IRRADIANCE_TILE) * uint(GI_IRRADIANCE_TILE);
+        for (uint i = lid.y * uint(GI_IRRADIANCE_TILE) + lid.x; i < rayCount; i += threads) {
+            float3 d = giSphericalFibonacci(i, rayCount);
+            gRayDir[i] = normalize(c0 * d.x + c1 * d.y + c2 * d.z);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     int2 tileLocal = int2(lid.xy);
     int2 tileOrigin = giProbeAtlasOrigin(int(probe.slot), GI_IRRADIANCE_TILE, int(giCascadeIndex));
     bool isPayload = tileLocal.x >= GI_BORDER && tileLocal.x < GI_IRRADIANCE_TILE - GI_BORDER &&
@@ -92,24 +117,24 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
         int2 local = tileLocal - GI_BORDER;
         float3 texelDir = giTexelDirection(local, GI_IRRADIANCE_PAYLOAD);
 
-        // The per-frame rotation is constant across the probe's rays, so it is
-        // hoisted out of the loop; only the Fibonacci direction varies. It MUST
-        // be the rotation the trace used, which is why the frame counter is a
-        // uniform of both passes and not re-derived from anything local.
-        float3 c0, c1, c2;
-        giRayRotation(giFrameIndex, c0, c1, c2);
-
         float3 sum = float3(0, 0, 0);
         float wsum = 0.0;
-        for (uint r = 0; r < giRayCount; ++r) {
-            float3 d = giSphericalFibonacci(r, giRayCount);
-            float3 rayDir = normalize(c0 * d.x + c1 * d.y + c2 * d.z);
-            float w = max(0.0, dot(texelDir, rayDir));
+        // The SECOND moment of the same weighted sum, and the sum of squared
+        // weights: together they give the standard error of `estimate` itself,
+        // which is what stops the blend curve below reading this estimator's own
+        // Monte Carlo noise as a lighting change. See giBlend.
+        float3 sum2 = float3(0, 0, 0);
+        float wsum2 = 0.0;
+        for (uint r = 0; r < rayCount; ++r) {
+            float w = max(0.0, dot(texelDir, gRayDir[r]));
             if (w <= 0.0) {
                 continue;
             }
-            sum += w * giRayResults[probeIndex * giRayCount + r].rgb;
+            float3 radiance = giRayResults[probeIndex * giRayCount + r].rgb;
+            sum += w * radiance;
             wsum += w;
+            sum2 += w * radiance * radiance;
+            wsum2 += w * w;
         }
 
         // Cosine-weighted MEAN, not sum: dividing by the weight total is what
@@ -128,7 +153,15 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
         } else if (wsum <= 1e-6) {
             result = previous;
         } else {
-            result = giBlend(previous, estimate, giLightingReset);
+            // Standard error of a weighted mean: Var(mu) = sigma_x^2 * sum(w^2)
+            // / sum(w)^2. `length()` over the three channel sigmas rather than a
+            // per-channel gate because the channels share one ray set and are
+            // therefore fully correlated — the same scale `giBlend` compares it
+            // against. max(..., 0) handles the cancellation case; a firefly
+            // inflating sigma and thereby HOLDING the window open is correct.
+            float3 var = max(sum2 / wsum - estimate * estimate, float3(0, 0, 0));
+            float sigma = length(sqrt(var)) * sqrt(wsum2) / wsum;
+            result = giBlend(previous, estimate, giLightingReset, sigma);
         }
 
         giIrradiance[tileOrigin + tileLocal] = float4(result, 1.0);

@@ -187,8 +187,14 @@ bool slabTest(float3 boundsMin, float3 boundsMax, float3 origin, float3 invDir, 
     return tNear <= tFar;
 }
 
-/// STOCHASTIC ALPHA TEST for a cutout triangle, the any-hit half of the opacity
+/// STOCHASTIC ALPHA TEST for a cutout triangle, the shader half of the opacity
 /// bake in `internal/model_material_proxy.hpp`.
+///
+/// BOTH WALKS APPLY IT. It landed on the any-hit walk first (Q2, a leaf card had
+/// been casting the shadow of a solid quad), and for a while only that walk
+/// consulted it — so the same card was still a solid quad in a REFLECTION and
+/// still blocked a GI probe ray outright. Coverage is a property of the
+/// triangle, not of the question being asked about it.
 ///
 /// `tri.opacity` is the fraction of the triangle that survives the material's
 /// alpha test, measured at BLAS build over stratified barycentric taps. Here it
@@ -219,6 +225,29 @@ bool cutoutPasses(float opacity, uint primId, uint seed) {
     h ^= h >> 15; h *= 0x846ca68bu;
     h ^= h >> 16;
     return (float(h) * (1.0 / 4294967296.0)) < opacity;
+}
+
+/// A cutout seed derived from the RAY ITSELF, for a closest-hit caller that has
+/// no per-pixel stream of its own to hand down — today the two GI probe traces,
+/// which are dispatched per probe and per texel rather than per pixel and never
+/// built one (see the seedless `sceneClosest` overload).
+///
+/// It has every property `cutoutPasses` asks of a seed: two different rays get
+/// uncorrelated seeds, the SAME ray always gets the same one — so a replay stays
+/// exact, which is what the A-SVGF gradient and the deterministic smoke gate
+/// both require — and a probe's ray set rotates every frame, so a canopy's
+/// decisions decorrelate over the field's own accumulation instead of freezing
+/// into one pattern that a low-triangle billboard would resolve as all-or-
+/// nothing. A caller that already owns a (pixel, frame) stream should pass that
+/// instead: it is one hash cheaper and reads as the deliberate choice it is.
+uint rtRayCutoutSeed(float3 origin, float3 dir) {
+    uint h = asuint(origin.x) * 73856093u ^ asuint(origin.y) * 19349663u ^
+             asuint(origin.z) * 83492791u ^ asuint(dir.x) * 2654435761u ^
+             asuint(dir.y) * 2246822519u ^ asuint(dir.z) * 0x9E3779B9u;
+    h ^= h >> 16; h *= 0x7feb352du;
+    h ^= h >> 15; h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
 }
 
 // Möller-Trumbore against a triangle already stored as origin + two edges, so
@@ -559,8 +588,14 @@ bool sceneOccluded(float3 origin, float3 dir, float tMax, uint seed) {
 }
 
 // One BLAS leaf's triangle window against the running best.
+//
+// `seed` is the cutout stream, passed by value exactly as the any-hit walk
+// passes it. THE ORDER OF THE TESTS IS SAFE and for a non-obvious reason: the
+// pass/fail decision is a pure function of (seed, primId), so the surviving
+// subset of triangles is independent of the order they are visited in, and a
+// farther candidate that the `hit.t` cull skipped could never have won anyway.
 void blasLeafClosest(uint firstTriangle, uint count, float3 origin, float3 dir, float scale,
-                     inout Hit hit) {
+                     uint seed, inout Hit hit) {
     for (uint i = 0; i < count; ++i) {
         uint index = firstTriangle + i;
         BvhTriangle tri = blasTriangles[index];
@@ -584,7 +619,7 @@ void blasLeafClosest(uint firstTriangle, uint count, float3 origin, float3 dir, 
         float t = dot(tri.e2, qv) * invDet;
         // Model-space t converted back to world scale before comparing.
         float worldT = t / scale;
-        if (t > RAY_EPSILON && worldT < hit.t) {
+        if (t > RAY_EPSILON && worldT < hit.t && cutoutPasses(tri.opacity, tri.primId, seed)) {
             hit.t = worldT;
             hit.triIndex = index;
             hit.bary = float2(u, v);
@@ -596,7 +631,7 @@ void blasLeafClosest(uint firstTriangle, uint count, float3 origin, float3 dir, 
 // Closest hit within one BLAS. `hit` carries the running best so a later
 // instance cannot overwrite a nearer one.
 void blasClosest(uint nodeOffset, uint triangleOffset, float3 origin, float3 dir, float scale,
-                 inout Hit hit) {
+                 uint seed, inout Hit hit) {
     float3 invDir = 1.0 / dir;
 
     uint stack[BLAS_STACK];
@@ -643,11 +678,13 @@ void blasClosest(uint nodeOffset, uint triangleOffset, float3 origin, float3 dir
         // Leaves are intersected inline, which also tightens hit.t before the
         // interior descent below chooses where to go.
         if (goLeft && node.lcount != 0) {
-            blasLeafClosest(triangleOffset + node.lchild, node.lcount, origin, dir, scale, hit);
+            blasLeafClosest(triangleOffset + node.lchild, node.lcount, origin, dir, scale, seed,
+                            hit);
             goLeft = false;
         }
         if (goRight && node.rcount != 0) {
-            blasLeafClosest(triangleOffset + node.rchild, node.rcount, origin, dir, scale, hit);
+            blasLeafClosest(triangleOffset + node.rchild, node.rcount, origin, dir, scale, seed,
+                            hit);
             goRight = false;
         }
 
@@ -676,7 +713,8 @@ void blasClosest(uint nodeOffset, uint triangleOffset, float3 origin, float3 dir
 }
 
 // One TLAS leaf's instance window against the running best.
-void instancesClosest(uint firstInstance, uint count, float3 origin, float3 dir, inout Hit hit) {
+void instancesClosest(uint firstInstance, uint count, float3 origin, float3 dir, uint seed,
+                      inout Hit hit) {
     for (uint i = 0; i < count; ++i) {
         uint instanceIndex = firstInstance + i;
         TlasInstance inst = tlasInstances[instanceIndex];
@@ -691,15 +729,19 @@ void instancesClosest(uint firstInstance, uint count, float3 origin, float3 dir,
         // character from reflections and from the GI probe field. The bind-pose
         // approximation is accepted there — see TLAS_SKINNED_FLAG.
         float previousT = hit.t;
+        // The instance ordinal is mixed into the cutout seed for the same
+        // reason instancesOccluded mixes it: `primId` is a per-MODEL ordinal,
+        // so without this every instance of one tree would resolve the
+        // identical leaves for a given ray.
         blasClosest(tlasNodeOffset(inst), inst.blasTriangleOffset, mOrigin, mDir / scale, scale,
-                    hit);
+                    seed ^ (instanceIndex * 0x9E3779B9u), hit);
         if (hit.t < previousT) {
             hit.instanceIndex = instanceIndex;
         }
     }
 }
 
-Hit sceneClosest(float3 origin, float3 dir, float tMax) {
+Hit sceneClosest(float3 origin, float3 dir, float tMax, uint seed) {
     Hit hit;
     hit.t = tMax;
     hit.triIndex = 0;
@@ -728,11 +770,11 @@ Hit sceneClosest(float3 origin, float3 dir, float tMax) {
         bool goRight = slabTest(node.rmin, node.rmax, origin, invDir, hit.t, tR);
 
         if (goLeft && node.lcount != 0) {
-            instancesClosest(node.lchild, node.lcount, origin, dir, hit);
+            instancesClosest(node.lchild, node.lcount, origin, dir, seed, hit);
             goLeft = false;
         }
         if (goRight && node.rcount != 0) {
-            instancesClosest(node.rchild, node.rcount, origin, dir, hit);
+            instancesClosest(node.rchild, node.rcount, origin, dir, seed, hit);
             goRight = false;
         }
 
@@ -758,6 +800,14 @@ Hit sceneClosest(float3 origin, float3 dir, float tMax) {
         }
     }
     return hit;
+}
+
+/// Closest hit for a caller with no cutout stream of its own: the seed comes
+/// from the ray. See rtRayCutoutSeed for why that is a legitimate seed and not
+/// a shortcut, and prefer the four-argument form when the caller already has a
+/// (pixel, frame) stream — the two GI probe traces are the callers that do not.
+Hit sceneClosest(float3 origin, float3 dir, float tMax) {
+    return sceneClosest(origin, dir, tMax, rtRayCutoutSeed(origin, dir));
 }
 
 #endif // RT_TRACE_TRAVERSAL

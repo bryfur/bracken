@@ -52,9 +52,16 @@
 #define GI_SP_WEIGHT_FLOOR 0.5
 
 #define GI_SP_PI 3.141592653589793
-// The octahedral map is equal-area, so every texel of a full-sphere
-// GI_SP_OCT^2 payload subtends the same solid angle.
-#define GI_SP_TEXEL_SOLID_ANGLE (4.0 * GI_SP_PI / float(GI_SP_RAYS))
+// THE OCTAHEDRAL MAP IS NOT EQUAL-AREA. Square -> octahedron preserves area,
+// but the radial octahedron -> sphere step has Jacobian dOmega = dA / |v|^3
+// with v the UN-normalized folded vector, whose length runs from 1 at the six
+// octahedron vertices to 1/sqrt(3) at the face centres. Over the 8x8 texels the
+// true solid angle spans 0.54x .. 1.46x of 4*pi/64, world-axis texels being the
+// over-weighted ones — so a constant weight tilts every probe's L1 lobe toward
+// the world axes. The SUM is right, which is why a uniform sphere or hemisphere
+// reproduces exactly and hid this. Below: the texel's area in the [-1,1]^2
+// square, which `giSpTexelDirectionSolidAngle` divides by |v|^3.
+#define GI_SP_TEXEL_AREA ((2.0 / float(GI_SP_OCT)) * (2.0 / float(GI_SP_OCT)))
 
 /// One probe per GI_SP_TILE-square tile; a partial edge tile still gets one.
 int2 giSpGrid(int2 screenSize) {
@@ -108,13 +115,18 @@ int2 giSpUnpackAnchor(uint flags) {
 // constants, which none of the screen passes need.
 // ---------------------------------------------------------------------------
 
-float3 giSpOctDecode(float2 e) {
+/// The decode WITHOUT the normalize: a point on |x|+|y|+|z| = 1, whose length is
+/// the Jacobian the solid angle above is built from. Split out for that reason
+/// alone — every caller that only wants a direction takes `giSpOctDecode`.
+float3 giSpOctDecodeRaw(float2 e) {
     e = e * 2.0 - 1.0;
     float3 n = float3(e.xy, 1.0 - abs(e.x) - abs(e.y));
     float t = saturate(-n.z);
     n.xy += select(n.xy >= 0.0, float2(-t, -t), float2(t, t));
-    return normalize(n);
+    return n;
 }
+
+float3 giSpOctDecode(float2 e) { return normalize(giSpOctDecodeRaw(e)); }
 
 /// Per-frame sub-texel jitter, R2 sequence in the frame counter alone.
 /// Deterministic in `frameIndex` is the requirement: --smoke reproduces bit for
@@ -137,6 +149,22 @@ float3 giSpTexelDirection(int texel, uint frameIndex) {
     int ty = texel / GI_SP_OCT;
     float2 oct = (float2(float(tx), float(ty)) + giSpJitter(frameIndex)) / float(GI_SP_OCT);
     return giSpOctDecode(oct);
+}
+
+/// The same direction, plus the SOLID ANGLE that texel subtends this frame —
+/// the quadrature weight its radiance must carry into an integral over the
+/// sphere. Evaluated at the JITTERED sample rather than the texel centre, which
+/// is the unbiased choice: E[dA/|v(x_f)|^3] over the jitter sequence is the
+/// texel's true solid angle, and the temporal EMA is what takes that
+/// expectation. CPU mirror: `screen_probe_texel_solid_angle`.
+float3 giSpTexelDirectionSolidAngle(int texel, uint frameIndex, out float solidAngle) {
+    int tx = texel % GI_SP_OCT;
+    int ty = texel / GI_SP_OCT;
+    float2 oct = (float2(float(tx), float(ty)) + giSpJitter(frameIndex)) / float(GI_SP_OCT);
+    float3 v = giSpOctDecodeRaw(oct);
+    float len = length(v);
+    solidAngle = GI_SP_TEXEL_AREA / (len * len * len);
+    return v / len;
 }
 
 // ---------------------------------------------------------------------------

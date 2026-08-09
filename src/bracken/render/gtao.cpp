@@ -9,17 +9,6 @@ namespace bracken::render {
 
 namespace {
 constexpr const char* LOG_TAG = "gtao";
-
-// Golden-ratio low-discrepancy sequence for the per-frame temporal jitter:
-// slice rotation and step offset never repeat and cover [0,1) uniformly,
-// which the temporal accumulation integrates over ~1/(1-feedbackMax) frames.
-constexpr float GOLDEN_RATIO_CONJUGATE = 0.61803398874989485f;
-
-float temporal_sequence(uint64_t frame_index, float scale) {
-    const float x = static_cast<float>(frame_index % 4096u) * scale;
-    return x - std::floor(x);
-}
-
 } // namespace
 
 GTAO::GTAO() = default;
@@ -199,8 +188,11 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
         uniforms.screenSize = working_size;
         uniforms.invScreenSize = inv_working;
         uniforms.radiusScale = params.radius_scale;
-        uniforms.temporalRotation = temporal_sequence(params.frame_index, GOLDEN_RATIO_CONJUGATE);
-        uniforms.temporalOffset = temporal_sequence(params.frame_index, 1.0f - GOLDEN_RATIO_CONJUGATE);
+        // The two axes of one 2-D R2 sequence, NOT one sequence and its
+        // complement — detail::TEMPORAL_R2_A/B carry why that distinction is
+        // the whole point.
+        uniforms.temporalRotation = detail::temporal_sequence(params.frame_index, detail::TEMPORAL_R2_A);
+        uniforms.temporalOffset = detail::temporal_sequence(params.frame_index, detail::TEMPORAL_R2_B);
         // radius / falloffRange / occluderThickness / maxDistance keep their
         // NSDMI tuning defaults.
 
@@ -260,16 +252,24 @@ void GTAO::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, g
         SDL_GPUTextureSamplerBinding bindings[5] = {};
         bindings[0].texture = ao_raw_->handle();
         bindings[0].sampler = nearest_clamp_sampler_;
-        // History reprojects to arbitrary sub-texel positions: linear filter.
+        // NEAREST, with the 2x2 bilinear built by hand in the shader: GB is an
+        // OCTAHEDRAL PAIR and a hardware filter would average the coordinates
+        // rather than the directions they encode (shaders/bent_cone.hlsli).
         // Contents are ignored while historyValid == 0.
         bindings[1].texture = history_read->handle();
-        bindings[1].sampler = linear_clamp_sampler_;
+        bindings[1].sampler = nearest_clamp_sampler_;
         bindings[2].texture = velocity.handle();
         bindings[2].sampler = nearest_clamp_sampler_;
         bindings[3].texture = depth.handle();
         bindings[3].sampler = nearest_clamp_sampler_;
-        // Reprojected alongside the history it belongs to, so it takes the
-        // same linear filter.
+        // Linear view depth is a plain linear quantity with no seam, so the
+        // hardware filter is fine here. The shader taps it at the same four
+        // texel CENTRES as the history above and under the same weights, which
+        // reproduces what a single filtered fetch at the reprojected position
+        // returned. (Silhouettes still blend a foreground and a background
+        // depth into `prevZ` and suppress feedback on both sides — a joint
+        // bilateral over these four taps is the fix, and it is a separate
+        // change because it moves every AO-on pin.)
         bindings[4].texture = history_depth_read->handle();
         bindings[4].sampler = linear_clamp_sampler_;
         SDL_BindGPUFragmentSamplers(pass, 0, bindings, 5);

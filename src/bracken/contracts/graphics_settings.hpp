@@ -173,11 +173,12 @@ enum class LocalRtShadowMode : int {
  * from a fixed ray budget per frame rather than per pixel, which is what makes
  * GI affordable on hardware that cannot afford a ray per pixel.
  *
- * `ProbesScreen` adds the screen-probe gather of phase R4. IT IS DECLARED NOW
- * AND BEHAVES AS `Probes` UNTIL R4 LANDS — deliberately, so the on-disk integer
- * for the quality tier is fixed before players have settings files. It is a
- * valid value and clamps like any other; it simply does not yet do the extra
- * thing its name promises.
+ * `ProbesScreen` layers phase R4's screen-probe gather
+ * (`render/gi/screen_probes.hpp`) over that world field: probes placed on the
+ * depth prepass march the Hi-Z pyramid (`render/hzb.hpp`), and the result is
+ * weight-blended back toward the field wherever the screen has no answer. It
+ * therefore REQUIRES the depth prepass, and falls back to plain `Probes`
+ * behaviour (with a warning) if the gather cannot allocate.
  *
  * `VoxelProbes` fills the SAME probe field from a voxel radiance clipmap
  * instead of from rays (`render/gi/voxel_gi.hpp`). It is the RASTER
@@ -204,11 +205,11 @@ enum class GiMode : int {
  * Probe-field budget tier: rays per probe per update and how often a probe is
  * revisited.
  *
- * STORED BUT NOT YET CONSUMED. R1a allocates and scrolls the probe volume;
- * nothing traces into it, so this value currently changes nothing. It is
- * defined here rather than with the update pass so that the settings file
- * format is complete in one change instead of two — the field is read by R1b,
- * which is where the rays/probe and cadence tables will live.
+ * Selects `render/gi/probe_schedule.hpp`'s `gi_budget()` row — rays per probe
+ * (32 / 64 / 96) and the fraction of a cascade refreshed per turn (1/8 at Low,
+ * 1/4 at Medium and High). `ProbeVolume::Config::quality` carries it and the
+ * volume's update pass reads it, so this is the field that decides both the
+ * per-frame trace cost and how fast the field converges after a light moves.
  */
 enum class GiQuality : int {
     Low = 0,
@@ -435,10 +436,12 @@ struct GraphicsSettings {
     float sun_intensity = 3.0f;     // multiplier on directional sun light (HDR: >1 so bloom/tonemap have headroom)
 
     // Bloom
-    // POST-exposure HDR luminance above which bloom contributes: the prefilter
-    // thresholds scene luminance * exposure, so what blooms stays stable when
-    // exposure changes (identical to the old pre-exposure behavior at
-    // exposure = 1.0).
+    // POST-exposure HDR luminance above which bloom contributes. The prefilter
+    // thresholds scene luminance against the SAME product the composite pass
+    // applies — `exposure * exp2(adapted EV)` — so what blooms is what will be
+    // bright on screen, at any adaptation. It reads the auto-exposure state
+    // buffer to do it; with auto exposure off the factor is the manual bias
+    // alone, and at exposure = 1.0 / EV = 0 this is the plain pre-exposure cut.
     float bloom_threshold = 1.1f;
 
     // AO

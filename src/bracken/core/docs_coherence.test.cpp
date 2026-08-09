@@ -219,14 +219,29 @@ bool is_external(const std::string& path) {
     return false;
 }
 
-// Directories the index must never enter. PRUNED, not filtered: a repo with
-// five live build trees (build/, build-rel/, build-bench/, build-tsan/,
-// build-asan/) plus .git holds hundreds of thousands of files, and merely
-// skipping them after the iterator has already descended turns this scan from
-// milliseconds into tens of seconds — worse when another lane is writing into
-// one of them.
-bool is_pruned_dir(const std::string& name) {
-    return starts_with(name, "build") || name == ".git" || name == "_deps" || name == ".cache";
+// Directories the index must never enter. PRUNED, not filtered: the build tree
+// plus .git holds hundreds of thousands of files, and merely skipping them
+// after the iterator has already descended turns this scan from milliseconds
+// into tens of seconds — worse when something is writing into one of them.
+//
+// `.claude/worktrees` is pruned for a DIFFERENT and stronger reason: it holds
+// git worktrees — whole second checkouts of this same repo. Descending into one
+// puts a second `bvh.hpp`, a second `pbr.hlsli` and a second everything else
+// into an index keyed by BASENAME, and `resolve_citation` then answers with
+// whichever copy the directory walk happened to reach first. That makes every
+// citation check in this file a coin flip on a mid-edit copy of the tree: the
+// suite fails, and it fails naming a path no one is working on. Only that one
+// subdirectory is pruned, not `.claude` itself, because `.claude/RULES.md` is a
+// tracked file the docs legitimately cite.
+//
+// Takes the path relative to the repo root rather than a bare basename, because
+// "worktrees" alone is too generic a name to prune repo-wide.
+bool is_pruned_dir(const fs::path& relative) {
+    const std::string name = relative.filename().string();
+    if (starts_with(name, "build") || name == ".git" || name == "_deps" || name == ".cache") {
+        return true;
+    }
+    return relative.generic_string() == ".claude/worktrees";
 }
 
 // An index of every tracked repo file by basename, for citations written as a
@@ -238,7 +253,7 @@ std::map<std::string, std::vector<std::string>> basename_index(const fs::path& r
     for (; it != end; ++it) {
         const fs::directory_entry& entry = *it;
         if (entry.is_directory()) {
-            if (is_pruned_dir(entry.path().filename().string())) {
+            if (is_pruned_dir(fs::relative(entry.path(), root))) {
                 it.disable_recursion_pending();
             }
             continue;

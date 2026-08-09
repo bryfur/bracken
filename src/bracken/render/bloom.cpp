@@ -26,6 +26,13 @@ bool Bloom::init(gpu::GPUDevice& device, int width, int height) {
     create_textures(width, height);
     create_sampler();
 
+    // Zeroed filler for the prefilter's always-declared exposure SSBO slot
+    // (read only when the auto-exposure flag is set), mirroring the composite
+    // pass's own dummy.
+    const float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    dummy_exposure_buffer_ =
+        gpu::GPUBuffer::create_static(device, gpu::GPUBuffer::Type::Storage, zeros, sizeof(zeros));
+
     if (!is_ready()) {
         BRACKEN_LOG_ERROR(LOG_TAG, "Bloom: Failed to initialize");
         return false;
@@ -39,6 +46,7 @@ void Bloom::shutdown() {
     for (int i = 0; i < MAX_MIPS; ++i) {
         mip_textures_[i].reset();
     }
+    dummy_exposure_buffer_.reset();
 
     if (device_ && linear_sampler_) {
         device_->release_sampler(linear_sampler_);
@@ -105,7 +113,7 @@ void Bloom::create_sampler() {
 }
 
 bool Bloom::is_ready() const {
-    if (!linear_sampler_) {
+    if (!linear_sampler_ || !dummy_exposure_buffer_) {
         return false;
     }
     for (int i = 0; i < mip_count_; ++i) {
@@ -124,7 +132,7 @@ SDL_GPUTexture* Bloom::bloom_texture() const {
 }
 
 void Bloom::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, SDL_GPUTexture* scene_color,
-                   float threshold, float exposure) {
+                   float threshold, float exposure, SDL_GPUBuffer* exposure_buffer) {
     BRACKEN_PROFILE_ZONE_COLOR("Bloom::render", 0x16A085);
     if (!is_ready() || !cmd || !scene_color) {
         return;
@@ -135,6 +143,13 @@ void Bloom::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, S
     if (!downsample_pipeline || !upsample_pipeline) {
         return;
     }
+
+    // The prefilter's exposure SSBO. Bound on EVERY downsample iteration, not
+    // just the thresholding one: SDL3 GPU requires a slot the shader DECLARES
+    // to be bound whether or not the branch that reads it runs, and an unbound
+    // descriptor is undefined rather than merely unread.
+    SDL_GPUBuffer* exposure_ssbo =
+        exposure_buffer != nullptr ? exposure_buffer : dummy_exposure_buffer_->handle();
 
     // =========================================================================
     // Downsample chain: scene_color -> mip[0] -> mip[1] -> ... -> mip[N-1]
@@ -149,7 +164,10 @@ void Bloom::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, S
         uniforms.srcTexelSize = glm::vec2(1.0f / src_w, 1.0f / src_h);
         uniforms.threshold = threshold;
         uniforms.isFirstPass = (i == 0) ? 1.0f : 0.0f;
-        uniforms.exposure = exposure; // prefilter thresholds post-exposure luminance
+        // The prefilter thresholds POST-exposure luminance, which is the manual
+        // bias times exp2(adapted EV) — the same product composite applies.
+        uniforms.exposure = exposure;
+        uniforms.autoExposureEnabled = (exposure_buffer != nullptr) ? 1.0f : 0.0f;
 
         SDL_GPUColorTargetInfo color_target = {};
         color_target.texture = mip_textures_[i]->handle();
@@ -168,6 +186,7 @@ void Bloom::render(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& registry, S
         binding.texture = src_tex;
         binding.sampler = linear_sampler_;
         SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+        SDL_BindGPUFragmentStorageBuffers(pass, 0, &exposure_ssbo, 1);
 
         SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
         SDL_EndGPURenderPass(pass);

@@ -65,6 +65,12 @@ cbuffer GiProbeBlendUniforms : register(b0, space2) {
 [[vk::binding(0, 1)]] RWTexture2D<float2> giVisibility : register(u0, space1);
 
 groupshared float2 gPayload[GI_VISIBILITY_PAYLOAD][GI_VISIBILITY_PAYLOAD];
+/// THE ROTATED DIRECTION SET, computed once per group instead of once per
+/// (texel, ray). It depends only on `r`, `giRayCount` and `giFrameIndex`, all
+/// group-uniform, and this pass has 196 payload texels — 196 x 64 x 1728 x 2
+/// regenerations of a frac/divide/sqrt/sin/cos chain on the rota's worst frame,
+/// against 96 that are actually distinct.
+groupshared float3 gRayDir[GI_MAX_PROBE_RAYS];
 
 [numthreads(GI_VISIBILITY_TILE, GI_VISIBILITY_TILE, 1)]
 void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
@@ -80,6 +86,21 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
         return;
     }
 
+    // THE PRELOAD SITS BETWEEN THE TWO GROUP-UNIFORM EARLY RETURNS AND THE
+    // isPayload SPLIT, so every surviving thread reaches this barrier. 16x16
+    // threads cover GI_MAX_PROBE_RAYS one-to-one, so no stride is needed here.
+    const uint rayCount = min(giRayCount, (uint)GI_MAX_PROBE_RAYS);
+    {
+        float3 c0, c1, c2;
+        giRayRotation(giFrameIndex, c0, c1, c2);
+        const uint flat = lid.y * uint(GI_VISIBILITY_TILE) + lid.x;
+        if (flat < rayCount) {
+            float3 d = giSphericalFibonacci(flat, rayCount);
+            gRayDir[flat] = normalize(c0 * d.x + c1 * d.y + c2 * d.z);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     int2 tileLocal = int2(lid.xy);
     int2 tileOrigin = giProbeAtlasOrigin(int(probe.slot), GI_VISIBILITY_TILE, int(giCascadeIndex));
     bool isPayload = tileLocal.x >= GI_BORDER && tileLocal.x < GI_VISIBILITY_TILE - GI_BORDER &&
@@ -88,9 +109,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
     if (isPayload) {
         int2 local = tileLocal - GI_BORDER;
         float3 texelDir = giTexelDirection(local, GI_VISIBILITY_PAYLOAD);
-
-        float3 c0, c1, c2;
-        giRayRotation(giFrameIndex, c0, c1, c2);
 
         // DISTANCES ARE STORED NORMALIZED BY CASCADE SPACING, and that is a
         // correctness requirement rather than tidiness. The atlas is
@@ -119,10 +137,20 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
 
         float2 sum = float2(0, 0);
         float wsum = 0.0;
-        for (uint r = 0; r < giRayCount; ++r) {
-            float3 d = giSphericalFibonacci(r, giRayCount);
-            float3 rayDir = normalize(c0 * d.x + c1 * d.y + c2 * d.z);
-            float w = pow(max(0.0, dot(texelDir, rayDir)), GI_VISIBILITY_SHARPNESS);
+        for (uint r = 0; r < rayCount; ++r) {
+            // The compare is EXACTLY the pow test that follows, for the shipped
+            // sharpness: pow(c, 50) <= 1e-8 iff c <= GI_VISIBILITY_WEIGHT_CUTOFF.
+            // At 64 directions over the sphere the mean nearest-neighbour
+            // separation is ~25 degrees against this lobe's 46, so ~85% of pairs
+            // used to evaluate a log2/exp2 pair purely to discard it. The
+            // original test is kept below rather than replaced: it is free once
+            // the pow has been computed, and keeping it is what makes this hoist
+            // bit-identical rather than merely equivalent.
+            float c = dot(texelDir, gRayDir[r]);
+            if (c <= GI_VISIBILITY_WEIGHT_CUTOFF) {
+                continue;
+            }
+            float w = pow(c, GI_VISIBILITY_SHARPNESS);
             if (w <= 1e-8) {
                 continue;
             }

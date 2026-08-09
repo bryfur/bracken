@@ -93,7 +93,9 @@ private:
 
     gpu::GPUDevice* device_ = nullptr;
     std::unique_ptr<gpu::GPUTexture> fog_texture_; // Half-res RGBA16F
-    SDL_GPUSampler* linear_sampler_ = nullptr;
+    // NEAREST, clamped: the pass's one sampler, and its one consumer is the
+    // full-res depth texture read at half-res pixel centres. See create_sampler().
+    SDL_GPUSampler* depth_sampler_ = nullptr;
 
     int width_ = 0;
     int height_ = 0;

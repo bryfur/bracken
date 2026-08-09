@@ -14,8 +14,8 @@ Consolidated from the chapters below. Changing any of these requires auditing ev
 | `MAX_BONE_PALETTES` | 1024 | `scene/frame_packet.hpp` | Bone palettes per frame, enforced at **build time**: `FrameBuilder::alloc_bone_palette` past the budget logs an error and returns an invalid allocation; `draw_skinned` with an invalid id drops the draw with a warning |
 | `CSM_MAX_CASCADES` / `MAX_SHADOW_CASCADES` | 4 | `render/shadow_map.hpp` / `scene/scene_renderer.hpp` (static-asserted equal) | Shadow cascades in the single 2×2-quadrant D32 atlas |
 | `CLUSTER_DIM_X/Y/Z` | 16 × 9 × 24 (= `CLUSTER_COUNT` 3456) | `render/lighting/light.hpp` (duplicated as `#define`s in `clusters.hlsli`) | Clustered-lighting grid dimensions |
-| `MAX_LIGHTS` | 256 | `render/lighting/light.hpp` | Dynamic point + spot lights per frame; excess silently dropped at `ClusterGrid::add_*` |
-| `MAX_LIGHTS_PER_CLUSTER` | 128 | `render/lighting/light.hpp` | Per-cluster light-bin truncation (lowest indices kept; one log per frame) |
+| `MAX_LIGHTS` | 256 | `render/lighting/light.hpp` | Dynamic point + spot lights per frame; excess REFUSED at `ClusterGrid::add_*` (`[[nodiscard]] bool` returns false), counted in `FrameDiagnostics::lights_dropped`, one `BRACKEN_LOG_WARN` per grid |
+| `MAX_LIGHTS_PER_CLUSTER` | 128 | `render/lighting/light.hpp` | Per-cluster light-bin cap (the highest-contribution lights are kept, ranked per froxel; one log per frame) |
 | Swapchain / scene / depth formats | `RGBA8_UNORM` / `RGBA16F` / `D32_FLOAT` | `gpu/pipeline_registry.hpp` | Swapchain, HDR scene color, and depth target formats |
 | Default world extents | 32000 × 32000 | `application.hpp` (`init_renderer` default arguments) | Terrain/grass world size when the host omits it |
 | Near / far planes | `CameraModeConfig::near_plane`/`far_plane` (defaults 5 / 15000), arguments swapped (reversed-Z) | `systems/camera_controller.hpp` (config), `systems/camera_system.cpp` (`compute_matrices`) | The engine's only scene projection; configurable via `CameraModeConfig` |
@@ -2505,7 +2505,7 @@ Within a set, storage-buffer slots begin immediately after the shader's sampled 
 
 CPU-side slot mapping: `SDL_PushGPUVertexUniformData(cmd, i, ...)` → `(i, 1)`; `SDL_PushGPUFragmentUniformData(cmd, i, ...)` → `(i, 3)`; `SDL_BindGPUVertexStorageBuffers` / `SDL_BindGPUFragmentStorageBuffers(pass, first, ...)` → set-0/set-2 storage slots relative to the sampler count; `SDL_BindGPUFragmentSamplers(pass, first, ...)` → `(first.., 2)`.
 
-`cluster_lighting.hlsli` codifies this for clustered lighting: the including fragment shader must `#define CLUSTER_SSBO_BINDING_BASE <its sampler count>` first (compile-time `#error` otherwise); the include then declares `ClusterParamsCB` at `(2, 3)`, the local-shadow atlas + comparison sampler at the shader's LAST sampler slot (`BASE-1`, set 2), and four SSBOs (`lightDataBuf` ByteAddressBuffer, `clusterOffsetsBuf StructuredBuffer<uint2>`, `lightIndicesBuf StructuredBuffer<uint>`, `localShadowSlots StructuredBuffer<LocalShadowSlot>`) at set-2 slots `BASE+0..3`, matched by `SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 4)` on the CPU. Slot `(2,3)`, the last sampler, and those four set-2 bindings are reserved in every cluster-lit shader (`model.frag` base 15, `model_instanced.frag` 15, `terrain.frag` 13, `grass.frag` 11). The three slots preceding the local-shadow atlas are the probe-field GI atlases `gi_sample.hlsli` reads — irradiance and visibility (linear clamp) plus the per-probe metadata plane (point clamp) — at 11–13 / 11–13 / 9–11 / 7–9 respectively; below those is the RT sun-visibility mask (10/10/8/6), with a white dummy while disabled.
+`cluster_lighting.hlsli` codifies this for clustered lighting: the including fragment shader must `#define CLUSTER_SSBO_BINDING_BASE <its sampler count PLUS its storage-texture count>` first (compile-time `#error` otherwise), and `CLUSTER_SAMPLER_COUNT` to the sampler count alone when the two differ — they stopped being the same number at R5c, because storage textures sit between samplers and storage buffers in SDL's set-2 layout and the Full-DI tier declares two of them (`local_di.hlsli`). The include then declares `ClusterParamsCB` at `(2, 3)`, the local-shadow atlas + comparison sampler at the shader's LAST sampler slot (`CLUSTER_SAMPLER_COUNT-1`, set 2), and four SSBOs (`lightDataBuf` ByteAddressBuffer, `clusterOffsetsBuf StructuredBuffer<uint2>`, `lightIndicesBuf StructuredBuffer<uint>`, `localShadowSlots StructuredBuffer<LocalShadowSlot>`) at set-2 slots `BASE+0..3`; the CPU call binds FIVE, the fifth being the R4b screen-probe SH at `BASE+4` (`gi_screen_sample.hlsli`). Slot `(2,3)`, the last sampler, and those five set-2 bindings are reserved in every cluster-lit shader (`CLUSTER_SAMPLER_COUNT` 16 / 16 / 14 / 12 and `CLUSTER_SSBO_BINDING_BASE` 19 / 19 / 17 / 15 for `model.frag` / `model_instanced.frag` / `terrain.frag` / `grass.frag`). The three slots preceding the local-shadow atlas are the probe-field GI atlases `gi_sample.hlsli` reads — irradiance and visibility (linear clamp) plus the per-probe metadata plane (point clamp) — at 11–13 / 11–13 / 9–11 / 7–9 respectively; below those is the RT sun-visibility mask (10/10/8/6), with a white dummy while disabled.
 
 ### CPU↔GPU uniform contract — `src/bracken/gpu/gpu_uniforms.hpp`
 
@@ -2583,7 +2583,7 @@ Notable defaults living in these structs (pushed as-is unless the renderer overr
 - **Instances:** `model_instanced.vert.hlsl` reads `InstanceData` records at `(0, 0)`; `shadow_depth_instanced.vert.hlsl` reads `ShadowInstanceData`.
 - **Particles:** `particle.vert.hlsl` reads `ParticleInstance` at `(0, 0)`, offset by `BatchUniforms::instanceOffset` (set 1, b1), one instanced draw per (emitter, mesh) batch; opacity is folded into rgb because the additive blend ignores alpha (`effect_renderer.cpp`).
 - **Grass:** `grass.vert.hlsl` reads visible chunk origins at `(2, 0)` after its heightmap/splatmap samplers.
-- **Cluster lights:** `lightDataBuf` layout is `[LightDataHeader 16B][LightHeader×cap 8B][PointLight×cap 48B][SpotLight×cap 64B]` with `cap = clusterParams.maxPerCluster.y`; the shader clamps the per-cluster count to `maxPerCluster.x` to bound the loop against stale/partial uploads, and reads each light's engine-assigned `shadow_slot` (point: byte 36 of the 48-B record; spot: byte 56) for local-shadow sampling (`cluster_lighting.hlsli`).
+- **Cluster lights:** `lightDataBuf` layout is `[LightDataHeader 16B][LightHeader×cap 8B][PointLight×cap 48B][SpotLight×cap 80B]` with `cap = clusterParams.maxPerCluster.y` (the spot stride is 80, not 64, since R6 — the sizes and offsets in this paragraph are all `static_assert`ed at the top of `light_cluster.cpp`, which is the source of truth); the shader clamps the per-cluster count to `maxPerCluster.x` to bound the loop against stale/partial uploads, and reads each light's engine-assigned `shadow_slot` (point: byte 36 of the 48-B record; spot: byte 56) for local-shadow sampling (`cluster_lighting.hlsli`).
 
 ### Threading & lifetime contracts
 
@@ -4262,7 +4262,7 @@ GPU buffers (all `gpu::GPUBuffer::Type::Storage`, dynamic):
    section offsets (`cap = max_lights_`, default `MAX_LIGHTS`):
    `[LightDataHeader 16B: header_count, point_count, spot_count, _pad]`
    `[LightHeader × cap]` `[PointLight × cap]` `[SpotLight × cap]` →
-   16 + 256·(8+48+64) = **30 736 bytes** at default capacity. The shader
+   16 + 256·(8+48+80) = **34 832 bytes** at default capacity. The shader
    derives the same offsets from `maxPerCluster.y`
    (`pointLightsBase()`/`spotLightsBase()` in `cluster_lighting.hlsli`).
 2. **Cluster offsets buffer** — `uvec2 (offset, count)` per cluster, flat
@@ -4289,8 +4289,10 @@ void begin_frame(core::jobs::JobSystem& js, const scene::CameraState& camera,
 void begin_frame(const scene::CameraState& camera, uint32_t screen_w,
                  uint32_t screen_h, float near_plane, float far_plane);
                  // convenience: delegates to JobSystem::instance()
-void add_point_light(const PointLight& l);
-void add_spot_light(const SpotLight& l);
+[[nodiscard]] bool add_point_light(const PointLight& l);  // false = refused, frame cap reached
+[[nodiscard]] bool add_spot_light(const SpotLight& l);
+[[nodiscard]] uint32_t lights_dropped() const;         // refused since begin_frame()
+[[nodiscard]] uint32_t cluster_lights_dropped() const; // insertions the per-cluster cap refused
 void build(core::jobs::JobSystem& js);
 void build();                                  // convenience: JobSystem::instance()
 void upload(SDL_GPUCopyPass* copy_pass);       // caller-owned pass
@@ -4321,7 +4323,11 @@ caller's copy pass (the engine batches it into the frame's consolidated
   `light_cluster.test.cpp`). The cluster-AABB rebuild is a chunked
   `parallel_for(js, …)` fan-out (per-slice z depths precomputed serially;
   disjoint per-cluster writes, no merge).
-- `add_*_light` drops silently once `points + spots >= max_lights_`.
+- `add_*_light` returns `false` once `points + spots >= max_lights_`,
+  increments `lights_dropped_` (reset each `begin_frame`, surfaced as
+  `FrameDiagnostics::lights_dropped` and printed in the smoke line), and warns
+  once per grid via `BRACKEN_LOG_WARN` (`warned_dropped_` is never reset — the
+  cap is a standing property of the scene, not a per-frame event).
 - `build()` first resolves **persistent light identity**
   (`assign_stable_ids_and_remap`, serial, emission order): host-supplied
   non-zero `stable_id`s are claimed verbatim in one pass, then every light
@@ -4343,24 +4349,61 @@ caller's copy pass (the engine batches it into the frame's consolidated
   **per-light cluster-range insertion**: a conservative cluster-index box
   (Z slices from the inverse exponential mapping; X/Y tiles from the NDC
   bounds of the sphere's view-space AABB corners projected through
-  `last_projection_`) followed by an exact sphere/AABB test per cluster in
-  the box — O(lights × touched clusters), not O(lights × 3456). Spheres
-  reaching the near plane (unbounded projection) fall back to the full X/Y
-  range. Lights with `radius <= 0` or entirely outside [near, far] are
-  skipped. Insertion order is ascending light index → deterministic output
-  (pinned by `ClusterGrid.BuildIsDeterministic`). Per-cluster bins truncate
-  at `MAX_LIGHTS_PER_CLUSTER` keeping the lowest indices, logging one
-  `SDL_Log` per frame. Binning fans out over `js` chunked by **cluster
+  `last_projection_`) followed by an exact refine per cluster in the box —
+  O(lights × touched clusters), not O(lights × 3456). Before projecting, the
+  AABB is **clipped to `z <= -near`**: no froxel lives nearer than the near
+  plane, so the clipped box still contains every sphere point a froxel can
+  touch, every corner then has `w = -z >= near > 0`, and a light beside the
+  camera can be rejected outright by the sideways test instead of surrendering
+  the whole X/Y range. For a light entirely beyond the near plane the clip is
+  a no-op. Lights with `radius <= 0` or entirely outside [near, far] are
+  skipped.
+- The per-cluster refine is a sphere/AABB test **ANDed, for a spot, with a
+  conservative cone/AABB test** (the froxel's bounding sphere against the
+  infinite cone, trig-free from `cos_outer`/`sin_outer` precomputed per
+  light). Without it a spot was binned as its full radius sphere: the
+  playground's 32° flashlight landed in 3246 of 3456 froxels instead of 286,
+  and every one of those cost the fragment loop an 80-byte `SpotLight` load
+  and a `spotConeFactor` that returns zero — and cost the Full-DI tier a RIS
+  candidate draw with p̂ ≡ 0, since the froxel list is that pass's candidate
+  domain. The cull can only remove froxels the forward loop already shades
+  black, so it is image-neutral for the raster path. It is skipped for points
+  and for any cone that is not well-formed (`outer_cos <= 0`, i.e. a
+  half-angle at or past 90°, or a transposed `inner_cos < outer_cos` pair,
+  whose lit set is the COMPLEMENT of the cone) — those fall back to sphere
+  binning. Pinned by `ClusterGrid.SpotBinsCoverEveryFragmentInsideTheCone`
+  and `ClusterGrid.SpotConeCullRemovesFroxelsTheConeMissesAndKeepsTheOnesItHits`
+  in `light_cluster.test.cpp`.
+- Insertion order is ascending light index → deterministic output (pinned by
+  `ClusterGrid.BuildIsDeterministic`). A bin that reaches
+  `MAX_LIGHTS_PER_CLUSTER` does **not** simply refuse the rest: it keeps the
+  highest-contribution lights for that froxel, as a streaming replace-min
+  (exact top-k) over `luminance × point_falloff(distance to the froxel's
+  closest point, radius)` — the same `point_falloff` the forward loop and the
+  RIS target function evaluate (`render/lighting/light_target.hpp`). The score
+  is per-FROXEL rather than a scene-wide power proxy, because total power
+  ranks a distant floodlight above the torch in the player's hand. Ties keep
+  the incumbent (strictly-greater replacement), so identical lights still
+  resolve to the lowest indices. Scores are filled lazily on a bin's first
+  refusal, so a scene that never overflows allocates and evaluates nothing.
+  Every refused insertion is still counted in `cluster_lights_dropped_` and
+  warned about once per frame via `BRACKEN_LOG_WARN` (`warned_truncation_`,
+  reset in `begin_frame`).
+- Binning fans out over `js` chunked by **cluster
   index** (the per-light conservative cluster boxes are precomputed once,
   serially, as `LightRange` scratch): each chunk owns a disjoint cluster
   subrange, walks the light list ascending, and inserts only into its own
-  clusters' bins — every bin written by exactly one chunk, so per-bin order
-  and the truncation cutoff are bit-identical to the serial light-major loop
-  at any worker count (chunk-local truncation flags OR-merge in chunk order
-  after the join). At ≤ 8 lights or with an uninitialized pool the whole
-  range runs as one inline chunk. Finally offsets/indices are packed
-  serially, setting `offsets_dirty_` only if any (offset,count) pair
-  actually changed.
+  clusters' bins (and is the only writer of their score rows) — every bin
+  written by exactly one chunk, so per-bin order and which lights survive the
+  cap are bit-identical to the serial light-major loop at any worker count
+  (chunk-local truncation COUNTS, `chunk_truncated_` `uint32_t`, sum in
+  chunk-index order after the join). At ≤ 8 lights or with an uninitialized
+  pool the whole range runs as one inline chunk. Note a bin is no longer
+  ascending in light index once eviction has run; no consumer assumes it is
+  (`accumulateClusterLights`, `clusterFroxelLightCount`/`clusterFroxelLight`
+  and the reservoir's uniform froxel draw all address lights by packed index).
+  Finally offsets/indices are packed serially, setting `offsets_dirty_` only
+  if any (offset,count) pair actually changed.
 - Zero-light frames: only re-zero (and re-mark dirty) the offsets table if
   the previous build wrote counts (`offsets_all_zero_` flag).
 - `upload()` packs the light-data buffer into member scratch and transfers
@@ -4383,23 +4426,40 @@ regression-pinned by
 - `ClusterParams` cbuffer at **set 3, binding 2** (pushed via
   `SDL_PushGPUFragmentUniformData(cmd, 2, ...)` in
   `SceneRenderer::bind_cluster_lights`).
-- Three fragment storage buffers bound with
-  `SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 3)`:
+- **Five** fragment storage buffers bound with
+  `SDL_BindGPUFragmentStorageBuffers(pass, 0, bufs, 5)`:
   `lightDataBuf` (ByteAddressBuffer), `clusterOffsetsBuf`
   (`StructuredBuffer<uint2>`), `lightIndicesBuf`
-  (`StructuredBuffer<uint>`). SDL GPU lays out fragment set 2 as sampled
-  textures, then storage textures, then storage buffers, so the including
-  shader must
-  `#define CLUSTER_SSBO_BINDING_BASE <its fragment sampler count>` before the
-  include (a `#error` enforces it). Current values: `model.frag` /
-  `model_instanced.frag` = 6, `terrain.frag` = 4, `grass.frag` = 2.
+  (`StructuredBuffer<uint>`), `localShadowSlots`
+  (`StructuredBuffer<LocalShadowSlot>`, also declared by
+  `cluster_lighting.hlsli`), and the R4b screen-probe SH declared by
+  `gi_screen_sample.hlsli` at `CLUSTER_SSBO_BINDING_BASE + 4`. Slots 3 and 4
+  are backfilled with `light_data_buffer()` when local shadows / screen probes
+  are unavailable: the slot must hold a valid buffer, and neither is read then
+  (`shadow_slot == -1`, `giScreenEnabled == 0`). SDL GPU lays out fragment
+  set 2 as sampled textures, then storage textures, then storage buffers, so
+  the including shader must `#define CLUSTER_SSBO_BINDING_BASE <its fragment
+  sampler count PLUS its storage-texture count>` before the include (a
+  `#error` enforces it), and `CLUSTER_SAMPLER_COUNT` separately when the two
+  differ — which they have since R5c, because the Full-DI tier declares two
+  storage textures. Current values: `CLUSTER_SAMPLER_COUNT` 16 / 16 / 14 / 12
+  and `CLUSTER_SSBO_BINDING_BASE` (= count + 3) 19 / 19 / 17 / 15 for
+  `model.frag` / `model_instanced.frag` / `terrain.frag` / `grass.frag`.
 - Shader-side hardening: the per-cluster loop count is
   `min(offsets.count, maxPerCluster.x)` so a stale/partial offsets buffer
   cannot spin ~2³² iterations; `gridDim.w == 0` short-circuits the whole
   accumulation.
 - Attenuation: `pointFalloff(d,R) = saturate(1-(d/R)^4)^2 / max(d², 1e-4)`;
-  spots multiply `smoothstep(outer_cos, inner_cos, dot(spotDir, -L))`.
-  Both feed the standard `evaluatePBR` BRDF.
+  spots multiply `smoothstep(outer_cos, inner_cos, dot(spotDir, -L))`. Both
+  live in `cluster_index.hlsli` (binding-free by construction, so every
+  consumer can share the one copy) and are mirrored on the CPU by
+  `render/lighting/light_target.hpp`. Both feed the standard `evaluatePBR`
+  BRDF. The loop's three structural zeros — `dist > radius`, `cone <= 0` and
+  `dot(N, L) <= 0` — are all tested BEFORE the local-shadow atlas lookup, so a
+  back-facing or out-of-cone pixel never pays the matrix transform and four
+  `SampleCmpLevelZero` taps for a visibility term that would be multiplied by
+  zero. The `N·L` predicate is `evaluatePBR`'s own, verbatim, so the two
+  cannot drift.
 
 #### SceneRenderer integration & silent behaviors
 
@@ -4416,8 +4476,10 @@ regression-pinned by
   `docs/architecture.md`). `bind_cluster_lights` always pushes
   `frame_cluster_params_`, never `cluster_grid_.params()`.
 - `FrameBuilder::add_point_light/add_spot_light`
-  (`src/bracken/scene/frame_builder.hpp`) are unbounded; the 256 cap
-  is enforced (silently) at `ClusterGrid::add_*`.
+  (`src/bracken/scene/frame_builder.hpp`) are unbounded; the 256 cap is
+  enforced at `ClusterGrid::add_*`, which refuses the excess, counts it in
+  `FrameDiagnostics::lights_dropped` and warns once per grid — check
+  `RenderStats::diagnostics` before believing a missing lamp is a shader bug.
 
 #### Threading / lifetime / testing
 

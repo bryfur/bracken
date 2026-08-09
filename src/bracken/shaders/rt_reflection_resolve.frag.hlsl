@@ -1,12 +1,18 @@
-// Full-resolution resolve for the sparse ray-traced reflection signal.
+// Full-resolution resolve for the ray-traced reflection signal.
 //
-// The trace runs at quarter resolution by default. A plain bilinear sample in
-// the final composite blurred a reflecting stone texel across grass, foliage
-// and silhouettes, and because it ran after TAA the result shimmered instead
-// of accumulating with the rest of the frame. This pass runs directly after
-// opaque forward lighting and before water/TAA/bloom/exposure. It rejects
-// cross-surface taps using the full-resolution depth + material G-buffer and
-// evaluates the receiving surface's BRDF at full resolution.
+// WHAT THIS PASS IS depends on where `GraphicsSettings::rt_reflection_resolution`
+// is set, and it is FULL by default. At Full the bilinear reconstruction below
+// collapses to a single tap of weight 1 (the source texel IS the pixel), and
+// what remains — which is not incidental — is the full-resolution material gate
+// and the receiving surface's BRDF. At Half/Quarter the four-tap
+// depth/normal/material-guided upsample is additionally what keeps a reflecting
+// stone texel off the grass and foliage beside it: a plain bilinear sample in
+// the final composite blurred it straight across silhouettes.
+//
+// WHERE IT SITS is true at any resolution and is the other half of the reason
+// it exists: running directly after opaque forward lighting and before
+// water/TAA/bloom/exposure lets the traced signal accumulate with the rest of
+// the frame, instead of shimmering as a late overlay drawn after TAA.
 
 #include "reflection_gate.hlsli"
 #include "depth_linear.hlsli"
@@ -132,9 +138,27 @@ float4 PSMain(PSInput input) : SV_Target {
     }
 
     if (weightSum <= 1e-5) {
-        // A missing compatible sparse sample is less objectionable than a
-        // reflection from another material or across a silhouette. TAA fills
-        // stable sub-pixel gaps over subsequent frames.
+        // A reflection from another material or across a silhouette is worse
+        // than none, so the preference for zero is right — but be clear about
+        // what zero costs, because the second half of this comment used to
+        // claim "TAA fills stable sub-pixel gaps over subsequent frames" and
+        // that is false. The rejection is a deterministic function of the
+        // G-buffer, not of the jitter: a thin smooth railing whose sparse taps
+        // all land on the background is rejected EVERY frame, and there is no
+        // traced data anywhere near it for TAA to converge onto. Worse, the
+        // forward pass has already surrendered its share of this pixel
+        // (`iblSpecularScale = 1 - rtReflectionWeight(...)`, computed from the
+        // pixel's own roughness in a pass that runs before this one), so the
+        // pixel ends up with `gate` of nothing plus `1 - gate` of IBL — the
+        // sum-to-one invariant in reflection_gate.hlsli broken on the dark
+        // side. Fixing it properly means this pass supplying the IBL half
+        // itself, which needs the prefiltered cube bound here.
+        //
+        // UNREACHABLE AT THE DEFAULT Full resolution, which is why it has
+        // stayed invisible: there `sourcePos == coord` exactly, tap 0 is the
+        // pixel itself, its depth/normal/material weights are all 1, and the
+        // trace wrote alpha from the same G-buffer texel through the same gate,
+        // so `weightSum` is 1.
         return float4(0.0, 0.0, 0.0, 0.0);
     }
     radiance /= weightSum;

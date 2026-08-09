@@ -26,13 +26,20 @@
  * far under the angular scale a diffuse cone resolves — and 8 bits of aperture
  * is a 0.4% step in a factor that multiplies ambient only.
  *
- * THE ESCAPE VALUE. A >= BENT_CONE_OPEN is "this pixel carries no directional
- * information": the cone is the full hemisphere, so its mean direction is the
- * shading normal by definition and GB may be anything. That is not a special
- * case bolted on — it is what makes a 1x1 WHITE dummy texture (what every
- * scene shader binds when AO is off, and what the full-res target is cleared
- * to before the first frame) decode to exactly the pre-R5a behaviour: AO 1,
- * gate 1, bent normal = shading normal. No uniform flag is needed anywhere.
+ * THE ESCAPE VALUE. A >= BENT_CONE_OPEN is "this pixel carries no usable
+ * directional information", so GB may be anything and the shading normal is
+ * used instead. That is not a special case bolted on — it is what makes a 1x1
+ * WHITE dummy texture (what every scene shader binds when AO is off, and what
+ * the full-res target is cleared to before the first frame) decode to exactly
+ * the pre-R5a behaviour: AO 1, gate 1, bent normal = shading normal. No uniform
+ * flag is needed anywhere.
+ *
+ * TWO DIFFERENT THINGS LAND ON IT, which is why the gate ramps rather than
+ * branches (see BENT_CONE_TRUST): a genuinely open pixel, whose cone IS the
+ * full hemisphere and whose mean direction is the shading normal by definition;
+ * and a lobe too SPLIT to fit a cone at all (two open sides under an eave),
+ * which the resultant->cone inversion also clamps to aperture 1 while its AO
+ * says 0.5. The first wants an ungated GI term, the second wants the scalar.
  */
 
 #ifndef BRACKEN_BENT_CONE_HLSLI
@@ -43,6 +50,20 @@
 /// bilinear filter; a genuinely open pixel lands here anyway, and its bent
 /// normal IS its shading normal, so the fallback is exact rather than a guess.
 #define BENT_CONE_OPEN 0.998
+
+/// Aperture below which the cone fit is trusted outright. Between this and
+/// BENT_CONE_OPEN the GI gate RAMPS to the scalar, because the resultant->cone
+/// inversion in gtao.frag.hlsl clamps at the open hemisphere for ANY lobe too
+/// split to fit a cone (resultant <= 2/3 -> aperture 1; render/gtao.hpp
+/// gtao_cone_cos_from_resultant documents the clamp). An aperture near 1
+/// therefore means "very wide OR unfittable", and only the second wants the
+/// scalar gate: an overhead occluder with open sides — an eave, a cart
+/// underside, a ceiling — has aperture 1 and AO 0.5. Without the ramp the gate
+/// steps from ~0.996 straight to the scalar AO across ONE RGBA8 code, which
+/// crawls along the isoline as the estimate dithers over it.
+/// 0.95 is alpha >= 77 degrees — within the 3-slice estimator's own noise of
+/// the clamp — and 0.95..0.998 is 12 codes, enough for a ramp.
+#define BENT_CONE_TRUST 0.95
 
 /// Unit vector -> [0,1]^2. Verbatim `octEncode` from prepass_gbuffer.frag.hlsl.
 float2 bentOctEncode(float3 n) {
@@ -107,9 +128,18 @@ BentCone decodeBentCone(float4 texel, float3 shadingNormal) {
  * weighted solid angle of a cone of half-angle alpha about its own axis is
  * pi*sin^2(alpha). Dividing by the pi the irradiance convention already
  * carries leaves sin^2(alpha) — the stored aperture itself.
+ *
+ * The BENT_CONE_TRUST..BENT_CONE_OPEN ramp is what keeps the two branches from
+ * meeting at a cliff: the aperture saturates at 1 both for a genuinely open
+ * pixel and for a lobe too split to fit a cone at all, and only the second
+ * wants the scalar. smoothstep reaches exactly 1 at BENT_CONE_OPEN, so the
+ * valid branch meets the escape branch there and the escape path — the 1x1
+ * white dummy, sky, far field, ao_strength == 0 — is untouched.
  */
 float bentConeGiGate(BentCone c, float materialAo, float scalarGate) {
-    return c.valid ? min(materialAo, c.aperture) : scalarGate;
+    return c.valid ? lerp(min(materialAo, c.aperture), scalarGate,
+                          smoothstep(BENT_CONE_TRUST, BENT_CONE_OPEN, c.aperture))
+                   : scalarGate;
 }
 
 #endif // BRACKEN_BENT_CONE_HLSLI

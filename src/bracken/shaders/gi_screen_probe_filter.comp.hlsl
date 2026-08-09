@@ -70,7 +70,9 @@ SamplerState velocitySampler : register(s2, space0);
 // --- read-write (set 1) ---
 [[vk::binding(0, 1)]] RWTexture2D<float4> filteredAtlas : register(u0, space1);
 
-groupshared float gsLuma[GI_SP_RAYS];
+/// (luminance, 1) per LIVE sample, so the reduction carries its own divisor —
+/// see the clamp below for why the count is not GI_SP_RAYS.
+groupshared float2 gsLumaCount[GI_SP_RAYS];
 
 float lumaOf(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
@@ -105,7 +107,21 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
     // and converted to scene radiance with the adapted EV — so the clamp
     // rejects the same FRACTION of rays at noon and at midnight, which is what
     // "scale-free" was always supposed to mean.
-    gsLuma[groupIndex] = resolved ? lumaOf(raw.rgb) : 0.0;
+    // THE MEAN IS OVER THE LIVE SAMPLES, not over all 64 texels. Only the
+    // hemisphere above the anchor is traced, and the march writes the rest as
+    // RESOLVED ZEROS (its last else-if) — a true zero for the SH projection,
+    // which integrates the whole sphere, but not a sample of anything. Averaging
+    // them in halves the statistic (~32 of 64 texels are live, bounded 25..40
+    // across normals and jitter) and with it the ceiling this constant is
+    // documented to be a multiple of. A firefly clamp is a robust-statistics
+    // device: it must compare a sample against the distribution OF THE SAMPLES.
+    // The live test is the march's own predicate recomputed — screen_probes.cpp
+    // hands both passes the same frameIndex and the same probe buffer, so the
+    // jitter and the anchor normal agree bit for bit. Traced-but-UNRESOLVED
+    // texels stay out too: a dropped miss record carries no sample either.
+    const float3 texelDir = giSpTexelDirection(texel, frameIndex);
+    const bool traced = (probe.flags & GI_SP_FLAG_VALID) != 0u && dot(texelDir, probe.normal) > 0.0;
+    gsLumaCount[groupIndex] = (traced && resolved) ? float2(lumaOf(raw.rgb), 1.0) : float2(0.0, 0.0);
     GroupMemoryBarrierWithGroupSync();
     float mean = 0.0;
     {
@@ -113,11 +129,13 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex) {
         [unroll]
         for (uint stride = GI_SP_RAYS / 2; stride > 0; stride >>= 1) {
             if (groupIndex < stride) {
-                gsLuma[groupIndex] += gsLuma[groupIndex + stride];
+                gsLumaCount[groupIndex] += gsLumaCount[groupIndex + stride];
             }
             GroupMemoryBarrierWithGroupSync();
         }
-        mean = gsLuma[0] / float(GI_SP_RAYS);
+        // An invalid probe reduces to a count of 0 and a mean of 0, which takes
+        // the absolute perceptual floor — exactly as it did before.
+        mean = gsLumaCount[0].x / max(gsLumaCount[0].y, 1.0);
     }
     if (resolved) {
         float adaptedEv = rtAdaptedEv(exposureState[0], exposureEnabled, manualExposureEv);

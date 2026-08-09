@@ -60,11 +60,13 @@ namespace bracken::render::gi {
  * Texels per axis in every cascade.
  *
  * 96 rather than 128, and the reason is the memory table rather than taste. Two
- * volumes per cascade survive the design — an RGBA8 albedo+opacity that only the
- * injection pass reads (so it needs no mip chain) and an RGBA16F radiance that
- * the cones sample (so it does). At 128 that is 25 + 57 = 82 MB on top of the
- * probe field's 30, which is a lot to ask of a feature whose entire purpose is
- * to be the CHEAPER alternative to ray tracing. At 96 it is ~35 MB.
+ * volumes per cascade survive the design — an R32_UINT packed albedo+emissive
+ * that only the injection pass reads (so it needs no mip chain) and an RGBA16F
+ * radiance that the cones sample (so it does). At 128 that is 25 + 57 = 82 MB
+ * on top of the probe field's 30, which is a lot to ask of a feature whose
+ * entire purpose is to be the CHEAPER alternative to ray tracing. At 96 it is
+ * ~35 MB. Four bytes a texel either way, so the format correction above does
+ * not move the table.
  *
  * The cost of the reduction is voxel WORLD size at a fixed cascade extent, and
  * that is the number that decides how thin a wall can be before light leaks
@@ -265,18 +267,24 @@ inline constexpr float VOXEL_CASCADE_MARGIN = 2.0f;
 /**
  * Front-to-back alpha compositing, one cone step.
  *
- * `accum` is (rgb premultiplied radiance, a occlusion). Standard over-operator:
- * a sample only contributes what the samples in front of it left unblocked,
- * which is what makes a cone that hits a wall stop reporting whatever is behind
- * it. Returns the updated accumulator.
+ * BOTH arguments are PREMULTIPLIED: rgb is coverage x radiance, a is coverage.
+ * The sample's convention is what the volume actually stores — injection writes
+ * (radiance, 1) for an occupied voxel and (0, 0) for an empty one, and the mip
+ * pass reduces that with an UNWEIGHTED box average, so a level-m texel holds
+ * (coverage * meanRadiance, coverage). The colour was attenuated by coverage
+ * when the empty children averaged in as black.
+ *
+ * Standard over-operator on premultiplied data, therefore: a sample contributes
+ * only what the samples in front of it left unblocked, and its colour is NOT
+ * multiplied by its own alpha a second time. Doing that costs a factor of the
+ * tap's coverage, which is 1 at mip 0 inside solid geometry (why it hid) and
+ * 2^-m out where the cone has widened (where the long-range bounce is).
  */
 [[nodiscard]] inline glm::vec4 voxel_cone_accumulate(const glm::vec4& accum,
                                                      const glm::vec4& sample) noexcept {
     const float transmittance = 1.0f - accum.a;
-    return {accum.r + transmittance * sample.a * sample.r,
-            accum.g + transmittance * sample.a * sample.g,
-            accum.b + transmittance * sample.a * sample.b,
-            accum.a + transmittance * sample.a};
+    return {accum.r + transmittance * sample.r, accum.g + transmittance * sample.g,
+            accum.b + transmittance * sample.b, accum.a + transmittance * sample.a};
 }
 
 /// Occlusion above which a cone is considered to have hit something, for the
@@ -303,6 +311,68 @@ inline constexpr float VOXEL_CONE_TERMINATE_ALPHA = 0.98f;
  */
 [[nodiscard]] inline float voxel_cone_step(float t, float tan_half_angle) noexcept {
     return std::max(0.5f * voxel_cone_diameter(t, tan_half_angle), VOXEL_BASE_SIZE * 0.5f);
+}
+
+// ---------------------------------------------------------------------------
+// Relight staleness
+// ---------------------------------------------------------------------------
+
+/**
+ * Angle the sun may drift from a cascade's LAST INJECTED direction before that
+ * cascade's radiance is stale, in degrees.
+ *
+ * Sized to the clipmap's own angular tolerance, NOT to the RT denoiser's
+ * per-frame cut threshold, and that distinction is the whole point: injection is
+ * not a temporal accumulator, so what matters is how far a shadow may have moved
+ * since a voxel was last lit, not how much history to discard this frame. A
+ * per-frame test cannot work here at all — a 24-minute day moves the sun
+ * 0.004 degrees per frame, two orders under any threshold worth having, so it
+ * only ever fires when a cascade happens to scroll for an unrelated reason.
+ *
+ * At the playground's 0.25 deg/s a cascade re-lights about every four seconds.
+ */
+inline constexpr float VOXEL_RELIGHT_ANGLE_DEG = 1.0f;
+
+/// Relative change in an injected radiance term that makes a cascade stale.
+inline constexpr float VOXEL_RELIGHT_COLOR_REL = 0.05f;
+
+/// Absolute floor in that ratio's denominator. Without it a sun fading toward
+/// black produces an unbounded RELATIVE change out of an irrelevant ABSOLUTE
+/// one, and the clipmap re-lights every frame across dusk for nothing.
+inline constexpr float VOXEL_RELIGHT_COLOR_FLOOR = 0.05f;
+
+/**
+ * Has the lighting moved far enough from what a cascade was last INJECTED with
+ * to make its radiance stale?
+ *
+ * Accumulated, not per-frame: the comparison is against the lighting that
+ * cascade actually received, so a drift far below any per-frame threshold still
+ * trips once it has added up.
+ *
+ * The SKY is compared as well as the sun, and that is not belt-and-braces: at
+ * night the sun's radiance is exactly zero AND stationary, so a sun-only test
+ * freezes the clipmap for the whole night while `ambient_sky` is the only thing
+ * still moving.
+ */
+[[nodiscard]] inline bool voxel_relight_needed(const glm::vec3& last_dir, const glm::vec3& dir,
+                                               const glm::vec3& last_sun, const glm::vec3& sun,
+                                               const glm::vec3& last_sky,
+                                               const glm::vec3& sky) noexcept {
+    const float last_len = glm::length(last_dir);
+    const float len = glm::length(dir);
+    if (last_len > 1e-6f && len > 1e-6f) {
+        const float c = std::clamp(glm::dot(last_dir / last_len, dir / len), -1.0f, 1.0f);
+        constexpr float rad_to_deg = 57.29577951308232f;
+        if (std::acos(c) * rad_to_deg > VOXEL_RELIGHT_ANGLE_DEG) {
+            return true;
+        }
+    }
+    // MAX, not sum: either term alone is sufficient, and adding them would let a
+    // rising sun cancel a dimming sky.
+    const auto relative = [](const glm::vec3& a, const glm::vec3& b) {
+        return glm::length(b - a) / std::max(glm::length(a), VOXEL_RELIGHT_COLOR_FLOOR);
+    };
+    return std::max(relative(last_sun, sun), relative(last_sky, sky)) > VOXEL_RELIGHT_COLOR_REL;
 }
 
 // ---------------------------------------------------------------------------
