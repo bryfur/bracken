@@ -135,6 +135,15 @@ float rtFastHistoryMargin(float fastMean, float fastCount) {
     return RT_FAST_HISTORY_CLAMP_SIGMA * sigma + RT_FAST_HISTORY_CLAMP_FLOOR;
 }
 
+/// CPU mirror: `visibility_filter_variance` — the variance of the ACCUMULATED
+/// estimate. Read that comment: `moment2 - mean^2` alone is the variance of one
+/// Bernoulli draw and does not shrink with history, which is what pinned the
+/// filter's "variance-guided" radius at its maximum.
+float rtVisibilityFilterVariance(float mean, float moment2, float count) {
+    float sampleVariance = max(moment2 - mean * mean, 0.0);
+    return sampleVariance / max(count, 1.0);
+}
+
 // ---------------------------------------------------------------------------
 // 4. Exposure-aware clamps
 // ---------------------------------------------------------------------------

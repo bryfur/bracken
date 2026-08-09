@@ -152,12 +152,17 @@ inline constexpr uint32_t k_emissive_froxel_capacity = 16;
  * for a record to enter that froxel's list.
  *
  * The same quantity `emissive_target()` computes with the two cosines set to 1,
- * so it is an upper bound on the record's p̂ anywhere in the froxel and is
- * directly commensurable with the analytic path's target function. Its other
- * face is a RELEVANCE RADIUS, `sqrt(power / threshold)`, which is what makes the
- * bin O(records x touched froxels) instead of O(records x CLUSTER_COUNT) — the
- * same role a point light's `radius` plays for the light binner, derived rather
- * than authored because a triangle has no range field to author.
+ * so it is directly commensurable with the analytic path's target function. It
+ * is a SAMPLE of p̂ at that one point, not a bound over the froxel: a record
+ * nearer the froxel than its centre is under-scored, by up to (D / (D - h))^2
+ * for a froxel of half-extent h, and can therefore miss the list of the froxel
+ * it sits in.
+ *
+ * Its other face is a RELEVANCE RADIUS, `sqrt(power / threshold)`, which is
+ * what makes the bin O(records x touched froxels) instead of
+ * O(records x CLUSTER_COUNT) — the same role a point light's `radius` plays for
+ * the light binner, derived rather than authored because a triangle has no
+ * range field to author.
  *
  * 0.002 in the engine's linear units. Measured against the playground village:
  * a lit-window record (power ~ 10^2) reaches a couple of hundred units, an orb
@@ -231,6 +236,21 @@ inline constexpr uint32_t k_emissive_froxel_stride = k_emissive_froxel_capacity 
 [[nodiscard]] inline constexpr uint32_t emissive_cluster_table_size(uint32_t froxel_count) {
     return froxel_count * k_emissive_froxel_stride;
 }
+
+/**
+ * "Do not memoize me" — the record generation a caller passes when it has no
+ * generation to offer, which forces `build()` to run.
+ *
+ * A SENTINEL RATHER THAN A DEFAULT ARGUMENT, deliberately. The table is a pure
+ * function of (record CONTENTS, view, projection, z planes, grid), and every
+ * one of those is visible in `build()`'s arguments except the first: two
+ * different record vectors can occupy the same heap address at the same size,
+ * which is exactly what a test or a bench that builds temporaries does. A
+ * defaulted generation would make both carry 0 and let the second build be
+ * silently skipped against the first one's table. Making the opt-in explicit
+ * keeps every CPU-only caller ungated and correct by construction.
+ */
+inline constexpr uint32_t k_emissive_no_generation = 0xFFFFFFFFu;
 
 // ---------------------------------------------------------------------------
 // The CPU mirror of the shader's mixture draw.
@@ -387,10 +407,31 @@ public:
      *
      * An empty record set, an empty bounds table or a mismatched grid clears the
      * table and leaves `live()` false; nothing else in the frame then reads it.
+     *
+     * @param record_generation `RtScene::emissive_generation()`, opting this
+     *   call into the REBUILD GATE: when it, the record span, and every field
+     *   of `params` this table depends on are all unchanged since the last
+     *   successful build, the existing table already describes this frame and
+     *   the whole pass is skipped — `stats()`, `live()` and the pending upload
+     *   all still stand. Pass `k_emissive_no_generation` (what the overloads
+     *   without it do) to force the rebuild; see that constant for why it is
+     *   not a default argument.
+     *
+     *   The gate cannot fire on a frame the camera moved, so it recovers
+     *   nothing in the playground's own bench — the emissive orbs bob every
+     *   frame there, which bumps the generation regardless. It is for a paused
+     *   game, a photo mode, a cutscene hold, or a fixed camera over static
+     *   emitters.
      */
     void build(core::jobs::JobSystem& js, std::span<const EmissiveTriangle> records,
-               const lighting::ClusterParams& params, std::span<const lighting::ClusterBounds> bounds);
+               const lighting::ClusterParams& params, std::span<const lighting::ClusterBounds> bounds,
+               uint32_t record_generation);
     /// Convenience overload servicing the canonical singleton pool.
+    void build(std::span<const EmissiveTriangle> records, const lighting::ClusterParams& params,
+               std::span<const lighting::ClusterBounds> bounds, uint32_t record_generation);
+    /// Ungated forms: always rebuild. What every CPU-only caller wants.
+    void build(core::jobs::JobSystem& js, std::span<const EmissiveTriangle> records,
+               const lighting::ClusterParams& params, std::span<const lighting::ClusterBounds> bounds);
     void build(std::span<const EmissiveTriangle> records, const lighting::ClusterParams& params,
                std::span<const lighting::ClusterBounds> bounds);
 
@@ -458,6 +499,18 @@ private:
     uint32_t froxel_count_ = 0;
     glm::mat4 last_inv_projection_{0.0f};
     glm::mat4 projection_{1.0f};
+    /// The rebuild gate's memo of the inputs of the last SUCCESSFUL build —
+    /// everything the table is a function of. `last_inv_projection_` above is
+    /// part of it and is deliberately shared with the projection memo one line
+    /// up: that memo's condition is a subset of this one's, so the two cannot
+    /// drift. Cleared by shutdown(); untouched by invalidate(), which clears
+    /// `live_` and thereby disarms the gate on its own.
+    const EmissiveTriangle* last_records_ = nullptr;
+    std::size_t last_record_count_ = 0;
+    uint32_t last_generation_ = k_emissive_no_generation;
+    glm::mat4 last_view_{0.0f};
+    glm::vec4 last_z_planes_{0.0f};
+    glm::uvec4 last_grid_dim_{0u};
     /// The four SIDE planes of the frustum in VIEW space (Gribb-Hartmann rows of
     /// the projection), normalized. The cheap pre-cull: six dot products reject
     /// a record before it costs eight matrix-vector products to bound its tiles.

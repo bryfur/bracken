@@ -1496,8 +1496,17 @@ struct alignas(16) RtShadowTemporalUniforms {
     /// units, 0.0375 at 500, 0.025 at 1000, and "never reject" past far/2,
     /// where every surface linearized to the same saturated constant. No
     /// constant reproduces a distance-dependent curve, and 5% is what this
-    /// field has always claimed to mean. Must stay equal to
-    /// RtShadowGradientUniforms::depthRejectRelative.
+    /// field has always claimed to mean.
+    ///
+    /// Deliberately 125x LOOSER than RtShadowGradientUniforms::depthRejectRelative
+    /// (0.05 against SUN_GRADIENT_DEPTH_REJECT_RELATIVE's 0.0004). This test asks
+    /// "is this history REUSABLE?"; the gradient's asks "is this LITERALLY the
+    /// point the previous frame traced?". render/rt_denoise_math.hpp carries the
+    /// measurement that separated them (at 0.05 the gradient reports a 3.3%
+    /// spurious fire rate and the sun's accumulation window collapses from 26.6
+    /// frames to 10.3 for no signal), and rt_denoise_math.test.cpp pins it. Do
+    /// NOT resync them. The 5%-intent family this value DOES belong to is
+    /// RtShadowFilterUniforms::depthSigma and the shaders' LOCAL_DI_DEPTH_TOLERANCE.
     float depthRejectRelative = 0.05f;
     /// R5b: the analytic sun gradient's global hysteresis floor, [0, 1]
     /// (render/rt_denoise_math.hpp's `lighting_reset_floor`). 0 is the identity
@@ -1512,9 +1521,32 @@ struct alignas(16) RtShadowTemporalUniforms {
     uint32_t counterBase = 0;
     uint32_t _pad0 = 0;
     uint32_t _pad1 = 0;
+    /**
+     * Previous frame's unjittered view-projection COMPOSED with this frame's
+     * inverse view-projection, so one `mul` takes a current clip-space point
+     * straight to the previous frame's clip space.
+     *
+     * The disocclusion test asks "is the history at this reprojected texel the
+     * same surface?", and the history's alpha is the linear view depth the
+     * PREVIOUS frame's camera measured. Comparing it against THIS frame's view
+     * depth therefore measures the camera's own motion, not the surface's —
+     * the exact defect RtShadowGradientUniforms::prevViewProjUnjittered
+     * documents for the gradient replays, which were fixed while this pass,
+     * applying the same test at a looser knee, was left on the old form. At the
+     * playground's 420-unit boom a follow camera translates 2.3-5.0 units per
+     * frame, which trips `0.05 * d` outright below d ~= 46-100; camera ROTATION
+     * trips it at screen edges at ANY depth, since dz/z ~= tan(fov/2) * theta.
+     *
+     * Composed on the CPU rather than shipping `invViewProj` and
+     * `prevViewProjUnjittered` separately: this pass needs no world position
+     * for anything else (unlike the gradient, whose replay ray starts at one),
+     * so composing costs 64 bytes instead of 128 and one `mul` per pixel
+     * instead of two, and is algebraically identical.
+     */
+    glm::mat4 prevClipFromClip{1.0f};
 };
 
-BRACKEN_HLSL_CBUFFER(RtShadowTemporalUniforms, 64);
+BRACKEN_HLSL_CBUFFER(RtShadowTemporalUniforms, 128);
 BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, tracedSize, 0);
 BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, tileCount, 8);
 BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, stratumCount, 16);
@@ -1528,6 +1560,7 @@ BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, gradientValid, 48);
 BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, counterBase, 52);
 BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, _pad0, 56);
 BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, _pad1, 60);
+BRACKEN_HLSL_FIELD(RtShadowTemporalUniforms, prevClipFromClip, 64);
 
 /**
  * A-SVGF gradient trace for the SUN visibility signal — matches
@@ -1555,7 +1588,12 @@ struct alignas(16) RtShadowGradientUniforms {
     uint32_t historyValid = 0;
     float depthA = 0.0f;
     float depthB = 0.0f;
-    float depthRejectRelative = 0.05f;
+    /// `SUN_GRADIENT_DEPTH_REJECT_RELATIVE` (render/rt_denoise_math.hpp; gpu/
+    /// sits below render/ and cannot include it, so this literal is the same
+    /// arrangement RtLocalShadowGradientUniforms::depthRejectRelative uses).
+    /// The driver always overwrites it — the default being the TEMPORAL pass's
+    /// 0.05 was the wrong fallback for the one field that must never hold it.
+    float depthRejectRelative = 0.0004f;
     /// §5.8 — the capsule set the trace used. The replay must see the SAME one
     /// or every capsule-shadowed stratum fires a gradient forever. Took the
     /// slot that was `_pad0`, so the extent is unchanged.
@@ -1695,7 +1733,19 @@ struct alignas(16) RtShadowFilterUniforms {
     /// `0.05 * (1 - 2t/far)` and degenerated into a uniform-weight box filter
     /// past far/2.
     float depthSigma = 0.05f;
-    glm::uvec2 _pad0{0, 0};
+    /// Exponent on the normal similarity of a gathered tap. 8 is what the two
+    /// sibling gathers ship (RtDiSpatialUniforms::normalPower,
+    /// GiScreenProbeProjectUniforms::normalPower) and it is not a free choice:
+    /// on this engine's curved pack geometry a 3-texel step turns the geometric
+    /// normal 15-20 degrees, so 32 would drop cos 0.94 to 0.14 and destroy the
+    /// filtering on every barrel, trunk and cobble bulge, where 8 leaves 0.61.
+    float normalPower = 8.0f;
+    /// 1 when the prepass G-buffer is bound and its octahedral normal may be
+    /// read. Same contract as RtShadowUniforms::hasGBuffer: the slot always
+    /// holds a valid texture (the depth target stands in), and this — not the
+    /// bind — decides whether it is decoded. Decoding depth as a normal would
+    /// reject every tap and leave `weightSum` at zero.
+    uint32_t hasGBuffer = 0;
 };
 
 BRACKEN_HLSL_CBUFFER(RtShadowFilterUniforms, 48);
@@ -1706,7 +1756,8 @@ BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, depthA, 24);
 BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, depthB, 28);
 BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, maxRadius, 32);
 BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, depthSigma, 36);
-BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, _pad0, 40);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, normalPower, 40);
+BRACKEN_HLSL_FIELD(RtShadowFilterUniforms, hasGBuffer, 44);
 
 /**
  * Ray-traced reflection compute uniforms — matches rt_reflection.comp.hlsl

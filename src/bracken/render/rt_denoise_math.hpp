@@ -24,11 +24,12 @@
  *
  * Mirrors (change one, change both — every constant below is `#define`d
  * verbatim in `shaders/rt_denoise.hlsli`):
- *   lighting_reset_floor     -> rtLightingResetFloor
- *   gradient_dilation_weight -> rtGradientDilationWeight
- *   fast_history_margin      -> rtFastHistoryMargin
- *   exposure_scene_scale     -> rtExposureSceneScale
- *   clamp_sigma_floor        -> rtClampSigmaFloor
+ *   lighting_reset_floor        -> rtLightingResetFloor
+ *   gradient_dilation_weight    -> rtGradientDilationWeight
+ *   fast_history_margin         -> rtFastHistoryMargin
+ *   visibility_filter_variance  -> rtVisibilityFilterVariance
+ *   exposure_scene_scale        -> rtExposureSceneScale
+ *   clamp_sigma_floor           -> rtClampSigmaFloor
  *
  * Tier: pure (no state, no device, callable from anywhere).
  */
@@ -319,6 +320,39 @@ inline constexpr float FAST_HISTORY_CLAMP_FLOOR = 0.05f;
     const float n = std::max(fast_count, 1.0f);
     const float sigma = std::sqrt(std::max(p * (1.0f - p), 0.0f) / n);
     return FAST_HISTORY_CLAMP_SIGMA * sigma + FAST_HISTORY_CLAMP_FLOOR;
+}
+
+/**
+ * The variance the visibility filter's radius is driven by: the variance of the
+ * ACCUMULATED ESTIMATE, not of one sample.
+ *
+ * `rt_shadow_denoise_filter.comp.hlsl` used `moment2 - mean^2` directly, and for
+ * this signal that number is a constant. The traced sample is one BIT
+ * (`rtUnpackVisibility` returns 1.0 or 0.0), so `sample*sample == sample`
+ * identically; the temporal pass seeds `mean = sample`, `moment2 = sample*sample`
+ * and advances both with the same `lerp` from the same operands, so the stored
+ * second moment is bit-identical to the stored mean and `moment2 - mean^2`
+ * evaluates to `p(1-p)` — the variance of a SINGLE Bernoulli draw — forever. The
+ * fast-history clamp is written to PRESERVE that difference, so it does not
+ * separate them either. Deriving the recursion gives the same answer: with
+ * `V = moment2 - mean^2` a step is `V' = (1-a)V + a(1-a)(s-m)^2`, whose fixed
+ * point is `p(1-p)` regardless of how many frames have accumulated.
+ *
+ * `p(1-p)` exceeds 0.0625 for every p in [0.067, 0.933], so the filter's
+ * `saturate(sqrt(variance) * 4)` saturated over the whole fractional range and
+ * the "variance-guided" radius sat at its maximum on exactly the pixels the pass
+ * exists for — genuine penumbrae. Dividing by the accumulated count is what makes
+ * it the estimator's standard error, `p(1-p)/n`, which is the same statistic
+ * `fast_history_margin` above already derives for the four-frame window.
+ *
+ * `count` caps at `max_accum_frames`, past which the EMA's true variance is
+ * `sigma^2 * a/(2-a)` = `sigma^2/63` at a = 1/32 — so this over-estimates by ~2x
+ * at full convergence, deliberately, on the side of blurring.
+ */
+[[nodiscard]] inline float visibility_filter_variance(float mean, float moment2,
+                                                      float count) noexcept {
+    const float sample_variance = std::max(moment2 - mean * mean, 0.0f);
+    return sample_variance / std::max(count, 1.0f);
 }
 
 // ---------------------------------------------------------------------------

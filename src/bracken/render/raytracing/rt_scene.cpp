@@ -1,5 +1,6 @@
 #include "bracken/render/raytracing/rt_scene.hpp"
 
+#include "bracken/core/assert.hpp"
 #include "bracken/core/hash.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/core/jobs/parallel_for.hpp"
@@ -25,12 +26,21 @@ struct ModelGeometry {
     std::vector<uint32_t> indices;
     std::vector<glm::vec3> normals;
     std::vector<glm::vec4> triangle_colors;
-    /// Per-triangle emitted radiance, in lockstep with `triangle_colors`. All
-    /// zero when no mesh of the model emits, which is the common case; the
-    /// `any_emissive` flag below is what lets the gather skip the whole walk.
+    /// Per-triangle emitted radiance, in lockstep with `indices / 3`. Gathered
+    /// UNCONDITIONALLY, like `triangle_opacity` below and for the same reason:
+    /// an emitting triangle is a LIGHT, not a shading attribute, and the
+    /// configuration that wants those lights most — local shadows on,
+    /// reflections off — is exactly the one with no attribute buffer.
+    ///
+    /// `any_emissive` false means the model emits nothing anywhere, and the
+    /// vector is RELEASED at the end of the gather rather than the walk being
+    /// skipped: every `Pending` holds its geometry simultaneously, so 12 bytes
+    /// per triangle across the whole model set is megabytes of transient peak
+    /// for data that is all zero. The record walk's bounds check on this
+    /// vector's size then skips a released model for free.
     std::vector<glm::vec3> triangle_emissive;
     /// Per-triangle opacity in [0, 1], in lockstep with `indices / 3`. Unlike
-    /// the two above it is gathered UNCONDITIONALLY, not under
+    /// the COLOURS above it is gathered UNCONDITIONALLY, not under
     /// `want_attributes`: it rides `BvhTriangle::opacity` rather than the
     /// attribute buffer, and the configuration that needs it most — shadows on,
     /// reflections off — is exactly the one where no attribute buffer exists.
@@ -130,6 +140,25 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
                     : 1.0f;
             g.triangle_opacity.push_back(opacity);
             g.any_cutout = g.any_cutout || opacity < 1.0f;
+
+            // Emission, from the same per-triangle bake and with the same
+            // fallback shape as the colour below: the mesh-wide factor when the
+            // proxy is absent (an untextured emissive mesh bakes the factor for
+            // every triangle, so absence here means the model was loaded
+            // without retention and only the factor survives).
+            //
+            // Outside `want_attributes` because the RECORDS derived from it are
+            // outside it — see the record walk in build_blas_for_models.
+            glm::vec3 emissive(0.0f);
+            if (tri < mesh.rt_triangle_emissive.size()) {
+                emissive = mesh.rt_triangle_emissive[tri];
+            } else {
+                emissive = mesh.material.emissive_factor;
+            }
+            g.triangle_emissive.push_back(emissive);
+            g.any_emissive =
+                g.any_emissive || emissive.r > 0.0f || emissive.g > 0.0f || emissive.b > 0.0f;
+
             if (want_attributes) {
                 if (tri < mesh.rt_triangle_base_colors.size()) {
                     g.triangle_colors.push_back(mesh.rt_triangle_base_colors[tri]);
@@ -142,23 +171,16 @@ ModelGeometry gather(const Model& model, bool want_attributes) {
                 } else {
                     g.triangle_colors.push_back(mesh.material.base_color_factor);
                 }
-
-                // Emission, from the same per-triangle bake and with the same
-                // fallback shape: the mesh-wide factor when the proxy is absent
-                // (an untextured emissive mesh bakes the factor for every
-                // triangle, so absence here means the model was loaded without
-                // retention and only the factor survives).
-                glm::vec3 emissive(0.0f);
-                if (tri < mesh.rt_triangle_emissive.size()) {
-                    emissive = mesh.rt_triangle_emissive[tri];
-                } else {
-                    emissive = mesh.material.emissive_factor;
-                }
-                g.triangle_emissive.push_back(emissive);
-                g.any_emissive = g.any_emissive || emissive.r > 0.0f || emissive.g > 0.0f ||
-                                 emissive.b > 0.0f;
             }
         }
+    }
+    // A model that emits nowhere carries an all-zero array, and `pending` holds
+    // every model's geometry at once — so releasing it here is what keeps the
+    // now-unconditional fill above proportional to the emitters that actually
+    // exist instead of to the whole model set. Swap rather than `clear()`:
+    // clear() keeps the capacity, which is the memory this is about.
+    if (!g.any_emissive) {
+        std::vector<glm::vec3>().swap(g.triangle_emissive);
     }
     return g;
 }
@@ -258,6 +280,7 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
     emissive_records_.clear();
     emissive_total_power_ = 0.0f;
     emissive_dirty_ = true;
+    ++emissive_generation_;
     stats_ = {};
 
     // The BLAS set is about to be renumbered, so every offset in the current
@@ -381,22 +404,48 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
                         }
                     }
                 }
-
-                // R6: an emitting triangle is also a LIGHT, if it delivers
-                // enough power to be worth a candidate slot. The vertices come
-                // from the BVH triangle rather than from the index buffer
-                // because that is where they are already in origin+edge form,
-                // and because it guarantees the record names a triangle the
-                // shadow ray can actually hit.
-                if (a.emissive_luminance > 0.0f) {
-                    const float area = 0.5f * glm::length(glm::cross(tri.e1, tri.e2));
-                    if (a.emissive_luminance * area >= k_emissive_min_power) {
-                        entry.emissive.push_back(
-                            ModelEmissiveTriangle{tri.v0, tri.e1, tri.e2, a.emissive});
-                    }
-                }
                 attributes_.push_back(a);
             }
+        }
+
+        // R6: an emitting triangle is also a LIGHT. OUTSIDE the attribute block
+        // above, and that placement is load-bearing rather than tidy. A record
+        // carries its own radiance/area/power and the Full-DI pass never binds
+        // the attribute buffer at all, so gating this walk on `want_attributes`
+        // made the one configuration that wants emissive lights most — local
+        // shadows on, reflections off — the one configuration that silently had
+        // none of them. Exactly the reasoning that put `BvhTriangle::opacity`
+        // outside it too.
+        //
+        // The vertices come from the BVH triangle rather than from the index
+        // buffer because that is where they are already in origin+edge form,
+        // and because it guarantees the record names a triangle the shadow ray
+        // can actually hit.
+        //
+        // The test is a scale-FREE radiance floor, not a power floor: power is
+        // radiance x AREA, and area is the one factor of it an instance
+        // transform changes. `k_emissive_min_power` is applied in world space,
+        // where the world triangle exists — see rebuild_emissive_records.
+        //
+        // A LATENT HAZARD, inert today and worth naming before it is not: this
+        // walks REFERENCES, not source triangles. The binned-SAH builder emits
+        // each source triangle exactly once, so `prim_id` is unique across
+        // `p.blas.triangles` and each emitter contributes one record. A builder
+        // that SPATIALLY SPLITS — duplicating a reference across a plane — would
+        // emit one `prim_id` k times, and this loop would push the whole
+        // UNCLIPPED triangle at full emission k times over. That is a k-fold
+        // brightening of precisely the largest emitters, which are the ones a
+        // spatial split targets. Anyone adding one has to de-duplicate here.
+        for (const BvhTriangle& tri : p.blas.triangles) {
+            const std::size_t ti = tri.prim_id;
+            if (ti >= p.geometry.triangle_emissive.size()) {
+                continue; // a model that emits nowhere released the array
+            }
+            const glm::vec3 e = p.geometry.triangle_emissive[ti];
+            if (!(lighting::target_luminance(e) > k_emissive_min_luminance)) {
+                continue;
+            }
+            entry.emissive.push_back(ModelEmissiveTriangle{tri.v0, tri.e1, tri.e2, e});
         }
 
         stats_.emissive_triangles += static_cast<uint32_t>(entry.emissive.size());
@@ -627,6 +676,7 @@ void RtScene::rebuild_emissive_records(
             emissive_instances_.clear();
             emissive_total_power_ = 0.0f;
             emissive_dirty_ = true;
+            ++emissive_generation_;
             stats_.emissive_epoch++;
         }
         stats_.emissive_records = 0;
@@ -650,6 +700,7 @@ void RtScene::rebuild_emissive_records(
     emissive_records_.clear();
     emissive_sources_.clear();
     emissive_instances_.clear();
+    stats_.emissive_records_below_power = 0;
 
     // Walk the INPUT instance order rather than the TLAS slot order: the slot
     // permutation is the builder's and changes with the tree, while the input
@@ -668,8 +719,22 @@ void RtScene::rebuild_emissive_records(
         for (const ModelEmissiveTriangle& src : it->second.emissive) {
             EmissiveTriangle rec;
             emissive_place(src, transform, rec);
-            if (!(rec.power > 0.0f)) {
-                continue; // a degenerate instance transform collapsed it
+            // THE CALIBRATED THRESHOLD, IN THE UNITS IT IS DOCUMENTED IN.
+            // `k_emissive_min_power` is linear radiance x WORLD units squared,
+            // and area is the one factor of power an instance transform
+            // changes: a model authored in metres and instanced at 100x has a
+            // world area ten thousand times its model area. Testing MODEL-space
+            // power — which is what this did until the units were reconciled —
+            // made the effective world floor `k_emissive_min_power * s^2`, an
+            // invisible scale-dependent cut that rejected exactly the small lit
+            // windows this phase set out to light. The prefilter at BLAS build
+            // is a scale-free radiance floor for that reason, and the power
+            // decision belongs here, where the world triangle exists. It
+            // subsumes the old degenerate-transform check: a collapsed instance
+            // has zero area and therefore zero power.
+            if (!(rec.power >= k_emissive_min_power)) {
+                ++stats_.emissive_records_below_power;
+                continue;
             }
             emissive_records_.push_back(rec);
             emissive_sources_.push_back(src);
@@ -685,15 +750,24 @@ void RtScene::rebuild_emissive_records(
     // brightest" and it would destroy the property the refresh path above
     // stands on: that each instance owns a CONTIGUOUS slice. So the cut is a
     // power THRESHOLD (nth_element over a copy of the powers) applied as a
-    // stable filter, which drops exactly the records a sort would have dropped
-    // while leaving every slice contiguous.
+    // stable filter — NOT a sort.
+    //
+    // TIES AT THE THRESHOLD ARE NOT A CORNER CASE HERE. `power` is
+    // luminance(radiance) * area, and `emissive_place` transforms the edges
+    // with w = 0, so two instances of one model differing only in TRANSLATION
+    // produce BIT-IDENTICAL powers. A pack of same-orientation lampposts is
+    // therefore a tie group hundreds of records wide. A strict `>` filter alone
+    // drops the whole group the cut lands in — keeping far fewer than the
+    // budget allows while the arithmetic still claims `size - cap` were
+    // dropped. So the tied group is admitted in record order until the budget
+    // is full, which fills the cap exactly and keeps every slice contiguous
+    // because both decisions are made inside the one in-order walk.
     stats_.emissive_records_dropped = 0;
     if (emissive_records_.size() > k_max_emissive_records) {
-        const auto dropped = emissive_records_.size() - k_max_emissive_records;
-        stats_.emissive_records_dropped = static_cast<uint32_t>(dropped);
+        const std::size_t before_size = emissive_records_.size();
 
-        emissive_weight_scratch_.resize(emissive_records_.size());
-        for (std::size_t i = 0; i < emissive_records_.size(); ++i) {
+        emissive_weight_scratch_.resize(before_size);
+        for (std::size_t i = 0; i < before_size; ++i) {
             emissive_weight_scratch_[i] = emissive_records_[i].power;
         }
         const auto cut = emissive_weight_scratch_.begin() +
@@ -702,16 +776,31 @@ void RtScene::rebuild_emissive_records(
                          std::greater<float>());
         const float threshold = *cut;
 
+        // Everything strictly above the nth element sits in the first
+        // k_max_emissive_records slots of the partition, so this is <= the cap
+        // by construction and the quota below never underflows. Every power
+        // here is finite and >= k_emissive_min_power (filtered at the push
+        // above), so there is no NaN to reason about in the ordering.
+        const auto strictly_greater = static_cast<std::size_t>(
+            std::count_if(emissive_weight_scratch_.begin(), emissive_weight_scratch_.end(),
+                          [threshold](float w) { return w > threshold; }));
+        BRACKEN_ASSERT(strictly_greater <= k_max_emissive_records);
+        std::size_t tie_quota = k_max_emissive_records - strictly_greater;
+
         std::size_t out = 0;
         for (EmissiveInstance& slice : emissive_instances_) {
             const uint32_t begin = slice.record_begin;
             const uint32_t count = slice.record_count;
             slice.record_begin = static_cast<uint32_t>(out);
             uint32_t kept = 0;
-            for (uint32_t k = 0; k < count && out < k_max_emissive_records; ++k) {
+            for (uint32_t k = 0; k < count; ++k) {
                 const std::size_t from = static_cast<std::size_t>(begin) + k;
-                if (!(emissive_records_[from].power > threshold)) {
-                    continue;
+                const float power = emissive_records_[from].power;
+                if (!(power > threshold)) {
+                    if (power < threshold || tie_quota == 0) {
+                        continue;
+                    }
+                    --tie_quota; // exactly at the threshold, budget still open
                 }
                 emissive_records_[out] = emissive_records_[from];
                 emissive_sources_[out] = emissive_sources_[from];
@@ -720,10 +809,18 @@ void RtScene::rebuild_emissive_records(
             }
             slice.record_count = kept;
         }
+        BRACKEN_ASSERT(out <= k_max_emissive_records);
         emissive_records_.resize(out);
         emissive_sources_.resize(out);
         std::erase_if(emissive_instances_,
                       [](const EmissiveInstance& s) { return s.record_count == 0; });
+
+        // Report what was actually KEPT rather than what the budget arithmetic
+        // predicted. With the tie admission above the two agree, and the
+        // recount is what keeps them agreeing if this cut is ever changed again
+        // — the no-silent-drops rule is about the real number.
+        const std::size_t dropped = before_size - out;
+        stats_.emissive_records_dropped = static_cast<uint32_t>(dropped);
 
         if (!emissive_over_budget_logged_) {
             emissive_over_budget_logged_ = true;
@@ -738,6 +835,7 @@ void RtScene::rebuild_emissive_records(
     rebuild_emissive_alias();
     stats_.emissive_records = static_cast<uint32_t>(emissive_records_.size());
     emissive_dirty_ = true;
+    ++emissive_generation_;
     if (topology_changed) {
         stats_.emissive_epoch++;
     }
@@ -779,6 +877,18 @@ bool RtScene::refresh_emissive_records(
             // drift for as long as the scene runs.
             emissive_place(emissive_sources_[idx], transform, emissive_records_[idx]);
             const float after = emissive_records_[idx].power;
+            // MEMBERSHIP, not just weight. The power floor is applied in world
+            // space, so it depends on the instance transform and a scaled
+            // emitter can cross it without the record set changing shape. This
+            // path cannot express that: its whole contract is that record
+            // indices are preserved, so it can neither add the record back nor
+            // remove it. Hand the question to the rebuild instead — nothing
+            // else would, because the topology hash is handles and count only,
+            // and the drop would otherwise have hysteresis: an instance that
+            // scaled back up would never recover its records.
+            if ((before >= k_emissive_min_power) != (after >= k_emissive_min_power)) {
+                return false; // caller rebuilds
+            }
             if (std::abs(after - before) > 1e-3f * std::max(before, 1e-6f)) {
                 powers_changed = true;
             }
@@ -792,6 +902,7 @@ bool RtScene::refresh_emissive_records(
         rebuild_emissive_alias();
     }
     emissive_dirty_ = true;
+    ++emissive_generation_;
     return true;
 }
 

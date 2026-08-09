@@ -71,11 +71,23 @@ struct RtSceneStats {
     /// should read builds≈1, refits≈frames, and any drift back towards
     /// builds≈frames is the topology check failing to engage.
     uint32_t tlas_refits = 0;
-    /// Emissive triangles found across all MODELS (R6). Model-space, counted
-    /// once per BLAS build; the scene may instance each of them many times.
+    /// Model triangles that EMIT, across all models (R6) — everything above the
+    /// scale-free `k_emissive_min_luminance` prefilter. Model-space, counted
+    /// once per BLAS build; the scene may instance each of them many times, and
+    /// each instance's world-space power decides separately whether it becomes
+    /// a record. A nonzero value here with `emissive_records` 0 means the
+    /// emitters are all too dim once their world area is known —
+    /// `emissive_records_below_power` is that count.
     uint32_t emissive_triangles = 0;
     /// Scene-level emissive light records actually uploaded this frame.
     uint32_t emissive_records = 0;
+    /// World-space placements that failed `k_emissive_min_power` on the most
+    /// recent rebuild — an emitting model triangle whose instance is too small
+    /// (or too dim) to deliver a candidate slot's worth of light. Reported for
+    /// the same reason the cap's drop is: the prefilter is a radiance floor and
+    /// this is the only counter that distinguishes "nothing in this scene
+    /// emits" from "everything that emits is beneath the power floor".
+    uint32_t emissive_records_below_power = 0;
     /// Records the cap threw away on the MOST RECENT rebuild. A per-rebuild
     /// figure rather than a running total, because the actionable question is
     /// "how far over budget is this scene", and a total that climbs with the
@@ -136,7 +148,10 @@ public:
      * producing an empty structure — the same trap load_model_with_lods
      * documents.
      *
-     * @param want_attributes also gather normals/colours for reflections.
+     * @param want_attributes also gather normals/colours for reflections. It
+     *   does NOT gate the emissive LIGHT records: those carry their own
+     *   radiance and are read by a pass that never binds the attribute buffer,
+     *   so they are collected either way (see the record walk in the .cpp).
      */
     void build_blas_for_models(const ModelManager& models, bool want_attributes);
 
@@ -218,9 +233,10 @@ public:
     [[nodiscard]] SDL_GPUBuffer* blas_triangles() const;
     [[nodiscard]] SDL_GPUBuffer* triangle_attributes() const;
     /// The emissive light records + their alias rows (R6). Null when the scene
-    /// has no emitter above `k_emissive_min_power`, or when attributes were
-    /// never gathered — an emissive light IS an attribute, so `want_attributes`
-    /// gates both.
+    /// has no emitter clearing `k_emissive_min_power` in WORLD space.
+    /// Deliberately independent of `want_attributes`: a record carries its own
+    /// radiance/area/power and the Full-DI pass never binds the attribute
+    /// buffer, so a shadows-only build has emissive lights like any other.
     [[nodiscard]] SDL_GPUBuffer* emissive_records() const;
     [[nodiscard]] uint32_t emissive_record_count() const noexcept {
         return static_cast<uint32_t>(emissive_records_.size());
@@ -239,6 +255,20 @@ public:
     /// whether an emissive record index carried over from last frame still
     /// names the same triangle.
     [[nodiscard]] uint32_t emissive_epoch() const noexcept { return stats_.emissive_epoch; }
+    /// Bumped whenever any record's CONTENT changes — its placement, its power,
+    /// or the set itself. A consumer that MEMOIZES a table derived from the
+    /// records (R8's froxel binner) compares this and skips a rebuild when it
+    /// has not moved.
+    ///
+    /// Separate from `emissive_epoch` on purpose, and the two are not
+    /// interchangeable: the epoch answers "may a reservoir carry record index k
+    /// across this frame boundary", so it moves only on a TOPOLOGY change and
+    /// deliberately stays put when an emitter merely moved. That is precisely
+    /// the case a derived table must NOT skip. It is also a plain member rather
+    /// than an `RtSceneStats` field, because `stats_` is reset wholesale by
+    /// `build_blas_for_models` and a memo compared against a counter that can
+    /// go backwards is a stale-table bug waiting to happen.
+    [[nodiscard]] uint32_t emissive_generation() const noexcept { return emissive_generation_; }
 
 private:
     struct ModelEntry {
@@ -326,6 +356,10 @@ private:
     std::size_t emissive_capacity_ = 0;
     float emissive_total_power_ = 0.0f;
     bool emissive_dirty_ = false;
+    /// See `emissive_generation()`. Monotonic for the object's lifetime, and
+    /// never reset — a consumer's memo is only ever compared for equality, so
+    /// wrapping at 2^32 rebuilds is harmless and resetting would not be.
+    uint32_t emissive_generation_ = 0;
     /// Latched so an over-budget scene logs once rather than once per frame —
     /// the rebuild runs whenever anything moves, so the unlatched version was a
     /// warning per frame forever.

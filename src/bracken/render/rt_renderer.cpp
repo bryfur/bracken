@@ -630,8 +630,8 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
                 reconstruct_gradient(cmd, sun_shadow_, w, h);
 
             sun_shadow_.bits_index = bits_next;
-            denoise_visibility(cmd, sun_shadow_, depth, velocity, params, shadows.max_accum_frames,
-                               shadows.filter_radius, w, h);
+            denoise_visibility(cmd, sun_shadow_, depth, normal_rough, velocity, params,
+                               shadows.max_accum_frames, shadows.filter_radius, w, h);
             sun_shadow_.frame_index++;
         }
     } else {
@@ -684,9 +684,10 @@ void RtRenderer::render(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture& depth,
 // produces a full-res R8 mask. That is why the local-light pass reuses these
 // three pipelines rather than forking them — see VisibilityDenoiser's comment.
 void RtRenderer::denoise_visibility(SDL_GPUCommandBuffer* cmd, VisibilityDenoiser& d,
-                                    gpu::GPUTexture& depth, SDL_GPUTexture* velocity,
-                                    const FrameParams& params, float max_accum_frames,
-                                    float filter_radius, int traced_w, int traced_h) {
+                                    gpu::GPUTexture& depth, SDL_GPUTexture* normal_rough,
+                                    SDL_GPUTexture* velocity, const FrameParams& params,
+                                    float max_accum_frames, float filter_radius, int traced_w,
+                                    int traced_h) {
     BRACKEN_PROFILE_ZONE("RtRenderer::denoise_visibility");
 
     const auto tiles_x = static_cast<uint32_t>((traced_w + 7) / 8);
@@ -739,6 +740,13 @@ void RtRenderer::denoise_visibility(SDL_GPUCommandBuffer* cmd, VisibilityDenoise
         u.depthB = params.depth_b;
         u.maxAccumFrames = std::max(max_accum_frames, 1.0f);
         u.depthRejectRelative = 0.05f;
+        // Composed here rather than in the shader: the pass reconstructs no
+        // world position for anything else, so one matrix and one `mul` per
+        // pixel do what `invViewProj` + `prevViewProjUnjittered` would. This is
+        // what makes the disocclusion test measure the SURFACE rather than the
+        // camera — the same correction the gradient replays took, applied to the
+        // accumulator that was left behind. See the shader's comment at the test.
+        u.prevClipFromClip = params.prev_view_proj_unjittered * params.inv_view_proj;
         // The analytic sun gradient, measured on the main thread before any ray
         // was cast. 0 on every frame the sun did not move, which is what makes
         // the pre-R5b path bit-identical.
@@ -795,6 +803,8 @@ void RtRenderer::denoise_visibility(SDL_GPUCommandBuffer* cmd, VisibilityDenoise
         u.depthB = params.depth_b;
         u.maxRadius = std::max(filter_radius, 0.0f);
         u.depthSigma = 0.05f;
+        u.normalPower = 8.0f;
+        u.hasGBuffer = normal_rough != nullptr ? 1u : 0u;
 
         const SDL_GPUStorageTextureReadWriteBinding rw{.texture = d.mask->handle(),
                                                        .mip_level = 0, .layer = 0, .cycle = true,
@@ -802,11 +812,16 @@ void RtRenderer::denoise_visibility(SDL_GPUCommandBuffer* cmd, VisibilityDenoise
         gpu::ComputePass pass = gpu::ComputePass::begin(cmd, {&rw, 1}, {});
         if (pass) {
             pass.bind_pipeline(*filter);
-            const std::array<SDL_GPUTextureSamplerBinding, 2> textures{{
+            const std::array<SDL_GPUTextureSamplerBinding, 3> textures{{
                 // Linear: the filter's uniform-tile path samples the history
                 // at a sub-texel UV to upsample it continuously.
                 {d.history[next]->handle(), linear_clamp_sampler_},
                 {depth.handle(), nearest_clamp_sampler_},
+                // NEAREST, and the slot holds a valid texture even with no
+                // G-buffer: a filtered octahedral pair across a silhouette
+                // decodes to a direction neither surface has, and `hasGBuffer`
+                // is what decides whether it is decoded at all.
+                {normal_rough != nullptr ? normal_rough : depth.handle(), nearest_clamp_sampler_},
             }};
             pass.bind_samplers(0, textures);
             const std::array<SDL_GPUTexture*, 1> ro{d.tile_class->handle()};
@@ -1381,7 +1396,19 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
                                       const FrameParams& params,
                                       const RtLocalShadowSettings& settings,
                                       const RtClusterBindings& clusters) {
-    if (!clusters.complete()) {
+    // A scene lit only by emissive meshes has zero BINNED analytic lights and
+    // is not dark, so `complete()` (which requires total_lights > 0) is the
+    // wrong gate for the Full tier. `emissiveCount` is not resolved until the
+    // DI targets are allocated further down, so this is deliberately the
+    // CONSERVATIVE predicate: if those targets then fail to allocate, the
+    // emissive count resolves to 0, the shader's `shaded` is false everywhere
+    // and the pass writes the identity mask — one wasted frame, never a wrong
+    // one.
+    const bool emissive_possible = settings.full_di && settings.emissive_candidate_count > 0 &&
+                                   scene_.emissive_record_count() > 0 &&
+                                   scene_.emissive_records() != nullptr &&
+                                   scene_.emissive_total_power() > 0.0f;
+    if (!clusters.has_grid() || (clusters.total_lights == 0 && !emissive_possible)) {
         // No binned lights this frame, or the caller had no cluster buffers to
         // give. Not an error and not worth a log line every frame: a scene with
         // no local lights has nothing for this pass to shadow. But the history
@@ -1688,8 +1715,8 @@ bool RtRenderer::render_local_shadows(SDL_GPUCommandBuffer* cmd, gpu::GPUTexture
     local_reservoir_index_ = next;
     local_shadow_.bits_index = bits_next;
 
-    denoise_visibility(cmd, local_shadow_, depth, velocity, params, settings.max_accum_frames,
-                       settings.filter_radius, w, h);
+    denoise_visibility(cmd, local_shadow_, depth, normal_rough, velocity, params,
+                       settings.max_accum_frames, settings.filter_radius, w, h);
 
     // The radiance denoiser last, and after denoise_visibility rather than
     // before it, because it reads the LOCAL signal's reconstructed gradient —

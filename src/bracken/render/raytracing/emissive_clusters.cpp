@@ -70,6 +70,16 @@ void EmissiveClusterGrid::shutdown() {
     live_ = false;
     dirty_ = false;
     stats_ = {};
+    // The rebuild gate's memo. `last_records_` in particular must not outlive
+    // the table it describes: a freed record vector's address is exactly the
+    // kind of thing a later allocation reuses.
+    last_records_ = nullptr;
+    last_record_count_ = 0;
+    last_generation_ = k_emissive_no_generation;
+    last_view_ = glm::mat4(0.0f);
+    last_inv_projection_ = glm::mat4(0.0f);
+    last_z_planes_ = glm::vec4(0.0f);
+    last_grid_dim_ = glm::uvec4(0u);
     device_ = nullptr;
 }
 
@@ -85,13 +95,51 @@ std::span<const uint32_t> EmissiveClusterGrid::froxel_list(uint32_t froxel) cons
 void EmissiveClusterGrid::build(std::span<const EmissiveTriangle> records,
                                 const lighting::ClusterParams& params,
                                 std::span<const lighting::ClusterBounds> bounds) {
-    build(core::jobs::JobSystem::instance(), records, params, bounds);
+    build(core::jobs::JobSystem::instance(), records, params, bounds, k_emissive_no_generation);
 }
 
 void EmissiveClusterGrid::build(core::jobs::JobSystem& js, std::span<const EmissiveTriangle> records,
                                 const lighting::ClusterParams& params,
                                 std::span<const lighting::ClusterBounds> bounds) {
+    build(js, records, params, bounds, k_emissive_no_generation);
+}
+
+void EmissiveClusterGrid::build(std::span<const EmissiveTriangle> records,
+                                const lighting::ClusterParams& params,
+                                std::span<const lighting::ClusterBounds> bounds,
+                                uint32_t record_generation) {
+    build(core::jobs::JobSystem::instance(), records, params, bounds, record_generation);
+}
+
+void EmissiveClusterGrid::build(core::jobs::JobSystem& js, std::span<const EmissiveTriangle> records,
+                                const lighting::ClusterParams& params,
+                                std::span<const lighting::ClusterBounds> bounds,
+                                uint32_t record_generation) {
     BRACKEN_PROFILE_ZONE_COLOR("EmissiveClusterGrid::build", 0x27AE60);
+
+    // THE REBUILD GATE, before anything is cleared. The table is a pure
+    // function of the record contents, the view, the projection, the near/far
+    // pair and the grid — so when none of them moved, the table already on hand
+    // IS this frame's table and re-deriving it produces the same 235 KB. Every
+    // input is compared: the caller's generation for the contents (see
+    // `k_emissive_no_generation` for why that is not inferable from the span),
+    // and `params`' four contributing fields, including `zPlanes` and `gridDim`
+    // — the froxel BOUNDS are a function of those two as much as of the
+    // projection, and comparing the view alone would memoize across a near-plane
+    // change.
+    //
+    // `live_` gates the whole thing, which is what makes it correct across
+    // invalidate() (it clears live_) and across a failed upload (that clears
+    // live_ too). `dirty_` is deliberately left ALONE rather than forced false:
+    // if the last upload could not allocate, the retry has to survive this.
+    if (live_ && record_generation != k_emissive_no_generation &&
+        record_generation == last_generation_ && records.data() == last_records_ &&
+        records.size() == last_record_count_ && bounds.size() == froxel_count_ &&
+        params.view == last_view_ && params.invProjection == last_inv_projection_ &&
+        params.zPlanes == last_z_planes_ && params.gridDim == last_grid_dim_) {
+        return;
+    }
+
     stats_ = {};
     live_ = false;
 
@@ -302,8 +350,24 @@ void EmissiveClusterGrid::build(core::jobs::JobSystem& js, std::span<const Emiss
                         const glm::vec3 d = centre - rr.view_center;
                         const float d2 = glm::dot(d, d);
                         // The same expression emissive_target() computes with
-                        // both cosines at 1 — an upper bound on this record's p̂
-                        // anywhere in the froxel, on the analytic path's scale.
+                        // both cosines at 1, evaluated AT THE FROXEL CENTRE — a
+                        // sample of this record's p̂ inside the froxel on the
+                        // analytic path's scale, NOT a bound on it. A point at
+                        // the near face of a froxel of half-extent h is
+                        // under-scored by up to (D / (D - h))^2, so a record
+                        // can miss the list of the froxel that CONTAINS it once
+                        // that froxel is deep enough (measured on the default
+                        // 0.1/4000 grid: a power-4 record at ~182 units, a
+                        // power-80 one at ~1064). At emissive_froxel_share = 1
+                        // a nonempty list is the whole domain, so such a record
+                        // is then reachable only where the list is empty.
+                        //
+                        // Scoring from the froxel's NEAREST POINT instead is the
+                        // obvious repair and is a measured behaviour change, not
+                        // a correctness one: it is strictly more permissive, and
+                        // flipping a far froxel from empty to nonempty REMOVES
+                        // its global fallback, which is what still carries the
+                        // far-field fill. It does not belong in a comment fix.
                         const float score = rr.power / std::max(d2, rr.area);
                         if (!(score >= k_emissive_froxel_min_contribution)) {
                             continue;
@@ -397,6 +461,16 @@ void EmissiveClusterGrid::build(core::jobs::JobSystem& js, std::span<const Emiss
                           "once; RtStats::emissive_froxel_dropped tracks it per frame.",
                           stats_.entries_dropped, k_emissive_froxel_capacity);
     }
+
+    // The gate's memo, recorded only on the path that actually produced a
+    // table. Every early return above leaves it as it was and `live_` false,
+    // so the next call rebuilds.
+    last_records_ = records.data();
+    last_record_count_ = records.size();
+    last_generation_ = record_generation;
+    last_view_ = params.view;
+    last_z_planes_ = params.zPlanes;
+    last_grid_dim_ = params.gridDim;
 
     live_ = true;
     dirty_ = true;

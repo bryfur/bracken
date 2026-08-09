@@ -56,7 +56,10 @@ struct RtShadowSettings {
     /// Frames of temporal accumulation to converge over. Higher is cleaner and
     /// lags further behind moving occluders.
     float max_accum_frames = 32.0f;
-    /// Spatial filter radius, in traced texels, at maximum variance.
+    /// Spatial filter radius, in traced texels, for an estimate with no
+    /// accumulated history. The filter scales down from here as the standard
+    /// error of the accumulated mean falls — see `visibility_filter_variance`
+    /// in render/rt_denoise_math.hpp.
     float filter_radius = 3.0f;
 };
 
@@ -190,7 +193,9 @@ struct RtLocalShadowSettings {
     /// handful of frames.
     float history_max_m_ratio = 20.0f;
     /// Denoiser knobs, same meaning as RtShadowSettings' — the two signals go
-    /// through the same three pipelines.
+    /// through the same three pipelines. `filter_radius` is the radius at NO
+    /// accumulated history, not at "maximum variance": for a one-bit signal the
+    /// stored moments alone are a constant, so it is the count that scales it.
     float max_accum_frames = 32.0f;
     float filter_radius = 3.0f;
 
@@ -293,11 +298,14 @@ struct RtClusterBindings {
     /// which case every buffer above holds LAST frame's contents.
     uint32_t total_lights = 0;
 
-    [[nodiscard]] bool complete() const {
+    /// Buffers and params are present. Says nothing about the light COUNT: R6's
+    /// emissive candidates need the froxel GRID, not binned analytic lights, so
+    /// a scene lit only by glowing windows is a valid grid with zero lights.
+    [[nodiscard]] bool has_grid() const {
         return light_data != nullptr && cluster_offsets != nullptr && light_indices != nullptr &&
-               light_remap != nullptr && params != nullptr &&
-               params_size > 0 && total_lights > 0;
+               light_remap != nullptr && params != nullptr && params_size > 0;
     }
+    [[nodiscard]] bool complete() const { return has_grid() && total_lights > 0; }
 };
 
 /**
@@ -835,8 +843,12 @@ private:
     /// Records the three denoiser dispatches for one signal. Split out of
     /// render() because the trace is one dispatch and the denoiser is most of
     /// the pass.
+    /// `normal_rough` is the prepass G-buffer, and may be null: the filter's
+    /// edge-stop reads its octahedral normal, and `hasGBuffer` — not the bind —
+    /// is what decides whether it is decoded.
     void denoise_visibility(SDL_GPUCommandBuffer* cmd, VisibilityDenoiser& d, gpu::GPUTexture& depth,
-                            SDL_GPUTexture* velocity, const FrameParams& params, float max_accum_frames,
+                            SDL_GPUTexture* normal_rough, SDL_GPUTexture* velocity,
+                            const FrameParams& params, float max_accum_frames,
                             float filter_radius, int traced_w, int traced_h);
     /// Stratum grid for a traced resolution (ceil / GRADIENT_STRATUM).
     [[nodiscard]] static int gradient_stratum_count(int traced);

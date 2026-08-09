@@ -303,18 +303,26 @@ float4 PSMain(PSInput input) : SV_Target {
     // Widen roughness where the surface normal varies fast to kill specular shimmer.
     roughness = specularAARoughness(N, roughness);
 
-    float shadow = calcShadow(input.fragPos, N_geo, L, input.viewDepth, input.position.xy);
-
     // Ray-traced shadows REPLACE the cascade result rather than multiplying
     // with it: multiplying would double-darken everywhere the two agree, and
     // tracing exists because it is the more accurate answer. The cascades stay
-    // as the fallback when it is off.
+    // as the fallback when it is off, which is precisely why the CSM lookup
+    // sits in the ELSE and not above the test: the traced branch overwrites
+    // `shadow` unconditionally, so on a traced frame the whole PCF/PCSS kernel
+    // — up to 20 atlas taps on a lit pixel — used to be computed and thrown
+    // away. Sinking it is exact rather than merely close: `rtShadowEnabled` is
+    // a cbuffer value, so the branch is UNIFORM across the draw, and every tap
+    // in calcShadow is SampleCmpLevelZero/SampleLevel, so nothing here needs a
+    // derivative that branching could invalidate.
+    float shadow;
     if (rtShadowEnabled > 0.5) {
         // Normalized UV into the mask's OWN resolution: screenAOTexel* is
         // 1/screen size, and the mask's sampler does the rest. This is what
         // makes half- or quarter-res masks a free parameter.
         float2 rtUV = input.position.xy * float2(screenAOTexelX, screenAOTexelY);
         shadow = rtShadowTexture.SampleLevel(rtShadowSampler, rtUV, 0).r;
+    } else {
+        shadow = calcShadow(input.fragPos, N_geo, L, input.viewDepth, input.position.xy);
     }
 
 

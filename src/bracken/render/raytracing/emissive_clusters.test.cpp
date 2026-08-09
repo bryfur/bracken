@@ -450,6 +450,125 @@ TEST(EmissiveClusterBinner, NoRecordsLeavesTheTableDEADRatherThanStale) {
     EXPECT_EQ(bins.stats().entries, 0u);
 }
 
+// The rebuild gate. It is the ONLY part of this class the pin table cannot
+// exercise — the smoke camera orbits, so the gate never fires there — which is
+// why it is pinned here instead. The construction is the same throughout: build
+// a table, then move every record IN PLACE (same address, same size, so nothing
+// in the arguments changes) and rebuild. A rebuild is then observable as a
+// different table, and so is a skip.
+TEST(EmissiveClusterBinner, TheRebuildGateComparesEveryInputTheTableDependsOn) {
+    CpuFroxelGrid froxels;
+    froxels.run();
+
+    const auto rebuilt_after = [&froxels](auto&& vary) {
+        std::vector<EmissiveTriangle> recs = make_scene(200);
+        ClusterParams p = froxels.params();
+        uint32_t generation = 5u;
+
+        EmissiveClusterGrid g;
+        g.build(recs, p, froxels.bounds(), generation);
+        EXPECT_TRUE(g.live());
+        EXPECT_GT(g.stats().entries, 0u);
+        const std::vector<uint32_t> before(g.table().begin(), g.table().end());
+
+        for (EmissiveTriangle& r : recs) {
+            r.v0.z -= 3000.0f;
+        }
+        vary(p, generation);
+        g.build(recs, p, froxels.bounds(), generation);
+        return std::vector<uint32_t>(g.table().begin(), g.table().end()) != before;
+    };
+
+    EXPECT_FALSE(rebuilt_after([](ClusterParams&, uint32_t&) {}))
+        << "every input was unchanged, so the existing table already describes this frame";
+
+    // The generation is the one input a caller cannot infer from the arguments,
+    // which is the entire reason it is passed: these records moved without the
+    // span moving at all.
+    EXPECT_TRUE(rebuilt_after([](ClusterParams&, uint32_t& gen) { gen = 6u; }))
+        << "a bumped record generation did not force a rebuild";
+    EXPECT_TRUE(rebuilt_after([](ClusterParams& p, uint32_t&) {
+        p.view = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 300.0f));
+    })) << "the camera moved and the table is camera-relative";
+    EXPECT_TRUE(rebuilt_after([](ClusterParams& p, uint32_t&) { p.zPlanes.y *= 1.5f; }))
+        << "the near/far pair drives the froxel bounds as much as the projection does";
+    EXPECT_TRUE(rebuilt_after(
+        [](ClusterParams& p, uint32_t&) { p.invProjection[0][0] *= 1.1f; }))
+        << "the projection changed";
+}
+
+// The sentinel is what keeps every CPU-only caller — every test and bench in
+// the tree, all of which build temporaries whose addresses recur — ungated.
+TEST(EmissiveClusterBinner, TheNoGenerationSentinelAlwaysRebuilds) {
+    CpuFroxelGrid froxels;
+    froxels.run();
+    std::vector<EmissiveTriangle> recs = make_scene(200);
+
+    EmissiveClusterGrid explicit_sentinel;
+    explicit_sentinel.build(recs, froxels.params(), froxels.bounds(),
+                            bracken::render::rt::k_emissive_no_generation);
+    ASSERT_TRUE(explicit_sentinel.live());
+    const std::vector<uint32_t> before(explicit_sentinel.table().begin(),
+                                       explicit_sentinel.table().end());
+
+    for (EmissiveTriangle& r : recs) {
+        r.v0.z -= 3000.0f;
+    }
+    explicit_sentinel.build(recs, froxels.params(), froxels.bounds(),
+                            bracken::render::rt::k_emissive_no_generation);
+    EXPECT_NE(std::vector<uint32_t>(explicit_sentinel.table().begin(),
+                                    explicit_sentinel.table().end()),
+              before);
+
+    // And the overloads that take no generation at all are that sentinel.
+    EmissiveClusterGrid ungated;
+    std::vector<EmissiveTriangle> recs2 = make_scene(200);
+    ungated.build(recs2, froxels.params(), froxels.bounds());
+    const std::vector<uint32_t> before2(ungated.table().begin(), ungated.table().end());
+    for (EmissiveTriangle& r : recs2) {
+        r.v0.z -= 3000.0f;
+    }
+    ungated.build(recs2, froxels.params(), froxels.bounds());
+    EXPECT_NE(std::vector<uint32_t>(ungated.table().begin(), ungated.table().end()), before2);
+}
+
+// A skipped build leaves everything standing — that IS the skip — but a
+// refused one must still refuse. The gate sits above the grid check, so a
+// mismatched bounds table has to reach it.
+TEST(EmissiveClusterBinner, TheRebuildGateNeverKeepsATableForAGridItCannotDescribe) {
+    CpuFroxelGrid froxels;
+    froxels.run();
+    const auto records = make_scene();
+
+    EmissiveClusterGrid bins;
+    bins.build(records, froxels.params(), froxels.bounds(), 11u);
+    ASSERT_TRUE(bins.live());
+
+    // A bounds table this froxel count cannot describe, with everything else
+    // identical: the gate has to notice, refuse, and stop claiming to be live.
+    std::vector<ClusterBounds> too_few(4);
+    bins.build(records, froxels.params(), too_few, 11u);
+    EXPECT_FALSE(bins.live()) << "a mismatched bounds table was answered from the memo";
+
+    // Same, through the grid dimensions rather than the span length.
+    bins.build(records, froxels.params(), froxels.bounds(), 11u);
+    ASSERT_TRUE(bins.live());
+    ClusterParams shallower = froxels.params();
+    shallower.gridDim.z = 2u;
+    bins.build(records, shallower, froxels.bounds(), 11u);
+    EXPECT_FALSE(bins.live()) << "the grid changed under a table that still claimed to be live";
+
+    // invalidate() disarms the gate on its own: it clears live_, and the gate
+    // is gated on live_. Without that, a frame that skipped the bin entirely
+    // could be followed by one that "skips" straight back onto a stale table.
+    bins.build(records, froxels.params(), froxels.bounds(), 11u);
+    ASSERT_TRUE(bins.live());
+    bins.invalidate();
+    bins.build(records, froxels.params(), froxels.bounds(), 11u);
+    EXPECT_TRUE(bins.live());
+    EXPECT_GT(bins.stats().entries, 0u) << "invalidate() left the gate armed, so nothing rebuilt";
+}
+
 TEST(EmissiveClusterBinner, AMismatchedGridIsRefusedRatherThanIndexedPastTheEnd) {
     CpuFroxelGrid froxels;
     froxels.run();

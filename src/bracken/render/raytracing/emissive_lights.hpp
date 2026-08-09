@@ -6,14 +6,16 @@
 //
 // TWO LEVELS, and the split is what makes this affordable.
 //
-//  * PER MODEL, once at BLAS build time: which of a model's triangles emit
-//    enough to be worth sampling, in MODEL space (`ModelEmissiveTriangle`).
-//    This is the expensive walk — every triangle of every loaded model — and it
-//    runs exactly as often as `RtScene::build_blas_for_models` does.
+//  * PER MODEL, once at BLAS build time: which of a model's triangles EMIT AT
+//    ALL, in MODEL space (`ModelEmissiveTriangle`). This is the expensive walk
+//    — every triangle of every loaded model — and it runs exactly as often as
+//    `RtScene::build_blas_for_models` does.
 //  * PER SCENE, when the instance list changes: those triangles pushed through
-//    each instance's transform into world space, power-sorted under a cap, and
-//    given a Vose alias row each (`EmissiveTriangle`). This is O(emissive
-//    triangles x instances of their models), not O(scene triangles).
+//    each instance's transform into world space, cut to a cap by a power
+//    THRESHOLD (a stable in-order filter, not a sort — see rt_scene.cpp's note
+//    on slice contiguity), and given a Vose alias row each
+//    (`EmissiveTriangle`). This is O(emissive triangles x instances of their
+//    models), not O(scene triangles).
 //
 // THE THRESHOLD, and why it is on POWER rather than on radiance. A record costs
 // 64 bytes, one alias bucket, and a share of every candidate draw in the frame;
@@ -21,6 +23,16 @@
 // radiance x area. A dim wall-sized panel matters and a brilliant speck does
 // not. `k_emissive_min_power` is stated in the engine's own units (linear
 // radiance x world units squared) and documented at its definition.
+//
+// WHICH IS WHY IT IS APPLIED AT THE SECOND LEVEL AND NOT THE FIRST. Area is the
+// one factor of power an instance transform changes, so a power test in model
+// space is a world-space test whose threshold is secretly `k_emissive_min_power
+// * s^2` for an instance scale `s` — 10 000x off for a metre-authored pack
+// instanced into a centimetre world, silently rejecting exactly the small lit
+// windows this phase set out to light. The per-model prefilter is therefore a
+// scale-FREE radiance floor (`k_emissive_min_luminance`, whose only job is to
+// keep the flatten off triangles that emit nothing), and the calibrated power
+// floor is applied where the world triangle exists.
 //
 // WHAT THIS IS NOT. It is not a second scene representation (§8's standing
 // rule): the records are derived from the BLAS triangles that already exist,
@@ -86,7 +98,8 @@ static_assert(sizeof(EmissiveTriangle) == 64,
               "shaders/rt_emissive.hlsli");
 
 /**
- * Minimum `luminance(radiance) * area` for a triangle to become a light.
+ * Minimum WORLD-SPACE `luminance(radiance) * area` for a placed triangle to
+ * become a light record.
  *
  * DELIBERATELY LOW, and it took a measurement to find out why it has to be. The
  * tempting formulation — "deliver at least X at a reference distance" — reads
@@ -97,12 +110,34 @@ static_assert(sizeof(EmissiveTriangle) == 64,
  * high enough to reject a dim 1 m^2 panel also rejects every facet of the
  * brightest object in the scene.
  *
- * So this constant does one job only: keep the flatten off the ~600 k triangles
- * that emit EXACTLY NOTHING. Deciding what is worth sampling is the CAP's job
- * below, where the power sort can compare records against each other instead of
- * against an absolute number that has no scene-independent meaning.
+ * So this constant does one job only: keep the record set off placements that
+ * deliver essentially nothing. Deciding what is worth sampling is the CAP's job
+ * below, where the power threshold can compare records against each other
+ * instead of against an absolute number that has no scene-independent meaning.
+ *
+ * WORLD SPACE IS PART OF THE CONTRACT. "Linear radiance x world units squared"
+ * is only true where the world triangle exists, i.e. after the instance
+ * transform — see the units note at the top of this file for what testing it in
+ * model space silently did instead.
  */
 inline constexpr float k_emissive_min_power = 1.0f;
+
+/**
+ * The per-MODEL prefilter: minimum emitted luminance for a triangle to be worth
+ * carrying into the world-space flatten at all.
+ *
+ * A radiance floor rather than a power one, and that is the whole point.
+ * Radiance is invariant under the instance transform; area is not. This runs
+ * once per BLAS build, in model space, where the instance scale is not yet
+ * known — so the only threshold it can apply honestly is one that does not
+ * depend on it.
+ *
+ * 1e-3 is "a material author typed a nonzero emissive factor and meant it",
+ * comfortably above float noise from the per-triangle bake and far below
+ * anything visible. It is not a quality dial: the quality decision is
+ * `k_emissive_min_power` above, applied in world units, and the CAP below.
+ */
+inline constexpr float k_emissive_min_luminance = 1e-3f;
 
 /**
  * Hard cap on scene-level records.
@@ -119,6 +154,14 @@ inline constexpr float k_emissive_min_power = 1.0f;
  * engine's no-silent-drops rule. Dropping the dimmest is also the RIGHT
  * degradation for a power-weighted alias table — those records were the ones
  * the sampler would almost never have drawn.
+ *
+ * Records whose power TIES the cut are admitted in record order until the cap
+ * is exactly full, so the kept set is what a sort would have kept, and
+ * `emissive_records_dropped` is RECOUNTED from what actually survived rather
+ * than predicted from `size - cap`. Ties are the common case rather than a
+ * corner one here — two instances of one model differing only in translation
+ * have bit-identical powers — and a strict `>` filter alone would have thrown
+ * away a whole tie group while reporting the arithmetic figure.
  */
 inline constexpr uint32_t k_max_emissive_records = 8192;
 

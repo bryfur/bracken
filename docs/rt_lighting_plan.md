@@ -2518,6 +2518,50 @@ reflections and GI.
   LOD copy block still drops `alpha_mode`/`double_sided`/`texture_pixels`, so LOD
   levels bake as opaque.
 
+* ~~The visibility filter's "variance-guided" radius was a constant, and its
+  gather had no normal edge-stop~~ — **LANDED, as one package, because the two
+  defects hid each other.** The traced sample is one BIT, so `sample*sample ==
+  sample` and the temporal pass's two moments are bit-identical: `moment2 -
+  mean^2` evaluated to `p(1-p)`, the variance of a SINGLE Bernoulli draw, which
+  does not shrink as history accumulates. Against `saturate(sqrt(v) * 4)` that
+  saturates for every p in [0.067, 0.933], so the radius sat at `filter_radius`
+  forever on exactly the fractional-mean texels the pass exists for — the last
+  stage of the denoiser was a 7x7 box. The statistic is now the ACCUMULATED
+  estimate's standard error, `p(1-p)/n` (`visibility_filter_variance` in
+  render/rt_denoise_math.hpp, the same quantity `fast_history_margin` already
+  derived for the four-frame window), pinned by a test that fails if the count
+  division is ever dropped again. The gather also takes the prepass G-buffer's
+  octahedral normal now, at `normalPower = 8` — the sibling `rt_di_denoise_spatial`
+  gather's exponent, and not 32, which on this engine's curved pack geometry
+  would destroy the filtering on every barrel and trunk. The depth term cannot
+  substitute: at a wall/floor junction the two surfaces are at the SAME depth.
+
+  Still open here, and deliberately not landed with it: the depth term's SHAPE.
+  `exp(-dz / (depthSigma * z))` is a fixed 5% of ABSOLUTE view depth — ~21.6
+  traced-texel footprints at every distance — so it cannot reject across a
+  small-gap silhouette (a character 50 units off a wall at z = 1000 attenuates to
+  0.37, not a rejection) while OVER-rejecting at grazing incidence, where a
+  ground plane's dz per texel grows as z² against a sigma growing as z. Lowering
+  the constant is a regression, not a fix: it collapses the kernel to a single
+  texel over most of an outdoor frame. The admissible form is a slope-scaled
+  tolerance, `depthSlopeSigma * expected_dz + depthFloorRelative * z`, with the
+  gradient estimated explicitly from `sceneDepth` by min-of-forward/backward
+  difference (compute-shader derivatives are not portably available under SPIR-V
+  here). It needs an A/B measurement before it lands, and renaming the uniform is
+  part of it so the 0.05 this document pins as "5% relative, deliberately not
+  retuned" is not silently redefined while keeping its name.
+* ~~The visibility TEMPORAL pass was still measuring the camera~~ — **LANDED.**
+  §5.9's own entry above records fixing the two gradient replays, which compared
+  the history's recorded depth against *this* frame's view depth; the accumulator
+  that applies the same test at a looser knee (0.05 against 0.0004) was left on
+  the old form, and `rt_shadow_gradient.comp.hlsl` states outright that its depth
+  test "is deliberately the one that pass applies". Both halves now project into
+  the previous frame's clip space before comparing —
+  `RtShadowTemporalUniforms::prevClipFromClip`, composed on the CPU as
+  `prev_view_proj_unjittered * inv_view_proj` because this pass, unlike the
+  replay, needs no world position for anything else. The knee is unchanged: this
+  removes an error term, it does not rescale the ruler. One shader carries the
+  test for BOTH visibility signals, so one fix repairs both.
 * **The DI temporal pass has no geometric history validation at all** — it
   accepts reprojected history on `prevUv ∈ [0,1]` and `hist.a > 0`, nothing else.
   `count` therefore never resets under motion, so the R7c radius ramp and the

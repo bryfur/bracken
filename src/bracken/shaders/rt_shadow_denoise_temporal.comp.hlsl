@@ -2,8 +2,12 @@
 //
 // One thread per TRACED pixel. Unpacks this frame's single stochastic sample,
 // reprojects last frame's estimate through the velocity buffer, and merges
-// them into a running mean plus the second moment the spatial filter needs to
-// know how much it still has to blur.
+// them into a running mean, a second moment, and the sample COUNT. The spatial
+// filter needs all three to know how much it still has to blur — and for a
+// one-bit sample the count is the load-bearing one, because `sample*sample ==
+// sample` makes the second moment bit-identical to the mean and their
+// difference a constant. rt_denoise_math.hpp's `visibility_filter_variance` is
+// where that is worked through.
 //
 // THIS PASS IS WHERE THE NOISE ACTUALLY GOES. One sun-disk sample per pixel is
 // ~50% error in the penumbra; sixteen accumulated frames is ~12%; the spatial
@@ -96,6 +100,10 @@ cbuffer RtShadowTemporalUniforms : register(b0, space2) {
     uint counterBase;
     uint _pad0;
     uint _pad1;
+    /// Previous frame's unjittered view-projection composed with this frame's
+    /// inverse view-projection: one `mul` takes a current clip-space point to
+    /// the previous frame's clip space. See the depth test below.
+    float4x4 prevClipFromClip;
 };
 
 // BINDING ORDER IS NOT FREE. Within set 0 SDL3 GPU assigns sampled textures
@@ -253,9 +261,39 @@ void CSMain(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 // Reject history across a depth discontinuity. Without this,
                 // a disocclusion drags the occluder's shadow along behind it
                 // — the classic ghost trailing anything that moves.
-                const float depthDelta = abs(hist.a - linearDepth);
-                const bool depthOk =
-                    linearDepth > 0.0 && depthDelta <= depthRejectRelative * max(linearDepth, 1.0);
+                //
+                // The quantity to compare `hist.a` against is what THIS pixel's
+                // view depth WAS under the PREVIOUS frame's camera, not what it
+                // is under this one: the history recorded a linear view depth,
+                // and the two cameras differ. Comparing against `linearDepth`
+                // directly measures the camera's own motion — which at the
+                // playground's 420-unit boom is 2.3-5.0 world units per frame
+                // of translation against a tolerance of 0.05*d, i.e. outright
+                // rejection below d ~= 46-100, plus a scale-free rotation term
+                // (dz/z ~= tan(fov/2)*theta) that trips at screen edges at ANY
+                // depth on an ordinary mouse flick. Both are false rejections
+                // that drop `count` to 1 and put a raw stochastic bit on screen.
+                //
+                // This is the same correction rt_shadow_gradient.comp.hlsl:250
+                // carries, and it has to be: that shader states outright that
+                // its depth test "is deliberately the one that pass applies".
+                // The two were meant to be one test at two knees, and only the
+                // gradient half was fixed. The 0.05 knee is unchanged — this
+                // removes an error term, it does not rescale the ruler.
+                //
+                // NDC is reconstructed from the DEPTH TEXEL's own centre rather
+                // than from `uv`, because `rawDepth` was point-loaded at
+                // `depthCoord`; using the traced pixel's UV would pair a
+                // full-res depth sample with a half-res position.
+                float2 ndc = ((float2(depthCoord) + 0.5) / float2(depthSize)) * 2.0 - 1.0;
+                ndc.y = -ndc.y;
+                const float4 prevClip = mul(prevClipFromClip, float4(ndc, rawDepth, 1.0));
+                const float expectedPrevDepth =
+                    prevClip.w > 0.0 ? linearizeDepth(prevClip.z / prevClip.w) : 0.0;
+
+                const float depthDelta = abs(hist.a - expectedPrevDepth);
+                const bool depthOk = linearDepth > 0.0 && expectedPrevDepth > 0.0 &&
+                                     depthDelta <= depthRejectRelative * max(linearDepth, 1.0);
 
                 if (depthOk) {
                     count = rtApplyReset(min(hist.b + 1.0, maxAccumFrames), reset);

@@ -278,12 +278,15 @@ float4 PSMain(PSInput input) : SV_Target {
     }
     roughness = specularAARoughness(N, roughness);
 
-    float shadow = calcShadow(input.fragPos, N_geo, L, input.viewDepth, input.position.xy);
-
-    // Traced sun shadows REPLACE the cascade result (see model.frag.hlsl).
+    // Traced sun shadows REPLACE the cascade result, so the cascade lookup is
+    // the ELSE and never runs on a traced frame (see model.frag.hlsl for why
+    // sinking it past this uniform branch is exact).
+    float shadow;
     if (rtShadowEnabled > 0.5) {
         float2 rtUV = input.position.xy * float2(screenAOTexelX, screenAOTexelY);
         shadow = rtShadowTexture.SampleLevel(rtShadowSampler, rtUV, 0).r;
+    } else {
+        shadow = calcShadow(input.fragPos, N_geo, L, input.viewDepth, input.position.xy);
     }
     float3 directLight = lightColor * sunIntensity * shadow;
 

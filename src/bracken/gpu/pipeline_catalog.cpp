@@ -895,7 +895,12 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
     {.name = "RtShadowFilter",
      .shader = "rt_shadow_denoise_filter.comp.spv",
      .entry_point = "CSMain",
-     .resources = {.num_samplers = 2,                   // history, depth
+     // The third sampler is the prepass G-buffer: the gather's edge-stop needs
+     // an ORIENTATION test, because a wall and the floor it meets are at the
+     // same depth and the depth term cannot see the junction at all. Bound to
+     // the depth target as a stand-in when no G-buffer exists, exactly as the
+     // trace does — `hasGBuffer` decides whether it is decoded.
+     .resources = {.num_samplers = 3,                   // history, depth, prepass normal
                    .num_readonly_storage_textures = 1,  // tile verdicts
                    .num_readwrite_storage_textures = 1, // full-res R8 mask
                    .num_uniform_buffers = 1}},

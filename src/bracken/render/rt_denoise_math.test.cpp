@@ -1,5 +1,6 @@
 #include "bracken/render/rt_denoise_math.hpp"
 
+#include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/render/gi/gi_math.hpp"
 
 #include <gtest/gtest.h>
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <span>
 
 // The R5b denoiser core (docs/rt_lighting_plan.md §5.6). Every curve here is
@@ -190,6 +192,18 @@ TEST(RtDenoiseMath, SunAndLocalGradientKneesAreDeliberatelyDifferent) {
     EXPECT_LT(SUN_GRADIENT_DEPTH_REJECT_RELATIVE, LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE);
 }
 
+TEST(RtDenoiseMath, GradientUniformDefaultsCarryTheirOwnConstants) {
+    // gpu/ sits below render/ and cannot include this header, so both gradient
+    // cbuffers carry their knee as a literal default. That is two definitions of
+    // a measured constant, and the drift it invites is not hypothetical: the
+    // sun's default was the TEMPORAL pass's 0.05 — the one value that field must
+    // never hold — kept alive only because rt_renderer.cpp always overwrites it.
+    EXPECT_FLOAT_EQ(gpu::RtShadowGradientUniforms{}.depthRejectRelative,
+                    SUN_GRADIENT_DEPTH_REJECT_RELATIVE);
+    EXPECT_FLOAT_EQ(gpu::RtLocalShadowGradientUniforms{}.depthRejectRelative,
+                    LOCAL_GRADIENT_DEPTH_REJECT_RELATIVE);
+}
+
 // ---------------------------------------------------------------------------
 // 3. Dual fast/slow history
 // ---------------------------------------------------------------------------
@@ -231,6 +245,83 @@ TEST(RtDenoiseMath, FastWindowIsShorterThanTheMainOne) {
     // 32 is RtShadowSettings::max_accum_frames. A "fast" history that was not
     // materially faster would detect nothing the main one had not already.
     EXPECT_LT(FAST_HISTORY_WINDOW, 32.0f / 4.0f);
+}
+
+// ---------------------------------------------------------------------------
+// 3b. The visibility filter's radius driver
+// ---------------------------------------------------------------------------
+//
+// The property these pin is the one the shader lacked for its whole life: for a
+// ONE-BIT sample the stored moments are bit-identical, so `moment2 - mean^2` is
+// p(1-p) and does not move as history accumulates. Anything that reintroduces
+// that — dropping the count division, or "simplifying" the expression back to
+// the two moments — fails here rather than silently pinning the filter's radius
+// at its maximum again.
+
+/// The temporal pass's recursion, exactly: seeded from one binary sample and
+/// advanced with alpha = 1/count from the same operands for both moments.
+struct BinaryAccumulator {
+    float mean = 0.0f;
+    float moment2 = 0.0f;
+    float count = 0.0f;
+
+    void push(float sample, float max_accum_frames) {
+        if (count <= 0.0f) {
+            mean = sample;
+            moment2 = sample * sample;
+            count = 1.0f;
+            return;
+        }
+        count = std::min(count + 1.0f, max_accum_frames);
+        const float alpha = 1.0f / count;
+        mean += (sample - mean) * alpha;
+        moment2 += (sample * sample - moment2) * alpha;
+    }
+};
+
+TEST(RtDenoiseMath, FilterVarianceFallsAsHistoryAccumulates) {
+    // A half-lit penumbra texel: alternating bits, so the mean converges to 0.5
+    // and the SAMPLE variance parks at 0.25 forever. The estimator's must not.
+    BinaryAccumulator acc;
+    float previous = std::numeric_limits<float>::infinity();
+    for (int frame = 0; frame < 64; ++frame) {
+        acc.push(static_cast<float>(frame % 2), 32.0f);
+        const float v = visibility_filter_variance(acc.mean, acc.moment2, acc.count);
+        if (frame >= 2 && acc.count < 32.0f) {
+            EXPECT_LT(v, previous) << "frame " << frame;
+        }
+        previous = v;
+    }
+    // The raw second-moment difference is what the shader used to read: still
+    // ~p(1-p) after 64 frames, which is why the radius never came down.
+    EXPECT_NEAR(acc.moment2 - acc.mean * acc.mean, 0.25f, 0.02f);
+    // Divided by the accumulated count it is an order of magnitude smaller, and
+    // below the 1/16 knee where the shader's `saturate(sqrt(v) * 4)` stops
+    // saturating — i.e. the radius is finally free to move.
+    EXPECT_LT(previous, 0.0625f);
+}
+
+TEST(RtDenoiseMath, FilterVarianceIsTheStandardErrorOfTheMean) {
+    // p(1-p)/n, the same statistic fast_history_margin derives for the fast
+    // window — expressed there as its square root.
+    for (const float count : {1.0f, 4.0f, 32.0f}) {
+        EXPECT_FLOAT_EQ(visibility_filter_variance(0.5f, 0.5f, count), 0.25f / count);
+        const float sigma = fast_history_margin(0.5f, count) - FAST_HISTORY_CLAMP_FLOOR;
+        EXPECT_NEAR(std::sqrt(visibility_filter_variance(0.5f, 0.5f, count)),
+                    sigma / FAST_HISTORY_CLAMP_SIGMA, 1e-6f);
+    }
+}
+
+TEST(RtDenoiseMath, FilterVarianceIsRobustToOutOfRangeInputs) {
+    // The moments ride an RGBA16F history, so a round-trip can make `moment2`
+    // marginally smaller than `mean^2`; a count of 0 is the first frame.
+    EXPECT_FLOAT_EQ(visibility_filter_variance(0.5f, 0.24f, 8.0f), 0.0f);
+    EXPECT_TRUE(std::isfinite(visibility_filter_variance(0.5f, 0.5f, 0.0f)));
+    EXPECT_TRUE(std::isfinite(visibility_filter_variance(0.5f, 0.5f, -1.0f)));
+    // A unanimous texel: zero variance at any count, so it is never blurred on
+    // the strength of its moments — only the count term can widen it.
+    EXPECT_FLOAT_EQ(visibility_filter_variance(1.0f, 1.0f, 1.0f), 0.0f);
+    EXPECT_FLOAT_EQ(visibility_filter_variance(0.0f, 0.0f, 1.0f), 0.0f);
 }
 
 // ---------------------------------------------------------------------------

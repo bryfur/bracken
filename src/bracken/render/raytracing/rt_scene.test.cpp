@@ -31,6 +31,15 @@ std::unique_ptr<Model> make_cube(float scale = 1.0f) {
     return model;
 }
 
+/// The same cube with an authored emissive factor. `scale` is what makes a
+/// facet's MODEL-space area move independently of its WORLD-space one, which is
+/// the distinction the power threshold turns on.
+std::unique_ptr<Model> make_emissive_cube(glm::vec3 emissive, float scale = 1.0f) {
+    auto model = make_cube(scale);
+    model->meshes[0].material.emissive_factor = emissive;
+    return model;
+}
+
 struct Fixture {
     bracken::core::jobs::JobSystem jobs;
     ModelManager models;
@@ -333,6 +342,125 @@ TEST(RtScene, RefitDegradationForcesARebuild) {
         EXPECT_EQ(scene.stats().tlas_builds, 2u) << "the refit-count backstop never fired";
         EXPECT_EQ(scene.stats().tlas_refits, k_tlas_max_refits_between_builds);
     }
+}
+
+// R6's emissive LIGHT records are not attributes and must not ride
+// `want_attributes`. The Full-DI tier is the only consumer of them and it never
+// binds the attribute buffer, so gating them on reflections/GI made the
+// configuration that wants them most — local shadows on, reflections off —
+// the one configuration that silently had none. The equality is the other half
+// of the claim: hoisting the walk changed WHERE it runs, not WHAT it keeps.
+TEST(RtScene, EmissiveLightRecordsDoNotDependOnAttributes) {
+    Fixture f;
+    auto a = f.models.register_model("glow", make_emissive_cube({4.0f, 4.0f, 4.0f}));
+    ASSERT_TRUE(a);
+
+    const std::vector<std::pair<bracken::ModelHandle, glm::mat4>> instances{
+        {a.value(), glm::mat4(1.0f)},
+        {a.value(), glm::translate(glm::mat4(1.0f), glm::vec3(40.0f, 0.0f, 0.0f))},
+    };
+
+    RtScene without;
+    without.build_blas_for_models(f.models, /*want_attributes=*/false);
+    without.set_instances(instances);
+
+    EXPECT_GT(without.stats().emissive_triangles, 0u)
+        << "a shadows-only build found no emitting model triangles";
+    EXPECT_GT(without.emissive_record_count(), 0u)
+        << "a shadows-only build produced no emissive light records";
+    EXPECT_GT(without.emissive_total_power(), 0.0f);
+
+    RtScene with;
+    with.build_blas_for_models(f.models, /*want_attributes=*/true);
+    with.set_instances(instances);
+
+    EXPECT_EQ(without.stats().emissive_triangles, with.stats().emissive_triangles);
+    EXPECT_EQ(without.emissive_record_count(), with.emissive_record_count());
+    EXPECT_FLOAT_EQ(without.emissive_total_power(), with.emissive_total_power());
+}
+
+// `k_emissive_min_power` is radiance x WORLD units squared, and area is the one
+// factor of power an instance transform moves. Testing it in model space made
+// the effective world floor `k_emissive_min_power * s^2` — 10 000x off for a
+// metre-authored pack instanced into this engine's world, with no diagnostic.
+TEST(RtScene, ThePowerThresholdIsAppliedInWorldUnits) {
+    Fixture f;
+    // Authored small: every facet's MODEL-space power is 0.02, far under the
+    // threshold. Instanced large, it delivers 200.
+    auto a = f.models.register_model("lamp", make_emissive_cube({4.0f, 4.0f, 4.0f}, 0.1f));
+    ASSERT_TRUE(a);
+
+    RtScene scene;
+    scene.build_blas_for_models(f.models, /*want_attributes=*/false);
+    ASSERT_GT(scene.stats().emissive_triangles, 0u)
+        << "the per-model prefilter must be a scale-free RADIANCE floor: a dim-by-area "
+           "emitter cannot be judged before its instance scale is known";
+
+    scene.set_instances(std::vector<std::pair<bracken::ModelHandle, glm::mat4>>{
+        {a.value(), glm::scale(glm::mat4(1.0f), glm::vec3(100.0f))}});
+    EXPECT_EQ(scene.emissive_record_count(), scene.stats().emissive_triangles)
+        << "a 100x instance delivers 10 000x the model-space power and is a light";
+    EXPECT_EQ(scene.stats().emissive_records_below_power, 0u);
+
+    // The other direction, and the reason the counter exists: shrink the same
+    // instance until every placement is under the floor. `emissive_records = 0`
+    // must be distinguishable from "this scene has no emitters at all", and the
+    // record set has to actually follow the transform rather than latch —
+    // the topology hash is handles and count only, so nothing else would
+    // notice that membership changed.
+    scene.set_instances(std::vector<std::pair<bracken::ModelHandle, glm::mat4>>{
+        {a.value(), glm::scale(glm::mat4(1.0f), glm::vec3(0.5f))}});
+    EXPECT_EQ(scene.emissive_record_count(), 0u);
+    EXPECT_EQ(scene.stats().emissive_records_below_power, scene.stats().emissive_triangles);
+    EXPECT_GT(scene.stats().emissive_triangles, 0u) << "the model still emits; its instance is tiny";
+}
+
+// The over-budget cut is a power THRESHOLD applied as a stable filter, and ties
+// at that threshold are the COMMON case rather than a corner one: `emissive_place`
+// transforms the edges with w = 0, so instances of one model differing only in
+// translation carry bit-identical powers. A strict `>` filter alone throws the
+// whole tied group away while the arithmetic still reports `size - cap`.
+TEST(RtScene, TiedRecordsAtTheBudgetCutFillItRatherThanEmptyingIt) {
+    Fixture f;
+    auto a = f.models.register_model("window", make_emissive_cube({4.0f, 4.0f, 4.0f}));
+    ASSERT_TRUE(a);
+
+    RtScene scene;
+    scene.build_blas_for_models(f.models, /*want_attributes=*/false);
+    const uint32_t per_instance = scene.stats().emissive_triangles;
+    ASSERT_GT(per_instance, 0u);
+
+    // Enough translation-only instances to overflow the cap. Every record's
+    // power is then the same float, so the cut lands inside one enormous tie
+    // group and `strictly_greater` is zero.
+    const uint32_t instance_count = k_max_emissive_records / per_instance + 8u;
+    std::vector<std::pair<bracken::ModelHandle, glm::mat4>> instances;
+    for (uint32_t i = 0; i < instance_count; ++i) {
+        instances.emplace_back(a.value(),
+                               glm::translate(glm::mat4(1.0f),
+                                              glm::vec3(static_cast<float>(i) * 5.0f, 0.0f, 0.0f)));
+    }
+    const uint32_t flattened = instance_count * per_instance;
+    ASSERT_GT(flattened, k_max_emissive_records);
+
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.emissive_record_count(), k_max_emissive_records)
+        << "the tie group at the cut was dropped wholesale instead of filling the budget";
+    EXPECT_EQ(scene.stats().emissive_records, k_max_emissive_records);
+    EXPECT_EQ(scene.stats().emissive_records_dropped, flattened - k_max_emissive_records)
+        << "the drop count must be RECOUNTED from the survivors, not predicted from size - cap";
+    EXPECT_EQ(scene.stats().emissive_records + scene.stats().emissive_records_dropped, flattened);
+    EXPECT_GT(scene.emissive_total_power(), 0.0f);
+
+    // The slices the cut leaves behind are what the refresh path walks, so move
+    // one instance and check the record set survives it. Translation preserves
+    // area, hence power, hence membership — so a refresh that mis-indexed a
+    // truncated slice is the only way this changes.
+    instances[0].second = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 3.0f, 0.0f));
+    const float before = scene.emissive_total_power();
+    scene.set_instances(instances);
+    EXPECT_EQ(scene.emissive_record_count(), k_max_emissive_records);
+    EXPECT_FLOAT_EQ(scene.emissive_total_power(), before);
 }
 
 // Rebuilding the BLAS set renumbers every offset a TLAS instance carries, so

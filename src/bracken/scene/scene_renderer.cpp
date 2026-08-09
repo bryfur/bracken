@@ -867,7 +867,24 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
         // pipelines below so those binding slots are valid; the buffers retain
         // their last-uploaded state (initially zero).
         const bool any_dyn_lights = !frame.point_lights().empty() || !frame.spot_lights().empty();
-        const bool cluster_upload_needed = cluster_grid_ready_ && any_dyn_lights;
+        // R6/R8: AN EMISSIVE MESH IS A LIGHT THE CLUSTER GRID KNOWS NOTHING
+        // ABOUT. The Full-DI pass still needs the froxel BOUNDS — which are
+        // light-independent — and a real ClusterParams to index them with, so
+        // gating the whole grid on "are there any binned analytic lights"
+        // silently switched emissive DI off in exactly the scene that needs it
+        // most: one lit only by glowing windows has zero binned lights and is
+        // not dark. rt_local_shadow.comp.hlsl says so in its own comments and,
+        // until this, could never reach the code that says it.
+        //
+        // Settings-level rather than record-level on purpose: the RT scene's
+        // records are not refreshed until ensure_raytracing_scene() several
+        // hundred lines below, so a record-count test here would read last
+        // frame's answer.
+        const bool emissive_di_wanted = gfx.rt_local_shadows == LocalRtShadowMode::Full &&
+                                        rt_renderer_ != nullptr &&
+                                        rt_local_tuning_.emissive_candidates > 0;
+        const bool cluster_upload_needed =
+            cluster_grid_ready_ && (any_dyn_lights || emissive_di_wanted);
         // ATLAS RETIREMENT. In Ratio mode the traced pass owns local shadowing
         // outright: the selector never runs, no tile is ever rendered, and
         // every shadow_slot stays -1 — which makes the atlas branch in
@@ -884,8 +901,13 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
         // where the alternative would be a frame that pays for both.
         const bool rt_local_shadows_wanted =
             gfx.rt_local_shadows != LocalRtShadowMode::Off && rt_renderer_ != nullptr;
-        frame_local_shadows_active_ = cluster_upload_needed && gfx.local_shadows && !rt_local_shadows_wanted &&
-                                      local_shadows_ && local_shadows_->is_ready();
+        // Stays on the ANALYTIC condition, not on the widened
+        // `cluster_upload_needed` above: the rasterized atlas has nothing to
+        // render for an emissive mesh, so a scene lit only by glowing windows
+        // must not switch it on.
+        frame_local_shadows_active_ = cluster_grid_ready_ && any_dyn_lights && gfx.local_shadows &&
+                                      !rt_local_shadows_wanted && local_shadows_ &&
+                                      local_shadows_->is_ready();
         if (cluster_upload_needed) {
             // Local (point/spot) light shadows: the selector picks the
             // budgeted shadow casters, assigns atlas tiles, decides which
@@ -1271,7 +1293,8 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     BRACKEN_PROFILE_ZONE_COLOR("RTEmissiveBins", 0x27AE60);
                     BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "RTEmissiveBins");
                     emissive_clusters_.build(rt_renderer_->scene().emissive_record_data(),
-                                             cluster_grid_.params(), cluster_grid_.cluster_bounds());
+                                             cluster_grid_.params(), cluster_grid_.cluster_bounds(),
+                                             rt_renderer_->scene().emissive_generation());
                     emissive_clusters_.upload(cmd);
                 } else {
                     emissive_clusters_.invalidate();
