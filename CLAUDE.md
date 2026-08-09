@@ -553,22 +553,54 @@ past `far/2` — is closed. The formula now lives in exactly one place,
 RelWithDebInfo, 3-run identical), and the whole eleven-row matrix is here rather
 than spread over the historical tables above:
 
-| Invocation (`--smoke 30`) | at depth-fix | at Q1 | at Q2 (alpha cutout) |
+| Invocation (`--smoke 30`) | at Q1 | at Q2 (alpha cutout) | **at the lighting pass (2026-08-09)** |
 |---|---|---|---|
-| RT off | `86.3 / 45.5` | `86.3 / 45.5` | `86.3 / 45.5` (BIT-identical throughout) |
-| `PLAYGROUND_AO=0` | `87.0 / 44.5` | `87.0 / 44.5` | `87.0 / 44.5` |
-| `PLAYGROUND_AO=2` | `86.0 / 45.7` | `86.0 / 45.7` | `86.0 / 45.7` |
-| `PLAYGROUND_RT=both` | `83.7 / 48.3` | `83.6 / 48.3` | **`84.5 / 47.4`** |
-| `PLAYGROUND_GI=probes` | `84.7 / 46.7` | `84.6 / 46.8` | `84.6 / 46.8` |
-| `RT=both GI=probes` | `81.9 / 49.8` | `81.8 / 49.9` | **`82.7 / 48.9`** |
-| `RT=both GI=probes_screen` | `82.3 / 50.4` | `81.6 / 51.1` | **`82.6 / 50.1`** |
-| `RT=both RT_LOCAL=ratio` | `85.3 / 47.5` | `85.2 / 47.5` | **`86.2 / 46.5`** |
-| `RT=both RT_LOCAL=full` | `85.5 / 47.3` | `85.5 / 47.2` | **`86.5 / 46.2`** |
-| night, `TOD_HOUR=1 … ratio` | **`35.4 / 57.4`** | `35.3 / 56.8` | `35.3 / 56.8` |
-| night, `TOD_HOUR=1 … full` | `36.0 / 55.0` | `35.5 / 53.9` | `35.6 / 53.7` |
+| RT off | `86.3 / 45.5` | `86.3 / 45.5` | `86.3 / 45.6` |
+| `PLAYGROUND_AO=0` | `87.0 / 44.5` | `87.0 / 44.5` | `86.9 / 44.7` |
+| `PLAYGROUND_AO=2` | `86.0 / 45.7` | `86.0 / 45.7` | `86.0 / 45.8` |
+| `PLAYGROUND_RT=both` | `83.6 / 48.3` | `84.5 / 47.4` | `84.7 / 47.4` |
+| `PLAYGROUND_GI=probes` | `84.6 / 46.8` | `84.6 / 46.8` | `84.9 / 46.8` |
+| `RT=both GI=probes` | `81.8 / 49.9` | `82.7 / 48.9` | `83.2 / 48.8` |
+| `RT=both GI=probes_screen` | `81.6 / 51.1` | `82.6 / 50.1` | `82.8 / 50.1` |
+| `RT=both RT_LOCAL=ratio` | `85.2 / 47.5` | `86.2 / 46.5` | `86.3 / 46.5` |
+| `RT=both RT_LOCAL=full` | `85.5 / 47.2` | `86.5 / 46.2` | `86.7 / 46.2` |
+| `RT=shadows RT_LOCAL=full` | — | — | `86.7 / 46.2` **(new row — see below)** |
+| `PLAYGROUND_GI=voxel` | — | `81.5 / 48.3` | **`84.8 / 46.0`** |
+| night, `TOD_HOUR=1 … ratio` | `35.3 / 56.8` | `35.3 / 56.8` | `38.5 / 59.4` |
+| night, `TOD_HOUR=1 … full` | `35.5 / 53.9` | `35.6 / 53.7` | `38.7 / 56.2` |
+| night, `TOD_HOUR=1 GI=voxel` | — | `50.9 / 71.8` | **`64.2 / 68.6`** |
+| night, `TOD_HOUR=1 GI=off` | — | `35.8 / 59.8` | `38.5 / 62.0` |
+
+**The RT-off row is no longer bit-identical, and that is the point of the
+column.** The 2026-08-09 pass changed the forward pass deliberately —
+`ndfGGX` had a denominator clamp eating the whole GGX lobe below perceptual
+roughness 0.1156, shadow casters culled front faces so single-sided geometry
+cast nothing, and the cascade alpha test used 0.5 against assets authored at
+0.35 — so a raster row that did NOT move would have meant a fix had failed to
+reach anything. Judge a future change against this column, not against the
+bit-identity gate the earlier columns lived under.
+
+**Two caveats on reading this table, both learned the hard way in that pass.**
+`mean_luma` is an aggregate over 1.44M pixels and is structurally blind to a
+change that is large but localized: the `ndfGGX` fix restores 7x the specular
+energy at roughness 0.06 and moves **328 pixels** here, because the playground
+authors exactly ONE material below the knee (`roughness_factor = 0.06f`, the
+chrome orb). A null row is not a null change — diff the screenshots. And the
+`render` / `present_wait` / `fps` figures in a `--smoke 30` line are NOT
+timings: identical runs measured 1.96–2.38 ms while `mean_luma` stayed
+bit-stable, because 30 frames end before the GPU leaves its idle clock. Use
+`--rt-bench 3000`, A/B, back to back.
+
+**The new `RT=shadows RT_LOCAL=full` row is a GATE, not a datum.** Emissive
+mesh lights used to require `rt_reflections` or traced GI to be on, because the
+R6 record gather sat inside the `want_attributes` block — so the Full-DI tier,
+the only tier that can use them, silently got none whenever both were off. The
+row exists to pin that: it must report `emissive_records=8192 emissive_di=true`,
+and if it ever reads `emissive_records=0` the gather has drifted back inside an
+attribute gate.
 
 **A fourth GI mode landed 2026-08-08: `GiMode::VoxelProbes`, the RASTER path**
-(`PLAYGROUND_GI=voxel`, `81.5 / 48.3`; night `50.9 / 71.8` against `35.8 / 59.8`
+(`PLAYGROUND_GI=voxel`, `84.8 / 46.0`; night `64.2 / 68.6` against `38.5 / 62.0`
 with GI off). It fills the SAME probe field by CONE
 TRACING a voxel radiance clipmap instead of by tracing rays, so everything
 downstream — the octahedral atlases, the blend, the Chebyshev leak test,
@@ -582,9 +614,37 @@ toward occluding; see docs/rt_lighting_plan.md §7.
 **JUDGE THIS MODE BY `auto_ev`, NOT BY `mean_luma`.** Auto-exposure absorbs a
 brightness error and lands the mean back near where it started, so a mode that
 is three stops too bright still reports a plausible mean — this one read
-`98.4 / 47.4` while being visibly blown out. The exposure tells the truth:
-GI off `0.47`, `probes` `0.56`, `voxel` `0.81`. A voxel row far from the traced
-row is a units bug, whatever the mean says.
+`98.4 / 47.4` while being visibly blown out. The exposure tells the truth, and
+the rule worked exactly as written: `voxel` sat at **`0.81`** against GI-off
+`0.47` and `probes` `0.56` for a full phase, and the gap was three separate
+units bugs, all closed on 2026-08-09:
+
+* the cone integral multiplied by voxel coverage **twice** — the mip chain is
+  an unweighted box average over children whose empty half stores black, so
+  storage is already PREMULTIPLIED, and `voxelConeAccumulate` multiplied by
+  `sample.a` again. Invisible at mip 0 (alpha is exactly 1 there), and at 64
+  rays the cone is past mip 1 beyond ~49 units, so it was wrong for
+  essentially the whole march;
+* `VOXEL_LAMBERT_AVERAGE` was `0.5` where its own stated derivation gives
+  `0.25` — `(1/4pi) * pi`. 0.5 is the mean over the LIT HEMISPHERE, a
+  different quantity;
+* the cone's sky-escape term was **dead code**: `VoxelConeTraceUniforms::
+  skyColor` was never assigned by the CPU, so a cone leaving the clipmap
+  returned black, against three comments and a commit message saying otherwise.
+
+Current exposures: GI off `0.48`, `probes` `0.54`, **`voxel` `0.51`** — the
+raster path now sits between the two, which is what this rule was asking for.
+
+**KNOWN ARTIFACT, introduced by that third fix.** With the sky term live there
+is a hard horizontal SEAM across the frame at night — measured at 01:00 as a
+5.5-luma step over two pixel rows, full width, against 0.5 with the sky term
+off and 1.4 for `GI=probes`. It is the voxel CASCADE switch: the cone
+hard-switches cascade as its diameter grows with no blend band, `accum.a` steps
+there, and `skyColor * (1 - accum.a)` amplifies an alpha step into a visible
+luma step. The sky term reveals it rather than causes it. The fix is a blend
+band across the cascade transition in the cone march, which is not written yet.
+Note for whoever takes it: the per-cascade `ray_max` is NOT the cause — that
+was tried and measured at zero effect.
 
 **`SDL_GenerateMipmapsForGPUTexture` FAULTS ON A 3D TEXTURE** and takes the
 process down inside the driver with no diagnostic. That one call is why the
