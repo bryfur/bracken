@@ -330,7 +330,8 @@ bool VoxelGi::rebuild_cascade(SDL_GPUCommandBuffer* cmd, int cascade,
     if (mip == nullptr) {
         return false;
     }
-    for (int level = 1; level < radiance->mip_levels(); ++level) {
+    const int mip_count = static_cast<int>(radiance->mip_levels());
+    for (int level = 1; level < mip_count; ++level) {
         const int dst = std::max(VOXEL_RESOLUTION >> level, 1);
         gpu::VoxelMipUniforms mu{};
         mu.dstSize = glm::uvec3(static_cast<std::uint32_t>(dst));

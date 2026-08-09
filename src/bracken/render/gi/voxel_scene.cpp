@@ -170,7 +170,9 @@ void VoxelScene::set_instances(std::span<const std::pair<ModelHandle, glm::mat4>
     std::uint64_t work = 0;
 
     for (const auto& [handle, transform] : instances) {
-        if (handle < 0 || static_cast<std::size_t>(handle) >= model_ranges_.size()) {
+        // ModelHandle is unsigned, so the upper bound is the whole test:
+        // INVALID_MODEL_HANDLE is the largest value it can hold.
+        if (static_cast<std::size_t>(handle) >= model_ranges_.size()) {
             ++stats_.instances_without_geometry;
             continue;
         }

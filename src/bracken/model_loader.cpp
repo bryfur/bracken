@@ -1061,11 +1061,12 @@ ModelHandle ModelManager::load_model_with_lods(const std::string& name, const st
 
     (void)build_lods(handle, ratios, thresholds);
 
-    if (device_) {
-        ModelLoader::upload_to_gpu(*device_, textures_, *get_model(handle), retain_cpu_geometry_);
+    Model* base = get_model(handle);
+    if (device_ && base != nullptr) {
+        ModelLoader::upload_to_gpu(*device_, textures_, *base, retain_cpu_geometry_);
         // Levels were appended after the base, so uploading them here keeps
         // the "CPU geometry is freed at upload" rule uniform across all of them.
-        for (ModelHandle lod : get_model(handle)->lod_handles) {
+        for (ModelHandle lod : base->lod_handles) {
             if (Model* m = get_model(lod)) {
                 ModelLoader::upload_to_gpu(*device_, textures_, *m, retain_cpu_geometry_);
             }
@@ -1204,6 +1205,9 @@ std::size_t ModelManager::build_lods(ModelHandle handle, std::span<const float> 
         models_.push_back(std::move(lod));
         model_paths_.emplace_back();
         base = get_model(handle); // models_ may have reallocated
+        if (base == nullptr) {
+            break; // unreachable: handle was resolved above and models_ only grows
+        }
         base->lod_handles.push_back(lod_handle);
         base->lod_thresholds.push_back(thresholds[level]);
         ++created;
