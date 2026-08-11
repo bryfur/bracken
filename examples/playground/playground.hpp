@@ -121,6 +121,11 @@ private:
         int orbs_collected = 0;
         glm::vec3 player_pos{0.0f};
         std::string anim_state;
+        /// Upper-body rig layer weight. The state machine used to carry an
+        /// `Attack` state, so "is he swinging" was readable straight off
+        /// `anim_state`; the swing is a masked ADDITIVE LAYER now, and its
+        /// weight is where that information lives.
+        float anim_upper_weight = 0.0f;
         bool village_loaded = false;
         // Chrome-ball physics state (copied from the sim-written mirrors —
         // the fence never calls into PhysicsWorld itself; physics is sim-stage).
@@ -151,6 +156,9 @@ private:
                           // + the grass-tuft ground cover; procedural fallback
     void build_orb_spots();
     void setup_state_machine();
+    /// Build the two-layer character rig (locomotion + masked upper body).
+    /// Called from setup_state_machine, after the model is registered.
+    void setup_animation_rig();
     void setup_effects();
     void setup_physics(); // world + terrain heightfield + static prop boxes
                           // + chrome ball + character pusher capsule; runs
@@ -269,10 +277,33 @@ private:
     float player_speed_ = 0.0f;
     bool running_input_ = false;
     glm::vec3 move_dir_{0.0f}; // set by handle_input / smoke driver
-    bracken::animation::AnimationPlayer anim_player_;
+    // The character runs on an AnimationRig rather than a bare AnimationPlayer,
+    // and the Attack clip is why: as a whole-body Override state it stopped the
+    // legs mid-stride, so the villager had to stand still to swing. It is now a
+    // MASKED upper-body layer over the locomotion layer, which is the thing a
+    // layer stack exists for.
+    //
+    //   layer 0  locomotion, driven by anim_sm_ (Idle/Walk/Run)
+    //   layer 1  upper body, masked to the Spine subtree, plays Attack
+    //
+    // The scratch is per EVALUATING THREAD, not per character; there is one
+    // character here, so it is a member. A crowd would keep one per
+    // parallel_for chunk instead — see animation/pose.hpp.
+    bracken::animation::AnimationRig anim_rig_;
+    bracken::animation::PoseScratch anim_scratch_{};
+    /// clip -> joint -> channel, built ONCE per model and shared const by every
+    /// rig driven by it. It ALIASES the model's clip vector, so it must be
+    /// rebuilt if the model is ever reloaded.
+    bracken::animation::ClipBindings anim_bindings_;
+    int upper_body_layer_ = -1;      // rig layer index; -1 until the model is bound
+    int attack_clip_ = -1;           // resolved once from the model's clip names
+    float upper_body_weight_ = 0.0f; // followed toward the attack state, never snapped
+    /// Per-joint feather across the upper-body mask boundary. A MEMBER because
+    /// LayerDesc stores the span, not a copy: a local would dangle.
+    std::array<float, bracken::animation::MAX_BONES> upper_body_feather_{};
     bracken::animation::AnimationStateMachine anim_sm_;
-    int param_speed_ = -1;     // anim_sm_ parameter indices, resolved once in
-    int param_attacking_ = -1; // setup_state_machine (no per-frame name hashing)
+    int param_speed_ = -1; // anim_sm_ parameter index, resolved once in
+                           // setup_state_machine (no per-frame name hashing)
     bracken::animation::RotationSmoother facing_;
     bracken::animation::FootIKSmoother foot_smoother_;
     glm::mat4 player_transform_{1.0f};

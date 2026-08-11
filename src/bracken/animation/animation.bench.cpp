@@ -1,4 +1,5 @@
 #include "bracken/animation/animation_player.hpp"
+#include "bracken/animation/animation_rig.hpp"
 #include "bracken/animation/animation_state_machine.hpp"
 #include <benchmark/benchmark.h>
 
@@ -6,6 +7,7 @@
 #include <cstddef>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <array>
 #include <random>
 #include <string>
 #include <utility>
@@ -304,3 +306,180 @@ static void BM_StateMachineUpdate(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_StateMachineUpdate);
+
+// ============================================================================
+// AnimationRig::evaluate — the layer stack, 1 / 2 / 4 / 8 layers deep
+//
+// THIS IS THE COST OF ANIMATING ONE CHARACTER FOR ONE FRAME, and it is paid in
+// the sim stage, per character, every frame — so the shape of the curve is what
+// decides how many rig-driven characters a scene can hold.
+//
+// Two comparisons are the point, and neither is the absolute number:
+//
+//   * {128, 1} against BM_AnimationPlayerUpdate/128. A one-layer rig does the
+//     same work the player does and is bitwise-identical to it
+//     (animation_rig.test.cpp), so the gap between those two rows is the layer
+//     machinery's fixed overhead and nothing else. If it is not close to zero,
+//     the abstraction is costing something and the number belongs in a doc.
+//   * {128, 1} -> {128, 2} -> {128, 4} -> {128, 8}. Each extra layer is one
+//     more FULL skeleton sample (the mask gates the blend, not the sample) plus
+//     one blend pass, and the additive layers also re-derive their reference
+//     pose. The curve should be close to linear; a superlinear knee means
+//     something in the layer loop is not O(joints).
+//
+// The 8-layer point is k_max_animation_layers — the budget's ceiling, measured
+// so the budget is a number rather than a guess.
+//
+// Meaningless from a default configure (-O0 with live asserts). Reconfigure
+// with -DCMAKE_BUILD_TYPE=RelWithDebInfo before quoting a number.
+// ============================================================================
+
+namespace {
+
+struct RigBenchFixture {
+    Skeleton skeleton;
+    std::vector<AnimationClip> clips;
+    ClipBindings bindings;
+    AnimationRig rig;
+    PoseScratch scratch;
+
+    RigBenchFixture(int num_joints, int layers) : skeleton(make_bench_skeleton(num_joints)) {
+        clips.push_back(make_bench_clip("walk", num_joints, 0.0f));
+        clips.push_back(make_bench_clip("run", num_joints, 1.7f));
+        clips.push_back(make_bench_clip("aim", num_joints, 0.4f));
+        bindings.build(skeleton, clips);
+        rig.bind(skeleton, clips, bindings);
+
+        for (int i = 0; i < layers; ++i) {
+            LayerDesc d;
+            d.name = "layer" + std::to_string(i);
+            // Alternate the modes so the benchmark exercises both operators
+            // (Additive is the more expensive one — it samples a reference).
+            d.mode = (i % 2 == 1) ? BlendMode::Additive : BlendMode::Override;
+            // Layer 0's weight and mask are ignored by design; for the rest, a
+            // weight strictly between 0 and 1 is what forces the real blend
+            // (both operators fast-path the endpoints, so 0 or 1 would measure
+            // a memcpy).
+            d.weight = 0.5f;
+            if (i > 0) {
+                // Joint 1 roots half of the balanced tree — the realistic
+                // upper-body shape, and big enough that the masked blend is
+                // actually executed rather than skipped joint by joint.
+                d.mask = BoneMask::none();
+                d.mask.set_subtree(skeleton, 1);
+            }
+            const int index = rig.add_layer(std::move(d));
+            // EVERY layer gets a clip, LAYER 0 INCLUDED. Without this the base
+            // layer has no source, samples the rest pose, and the 1-layer point
+            // silently measures the hierarchy walk instead of the sampler —
+            // which made the whole curve read as though layers were free.
+            if (index >= 0) {
+                rig.play_clip(index, index % 3, 0.0f);
+            }
+        }
+    }
+};
+
+} // namespace
+
+static void BM_AnimationRigEvaluate(benchmark::State& state) {
+    const int num_joints = static_cast<int>(state.range(0));
+    const int layers = static_cast<int>(state.range(1));
+    RigBenchFixture f(num_joints, layers);
+    f.rig.evaluate(f.skeleton, f.clips, kFrameDt, f.scratch); // prime cursors
+
+    for (auto _ : state) {
+        f.rig.evaluate(f.skeleton, f.clips, kFrameDt, f.scratch);
+        benchmark::DoNotOptimize(f.rig.bone_matrices().data());
+        benchmark::ClobberMemory();
+    }
+    // Joints * layers is the work unit, so items/s is comparable ACROSS the
+    // layer sweep in a way ns/iteration is not.
+    state.SetItemsProcessed(state.iterations() * num_joints * layers);
+}
+BENCHMARK(BM_AnimationRigEvaluate)
+    ->Args({16, 1})
+    ->Args({64, 1})
+    ->Args({128, 1})
+    ->Args({128, 2})
+    ->Args({128, 4})
+    ->Args({128, 8});
+
+// A blend-space layer is the other shape a base layer takes, and it is the
+// expensive one: `samples` full skeleton samples plus `samples - 1` blends,
+// against a clip layer's one (or two, mid-crossfade). Measured at 128 joints
+// with cursors cached, which is the rig's default.
+static void BM_AnimationRigBlendSpaceLayer(benchmark::State& state) {
+    const int num_joints = 128;
+    const int samples = static_cast<int>(state.range(0));
+    Skeleton skeleton = make_bench_skeleton(num_joints);
+    std::vector<AnimationClip> clips;
+    for (int k = 0; k < samples; ++k) {
+        clips.push_back(make_bench_clip("s" + std::to_string(k), num_joints, 0.3f * static_cast<float>(k)));
+    }
+    ClipBindings bindings;
+    bindings.build(skeleton, clips);
+
+    AnimationRig rig;
+    rig.bind(skeleton, clips, bindings);
+    LayerDesc base;
+    base.name = "locomotion";
+    const int layer = rig.add_layer(std::move(base));
+
+    BlendSpace1D space;
+    for (int k = 0; k < samples; ++k) {
+        (void)space.add_sample(k, static_cast<float>(k));
+    }
+    space.finalize();
+    rig.set_blend_space_1d(layer, space);
+    // Halfway between two samples: the query that actually blends, rather than
+    // an on-sample query that culls down to one clip.
+    rig.set_blend_position(layer, static_cast<float>(samples) * 0.5f - 0.5f);
+
+    PoseScratch scratch;
+    rig.evaluate(skeleton, clips, kFrameDt, scratch);
+    for (auto _ : state) {
+        rig.evaluate(skeleton, clips, kFrameDt, scratch);
+        benchmark::DoNotOptimize(rig.bone_matrices().data());
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * num_joints);
+}
+BENCHMARK(BM_AnimationRigBlendSpaceLayer)->Arg(2)->Arg(4)->Arg(8);
+
+// ============================================================================
+// BlendSpace2D::resolve — the O(n^2) gradient band
+//
+// 4 samples is 12 pair evaluations, 8 is 56. This is per layer per character
+// per frame, so the shape of this curve is what k_max_blend_samples is set
+// against.
+// ============================================================================
+
+static void BM_BlendSpace2DResolve(benchmark::State& state) {
+    const int samples = static_cast<int>(state.range(0));
+    BlendSpace2D space;
+    (void)space.add_sample(0, glm::vec2(0.0f, 0.0f));
+    for (int k = 1; k < samples; ++k) {
+        const float a = static_cast<float>(k) * 6.2831853f / static_cast<float>(samples - 1);
+        (void)space.add_sample(k, glm::vec2(std::cos(a), std::sin(a)));
+    }
+
+    std::array<WeightedClip, k_max_blend_samples> out{};
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> dist(-1.2f, 1.2f);
+    std::vector<glm::vec2> queries(kNumRandomTimes);
+    for (auto& q : queries) {
+        q = glm::vec2(dist(rng), dist(rng));
+    }
+
+    size_t i = 0;
+    for (auto _ : state) {
+        std::uint32_t n = space.resolve(queries[i & (kNumRandomTimes - 1)], out);
+        ++i;
+        benchmark::DoNotOptimize(n);
+        benchmark::DoNotOptimize(out.data());
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * samples);
+}
+BENCHMARK(BM_BlendSpace2DResolve)->Arg(4)->Arg(8);

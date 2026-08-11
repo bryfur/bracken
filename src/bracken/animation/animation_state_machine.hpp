@@ -1,6 +1,8 @@
 #pragma once
 
 #include "bracken/animation/animation_player.hpp"
+#include "bracken/animation/animation_rig.hpp"
+#include "bracken/animation/blend_space.hpp"
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -37,6 +39,44 @@ struct AnimState {
     bool loop = true;
     float speed = 1.0f;
     std::vector<StateTransition> transitions;
+
+    // ---- rig-driving fields, ignored entirely by update(AnimationPlayer&) ----
+    //
+    // A state can drive ONE layer of an AnimationRig, with either a single clip
+    // (the default, identical to the player behaviour) or a blend space whose
+    // position is fed from named parameters. The player overload predates all of
+    // this and is untouched by it: a host that never builds a rig sees exactly
+    // the state machine it saw before.
+    //
+    // ONE COST IS NOT ZERO, AND IT IS PAID BY HOSTS THAT NEVER TOUCH A RIG:
+    // the two blend spaces are stored BY VALUE, which grows `AnimState` by
+    // ~236 bytes (each space is a fixed `std::array` of `k_max_blend_samples`
+    // samples, sized so a blend space allocates nothing and can be copied into
+    // a layer without touching the heap). A machine with ten states therefore
+    // costs ~2.4 KB more than it did. That is deliberate — a `unique_ptr` here
+    // would trade the bytes for an allocation and an indirection on a type that
+    // is copied at setup and never on the frame path — but it IS a change to an
+    // existing struct's layout, so anything that serialized `sizeof(AnimState)`
+    // (nothing in this tree does) would notice.
+
+    /// Which rig layer this state drives. `update(AnimationRig&, int)` uses its
+    /// `layer` argument when that argument is >= 0 and this field otherwise, so
+    /// a machine whose states all live on one layer needs no per-state setup.
+    int layer = 0;
+
+    /// What the state installs on its layer when entered.
+    LayerSource source = LayerSource::Clip;
+
+    /// Used when `source` is `Blend1D` / `Blend2D`. Samples carry clip INDICES,
+    /// not names — resolve them with `find_clip_index` at setup, because
+    /// `bind_clips` only resolves `clip_name`.
+    BlendSpace1D blend_space_1d{};
+    BlendSpace2D blend_space_2d{};
+
+    /// Parameter indices driving the blend position each update; -1 = leave that
+    /// axis alone. Resolve them once with `param_index`.
+    int blend_param_x = -1;
+    int blend_param_y = -1;
 };
 
 class AnimationStateMachine {
@@ -70,6 +110,40 @@ public:
 
     void update(AnimationPlayer& player);
 
+    /**
+     * Drive ONE layer of an `AnimationRig` instead of a player.
+     *
+     * `layer` >= 0 overrides every state's own `AnimState::layer`; `layer` < 0
+     * (the default) uses each state's field, which is what lets one machine own
+     * a base layer and another own an upper-body layer without either knowing
+     * about the other.
+     *
+     * Every existing behaviour is preserved exactly — transition priority,
+     * AND/OR conditions, the `!loop && !playing` clip-ended trigger — because
+     * both overloads run the SAME evaluator (`next_transition`). A state whose
+     * `source` is a blend space additionally pushes its blend parameters into
+     * the layer every update, which is what makes "states drive a blend space"
+     * true rather than aspirational.
+     *
+     * TWO THINGS A BLEND-SPACE STATE DOES NOT GET, both structural rather than
+     * unimplemented, and both worth knowing before you author one:
+     *
+     *  * NO CROSSFADE ON ENTRY. `StateTransition::crossfade_duration` is
+     *    forwarded to `AnimationRig::play_clip`, and a blend-space layer has no
+     *    clip to fade from — installing a space swaps the layer's source
+     *    outright. Transitioning into (or out of) a blend-space state therefore
+     *    POPS. Cross-fading a whole layer source would need a second pose
+     *    buffer and a fade clock per layer; it is not built.
+     *  * NO `clip_ended` TRIGGER. The clip-ended path reads
+     *    `!state.loop && !rig.layer_playing(layer)`, and a blend-space layer's
+     *    clock never stops on its own (it has no single duration to end at), so
+     *    `layer_playing` stays true forever. A non-looping blend-space state
+     *    must be left by a parameter condition, not by "the clip finished".
+     *
+     * `AnimState::loop` and `AnimState::speed` still reach the layer on entry.
+     */
+    void update(AnimationRig& rig, int layer = -1);
+
     const std::string& current_state() const;
     bool is_bound() const { return bound_; }
 
@@ -84,10 +158,40 @@ private:
     std::string default_state_;
     bool bound_ = false;
 
+    // What has actually been installed on a rig, so update(AnimationRig&) can
+    // apply the DEFAULT state once without re-installing (and re-allocating) a
+    // blend space every frame. The player path has no equivalent and needs
+    // none: a player defaults to clip 0 and a state's clip is applied on the
+    // first transition.
+    //
+    // It is a CACHE OF WHAT A RIG HOLDS, keyed by state index, and a state index
+    // is only meaningful against the table that produced it — so anything that
+    // rewrites that table (`add_state`, `bind_clips`) must call
+    // `invalidate_applied()`, or the fast path skips a re-install that was
+    // needed and the layer keeps playing a clip index resolved against the old
+    // table. It also means one machine driving TWO rigs re-installs on every
+    // update once their layers differ: correct, but wasteful. Drive one rig per
+    // machine.
+    int applied_state_ = -1;
+    int applied_layer_ = -1;
+
+    void invalidate_applied() noexcept {
+        applied_state_ = -1;
+        applied_layer_ = -1;
+    }
+
     int ensure_param(const std::string& name);
     int find_param(const std::string& name) const;
 
     void enter_state(int state_index, AnimationPlayer& player, float crossfade);
+    void enter_state(int state_index, AnimationRig& rig, int layer, float crossfade);
+
+    // The one transition evaluator both update() overloads share. Returns the
+    // index of the state to enter, or -1 to stay put. Factored so the player and
+    // rig paths cannot drift — a second copy of this loop is how "the rig
+    // ignores transition priority" bugs get written.
+    [[nodiscard]] int next_transition(const AnimState& state, bool clip_ended,
+                                      float& out_crossfade) const;
 };
 
 } // namespace bracken::animation

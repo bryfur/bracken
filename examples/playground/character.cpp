@@ -215,6 +215,23 @@ anim::AnimationClip make_idle_clip() {
 }
 
 // Overhead swing with the right arm; explicit keys, non-looping.
+//
+// AUTHORING CONTRACT, and it changed when the playground moved to an
+// AnimationRig: this clip is consumed as an ADDITIVE upper-body layer over
+// locomotion (playground.cpp, setup_animation_rig), not as a whole-body state.
+// Three things follow from that and all three are already true here:
+//
+//  * every joint's rest local_rotation is identity (add_joint), so the
+//    additive delta `inverse(rest) * key` is just the authored key — what you
+//    write is what gets added on top of the walk;
+//  * the clip animates ONLY the joints it means to move. A joint with no
+//    channel contributes a zero delta and keeps whatever locomotion was doing
+//    with it, which is why the left arm keeps swinging through a swing;
+//  * both keyed channels start and end at the identity rotation, so the layer
+//    fades in and out of nothing rather than snapping.
+//
+// Adding a channel here that holds a non-identity value at t=0 would make the
+// character jerk the moment an attack starts.
 anim::AnimationClip make_attack_clip() {
     anim::AnimationClip clip;
     clip.name = "Attack";

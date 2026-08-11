@@ -13,36 +13,57 @@ JointIndex find_joint(const Skeleton& skeleton, std::string_view name) {
     return {};
 }
 
-glm::mat4 joint_model_transform(const AnimationPlayer& player, JointIndex joint) {
+glm::mat4 joint_model_transform(const PoseView& pose, JointIndex joint) {
     if (!joint.valid()) {
         return glm::mat4(1.0f);
     }
-    const auto transforms = player.world_transforms();
     const auto index = static_cast<std::size_t>(joint.value);
-    // Beyond used_joint_count() the slots hold identity rather than stale
+    // Beyond used_joint_count the slots hold identity rather than stale
     // data, but bounds still matter: a skeleton swapped for a shorter one
     // would otherwise read past the array.
-    if (index >= transforms.size() || index >= player.used_joint_count()) {
+    if (index >= pose.world_transforms.size() || index >= pose.used_joint_count) {
         return glm::mat4(1.0f);
     }
-    return transforms[index];
+    return pose.world_transforms[index];
 }
 
-glm::mat4 attachment_transform(const glm::mat4& model_transform, const AnimationPlayer& player,
-                               JointIndex joint, const glm::mat4& local_offset) {
+glm::mat4 attachment_transform(const glm::mat4& model_transform, const PoseView& pose, JointIndex joint,
+                               const glm::mat4& local_offset) {
     if (!joint.valid()) {
         // No joint means no attachment. Returning the model transform (rather
         // than identity) keeps the object on the character instead of dropping
         // it at the world origin, which is far easier to notice and diagnose.
         return model_transform * local_offset;
     }
-    return model_transform * joint_model_transform(player, joint) * local_offset;
+    return model_transform * joint_model_transform(pose, joint) * local_offset;
+}
+
+glm::vec3 attachment_position(const glm::mat4& model_transform, const PoseView& pose, JointIndex joint,
+                              const glm::vec3& local_offset) {
+    const glm::mat4 bone = attachment_transform(model_transform, pose, joint);
+    return glm::vec3(bone * glm::vec4(local_offset, 1.0f));
+}
+
+// The AnimationPlayer overloads are forwarders, so the player and the rig can
+// never take different code paths through this file.
+namespace {
+[[nodiscard]] PoseView view_of(const AnimationPlayer& player) noexcept {
+    return PoseView{player.world_transforms(), player.bone_matrices(), player.used_joint_count()};
+}
+} // namespace
+
+glm::mat4 joint_model_transform(const AnimationPlayer& player, JointIndex joint) {
+    return joint_model_transform(view_of(player), joint);
+}
+
+glm::mat4 attachment_transform(const glm::mat4& model_transform, const AnimationPlayer& player,
+                               JointIndex joint, const glm::mat4& local_offset) {
+    return attachment_transform(model_transform, view_of(player), joint, local_offset);
 }
 
 glm::vec3 attachment_position(const glm::mat4& model_transform, const AnimationPlayer& player,
                               JointIndex joint, const glm::vec3& local_offset) {
-    const glm::mat4 bone = attachment_transform(model_transform, player, joint);
-    return glm::vec3(bone * glm::vec4(local_offset, 1.0f));
+    return attachment_position(model_transform, view_of(player), joint, local_offset);
 }
 
 Attachment make_attachment(const Skeleton& skeleton, std::string_view bone_name,
