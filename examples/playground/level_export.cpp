@@ -20,8 +20,9 @@
 
 #include <cstdint>
 #include <cstring>
-#include <fstream>
+#include <iostream>
 #include <string>
+#include <vector>
 
 using bracken::ModelHandle;
 namespace level = bracken::scene;
@@ -74,37 +75,23 @@ struct Fnv1a {
     }
 };
 
-level::LevelWater to_level_water(const bracken::render::WaterRegion& r) {
-    level::LevelWater w;
-    w.min_x = r.min_x;
-    w.min_z = r.min_z;
-    w.max_x = r.max_x;
-    w.max_z = r.max_z;
-    w.height = r.height;
-    w.flow = r.flow;
-    w.flow_speed = r.flow_speed;
-    w.deep_color = r.deep_color;
-    w.shallow_color = r.shallow_color;
-    w.absorption = r.absorption;
-    w.foam_depth = r.foam_depth;
-    w.reflection_roughness = r.reflection_roughness;
-    w.reflection_strength = r.reflection_strength;
-    w.refraction_strength = r.refraction_strength;
-    w.ssr_strength = r.ssr_strength;
-    w.ssr_max_distance = r.ssr_max_distance;
-    w.ssr_thickness = r.ssr_thickness;
-    w.detail_wave_strength = r.detail_wave_strength;
-    w.sim_displacement = r.sim_displacement;
-    w.sim_normal_strength = r.sim_normal_strength;
-    w.ripple_foam_gain = r.ripple_foam_gain;
-    w.sim_center = r.sim_center;
-    w.sim_extent = r.sim_extent;
-    w.wave_speed = r.wave_speed;
-    w.wave_damping = r.wave_damping;
-    return w;
-}
-
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Inspection — `--dump-level FILE`
+// ---------------------------------------------------------------------------
+
+bool dump_level_file(const std::string& path) {
+    // No window, no device, no assets: this is the mode that still works when
+    // the file is the thing that is broken.
+    auto loaded = level::load_level(path);
+    if (loaded.is_err()) {
+        std::cerr << "--dump-level " << path << ": " << level::to_string(loaded.error()) << "\n";
+        return false;
+    }
+    std::cout << level::level_dump(loaded.value(), /*max_rows=*/0);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // The one composition site
@@ -125,17 +112,22 @@ glm::mat4 PlaygroundGame::place_prop(const char* model_name, ModelHandle handle,
 // The digest instrument
 // ---------------------------------------------------------------------------
 
-void PlaygroundGame::log_prop_digest(const char* label) const {
+uint64_t PlaygroundGame::prop_digest() const {
     Fnv1a h;
     for (const Prop& p : props_) {
         const uint32_t handle = p.model;
         h.bytes(&handle, sizeof(handle));
         h.bytes(&p.transform[0][0], sizeof(glm::mat4));
     }
+    return h.value;
+}
+
+void PlaygroundGame::log_prop_digest(const char* label) const {
     // The A/B gate. `--export-level v.level` then `--level v.level` must print
     // the same props= and digest= as a plain run; if it does not, the format
     // moved something the screenshot's mean luma would never show.
-    BRACKEN_LOG_INFO(LOG_TAG, "[level] source={} props={} digest=0x{:016x}", label, props_.size(), h.value);
+    BRACKEN_LOG_INFO(LOG_TAG, "[level] source={} props={} digest=0x{:016x}", label, props_.size(),
+                     prop_digest());
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +176,9 @@ bool PlaygroundGame::export_level_now() {
     out.nav = nav_.config();
 
     if (const auto* water = scene_renderer().water(); water != nullptr && water->active()) {
-        out.water.push_back(to_level_water(water->region()));
+        // The engine's conversion, not a hand-written copy of 25 fields — a
+        // field added to WaterRegion is then wrong in one place instead of two.
+        out.water.push_back(level::to_level_water(water->region()));
     }
 
     // The ground-cover layer as a RULE as well as rows — see the mirrored
@@ -219,27 +213,91 @@ bool PlaygroundGame::export_level_now() {
     // round-trips it and never looks inside. See k_level_rng_key.
     out.extras().write(k_level_rng_key, static_cast<int64_t>(rng_after_scatter_));
 
-    if (auto r = level::save_level(out, export_level_path_); r.is_err()) {
+    // ONE engine call: it verifies the level against its own encoder before a
+    // byte reaches the disk, writes it atomically, and drops the readable
+    // `.txt` sidecar beside it. The demo does not own that policy — a game's
+    // own export tool gets the same three steps in the same order for free.
+    if (auto r = level::export_level(out, export_level_path_); r.is_err()) {
         BRACKEN_LOG_ERROR(LOG_TAG, "--export-level {}: {}", export_level_path_,
                           level::to_string(r.error()));
         return false;
     }
 
-    // The text sidecar. A binary format nobody can read is a format nobody
-    // debugs; this one is diagnostic only and has no parser on purpose.
-    const std::string dump_path = export_level_path_ + ".txt";
-    {
-        std::ofstream dump(dump_path, std::ios::trunc);
-        if (!dump) {
-            BRACKEN_LOG_WARN(LOG_TAG, "--export-level: could not write the dump sidecar {}", dump_path);
-        } else {
-            dump << level::level_dump(out);
+    BRACKEN_LOG_INFO(LOG_TAG, "--export-level {}: {} instances, {} models, {} markers (dump in {}.txt)",
+                     export_level_path_, out.instances.size(), out.models.size(), out.markers.size(),
+                     export_level_path_);
+
+    return verify_exported_level(out, export_level_path_);
+}
+
+// ---------------------------------------------------------------------------
+// The round-trip proof
+// ---------------------------------------------------------------------------
+
+bool PlaygroundGame::verify_exported_level(const level::Level& authored, const std::string& path) {
+    auto reloaded = level::load_level(path);
+    if (reloaded.is_err()) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "[level] roundtrip FAILED: the file just written will not load ({})",
+                          level::to_string(reloaded.error()));
+        return false;
+    }
+    if (level::level_digest(reloaded.value()) != level::level_digest(authored)) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "[level] roundtrip FAILED: the file's content digest does not match "
+                                   "the level it was written from");
+        return false;
+    }
+
+    // Resolve through the SAME ModelManager the live scene used. That is what
+    // makes the comparison meaningful: ModelHandle is a registration-order
+    // index, so a resolution against a differently loaded manager would be
+    // testing handle assignment rather than the format.
+    level::ResolvedLevel resolved;
+    const level::LevelResolveReport report = resolved.resolve(reloaded.value(), models());
+    if (report.any_dropped()) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "[level] roundtrip FAILED: {} instances dropped on reload ({} unknown "
+                                   "model, {} bad index)",
+                          report.instances_dropped_unknown_model + report.instances_dropped_bad_index,
+                          report.instances_dropped_unknown_model, report.instances_dropped_bad_index);
+        return false;
+    }
+    if (resolved.size() != props_.size()) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "[level] roundtrip FAILED: {} draws reloaded against {} live props",
+                          resolved.size(), props_.size());
+        return false;
+    }
+
+    // Matrix by matrix, byte for byte. NOT epsilon-compared: the whole claim of
+    // level_instance_transform is that both sides run the same three glm calls
+    // on the same three floats, so anything but equality is a real defect —
+    // and one that no screenshot would ever show.
+    Fnv1a h;
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < props_.size(); ++i) {
+        const level::ResolvedLevel::Draw& draw = resolved.draws()[i];
+        const uint32_t handle = draw.model;
+        h.bytes(&handle, sizeof(handle));
+        h.bytes(&draw.transform[0][0], sizeof(glm::mat4));
+        if (draw.model != props_[i].model ||
+            std::memcmp(&draw.transform[0][0], &props_[i].transform[0][0], sizeof(glm::mat4)) != 0) {
+            if (mismatches < 4) {
+                BRACKEN_LOG_ERROR(LOG_TAG, "[level] roundtrip: instance {} differs (model {} vs {})", i,
+                                  draw.model, props_[i].model);
+            }
+            ++mismatches;
         }
     }
 
-    BRACKEN_LOG_INFO(LOG_TAG, "--export-level {}: {} instances, {} models, {} markers (dump in {})",
-                     export_level_path_, out.instances.size(), out.models.size(), out.markers.size(),
-                     dump_path);
+    const uint64_t live = prop_digest();
+    if (mismatches != 0 || h.value != live) {
+        BRACKEN_LOG_ERROR(LOG_TAG,
+                          "[level] roundtrip FAILED: {} of {} instances differ; digest 0x{:016x} "
+                          "reloaded vs 0x{:016x} live",
+                          mismatches, props_.size(), h.value, live);
+        return false;
+    }
+
+    BRACKEN_LOG_INFO(LOG_TAG, "[level] roundtrip OK: {} props reload bit-identical, digest=0x{:016x}",
+                     props_.size(), live);
     return true;
 }
 

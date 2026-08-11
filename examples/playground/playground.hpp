@@ -24,12 +24,29 @@
 #include <string>
 #include <vector>
 
+namespace bracken::scene {
+/// Declared, not included: only level_export.cpp needs the definition, and
+/// playground.hpp is included by every file in the demo.
+class Level;
+} // namespace bracken::scene
+
 namespace playground {
 
 /** Bundle every .glb under assets/models into one pack file and exit. The
  *  shippable form of the asset directory: one artifact, one file handle, and a
  *  sorted TOC so lookups are a binary search rather than a scan. */
 [[nodiscard]] bool build_asset_pack(const std::string& out_path);
+
+/**
+ * Read a `.level` and print `bracken::scene::level_dump` to stdout, then exit.
+ *
+ * The INSPECTION path, and the reason it is a mode of the demo rather than a
+ * separate tool: it needs no window, no GPU device and no assets, so it is the
+ * one thing that always runs against a file that will not load — including on
+ * a build machine with neither a display nor the 50 MB of art. False (exit 1)
+ * when the file is refused, with the refusal named.
+ */
+[[nodiscard]] bool dump_level_file(const std::string& path);
 
 
 /**
@@ -276,9 +293,30 @@ private:
     glm::mat4 place_prop(const char* model_name, bracken::ModelHandle handle, const glm::vec3& position,
                          float yaw, float scale);
 
-    /** --export-level: build a scene::Level from the finished scene and write
-     *  it (plus a text dump sidecar). False on any IO failure. */
+    /** --export-level: build a scene::Level from the finished scene, write it
+     *  (plus a text dump sidecar), and PROVE the round trip before claiming
+     *  success. False on any IO failure or any round-trip mismatch. */
     [[nodiscard]] bool export_level_now();
+
+    /**
+     * The end-to-end proof, run by `--export-level` before it returns true.
+     *
+     * Two checks, and they answer different questions. `verify_level_roundtrip`
+     * asks whether the LEVEL survives its own encoder — it is pure data and
+     * needs no models. This then reads the file back OFF DISK, resolves it
+     * against the same ModelManager the live scene used, and compares the
+     * resulting draws to `props_` matrix by matrix: that is what proves the
+     * whole path, including the name->handle resolution and the transform
+     * recomposition, lands on the frame the demo was already drawing.
+     *
+     * Doing it here rather than in a second process is the point. A human
+     * comparing two `digest=` lines from two runs is a step that gets skipped;
+     * a non-zero exit code is not.
+     *
+     * NOT const: resolving needs `Application::models()`, which is not.
+     */
+    [[nodiscard]] bool verify_exported_level(const bracken::scene::Level& authored,
+                                             const std::string& path);
 
     /** --level: fill props_, pending_colliders_, orb_spots_ and chimney_tops_
      *  from a level file. Lives in playground.cpp because the collider policy
@@ -286,10 +324,13 @@ private:
      *  engine. False if the file could not be read. */
     [[nodiscard]] bool load_level_props();
 
-    /** FNV-1a over props_ (handle + the 16 matrix floats, in draw order),
-     *  logged as `[level] props=N digest=0x...`. The A/B instrument for the
-     *  round trip: an exported and reloaded village must print the same line
-     *  a hand-authored run does. */
+    /** FNV-1a over props_ (handle + the 16 matrix floats, in draw order). The
+     *  A/B instrument for the round trip: an exported and reloaded village
+     *  must produce the same number a hand-authored run does. */
+    [[nodiscard]] uint64_t prop_digest() const;
+
+    /** `prop_digest()` as one log line, `[level] source=... props=N
+     *  digest=0x...`. Printed at init in every mode. */
     void log_prop_digest(const char* label) const;
 
     // World

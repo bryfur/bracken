@@ -55,8 +55,13 @@ lantern.intensity = 9.0f;
 lantern.source_radius = 40.0f;
 level.point_lights.push_back(lantern);
 
-if (auto r = save_level(level, "riverside.level"); r.is_err()) {
-    BRACKEN_LOG_ERROR(LOG_TAG, "save failed: {}", to_string(r.error()));
+// export_level is the entry point an authoring tool wants: it VERIFIES the
+// level against its own encoder first (a level that cannot survive a round
+// trip must not become a file), writes it atomically, and drops a readable
+// `riverside.level.txt` beside it. save_level is the same write without the
+// verification, for a caller that has already done it.
+if (auto r = export_level(level, "riverside.level"); r.is_err()) {
+    BRACKEN_LOG_ERROR(LOG_TAG, "export failed: {}", to_string(r.error()));
 }
 ```
 
@@ -193,20 +198,72 @@ time.
 ### Reading a level file
 
 ```cpp
-BRACKEN_LOG_INFO(LOG_TAG, "{}", level_dump(level));
+BRACKEN_LOG_INFO(LOG_TAG, "{}", level_dump(level));        // first 8 rows per table
+auto wrote = save_level_dump(level, path + ".txt");        // every row, to a file
 ```
 
-`level_dump` is diagnostic and has no parser. The playground writes it as a
-`.level.txt` sidecar next to every export.
+`level_dump` is diagnostic and has no parser — deliberately. Its second
+parameter is a per-table row cap; `0` means all of them, which is what a tool
+inspecting a file wants and what `save_level_dump` passes. Every index it
+prints goes through `model_name` / `string_at`, which answer `""` for an
+out-of-range index rather than reading one: dumping is exactly what you do to a
+file you already suspect.
+
+The shipped tool is a mode of the demo, because it needs neither a window nor a
+GPU nor the 50 MB of art:
+
+```
+playground --dump-level village.level
+```
+
+### Verifying an export
+
+`export_level` already does this for you — reach for `verify_level_roundtrip`
+directly only when you are not writing a file (a level built in memory and
+shipped some other way):
+
+```cpp
+if (auto ok = verify_level_roundtrip(level); ok.is_err()) {
+    BRACKEN_LOG_ERROR(LOG_TAG, "level will not survive its own encoder: {}",
+                      to_string(ok.error()));
+    return false;                       // do not ship this file
+}
+```
+
+`verify_level_roundtrip` serializes, parses the result back, and compares
+`level_digest` on both sides plus the count of carried extra records. It is the
+round-trip proof as a CALLABLE, so an export tool gates on it instead of a
+human comparing two log lines. The failure it actually catches is `BadValue`: a
+NaN written by a broken authoring step encodes fine and is refused on the way
+back in — at export time, in the tool, rather than six weeks later in a
+player's install.
+
+`level_digest` is FNV-1a over the level's canonical content in table order. It
+excludes `extras()`, which belongs to the host: a game that writes a frame
+counter in there must not thereby make every level unequal to itself.
 
 ### The playground
 
 ```
-playground --export-level village.level     # build the scene, write it, exit
+playground --export-level village.level     # build the scene, write it, verify, exit
 playground --smoke 30 --level village.level # rebuild the props from the file
+playground --dump-level village.level       # read it as text
 ```
 
-Both runs print
+`--export-level` proves itself and exits non-zero if it cannot. After writing
+the file it reads it back OFF DISK, resolves it against the same
+`ModelManager` the live scene used, and compares the result to the live prop
+list matrix by matrix — not epsilon-compared, `memcmp`'d, because the whole
+claim of `level_instance_transform` is that both sides ran the same three glm
+calls on the same three floats:
+
+```
+[level] roundtrip OK: 2550 props reload bit-identical, digest=0x…
+```
+
+`--level` is the separate, weaker-but-broader gate: the export's own check
+proves the DATA survives, and this proves the RENDERER never notices the
+difference. Both runs print
 
 ```
 [level] source=authored props=2550 digest=0x…
@@ -225,9 +282,9 @@ and the two digests must match. `--smoke 30` must still report the pinned
 | File | What |
 |---|---|
 | `src/bracken/scene/level.hpp` | the data model, errors, free functions, `ResolvedLevel` |
-| `src/bracken/scene/level.cpp` | transform, encode/decode, scatter, dump, resolution |
-| `src/bracken/scene/level.test.cpp` | 26 tests, listed at the end of this document |
-| `examples/playground/level_export.cpp` | `place_prop`, `export_level_now`, `log_prop_digest` |
+| `src/bracken/scene/level.cpp` | transform, encode/decode, validation, scatter, dump, digest, resolution |
+| `src/bracken/scene/level.test.cpp` | 44 tests, listed at the end of this document |
+| `examples/playground/level_export.cpp` | `place_prop`, `export_level_now`, `verify_exported_level`, `prop_digest`, `dump_level_file` |
 
 ### Files modified
 
@@ -372,20 +429,77 @@ is refused (`LevelError::FutureVersion`) rather than guessed at.
 
 ```cpp
 enum class LevelError : uint8_t {
-    FileNotFound, NotALevelFile, Corrupt, FutureVersion, WriteFailed, BadTable
+    FileNotFound, NotALevelFile, Corrupt, FutureVersion, WriteFailed,
+    BadTable, BadValue
 };
 const char* to_string(LevelError) noexcept;
 ```
 
-`BadTable` is a `count * stride` that disagrees with the blob length, a
-non-positive stride, or a terrain sample blob that is not a whole number of
-16-bit samples. The checksum passed in that case, so it is a writer bug or a
-hand-edited file — refused rather than half-read. Nothing in the decode path can
-read past a blob: the length check is done by division, never by forming
-`count * stride` (which could overflow).
+`BadTable` is a structural contradiction: a `count * stride` that disagrees
+with the blob length, a non-positive stride, a terrain sample blob that is not
+a whole number of 16-bit samples, a heightmap whose declared resolution does
+not square to its sample count, a declared name-table length larger than the
+whole document, an out-of-range terrain resolution or nav grid. The checksum
+passed in every one of those cases, so it is a writer bug or a hand-edited file
+— refused rather than half-read.
+
+`BadValue` is a number that survives the container and could not survive the
+renderer: a NaN or an infinity in a position, a scale, a colour, a fog
+distance, a cell size. It is refused at LOAD because that is the only place it
+is cheap to refuse. A NaN that reaches a transform poisons the whole matrix,
+and a NaN matrix in the frame packet propagates into culling (every comparison
+against it is false), the bounding-sphere merge and the depth pyramid — the
+symptom is a blank or flickering frame several subsystems away from the file
+that caused it.
 
 Every fallible entry point returns `core::Result<T, LevelError>` and is
 `[[nodiscard]]`.
+
+### Hardening: what a malformed file may do to you
+
+A `.level` is untrusted input the moment it can arrive from anywhere but the
+build that wrote it — a mod directory, a download, a partially written file, a
+hand-edited one. The contract, case by case in `level.test.cpp`:
+
+* **It never reads outside the bytes it was handed.** The container's cursor
+  bounds-checks every take, and every table decode divides rather than
+  multiplying, so a `count` can never be trusted into a pointer.
+* **It never allocates on a number it read** without first bounding that number
+  by something the file cannot inflate. The bulk tables are bounded by their
+  blob's actual length; the two path-addressed name tables are bounded by the
+  container's own record count (a table of N names occupies 2N records, so a
+  count larger than the whole document is a lie the file's own size disproves)
+  as well as by `k_max_name_table_rows`; terrain, nav and scatter have explicit
+  ceilings.
+* **Every refusal is a named `LevelError` with one log line saying which record
+  was wrong**, and a decode either returns a complete `Level` or an error —
+  never a half-populated one.
+* **Indices are the format's only pointers and none of them is followed off the
+  end.** `model_name` / `string_at` / `scatter_slice` answer empty for an
+  out-of-range index; an instance whose model index is past the table is
+  counted in `LevelResolveReport::instances_dropped_bad_index`.
+
+What it deliberately does not do is validate GAMEPLAY: a level may place a
+crate under the terrain, aim a spotlight at nothing, or reference a model the
+host never registers. Those are counted or simply allowed. Structural
+integrity is the engine's business; whether the level is any good is the
+game's.
+
+| Limit | Value | What it bounds |
+|---|---|---|
+| `k_max_name_table_rows` | 65536 | rows in the two path-addressed tables (models, strings) |
+| `k_max_table_rows` | 2097152 | rows in ANY blob table. The blob's length bounds the count only by `length / stride`, and the stride comes from the file too: a declared stride of 1 turns a 10 MB blob into ten million 52-byte rows. This is what makes the amplification bounded rather than proportional |
+| `k_max_terrain_resolution` | 8192 | heightmap and splatmap resolution, so `res * res` cannot overflow or allocate on a file's say-so |
+| `k_max_nav_cells` | 4194304 | `width * depth`, which `nav::NavGrid::build` allocates a cell per |
+| `k_max_scatter_cells_per_axis` | 8192 | candidate cells a scatter rule may walk |
+| `k_max_scatter_instances` | 1048576 | instances one scatter rule may PRODUCE — the cell bound alone still permits 8192² candidates |
+
+Two holes, stated rather than discovered. The container's `game_version` field
+(which carries `Level::content_version`) sits outside the payload checksum, so
+a corrupted one loads as a different content version with no error — that is
+the container's documented behaviour and the level schema inherits it. And a
+finite-but-absurd number (a scale of `1e30`) is accepted: finiteness is
+checkable, plausibility is the game's business.
 
 ### Resolution and diagnostics
 
@@ -508,12 +622,14 @@ standalone in the generated `bracken_public_headers` TU.
 | Entry point | Tier | Why |
 |---|---|---|
 | `Level` construction, mutation, queries | `owned` | plain data; touches no engine global |
-| `save_level` / `load_level` | main-thread / loading | blocking file IO; `BRACKEN_ASSERT_NOT_SIM_STAGE()` |
+| `save_level` / `load_level` / `export_level` / `save_level_dump` | main-thread / loading | blocking file IO; `BRACKEN_ASSERT_NOT_SIM_STAGE()` |
 | `serialize_level` / `parse_level` | worker-safe | no filesystem, no shared state |
 | `ResolvedLevel::resolve` | main-thread / loading | reads the ModelManager name table, which a concurrent load mutates; `BRACKEN_ASSERT_NOT_SIM_STAGE()` |
 | `ResolvedLevel::emit` | `sim-stage` | one loop of `FrameSink::draw_model`; allocates nothing, touches nothing shared |
 | `scatter_ground_cover` | worker-safe | pure; the only state is a local LCG |
-| `level_dump` | `owned` | builds a string |
+| `level_dump` / `level_digest` | `owned` | pure reads; `level_dump` builds a string |
+| `verify_level_roundtrip` | worker-safe | serialize + parse in memory; no filesystem |
+| `to_level_water` / `to_water_region` | `owned` | field copies |
 
 Nothing here is on the frame path except `emit`, and `emit` is exactly the loop
 a host writes by hand over its own prop vector.
@@ -632,8 +748,16 @@ Step 6 is pinned by the five digest tests in `frame_test.test.cpp`.
 >   the format: `LevelInstance` 52 B, `LevelMarker` 20 B, `LevelRect` 16 B,
 >   `LevelWater` 124 B, `LevelScatterModel` 16 B, `LevelScatterRule` 48 B, all
 >   `static_assert`ed padding-free and APPEND-ONLY.
-> - `k_max_scatter_cells_per_axis = 8192` (`scene/level.cpp`) — a scatter rule
->   asking for more is refused with an ERROR rather than expanded.
+> - The loader's ceilings, all in `scene/level.hpp`, all of them the answer to
+>   "what stops a hostile file allocating": `k_max_name_table_rows = 65536`
+>   (rows in the two path-addressed tables — the tighter bound is the
+>   container's own record count), `k_max_table_rows = 1 << 21` (rows in any
+>   blob table, because a declared stride of 1 would otherwise amplify a small
+>   blob 52x), `k_max_terrain_resolution = 8192`,
+>   `k_max_nav_cells = 4194304` (`width * depth`),
+>   `k_max_scatter_cells_per_axis = 8192` (candidate cells a rule may walk) and
+>   `k_max_scatter_instances = 1048576` (instances it may produce). Every one
+>   is a refusal with a named error, never a truncation.
 
 *Gotchas — add:*
 
@@ -649,6 +773,16 @@ Step 6 is pinned by the five digest tests in `frame_test.test.cpp`.
 >   different orders produce different handles, a different `FramePacket`
 >   digest, and a pixel-identical image. If a digest comparison fails and the
 >   screenshot does not move, check the registration order first.
+> - **A malformed level is a `LevelError`, never a crash — and `BadValue` is
+>   the one that surprises people.** A NaN encodes perfectly well, so a broken
+>   authoring step produces a file that saves cleanly and is refused on the way
+>   back IN. Run `scene::verify_level_roundtrip` in your export tool and the
+>   refusal happens there instead of in a player's install; that is what
+>   `playground --export-level` does before it claims success.
+> - **`playground --dump-level FILE` needs no window, no GPU and no assets.**
+>   It is the mode that still works when the file is the thing that is broken,
+>   and it is the only way to see what is actually in a `.level` without
+>   writing a parser.
 > - **Do not decompose a matrix to author a level instance.** Capture the
 >   translate/yaw/scale inputs at the composition site
 >   (`PlaygroundGame::place_prop` is the worked example). Recovering them from
@@ -658,19 +792,28 @@ Step 6 is pinned by the five digest tests in `frame_test.test.cpp`.
 *Building & testing — add next to `--build-pack`:*
 
 > `playground --export-level village.level` writes the hand-authored village out
-> as a `.level` (plus a readable `.level.txt` dump) and exits;
+> as a `.level` (plus a readable `.level.txt` dump) and exits. **It verifies
+> itself**: the level is round-tripped through its own encoder, then read back
+> off disk, resolved against the same model manager, and compared to the live
+> prop list matrix by matrix — `[level] roundtrip OK: N props reload
+> bit-identical` and exit 0, or a `roundtrip FAILED` line and exit 1. The proof
+> is a build step, not an eyeball.
+>
 > `playground --smoke 30 --level village.level` rebuilds the prop / marker /
-> collider layer from that file instead of running the C++ layout. Both runs
-> print `[level] source=… props=N digest=0x…` at init and **the digests must
-> match** — that line, not `mean_luma`, is the round-trip gate (an aggregate
-> over 1.44M pixels cannot see a single prop shift by a ulp). The smoke
-> screenshot pins must also still hold.
+> collider layer from that file instead of running the C++ layout; that is the
+> broader gate, because it proves the RENDERER cannot tell the difference. Both
+> runs print `[level] source=… props=N digest=0x…` at init and **the digests
+> must match** — that line, not `mean_luma`, is what sees a single prop shifting
+> by a ulp. The smoke screenshot pins must also still hold.
+>
+> `playground --dump-level village.level` prints the file as text and exits;
+> it needs no display, no GPU and no assets.
 
 ---
 
 ## Tests
 
-`src/bracken/scene/level.test.cpp` (26):
+`src/bracken/scene/level.test.cpp` (51):
 
 | Test | Asserts |
 |---|---|
@@ -701,6 +844,36 @@ Step 6 is pinned by the five digest tests in `frame_test.test.cpp`.
 | `ScatterSliceRefusesAnOutOfRangeRule` | |
 | `MarkersAreQueryableByRole`, `OutOfRangeTableIndicesAnswerRatherThanAbort`, `TerrainConvertsToAndFromAHeightmap`, `DumpNamesEverySection` | |
 
+Hostile input (second pass):
+
+| Test | Asserts |
+|---|---|
+| `ANaNInAnInstanceIsRefused` | a NaN position and an infinite scale each → `BadValue`; the same level with finite values → `is_ok`, so the refusal is about the value and not the shape |
+| `ANaNAnywhereElseIsRefusedToo` | seven sections one at a time — env sun dir, terrain origin, nav cell size, a point light's intensity, water damping, a marker position, a scatter step |
+| `AnIntegerFieldIsNotMistakenForANaN` | `motion_id = 0x7FC00001` and `lod_hint = 0xFF800000` (NaN and -inf bit patterns) load unchanged — the reason finiteness is checked per FIELD and not as a blanket byte scan |
+| `TerrainThatContradictsItsOwnResolutionIsRefused` | resolution that does not square to the sample count, splat resolution that does not match the byte count, and an odd number of sample bytes → `BadTable`. Without this a `Heightmap` indexes at `z * resolution + x` past the end of its data |
+| `AnAbsurdTerrainResolutionIsRefusedRatherThanSquared` | −1, `k_max_terrain_resolution + 1`, 2⁴⁰ |
+| `AnAbsurdNavGridIsRefused` | negative sides, an over-budget product, AND `2⁴⁰ × 2⁴⁰` — the case a bounds check written as `width * depth > cap` alone would ACCEPT, because the product overflows |
+| `ATinyStrideCannotAmplifyASmallBlobIntoAHugeTable` | a 1-byte stride over `k_max_table_rows + 1` rows → `BadTable`; the same shape at 64 rows still loads, because a short stride is the format's forward-compatibility mechanism and not the thing being refused |
+| `ANameCountLargerThanTheDocumentIsRefused` | 4096 models declared in a three-record file; `k_max_name_table_rows + 1` strings |
+| **`EveryTruncationOfAValidLevelIsRefusedRatherThanCrashing`** | every prefix of a valid file, byte by byte, is a named error and never a parse — the whole fuzz corpus a format this small needs, and the test to run under ASan |
+| `EverySingleByteCorruptionIsRefused` | every 17th byte flipped is caught, skipping only the container's unchecked `game_version` field |
+| `OutOfRangeIndicesAreRefusedByTheReaderNotFollowed` | model index 4000 of 1, marker name 9999, a scatter slice past the table: each answers empty, the instance is counted as `instances_dropped_bad_index`, and the dump still renders |
+| `ScatterOutputIsCappedRatherThanUnbounded` | a rule whose ground accepts every one of 1.44M candidates stops at `k_max_scatter_instances` |
+
+The exporter surface and inspection:
+
+| Test | Asserts |
+|---|---|
+| `DigestIsFieldSensitiveAndIgnoresHostExtras` | seventeen single-field mutations each move `level_digest`, including SWAPPING two instances (order is content); a record written to `extras()` does not |
+| `VerifyRoundTripAcceptsAGoodLevelAndNamesABadOne` | a good level passes; a NaN → `BadValue`; a terrain header contradicting its blob → `BadTable` |
+| `HostRecordsUnderASchemaPrefixAreDroppedNotSmuggled` | a host record under `instances/` or `models/` is dropped rather than left in the file to override the schema; its own-prefix records survive |
+| `WaterConvertsBothWaysFieldForField` | `to_water_region` → `to_level_water` is `memcmp`-identical over a fully perturbed region |
+| `EveryEnvironmentFloatSurvivesTheRoundTrip` | every float slot of `EnvironmentState` filled with a distinct value survives — the tripwire for a field added without a record in `write_env`/`read_env` |
+| `DumpShowsEveryRowWhenAskedAndTruncatesByDefault` | `max_rows = 0` shows all 45 instances, the default shows 8, and every section (lights, water, extras, digest) appears |
+| `ExportVerifiesBeforeItWritesAndDropsTheSidecar` | a good level writes both files and reloads to the same digest; a NaN level fails verification and leaves NOTHING on disk; `write_dump = false` skips the sidecar and is not an error |
+| `DumpOfAnEmptyLevelIsStillAnswerable`, `DumpSidecarIsWrittenAndReadable` | an empty level dumps; the sidecar equals the full dump; an unopenable path is `WriteFailed`, not an abort |
+
 `src/bracken/testing/frame_test.test.cpp` (5 added):
 `DigestIsStableForIdenticalFrames`, `DigestIsOrderSensitive` (same two draws,
 swapped → different digest), `DigestIsFieldSensitive` (one tint component, one
@@ -714,17 +887,33 @@ it), `DigestIsIndependentOfLaneCount`, `DigestDistinguishesAnEmptyFrame`.
 
 ### What the tests do not cover
 
-The playground round trip itself. `--export-level` / `--level` cannot run in the
-unit suite (it needs a GPU, a display and the 50 MB asset set), so the in-tree
-proof is the engine-side digest test above, and the playground pair is a
-**manual gate**:
+**The playground round trip is now self-checking, but it has still never been
+run.** `--export-level` performs the whole proof in-process — encoder round
+trip, reload off disk, resolve against the live `ModelManager`, `memcmp` every
+matrix against `props_` — and exits non-zero if any of it disagrees, so it no
+longer depends on a human comparing two log lines. It cannot run in the unit
+suite (it needs a GPU, a display and the 50 MB asset set), so the in-tree proof
+remains the engine-side digest test above, and this is the gate to run by hand:
 
 ```
-playground --export-level village.level
-playground --smoke 30
-playground --smoke 30 --level village.level
+playground --export-level village.level     # must print [level] roundtrip OK, exit 0
+playground --dump-level village.level        # must show 2550 instances, 47 models
+playground --smoke 30                        # the pinned mean_luma / stddev
+playground --smoke 30 --level village.level  # same [level] digest=, same pins
 ```
 
-The two `[level] … digest=` lines must match, and both `--smoke` runs must
-report the pinned `mean_luma` / `stddev`. Neither has been executed — this
-change was developed against `-fsyntax-only`.
+None of the four has been executed: this change was developed against
+`-fsyntax-only`, in a worktree with no build tree.
+
+Also uncovered, deliberately:
+
+* **the scatter instance cap under a realistic rule** — the cap test forces it
+  with a 1.44M-candidate grid, which is a plausible authoring mistake but not a
+  plausible level;
+* **`k_max_name_table_rows`, `k_max_terrain_resolution` and `k_max_nav_cells`
+  as VALUES.** They are ceilings picked to be far past anything this engine
+  renders, not measured limits. The property under test is that a file cannot
+  push past them, not that these are the right numbers;
+* **concurrent load.** `load_level` is main-thread/loading tier and asserts
+  `NOT_SIM_STAGE`; two threads loading into one `ModelManager` is the
+  ModelManager's contract, not this format's.

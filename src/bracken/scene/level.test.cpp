@@ -11,16 +11,21 @@
 #include <gtest/gtest.h>
 
 #include "bracken/model_loader.hpp"
+#include "bracken/render/water_renderer.hpp"
 #include "bracken/save/save_document.hpp"
 #include "bracken/scene/level.hpp"
 #include "bracken/testing/frame_test.hpp"
 
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <glm/gtc/matrix_transform.hpp>
+#include <limits>
 #include <memory>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 using bracken::Model;
@@ -605,7 +610,8 @@ TEST(Level, AFutureSchemaIsRefusedRatherThanGuessedAt) {
 
 TEST(Level, EveryErrorHasAMessage) {
     for (auto e : {LevelError::FileNotFound, LevelError::NotALevelFile, LevelError::Corrupt,
-                   LevelError::FutureVersion, LevelError::WriteFailed, LevelError::BadTable}) {
+                   LevelError::FutureVersion, LevelError::WriteFailed, LevelError::BadTable,
+                   LevelError::BadValue}) {
         EXPECT_STRNE(to_string(e), "unknown");
     }
 }
@@ -873,4 +879,538 @@ TEST(Level, DumpNamesEverySection) {
     EXPECT_NE(text.find("environment:"), std::string::npos);
     EXPECT_NE(text.find("nav:"), std::string::npos);
     EXPECT_NE(text.find("instances"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Hostile input
+//
+// A `.level` is untrusted the moment it can arrive from anywhere but the build
+// that wrote it. The contract these pin, stated in level.hpp: never a crash,
+// never an allocation on a number the file made up, always a named LevelError.
+//
+// Every test below builds its bad file through the REAL encoder or the real
+// container, so none of them can pass by accident against a decoder that
+// simply refuses everything — the good-file cases above prove it accepts.
+// ---------------------------------------------------------------------------
+
+// The whole point of BadValue: a NaN encodes perfectly well and is refused on
+// the way back in, before it can become a matrix.
+TEST(Level, ANaNInAnInstanceIsRefused) {
+    Level level;
+    level.add_instance("prop_crate", {0.0f, std::numeric_limits<float>::quiet_NaN(), 0.0f}, 0.0f, 1.0f);
+    auto r = parse_level(serialize_level(level));
+    ASSERT_TRUE(r.is_err());
+    EXPECT_EQ(r.error(), LevelError::BadValue);
+
+    // An infinity is the same class of poison and is refused the same way.
+    Level infinite;
+    infinite.add_instance("prop_crate", {0.0f, 0.0f, 0.0f}, 0.0f,
+                          std::numeric_limits<float>::infinity());
+    auto inf = parse_level(serialize_level(infinite));
+    ASSERT_TRUE(inf.is_err());
+    EXPECT_EQ(inf.error(), LevelError::BadValue);
+
+    // ... and a finite level of the same shape is accepted, so the refusal is
+    // about the value and not about the shape.
+    Level good;
+    good.add_instance("prop_crate", {0.0f, 1.0f, 0.0f}, 0.0f, 1.0f);
+    EXPECT_TRUE(parse_level(serialize_level(good)).is_ok());
+}
+
+TEST(Level, ANaNAnywhereElseIsRefusedToo) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+
+    {
+        Level level = make_full_level();
+        level.environment->sun_dir.y = nan;
+        auto r = parse_level(serialize_level(level));
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadValue) << "a NaN sun direction reached the frame";
+    }
+    {
+        Level level = make_full_level();
+        level.terrain->origin_x = nan;
+        auto r = parse_level(serialize_level(level));
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadValue);
+    }
+    {
+        Level level = make_full_level();
+        level.nav->cell_size = nan;
+        auto r = parse_level(serialize_level(level));
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadValue);
+    }
+    {
+        Level level = make_full_level();
+        level.point_lights[0].intensity = nan;
+        auto r = parse_level(serialize_level(level));
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadValue);
+    }
+    {
+        Level level = make_full_level();
+        level.water[0].wave_damping = nan;
+        auto r = parse_level(serialize_level(level));
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadValue);
+    }
+    {
+        Level level = make_full_level();
+        level.markers[1].position.z = nan;
+        auto r = parse_level(serialize_level(level));
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadValue);
+    }
+    {
+        Level level = make_full_level();
+        level.scatter_rules[0].step = nan;
+        auto r = parse_level(serialize_level(level));
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadValue);
+    }
+}
+
+// A model INDEX that happens to look like a NaN when read as a float must not
+// be refused — which is why the finiteness checks are per-field and not a
+// blanket byte scan of the row.
+TEST(Level, AnIntegerFieldIsNotMistakenForANaN) {
+    Level level;
+    level.models.assign(1, "prop_crate");
+    level.model_sources.assign(1, "");
+    LevelInstance inst;
+    inst.model = 0;
+    // 0x7FC00001 is a quiet NaN bit pattern. As a motion id it is just a
+    // number, and a decoder that scanned the row as floats would reject it.
+    inst.motion_id = 0x7FC00001u;
+    inst.lod_hint = 0xFF800000u; // -infinity's bit pattern
+    inst.flags = DrawFlags::NoFog;
+    level.instances.push_back(inst);
+
+    auto r = parse_level(serialize_level(level));
+    ASSERT_TRUE(r.is_ok()) << to_string(r.error());
+    EXPECT_EQ(r.value().instances[0].motion_id, 0x7FC00001u);
+    EXPECT_EQ(r.value().instances[0].lod_hint, 0xFF800000u);
+}
+
+// The heightmap's header and its blob must agree, because `Heightmap` indexes
+// at `z * resolution + x` and a resolution larger than the data is an
+// out-of-bounds read at the first sample.
+TEST(Level, TerrainThatContradictsItsOwnResolutionIsRefused) {
+    {
+        Level level = make_full_level();
+        level.terrain->resolution = 64; // 16 samples on hand
+        auto r = parse_level(serialize_level(level));
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadTable);
+    }
+    {
+        Level level = make_full_level();
+        level.terrain->splat_resolution = 9; // 16 bytes on hand, wants 324
+        auto r = parse_level(serialize_level(level));
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadTable);
+    }
+    {
+        // An odd number of sample BYTES is not a whole number of samples.
+        bracken::save::SaveDocument doc;
+        doc.write("level/version", static_cast<int64_t>(k_level_format_version));
+        doc.write("terrain/present", true);
+        doc.write("terrain/resolution", int64_t{2});
+        const std::array<std::byte, 7> odd{};
+        doc.write_blob("terrain/samples", odd);
+        auto r = parse_level(doc.serialize());
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadTable);
+    }
+}
+
+TEST(Level, AnAbsurdTerrainResolutionIsRefusedRatherThanSquared) {
+    for (const int64_t resolution : {int64_t{-1}, int64_t{k_max_terrain_resolution} + 1, int64_t{1} << 40}) {
+        bracken::save::SaveDocument doc;
+        doc.write("level/version", static_cast<int64_t>(k_level_format_version));
+        doc.write("terrain/present", true);
+        doc.write("terrain/resolution", resolution);
+        auto r = parse_level(doc.serialize());
+        ASSERT_TRUE(r.is_err()) << "resolution " << resolution << " was accepted";
+        EXPECT_EQ(r.error(), LevelError::BadTable);
+    }
+}
+
+// NavGrid::build allocates width * depth cells, so a file's word on the matter
+// is the one number that must not be believed.
+TEST(Level, AnAbsurdNavGridIsRefused) {
+    struct Case {
+        int64_t width;
+        int64_t depth;
+    };
+    // The last pair is the overflow case: multiplied as int64 it wraps, so a
+    // bounds check written as `width * depth > cap` alone would ACCEPT it.
+    for (const Case c : {Case{-1, 10}, Case{10, -1}, Case{1 << 20, 1 << 20}, Case{1LL << 40, 1LL << 40}}) {
+        bracken::save::SaveDocument doc;
+        doc.write("level/version", static_cast<int64_t>(k_level_format_version));
+        doc.write("nav/present", true);
+        doc.write("nav/width", c.width);
+        doc.write("nav/depth", c.depth);
+        auto r = parse_level(doc.serialize());
+        ASSERT_TRUE(r.is_err()) << "nav " << c.width << "x" << c.depth << " was accepted";
+        EXPECT_EQ(r.error(), LevelError::BadTable);
+    }
+}
+
+// The tight bound on the two path-addressed tables: a table of N names needs 2N
+// records to exist, so a count larger than the whole document is a lie the
+// file's own size disproves. Without this, a 200-byte file can ask for a
+// gigabyte of empty strings.
+TEST(Level, ANameCountLargerThanTheDocumentIsRefused) {
+    bracken::save::SaveDocument doc;
+    doc.write("level/version", static_cast<int64_t>(k_level_format_version));
+    doc.write("models/count", int64_t{4096}); // three records in the whole file
+    auto r = parse_level(doc.serialize());
+    ASSERT_TRUE(r.is_err());
+    EXPECT_EQ(r.error(), LevelError::BadTable);
+
+    bracken::save::SaveDocument strings;
+    strings.write("level/version", static_cast<int64_t>(k_level_format_version));
+    strings.write("strings/count", int64_t{k_max_name_table_rows} + 1);
+    auto s = parse_level(strings.serialize());
+    ASSERT_TRUE(s.is_err());
+    EXPECT_EQ(s.error(), LevelError::BadTable);
+}
+
+// The amplification bound. The blob's length alone only bounds the row count by
+// `length / stride`, and the stride comes from the file too — a declared stride
+// of 1 turns a small blob into millions of 52-byte rows.
+TEST(Level, ATinyStrideCannotAmplifyASmallBlobIntoAHugeTable) {
+    constexpr int64_t k_rows = int64_t{k_max_table_rows} + 1;
+    auto parsed = parse_level(hand_built_level(k_rows, 1, static_cast<std::size_t>(k_rows), {}));
+    ASSERT_TRUE(parsed.is_err());
+    EXPECT_EQ(parsed.error(), LevelError::BadTable);
+
+    // The same shape one row under the ceiling is structurally fine — the
+    // refusal is about the ceiling, not about short strides, which are the
+    // format's forward-compatibility mechanism.
+    constexpr int64_t k_ok_rows = 64;
+    auto small = parse_level(hand_built_level(k_ok_rows, 1, static_cast<std::size_t>(k_ok_rows), {}));
+    ASSERT_TRUE(small.is_ok()) << to_string(small.error());
+    EXPECT_EQ(small.value().instances.size(), static_cast<std::size_t>(k_ok_rows));
+}
+
+// The blunt instrument, and the one that finds what a case-by-case test does
+// not: EVERY prefix of a valid file must be refused with a named error, and
+// none of them may read out of bounds (run this under ASan and it is the whole
+// fuzz corpus a format this small needs).
+TEST(Level, EveryTruncationOfAValidLevelIsRefusedRatherThanCrashing) {
+    const std::vector<std::byte> whole = serialize_level(make_full_level());
+    ASSERT_GT(whole.size(), 512u);
+
+    for (std::size_t n = 0; n < whole.size(); ++n) {
+        auto r = parse_level(std::span<const std::byte>(whole.data(), n));
+        ASSERT_TRUE(r.is_err()) << "a " << n << "-byte prefix of a " << whole.size()
+                                << "-byte level parsed as a complete level";
+        // Which error is not the point — that it IS an error, every time, is.
+        EXPECT_TRUE(r.error() == LevelError::NotALevelFile || r.error() == LevelError::Corrupt ||
+                    r.error() == LevelError::FutureVersion || r.error() == LevelError::BadTable ||
+                    r.error() == LevelError::BadValue)
+            << "prefix " << n << " produced an unexpected error";
+    }
+    EXPECT_TRUE(parse_level(whole).is_ok());
+}
+
+// Every single-byte corruption must be caught. The payload checksum is what
+// does it; the header cases fall out as NotASaveFile / FutureVersion / Corrupt.
+TEST(Level, EverySingleByteCorruptionIsRefused) {
+    const std::vector<std::byte> whole = serialize_level(make_full_level());
+    ASSERT_GT(whole.size(), 512u);
+
+    // Bytes 12..15 are the container's `game_version` — host metadata it
+    // round-trips and deliberately does not validate, so corrupting one
+    // produces a level that loads with a different content_version and no
+    // error. That is the format's stated behaviour, not a hole in this sweep.
+    constexpr std::size_t k_game_version_offset = 12;
+
+    // Every 17th byte: a full sweep is tens of thousands of parses of a
+    // 500-record document and buys nothing a coprime stride does not.
+    for (std::size_t i = 0; i < whole.size(); i += 17) {
+        if (i >= k_game_version_offset && i < k_game_version_offset + 4) {
+            continue;
+        }
+        std::vector<std::byte> damaged = whole;
+        damaged[i] = static_cast<std::byte>(std::to_integer<uint8_t>(damaged[i]) ^ 0x5Au);
+        auto r = parse_level(damaged);
+        EXPECT_TRUE(r.is_err()) << "flipping byte " << i << " of " << whole.size()
+                                << " produced a level that loaded cleanly";
+    }
+}
+
+// Indices into the two name tables are the format's only "pointers". None of
+// them may be followed off the end — a level whose instance names model 4000
+// of 2 is counted as a drop, and a marker naming string 9999 answers "".
+TEST(Level, OutOfRangeIndicesAreRefusedByTheReaderNotFollowed) {
+    Level level;
+    (void)level.intern_model("prop_crate");
+    (void)level.intern_string("spawn");
+
+    LevelInstance inst;
+    inst.model = 4000u;
+    level.instances.push_back(inst);
+    LevelMarker marker;
+    marker.name = 9999u;
+    level.markers.push_back(marker);
+    LevelScatterRule rule;
+    rule.name = 12345u;
+    rule.model_first = 77u;
+    rule.model_count = 88u;
+    level.scatter_rules.push_back(rule);
+
+    auto r = parse_level(serialize_level(level));
+    ASSERT_TRUE(r.is_ok()) << to_string(r.error());
+    const Level& back = r.value();
+
+    EXPECT_TRUE(back.model_name(back.instances[0].model).empty());
+    EXPECT_TRUE(back.string_at(back.markers[0].name).empty());
+    EXPECT_TRUE(back.scatter_slice(back.scatter_rules[0]).empty());
+
+    ModelManager mm;
+    register_all(mm, {"prop_crate"});
+    ResolvedLevel resolved;
+    const LevelResolveReport report = resolved.resolve(back, mm);
+    EXPECT_EQ(report.instances_placed, 0u);
+    EXPECT_EQ(report.instances_dropped_bad_index, 1u);
+    EXPECT_TRUE(resolved.draws().empty());
+
+    // And the dump — the thing you reach for when a file is already suspect —
+    // must survive all of it.
+    EXPECT_FALSE(level_dump(back, 0).empty());
+}
+
+// The output bound. The cells-per-axis ceiling alone still permits 8192^2
+// candidates; without this a rule whose ground accepts everything allocates
+// until the process dies.
+TEST(Level, ScatterOutputIsCappedRatherThanUnbounded) {
+    LevelScatterRule rule;
+    rule.outer_radius = 600.0f;
+    rule.step = 1.0f;  // 1200 cells per axis, ~1.13M inside the circle
+    rule.jitter = 0.0f;
+    const LevelScatterModel model{0u, 1.0f, 1.0f, 1.0f};
+    const std::span<const LevelScatterModel> models(&model, 1);
+
+    const auto flat = [](float, float) { return std::optional<float>(0.0f); };
+    const std::vector<LevelInstance> out = scatter_ground_cover(rule, models, flat);
+    EXPECT_EQ(out.size(), static_cast<std::size_t>(k_max_scatter_instances));
+}
+
+// ---------------------------------------------------------------------------
+// The engine-side exporter surface
+// ---------------------------------------------------------------------------
+
+TEST(Level, DigestIsFieldSensitiveAndIgnoresHostExtras) {
+    const Level base = make_full_level();
+    const uint64_t reference = level_digest(base);
+    EXPECT_EQ(reference, level_digest(make_full_level())) << "the digest is not a function of the content";
+
+    const auto moved = [&](auto&& mutate) {
+        Level copy = base;
+        mutate(copy);
+        return level_digest(copy) != reference;
+    };
+    EXPECT_TRUE(moved([](Level& l) { l.instances[2].position.x += 0.001f; }));
+    EXPECT_TRUE(moved([](Level& l) { l.instances[2].tint.a = 0.5f; }));
+    EXPECT_TRUE(moved([](Level& l) { l.instances[0].flags = DrawFlags::None; }));
+    EXPECT_TRUE(moved([](Level& l) { std::swap(l.instances[0], l.instances[1]); }))
+        << "the digest is order-insensitive, so it cannot prove draw order survived";
+    EXPECT_TRUE(moved([](Level& l) { l.name = "elsewhere"; }));
+    EXPECT_TRUE(moved([](Level& l) { l.models[0] = "prop_barrel"; }));
+    EXPECT_TRUE(moved([](Level& l) { l.model_sources[0] = "other.glb"; }));
+    EXPECT_TRUE(moved([](Level& l) { l.markers[0].yaw += 0.1f; }));
+    EXPECT_TRUE(moved([](Level& l) { l.point_lights[0].casts_shadows = false; }));
+    EXPECT_TRUE(moved([](Level& l) { l.spot_lights[0].outer_angle.value += 1.0f; }));
+    EXPECT_TRUE(moved([](Level& l) { l.water[0].wave_speed += 1.0f; }));
+    EXPECT_TRUE(moved([](Level& l) { l.terrain->samples[3] += 1; }));
+    EXPECT_TRUE(moved([](Level& l) { l.terrain->splat[3] += 1; }));
+    EXPECT_TRUE(moved([](Level& l) { l.environment->cloud_density += 0.01f; }));
+    EXPECT_TRUE(moved([](Level& l) { l.nav->width += 1; }));
+    EXPECT_TRUE(moved([](Level& l) { l.scatter_rules[0].seed += 1; }));
+    EXPECT_TRUE(moved([](Level& l) { l.terrain.reset(); }));
+
+    // extras() is the HOST's channel. A game that writes a frame counter into
+    // it must not make every level unequal to itself.
+    Level with_extras = base;
+    with_extras.extras().write("mygame/frame", int64_t{12345});
+    EXPECT_EQ(level_digest(with_extras), reference);
+}
+
+TEST(Level, VerifyRoundTripAcceptsAGoodLevelAndNamesABadOne) {
+    Level level = make_full_level();
+    level.extras().write("mygame/checkpoint", std::string_view("bridge"));
+    auto ok = verify_level_roundtrip(level);
+    EXPECT_TRUE(ok) << to_string(ok.error());
+
+    // The case this exists to catch at EXPORT time rather than at load time.
+    Level poisoned = make_full_level();
+    poisoned.instances[1].position.z = std::numeric_limits<float>::quiet_NaN();
+    auto bad = verify_level_roundtrip(poisoned);
+    ASSERT_TRUE(bad.is_err());
+    EXPECT_EQ(bad.error(), LevelError::BadValue);
+
+    // A terrain header that disagrees with its own blob is likewise an
+    // export-time failure, not a mystery in the shipped build.
+    Level inconsistent = make_full_level();
+    inconsistent.terrain->resolution = 5;
+    auto table = verify_level_roundtrip(inconsistent);
+    ASSERT_TRUE(table.is_err());
+    EXPECT_EQ(table.error(), LevelError::BadTable);
+}
+
+// Host records survive; host records that SQUAT on the schema's own prefixes do
+// not, because the encoder would otherwise leave `models/9/name` in a
+// three-model file for the next reader to trip over.
+TEST(Level, HostRecordsUnderASchemaPrefixAreDroppedNotSmuggled) {
+    Level level = make_full_level();
+    level.extras().write("mygame/save_slot", int64_t{3});
+    level.extras().write("instances/count", int64_t{999999});
+    level.extras().write("models/9/name", std::string_view("ghost"));
+
+    auto r = parse_level(serialize_level(level));
+    ASSERT_TRUE(r.is_ok()) << to_string(r.error());
+    const Level& back = r.value();
+
+    EXPECT_EQ(back.instances.size(), level.instances.size()) << "a squatted record overrode the schema";
+    EXPECT_EQ(back.models.size(), level.models.size());
+    EXPECT_TRUE(back.extras().has("mygame/save_slot"));
+    EXPECT_FALSE(back.extras().has("instances/count"));
+    EXPECT_FALSE(back.extras().has("models/9/name"));
+    EXPECT_EQ(back.extras().record_count(), 1u);
+}
+
+TEST(Level, WaterConvertsBothWaysFieldForField) {
+    // Every field perturbed away from its default: a conversion that forgot one
+    // would otherwise pass by inheriting the same default on both sides.
+    const LevelWater original = make_full_level().water[0];
+    const bracken::render::WaterRegion region = to_water_region(original);
+    const LevelWater back = to_level_water(region);
+    EXPECT_EQ(0, std::memcmp(&original, &back, sizeof(LevelWater)))
+        << "to_water_region / to_level_water lost or transposed a field";
+
+    // Spot-check the two that are easiest to transpose.
+    EXPECT_EQ(region.min_z, original.min_z);
+    EXPECT_EQ(region.max_x, original.max_x);
+    EXPECT_EQ(region.sim_center, original.sim_center);
+}
+
+// A tripwire for a field ADDED to EnvironmentState without a record in
+// write_env/read_env: the struct is float-only, so filling every float slot
+// with a distinct value catches a new member that nobody wired up.
+TEST(Level, EveryEnvironmentFloatSurvivesTheRoundTrip) {
+    constexpr std::size_t k_floats = sizeof(bracken::render::EnvironmentState) / sizeof(float);
+    static_assert(sizeof(bracken::render::EnvironmentState) % sizeof(float) == 0,
+                  "EnvironmentState gained a member that is not a float; this test needs revisiting");
+
+    std::array<float, k_floats> pattern{};
+    for (std::size_t i = 0; i < k_floats; ++i) {
+        pattern[i] = 0.125f + static_cast<float>(i) * 1.5f; // exact in binary32
+    }
+    // Written slot by slot through a byte pointer: EnvironmentState has default
+    // member initializers, so a whole-struct memcpy into it is a
+    // -Wclass-memaccess error even though its layout is exactly these floats.
+    bracken::render::EnvironmentState env;
+    auto* slots = reinterpret_cast<unsigned char*>(&env);
+    for (std::size_t i = 0; i < k_floats; ++i) {
+        std::memcpy(slots + i * sizeof(float), &pattern[i], sizeof(float));
+    }
+
+    Level level;
+    level.environment = env;
+    auto r = parse_level(serialize_level(level));
+    ASSERT_TRUE(r.is_ok()) << to_string(r.error());
+    ASSERT_TRUE(r.value().environment.has_value());
+    EXPECT_EQ(0, std::memcmp(&env, &*r.value().environment, sizeof(env)))
+        << "an EnvironmentState field is not carried by write_env/read_env";
+}
+
+// ---------------------------------------------------------------------------
+// Inspection
+// ---------------------------------------------------------------------------
+
+TEST(Level, DumpShowsEveryRowWhenAskedAndTruncatesByDefault) {
+    Level level = make_full_level();
+    for (int i = 0; i < 40; ++i) {
+        level.add_instance("prop_crate", {static_cast<float>(i), 0.0f, 0.0f}, 0.0f, 1.0f);
+    }
+    level.extras().write("mygame/save_slot", int64_t{3});
+
+    const std::string preview = level_dump(level);
+    const std::string full = level_dump(level, 0);
+    EXPECT_LT(preview.size(), full.size());
+    EXPECT_NE(preview.find("showing 8 of 45"), std::string::npos) << preview.substr(0, 400);
+    EXPECT_NE(full.find("showing 45 of 45"), std::string::npos);
+
+    // Every section a reader needs to answer "what is in this file".
+    for (const char* needle : {"riverside", "digest 0x", "prop_crate", "player_spawn", "scatter rule",
+                               "terrain:", "environment:", "nav:", "point [", "spot  [", "water [0]",
+                               "mygame/save_slot"}) {
+        EXPECT_NE(full.find(needle), std::string::npos) << "the dump does not mention " << needle;
+    }
+}
+
+TEST(Level, DumpOfAnEmptyLevelIsStillAnswerable) {
+    const std::string text = level_dump(Level{});
+    EXPECT_NE(text.find("instances     0"), std::string::npos);
+    EXPECT_EQ(text.find("terrain:"), std::string::npos);
+    EXPECT_EQ(text.find("extras"), text.rfind("extras")); // the counts line only
+}
+
+// The exporter entry point: the ORDER is the policy it owns. A level that
+// cannot survive its own encoder must not become a file, so a failed
+// verification must leave nothing on disk.
+TEST(Level, ExportVerifiesBeforeItWritesAndDropsTheSidecar) {
+    {
+        TempFile f("bracken_level_export_ok.level");
+        std::error_code sidecar_ec;
+        const Level level = make_full_level();
+        auto r = export_level(level, f.path);
+        ASSERT_TRUE(r) << to_string(r.error());
+        EXPECT_TRUE(std::filesystem::exists(f.path));
+        EXPECT_TRUE(std::filesystem::exists(f.path + ".txt"));
+        auto back = load_level(f.path);
+        ASSERT_TRUE(back.is_ok()) << to_string(back.error());
+        EXPECT_EQ(level_digest(back.value()), level_digest(level));
+        std::filesystem::remove(f.path + ".txt", sidecar_ec);
+    }
+    {
+        TempFile f("bracken_level_export_bad.level");
+        Level poisoned = make_full_level();
+        poisoned.instances[0].scale = std::numeric_limits<float>::quiet_NaN();
+        auto r = export_level(poisoned, f.path);
+        ASSERT_TRUE(r.is_err());
+        EXPECT_EQ(r.error(), LevelError::BadValue);
+        EXPECT_FALSE(std::filesystem::exists(f.path))
+            << "a level that fails verification still reached the disk";
+    }
+    {
+        // The sidecar is opt-out, and skipping it is not an error.
+        TempFile f("bracken_level_export_nodump.level");
+        std::error_code stale_ec;
+        std::filesystem::remove(f.path + ".txt", stale_ec); // left by a previous run
+        auto r = export_level(make_full_level(), f.path, /*write_dump=*/false);
+        ASSERT_TRUE(r) << to_string(r.error());
+        EXPECT_TRUE(std::filesystem::exists(f.path));
+        EXPECT_FALSE(std::filesystem::exists(f.path + ".txt"));
+    }
+}
+
+TEST(Level, DumpSidecarIsWrittenAndReadable) {
+    TempFile f("bracken_level_dump.txt");
+    const Level level = make_full_level();
+    auto r = save_level_dump(level, f.path);
+    ASSERT_TRUE(r) << to_string(r.error());
+
+    std::ifstream in(f.path);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(text, level_dump(level, 0)) << "the sidecar is not the full dump";
+
+    // A path that cannot be opened is a WriteFailed, not an abort.
+    auto bad = save_level_dump(level, temp_path("no_such_directory_here/level.txt"));
+    ASSERT_TRUE(bad.is_err());
+    EXPECT_EQ(bad.error(), LevelError::WriteFailed);
 }

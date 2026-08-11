@@ -71,6 +71,15 @@ namespace bracken {
 class ModelManager;
 }
 
+namespace bracken::render {
+/// Declared, not included: `render/water_renderer.hpp` pulls in `gpu_buffer`,
+/// `gpu_texture` and `<SDL3/SDL_gpu.h>`, and a level header that dragged the
+/// GPU layer into every host TU would be the same mistake `application.hpp` is
+/// pinned against. The two conversion functions below are declared here and
+/// DEFINED in level.cpp, which may include that header freely.
+struct WaterRegion;
+} // namespace bracken::render
+
 namespace bracken::scene {
 
 class FrameSink;
@@ -85,13 +94,94 @@ enum class LevelError : uint8_t {
     Corrupt,        ///< checksum failed, or the payload is truncated
     FutureVersion,  ///< written by a newer level schema than this build knows
     WriteFailed,
-    /// A blob table's `count` * `stride` disagrees with the blob's length. The
+    /// A blob table's `count` * `stride` disagrees with the blob's length, a
+    /// declared table length is absurd, or a section's parts contradict each
+    /// other (a 512-sample heightmap that calls itself 257 across). The
     /// checksum passed, so this is a WRITER bug or a hand-edited file, not bit
     /// rot — and it is refused rather than half-read.
     BadTable,
+    /// A number that survives the container but cannot survive the renderer: a
+    /// NaN or an infinity in a position, a scale, a colour, a fog distance.
+    ///
+    /// Refused at LOAD, which is the only place it can be refused cheaply. A
+    /// NaN that reaches a transform poisons its whole matrix, and a NaN matrix
+    /// in the frame packet propagates into culling (every comparison against
+    /// it is false), into the bounding-sphere merge, and into the depth
+    /// pyramid — the symptom is a blank or flickering frame several subsystems
+    /// away from the file that caused it. One `std::isfinite` sweep at load is
+    /// four orders of magnitude cheaper than that debugging session.
+    BadValue,
 };
 
 [[nodiscard]] const char* to_string(LevelError e) noexcept;
+
+// ---------------------------------------------------------------------------
+// What a MALFORMED file may do to you
+//
+// A `.level` is untrusted input the moment it can arrive from anywhere but the
+// build that wrote it — a mod directory, a download, a partially written file,
+// a hand-edited one. The loader's contract, which `level.test.cpp` pins case by
+// case:
+//
+//   * it never reads outside the bytes it was handed (the container's cursor
+//     bounds-checks every take, and every table decode divides rather than
+//     multiplying, so a count can never be trusted into a pointer);
+//   * it never allocates on a number it read without first bounding that
+//     number by something the FILE cannot inflate — a blob's actual length for
+//     the bulk tables, the container's own record count for the two
+//     path-addressed ones, and the explicit ceilings below for the rest;
+//   * every refusal is a `LevelError`, named, with one log line saying which
+//     record was wrong. There is no path from a bad file to an abort, and
+//     no path from a bad file to a half-populated Level: a decode either
+//     returns a complete level or returns an error.
+//
+// What it deliberately does NOT do is validate GAMEPLAY: a level may place a
+// crate under the terrain, aim a spotlight at nothing, or reference a model
+// the host never registers. Those are counted (`LevelResolveReport`) or simply
+// allowed. Structural integrity is the engine's business; whether the level is
+// any good is the game's.
+// ---------------------------------------------------------------------------
+
+/// Rows in the two PATH-ADDRESSED tables (models, strings). Their length comes
+/// from a record rather than from a blob's size, so nothing else bounds it —
+/// and a checksum-valid file can still claim a billion of them. The decode also
+/// refuses any count larger than the container's total record count, which is
+/// the tighter bound (a table of N names needs 2N records to exist); this
+/// ceiling is the coarse one that keeps a small, densely packed file from
+/// asking for gigabytes.
+inline constexpr uint32_t k_max_name_table_rows = 65536;
+
+/// Rows in ANY blob table (instances, markers, water, lights, scatter, grass
+/// exclusions).
+///
+/// The blob's own length already bounds the row count — but only by
+/// `length / stride`, and the stride comes from the file too. A hostile file
+/// declaring a 1-byte stride turns a 10 MB blob into ten million rows of
+/// `sizeof(LevelInstance)`, a 52x amplification, all of it allocated before
+/// anything looks at the contents. This is the ceiling that makes the
+/// amplification bounded rather than proportional. Two million placed
+/// instances is already two orders of magnitude past anything this engine
+/// renders in one level.
+inline constexpr uint32_t k_max_table_rows = 1u << 21;
+
+/// Heightmap resolution ceiling. 8192^2 samples is 128 MB of `uint16_t` — well
+/// past anything this engine renders, and the point of the bound is that
+/// `resolution * resolution` must not overflow or allocate on a file's say-so.
+inline constexpr uint32_t k_max_terrain_resolution = 8192;
+
+/// `width * depth` for a level's nav config. `nav::NavGrid::build` allocates a
+/// cell per unit of it.
+inline constexpr uint32_t k_max_nav_cells = 4u << 20;
+
+/// Grid cells per axis a scatter rule may ask for. A metre-scale step over a
+/// kilometre-scale radius is a typo, and expanding it silently is how a level
+/// load turns into a two-minute hang.
+inline constexpr int k_max_scatter_cells_per_axis = 8192;
+
+/// Instances one scatter rule may produce. The cell bound alone still permits
+/// 8192^2 candidates; this is what keeps the OUTPUT bounded when a ground
+/// callback accepts all of them.
+inline constexpr uint32_t k_max_scatter_instances = 1u << 20;
 
 /**
  * Bump ONLY when the record set changes shape in a way an older build cannot
@@ -240,7 +330,12 @@ struct LevelTerrain {
  * Mirrored and not included: `render/water_renderer.hpp` pulls in `gpu_buffer`,
  * `gpu_texture` and `<SDL3/SDL_gpu.h>`, and a level header that dragged the GPU
  * layer into every host TU would be the same mistake `application.hpp` is
- * pinned against. Convert at the call site — the field names match one to one.
+ * pinned against.
+ *
+ * You do NOT hand-copy the 25 fields: `to_level_water` / `to_water_region`
+ * below are the conversion, defined in level.cpp where the render header is
+ * fair game. A host that copied them itself would be one silently forgotten
+ * field away from a river that loads back with the wrong foam.
  */
 struct LevelWater {
     float min_x = 0.0f;
@@ -463,16 +558,98 @@ private:
 
 [[nodiscard]] std::vector<std::byte> serialize_level(const Level& level);
 
+// ---------------------------------------------------------------------------
+// Inspection
+//
+// A binary format nobody can read is a format nobody debugs. These are the
+// answer to that, and they are DIAGNOSTIC: there is no parser for the text and
+// there should not be one. The playground's `--dump-level <file>` is the
+// shipped tool built out of them, and it needs neither a GPU nor a window.
+// ---------------------------------------------------------------------------
+
 /**
- * A human-readable dump: counts, the model and string tables, the terrain and
- * environment headers, and the first rows of each table.
+ * A human-readable dump: counts, the model and string tables, the terrain,
+ * environment and nav headers, the scatter rules, the carried extra records,
+ * and up to `max_rows` rows of each bulk table.
  *
- * A binary format nobody can read is a format nobody debugs, and this is the
- * answer to that — write it next to the `.level` as a sidecar, or print it
- * from a tool. It is DIAGNOSTIC, not a second serialization: there is no
- * parser for it and there should not be one.
+ * `max_rows == 0` means every row — that is what a tool inspecting a file
+ * wants, and it is why the parameter exists at all. The default of eight is
+ * for the sidecar an exporter drops next to the file, where the point is the
+ * shape of the level rather than its contents.
+ *
+ * Total: it never fails and never aborts. Every index it prints goes through
+ * `model_name` / `string_at`, which answer with "" rather than reading out of
+ * range, because dumping a file is exactly what you do to a file you already
+ * suspect is malformed.
  */
-[[nodiscard]] std::string level_dump(const Level& level);
+[[nodiscard]] std::string level_dump(const Level& level, std::size_t max_rows = 8);
+
+/** `level_dump` written to a file. The `.level.txt` sidecar an exporter drops
+ *  beside the binary. `WriteFailed` if the path cannot be opened. */
+[[nodiscard]] core::Result<void, LevelError> save_level_dump(const Level& level, const std::string& path);
+
+/**
+ * FNV-1a over a level's canonical content, in table order.
+ *
+ * What it is FOR: comparing two levels without comparing two files. The bytes
+ * of a `.level` are not a good identity — the container preserves the order
+ * records were written in, and a level rebuilt with its sections assigned in a
+ * different order is the same level with a different file. This folds the
+ * DATA, in the order the tables define, so two levels that describe the same
+ * scene agree and two that do not, do not.
+ *
+ * What it deliberately excludes: `extras()`. Those records are the HOST's, and
+ * a host that writes a frame counter into them would otherwise make every
+ * level unequal to itself.
+ *
+ * Stable across runs and machines of the same float format: every input is a
+ * stored value, never a recomputed one.
+ */
+[[nodiscard]] uint64_t level_digest(const Level& level) noexcept;
+
+/**
+ * Serialize, parse the result back, and check the two levels agree.
+ *
+ * The round-trip proof as a CALLABLE, so an exporter can gate on it instead of
+ * a human eyeballing two log lines. This is what `--export-level` runs before
+ * it claims success, and what a game's own export tool should run: a level
+ * that cannot survive its own encoder is a level you find out about now, in
+ * the tool, rather than six weeks later when a player's save loads a village
+ * with one crate in the wrong place.
+ *
+ * `BadValue` is the interesting failure and it is not hypothetical: a NaN
+ * position written by a broken authoring step encodes fine and is refused on
+ * the way back in, which is precisely the case this catches at export time.
+ * A digest mismatch with no decode error reports `Corrupt` — the encoder and
+ * the decoder disagree, which is a bug in this file and nowhere else.
+ */
+[[nodiscard]] core::Result<void, LevelError> verify_level_roundtrip(const Level& level);
+
+/**
+ * THE exporter entry point: verify, then write, then drop the text sidecar.
+ *
+ * The order is the policy, and it is why this is a function rather than three
+ * lines in each game's tool. `verify_level_roundtrip` runs FIRST, before a
+ * single byte reaches the disk — a level that cannot survive its own encoder
+ * should not become a file at all, and it is also the cheap half (pure data,
+ * no models, no IO). Only then does `save_level` do its atomic temp+rename.
+ *
+ * `write_dump` controls the `<path>.txt` sidecar. A failed sidecar is a WARN
+ * and not an error: it is a lost convenience, not a lost level.
+ *
+ * Tier: main-thread / loading. Blocking IO.
+ */
+[[nodiscard]] core::Result<void, LevelError> export_level(const Level& level, const std::string& path,
+                                                          bool write_dump = true);
+
+// ---- Water conversion ------------------------------------------------------
+//
+// Declared here, defined in level.cpp against the real `render::WaterRegion`.
+// An incomplete return type is legal in a declaration; a caller needs
+// `render/water_renderer.hpp` included, which any host with water already has.
+
+[[nodiscard]] LevelWater to_level_water(const bracken::render::WaterRegion& region) noexcept;
+[[nodiscard]] bracken::render::WaterRegion to_water_region(const LevelWater& water) noexcept;
 
 // ---------------------------------------------------------------------------
 // Resolution against a ModelManager

@@ -4,12 +4,14 @@
 #include "bracken/core/jobs/job_stage.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/model_loader.hpp"
+#include "bracken/render/water_renderer.hpp"
 #include "bracken/scene/frame_sink.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <fstream>
 #include <glm/gtc/matrix_transform.hpp>
 
 namespace bracken::scene {
@@ -85,6 +87,14 @@ template <typename T>
     }
     if (count == 0) {
         return data.empty();
+    }
+    // BEFORE the blob check, because this is the bound the blob check cannot
+    // provide: `data.size() / stride` is proportional to a stride the file also
+    // chose. See k_max_table_rows.
+    if (count > static_cast<int64_t>(k_max_table_rows)) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "table '{}': {} rows is past the {}-row ceiling", prefix, count,
+                          k_max_table_rows);
+        return false;
     }
     const auto ustride = static_cast<uint64_t>(stride);
     // Overflow-free: never form count * stride, divide instead.
@@ -284,14 +294,137 @@ struct ScatterRng {
 /// produces is stored in the file, so it must not depend on <numbers>.
 constexpr float k_two_pi = 6.283185307179586f;
 
-/// Cells per axis a scatter rule may ask for. A rule with a metre-scale step
-/// over a kilometre-scale radius is a typo, and expanding it silently is how a
-/// level load turns into a two-minute hang.
-constexpr int k_max_scatter_cells_per_axis = 8192;
+// ---------------------------------------------------------------------------
+// Finiteness
+//
+// Every float a level carries is checked at LOAD. See LevelError::BadValue for
+// why here and not at use: a NaN transform does not fail loudly anywhere
+// downstream, it quietly makes a frame wrong in a place that has no idea a
+// file was involved.
+//
+// The checks are explicit per record type rather than a blanket byte scan,
+// because these rows are float/uint32 MIXTURES — reinterpreting a model index
+// as a float and finding a NaN bit pattern would refuse a perfectly good file.
+// `all_floats_finite` is the exception and is used only on structs that are
+// float all the way through, which their size static_asserts pin.
+// ---------------------------------------------------------------------------
 
-/// Upper bound on the two PATH-ADDRESSED tables (models, strings). Their length
-/// comes from a record, not from a blob size, so nothing else bounds it.
-constexpr std::size_t k_max_string_table_rows = 1u << 20;
+struct FiniteScan {
+    bool ok = true;
+    void operator()(float v) noexcept { ok = ok && std::isfinite(v); }
+    void operator()(const glm::vec2& v) noexcept { (*this)(v.x); (*this)(v.y); }
+    void operator()(const glm::vec3& v) noexcept { (*this)(v.x); (*this)(v.y); (*this)(v.z); }
+    void operator()(const glm::vec4& v) noexcept {
+        (*this)(v.x);
+        (*this)(v.y);
+        (*this)(v.z);
+        (*this)(v.w);
+    }
+};
+
+/// For FLOAT-ONLY trivially copyable structs, and nothing else. Adding a
+/// non-float member to one of these makes this wrong in the silent direction
+/// (an integer that happens to look like a NaN), which is why each caller sits
+/// next to a size static_assert that a new member would break first.
+template <typename T>
+[[nodiscard]] bool all_floats_finite(const T& v) noexcept {
+    static_assert(std::is_trivially_copyable_v<T>);
+    static_assert(sizeof(T) % sizeof(float) == 0);
+    float scratch[sizeof(T) / sizeof(float)];
+    std::memcpy(scratch, &v, sizeof(T));
+    for (float f : scratch) {
+        if (!std::isfinite(f)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool row_finite(const LevelInstance& r) noexcept {
+    FiniteScan s;
+    s(r.position);
+    s(r.yaw);
+    s(r.scale);
+    s(r.tint);
+    return s.ok;
+}
+
+[[nodiscard]] bool row_finite(const LevelMarker& r) noexcept {
+    FiniteScan s;
+    s(r.position);
+    s(r.yaw);
+    return s.ok;
+}
+
+[[nodiscard]] bool row_finite(const LevelRect& r) noexcept { return all_floats_finite(r); }
+[[nodiscard]] bool row_finite(const LevelWater& r) noexcept { return all_floats_finite(r); }
+
+[[nodiscard]] bool row_finite(const LevelScatterModel& r) noexcept {
+    FiniteScan s;
+    s(r.weight);
+    s(r.min_scale);
+    s(r.max_scale);
+    return s.ok;
+}
+
+[[nodiscard]] bool row_finite(const LevelScatterRule& r) noexcept {
+    FiniteScan s;
+    s(r.center_x);
+    s(r.center_z);
+    s(r.inner_radius);
+    s(r.outer_radius);
+    s(r.step);
+    s(r.jitter);
+    s(r.sink);
+    return s.ok;
+}
+
+[[nodiscard]] bool row_finite(const PointLightRow& r) noexcept {
+    FiniteScan s;
+    s(r.px);
+    s(r.py);
+    s(r.pz);
+    s(r.radius);
+    s(r.cr);
+    s(r.cg);
+    s(r.cb);
+    s(r.intensity);
+    s(r.source_radius);
+    return s.ok;
+}
+
+[[nodiscard]] bool row_finite(const SpotLightRow& r) noexcept {
+    FiniteScan s;
+    s(r.px);
+    s(r.py);
+    s(r.pz);
+    s(r.radius);
+    s(r.dx);
+    s(r.dy);
+    s(r.dz);
+    s(r.inner_deg);
+    s(r.outer_deg);
+    s(r.cr);
+    s(r.cg);
+    s(r.cb);
+    s(r.intensity);
+    s(r.source_radius);
+    return s.ok;
+}
+
+/// The first offending ROW is named. A level with one bad crate among 2550 is
+/// the realistic case, and "instances[1873]" is the difference between a fix
+/// and a bisect.
+template <typename T>
+[[nodiscard]] bool rows_finite(const std::vector<T>& rows, std::string_view what) {
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (!row_finite(rows[i])) {
+            BRACKEN_LOG_ERROR(LOG_TAG, "{}[{}] carries a NaN or an infinity; refusing the level", what, i);
+            return false;
+        }
+    }
+    return true;
+}
 
 } // namespace
 
@@ -307,6 +440,7 @@ const char* to_string(LevelError e) noexcept {
     case LevelError::FutureVersion: return "level written by a newer schema than this build";
     case LevelError::WriteFailed: return "could not write the level file";
     case LevelError::BadTable: return "a level table's count/stride disagree with its data";
+    case LevelError::BadValue: return "a level value is not a finite number";
     }
     return "unknown";
 }
@@ -350,6 +484,75 @@ void LevelTerrain::from_heightmap(const Heightmap& hm) {
     min_height = hm.min_height;
     max_height = hm.max_height;
     samples = hm.height_data;
+}
+
+// ---------------------------------------------------------------------------
+// Water conversion
+//
+// Field for field, in declaration order, both directions. The only correct way
+// to read these is against `render::WaterRegion` side by side — which is the
+// argument for their being here, once, instead of in every host that ships a
+// river.
+// ---------------------------------------------------------------------------
+
+LevelWater to_level_water(const bracken::render::WaterRegion& region) noexcept {
+    LevelWater w;
+    w.min_x = region.min_x;
+    w.min_z = region.min_z;
+    w.max_x = region.max_x;
+    w.max_z = region.max_z;
+    w.height = region.height;
+    w.flow = region.flow;
+    w.flow_speed = region.flow_speed;
+    w.deep_color = region.deep_color;
+    w.shallow_color = region.shallow_color;
+    w.absorption = region.absorption;
+    w.foam_depth = region.foam_depth;
+    w.reflection_roughness = region.reflection_roughness;
+    w.reflection_strength = region.reflection_strength;
+    w.refraction_strength = region.refraction_strength;
+    w.ssr_strength = region.ssr_strength;
+    w.ssr_max_distance = region.ssr_max_distance;
+    w.ssr_thickness = region.ssr_thickness;
+    w.detail_wave_strength = region.detail_wave_strength;
+    w.sim_displacement = region.sim_displacement;
+    w.sim_normal_strength = region.sim_normal_strength;
+    w.ripple_foam_gain = region.ripple_foam_gain;
+    w.sim_center = region.sim_center;
+    w.sim_extent = region.sim_extent;
+    w.wave_speed = region.wave_speed;
+    w.wave_damping = region.wave_damping;
+    return w;
+}
+
+bracken::render::WaterRegion to_water_region(const LevelWater& water) noexcept {
+    bracken::render::WaterRegion r;
+    r.min_x = water.min_x;
+    r.min_z = water.min_z;
+    r.max_x = water.max_x;
+    r.max_z = water.max_z;
+    r.height = water.height;
+    r.flow = water.flow;
+    r.flow_speed = water.flow_speed;
+    r.deep_color = water.deep_color;
+    r.shallow_color = water.shallow_color;
+    r.absorption = water.absorption;
+    r.foam_depth = water.foam_depth;
+    r.reflection_roughness = water.reflection_roughness;
+    r.reflection_strength = water.reflection_strength;
+    r.refraction_strength = water.refraction_strength;
+    r.ssr_strength = water.ssr_strength;
+    r.ssr_max_distance = water.ssr_max_distance;
+    r.ssr_thickness = water.ssr_thickness;
+    r.detail_wave_strength = water.detail_wave_strength;
+    r.sim_displacement = water.sim_displacement;
+    r.sim_normal_strength = water.sim_normal_strength;
+    r.ripple_foam_gain = water.ripple_foam_gain;
+    r.sim_center = water.sim_center;
+    r.sim_extent = water.sim_extent;
+    r.wave_speed = water.wave_speed;
+    r.wave_damping = water.wave_damping;
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +633,18 @@ std::vector<LevelInstance> scatter_ground_cover(const LevelScatterRule& rule,
             inst.position = {x, *height - rule.sink, z};
             inst.yaw = yaw01 * k_two_pi;
             inst.scale = m.min_scale + (m.max_scale - m.min_scale) * scale01;
+            if (out.size() >= k_max_scatter_instances) {
+                // The cell bound alone permits 8192^2 candidates; this is what
+                // bounds the OUTPUT when a ground callback accepts all of
+                // them. Refuse the rest of the rule rather than truncate
+                // silently, and say so once — a partially expanded carpet that
+                // nobody was told about is worse than none.
+                BRACKEN_LOG_ERROR(LOG_TAG,
+                                  "scatter rule (seed {}) reached the {}-instance ceiling at cell ({}, {}); "
+                                  "the rest of the rule is not expanded",
+                                  rule.seed, k_max_scatter_instances, ix, iz);
+                return out;
+            }
             out.push_back(inst);
         }
     }
@@ -532,12 +747,33 @@ std::span<const LevelScatterModel> Level::scatter_slice(const LevelScatterRule& 
 namespace {
 
 [[nodiscard]] save::SaveDocument encode(const Level& level) {
-    // Start from the carried-forward records so a newer build's data survives
-    // an older build loading and re-saving. Known keys are written over the
-    // top; a stale key under an owned prefix cannot be here because the
-    // decoder never puts one there.
-    save::SaveDocument doc = level.extras();
+    // Seed from the carried-forward records so a newer build's data survives an
+    // older build loading and re-saving — but copy only what is NOT ours.
+    //
+    // The decoder never files an owned key into extras(), so the only way one
+    // gets there is a host writing into the schema's own namespace. Copying it
+    // would leave a record this encoder does not overwrite (`models/9/name` in
+    // a three-model level) sitting in the file to confuse the next reader.
+    // Dropping it loses the host nothing it was entitled to keep, and saying so
+    // once is what stops the loss from being a mystery.
+    save::SaveDocument doc;
     doc.set_game_version(level.content_version);
+    std::size_t squatters = 0;
+    for (std::string_view path : level.extras().paths()) {
+        if (is_owned_path(path)) {
+            ++squatters;
+            continue;
+        }
+        if (const save::SaveDocument::Value* v = level.extras().value_at(path)) {
+            doc.write_value(path, *v);
+        }
+    }
+    if (squatters != 0) {
+        BRACKEN_LOG_WARN(LOG_TAG,
+                         "level '{}': {} extra record(s) sit under a schema-owned prefix and are dropped; "
+                         "namespace host records under your own prefix",
+                         level.name, squatters);
+    }
 
     doc.write("level/version", static_cast<int64_t>(k_level_format_version));
     doc.write("level/name", level.name);
@@ -630,16 +866,26 @@ namespace {
     level.content_version = doc.game_version();
     (void)doc.read("level/name", level.name);
 
-    // The string tables are path-addressed, so their length comes from a record
+    // The name tables are path-addressed, so their length comes from a RECORD
     // rather than from a blob's size — nothing bounds it but this. A file whose
     // checksum passes can still name a billion models (hand-edited, or written
     // by something with its own bug), and `resize` would answer that with
     // bad_alloc rather than a diagnosis.
+    //
+    // TWO bounds, and the tight one is the second. A table of N names occupies
+    // 2N records in this container, so a declared count larger than the
+    // container's ENTIRE record count is a lie the file's own size disproves —
+    // that is what makes the allocation bounded by the bytes on disk rather
+    // than by a constant somebody picked. The ceiling is the coarse backstop
+    // for a small file that packs its lie densely.
+    const std::size_t records = doc.record_count();
     const std::size_t model_count = doc.read_count("models");
-    const std::size_t string_count_raw = doc.read_count("strings");
-    if (model_count > k_max_string_table_rows || string_count_raw > k_max_string_table_rows) {
-        BRACKEN_LOG_ERROR(LOG_TAG, "level declares {} models and {} strings; refusing", model_count,
-                          string_count_raw);
+    const std::size_t string_count = doc.read_count("strings");
+    if (model_count > k_max_name_table_rows || string_count > k_max_name_table_rows ||
+        model_count > records || string_count > records) {
+        BRACKEN_LOG_ERROR(LOG_TAG,
+                          "level declares {} models and {} strings over {} records (ceiling {}); refusing",
+                          model_count, string_count, records, k_max_name_table_rows);
         return core::Err(LevelError::BadTable);
     }
     level.models.resize(model_count);
@@ -649,8 +895,8 @@ namespace {
         (void)doc.read(save::index_path("models", i, "source"), level.model_sources[i]);
     }
 
-    level.strings.resize(string_count_raw);
-    for (std::size_t i = 0; i < string_count_raw; ++i) {
+    level.strings.resize(string_count);
+    for (std::size_t i = 0; i < string_count; ++i) {
         (void)doc.read(std::format("strings/{}", i), level.strings[i]);
     }
 
@@ -661,6 +907,13 @@ namespace {
         !read_table(doc, "scatter/rules", level.scatter_rules) ||
         !read_table(doc, "lights/point", point_rows) || !read_table(doc, "lights/spot", spot_rows)) {
         return core::Err(LevelError::BadTable);
+    }
+    // Finiteness, before any of it becomes a matrix. See LevelError::BadValue.
+    if (!rows_finite(level.instances, "instances") || !rows_finite(level.markers, "markers") ||
+        !rows_finite(level.water, "water") || !rows_finite(level.scatter_models, "scatter/models") ||
+        !rows_finite(level.scatter_rules, "scatter/rules") ||
+        !rows_finite(point_rows, "lights/point") || !rows_finite(spot_rows, "lights/spot")) {
+        return core::Err(LevelError::BadValue);
     }
     level.point_lights.reserve(point_rows.size());
     for (const PointLightRow& r : point_rows) {
@@ -673,7 +926,19 @@ namespace {
 
     if (doc.read_or<bool>("terrain/present", false)) {
         LevelTerrain t;
-        (void)doc.read("terrain/resolution", t.resolution);
+        // Read the two resolutions WIDE and range-check them. `read(uint32_t&)`
+        // narrows an int64 silently, so a file saying "-1" would otherwise
+        // arrive as 4294967295 and be squared.
+        const int64_t resolution = doc.read_or<int64_t>("terrain/resolution", 0);
+        const int64_t splat_resolution = doc.read_or<int64_t>("terrain/splat_resolution", 0);
+        if (resolution < 0 || resolution > static_cast<int64_t>(k_max_terrain_resolution) ||
+            splat_resolution < 0 || splat_resolution > static_cast<int64_t>(k_max_terrain_resolution)) {
+            BRACKEN_LOG_ERROR(LOG_TAG, "terrain resolution {} / splat resolution {} is out of range (0..{})",
+                              resolution, splat_resolution, k_max_terrain_resolution);
+            return core::Err(LevelError::BadTable);
+        }
+        t.resolution = static_cast<uint32_t>(resolution);
+        t.splat_resolution = static_cast<uint32_t>(splat_resolution);
         (void)doc.read("terrain/origin_x", t.origin_x);
         (void)doc.read("terrain/origin_z", t.origin_z);
         (void)doc.read("terrain/size", t.size);
@@ -690,35 +955,91 @@ namespace {
         if (!t.samples.empty()) {
             std::memcpy(t.samples.data(), samples.data(), samples.size());
         }
-        (void)doc.read("terrain/splat_resolution", t.splat_resolution);
         std::vector<std::byte> splat;
         (void)doc.read_blob("terrain/splat", splat);
         t.splat.resize(splat.size());
         if (!t.splat.empty()) {
             std::memcpy(t.splat.data(), splat.data(), splat.size());
         }
+        // The header and the blob must agree. A heightmap whose declared
+        // resolution does not square to its sample count is the one shape that
+        // would sail past every other check here and then be INDEXED by
+        // `Heightmap::get_height_local` at `z * resolution + x` — an out-of-
+        // bounds read the moment the level is applied. `Heightmap::valid`
+        // catches it too, but only if the host remembers to ask; refusing the
+        // file means it cannot be reached.
+        const auto samples_wanted = static_cast<std::size_t>(t.resolution) * t.resolution;
+        const auto splat_wanted = static_cast<std::size_t>(t.splat_resolution) * t.splat_resolution * 4u;
+        if (t.samples.size() != samples_wanted || t.splat.size() != splat_wanted) {
+            BRACKEN_LOG_ERROR(LOG_TAG,
+                              "terrain: {} samples for a {}^2 map (want {}), {} splat bytes for {}^2 RGBA "
+                              "(want {})",
+                              t.samples.size(), t.resolution, samples_wanted, t.splat.size(),
+                              t.splat_resolution, splat_wanted);
+            return core::Err(LevelError::BadTable);
+        }
         if (!read_table(doc, "terrain/grass_exclusions", t.grass_exclusions)) {
             return core::Err(LevelError::BadTable);
+        }
+        FiniteScan scan;
+        scan(t.origin_x);
+        scan(t.origin_z);
+        scan(t.size);
+        scan(t.min_height);
+        scan(t.max_height);
+        if (!scan.ok || !rows_finite(t.grass_exclusions, "terrain/grass_exclusions")) {
+            BRACKEN_LOG_ERROR(LOG_TAG, "terrain header carries a NaN or an infinity; refusing the level");
+            return core::Err(LevelError::BadValue);
         }
         level.terrain = std::move(t);
     }
 
     if (doc.read_or<bool>("env/present", false)) {
-        level.environment = read_env(doc);
+        const bracken::render::EnvironmentState e = read_env(doc);
+        // EnvironmentState is float all the way through — every member is a
+        // float or a glm vector of them — which is what makes the blanket scan
+        // legal here. A NaN sun direction is the classic version of this bug:
+        // it survives every normalize, reaches the shadow-cascade fit, and
+        // turns the whole frame black.
+        if (!all_floats_finite(e)) {
+            BRACKEN_LOG_ERROR(LOG_TAG, "environment carries a NaN or an infinity; refusing the level");
+            return core::Err(LevelError::BadValue);
+        }
+        level.environment = e;
     }
 
     if (doc.read_or<bool>("nav/present", false)) {
         nav::NavGridConfig n;
         (void)doc.read("nav/origin", n.origin);
         (void)doc.read("nav/cell_size", n.cell_size);
-        int64_t width = 0;
-        int64_t depth = 0;
-        (void)doc.read("nav/width", width);
-        (void)doc.read("nav/depth", depth);
+        const int64_t width = doc.read_or<int64_t>("nav/width", 0);
+        const int64_t depth = doc.read_or<int64_t>("nav/depth", 0);
+        // `NavGrid::build` allocates width * depth cells and walks them, so a
+        // negative or astronomical pair is a hang or an allocation failure one
+        // call after the load returns.
+        // Each side is bounded BEFORE the product is formed: two int64s from a
+        // file multiplied together overflow, and signed overflow is undefined
+        // — the bounds check would be the bug.
+        const auto cell_ceiling = static_cast<int64_t>(k_max_nav_cells);
+        if (width < 0 || depth < 0 || width > cell_ceiling || depth > cell_ceiling ||
+            width * depth > cell_ceiling) {
+            BRACKEN_LOG_ERROR(LOG_TAG, "nav grid {}x{} is out of range (0..{} cells)", width, depth,
+                              k_max_nav_cells);
+            return core::Err(LevelError::BadTable);
+        }
         n.width = static_cast<int>(width);
         n.depth = static_cast<int>(depth);
         (void)doc.read("nav/max_slope_degrees", n.max_slope_degrees);
         (void)doc.read("nav/max_step", n.max_step);
+        FiniteScan scan;
+        scan(n.origin);
+        scan(n.cell_size);
+        scan(n.max_slope_degrees);
+        scan(n.max_step);
+        if (!scan.ok) {
+            BRACKEN_LOG_ERROR(LOG_TAG, "nav config carries a NaN or an infinity; refusing the level");
+            return core::Err(LevelError::BadValue);
+        }
         level.nav = n;
     }
 
@@ -791,15 +1112,181 @@ core::Result<Level, LevelError> parse_level(std::span<const std::byte> bytes) {
 }
 
 // ---------------------------------------------------------------------------
+// Digest and self-verification
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// FNV-1a, byte at a time. The same construction `testing::TestFrame::digest`
+/// uses, deliberately: when both numbers appear in one log line they should be
+/// the same KIND of number, computed the same way, so a reader is comparing
+/// like with like.
+struct Fnv1a {
+    uint64_t value = 0xcbf29ce484222325ull;
+
+    void bytes(const void* p, std::size_t n) noexcept {
+        const auto* q = static_cast<const unsigned char*>(p);
+        for (std::size_t i = 0; i < n; ++i) {
+            value ^= static_cast<uint64_t>(q[i]);
+            value *= 0x100000001b3ull;
+        }
+    }
+    void u32(uint32_t v) noexcept { bytes(&v, sizeof(v)); }
+    /// Lengths are folded as a fixed 64-bit width so that concatenating two
+    /// tables can never collide with one table of their combined length.
+    void count(std::size_t n) noexcept {
+        const uint64_t wide = n;
+        bytes(&wide, sizeof(wide));
+    }
+    void text(std::string_view s) noexcept {
+        count(s.size());
+        bytes(s.data(), s.size());
+    }
+    /// Whole-table fold. Legal only for the padding-free row types — their
+    /// `sizeof` static_asserts in level.hpp are what make the padding bytes
+    /// this reads non-existent rather than indeterminate.
+    template <typename T>
+    void rows(const std::vector<T>& r) noexcept {
+        count(r.size());
+        if (!r.empty()) {
+            bytes(r.data(), r.size() * sizeof(T));
+        }
+    }
+};
+
+/// Records in `extras` that this schema does not own — the ones a save is
+/// obliged to carry forward. Used by the round-trip check, which must not
+/// count a host's squatted records against the encoder that correctly dropped
+/// them.
+[[nodiscard]] std::size_t carried_record_count(const save::SaveDocument& extras) {
+    std::size_t n = 0;
+    for (std::string_view path : extras.paths()) {
+        if (!is_owned_path(path)) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+} // namespace
+
+uint64_t level_digest(const Level& level) noexcept {
+    Fnv1a h;
+    h.u32(k_level_format_version);
+    h.u32(level.content_version);
+    h.text(level.name);
+
+    h.count(level.models.size());
+    for (std::size_t i = 0; i < level.models.size(); ++i) {
+        h.text(level.models[i]);
+        h.text(i < level.model_sources.size() ? std::string_view(level.model_sources[i])
+                                              : std::string_view{});
+    }
+    h.count(level.strings.size());
+    for (const std::string& s : level.strings) {
+        h.text(s);
+    }
+
+    h.rows(level.instances);
+    h.rows(level.markers);
+    h.rows(level.water);
+    h.rows(level.scatter_models);
+    h.rows(level.scatter_rules);
+
+    // Lights go through their on-disk rows rather than their descs: a desc
+    // carries a `bool` and therefore PADDING, and padding bytes after a copy
+    // are unspecified — hashing them would make a level's digest differ from
+    // itself between two runs of the same binary.
+    h.count(level.point_lights.size());
+    for (const auto& l : level.point_lights) {
+        const PointLightRow r = to_row(l);
+        h.bytes(&r, sizeof(r));
+    }
+    h.count(level.spot_lights.size());
+    for (const auto& l : level.spot_lights) {
+        const SpotLightRow r = to_row(l);
+        h.bytes(&r, sizeof(r));
+    }
+
+    h.u32(level.terrain.has_value() ? 1u : 0u);
+    if (level.terrain.has_value()) {
+        const LevelTerrain& t = *level.terrain;
+        h.u32(t.resolution);
+        // Field by field rather than one span over the five: a span would be
+        // assuming a layout nothing in the header pins.
+        h.bytes(&t.origin_x, sizeof(float));
+        h.bytes(&t.origin_z, sizeof(float));
+        h.bytes(&t.size, sizeof(float));
+        h.bytes(&t.min_height, sizeof(float));
+        h.bytes(&t.max_height, sizeof(float));
+        h.count(t.samples.size());
+        h.bytes(t.samples.data(), t.samples.size() * sizeof(uint16_t));
+        h.u32(t.splat_resolution);
+        h.count(t.splat.size());
+        h.bytes(t.splat.data(), t.splat.size());
+        h.rows(t.grass_exclusions);
+    }
+
+    h.u32(level.environment.has_value() ? 1u : 0u);
+    if (level.environment.has_value()) {
+        // Float all the way through; see the decode's finiteness scan.
+        static_assert(sizeof(bracken::render::EnvironmentState) % sizeof(float) == 0);
+        h.bytes(&*level.environment, sizeof(bracken::render::EnvironmentState));
+    }
+
+    h.u32(level.nav.has_value() ? 1u : 0u);
+    if (level.nav.has_value()) {
+        const nav::NavGridConfig& n = *level.nav;
+        h.bytes(&n.origin, sizeof(glm::vec3));
+        h.bytes(&n.cell_size, sizeof(float));
+        h.u32(static_cast<uint32_t>(n.width));
+        h.u32(static_cast<uint32_t>(n.depth));
+        h.bytes(&n.max_slope_degrees, sizeof(float));
+        h.bytes(&n.max_step, sizeof(float));
+    }
+    return h.value;
+}
+
+core::Result<void, LevelError> verify_level_roundtrip(const Level& level) {
+    const std::vector<std::byte> bytes = serialize_level(level);
+    auto parsed = parse_level(bytes);
+    if (parsed.is_err()) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "level '{}' does not survive its own encoder: {}", level.name,
+                          to_string(parsed.error()));
+        return core::Err(parsed.error());
+    }
+
+    const uint64_t authored = level_digest(level);
+    const uint64_t reloaded = level_digest(parsed.value());
+    if (authored != reloaded) {
+        BRACKEN_LOG_ERROR(LOG_TAG,
+                          "level '{}' round trip changed its content: digest 0x{:016x} -> 0x{:016x} "
+                          "({} bytes)",
+                          level.name, authored, reloaded, bytes.size());
+        return core::Err(LevelError::Corrupt);
+    }
+    const std::size_t carried = carried_record_count(level.extras());
+    if (carried != parsed.value().extras().record_count()) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "level '{}' round trip lost extra records: {} carried, {} came back",
+                          level.name, carried, parsed.value().extras().record_count());
+        return core::Err(LevelError::Corrupt);
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
 // Dump
 // ---------------------------------------------------------------------------
 
-std::string level_dump(const Level& level) {
-    constexpr std::size_t k_preview_rows = 8;
+std::string level_dump(const Level& level, std::size_t max_rows) {
+    // 0 means "all of them" — a tool inspecting a file wants the whole table,
+    // and the alternative spelling (SIZE_MAX at every call site) is the kind of
+    // thing that gets typed wrong once and silently truncates a report.
+    const auto limit = [max_rows](std::size_t n) { return max_rows == 0 ? n : std::min(max_rows, n); };
     std::string out;
 
-    out += std::format("level '{}'  schema v{}  content v{}\n", level.name, k_level_format_version,
-                       level.content_version);
+    out += std::format("level '{}'  schema v{}  content v{}  digest 0x{:016x}\n", level.name,
+                       k_level_format_version, level.content_version, level_digest(level));
     out += std::format("  instances     {}\n", level.instances.size());
     out += std::format("  models        {}\n", level.models.size());
     out += std::format("  strings       {}\n", level.strings.size());
@@ -825,22 +1312,54 @@ std::string level_dump(const Level& level) {
         }
     }
 
-    out += std::format("\ninstances (first {} of {}):\n", std::min(k_preview_rows, level.instances.size()),
-                       level.instances.size());
-    for (std::size_t i = 0; i < level.instances.size() && i < k_preview_rows; ++i) {
+    const std::size_t instance_rows = limit(level.instances.size());
+    out += std::format("\ninstances (showing {} of {}):\n", instance_rows, level.instances.size());
+    for (std::size_t i = 0; i < instance_rows; ++i) {
         const LevelInstance& n = level.instances[i];
-        out += std::format("  [{:5}] {:24} pos({:.2f}, {:.2f}, {:.2f}) yaw {:.4f} scale {:.4f} flags 0x{:x}\n", i,
-                           level.model_name(n.model), n.position.x, n.position.y, n.position.z, n.yaw, n.scale,
-                           static_cast<uint32_t>(n.flags));
+        // model_name() answers "" for an out-of-range index instead of reading
+        // one — dumping is exactly what you do to a file you already suspect.
+        out += std::format("  [{:5}] {:24} pos({:.2f}, {:.2f}, {:.2f}) yaw {:.4f} scale {:.4f} "
+                           "tint({:.2f}, {:.2f}, {:.2f}, {:.2f}) flags 0x{:x} motion {} lod {}\n",
+                           i, level.model_name(n.model), n.position.x, n.position.y, n.position.z, n.yaw,
+                           n.scale, n.tint.r, n.tint.g, n.tint.b, n.tint.a, static_cast<uint32_t>(n.flags),
+                           n.motion_id, n.lod_hint);
     }
 
     if (!level.markers.empty()) {
-        out += "\nmarkers:\n";
-        for (std::size_t i = 0; i < level.markers.size() && i < k_preview_rows; ++i) {
+        const std::size_t marker_rows = limit(level.markers.size());
+        out += std::format("\nmarkers (showing {} of {}):\n", marker_rows, level.markers.size());
+        for (std::size_t i = 0; i < marker_rows; ++i) {
             const LevelMarker& m = level.markers[i];
-            out += std::format("  [{:4}] {:20} ({:.2f}, {:.2f}, {:.2f})\n", i, level.string_at(m.name),
-                               m.position.x, m.position.y, m.position.z);
+            out += std::format("  [{:4}] {:20} ({:.2f}, {:.2f}, {:.2f}) yaw {:.4f}\n", i,
+                               level.string_at(m.name), m.position.x, m.position.y, m.position.z, m.yaw);
         }
+    }
+
+    if (!level.point_lights.empty() || !level.spot_lights.empty()) {
+        out += "\nlights:\n";
+        for (std::size_t i = 0; i < limit(level.point_lights.size()); ++i) {
+            const auto& l = level.point_lights[i];
+            out += std::format("  point [{:3}] ({:.1f}, {:.1f}, {:.1f}) r {:.1f} intensity {:.2f} "
+                               "source_r {:.1f} shadows {} id {}\n",
+                               i, l.position.x, l.position.y, l.position.z, l.radius, l.intensity,
+                               l.source_radius, l.casts_shadows ? "yes" : "no", l.stable_id);
+        }
+        for (std::size_t i = 0; i < limit(level.spot_lights.size()); ++i) {
+            const auto& l = level.spot_lights[i];
+            out += std::format("  spot  [{:3}] ({:.1f}, {:.1f}, {:.1f}) r {:.1f} cone {:.1f}/{:.1f} deg "
+                               "intensity {:.2f} shadows {} id {}\n",
+                               i, l.position.x, l.position.y, l.position.z, l.radius, l.inner_angle.value,
+                               l.outer_angle.value, l.intensity, l.casts_shadows ? "yes" : "no",
+                               l.stable_id);
+        }
+    }
+
+    for (std::size_t i = 0; i < level.water.size(); ++i) {
+        const LevelWater& w = level.water[i];
+        out += std::format("\nwater [{}]: x [{:.1f}, {:.1f}] z [{:.1f}, {:.1f}] at y {:.1f}, flow "
+                           "({:.2f}, {:.2f}) x {:.1f}, sim {:.0f} around ({:.0f}, {:.0f})\n",
+                           i, w.min_x, w.max_x, w.min_z, w.max_z, w.height, w.flow.x, w.flow.y,
+                           w.flow_speed, w.sim_extent, w.sim_center.x, w.sim_center.y);
     }
 
     for (std::size_t i = 0; i < level.scatter_rules.size(); ++i) {
@@ -873,7 +1392,53 @@ std::string level_dump(const Level& level) {
                            n.max_slope_degrees, n.max_step);
     }
 
+    // The carried records, by path. Not their values: they are the HOST's, of
+    // types this build may not know, and the point of listing them is to prove
+    // they survived — which is a question about presence, not about content.
+    if (level.extras().record_count() != 0) {
+        out += "\nextras (carried verbatim, not interpreted):\n";
+        for (std::string_view path : level.extras().paths()) {
+            out += std::format("  {}\n", path);
+        }
+    }
+
     return out;
+}
+
+core::Result<void, LevelError> export_level(const Level& level, const std::string& path, bool write_dump) {
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+    if (auto verified = verify_level_roundtrip(level); verified.is_err()) {
+        return core::Err(verified.error());
+    }
+    if (auto written = save_level(level, path); written.is_err()) {
+        return core::Err(written.error());
+    }
+    if (write_dump) {
+        const std::string dump_path = path + ".txt";
+        if (auto dumped = save_level_dump(level, dump_path); dumped.is_err()) {
+            // A missing sidecar is a lost convenience, not a lost level.
+            BRACKEN_LOG_WARN(LOG_TAG, "level '{}' was written but its dump sidecar '{}' was not ({})",
+                             level.name, dump_path, to_string(dumped.error()));
+        }
+    }
+    return {};
+}
+
+core::Result<void, LevelError> save_level_dump(const Level& level, const std::string& path) {
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+    const std::string text = level_dump(level, /*max_rows=*/0);
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "could not open '{}' for the level dump", path);
+        return core::Err(LevelError::WriteFailed);
+    }
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    out.flush();
+    if (!out) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "writing the level dump to '{}' failed", path);
+        return core::Err(LevelError::WriteFailed);
+    }
+    return {};
 }
 
 // ---------------------------------------------------------------------------

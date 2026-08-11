@@ -77,15 +77,25 @@ bool verify_smoke_screenshot(const char* path) {
 //   --export-level FILE.level: build the whole scene as usual, then write it as
 //            a bracken level file (plus FILE.level.txt, a readable dump) and
 //            exit. This is how the hand-authored village becomes data.
+//            IT VERIFIES ITSELF: the level is round-tripped through its own
+//            encoder, then read back OFF DISK, resolved against the same model
+//            manager, and compared to the live prop list matrix by matrix.
+//            Exit code 1 and a `[level] roundtrip FAILED` line if any of that
+//            disagrees, so the proof is a build step and not an eyeball.
 //   --level FILE.level: fill the prop / marker / collider layer from a level
 //            file instead of running the C++ layout. Everything else (terrain,
 //            splatmap, water, effects) is generated exactly as usual.
-//            THE ROUND-TRIP GATE, in two commands:
+//            THE RENDER-PATH GATE, in two commands:
 //                playground --export-level village.level
 //                playground --smoke 30 --level village.level
 //            The `[level] source=... props=N digest=0x...` line the second run
 //            prints must match the one a plain `--smoke 30` prints, and the
-//            screenshot's mean_luma must still read the pinned value.
+//            screenshot's mean_luma must still read the pinned value. The
+//            export's own check proves the data survives; this proves the
+//            renderer never notices the difference.
+//   --dump-level FILE.level: print the level as text and exit. Needs no window,
+//            no GPU and no assets — it is what you run against a file that
+//            will not load.
 int main(int argc, char** argv) {
     int smoke_frames = -1;
     bool engine_camera = true;
@@ -119,6 +129,15 @@ int main(int argc, char** argv) {
                 }
             }
             return playground::render_music_to_wav(out_path, seconds) ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--dump-level") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "--dump-level needs a path\n";
+                return 2;
+            }
+            // Handled here, before init_engine, for the same reason
+            // --build-pack is: inspecting a file must not need a display.
+            return playground::dump_level_file(argv[++i]) ? 0 : 1;
         }
         if (std::strcmp(argv[i], "--export-level") == 0) {
             if (i + 1 >= argc) {
