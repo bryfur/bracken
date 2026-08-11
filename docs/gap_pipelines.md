@@ -228,6 +228,61 @@ header says so. Use `render_hooks()`; `RenderHookSlot::AfterUi` is its
 many-per-slot replacement and runs first, so a host overlay ends up *under* the
 developer overlay instead of *instead of* it.
 
+It is also no longer possible to take that slot **silently**:
+`set_post_ui_callback` moved out of line and logs a WARN when it overwrites an
+already-installed callback, naming `init_dev_ui` as the likely victim. It does
+not refuse — a host may legitimately want the slot, and refusing would break a
+renderer restart that re-installs — but "F10 stopped working" now has a log line
+next to it.
+
+Three source-scanned tests keep that true rather than merely written down
+(`scene/render_hook.test.cpp`):
+
+- `TheAfterUiSlotRunsUnderTheDeveloperOverlayNotInsteadOfIt` reads
+  `scene/scene_renderer.cpp` and fails if the `AfterUi` dispatch stops preceding
+  the `post_ui_callback_` invocation, or if a second dispatch site appears.
+- the same test fails if the overwrite WARN is deleted.
+- `TheDeveloperOverlayOwnsADedicatedSlotNotAHookRegistration` fails if
+  `application.cpp` ever moves the overlay INTO the shared registry — where a
+  host's `clear()` could remove it, which is the original bug with the arrow
+  reversed.
+- `RegisteringNeverDisplacesAnExistingRegistration` is the positive statement:
+  64 registrations into one slot, same order and same name, and all 64 survive.
+  `set_post_ui_callback` would have kept the last one.
+
+### 1.5 The worked example, in the tree
+
+`examples/playground/custom_pass.hpp` / `custom_pass.cpp` is the whole loop as
+one copy-pasteable class, and it is the proof the feature works end to end:
+
+| Step | Where |
+|---|---|
+| the game's HLSL | `examples/playground/shaders/playground_tint.frag.hlsl` |
+| compiled by the pinned toolchain | `bracken_compile_shaders(playground DIRECTORY .../shaders)` in `examples/playground/CMakeLists.txt` |
+| staged next to the exe | `shaders_playground/` |
+| root registered + pipeline registered | `CustomTintPass::install`, called from `PlaygroundGame::on_init` after `init_renderer()` |
+| pass drawn | `CustomTintPass::draw`, from a `RenderHookSlot::AfterOpaque` hook |
+| released | `CustomTintPass::uninstall`, from `on_shutdown` BEFORE `shutdown_renderer()` |
+
+Two details in it are worth copying rather than reinventing:
+
+- the pipeline's **vertex** shader is the engine's own `fullscreen.vert.spv`
+  while its fragment shader is the game's. Search roots resolve engine-first, so
+  a host pipeline can reuse an engine shader by name — the ordering that stops a
+  host shadowing an engine shader is the same ordering that makes this work.
+- the blend mode is `AdditivePreserveAlpha`, not `Alpha`. The HDR scene target's
+  **destination alpha is metadata later passes read**, and a fullscreen resolve
+  must not grow it; the shader therefore writes premultiplied RGB and its own
+  alpha output is discarded.
+
+**It is off by default and that is load-bearing.** `PLAYGROUND_CUSTOM_PASS=1`
+installs it. `--smoke` is the engine's screenshot regression gate, so a pass that
+paints on the frame has to be opt-in or the pinned `mean_luma` moves and every
+downstream RT/GI table in CLAUDE.md loses its reference. The smoke line
+`[smoke] custom_pass installed=0 ran=0` is what a baseline run must print; the
+shader is still COMPILED by every build, so a break in `bracken_compile_shaders`
+fails the build rather than waiting for a game to find it.
+
 ---
 
 ## 2. Spec
@@ -427,6 +482,23 @@ BRACKEN_REGEN_PIPELINE_GOLDEN=src/bracken/gpu/pipeline_config_golden.inc \
 git diff --stat src/bracken/gpu/pipeline_config_golden.inc   # must be EMPTY
 ```
 
+### 2.8 What the tests pin
+
+All device-free. None of them needs a GPU, a window or SDL init; three read the
+source tree and `GTEST_SKIP` without `BRACKEN_REPO_ROOT`.
+
+| File | Suite | What it establishes |
+|---|---|---|
+| `gpu/host_pipeline.test.cpp` | `HostPipeline` | host desc defaults are byte-identical to `PipelineDesc`'s (so reversed-Z is inherited, not rediscovered); every catalogue row rebuilds identically as a host desc; format/vertex overrides win where documented; `depth_target=false` forces test+write off |
+| | `PipelineCacheKeyTest` | catalogue and host ordinals never collide, keys hash distinctly |
+| | `HostPipelineTableTest` | handles survive further registrations, removed handles go stale, slots are reused, walk order is registration order |
+| `gpu/pipeline_registry.test.cpp` | `PipelineRegistryHostContract` | every refusal path (no device / empty name / no shader / duplicate name), search-root ordering + dedup, stale-handle lookups, and that the whole host surface leaves the enumeration's answers unchanged |
+| | `PipelineRegistryLifecycle` | **the additivity walk** — every lifecycle entry point is inert without a device or a host; shutdown releases registrations and keeps roots; register+unregister leaves the cache counts where it found them; and a source scan that catalogue shader resolution never goes through the host roots |
+| `gpu/pipeline_catalog.test.cpp` | `PipelineCatalog` | the golden is a bijection with the enums, and a host desc mirroring a row renders to the same golden text |
+| `scene/render_hook.test.cpp` | `RenderHookRegistryTest` | order is `(order, sequence)` and total; slots are independent; entry-name addresses are stable across 64 further registrations (the `GPUTimestampPool::reserve_pair` requirement); registering never displaces an existing registration; **the two dev-overlay ownership scans** |
+| | `RenderHookRegistryDeathTest` | mutating the registry from inside a dispatch aborts on a `BRACKEN_CONTRACT` |
+| `scene/frame_diagnostics.test.cpp` | `FrameDiagnosticsTest` | `render_hooks_skipped` folds in `operator+=` and makes `any()` true on its own |
+
 ---
 
 ## 3. Architecture
@@ -501,18 +573,31 @@ rebuild and dispatch are reproducible. Nothing here is reachable from the
 Prepare stage, so the bit-identical-at-any-worker-count rule is not at issue;
 the ordering discipline is the same one for the same reason.
 
-### 3.5 Additivity
+### 3.5 Additivity — the lifecycle walk
 
-Nothing here runs unless a host registers something:
+The host surface widened six shared paths. Each one below is either provable by
+construction from the code, or pinned by a named test, and the distinction is
+stated rather than blurred:
 
-- `pipeline_catalog.{hpp,cpp}`: untouched.
-- catalogue pipeline creation: unchanged, including its shader-path
-  concatenation and its enumeration-gap WARN.
-- `render_frame`: five `empty(slot)` bool tests.
-- `FrameDiagnostics`: one new counter, zero unless a hook is skipped.
-- the playground registers **nothing** and installs **no** hook, so the
-  `--smoke 30` baselines must be bit-identical. That has **not been verified**
-  — see the report.
+| Path | Why a host registration cannot perturb the enum path | Evidence |
+|---|---|---|
+| `init` | element 0 of `shader_path_roots_` is **rewritten**, never appended, so the engine root stays first whatever a host added | `ShaderSearchPathsKeepTheEngineRootFirstAndDeduplicate` |
+| shader resolution | catalogue rows concatenate `shader_path()`; only HOST descs call `resolve_shader_path` | source scan: `CatalogueShaderResolutionNeverConsultsHostRoots` |
+| `preload_all_pipelines` | the two enum loops are unchanged and run first; the host walk is a loop over an **empty vector** with no host registrations, and sits AFTER the `preloaded_` latch so a host rebuild is never logged as an enumeration gap | by construction + `EveryLifecyclePathIsInertWithoutADeviceOrAHost` |
+| `invalidate_all` | one `clear()` on one cache, as before. The key type changed; the operation did not | by construction |
+| `set_swapchain_format` | the enum loop and its `pipeline_targets_swapchain` query are byte-identical; the host walk is a **second, separate** loop, deliberately not a widening of that query (which `pipeline_catalog.test.cpp` pins to exactly four enum values) | by construction + `TheHostSurfaceDoesNotPerturbTheEnumeration` |
+| `enable_hot_reload` | the old global `if (watcher_) return;` latch became per-root. With ONE root the two are identical in all four states: first success, repeat call, second watcher, and the failed-watch retry | by construction; **not** covered by a test, because watching needs a device — see the report |
+| `shutdown` | unwatches every handle and releases every host registration; keeps the search roots | `ShutdownReleasesHostRegistrationsAndKeepsTheSearchRoots` |
+| `render_frame` | five `empty(slot)` bool tests and nothing else | the `--smoke` baseline |
+| `FrameDiagnostics` | one new counter, zero unless a hook is skipped | `SkippedRenderHooksFoldAndCountAsAProblem` |
+
+`pipeline_catalog.{hpp,cpp}` are untouched — not an enumerator, not a row, not a
+field — so the golden is byte-identical by construction.
+
+**Still unverified:** the `--smoke 30` RT-off baseline (`86.3 / 45.6`) has not
+been re-measured, because this worktree has no build tree. With
+`PLAYGROUND_CUSTOM_PASS` unset the playground registers nothing and installs no
+hook, so it should be bit-identical; that is an argument, not a measurement.
 
 ---
 

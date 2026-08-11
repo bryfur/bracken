@@ -98,6 +98,14 @@ public:
 
     /**
      * @brief Shutdown and release all cached pipelines. Main-thread (asserted).
+     *
+     * Also unwatches every shader root and releases every HOST registration —
+     * those own GPU objects that die with the device, and their handles go
+     * stale rather than dangling. The shader SEARCH ROOTS are deliberately
+     * KEPT: they are configuration, not a resource, so a host that re-inits
+     * does not have to re-add them, and init() rewrites element 0 in place so
+     * the engine root stays first. `pipeline_registry.test.cpp`'s
+     * ShutdownReleasesHostRegistrationsAndKeepsTheSearchRoots pins the split.
      */
     void shutdown();
 

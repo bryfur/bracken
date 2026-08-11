@@ -325,8 +325,14 @@ public:
     // that called it silently replaced the developer overlay's registration and
     // turned F10 into a no-op. Use render_hooks() instead; RenderHookSlot::AfterUi
     // runs BEFORE this callback, so the overlay keeps drawing on top.
+    //
+    // Overwriting a callback that is already installed now logs a WARN naming
+    // the developer overlay. It is not refused — a host that genuinely wants the
+    // slot may still take it, and refusing would break the one caller that
+    // legitimately re-installs after a renderer restart — but it can no longer
+    // happen SILENTLY, which is the half of the bug that made it hard to find.
     using PostUICallback = std::function<void(SDL_GPUCommandBuffer*, SDL_GPUTexture*)>;
-    void set_post_ui_callback(PostUICallback cb) { post_ui_callback_ = std::move(cb); }
+    void set_post_ui_callback(PostUICallback cb);
 
     /**
      * @brief Host render passes: ordered, many per slot (`scene/render_hook.hpp`).

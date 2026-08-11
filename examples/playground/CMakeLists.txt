@@ -3,6 +3,7 @@
 add_executable(playground
     main.cpp
     playground.cpp
+    custom_pass.cpp
     scene_layout.cpp
     character.cpp
     day_weather.cpp
@@ -19,9 +20,11 @@ bracken_copy_shaders(playground)
 # The reference consumer compiles its OWN HLSL with the engine's pinned
 # shadercross/DXC and stages the SPIR-V into `shaders_playground/` next to the
 # exe — a different directory from `shaders/`, which bracken_copy_shaders wipes
-# on every build. Nothing registers the result at runtime: this exists so the
-# host-shader toolchain is exercised by every build rather than discovered
-# broken by a game. See docs/gap_pipelines.md for the runtime half.
+# on every build. Compiled by every build so the toolchain is exercised
+# continuously rather than discovered broken by a game; REGISTERED at runtime
+# only under PLAYGROUND_CUSTOM_PASS=1, because `--smoke` is the screenshot
+# regression gate and custom_pass.cpp paints on the frame. custom_pass.{hpp,cpp}
+# is the worked example of the whole loop; docs/gap_pipelines.md walks it.
 bracken_compile_shaders(playground DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 
 # Medieval village assets — 52 .glb, 4 terrain textures and village_layout.h,

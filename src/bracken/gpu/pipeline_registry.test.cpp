@@ -11,9 +11,13 @@
 
 #include "bracken/gpu/pipeline_registry.hpp"
 
+#include "bracken/core/asset/file_watcher.hpp"
 #include "bracken/core/assert.hpp"
 
 #include <gtest/gtest.h>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <set>
 #include <string>
 #include <utility>
@@ -242,6 +246,149 @@ TEST(PipelineRegistryHostContract, TheHostSurfaceDoesNotPerturbTheEnumeration) {
     }
     EXPECT_EQ(registry.creation_count(), 0u) << "no device: nothing was built by any of the above";
     EXPECT_EQ(registry.cached_pipeline_count(), 0u);
+}
+
+// =============================================================================
+// The ADDITIVE claim, path by path.
+//
+// The host surface widened five shared lifecycle paths — preload,
+// invalidate_all, set_swapchain_format, enable_hot_reload and shutdown — plus
+// the shader-path member the catalogue resolves against. Each of those is a
+// place where a host registration could, if the widening were sloppy, change
+// what the ENUM path does. The three tests below are the ones that can be made
+// device-free; the sixth path (create_pipeline_uncached, which needs a device)
+// is covered structurally by CatalogueShaderResolutionNeverConsultsHostRoots.
+// =============================================================================
+
+TEST(PipelineRegistryLifecycle, EveryLifecyclePathIsInertWithoutADeviceOrAHost) {
+    core::bind_main_thread();
+
+    PipelineRegistry registry;
+    const std::string engine_root = registry.shader_path();
+
+    // Walk every lifecycle entry point on a registry that has neither a device
+    // nor a host registration. None of them may create, cache, or latch.
+    EXPECT_FALSE(registry.preload_all_pipelines());
+    EXPECT_FALSE(registry.is_preloaded()) << "preload before init must not latch (see the guard in preload)";
+    registry.invalidate_all();
+    registry.set_swapchain_format(SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
+    EXPECT_EQ(registry.get_swapchain_format(), SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
+    registry.reload_all_pipelines();
+
+    // enable_hot_reload before init is a warned no-op — it must not consume the
+    // watcher, because the retry after the FileWatcher comes up is the whole
+    // reason the latch is per-root rather than global.
+    core::asset::FileWatcher watcher;
+    registry.enable_hot_reload(watcher);
+
+    registry.shutdown();
+
+    EXPECT_EQ(registry.creation_count(), 0u);
+    EXPECT_EQ(registry.cached_pipeline_count(), 0u);
+    EXPECT_EQ(registry.host_pipeline_count(), 0u);
+    EXPECT_FALSE(registry.is_preloaded());
+    EXPECT_EQ(registry.shader_path(), engine_root);
+    ASSERT_EQ(registry.shader_search_paths().size(), 1u) << "no host root was added, so there is exactly one";
+}
+
+TEST(PipelineRegistryLifecycle, ShutdownReleasesHostRegistrationsAndKeepsTheSearchRoots) {
+    core::bind_main_thread();
+
+    PipelineRegistry registry;
+    const std::string engine_root = registry.shader_path();
+    ASSERT_TRUE(registry.add_shader_search_path("game_shaders"));
+    ASSERT_EQ(registry.shader_search_paths().size(), 2u);
+
+    registry.shutdown();
+
+    // The DECISION this pins: shutdown drops the registrations (they own GPU
+    // objects that die with the device) but KEEPS the search roots (they are
+    // configuration, not resources). A host that re-inits does not have to
+    // re-add them, and element 0 is still the engine root — init() rewrites
+    // that slot in place rather than appending, which is what stops a host root
+    // ever being searched ahead of the engine's.
+    EXPECT_EQ(registry.host_pipeline_count(), 0u);
+    ASSERT_EQ(registry.shader_search_paths().size(), 2u);
+    EXPECT_EQ(registry.shader_search_paths()[0], engine_root);
+    EXPECT_EQ(registry.shader_search_paths()[1], "game_shaders/");
+    EXPECT_EQ(registry.shader_path(), engine_root);
+}
+
+TEST(PipelineRegistryLifecycle, RegisteringAndUnregisteringLeavesTheCacheCountsWhereItFoundThem) {
+    core::bind_main_thread();
+
+    PipelineRegistry registry; // no device: registration is refused before it can cache
+    const size_t cached_before = registry.cached_pipeline_count();
+    const size_t created_before = registry.creation_count();
+
+    std::vector<HostPipelineHandle> handles;
+    for (int i = 0; i < 4; ++i) {
+        handles.push_back(registry.register_graphics_pipeline(valid_graphics_desc("gfx_" + std::to_string(i))));
+    }
+    for (HostPipelineHandle h : handles) {
+        registry.unregister_pipeline(h);
+        // A stale handle must stay a nullptr answer rather than aliasing the
+        // next registration into the same slot.
+        EXPECT_EQ(registry.get_pipeline(h), nullptr);
+        EXPECT_EQ(registry.host_pipeline_desc(h), nullptr);
+    }
+    EXPECT_EQ(registry.cached_pipeline_count(), cached_before);
+    EXPECT_EQ(registry.creation_count(), created_before);
+    EXPECT_EQ(registry.host_pipeline_count(), 0u);
+}
+
+// -----------------------------------------------------------------------------
+// A source scan, because the claim is about a code path a device-free test
+// cannot execute: catalogue rows resolve their shaders by concatenating
+// shader_path() (search root 0, the engine's), NEVER through the host search
+// roots. If that ever changed, a game shipping its own `model.frag.spv` could
+// replace PipelineType::Model's — silently, and only in a shipped game.
+// -----------------------------------------------------------------------------
+
+/// Text of `pipeline_registry.cpp` between the first line containing `signature`
+/// and the next line that is exactly "}" at column 0 — i.e. one function body,
+/// given the file's house formatting. Empty when the signature is absent.
+std::string function_body(const std::string& file, const std::string& signature) {
+    const size_t start = file.find(signature);
+    if (start == std::string::npos) {
+        return {};
+    }
+    const size_t end = file.find("\n}\n", start);
+    return file.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+TEST(PipelineRegistryLifecycle, CatalogueShaderResolutionNeverConsultsHostRoots) {
+#ifndef BRACKEN_REPO_ROOT
+    GTEST_SKIP() << "BRACKEN_REPO_ROOT not defined; cannot locate the source tree";
+#else
+    const std::filesystem::path path =
+        std::filesystem::path(BRACKEN_REPO_ROOT) / "src" / "bracken" / "gpu" / "pipeline_registry.cpp";
+    std::ifstream in(path);
+    if (!in) {
+        GTEST_SKIP() << "source not present at " << path.string();
+    }
+    const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    const std::string graphics = function_body(source, "PipelineRegistry::create_pipeline_uncached(PipelineType");
+    ASSERT_FALSE(graphics.empty()) << "create_pipeline_uncached was renamed; update this test with the rename";
+    EXPECT_NE(graphics.find("shader_path()"), std::string::npos)
+        << "the catalogue path must concatenate shader_path(), the engine root";
+    EXPECT_EQ(graphics.find("resolve_shader_path"), std::string::npos)
+        << "a catalogue row resolved through the host search roots means a game can shadow an engine shader";
+
+    const std::string compute =
+        function_body(source, "PipelineRegistry::create_compute_pipeline_uncached(ComputePipelineType");
+    ASSERT_FALSE(compute.empty()) << "create_compute_pipeline_uncached was renamed; update this test";
+    EXPECT_NE(compute.find("shader_path()"), std::string::npos);
+    EXPECT_EQ(compute.find("resolve_shader_path"), std::string::npos);
+
+    // The other half of the same statement: the HOST path does go through the
+    // roots. Without this the test above would also pass if host resolution had
+    // quietly been changed to use the engine root only.
+    const std::string host = function_body(source, "PipelineRegistry::create_host_pipeline_uncached(");
+    ASSERT_FALSE(host.empty()) << "create_host_pipeline_uncached was renamed; update this test";
+    EXPECT_NE(host.find("resolve_shader_path"), std::string::npos);
+#endif
 }
 
 } // namespace

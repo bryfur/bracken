@@ -103,7 +103,10 @@ struct RenderHookContext {
     SDL_GPUTexture* scene_depth = nullptr; ///< D32_FLOAT, REVERSED-Z (near→1, far→0, clear 0.0)
     SDL_GPUTexture* velocity = nullptr;    ///< RG16F motion vectors; null when the prepass did not run
     SDL_GPUTexture* normal_roughness = nullptr; ///< RGBA8 G-buffer; null unless RT / ProbesScreen is on
-    SDL_GPUTexture* ao = nullptr;               ///< RGBA8 (AO, bent normal, aperture); null when AO is off
+    /// RGBA8 (AO, bent normal, cone aperture). NOT null when AO is off — it is
+    /// the renderer's 1x1 opaque-white dummy then, so a host pass can sample it
+    /// unconditionally and get "fully unoccluded" instead of having to branch.
+    SDL_GPUTexture* ao = nullptr;
     SDL_GPUTexture* swapchain = nullptr;        ///< AfterComposite / AfterUi only; null elsewhere
 
     SDL_GPUTextureFormat scene_color_format = SDL_GPU_TEXTUREFORMAT_INVALID;

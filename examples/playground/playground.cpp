@@ -508,6 +508,22 @@ bool PlaygroundGame::on_init() {
     sfx_.build(audio());
     audio().play_music(build_village_theme());
 
+    // Host-extensible rendering, the worked example (custom_pass.hpp). OFF
+    // unless PLAYGROUND_CUSTOM_PASS=1: this registers a game-owned pipeline and
+    // paints an additive vignette into the HDR scene target, which would move
+    // the pinned `--smoke` screenshot baselines that every RT/GI table in
+    // CLAUDE.md is referenced against. It is installed HERE — after
+    // init_renderer(), on the main thread, with the renderer up — because
+    // register_graphics_pipeline needs a device and creates the pipeline
+    // immediately.
+    if (CustomTintPass::enabled_by_environment()) {
+        if (!custom_pass_.install(scene_renderer())) {
+            BRACKEN_LOG_WARN("playground",
+                             "PLAYGROUND_CUSTOM_PASS was set but the host pass could not be installed; "
+                             "continuing without it");
+        }
+    }
+
     if (smoke_frames_ > 0) {
         set_collect_render_stats(true);
         setup_smoke_run();
@@ -531,6 +547,13 @@ void PlaygroundGame::on_shutdown() {
         static_bodies_.clear();
         physics_.shutdown();
         physics_ready_ = false;
+    }
+    // Release the host pipeline and hook while the renderer is still alive.
+    // Order matters exactly once, here: shutdown_renderer() destroys the
+    // PipelineRegistry, so unregistering after it would be a call through a
+    // dead pointer. A no-op when the pass was never installed.
+    if (custom_pass_.installed()) {
+        custom_pass_.uninstall(scene_renderer());
     }
     shutdown_renderer();
 }
@@ -2113,10 +2136,17 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
         const auto& diag = frame_diagnostics();
         std::cout << std::format("[smoke] diagnostics unknown_model={} no_skeleton={} palettes_over_budget={} "
                                  "effect_models_unresolved={} lights_dropped={} cluster_lights_dropped={} "
-                                 "camera_missing={}\n",
+                                 "render_hooks_skipped={} camera_missing={}\n",
                                  diag.draws_dropped_unknown_model, diag.skinned_dropped_no_skeleton,
                                  diag.palettes_over_budget, diag.effect_models_unresolved, diag.lights_dropped,
-                                 diag.cluster_lights_dropped, diag.camera_missing ? 1 : 0);
+                                 diag.cluster_lights_dropped, diag.render_hooks_skipped,
+                                 diag.camera_missing ? 1 : 0);
+        // Host-extensible rendering (custom_pass.hpp). `installed=0 ran=0` is
+        // the DEFAULT and is what every pinned screenshot baseline was measured
+        // against — if a plain `--smoke` run ever prints installed=1, the
+        // luma figures in CLAUDE.md do not apply to it.
+        std::cout << std::format("[smoke] custom_pass installed={} ran={}\n", custom_pass_.installed() ? 1 : 0,
+                                 custom_pass_.executions());
         quit();
     }
 }

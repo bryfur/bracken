@@ -5,14 +5,18 @@
 // into the engine's own SPIR-V output directory (gpu/uniform_layout.test.cpp
 // enumerates that one exhaustively and would fail on a host cbuffer).
 //
-// NOTHING REGISTERS IT AT RUNTIME. It exists so the toolchain path is exercised
-// by every build: if bracken_compile_shaders breaks, the playground stops
-// building, which is a louder and earlier signal than a game discovering it.
-// Registering it would move the `--smoke` screenshot baseline, and that
-// baseline is the standing proof this whole feature is additive.
+// It is compiled by EVERY build, and registered at runtime only when
+// PLAYGROUND_CUSTOM_PASS=1 — see examples/playground/custom_pass.cpp, which is
+// the worked example of the whole loop. Off by default because `--smoke` is the
+// engine's screenshot regression gate and this paints on the frame.
 //
-// Pair it with `fullscreen.vert.spv` from the engine's own set to draw a
-// full-screen triangle; see docs/gap_pipelines.md for the registration call.
+// Paired with the engine's own `fullscreen.vert.spv` (search roots resolve
+// engine-first, so a host pipeline can name an engine shader), drawn with
+// BlendMode::AdditivePreserveAlpha into the RGBA16F linear HDR scene target.
+// That blend adds RGB and leaves DESTINATION ALPHA alone, because scene alpha
+// is metadata later passes read — so this shader writes PREMULTIPLIED RGB and
+// its own alpha output is discarded by the blend state. Do not "fix" the alpha
+// here; it is not read.
 
 struct PSInput {
     float4 position : SV_Position;
@@ -23,13 +27,15 @@ struct PSInput {
 // (vertex uniforms are space1). See src/bracken/shaders/README.md — set-0
 // binding ORDER is the trap there, and it applies to host shaders identically.
 cbuffer TintUniforms : register(b0, space3) {
-    float4 tintColor; // linear, premultiplied by the caller
+    float4 tintColor; // linear HDR; .a is the overall strength
 };
 
 float4 PSMain(PSInput input) : SV_Target {
-    // A vignette in the host's tint colour: enough to be visibly a HOST pass
-    // rather than an engine one, and cheap enough to be honest about.
+    // Edge-weighted vignette: zero in the middle of the frame, strongest in the
+    // corners. Deliberately not centre-weighted — a wash over the whole image
+    // would be hard to tell apart from an exposure change, and the point of the
+    // example is to be visibly a HOST pass.
     const float2 centered = input.texcoord * 2.0f - 1.0f;
-    const float falloff = saturate(1.0f - dot(centered, centered));
-    return float4(tintColor.rgb * falloff, tintColor.a * falloff);
+    const float falloff = saturate(dot(centered, centered) - 0.25f);
+    return float4(tintColor.rgb * (tintColor.a * falloff), 0.0f);
 }

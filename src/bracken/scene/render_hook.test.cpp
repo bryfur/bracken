@@ -17,6 +17,9 @@
 #include "bracken/core/assert.hpp"
 
 #include <gtest/gtest.h>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -225,6 +228,108 @@ TEST(RenderHookRegistryDeathTest, MutatingFromInsideADispatchAborts) {
             other.clear();
         },
         "");
+}
+
+// =============================================================================
+// The developer overlay keeps its slot.
+//
+// The bug this whole feature exists to close is that SceneRenderer had exactly
+// one host extension point, Application::init_dev_ui had already taken it, and
+// a game calling set_post_ui_callback replaced the overlay without a word. Two
+// properties have to hold for that not to come back in a new shape, and neither
+// is expressible as a type, so they are pinned here.
+// =============================================================================
+
+TEST(RenderHookRegistryTest, RegisteringNeverDisplacesAnExistingRegistration) {
+    core::bind_main_thread();
+    RenderHookRegistry registry;
+
+    // The mechanical statement of "many per slot": 64 registrations into ONE
+    // slot, all with the same order and the same name, and all 64 survive.
+    // `set_post_ui_callback` would have kept the last one. If a future
+    // "optimization" ever deduplicates by name, this fails.
+    std::vector<RenderHookHandle> handles;
+    for (int i = 0; i < 64; ++i) {
+        handles.push_back(registry.add(RenderHookSlot::AfterUi, "overlay", 0, noop()));
+        ASSERT_TRUE(handles.back().is_valid()) << "registration " << i << " was refused";
+    }
+    EXPECT_EQ(registry.entries(RenderHookSlot::AfterUi).size(), 64u);
+    EXPECT_EQ(registry.size(), 64u);
+
+    // And every handle still resolves to its OWN entry: removing the first
+    // leaves 63, not 0, and does not invalidate the rest.
+    EXPECT_TRUE(registry.remove(handles.front()));
+    EXPECT_EQ(registry.entries(RenderHookSlot::AfterUi).size(), 63u);
+    for (size_t i = 1; i < handles.size(); ++i) {
+        EXPECT_TRUE(registry.remove(handles[i])) << "handle " << i << " went stale when its neighbour was removed";
+    }
+    EXPECT_TRUE(registry.empty());
+}
+
+/// Whole text of a repo-relative file, or empty when it cannot be read.
+std::string read_repo_file(const std::string& relative) {
+#ifndef BRACKEN_REPO_ROOT
+    (void)relative;
+    return {};
+#else
+    std::ifstream in(std::filesystem::path(BRACKEN_REPO_ROOT) / relative);
+    if (!in) {
+        return {};
+    }
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+#endif
+}
+
+TEST(RenderHookRegistryTest, TheAfterUiSlotRunsUnderTheDeveloperOverlayNotInsteadOfIt) {
+    const std::string source = read_repo_file("src/bracken/scene/scene_renderer.cpp");
+    if (source.empty()) {
+        GTEST_SKIP() << "BRACKEN_REPO_ROOT not defined or scene_renderer.cpp unreadable";
+    }
+
+    const size_t after_ui = source.find("run_render_hooks(RenderHookSlot::AfterUi");
+    ASSERT_NE(after_ui, std::string::npos) << "the AfterUi dispatch is gone — hosts have lost the swapchain slot";
+    const size_t overlay = source.find("post_ui_callback_(post_cmd");
+    ASSERT_NE(overlay, std::string::npos)
+        << "the post-UI callback invocation was renamed; the developer overlay rides on it, so update this test "
+           "deliberately rather than deleting it";
+
+    // ORDER IS THE CONTRACT. AfterUi hooks record first, so a game's overlay
+    // ends up UNDER the developer overlay. Swap these two and F10 starts
+    // drawing behind the game's HUD — visible, but only to whoever happens to
+    // open the overlay in a build with a host overlay installed.
+    EXPECT_LT(after_ui, overlay) << "RenderHookSlot::AfterUi must be dispatched BEFORE post_ui_callback_";
+
+    // Exactly one dispatch per slot: a second call site would run every hook in
+    // that slot twice, which for a blended overlay is a doubled image rather
+    // than an error.
+    EXPECT_EQ(source.find("run_render_hooks(RenderHookSlot::AfterUi", after_ui + 1), std::string::npos);
+
+    // Taking the legacy single slot from under the overlay is still POSSIBLE
+    // (the setter is public and one caller legitimately re-installs), but it may
+    // not be SILENT — that was the half of the original bug that made it cost a
+    // debugging session rather than a glance at the log.
+    EXPECT_NE(source.find("set_post_ui_callback replaced an already-installed callback"), std::string::npos)
+        << "the overwrite warning is gone; a game can once again turn F10 off without a word";
+}
+
+TEST(RenderHookRegistryTest, TheDeveloperOverlayOwnsADedicatedSlotNotAHookRegistration) {
+    const std::string app = read_repo_file("src/bracken/application.cpp");
+    if (app.empty()) {
+        GTEST_SKIP() << "BRACKEN_REPO_ROOT not defined or application.cpp unreadable";
+    }
+
+    // init_dev_ui still uses the dedicated single-assignment callback.
+    EXPECT_NE(app.find("set_post_ui_callback"), std::string::npos)
+        << "the developer overlay no longer claims the post-UI callback";
+
+    // And it deliberately does NOT register itself as a render hook. If it did,
+    // it would be one entry in a list a host can reorder (by `order`) or empty
+    // outright (`clear()`), which is the same failure as before with the arrow
+    // pointing the other way. The overlay's slot has to be one nothing else can
+    // reach.
+    EXPECT_EQ(app.find("render_hooks()"), std::string::npos)
+        << "Application must not put the developer overlay in the shared hook registry — a host's clear() would "
+           "remove it";
 }
 
 } // namespace

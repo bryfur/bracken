@@ -10,6 +10,7 @@
 #include "bracken/model_loader.hpp"
 #include "bracken/physics/physics_world.hpp"
 #include "bracken/scene/frame_sink.hpp"
+#include "custom_pass.hpp"
 #include "day_weather.hpp"
 #include "sfx.hpp"
 
@@ -394,6 +395,15 @@ private:
     // legacy fixed environment deterministic) it never writes env_.
     DayWeather day_weather_;
     bool day_weather_enabled_ = true;
+
+    // The host-extensible-rendering worked example (custom_pass.hpp): one
+    // game-owned pipeline built from the game's OWN HLSL, drawn from a
+    // RenderHookSlot::AfterOpaque hook. Installed only under
+    // PLAYGROUND_CUSTOM_PASS=1 — a `--smoke` run has to keep painting exactly
+    // what the pinned screenshot baselines were measured against. Main-thread
+    // tier: touched from on_init / on_shutdown / on_main_frame only.
+    CustomTintPass custom_pass_;
+
     // Rain emission state (sim-owned). The rain layer is a short continuous
     // volume effect re-spawned above the player on a cadence (continuous
     // emitters cannot move); splashes are burst effects at ray-cast impact

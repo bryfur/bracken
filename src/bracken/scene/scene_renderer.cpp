@@ -593,6 +593,21 @@ void SceneRenderer::end_ui() {
 // Host render passes (scene/render_hook.hpp)
 // ============================================================================
 
+void SceneRenderer::set_post_ui_callback(PostUICallback cb) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    // ONE assignable slot, and Application::init_dev_ui takes it. A game that
+    // set it used to turn F10 into a no-op with no diagnostic anywhere — the
+    // failure this whole extension surface exists to close. The slot is kept for
+    // the overlay's sake, so the least it can do is say when it is taken over.
+    if (post_ui_callback_ && cb) {
+        BRACKEN_LOG_WARN(LOG_TAG,
+                         "SceneRenderer::set_post_ui_callback replaced an already-installed callback — if that was "
+                         "the developer overlay (Application::init_dev_ui installs it), F10 will now draw nothing. "
+                         "Hosts should use render_hooks().add(RenderHookSlot::AfterUi, ...), which composes.");
+    }
+    post_ui_callback_ = std::move(cb);
+}
+
 void SceneRenderer::run_render_hooks(RenderHookSlot slot, SDL_GPUCommandBuffer* cmd, const CameraState& draw_camera,
                                      float dt, SDL_GPUTexture* swapchain) {
     // Hooks record into the frame's command buffer alongside every engine pass.
