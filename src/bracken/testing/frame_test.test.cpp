@@ -410,6 +410,9 @@ TEST(TestFrame, DigestDistinguishesAnEmptyFrame) {
     one.seal();
 
     EXPECT_NE(empty.digest(), one.digest());
+}
+
+// ---------------------------------------------------------------------------
 // UI textured quads and clip commands (the two payloads the UI module added).
 // Same five properties the ShadowCapsule block above pins, minus the budget
 // (these have none — they are ordinary UI commands and share the UI chunk).
