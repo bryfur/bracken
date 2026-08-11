@@ -261,8 +261,17 @@ struct VillagerRig {
 /// Angle between two rotations, in radians, sign-insensitive (q and -q are the
 /// same rotation).
 [[nodiscard]] float angle_between(const glm::quat& a, const glm::quat& b) {
-    const float d = std::fabs(glm::dot(a, b));
-    return 2.0f * std::acos(std::min(1.0f, d));
+    // Sign-align first: q and -q are the same rotation, so the short way round
+    // is the only meaningful one.
+    const glm::quat c = (glm::dot(a, b) < 0.0f) ? -b : b;
+    // 2*atan2(|a - c|, |a + c|), NOT 2*acos(|dot|). acos has infinite slope at
+    // 1, so it loses half its significant digits exactly where this test looks:
+    // at ONE ULP of separation the acos form returns 9.8e-4 rad, a resolution
+    // floor two orders of magnitude above the 1e-5 these tests want to assert.
+    // The atan2 form is linear in the separation and bottoms out at zero.
+    // The factor is 4, not 2: atan2(|a - c|, |a + c|) is HALF the 4-D angle
+    // between the quaternions, and the rotation angle is twice that again.
+    return 4.0f * std::atan2(glm::length(a - c), glm::length(a + c));
 }
 
 } // namespace

@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <numbers>
 #include <vector>
 
 using namespace bracken::animation;
@@ -307,17 +308,34 @@ TEST(BlendSpace2D, CollinearSamplesBehaveLikeAOneDimensionalSpace) {
     EXPECT_NEAR(weight_of(std::span<const WeightedClip>(out.data(), at_end), 2), 1.0f, 1e-6f);
 }
 
-TEST(BlendSpace2D, AQueryFarOutsideTheCoverFallsBackToTheNearestSample) {
+TEST(BlendSpace2D, AQueryFarOutsideTheCoverIsDominatedByTheSampleItPointsAt) {
+    // This space is DIRECTIONAL, not nearest-neighbour, and the distinction is
+    // the whole point of the test. There is no "outside the cover" fallback and
+    // there must not be one: a nearest-sample snap would put a discontinuity
+    // wherever the query crosses the perpendicular bisector, and gradient-band
+    // interpolation is C0 everywhere precisely because it never snaps.
     BlendSpace2D s;
     ASSERT_TRUE(s.add_sample(0, glm::vec2(1.0f, 0.0f)));
     ASSERT_TRUE(s.add_sample(1, glm::vec2(-1.0f, 0.0f)));
     std::array<WeightedClip, k_max_blend_samples> out{};
 
     const std::uint32_t n = s.resolve(glm::vec2(1000.0f, 3.0f), out);
-    ASSERT_GE(n, 1u) << "the fallback must never return an empty set";
+    ASSERT_GE(n, 1u) << "resolve must never return an empty set";
     EXPECT_NEAR(sum_of(std::span<const WeightedClip>(out.data(), n)), 1.0f, 1e-5f);
-    EXPECT_NEAR(weight_of(std::span<const WeightedClip>(out.data(), n), 0), 1.0f, 1e-5f)
-        << "(1000, 3) is nearest to (1, 0)";
+
+    // (1000, 3) is 0.003 rad off the +x axis, and the angular band between two
+    // opposed samples spans pi — so sample 1 keeps exactly 0.003/pi of the
+    // weight. Asserting 1.0 here would be asserting a snap that does not and
+    // should not happen; what the direction buys is DOMINANCE, not exclusivity.
+    const float w0 = weight_of(std::span<const WeightedClip>(out.data(), n), 0);
+    EXPECT_GT(w0, 0.999f) << "(1000, 3) points essentially straight at (1, 0)";
+    EXPECT_NEAR(w0, 1.0f - (3.0f / 1000.0f) / std::numbers::pi_v<float>, 2e-4f);
+
+    // Exactly on the axis it IS exclusive, and that is the property a caller
+    // can rely on: a query collinear with a sample resolves to that sample.
+    const std::uint32_t on_axis = s.resolve(glm::vec2(1000.0f, 0.0f), out);
+    ASSERT_EQ(on_axis, 1u);
+    EXPECT_FLOAT_EQ(weight_of(std::span<const WeightedClip>(out.data(), on_axis), 0), 1.0f);
 }
 
 TEST(BlendSpace2D, RefusesSamplesPastTheBudget) {
