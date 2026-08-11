@@ -11,6 +11,7 @@
 #include "bracken/effects/effect_system.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/heightmap.hpp"
+#include "bracken/heightmap_grid.hpp"
 #include "bracken/render/render_context.hpp"
 #include "bracken/scene/frame_packet_ring.hpp"
 #include "bracken/audio/audio_engine.hpp"
@@ -546,6 +547,20 @@ void Application::set_heightmap(const Heightmap& heightmap) {
         return;
     }
     scene_renderer_->set_heightmap(heightmap);
+}
+
+void Application::set_heightmap_grid(const HeightmapGrid& grid) {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "set_heightmap_grid() requires init_renderer() first");
+    // Same policy as set_heightmap: reject rather than install. A grid whose
+    // pages disagree about their quantization range renders a step along
+    // every seam and nothing anywhere says so — validate()'s error string
+    // names the page and the disagreement.
+    const core::Result<void, std::string> check = grid.validate();
+    if (!check) {
+        BRACKEN_LOG_ERROR("app", "set_heightmap_grid: ignoring the grid — {}", check.error());
+        return;
+    }
+    scene_renderer_->set_heightmap_grid(grid);
 }
 
 void Application::set_graphics_settings(const GraphicsSettings& settings) {

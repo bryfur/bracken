@@ -13,6 +13,7 @@
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/heightmap.hpp"
+#include "bracken/heightmap_grid.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/render/auto_exposure.hpp"
 #include "bracken/render/bloom.hpp"
@@ -469,19 +470,33 @@ void SceneRenderer::set_anisotropic_filter(int level) {
 }
 
 void SceneRenderer::set_heightmap(const Heightmap& heightmap) {
-    terrain_->set_heightmap(heightmap);
+    // THE 1x1 ADAPTER. Every pre-paging host call site lands here and the
+    // grid path below reproduces the old behaviour exactly: from_single keeps
+    // the map's origin/size/range, TerrainRenderer keeps its init-time world
+    // rect for a single page, and the grass binding below resolves to that
+    // page's own texture and the map's own five scalars.
+    set_heightmap_grid(HeightmapGrid::from_single(heightmap));
+}
+
+void SceneRenderer::set_heightmap_grid(const HeightmapGrid& grid) {
+    terrain_->set_heightmap_grid(grid);
 
     if (grass_renderer_ && terrain_->heightmap_texture()) {
+        // Whatever texture the terrain decided grass should sample — the
+        // single page's for a 1x1 grid, the coarse world proxy for a paged
+        // one — described by the params that decode it.
+        const render::TerrainRenderer::HeightmapSampleParams src = terrain_->heightmap_sample_params();
         render::HeightmapParams hm_params;
-        hm_params.world_origin_x = heightmap.world_origin_x;
-        hm_params.world_origin_z = heightmap.world_origin_z;
-        hm_params.world_size = heightmap.world_size;
-        hm_params.min_height = heightmap.min_height;
-        hm_params.max_height = heightmap.max_height;
+        hm_params.world_origin_x = src.world_origin_x;
+        hm_params.world_origin_z = src.world_origin_z;
+        hm_params.world_size = src.world_size;
+        hm_params.min_height = src.min_height;
+        hm_params.max_height = src.max_height;
         grass_renderer_->set_heightmap(terrain_->heightmap_texture(), hm_params);
     }
 
-    BRACKEN_LOG_DEBUG(LOG_TAG, "Heightmap set for terrain rendering");
+    BRACKEN_LOG_DEBUG(LOG_TAG, "Heightmap set for terrain rendering ({} of {} page(s) resident)",
+                      terrain_->resident_pages(), terrain_->heightmap_grid().page_count());
 }
 
 // ============================================================================

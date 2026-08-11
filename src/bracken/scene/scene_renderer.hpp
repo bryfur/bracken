@@ -65,6 +65,7 @@ class JobSystem;
 namespace bracken {
 class ModelManager;
 struct Heightmap;
+struct HeightmapGrid;
 struct EffectDefinition;
 struct Model;
 struct Mesh;
@@ -123,7 +124,21 @@ public:
 
     // ========== Configuration ==========
 
+    /// The single-map world. Since paged terrain landed this is the 1x1
+    /// adapter over set_heightmap_grid and nothing else.
     void set_heightmap(const Heightmap& heightmap);
+    /**
+     * An N x M grid of heightmap PAGES (docs/gap_streaming.md). Installs the
+     * per-page terrain meshes and rewires the grass height binding — which
+     * for a paged grid is a COARSE world-spanning proxy, so grass follows a
+     * smoothed terrain (a known limitation of this landing, see
+     * TerrainRenderer::heightmap_texture).
+     *
+     * A grid that fails HeightmapGrid::validate() is REFUSED with a logged
+     * error and the previous terrain is kept — see heightmap_grid.hpp for the
+     * seam-quantization trap that check exists for.
+     */
+    void set_heightmap_grid(const HeightmapGrid& grid);
     void set_anisotropic_filter(int level);
     void set_graphics_settings(const GraphicsSettings& settings);
     void set_vsync_mode(int mode);

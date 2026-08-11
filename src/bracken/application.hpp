@@ -42,6 +42,7 @@ class EffectSystem;
 class ModelManager;
 class Application;
 struct Heightmap;
+struct HeightmapGrid;
 
 /**
  * A scoped edit of the persisted graphics settings, committed on destruction.
@@ -277,6 +278,22 @@ protected:
     scene::PacketRing& frame_packets();
 
     void set_heightmap(const Heightmap& heightmap);
+
+    /**
+     * Install an N x M grid of heightmap PAGES instead of the single map
+     * (docs/gap_streaming.md). `set_heightmap(m)` is exactly
+     * `set_heightmap_grid(HeightmapGrid::from_single(m))`.
+     *
+     * Refuses — logged, previous terrain kept — a grid that fails
+     * `HeightmapGrid::validate()`. The check that matters is that every
+     * resident page shares one quantization range: pages packed
+     * independently disagree about the heights on the line they share and the
+     * seam STEPS, with nothing logged anywhere. Build the grid with
+     * `HeightmapGrid::create` + `set_page` and it cannot happen.
+     *
+     * Main-thread tier, after init_renderer().
+     */
+    void set_heightmap_grid(const HeightmapGrid& grid);
 
     /**
      * GRAPHICS SETTINGS APPLICATION (window mode, vsync, sampler rebuilds —

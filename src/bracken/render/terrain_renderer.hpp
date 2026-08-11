@@ -7,6 +7,7 @@
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/heightmap.hpp"
+#include "bracken/heightmap_grid.hpp"
 #include <cstddef>
 #include <glm/glm.hpp>
 #include <memory>
@@ -142,8 +143,70 @@ public:
 
     /**
      * Set heightmap from server data. Uploads to GPU texture.
+     *
+     * Since paged terrain landed this is the 1x1 adapter over
+     * set_heightmap_grid — `HeightmapGrid::from_single(heightmap)` and
+     * nothing else. Every existing host call site keeps working and keeps
+     * producing the identical mesh, tile set and draw stream; see
+     * docs/gap_streaming.md for what "identical" is pinned against.
      */
     void set_heightmap(const bracken::Heightmap& heightmap);
+
+    /**
+     * Set an N x M grid of heightmap PAGES. One GPU page per grid cell: its
+     * own vertex + index buffers, its own low-LOD shadow buffers, its own R16
+     * heightmap texture and its own tiles/rows. The pure `cull_tile_runs()`
+     * runs once per page and is unchanged.
+     *
+     * REFUSES (logs an ERROR and keeps the previous terrain) a grid that
+     * fails `HeightmapGrid::validate()` — above all one whose pages disagree
+     * about their quantization range, which is the seam-step trap
+     * heightmap_grid.hpp documents.
+     *
+     * DRAW-CALL ARITHMETIC, because this is the cost that grows: tile runs
+     * merge only inside one page (a run is an index-buffer range and each
+     * page owns its own index buffer), so a page that survives the page-AABB
+     * reject costs at least one draw in each of the six terrain walks per
+     * frame — main, depth prepass, and four shadow cascades. Today's single
+     * page collapses ~2700 tiles into ~10-30 runs, i.e. ~60-180 terrain draws
+     * a frame; with P frustum-intersecting pages the FLOOR is 6*P draws and
+     * the ceiling is 6 * sum(runs per page). Note the total is not ordered
+     * against the unpaged one — a page renumbers its tiles into its own
+     * buffer, so its runs can merge where the world-sized buffer's could not
+     * (measured in terrain_renderer.test.cpp, TerrainPageCulling). What is
+     * guaranteed is the floor and that the same triangles are drawn.
+     * `k_recommended_min_page_size` (2000 units) is the size below which
+     * TerrainRenderer warns.
+     *
+     * Main-thread tier (creates and destroys GPU resources).
+     */
+    void set_heightmap_grid(const bracken::HeightmapGrid& grid);
+
+    /// The installed grid. A host that called set_heightmap sees the 1x1
+    /// grid the adapter built.
+    [[nodiscard]] const bracken::HeightmapGrid& heightmap_grid() const { return grid_; }
+
+    /// Grid cells with height data AND a built GPU page.
+    [[nodiscard]] std::size_t resident_pages() const;
+
+    /// Approximate GPU bytes held by the resident pages (mesh buffers +
+    /// heightmap textures + the grass proxy). For the dev panel.
+    [[nodiscard]] std::size_t page_bytes() const;
+
+    /**
+     * What the grass renderer must put in its `HeightmapParams` to decode the
+     * texture `heightmap_texture()` hands it. Identical to the map's own five
+     * scalars for a 1x1 grid; the proxy's for a paged one (see
+     * heightmap_texture()).
+     */
+    struct HeightmapSampleParams {
+        float world_origin_x = 0.0f;
+        float world_origin_z = 0.0f;
+        float world_size = 0.0f;
+        float min_height = 0.0f;
+        float max_height = 0.0f;
+    };
+    [[nodiscard]] HeightmapSampleParams heightmap_sample_params() const { return grass_params_; }
 
     /**
      * Update splatmap texture from CPU data. Host-opt-in (nothing in the
@@ -273,8 +336,19 @@ public:
     // Accessors
     float world_width() const { return world_width_; }
     float world_height() const { return world_height_; }
-    bool has_heightmap() const { return heightmap_ != nullptr; }
-    gpu::GPUTexture* heightmap_texture() { return heightmap_texture_.get(); }
+    bool has_heightmap() const { return has_heightmap_; }
+    /**
+     * The ONE world-spanning R16 height texture the grass shader samples
+     * (`grass_blade.hlsli`'s `sampleTerrainHeight` hard-codes one texture,
+     * one origin and one world size). For a 1x1 grid this is that page's own
+     * texture — the pre-paging behaviour exactly. For a paged grid it is a
+     * COARSE PROXY resampled over the whole grid: grass then follows a
+     * smoothed terrain, which is a known and deliberate limitation of this
+     * landing (docs/gap_streaming.md). Per-page grass sampling needs a
+     * Texture2DArray plus a page index in the shader, which moves
+     * `GrassVertexUniforms` — a two-sided cbuffer change.
+     */
+    gpu::GPUTexture* heightmap_texture() { return grass_heightmap_texture_; }
     gpu::GPUTexture* material_array_texture() { return material_array_texture_.get(); }
     gpu::GPUTexture* splatmap_texture() { return splatmap_texture_.get(); }
 
@@ -355,12 +429,80 @@ public:
                                std::vector<TileRun>& out_runs);
 
 private:
-    void generate_terrain_mesh();
-    void generate_shadow_terrain_mesh(); // low-LOD mesh for shadow passes
+    /// One resident grid cell's GPU state. Everything that used to be a
+    /// single set of members on the renderer is now per page; the CPU tile
+    /// machinery (TerrainTile/TileRow/TileRun, build_tile_rows,
+    /// cull_tile_runs) is reused verbatim, once per page.
+    struct TerrainPage {
+        int px = 0;
+        int pz = 0;
+        std::unique_ptr<gpu::GPUBuffer> vertex_buffer;
+        std::unique_ptr<gpu::GPUBuffer> index_buffer;
+        std::unique_ptr<gpu::GPUBuffer> shadow_vertex_buffer;
+        std::unique_ptr<gpu::GPUBuffer> shadow_index_buffer;
+        std::unique_ptr<gpu::GPUTexture> heightmap_texture;
+        std::size_t heightmap_texture_bytes = 0;
+        uint32_t index_count = 0;
+        uint32_t shadow_index_count = 0;
+        std::vector<TerrainTile> tiles;
+        std::vector<TerrainTile> shadow_tiles;
+        std::vector<TileRow> rows;
+        std::vector<TileRow> shadow_rows;
+        /// Union of the page's tile AABBs — the reject tested in FRONT of
+        /// cull_tile_runs at all three draw sites. A frustum that misses this
+        /// box misses every tile inside it, so the reject can only remove
+        /// work the per-tile cull would have removed anyway.
+        glm::vec3 aabb_min = glm::vec3(0.0f);
+        glm::vec3 aabb_max = glm::vec3(0.0f);
+        glm::vec3 shadow_aabb_min = glm::vec3(0.0f);
+        glm::vec3 shadow_aabb_max = glm::vec3(0.0f);
+        std::size_t gpu_bytes = 0;
+
+        /// render()'s per-page gate — deliberately NOT index-count gated, so
+        /// a 1x1 grid reproduces the pre-paging early-out exactly.
+        [[nodiscard]] bool has_buffers() const { return vertex_buffer != nullptr && index_buffer != nullptr; }
+        [[nodiscard]] bool drawable() const { return has_buffers() && index_count > 0; }
+        [[nodiscard]] bool shadow_drawable() const {
+            return (shadow_vertex_buffer != nullptr && shadow_index_buffer != nullptr && shadow_index_count > 0) ||
+                   drawable();
+        }
+    };
+
+    /// The world rect one page's mesh spans, margin included.
+    struct PageRect {
+        float start_x = 0.0f;
+        float start_z = 0.0f;
+        float end_x = 0.0f;
+        float end_z = 0.0f;
+    };
+
+    /**
+     * Terrain is generated over a margin ring so the world does not end in a
+     * visible cliff. Shared by the main and shadow generators, both of which
+     * used a private 500 before paging.
+     */
+    static constexpr float k_page_margin = 500.0f;
+    /// Cap on the grass proxy's side, so a 16x16 grid of 257-sample pages
+    /// does not try to resample a 4112x4112 R16 texture (34 MB) at load.
+    static constexpr uint32_t k_grass_proxy_max_resolution = 1024;
+
+    /// Does any page satisfy a per-page gate? The three draw entry points use
+    /// this for their early-out so that a 1x1 grid takes the same one the
+    /// pre-paging code did.
+    [[nodiscard]] bool any_page(bool (TerrainPage::*predicate)() const) const;
+
+    [[nodiscard]] PageRect page_mesh_rect(int px, int pz) const;
+    void rebuild_pages();
+    void generate_page_mesh(TerrainPage& page);
+    void generate_page_shadow_mesh(TerrainPage& page);
+    void rebuild_grass_heightmap();
+
+    void generate_terrain_mesh();        // every page's main mesh
+    void generate_shadow_terrain_mesh(); // every page's low-LOD shadow mesh
     void load_terrain_textures();
     void create_fallback_material_array();
     void create_fallback_splatmap();
-    void upload_heightmap_texture();
+    void upload_heightmap_texture(); // every page's R16 texture + the grass proxy
 
     gpu::GPUDevice* device_ = nullptr;
     gpu::PipelineRegistry* pipeline_registry_ = nullptr;
@@ -381,11 +523,24 @@ private:
     float world_width_ = 0.0f;
     float world_height_ = 0.0f;
 
-    // Server-provided heightmap (CPU side for sampling)
-    std::unique_ptr<bracken::Heightmap> heightmap_;
+    // Server-provided height data (CPU side for sampling). A host that calls
+    // set_heightmap gets the 1x1 grid the adapter builds; get_height/
+    // get_normal read this and nothing else.
+    bracken::HeightmapGrid grid_;
+    /// grid_.resident_pages() > 0, cached: get_height is called once per mesh
+    /// vertex (millions at init) and must not walk the page vector.
+    bool has_heightmap_ = false;
 
-    // GPU resources
-    std::unique_ptr<gpu::GPUTexture> heightmap_texture_;
+    // GPU resources. One page per grid cell; always at least one entry after
+    // init (the flat placeholder the renderer draws before any heightmap
+    // arrives, which is exactly what the pre-paging code did).
+    std::vector<TerrainPage> pages_;
+    /// Built only for a PAGED grid — see heightmap_texture(). Null for 1x1.
+    std::unique_ptr<gpu::GPUTexture> grass_proxy_texture_;
+    /// Non-owning: page 0's texture (1x1) or grass_proxy_texture_ (paged).
+    gpu::GPUTexture* grass_heightmap_texture_ = nullptr;
+    std::size_t grass_proxy_bytes_ = 0;
+    HeightmapSampleParams grass_params_{};
 
     // Terrain material textures (using Texture2DArray to reduce sampler count)
     std::unique_ptr<gpu::GPUTexture> material_array_texture_; // 4 layers: grass, dirt, rock, sand
@@ -393,20 +548,6 @@ private:
 
     std::unique_ptr<gpu::GPUSampler> material_sampler_;
     std::unique_ptr<gpu::GPUSampler> splatmap_sampler_; // linear CLAMP — splatmap must not wrap in the margin ring
-    std::unique_ptr<gpu::GPUBuffer> vertex_buffer_;
-    std::unique_ptr<gpu::GPUBuffer> index_buffer_;
-    uint32_t index_count_ = 0;
-
-    // Low-LOD mesh used only for shadow passes. Coarser cell size -> ~16x fewer triangles.
-    // Shadow resolution already smooths over the mesh detail, so visual impact is negligible.
-    std::unique_ptr<gpu::GPUBuffer> shadow_vertex_buffer_;
-    std::unique_ptr<gpu::GPUBuffer> shadow_index_buffer_;
-    uint32_t shadow_index_count_ = 0;
-
-    std::vector<TerrainTile> tiles_;
-    std::vector<TerrainTile> shadow_tiles_;
-    std::vector<TileRow> tile_rows_;
-    std::vector<TileRow> shadow_tile_rows_;
 
     // Reused per draw call by draw_culled_tiles (main + prepass + cascades).
     // main-thread (like the draw path that owns it).
