@@ -350,7 +350,19 @@ public:
     static void upload_to_gpu(gpu::GPUDevice& device, TextureCache& textures, Model& model,
                               bool retain_cpu_geometry = false);
     /// Release the model's GPU resources. Main-thread tier (asserted).
+    ///
+    /// Drops the model's borrows on its textures WITHOUT telling the cache —
+    /// which is correct only when the cache is about to be cleared wholesale
+    /// or when nothing counts references. Streaming wants the counted form
+    /// below; this overload stays for callers that have no cache to hand.
     static void free_gpu_resources(Model& model);
+
+    /// As above, but also `release()`s each texture slot back to the cache, so
+    /// an evicted model's images can eventually be freed. Exactly one release
+    /// per non-null slot: `upload_to_gpu` takes exactly one `acquire()` per
+    /// slot, shared images included, so the pairing is slot-for-slot.
+    /// Main-thread tier (asserted).
+    static void free_gpu_resources(TextureCache& textures, Model& model);
 };
 
 /**
@@ -510,6 +522,69 @@ public:
 
     /// Release every model and its GPU resources. Main-thread (asserted).
     void unload_all();
+
+    /**
+     * Free one model's GPU resources while KEEPING its slot.
+     *
+     * This is eviction, not deletion, and the distinction is the whole point.
+     * `ModelHandle`s are dense indices that are baked into draw commands, into
+     * instance bins, into the LOD chains of other models and into the ray
+     * tracer's instance list; renumbering or reusing one is the bug class
+     * async_model_loader.cpp:28-41 records costing three smoke runs that
+     * rendered three different frames. So the slot, the name mapping, the
+     * source path, the bounds and the LOD links all survive: `get_model()`
+     * still returns the same `Model*`, `get_handle(name)` still resolves, and
+     * `model_count()` is unchanged — which is the invariant the acceleration
+     * structure's all-handles walk depends on.
+     *
+     * What goes is the payload: vertex/index buffers, texture references
+     * (released to the cache) and any retained CPU geometry. `Model::loaded`
+     * becomes false, which is the flag every consumer tests — the Prepare
+     * stage counts such a draw as `draws_deferred_not_resident` rather than
+     * dropping it as unknown, and the BLAS build skips the slot.
+     *
+     * DOES NOT FOLLOW THE LOD CHAIN. Levels are separate models with their own
+     * handles; evicting a base leaves its levels resident. A residency manager
+     * that wants the whole chain gone must evict each handle.
+     *
+     * INVALIDATES ANY RAY-TRACING ACCELERATION STRUCTURE BUILT OVER THIS
+     * MODEL. The TLAS only rebuilds when the instance SET changes, and an
+     * eviction changes neither the instance count nor the handle sequence, so
+     * nothing notices on its own — the caller must invalidate explicitly
+     * (`SceneRenderer::invalidate_raytracing_scene()`; `ResidencyManager` does
+     * it for you). Skipping that leaves BLAS triangles pointing at freed
+     * geometry.
+     *
+     * @return the byte estimate released (what `gpu_bytes` reported before).
+     *         0 for an unknown handle or a model already unloaded.
+     * Main-thread (asserted).
+     */
+    std::size_t unload_model(ModelHandle handle);
+
+    /**
+     * Put freshly decoded contents back into a slot `unload_model` emptied.
+     *
+     * The handle and the `Model*` are preserved (move-assign into the existing
+     * object, exactly as `reload_model` does), so every draw command that
+     * survived the eviction resolves again with no host bookkeeping.
+     *
+     * Refuses (false, logged) an unknown handle or a null model. A slot that
+     * is still loaded is unloaded first, so this doubles as "replace".
+     * Main-thread (asserted).
+     */
+    [[nodiscard]] bool reupload_model(ModelHandle handle, std::unique_ptr<Model> decoded);
+
+    /**
+     * Estimated GPU bytes a model currently holds: its buffers exactly, plus
+     * the FULL estimated size of every texture slot it references.
+     *
+     * The texture half deliberately OVER-counts: a shared atlas is charged to
+     * every model that references it, because the alternative — charging a
+     * share — would make a residency budget under-count by exactly the amount
+     * that does not get freed when one of the sharers is evicted. An upper
+     * bound is the safe direction for a budget.
+     */
+    [[nodiscard]] std::size_t gpu_bytes(ModelHandle handle) const noexcept;
 
 private:
     gpu::GPUDevice* device_ = nullptr;

@@ -255,6 +255,7 @@ void SceneRenderer::shutdown() {
     probe_volume_.reset();
     screen_probes_.reset();
     hzb_.reset();
+    release_occlusion_resources();
 
     if (default_sampler_ && context_) {
         context_->device().release_sampler(default_sampler_);
@@ -657,8 +658,22 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     // invalidations it reports are performed at their original sites below,
     // AFTER the minimized-window early-out, so a minimized frame still drops
     // nothing.
+    // Adopt the previous frame's occlusion readback BEFORE the plan is made:
+    // whether a usable field exists is one of the plan's inputs, and the plan
+    // has to stay a pure function of facts that are already settled.
+    if (gfx.occlusion_culling) {
+        resolve_occlusion_readback();
+    } else if (hzb_far_ || occlusion_transfer_ || occlusion_fence_) {
+        // Released the moment the setting goes off, mirroring hzb_/probe_volume_:
+        // a screen-sized mip chain is not something to keep resident for a
+        // feature nobody asked for.
+        release_occlusion_resources();
+        hzb_far_init_failed_ = false;
+    }
+
     RendererCaps caps;
     caps.post_ready = post_->is_ready();
+    caps.occlusion_depth_ready = occlusion_depth_ready_;
     caps.taa_ready = taa_->is_ready();
     caps.ibl_ready = ibl_ && ibl_->is_ready();
     caps.camera_seen = have_frame_camera_;
@@ -670,6 +685,7 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     frame_fog_active_ = plan.fog_active;
     frame_draw_dist_sq_ = plan.draw_dist_sq;
     frame_do_frustum_cull_ = plan.do_frustum_cull;
+    frame_occlusion_active_ = plan.occlusion_active;
 
     // Scene/sky clocks are advanced by the SIM stage and carried in the
     // packet's engine section (docs/multithreading_plan.md Phase 4): adopt
@@ -864,6 +880,20 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
 
         // Build instance batches (cull for main + per-cascade shadows) and
         // resolve the skinned commands against the packet-owned palettes.
+        // The occlusion field's motion gates, measured against the camera that
+        // actually rasterized the depth it holds. They are the difference
+        // between "conservative" and "conservative for a still camera": the
+        // depth is a frame old, so a big translation or rotation means it
+        // describes a view this one no longer resembles, and the field is
+        // simply not consulted that frame. Both inputs are scene state, so the
+        // decision is reproducible run to run.
+        if (frame_occlusion_active_) {
+            const glm::vec3 forward =
+                glm::normalize(-glm::vec3(camera.view[0][2], camera.view[1][2], camera.view[2][2]));
+            occlusion_field_.camera_travel = glm::length(camera.position - occlusion_camera_position_);
+            occlusion_field_.camera_rotation_cos = glm::dot(forward, occlusion_camera_forward_);
+        }
+
         build_instance_batches(frame, camera, frame_frustum_, plan.active_cascades);
         pack_bone_palettes(frame, camera);
 
@@ -1211,6 +1241,22 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 // pyramid allocated — that is a transient, not a mode change.
                 hzb_.reset();
                 hzb_init_failed_ = false;
+            }
+
+            // ===== The FARTHEST-surface pyramid, for next frame's draw
+            // occlusion cull. Same input as the block above, opposite reduction
+            // (render/hzb.hpp hzb_reduce_far), and its own texture — the two
+            // answers cannot be recovered from one another.
+            //
+            // It sits here for the same reason: this is the earliest point its
+            // only input exists. What it produces is consumed a WHOLE FRAME
+            // LATER, in the Prepare stage, because Prepare runs before this
+            // frame's prepass and SDL3 has no non-blocking map. That one-frame
+            // lag is the source of every conservatism knob on OcclusionField.
+            //
+            // Off by default: one enum compare and not a byte allocated. =====
+            if (gfx.occlusion_culling && frame_prepass_active_ && cmd != nullptr) {
+                build_occlusion_pyramid(cmd, draw_camera);
             }
 
             // ===== GTAO: computed from the prepass depth BEFORE the forward
@@ -2229,6 +2275,10 @@ void SceneRenderer::build_instance_batches(const FramePacket& frame, const Camer
     p.draw_dist_sq = frame_draw_dist_sq_;
     p.do_frustum_cull = frame_do_frustum_cull_;
     p.collect_stats = collect_stats_;
+    // Null unless the plan said yes. The field is a frame-constant read-only
+    // input, so handing it across does not weaken the Prepare stage's
+    // bit-identity contract (scene_prep.hpp PrepParams::occlusion).
+    p.occlusion = frame_occlusion_active_ ? &occlusion_field_ : nullptr;
 
     // Cull stats accumulate into per-chunk partials, merged once after the
     // fan-out (per-chunk merge discipline — see FrameStatsPartial).
@@ -2283,6 +2333,162 @@ void SceneRenderer::pack_bone_palettes(const FramePacket& frame, const CameraSta
 } // namespace bracken::scene
 
 namespace bracken::scene {
+
+// ============================================================================
+// Hi-Z draw occlusion culling (GraphicsSettings::occlusion_culling)
+// ============================================================================
+
+void SceneRenderer::release_occlusion_resources() {
+    if (context_ != nullptr) {
+        if (occlusion_fence_ != nullptr) {
+            // Waited, not abandoned: the fence guards a copy into
+            // occlusion_transfer_, and releasing the buffer with the copy still
+            // in flight is a use-after-free inside the driver.
+            SDL_WaitForGPUFences(context_->device().handle(), true, &occlusion_fence_, 1);
+            SDL_ReleaseGPUFence(context_->device().handle(), occlusion_fence_);
+        }
+        if (occlusion_transfer_ != nullptr) {
+            context_->device().release_transfer_buffer(occlusion_transfer_);
+        }
+    }
+    occlusion_fence_ = nullptr;
+    occlusion_transfer_ = nullptr;
+    occlusion_transfer_bytes_ = 0;
+    occlusion_depth_.clear();
+    occlusion_depth_ready_ = false;
+    occlusion_field_ = OcclusionField{};
+    hzb_far_.reset();
+}
+
+void SceneRenderer::resolve_occlusion_readback() {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    if (occlusion_fence_ == nullptr || context_ == nullptr || !hzb_far_) {
+        return;
+    }
+    SDL_GPUDevice* dev = context_->device().handle();
+
+    // DETERMINISTIC wait, deliberately. The alternative — "skip the test if the
+    // fence has not signalled" — makes the culled set depend on GPU timing, so
+    // two runs of the same scene render different frames and every pinned
+    // screenshot baseline stops meaning anything. This fence was submitted a
+    // full frame ago and is normally already signalled; if it ever is not, the
+    // cost shows up as render time, not as present_wait.
+    SDL_WaitForGPUFences(dev, true, &occlusion_fence_, 1);
+    SDL_ReleaseGPUFence(dev, occlusion_fence_);
+    occlusion_fence_ = nullptr;
+
+    const int mip_w = render::hzb_mip_size(hzb_far_->width(), k_occlusion_level);
+    const int mip_h = render::hzb_mip_size(hzb_far_->height(), k_occlusion_level);
+    const std::size_t texels = static_cast<std::size_t>(mip_w) * static_cast<std::size_t>(mip_h);
+    if (texels == 0 || occlusion_transfer_ == nullptr) {
+        return;
+    }
+
+    void* mapped = context_->device().map_transfer_buffer(occlusion_transfer_, false);
+    if (mapped == nullptr) {
+        return;
+    }
+    occlusion_depth_.resize(texels);
+    std::memcpy(occlusion_depth_.data(), mapped, texels * sizeof(float));
+    context_->device().unmap_transfer_buffer(occlusion_transfer_);
+
+    // The camera that rasterized THIS depth, promoted from the pending slot.
+    occlusion_view_proj_ = pending_occlusion_view_proj_;
+    occlusion_camera_position_ = pending_occlusion_camera_position_;
+    occlusion_camera_forward_ = pending_occlusion_camera_forward_;
+
+    occlusion_field_.depth = occlusion_depth_;
+    occlusion_field_.mip_w = mip_w;
+    occlusion_field_.mip_h = mip_h;
+    occlusion_field_.screen_w = hzb_far_->width();
+    occlusion_field_.screen_h = hzb_far_->height();
+    occlusion_field_.level = k_occlusion_level;
+    occlusion_field_.view_proj = occlusion_view_proj_;
+    occlusion_depth_ready_ = true;
+}
+
+void SceneRenderer::build_occlusion_pyramid(SDL_GPUCommandBuffer* cmd, const CameraState& camera) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    if (cmd == nullptr || context_ == nullptr || post_->offscreen_depth() == nullptr) {
+        return;
+    }
+    if (!hzb_far_ && !hzb_far_init_failed_) {
+        auto pyramid = std::make_unique<render::HzbPyramid>();
+        if (pyramid->init(context_->device(), context_->width(), context_->height(),
+                          render::HzbReduction::Farthest)) {
+            hzb_far_ = std::move(pyramid);
+        } else {
+            // init() logged why. Latched: retrying a format-support check and a
+            // mip-chain allocation every frame is a per-frame stall plus a log
+            // flood, exactly as for hzb_.
+            hzb_far_init_failed_ = true;
+        }
+    }
+    if (!hzb_far_) {
+        return;
+    }
+    if (hzb_far_->width() != context_->width() || hzb_far_->height() != context_->height()) {
+        // A resize retires the pending readback AND the adopted depth: the old
+        // level describes a different frame at a different resolution, and
+        // reusing it would address a smaller buffer with larger indices.
+        if (occlusion_fence_ != nullptr) {
+            SDL_WaitForGPUFences(context_->device().handle(), true, &occlusion_fence_, 1);
+            SDL_ReleaseGPUFence(context_->device().handle(), occlusion_fence_);
+            occlusion_fence_ = nullptr;
+        }
+        hzb_far_->resize(context_->width(), context_->height());
+        occlusion_depth_ready_ = false;
+        occlusion_field_ = OcclusionField{};
+    }
+
+    {
+        BRACKEN_PROFILE_ZONE_COLOR("HZB far", 0x8E6FC4);
+        BRACKEN_GPU_SCOPE(cmd, "HZBFar");
+        BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "HZBFar");
+        hzb_far_->build(cmd, *pipeline_registry_, *post_->offscreen_depth());
+    }
+
+    // One readback in flight at a time. A second request while the first is
+    // pending would race two copies into one transfer buffer.
+    if (occlusion_fence_ != nullptr) {
+        return;
+    }
+    const std::size_t need = hzb_far_->level_readback_bytes(k_occlusion_level);
+    if (need == 0) {
+        return;
+    }
+    if (occlusion_transfer_ == nullptr || occlusion_transfer_bytes_ < need) {
+        if (occlusion_transfer_ != nullptr) {
+            context_->device().release_transfer_buffer(occlusion_transfer_);
+        }
+        SDL_GPUTransferBufferCreateInfo info = {};
+        info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+        info.size = static_cast<Uint32>(need);
+        occlusion_transfer_ = context_->device().create_transfer_buffer(info);
+        occlusion_transfer_bytes_ = occlusion_transfer_ != nullptr ? need : 0;
+    }
+    if (occlusion_transfer_ == nullptr) {
+        return;
+    }
+
+    occlusion_fence_ = hzb_far_->request_level_readback(k_occlusion_level, occlusion_transfer_);
+    if (occlusion_fence_ != nullptr) {
+        // Remember what rasterized it; the next frame's travel/rotation gates
+        // are measured against exactly this camera, not against "last frame".
+        //
+        // The UNJITTERED matrix, deliberately, even though the prepass
+        // rasterized with the jittered one. The discrepancy is at most half a
+        // pixel at mip 0, i.e. 1/32 of a texel at level 4, and the footprint
+        // walk dilates by a whole texel on every side — so it is inside the
+        // conservatism the test already carries, and using the jittered matrix
+        // would make the cull depend on the TAA phase, which is a frame-index
+        // input nobody wants in a culling decision.
+        pending_occlusion_view_proj_ = frame_cam_.view_proj_unjittered;
+        pending_occlusion_camera_position_ = camera.position;
+        pending_occlusion_camera_forward_ =
+            glm::normalize(-glm::vec3(camera.view[0][2], camera.view[1][2], camera.view[2][2]));
+    }
+}
 
 void SceneRenderer::build_raytracing_scene(const ModelManager& models, bool want_attributes) {
     if (!rt_renderer_ || context_ == nullptr) {

@@ -12,6 +12,7 @@
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/heightmap.hpp"
 #include "bracken/heightmap_grid.hpp"
+#include "bracken/residency_manager.hpp"
 #include "bracken/render/render_context.hpp"
 #include "bracken/scene/frame_packet_ring.hpp"
 #include "bracken/audio/audio_engine.hpp"
@@ -302,6 +303,14 @@ void Application::frame_fence(uint64_t joined_frame_index) {
         core::asset::FileWatcher::instance().poll_main_thread();
     }
 
+    // Asset residency applies at the fence for exactly the same reason, and it
+    // is a stronger requirement: pump() can UNLOAD a model, and a packet being
+    // built or rendered against a freed vertex buffer is not a stale image, it
+    // is a crash. Null unless a host installed one.
+    if (residency_ != nullptr) {
+        residency_->pump();
+    }
+
     // Deferred graphics-settings application (request_graphics_settings; the
     // main-thread slot — DevUI — wins over the sim slot when both are set).
     if (has_pending_graphics_settings_ || has_pending_graphics_settings_main_) {
@@ -561,6 +570,19 @@ void Application::set_heightmap_grid(const HeightmapGrid& grid) {
         return;
     }
     scene_renderer_->set_heightmap_grid(grid);
+}
+
+void Application::set_residency(ResidencyManager* residency) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    residency_ = residency;
+    if (residency_ != nullptr && scene_renderer_ != nullptr) {
+        // Wired here rather than left to the host, because forgetting it is not
+        // a degraded feature: an eviction changes neither the instance count
+        // nor the handle sequence, so RtScene's dirty test does not fire and
+        // the BLAS keeps referencing geometry unload_model just freed.
+        scene::SceneRenderer* renderer = scene_renderer_.get();
+        residency_->set_geometry_invalidator([renderer] { renderer->invalidate_raytracing_scene(); });
+    }
 }
 
 void Application::set_graphics_settings(const GraphicsSettings& settings) {

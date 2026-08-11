@@ -16,6 +16,8 @@ FrameStatsPartial make_partial(uint32_t base) {
     p.entities_frustum_culled = base + 5;
     p.diagnostics.draws_dropped_unknown_model = base + 6;
     p.diagnostics.skinned_dropped_no_skeleton = base + 7;
+    p.entities_occlusion_culled = base + 8;
+    p.diagnostics.draws_deferred_not_resident = base + 9;
     return p;
 }
 
@@ -26,6 +28,8 @@ TEST(FrameStatsPartial, DefaultIsZero) {
     EXPECT_EQ(p.entities_rendered, 0u);
     EXPECT_EQ(p.entities_distance_culled, 0u);
     EXPECT_EQ(p.entities_frustum_culled, 0u);
+    EXPECT_EQ(p.entities_occlusion_culled, 0u);
+    EXPECT_EQ(p.diagnostics.draws_deferred_not_resident, 0u);
 }
 
 TEST(FrameStatsPartial, MergeIntoAccumulates) {
@@ -53,6 +57,11 @@ TEST(FrameStatsPartial, MergeIntoAccumulates) {
     // Diagnostics ride the same merge (and stay out of RenderStats).
     EXPECT_EQ(diag.draws_dropped_unknown_model, 106u);
     EXPECT_EQ(diag.skinned_dropped_no_skeleton, 107u);
+    // Occlusion culls ride RenderStats; "not resident" rides the diagnostics —
+    // and the latter is deliberately NOT folded into unknown_model, because the
+    // two have opposite diagnoses (a host bug vs a streaming budget).
+    EXPECT_EQ(stats.entities_occlusion_culled, 108u);
+    EXPECT_EQ(diag.draws_deferred_not_resident, 109u);
     EXPECT_TRUE(diag.any());
 }
 
@@ -82,6 +91,8 @@ TEST(FrameStatsPartial, PlusEqualsFoldsChunks) {
     EXPECT_EQ(total.entities_frustum_culled, 1010u); // (0+5) + (1000+5)
     EXPECT_EQ(total.diagnostics.draws_dropped_unknown_model, 1012u);
     EXPECT_EQ(total.diagnostics.skinned_dropped_no_skeleton, 1014u);
+    EXPECT_EQ(total.entities_occlusion_culled, 1016u);            // (0+8) + (1000+8)
+    EXPECT_EQ(total.diagnostics.draws_deferred_not_resident, 1018u);
 }
 
 // The Phase 3 discipline: per-chunk partials merged in chunk order at the

@@ -309,6 +309,15 @@ void RtScene::build_blas_for_models(const ModelManager& models, bool want_attrib
         if (m == nullptr || m->meshes.empty()) {
             continue;
         }
+        // An EVICTED slot: still registered, still numbered, but its CPU
+        // geometry was freed by ModelManager::unload_model. `gather` would find
+        // empty arrays and `has_cpu_geometry` would catch it below anyway —
+        // this states the reason at the one place the residency contract meets
+        // the acceleration structure, and this walk is why unload_model must
+        // leave model_count() unchanged.
+        if (!m->loaded) {
+            continue;
+        }
         ModelGeometry g = gather(*m, want_attributes);
         if (!g.has_cpu_geometry || g.indices.size() < 3) {
             continue;

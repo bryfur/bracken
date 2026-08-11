@@ -86,6 +86,7 @@ bool GraphicsSettings::save(const std::string& path) const {
     out << "show_debug_hud=" << show_debug_hud << "\n";
     out << "draw_distance=" << static_cast<int>(draw_distance) << "\n";
     out << "frustum_culling=" << frustum_culling << "\n";
+    out << "occlusion_culling=" << occlusion_culling << "\n";
     out << "anisotropic_filter=" << static_cast<int>(anisotropic_filter) << "\n";
     out << "vsync_mode=" << static_cast<int>(vsync_mode) << "\n";
     out << "shadow_mode=" << static_cast<int>(shadow_mode) << "\n";
@@ -194,6 +195,7 @@ bool GraphicsSettings::load(const std::string& path) {
     read_bool("show_debug_hud", show_debug_hud);
     read_enum("draw_distance", draw_distance);
     read_bool("frustum_culling", frustum_culling);
+    read_bool("occlusion_culling", occlusion_culling);
     read_enum("anisotropic_filter", anisotropic_filter);
     read_enum("vsync_mode", vsync_mode);
     read_enum("shadow_mode", shadow_mode);

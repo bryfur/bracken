@@ -215,9 +215,17 @@ enum class ComputePipelineType {
     GiProbeClassify,        ///< Backface fraction -> probe relocation offset + inside-geometry verdict
 
     // Hierarchical-Z pyramid (render/hzb.hpp, docs/rt_lighting_plan.md §5.5).
-    // Built only for GiMode::ProbesScreen; R4b's screen march is the consumer.
+    // The closest-surface chain is built only for GiMode::ProbesScreen (R4b's
+    // screen march); the farthest-surface one only for
+    // GraphicsSettings::occlusion_culling.
     HzbCopy,   ///< Mip 0: D32 prepass depth (sampled) -> R32F storage level
     HzbReduce, ///< Mip N: conservative (reversed-Z MAX) reduction of mip N-1, one dispatch per mip
+    /// Mip N of the FARTHEST-surface pyramid: the same reduction with the
+    /// operator flipped (reversed-Z MIN), for draw occlusion culling. A second
+    /// pipeline rather than a read-time flag because the two are opposite
+    /// reductions of the same buffer and neither can be recovered from the
+    /// other after the fact.
+    HzbReduceFar,
 
     // Screen-probe gather (render/gi/screen_probes.hpp,
     // docs/rt_lighting_plan.md §5.5, R4b). All six run inside one

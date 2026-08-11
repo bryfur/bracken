@@ -24,6 +24,20 @@ struct RendererCaps {
     bool camera_seen = false; ///< a camera was set on THIS or an earlier frame (sticky)
     bool shadows_ready = false;  ///< ShadowMap::is_ready() — the CSM atlas exists
     int shadow_cascades = 0;     ///< ShadowMap::active_cascades() (a settings-driven count)
+    /**
+     * A completed readback of the FARTHEST-surface Hi-Z pyramid, built over
+     * the PREVIOUS frame's depth prepass, is available to the Prepare stage.
+     *
+     * False on the first frame after the feature is switched on, after a
+     * resize, and on any frame whose previous prepass did not run. Every one of
+     * those is a fact about the renderer's state, never about GPU timing:
+     * the readback is waited on DETERMINISTICALLY, so "the fence has not
+     * signalled yet" is deliberately NOT one of the reasons this can be false.
+     * A cull that depended on whether a fence happened to be ready would make
+     * the frame irreproducible run to run and quietly retire the pinned
+     * screenshot baselines.
+     */
+    bool occlusion_depth_ready = false;
 };
 
 /**
@@ -56,6 +70,9 @@ struct RenderPlan {
     bool fog_active = false;
     /// Frustum-cull draws against the main view frustum during prep.
     bool do_frustum_cull = false;
+    /// Hi-Z occlusion-cull draws during prep. Requires the setting, the HDR
+    /// path (there is no depth prepass without it) and a completed readback.
+    bool occlusion_active = false;
     /// Squared draw distance, the prep cull radius (settings distance²).
     float draw_dist_sq = 0.0f;
     /// CSM cascades to bin, render and sample this frame; 0 == no shadow

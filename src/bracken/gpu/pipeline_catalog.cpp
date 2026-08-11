@@ -1153,6 +1153,12 @@ constexpr std::array<ComputePipelineDesc, static_cast<size_t>(ComputePipelineTyp
      // point the read-write binding, with its explicit mip_level, is the only
      // way to name a single level.
      .resources = {.num_readwrite_storage_textures = 2, .num_uniform_buffers = 1}},
+    {.name = "HzbReduceFar",
+     .shader = "hzb_reduce_far.comp.spv",
+     .entry_point = "CSMain",
+     // Identical resource shape to HzbReduce — same cbuffer, same two mip
+     // bindings. Only the reduction operator differs.
+     .resources = {.num_readwrite_storage_textures = 2, .num_uniform_buffers = 1}},
 
     // ---- screen-probe gather (render/gi/screen_probes.hpp, R4b) ------------
     {.name = "GiScreenProbePlace",

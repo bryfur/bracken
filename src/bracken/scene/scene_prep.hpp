@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bracken/contracts/frustum.hpp"
+#include "bracken/contracts/occlusion.hpp"
 #include "bracken/contracts/render_stats.hpp"
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
@@ -114,6 +115,23 @@ public:
         bool do_frustum_cull = false;
         bool collect_stats = false;
         bool prev_palette_valid = false; // prev palette buffer holds last frame's data
+        /**
+         * Frame-old coarse depth for the Hi-Z occlusion test, or null when
+         * GraphicsSettings::occlusion_culling is off (the default).
+         *
+         * DOES NOT WEAKEN THE BIT-IDENTITY CONTRACT. It is a frame-constant,
+         * read-only input — exactly like `main_frustum` — so the per-command
+         * predicate stays a pure function of (command, params) and the chunked
+         * walk still reproduces the serial one at any worker count. What would
+         * break the contract is the obvious alternative, a per-instance "was
+         * visible last frame" latch: chunk order would decide who writes it.
+         * There is deliberately no such latch.
+         *
+         * With it null the hot path costs one null compare per surviving
+         * command and every output is bit-identical to before the feature
+         * existed.
+         */
+        const OcclusionField* occlusion = nullptr;
     };
 
     /** One chunk's private partial for the prep fan-outs. Each field group is

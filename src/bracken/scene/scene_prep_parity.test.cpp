@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "bracken/contracts/frustum.hpp"
+#include "bracken/contracts/occlusion.hpp"
 #include "bracken/contracts/render_stats.hpp"
 #include "bracken/core/jobs/job_system.hpp"
 #include "bracken/model_loader.hpp"
@@ -65,7 +66,10 @@ template<typename T> bool bits_equal(const T& a, const T& b) {
 bool stats_equal(const FrameStatsPartial& a, const FrameStatsPartial& b) {
     return a.draw_calls == b.draw_calls && a.triangle_count == b.triangle_count &&
            a.entities_rendered == b.entities_rendered && a.entities_distance_culled == b.entities_distance_culled &&
-           a.entities_frustum_culled == b.entities_frustum_culled;
+           a.entities_frustum_culled == b.entities_frustum_culled &&
+           a.entities_occlusion_culled == b.entities_occlusion_culled &&
+           a.diagnostics.draws_dropped_unknown_model == b.diagnostics.draws_dropped_unknown_model &&
+           a.diagnostics.draws_deferred_not_resident == b.diagnostics.draws_deferred_not_resident;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,4 +462,110 @@ TEST(ScenePrepParity, StatsOffParity) {
     off.stats = on.stats;
     off.skinned_stats = on.skinned_stats;
     expect_runs_identical(on, off, "stats on vs off");
+}
+
+// ===========================================================================
+// Occlusion culling is inside the determinism contract too
+// (docs/gap_streaming.md piece c).
+//
+// `PrepParams::occlusion` is a frame-constant, read-only input, so the chunked
+// walk must still reproduce the serial one exactly. The alternative design —
+// a per-instance "was visible last frame" latch — would break this, and this
+// test is the reason there is no such latch.
+// ===========================================================================
+
+namespace {
+
+/// Field over the fixture's real camera. Constant depth, so which commands are
+/// culled is decided purely by their projection.
+struct ParityField {
+    std::vector<float> texels;
+    OcclusionField field;
+
+    ParityField(const PrepWorld& w, float depth) : texels(40 * 24, depth) {
+        field.depth = texels;
+        field.mip_w = 40;
+        field.mip_h = 24;
+        field.level = 3;
+        field.screen_w = 40 << 3;
+        field.screen_h = 24 << 3;
+        field.view_proj = w.camera.view_projection;
+        field.max_tested_screen_fraction = 1.0f;
+    }
+};
+
+void run_prep_with(jobs::JobSystem& js, const PrepWorld& w, const ScenePrep::PrepParams& p,
+                   ScenePrep::PrepScratch& scratch, PrepRun& run) {
+    const ScenePrep::InstanceBinOutputs out{run.bins,          run.touched,       run.shadow_bins,
+                                            run.shadow_touched, run.non_instanced, run.stats};
+    run.stats = {};
+    ScenePrep::prep_instance_batches(js, w.packet.model_commands(), p, scratch, out);
+    run.skinned_stats = {};
+    ScenePrep::prep_resolve_skinned(js, w.packet.skinned_commands(), w.packet.palettes(), p, scratch.skinned,
+                                    run.skinned, run.skinned_stats);
+    run.palette_copy.assign(w.packet.palette_matrix_total(), glm::mat4(-12345.0f));
+    if (!run.palette_copy.empty()) {
+        ScenePrep::prep_copy_palettes(js, w.packet.palettes(), run.palette_copy.data());
+    }
+}
+
+} // namespace
+
+TEST(ScenePrepParity, OcclusionCullIsBitIdenticalAtAnyWorkerCount) {
+    PrepWorld w;
+    build_world(w, 700, 300);
+
+    jobs::JobSystem js_serial; // never initialized: every core runs inline
+    jobs::JobSystem js1;
+    js1.init(1);
+    jobs::JobSystem js4;
+    js4.init(4);
+
+    // Several depths, so the sweep covers "culls nothing", "culls some" and
+    // "culls a lot" rather than whichever one a single constant happens to hit.
+    const float depths[] = {0.05f, 0.2f, 0.5f, 0.9f};
+    uint32_t total_culled = 0;
+    for (float depth : depths) {
+        SCOPED_TRACE(::testing::Message() << "field depth " << depth);
+        ParityField f(w, depth);
+        ScenePrep::PrepParams p = w.params();
+        p.occlusion = &f.field;
+
+        ScenePrep::PrepScratch scratch_serial;
+        ScenePrep::PrepScratch scratch1;
+        ScenePrep::PrepScratch scratch4;
+        PrepRun serial;
+        PrepRun run1;
+        PrepRun run4;
+        run_prep_with(js_serial, w, p, scratch_serial, serial);
+        run_prep_with(js1, w, p, scratch1, run1);
+        run_prep_with(js4, w, p, scratch4, run4);
+
+        expect_runs_identical(serial, run1, "occluded: serial vs js(1)");
+        expect_runs_identical(serial, run4, "occluded: serial vs js(4)");
+        EXPECT_EQ(serial.stats.entities_occlusion_culled, run4.stats.entities_occlusion_culled);
+        total_culled += serial.stats.entities_occlusion_culled;
+    }
+    EXPECT_GT(total_culled, 0u) << "the sweep culled nothing, so it proved nothing about the cull path";
+}
+
+TEST(ScenePrepParity, ANullOcclusionFieldReproducesTheUnoccludedRunExactly) {
+    // The additivity gate at the Prepare stage: with the feature off, every
+    // output must be what it was before the feature existed.
+    PrepWorld w;
+    build_world(w, 700, 300);
+    jobs::JobSystem js4;
+    js4.init(4);
+
+    ScenePrep::PrepScratch scratch_a;
+    ScenePrep::PrepScratch scratch_b;
+    PrepRun baseline;
+    PrepRun explicit_null;
+    run_prep(js4, w, scratch_a, baseline);
+    ScenePrep::PrepParams p = w.params();
+    ASSERT_EQ(p.occlusion, nullptr);
+    run_prep_with(js4, w, p, scratch_b, explicit_null);
+
+    expect_runs_identical(baseline, explicit_null, "no field vs explicit null");
+    EXPECT_EQ(explicit_null.stats.entities_occlusion_culled, 0u);
 }

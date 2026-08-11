@@ -41,6 +41,7 @@ class EffectSystem;
 
 class ModelManager;
 class Application;
+class ResidencyManager;
 struct Heightmap;
 struct HeightmapGrid;
 
@@ -294,6 +295,28 @@ protected:
      * Main-thread tier, after init_renderer().
      */
     void set_heightmap_grid(const HeightmapGrid& grid);
+
+    /**
+     * Install a host-owned residency manager, pumped at the frame fence.
+     *
+     * The fence is the only correct place: it is the pipeline's quiescent
+     * point, so no packet referencing an asset the pump is about to evict is
+     * being built or rendered. Hot-reload applies there for exactly the same
+     * reason. Pass null to detach.
+     *
+     * The manager must outlive the detach (or the Application). Installing one
+     * also wires its geometry invalidator to
+     * `SceneRenderer::invalidate_raytracing_scene()` when the renderer exists,
+     * which is what stops an eviction from leaving the acceleration structure
+     * pointing at freed geometry — call `init_renderer()` first, or install the
+     * invalidator yourself.
+     *
+     * Main-thread tier. Forward-declared deliberately: `residency_manager.hpp`
+     * reaches the `gpu/` layer through ModelManager, and application.hpp is
+     * forbidden from exporting that (public_headers.test.cpp).
+     */
+    void set_residency(ResidencyManager* residency);
+    [[nodiscard]] ResidencyManager* residency() const noexcept { return residency_; }
 
     /**
      * GRAPHICS SETTINGS APPLICATION (window mode, vsync, sampler rebuilds —
@@ -627,6 +650,9 @@ private:
     // packet rendering while the next is being simulated).
     std::unique_ptr<scene::PacketRing> packet_ring_;
     std::unique_ptr<scene::SceneRenderer> scene_renderer_;
+    /// Host-owned; null unless set_residency() installed one. Pumped at the
+    /// frame fence, never anywhere else.
+    ResidencyManager* residency_ = nullptr;
     std::unique_ptr<systems::CameraSystem> camera_;
     std::unique_ptr<systems::EffectSystem> effect_system_; // sim-stage owned (see effect_system())
     std::unique_ptr<audio::AudioEngine> audio_;            // owns the SDL audio device + mixer

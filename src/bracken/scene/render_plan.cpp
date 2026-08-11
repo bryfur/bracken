@@ -20,6 +20,14 @@ RenderPlan plan_frame(const GraphicsSettings& gfx, const FramePacket& frame, Ren
     // the composite pass tonemaps to the swapchain.
     plan.use_hdr_path = caps.post_ready;
 
+    // Occlusion culling: asked for, the HDR path is live (without the offscreen
+    // depth target there is no prepass and therefore no pyramid), and a
+    // readback of the previous frame's farthest-surface pyramid actually
+    // landed. Every input is a setting or a renderer fact, so the answer is
+    // reproducible run to run — which is exactly why it is decided here and not
+    // by an `if` buried in render_frame next to a fence query.
+    plan.occlusion_active = gfx.occlusion_culling && plan.use_hdr_path && caps.occlusion_depth_ready;
+
     // TAA: asked for AND resolvable (offscreen HDR path + live history).
     plan.taa_active = gfx.aa_mode == AAMode::TAA && plan.use_hdr_path && caps.taa_ready;
     plan.invalidate_taa_history = !plan.taa_active;

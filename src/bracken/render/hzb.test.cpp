@@ -23,6 +23,7 @@ namespace {
 using bracken::render::HzbSpan;
 using bracken::render::hzb_mip_count;
 using bracken::render::hzb_mip_size;
+using bracken::render::hzb_reduce_far;
 using bracken::render::hzb_reduce;
 using bracken::render::hzb_source_span;
 
@@ -353,5 +354,152 @@ TEST(HzbPyramidMath, PyramidIsDeterministic) {
         // Bitwise, not approximately: max() over the same values in the same
         // order has no room to differ, and the smoke gate depends on it.
         EXPECT_EQ(a[level].texels, b[level].texels) << "level " << level;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The SECOND reduction: farthest-surface-wins, for draw occlusion culling
+// (docs/gap_streaming.md piece c).
+//
+// These mirror the closest-surface tests above one for one, plus the ordering
+// test — which is the cheap guard against someone wiring the culler to the
+// wrong pyramid. That mistake is silent in one direction (nothing is ever
+// culled, reads as "occlusion culling does not help here") and catastrophic in
+// the other (visible geometry disappears, and mean luma does not move).
+// -----------------------------------------------------------------------------
+
+namespace {
+
+/// The far pyramid, built with the same walk and the same footprints — only the
+/// reduction differs, which is exactly the claim under test.
+std::vector<Level> build_far_pyramid(const Level& mip0) {
+    std::vector<Level> mips;
+    mips.push_back(mip0);
+    const int levels = hzb_mip_count(mip0.width, mip0.height);
+    for (int level = 1; level < levels; ++level) {
+        const Level& src = mips.back();
+        Level dst;
+        dst.width = hzb_mip_size(mip0.width, level);
+        dst.height = hzb_mip_size(mip0.height, level);
+        dst.texels.resize(static_cast<size_t>(dst.width) * static_cast<size_t>(dst.height));
+        for (int y = 0; y < dst.height; ++y) {
+            for (int x = 0; x < dst.width; ++x) {
+                const HzbSpan sx = hzb_source_span(x, dst.width, src.width);
+                const HzbSpan sy = hzb_source_span(y, dst.height, src.height);
+                float v = std::numeric_limits<float>::infinity();
+                for (int sy_i = sy.begin; sy_i < sy.end; ++sy_i) {
+                    for (int sx_i = sx.begin; sx_i < sx.end; ++sx_i) {
+                        v = hzb_reduce_far(v, src.at(sx_i, sy_i));
+                    }
+                }
+                dst.texels[static_cast<size_t>(y) * static_cast<size_t>(dst.width) + x] = v;
+            }
+        }
+        mips.push_back(std::move(dst));
+    }
+    return mips;
+}
+
+} // namespace
+
+TEST(HzbMath, FarReductionKeepsTheFarthestSurfaceUnderReversedZ) {
+    constexpr float far_surface = 0.05f;  // nearly at the far plane
+    constexpr float near_surface = 0.95f; // nearly at the near plane
+    EXPECT_FLOAT_EQ(hzb_reduce_far(far_surface, near_surface), far_surface);
+    EXPECT_FLOAT_EQ(hzb_reduce_far(near_surface, far_surface), far_surface);
+    // Sky (cleared to 0.0 = the far plane) DOES win here, and must: a texel
+    // with sky in it occludes nothing, which is what makes a prop against the
+    // sky un-cullable for free.
+    EXPECT_FLOAT_EQ(hzb_reduce_far(0.0f, near_surface), 0.0f);
+}
+
+TEST(HzbMath, TheTwoReductionsAreOpposites) {
+    // The guard against a flipped operator anywhere in the chain: for any pair,
+    // far <= near, with equality only when the pair is equal.
+    Level mip0 = random_depth(64, 37, 31337u);
+    for (size_t i = 0; i + 1 < mip0.texels.size(); ++i) {
+        const float a = mip0.texels[i];
+        const float b = mip0.texels[i + 1];
+        EXPECT_LE(hzb_reduce_far(a, b), hzb_reduce(a, b));
+    }
+}
+
+TEST(HzbPyramidMath, EveryFarMipTexelIsTheMinOfItsImmediateSourceFootprint) {
+    for (const auto& s : kSizes) {
+        SCOPED_TRACE(testing::Message() << s[0] << "x" << s[1]);
+        const std::vector<Level> mips = build_far_pyramid(random_depth(s[0], s[1], 1234u));
+        for (size_t level = 1; level < mips.size(); ++level) {
+            const Level& dst = mips[level];
+            const Level& src = mips[level - 1];
+            for (int y = 0; y < dst.height; ++y) {
+                for (int x = 0; x < dst.width; ++x) {
+                    const HzbSpan sx = hzb_source_span(x, dst.width, src.width);
+                    const HzbSpan sy = hzb_source_span(y, dst.height, src.height);
+                    float reference = std::numeric_limits<float>::infinity();
+                    for (int j = sy.begin; j < sy.end; ++j) {
+                        for (int i = sx.begin; i < sx.end; ++i) {
+                            reference = std::min(reference, src.at(i, j));
+                        }
+                    }
+                    ASSERT_FLOAT_EQ(dst.at(x, y), reference) << "level " << level << " texel " << x << "," << y;
+                }
+            }
+        }
+    }
+}
+
+TEST(HzbPyramidMath, EveryFarMipTexelIsTheMinOverItsWholeMip0Region) {
+    // The transitive claim the CULLER relies on: a texel at any level bounds
+    // the FARTHEST surface over every mip-0 texel beneath it. If this ever
+    // fails, a box can be declared hidden by a surface that is not actually in
+    // front of it everywhere in the footprint.
+    const int cases[][2] = {{3, 3}, {5, 7}, {17, 11}, {63, 65}, {100, 37}};
+    for (const auto& s : cases) {
+        SCOPED_TRACE(testing::Message() << s[0] << "x" << s[1]);
+        const std::vector<Level> mips = build_far_pyramid(random_depth(s[0], s[1], 99u));
+        for (size_t level = 1; level < mips.size(); ++level) {
+            const Level& dst = mips[level];
+            for (int y = 0; y < dst.height; ++y) {
+                for (int x = 0; x < dst.width; ++x) {
+                    const HzbSpan sx = mip0_span(x, static_cast<int>(level), s[0]);
+                    const HzbSpan sy = mip0_span(y, static_cast<int>(level), s[1]);
+                    float reference = std::numeric_limits<float>::infinity();
+                    for (int j = sy.begin; j < sy.end; ++j) {
+                        for (int i = sx.begin; i < sx.end; ++i) {
+                            reference = std::min(reference, mips[0].at(i, j));
+                        }
+                    }
+                    ASSERT_FLOAT_EQ(dst.at(x, y), reference) << "level " << level << " texel " << x << "," << y;
+                }
+            }
+        }
+    }
+}
+
+TEST(HzbPyramidMath, TheFarPyramidIsTexelWiseNoGreaterThanTheNearOne) {
+    // THE WRONG-PYRAMID GUARD. Wire the culler to the closest-surface chain and
+    // it culls nothing (harmless, looks like "no occluders here"); flip the
+    // comparison to make it cull and it removes visible geometry. This is the
+    // one assertion that would catch either.
+    for (const auto& s : kSizes) {
+        SCOPED_TRACE(testing::Message() << s[0] << "x" << s[1]);
+        const Level mip0 = random_depth(s[0], s[1], 555u);
+        const std::vector<Level> near_mips = build_pyramid(mip0);
+        const std::vector<Level> far_mips = build_far_pyramid(mip0);
+        ASSERT_EQ(near_mips.size(), far_mips.size());
+        for (size_t level = 0; level < near_mips.size(); ++level) {
+            ASSERT_EQ(near_mips[level].texels.size(), far_mips[level].texels.size());
+            for (size_t i = 0; i < near_mips[level].texels.size(); ++i) {
+                ASSERT_LE(far_mips[level].texels[i], near_mips[level].texels[i])
+                    << "level " << level << " texel " << i;
+            }
+        }
+        // Mip 0 is a copy either way, so the two chains must agree there and
+        // (for a random buffer) diverge above it — otherwise the "opposite
+        // reductions" claim is vacuous on this input.
+        EXPECT_EQ(near_mips[0].texels, far_mips[0].texels);
+        if (near_mips.size() > 1) {
+            EXPECT_NE(near_mips[1].texels, far_mips[1].texels);
+        }
     }
 }

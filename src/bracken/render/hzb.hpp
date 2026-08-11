@@ -4,6 +4,7 @@
 #include "bracken/gpu/gpu_texture.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -133,6 +134,35 @@ struct HzbSpan {
 [[nodiscard]] constexpr float hzb_reduce(float a, float b) { return a > b ? a : b; }
 
 /**
+ * The OPPOSITE reduction: farthest-surface-wins under reversed-Z.
+ *
+ * WHY THIS IS A SECOND PYRAMID AND NOT A FLAG AT READ TIME. A screen march
+ * needs the closest surface in a footprint (above); DRAW OCCLUSION CULLING
+ * needs the farthest. A box is hidden only when its nearest point is behind
+ * the farthest occluder ANYWHERE in its footprint — anything weaker culls a box
+ * that peeks through a gap between two occluders in the same texel. The two
+ * answers are different reductions of the same source, so they cannot be
+ * recovered from one another after the fact: a stored maximum simply does not
+ * contain the minimum.
+ *
+ * The failure modes are asymmetric, which is why this has its own name and its
+ * own test. Cull against the CLOSEST pyramid with the natural comparison and
+ * nothing is ever culled — harmless, and it reads as "occlusion culling does
+ * not help in this scene". Flip the comparison to make it cull and it culls
+ * VISIBLE geometry, which shows up as props missing behind walls and moves the
+ * mean luma by nothing at all. `render/hzb.test.cpp` pins `far <= near` texel
+ * for texel, which is the cheap guard against wiring the culler to the wrong
+ * one.
+ */
+[[nodiscard]] constexpr float hzb_reduce_far(float a, float b) { return a < b ? a : b; }
+
+/** Which surface a coarse texel retains. See hzb_reduce / hzb_reduce_far. */
+enum class HzbReduction : uint8_t {
+    Closest, ///< MAX under reversed-Z — the screen-probe march (R4b)
+    Farthest ///< MIN under reversed-Z — draw occlusion culling
+};
+
+/**
  * Hierarchical-Z pyramid over the depth prepass (docs/rt_lighting_plan.md
  * §5.5, R4a).
  *
@@ -175,8 +205,13 @@ public:
      * COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE, and that flag is documented as
      * supported by a limited set of formats.
      */
-    [[nodiscard]] bool init(gpu::GPUDevice& device, int width, int height);
+    [[nodiscard]] bool init(gpu::GPUDevice& device, int width, int height,
+                            HzbReduction reduction = HzbReduction::Closest);
     void shutdown();
+
+    /** Which surface this pyramid's coarse texels retain. Fixed at init: the
+     *  reduction is baked into the levels, so it cannot be a read-time choice. */
+    [[nodiscard]] HzbReduction reduction() const noexcept { return reduction_; }
 
     /** Reallocate at a new size; no-op at the same size. Contents are not
      *  preserved — the pyramid is rebuilt from scratch every frame anyway. */
@@ -202,6 +237,28 @@ public:
      */
     void build(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelines, gpu::GPUTexture& depth);
 
+    /** Bytes a `level` readback needs in its destination transfer buffer. */
+    [[nodiscard]] std::size_t level_readback_bytes(int level) const;
+
+    /**
+     * Record a download of ONE coarse mip into a caller-owned transfer buffer,
+     * on the caller's OWN command buffer, and return the fence to wait on.
+     *
+     * `level` must be >= 1: mip 0 is the full screen (5.8 MB at 1600x900),
+     * mip 5 is 5.6 KB, and the CPU cull wants the small one. Returns null when
+     * the pyramid is not ready, the level is out of range, or the submit
+     * failed; the caller owns the returned fence and must release it.
+     *
+     * SEPARATE COMMAND BUFFER, deliberately, following the idiom every existing
+     * readback in the tree uses (render/auto_exposure.cpp, gi/screen_probes.cpp,
+     * gi/probe_volume.cpp): the frame's command buffer is submitted at present
+     * time, and a fence acquired from it could not be waited on until then.
+     * No pass may be open on `cmd` — this opens a copy pass.
+     *
+     * Main-thread.
+     */
+    [[nodiscard]] SDL_GPUFence* request_level_readback(int level, SDL_GPUTransferBuffer* dst);
+
 private:
     void create_texture();
 
@@ -211,6 +268,7 @@ private:
     int width_ = 0;
     int height_ = 0;
     int mip_count_ = 0;
+    HzbReduction reduction_ = HzbReduction::Closest;
 };
 
 } // namespace bracken::render
