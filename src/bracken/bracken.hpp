@@ -63,6 +63,12 @@
 #include "bracken/render/auto_exposure.hpp"    // AutoExposure: compute histogram exposure, and its manual override
 
 // ---------------------------------------------------------------------------
+// Extending the renderer from a game — your own pipelines, your own passes
+// ---------------------------------------------------------------------------
+#include "bracken/gpu/host_pipeline.hpp"  // HostGraphicsPipelineDesc/HostComputePipelineDesc + their handles
+#include "bracken/scene/render_hook.hpp"  // RenderHookSlot/RenderHookContext/RenderHookRegistry: run your own pass
+
+// ---------------------------------------------------------------------------
 // Camera
 // ---------------------------------------------------------------------------
 #include "bracken/systems/camera_controller.hpp" // CameraController + CameraModeConfig: orbit/follow, shake, focus, fov

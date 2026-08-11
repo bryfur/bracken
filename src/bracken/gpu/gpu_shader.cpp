@@ -127,6 +127,21 @@ std::unique_ptr<GPUShader> GPUShader::load_spirv(GPUDevice& device, const std::s
     return shader;
 }
 
+bool GPUShader::reflect_spirv_file(const std::string& path, ShaderResources& out) {
+    // Registration-time only (host pipelines), so the extra read of a file
+    // load_spirv is about to read again is not worth avoiding.
+    const std::vector<uint8_t> bytecode = read_file(path);
+    if (bytecode.empty()) {
+        return false; // read_file already logged
+    }
+    if (!reflect_spirv_resources(bytecode, out)) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUShader::reflect_spirv_file: reflection failed for '{}': {}", path.c_str(),
+                          SDL_GetError());
+        return false;
+    }
+    return true;
+}
+
 bool GPUShader::reflect_spirv_resources(const std::vector<uint8_t>& spirv_bytecode, ShaderResources& out) {
     if (!s_compiler_initialized && !init_compiler()) {
         return false;

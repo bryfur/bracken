@@ -590,6 +590,64 @@ void SceneRenderer::end_ui() {
 }
 
 // ============================================================================
+// Host render passes (scene/render_hook.hpp)
+// ============================================================================
+
+void SceneRenderer::run_render_hooks(RenderHookSlot slot, SDL_GPUCommandBuffer* cmd, const CameraState& draw_camera,
+                                     float dt, SDL_GPUTexture* swapchain) {
+    // Hooks record into the frame's command buffer alongside every engine pass.
+    BRACKEN_ASSERT_MAIN_THREAD();
+    const std::span<RenderHookRegistry::Entry* const> hooks = render_hooks_.entries(slot);
+    if (hooks.empty()) {
+        return;
+    }
+    if (cmd == nullptr) {
+        // Nothing to record into. Counted, not skipped in silence — see
+        // FrameDiagnostics::render_hooks_skipped.
+        frame_diagnostics_.render_hooks_skipped += static_cast<uint32_t>(hooks.size());
+        return;
+    }
+
+    RenderHookContext ctx;
+    ctx.cmd = cmd;
+    ctx.pipelines = pipeline_registry_.get();
+    ctx.slot = slot;
+    ctx.scene_color = (post_ && post_->offscreen_color()) ? post_->offscreen_color()->handle() : nullptr;
+    ctx.scene_depth = (post_ && post_->offscreen_depth()) ? post_->offscreen_depth()->handle() : nullptr;
+    ctx.velocity = (frame_prepass_active_ && velocity_texture_) ? velocity_texture_->handle() : nullptr;
+    ctx.normal_roughness = normal_rough_texture_ ? normal_rough_texture_->handle() : nullptr;
+    ctx.ao = frame_ao_texture_;
+    ctx.swapchain = swapchain;
+    ctx.scene_color_format =
+        pipeline_registry_ ? pipeline_registry_->get_scene_color_format() : SDL_GPU_TEXTUREFORMAT_INVALID;
+    ctx.depth_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    ctx.swapchain_format =
+        pipeline_registry_ ? pipeline_registry_->get_swapchain_format() : SDL_GPU_TEXTUREFORMAT_INVALID;
+    ctx.width = context_ ? context_->width() : 0;
+    ctx.height = context_ ? context_->height() : 0;
+    ctx.camera = draw_camera;
+    ctx.view_projection_unjittered = frame_cam_.view_proj_unjittered;
+    ctx.prev_view_projection_unjittered = prev_view_proj_unjittered_;
+    ctx.depth_prepass_active = frame_prepass_active_;
+    ctx.scene_time = scene_time_;
+    ctx.dt = dt;
+    ctx.frame_index = frame_index_;
+
+    // While this scope is alive the registry refuses add/remove/clear: a hook
+    // that registered another hook would reallocate the span being walked.
+    RenderHookRegistry::DispatchScope guard(render_hooks_);
+    for (RenderHookRegistry::Entry* entry : hooks) {
+        // entry->name has a stable address for the registration's lifetime,
+        // which is what the GPU debug-label API requires — it stores the raw
+        // pointer and reads it later in the frame.
+        BRACKEN_PROFILE_ZONE_COLOR("RenderHook", 0x2C82C9);
+        BRACKEN_GPU_SCOPE(cmd, entry->name.c_str());
+        BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, entry->name.c_str());
+        entry->fn(ctx);
+    }
+}
+
+// ============================================================================
 // Main Render Frame
 // ============================================================================
 
@@ -1816,6 +1874,13 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 }
             }
 
+            // Host slot: after GTAO/GI/RT, before the forward pass. Scene
+            // colour is about to be cleared by begin_offscreen_pass, so this is
+            // for compute the forward pass will sample — see RenderHookSlot.
+            if (!render_hooks_.empty(RenderHookSlot::PreForward)) {
+                run_render_hooks(RenderHookSlot::PreForward, cmd, draw_camera, dt, nullptr);
+            }
+
             {
                 BRACKEN_PROFILE_ZONE_COLOR("HDROffscreen", 0xC0392B);
                 BRACKEN_GPU_SCOPE(cmd, "HDROffscreen");
@@ -1830,6 +1895,12 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     post_->end_offscreen_pass();
                     main_render_pass_ = nullptr;
                 }
+            }
+
+            // Host slot: the forward pass has ended and nothing is bound, so
+            // scene colour (HDR) and scene depth (reversed-Z) are both readable.
+            if (!render_hooks_.empty(RenderHookSlot::AfterOpaque)) {
+                run_render_hooks(RenderHookSlot::AfterOpaque, cmd, draw_camera, dt, nullptr);
             }
 
             // Resolve sparse reflections into the linear HDR scene BEFORE
@@ -1949,6 +2020,12 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                         }
                     }
                 }
+            }
+
+            // Host slot: after water, before the TAA resolve — anything drawn
+            // here is temporally stabilized with the rest of the frame.
+            if (!render_hooks_.empty(RenderHookSlot::BeforeTaa)) {
+                run_render_hooks(RenderHookSlot::BeforeTaa, cmd, draw_camera, dt, nullptr);
             }
 
             // ===== TAA resolve (before bloom/composite so the whole post
@@ -2088,10 +2165,30 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                     BRACKEN_GPU_TIMER(gpu_timer_pool_, cmd, "FXAA");
                     post_->render_fxaa_pass(cmd, current_swapchain_);
                 }
+
+                // Host slot: the swapchain holds the tonemapped LDR image and
+                // scene colour still holds the pre-tonemap HDR one.
+                if (!render_hooks_.empty(RenderHookSlot::AfterComposite)) {
+                    run_render_hooks(RenderHookSlot::AfterComposite, cmd, draw_camera, dt, current_swapchain_);
+                }
             } else {
                 swapchain_unavailable = true;
+                // No swapchain image this frame: the composite slot cannot run.
+                frame_diagnostics_.render_hooks_skipped +=
+                    static_cast<uint32_t>(render_hooks_.entries(RenderHookSlot::AfterComposite).size());
             }
         } else {
+            // The fallback direct-to-swapchain path has no HDR offscreen
+            // targets, so the three HDR-only slots have nothing to hand a
+            // callback. Counted rather than silently skipped — a host whose
+            // pass never ran needs to be able to tell that apart from a pass
+            // that ran and drew nothing.
+            frame_diagnostics_.render_hooks_skipped +=
+                static_cast<uint32_t>(render_hooks_.entries(RenderHookSlot::PreForward).size() +
+                                      render_hooks_.entries(RenderHookSlot::AfterOpaque).size() +
+                                      render_hooks_.entries(RenderHookSlot::BeforeTaa).size() +
+                                      render_hooks_.entries(RenderHookSlot::AfterComposite).size());
+
             // === NORMAL PATH: render directly to swapchain ===
             // (No depth prepass here: frame_prepass_active_ stays false, so
             // every forward draw keeps its GREATER_OR_EQUAL write-on pipeline.)
@@ -2146,6 +2243,20 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
                 draw_billboard_3d(billboard, camera);
             }
             end_ui();
+        }
+
+        // Host slot: after the engine's UI pass, on the swapchain. Runs BEFORE
+        // post_ui_callback_ (the dev overlay), so a host overlay ends up UNDER
+        // the developer overlay rather than replacing it — which is the exact
+        // failure the single-slot callback had.
+        if (!render_hooks_.empty(RenderHookSlot::AfterUi)) {
+            if (current_swapchain_ != nullptr) {
+                run_render_hooks(RenderHookSlot::AfterUi, context_->current_command_buffer(), camera, dt,
+                                 current_swapchain_);
+            } else {
+                frame_diagnostics_.render_hooks_skipped +=
+                    static_cast<uint32_t>(render_hooks_.entries(RenderHookSlot::AfterUi).size());
+            }
         }
 
         // current_swapchain_ can still be null here (begin_ui acquire failure

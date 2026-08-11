@@ -16,6 +16,8 @@
 #include <gtest/gtest.h>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace bracken::gpu {
 namespace {
@@ -96,6 +98,150 @@ TEST(PipelineRegistryContract, ShutdownWithoutInitIsIdempotent) {
     registry.shutdown();
     EXPECT_FALSE(registry.is_initialized());
     EXPECT_EQ(registry.creation_count(), 0u);
+}
+
+// =============================================================================
+// Host-registered pipelines (gpu/host_pipeline.hpp)
+//
+// Same limitation as above — no device, so no pipeline can actually be built.
+// What CAN be pinned device-free is every refusal path, the search-root
+// ordering, and the fact that registering does not perturb the enumeration the
+// catalogue's golden walks.
+// =============================================================================
+
+HostGraphicsPipelineDesc valid_graphics_desc(std::string name) {
+    HostGraphicsPipelineDesc desc;
+    desc.name = std::move(name);
+    desc.vertex_shader = "host.vert.spv";
+    desc.fragment_shader = "host.frag.spv";
+    return desc;
+}
+
+TEST(PipelineRegistryHostContract, RegistrationWithoutADeviceReturnsInvalidAndCreatesNothing) {
+    core::bind_main_thread();
+
+    PipelineRegistry registry;
+    const HostPipelineHandle graphics = registry.register_graphics_pipeline(valid_graphics_desc("host_gfx"));
+    EXPECT_FALSE(graphics.is_valid());
+
+    HostComputePipelineDesc compute_desc;
+    compute_desc.name = "host_compute";
+    compute_desc.shader = "host.comp.spv";
+    const HostComputePipelineHandle compute = registry.register_compute_pipeline(std::move(compute_desc));
+    EXPECT_FALSE(compute.is_valid());
+
+    // Exactly the contract UninitializedRegistryNeverCreates pins for the enum
+    // path: no device means no creation attempt at all, and nothing lands in
+    // the shared cache.
+    EXPECT_EQ(registry.creation_count(), 0u);
+    EXPECT_EQ(registry.cached_pipeline_count(), 0u);
+    EXPECT_EQ(registry.host_pipeline_count(), 0u);
+}
+
+TEST(PipelineRegistryHostContract, MalformedDescriptionsAreRefused) {
+    core::bind_main_thread();
+
+    PipelineRegistry registry;
+    // Empty name, and a name with no shaders. Both refused before the device
+    // check would even matter — asserted here through host_pipeline_count,
+    // which stays zero whatever the refusal reason.
+    EXPECT_FALSE(registry.register_graphics_pipeline(valid_graphics_desc("")).is_valid());
+    HostGraphicsPipelineDesc no_shaders;
+    no_shaders.name = "no_shaders";
+    EXPECT_FALSE(registry.register_graphics_pipeline(std::move(no_shaders)).is_valid());
+    HostComputePipelineDesc no_shader;
+    no_shader.name = "no_shader";
+    EXPECT_FALSE(registry.register_compute_pipeline(std::move(no_shader)).is_valid());
+    EXPECT_EQ(registry.host_pipeline_count(), 0u);
+    EXPECT_EQ(registry.creation_count(), 0u);
+}
+
+TEST(PipelineRegistryHostContract, LookupByAnInvalidOrStaleHandleIsNull) {
+    core::bind_main_thread();
+
+    PipelineRegistry registry;
+    // A default-constructed handle, and a fabricated one. Both must be nullptr
+    // rather than an out-of-range read into whatever the host table holds.
+    EXPECT_EQ(registry.get_pipeline(HostPipelineHandle{}), nullptr);
+    EXPECT_EQ(registry.get_compute_pipeline(HostComputePipelineHandle{}), nullptr);
+    EXPECT_EQ(registry.get_pipeline(HostPipelineHandle{7, 3}), nullptr);
+    EXPECT_EQ(registry.get_compute_pipeline(HostComputePipelineHandle{7, 3}), nullptr);
+    EXPECT_EQ(registry.host_pipeline_desc(HostPipelineHandle{}), nullptr);
+    EXPECT_EQ(registry.host_compute_pipeline_desc(HostComputePipelineHandle{}), nullptr);
+
+    // Unregistering a handle that was never live is a logged no-op, not an
+    // abort: a host tearing down in an unknown order is not a contract breach.
+    registry.unregister_pipeline(HostPipelineHandle{});
+    registry.unregister_pipeline(HostComputePipelineHandle{4, 1});
+    EXPECT_EQ(registry.creation_count(), 0u);
+}
+
+TEST(PipelineRegistryHostContract, ShaderSearchPathsKeepTheEngineRootFirstAndDeduplicate) {
+    core::bind_main_thread();
+
+    PipelineRegistry registry;
+    ASSERT_EQ(registry.shader_search_paths().size(), 1u);
+    const std::string engine_root = registry.shader_path();
+    EXPECT_EQ(registry.shader_search_paths()[0], engine_root);
+
+    EXPECT_TRUE(registry.add_shader_search_path("shaders_game"));
+    // Normalized with a trailing separator, so "dir" and "dir/" are one root.
+    ASSERT_EQ(registry.shader_search_paths().size(), 2u);
+    EXPECT_EQ(registry.shader_search_paths()[1], "shaders_game/");
+    EXPECT_FALSE(registry.add_shader_search_path("shaders_game/"));
+    EXPECT_FALSE(registry.add_shader_search_path("shaders_game"));
+    EXPECT_EQ(registry.shader_search_paths().size(), 2u);
+
+    EXPECT_FALSE(registry.add_shader_search_path("")) << "an empty root is a mistake, not a no-op";
+    EXPECT_EQ(registry.shader_search_paths().size(), 2u);
+
+    // Ordering is the whole safety property: if a host root could come first, a
+    // game shipping its own model.frag.spv would replace PipelineType::Model's.
+    EXPECT_TRUE(registry.add_shader_search_path("second_root"));
+    ASSERT_EQ(registry.shader_search_paths().size(), 3u);
+    EXPECT_EQ(registry.shader_search_paths()[0], engine_root);
+    EXPECT_EQ(registry.shader_search_paths()[1], "shaders_game/");
+    EXPECT_EQ(registry.shader_search_paths()[2], "second_root/");
+    EXPECT_EQ(registry.shader_path(), engine_root) << "shader_path() is element 0, always";
+}
+
+TEST(PipelineRegistryHostContract, TheHostSurfaceDoesNotPerturbTheEnumeration) {
+    core::bind_main_thread();
+
+    PipelineRegistry registry;
+    // Capture the catalogue's answers, exercise the whole host surface, and
+    // demand the answers are unchanged. This is the registry-side statement of
+    // what gpu/pipeline_catalog.test.cpp's golden depends on: the catalogue is
+    // a pure function of the enums and nothing a host does can reach it.
+    std::vector<std::string> graphics_names;
+    std::vector<bool> targets_swapchain;
+    for (int i = 0; i < static_cast<int>(PipelineType::Count); ++i) {
+        const auto type = static_cast<PipelineType>(i);
+        graphics_names.emplace_back(pipeline_type_to_string(type));
+        targets_swapchain.push_back(pipeline_targets_swapchain(type));
+    }
+    std::vector<std::string> compute_names;
+    for (int i = 0; i < static_cast<int>(ComputePipelineType::Count); ++i) {
+        compute_names.emplace_back(compute_pipeline_type_to_string(static_cast<ComputePipelineType>(i)));
+    }
+
+    EXPECT_TRUE(registry.add_shader_search_path("host_shaders"));
+    for (int i = 0; i < 8; ++i) {
+        (void)registry.register_graphics_pipeline(valid_graphics_desc("host_" + std::to_string(i)));
+    }
+    registry.set_swapchain_format(SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
+
+    for (int i = 0; i < static_cast<int>(PipelineType::Count); ++i) {
+        const auto type = static_cast<PipelineType>(i);
+        EXPECT_EQ(std::string(pipeline_type_to_string(type)), graphics_names[static_cast<size_t>(i)]);
+        EXPECT_EQ(pipeline_targets_swapchain(type), targets_swapchain[static_cast<size_t>(i)]);
+    }
+    for (int i = 0; i < static_cast<int>(ComputePipelineType::Count); ++i) {
+        EXPECT_EQ(std::string(compute_pipeline_type_to_string(static_cast<ComputePipelineType>(i))),
+                  compute_names[static_cast<size_t>(i)]);
+    }
+    EXPECT_EQ(registry.creation_count(), 0u) << "no device: nothing was built by any of the above";
+    EXPECT_EQ(registry.cached_pipeline_count(), 0u);
 }
 
 } // namespace

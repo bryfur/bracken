@@ -16,6 +16,14 @@ bracken_target_warnings(playground)
 target_link_libraries(playground PRIVATE bracken::bracken)
 bracken_copy_shaders(playground)
 
+# The reference consumer compiles its OWN HLSL with the engine's pinned
+# shadercross/DXC and stages the SPIR-V into `shaders_playground/` next to the
+# exe — a different directory from `shaders/`, which bracken_copy_shaders wipes
+# on every build. Nothing registers the result at runtime: this exists so the
+# host-shader toolchain is exercised by every build rather than discovered
+# broken by a game. See docs/gap_pipelines.md for the runtime half.
+bracken_compile_shaders(playground DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+
 # Medieval village assets — 52 .glb, 4 terrain textures and village_layout.h,
 # all tracked in git, all referenced by name from playground.cpp. They are
 # staged next to the exe because the playground resolves them at runtime

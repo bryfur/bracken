@@ -114,6 +114,12 @@ struct FrameDiagnostics {
     /// needs per-cluster scratch inside the binning hot loop, and the number
     /// a host can act on is how much light data was lost.)
     uint32_t cluster_lights_dropped = 0;
+    /// Host render hooks (`scene/render_hook.hpp`) whose slot could not run
+    /// this frame. The four HDR-path slots have no targets to hand a callback
+    /// on the fallback direct-to-swapchain path, so their hooks are skipped —
+    /// counted rather than silently dropped, because "my pass never ran" is
+    /// otherwise indistinguishable from "my pass drew nothing".
+    uint32_t render_hooks_skipped = 0;
     /// The frame had 3D content but no camera had ever been set, so the whole
     /// 3D pass was skipped.
     bool camera_missing = false;
@@ -127,6 +133,7 @@ struct FrameDiagnostics {
         effect_models_unresolved += other.effect_models_unresolved;
         lights_dropped += other.lights_dropped;
         cluster_lights_dropped += other.cluster_lights_dropped;
+        render_hooks_skipped += other.render_hooks_skipped;
         camera_missing = camera_missing || other.camera_missing;
         return *this;
     }
@@ -136,7 +143,7 @@ struct FrameDiagnostics {
     [[nodiscard]] bool any() const {
         return draws_dropped_unknown_model != 0 || skinned_dropped_no_skeleton != 0 || palettes_over_budget != 0 ||
                shadow_capsules_over_budget != 0 || effect_models_unresolved != 0 || lights_dropped != 0 ||
-               cluster_lights_dropped != 0 || camera_missing;
+               cluster_lights_dropped != 0 || render_hooks_skipped != 0 || camera_missing;
     }
 };
 

@@ -333,4 +333,23 @@ TEST(FrameDiagnosticsTest, CountsAreIdenticalAtAnyWorkerCount) {
     EXPECT_EQ(run_with(4), expected);
 }
 
+// A host render pass whose slot could not run this frame is a drop like any
+// other (scene/render_hook.hpp): on the fallback direct-to-swapchain path the
+// four HDR slots have no targets to hand a callback. The counter has to fold
+// and to make any() true on its own, or "my pass never ran" stays
+// indistinguishable from "my pass ran and drew nothing".
+TEST(FrameDiagnosticsTest, SkippedRenderHooksFoldAndCountAsAProblem) {
+    FrameDiagnostics a;
+    a.render_hooks_skipped = 2;
+    FrameDiagnostics b;
+    b.render_hooks_skipped = 3;
+    a += b;
+    EXPECT_EQ(a.render_hooks_skipped, 5u);
+
+    FrameDiagnostics only_hooks;
+    EXPECT_FALSE(only_hooks.any()) << "a clean frame must not report a problem";
+    only_hooks.render_hooks_skipped = 1;
+    EXPECT_TRUE(only_hooks.any()) << "any() must see this field, or the dev panel never shows the row";
+}
+
 } // namespace

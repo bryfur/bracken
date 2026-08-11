@@ -112,6 +112,21 @@ public:
     [[nodiscard]] static bool reflect_spirv_resources(const std::vector<uint8_t>& spirv_bytecode, ComputeResources& out,
                                                       uint32_t out_threadcount[3] = nullptr);
 
+    /**
+     * @brief Reflect the resource counts of a compute SPIR-V module on disk.
+     *
+     * The file-reading convenience over reflect_spirv_resources, and the entry
+     * point host-registered compute pipelines use: handing the reflected counts
+     * back in as the declared ones is what keeps create_from_spirv from logging
+     * a declared/reflected mismatch ERROR for a shader whose counts a game has
+     * no reason to know. Costs one extra read of the file, at registration time
+     * only.
+     *
+     * @return false (and `out` untouched) if the file is missing/empty or
+     *         reflection failed; both cases are logged.
+     */
+    [[nodiscard]] static bool reflect_spirv_file(const std::string& path, ComputeResources& out);
+
     // =========================================================================
     // Accessors
     // =========================================================================
