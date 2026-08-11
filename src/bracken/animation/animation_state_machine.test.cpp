@@ -1,6 +1,11 @@
 #include "bracken/animation/animation_state_machine.hpp"
 #include <gtest/gtest.h>
 
+#include <glm/gtc/matrix_transform.hpp>
+#include <memory>
+#include <string>
+#include <vector>
+
 using namespace bracken::animation;
 
 class StateMachineTest : public ::testing::Test {
@@ -725,4 +730,176 @@ TEST(StateMachineEdgeCases, CurrentStateAfterMultipleRapidTransitions) {
     // C has no transitions, so further updates stay in C
     sm.update(player);
     EXPECT_EQ(sm.current_state(), "C");
+}
+
+// ---------------------------------------------------------------------------
+// Driving an AnimationRig layer.
+//
+// The rig overload shares one transition evaluator with the player overload, so
+// these tests are about the WIRING — which layer is driven, what a blend-space
+// state installs, and that a clip-ended trigger reads the layer's clock rather
+// than a player's. Transition semantics themselves are covered above and are
+// not duplicated here.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bracken::animation::Skeleton make_rig_skeleton() {
+    bracken::animation::Skeleton s;
+    const int parents[] = {-1, 0, 1, 2};
+    for (int i = 0; i < 4; ++i) {
+        bracken::animation::Joint j;
+        j.name = "j" + std::to_string(i);
+        j.parent_index = parents[i];
+        j.local_translation = glm::vec3(0.0f, 5.0f, 0.0f);
+        j.local_rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+        j.local_scale = glm::vec3(1.0f);
+        j.inverse_bind_matrix = glm::mat4(1.0f);
+        s.joints.push_back(j);
+    }
+    return s;
+}
+
+bracken::animation::AnimationClip make_rig_clip(const char* name, float duration) {
+    bracken::animation::AnimationClip c;
+    c.name = name;
+    c.duration = duration;
+    bracken::animation::AnimationChannel ch;
+    ch.bone_index = 1;
+    ch.rotation_times = {0.0f, duration};
+    ch.rotations = {glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::angleAxis(0.5f, glm::vec3(1, 0, 0))};
+    c.channels.push_back(ch);
+    return c;
+}
+
+} // namespace
+
+TEST(StateMachineRig, DrivesTheRequestedLayerAndLeavesOthersAlone) {
+    const auto skeleton = make_rig_skeleton();
+    const std::vector<AnimationClip> clips{make_rig_clip("idle_anim", 1.0f), make_rig_clip("walk_anim", 1.0f)};
+    ClipBindings bindings;
+    bindings.build(skeleton, clips);
+
+    auto rig = std::make_unique<AnimationRig>();
+    rig->bind(skeleton, clips, bindings);
+    LayerDesc base;
+    base.name = "base";
+    ASSERT_EQ(rig->add_layer(std::move(base)), 0);
+    LayerDesc upper;
+    upper.name = "upper";
+    ASSERT_EQ(rig->add_layer(std::move(upper)), 1);
+
+    AnimationStateMachine sm;
+    AnimState idle;
+    idle.name = "idle";
+    idle.clip_name = "idle_anim";
+    StateTransition to_walk;
+    to_walk.target_state = "walk";
+    TransitionCondition go;
+    go.param_name = "go";
+    go.op = TransitionCondition::Op::IS_TRUE;
+    to_walk.conditions.push_back(go);
+    idle.transitions.push_back(to_walk);
+
+    AnimState walk;
+    walk.name = "walk";
+    walk.clip_name = "walk_anim";
+
+    sm.add_state(idle);
+    sm.add_state(walk);
+    sm.set_default_state("idle");
+    ASSERT_TRUE(sm.bind_clips(clips));
+
+    sm.set_bool("go", true);
+    sm.update(*rig, /*layer=*/1);
+
+    EXPECT_EQ(sm.current_state(), "walk");
+    EXPECT_EQ(rig->layer_clip(1), 1) << "the state machine drove the layer it was told to";
+    EXPECT_EQ(rig->layer_clip(0), 0) << "layer 0 must be untouched";
+}
+
+TEST(StateMachineRig, UsesTheStatesOwnLayerWhenNoLayerIsPassed) {
+    const auto skeleton = make_rig_skeleton();
+    const std::vector<AnimationClip> clips{make_rig_clip("a", 1.0f), make_rig_clip("b", 1.0f)};
+    ClipBindings bindings;
+    bindings.build(skeleton, clips);
+
+    auto rig = std::make_unique<AnimationRig>();
+    rig->bind(skeleton, clips, bindings);
+    for (int i = 0; i < 2; ++i) {
+        LayerDesc d;
+        d.name = "layer" + std::to_string(i);
+        ASSERT_EQ(rig->add_layer(std::move(d)), i);
+    }
+
+    AnimationStateMachine sm;
+    AnimState from;
+    from.name = "from";
+    from.clip_name = "a";
+    from.layer = 0;
+    StateTransition t;
+    t.target_state = "to";
+    TransitionCondition go;
+    go.param_name = "go";
+    go.op = TransitionCondition::Op::IS_TRUE;
+    t.conditions.push_back(go);
+    from.transitions.push_back(t);
+
+    AnimState to;
+    to.name = "to";
+    to.clip_name = "b";
+    to.layer = 1; // the state carries its own layer
+
+    sm.add_state(from);
+    sm.add_state(to);
+    sm.set_default_state("from");
+    ASSERT_TRUE(sm.bind_clips(clips));
+
+    sm.set_bool("go", true);
+    sm.update(*rig); // no explicit layer
+
+    EXPECT_EQ(sm.current_state(), "to");
+    EXPECT_EQ(rig->layer_clip(1), 1) << "the target state's own layer must be the one driven";
+}
+
+TEST(StateMachineRig, ABlendSpaceStateInstallsItsSpaceAndTracksItsParameter) {
+    const auto skeleton = make_rig_skeleton();
+    const std::vector<AnimationClip> clips{make_rig_clip("stand", 1.0f), make_rig_clip("move", 1.0f)};
+    ClipBindings bindings;
+    bindings.build(skeleton, clips);
+
+    auto rig = std::make_unique<AnimationRig>();
+    rig->bind(skeleton, clips, bindings);
+    LayerDesc base;
+    base.name = "base";
+    base.sync_duration = false;
+    ASSERT_EQ(rig->add_layer(std::move(base)), 0);
+
+    AnimationStateMachine sm;
+    // Parameter indices are resolved BEFORE the state is added, because the
+    // state carries the index rather than the name — that is the same
+    // no-hashing-per-frame discipline the rest of this API has.
+    const int speed = sm.param_index("speed");
+
+    AnimState locomotion;
+    locomotion.name = "locomotion";
+    locomotion.source = LayerSource::Blend1D;
+    locomotion.blend_param_x = speed;
+    ASSERT_TRUE(locomotion.blend_space_1d.add_sample(find_clip_index(clips, "stand"), 0.0f));
+    ASSERT_TRUE(locomotion.blend_space_1d.add_sample(find_clip_index(clips, "move"), 300.0f));
+    locomotion.blend_space_1d.finalize();
+    sm.add_state(locomotion);
+    sm.set_default_state("locomotion");
+
+    // bind_clips returns false because a blend-space state has no clip_name to
+    // resolve. That is expected and documented — the samples carry indices.
+    (void)sm.bind_clips(clips);
+
+    sm.set_float(speed, 150.0f);
+    sm.update(*rig);
+    EXPECT_NEAR(rig->blend_position(0).x, 150.0f, 1e-5f);
+
+    sm.set_float(speed, 300.0f);
+    sm.update(*rig);
+    EXPECT_NEAR(rig->blend_position(0).x, 300.0f, 1e-5f);
 }

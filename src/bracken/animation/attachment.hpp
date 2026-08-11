@@ -2,6 +2,7 @@
 
 #include "bracken/animation/animation_player.hpp"
 #include "bracken/animation/animation_types.hpp"
+#include "bracken/animation/pose.hpp"
 
 #include <glm/glm.hpp>
 #include <string_view>
@@ -47,6 +48,20 @@ struct JointIndex {
 [[nodiscard]] glm::mat4 joint_model_transform(const AnimationPlayer& player, JointIndex joint);
 
 /**
+ * The same thing, from any posed thing.
+ *
+ * `PoseView` (`pose.hpp`) is what an `AnimationRig` and an `AnimationPlayer`
+ * have in common, so this overload is what lets a layered character keep its
+ * lantern. Everything the `AnimationPlayer` overload's comment says about
+ * bone-space versus skinning-space applies here verbatim — this is the joint's
+ * WORLD transform, not its skinning matrix.
+ *
+ * The `AnimationPlayer` overloads on this page are one-line forwarders to these,
+ * so the two can never disagree.
+ */
+[[nodiscard]] glm::mat4 joint_model_transform(const PoseView& pose, JointIndex joint);
+
+/**
  * The world transform for something attached to a bone.
  *
  * `model_transform` is the character's own world matrix — the same one handed
@@ -69,6 +84,14 @@ struct JointIndex {
                                             const AnimationPlayer& player, JointIndex joint,
                                             const glm::vec3& local_offset = glm::vec3(0.0f));
 
+/** `PoseView` overloads — see `joint_model_transform(const PoseView&, JointIndex)`. */
+[[nodiscard]] glm::mat4 attachment_transform(const glm::mat4& model_transform, const PoseView& pose,
+                                             JointIndex joint,
+                                             const glm::mat4& local_offset = glm::mat4(1.0f));
+[[nodiscard]] glm::vec3 attachment_position(const glm::mat4& model_transform, const PoseView& pose,
+                                            JointIndex joint,
+                                            const glm::vec3& local_offset = glm::vec3(0.0f));
+
 /**
  * A resolved attachment: a joint plus a fixed offset within it.
  *
@@ -84,6 +107,12 @@ struct Attachment {
     [[nodiscard]] glm::mat4 world(const glm::mat4& model_transform,
                                   const AnimationPlayer& player) const {
         return attachment_transform(model_transform, player, joint, local_offset);
+    }
+
+    /// Overload for anything that can produce a `PoseView` — notably
+    /// `AnimationRig::pose()`.
+    [[nodiscard]] glm::mat4 world(const glm::mat4& model_transform, const PoseView& pose) const {
+        return attachment_transform(model_transform, pose, joint, local_offset);
     }
 };
 

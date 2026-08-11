@@ -1025,46 +1025,115 @@ void PlaygroundGame::setup_state_machine() {
         t.priority = priority;
         return t;
     };
-    const auto attack_now = [&] { return to("Attack", cond("attacking", TC::Op::IS_TRUE), 0.08f, 10); };
-
+    // ATTACK IS NOT A STATE HERE ANY MORE. It used to be a whole-body Override
+    // state that every locomotion state fell into at priority 10, which meant
+    // swinging stopped the legs dead: the villager had to plant his feet and
+    // stand still to hit anything. It is now a masked upper-body LAYER on the
+    // rig (see below), so the machine describes locomotion and nothing else.
     anim::AnimState idle;
     idle.name = "Idle";
     idle.clip_name = "Idle";
-    idle.transitions.push_back(attack_now());
     idle.transitions.push_back(to("Walk", cond("speed", TC::Op::GT, 20.0f), 0.15f));
 
     anim::AnimState walk;
     walk.name = "Walk";
     walk.clip_name = "Walk";
-    walk.transitions.push_back(attack_now());
     walk.transitions.push_back(to("Run", cond("speed", TC::Op::GT, 240.0f), 0.15f));
     walk.transitions.push_back(to("Idle", cond("speed", TC::Op::LT, 20.0f), 0.2f));
 
     anim::AnimState run;
     run.name = "Run";
     run.clip_name = "Run";
-    run.transitions.push_back(attack_now());
     run.transitions.push_back(to("Walk", cond("speed", TC::Op::LT, 220.0f), 0.2f));
-
-    anim::AnimState attack;
-    attack.name = "Attack";
-    attack.clip_name = "Attack";
-    attack.loop = false;
-    attack.transitions.push_back(to("Idle", cond("attacking", TC::Op::IS_FALSE), 0.2f));
 
     anim_sm_.add_state(std::move(idle));
     anim_sm_.add_state(std::move(walk));
     anim_sm_.add_state(std::move(run));
-    anim_sm_.add_state(std::move(attack));
     anim_sm_.set_default_state("Idle");
     if (!anim_sm_.bind_clips(models().get_model(player_model_)->animations)) {
         std::cout << "[playground] warning: state machine has states with unbound clips\n";
     }
 
-    // Resolve per-frame parameter names to indices once; update_player uses
-    // the index overloads so no name is hashed per frame.
+    // Resolve the per-frame parameter name to an index once; update_player uses
+    // the index overload so no name is hashed per frame.
     param_speed_ = anim_sm_.param_index("speed");
-    param_attacking_ = anim_sm_.param_index("attacking");
+
+    setup_animation_rig();
+}
+
+// The two-layer character rig. Everything here happens once, at load: the
+// bindings table, the mask, the layer descriptions and the clip lookup are all
+// pure functions of the model, and evaluate() must never allocate.
+void PlaygroundGame::setup_animation_rig() {
+    const Model* model = models().get_model(player_model_);
+    if (model == nullptr || !model->has_skeleton) {
+        return;
+    }
+
+    // ONE bindings table per model, shared const by every rig driven by it.
+    // Building it per character is the memory regression this type exists to
+    // avoid.
+    anim_bindings_.build(model->skeleton, model->animations);
+    anim_rig_.bind(model->skeleton, model->animations, anim_bindings_);
+
+    // Layer 0 — the base. Its weight and mask are ignored by construction; it
+    // writes the composed pose directly, which is what makes a single-layer rig
+    // bit-identical to an AnimationPlayer.
+    anim::LayerDesc base;
+    base.name = "locomotion";
+    if (anim_rig_.add_layer(std::move(base)) != 0) {
+        std::cout << "[playground] warning: could not add the locomotion layer\n";
+        return;
+    }
+
+    // Layer 1 — the upper body, masked to the Spine subtree so the legs keep
+    // doing whatever layer 0 is doing while the arms swing.
+    //
+    // ADDITIVE, not Override, and the choice is load-bearing rather than
+    // stylistic. The Attack clip (character.cpp) authors channels for the right
+    // arm and the spine and NOTHING else, so as an Override layer every other
+    // masked joint would take the sampler's fallback — the REST pose — and the
+    // left arm would stop swinging mid-stride the instant the layer faded in.
+    // Additive against the rest pose makes a joint with no channel contribute a
+    // ZERO delta, which is exactly the semantics the clip was authored with.
+    const anim::JointIndex spine = anim::find_joint(model->skeleton, "Spine");
+    if (!spine.valid()) {
+        std::cout << "[playground] warning: no Spine bone; the upper-body layer is disabled\n";
+        return;
+    }
+    anim::BoneMask upper;
+    upper.set_subtree(model->skeleton, spine.value);
+
+    // FEATHER the mask boundary instead of cutting it: a binary mask pops the
+    // chest the instant the layer fades in. The ramp is measured in hierarchy
+    // depth and is rooted at the mask root's PARENT rather than at the mask
+    // root — rooting it at the spine would give the spine itself weight 0, and
+    // the spine is the one joint the swing most needs.
+    const int feather_root = model->skeleton.joints[static_cast<std::size_t>(spine.value)].parent_index;
+    if (feather_root >= 0) {
+        anim::feather_by_depth(model->skeleton, feather_root, 2,
+                               std::span<float>(upper_body_feather_.data(), upper_body_feather_.size()));
+    }
+
+    anim::LayerDesc upper_desc;
+    upper_desc.name = "upper_body";
+    upper_desc.mode = anim::BlendMode::Additive;
+    upper_desc.additive_reference_clip = -1; // the skeleton's rest pose
+    upper_desc.weight = 0.0f;                // raised only while an attack is in flight
+    upper_desc.mask = upper;
+    if (feather_root >= 0) {
+        upper_desc.joint_weights =
+            std::span<const float>(upper_body_feather_.data(), upper_body_feather_.size());
+    }
+    upper_body_layer_ = anim_rig_.add_layer(std::move(upper_desc));
+
+    attack_clip_ = anim::find_clip_index(model->animations, "Attack");
+    if (upper_body_layer_ > 0 && attack_clip_ >= 0) {
+        // Started here so the layer's crossfade bookkeeping settles on frame 1;
+        // it runs once through at weight 0, which nothing can see.
+        anim_rig_.play_clip(upper_body_layer_, attack_clip_, 0.0f);
+        anim_rig_.set_layer_loop(upper_body_layer_, false);
+    }
 }
 
 void PlaygroundGame::setup_effects() {
@@ -2275,25 +2344,54 @@ void PlaygroundGame::update_player(float dt) {
 
     player_transform_ = glm::rotate(glm::translate(glm::mat4(1.0f), player_pos_), facing_.current, glm::vec3(0, 1, 0));
 
+    const bool was_attacking = attack_timer_ > 0.0f;
     attack_timer_ = std::max(0.0f, attack_timer_ - dt);
     anim_sm_.set_float(param_speed_, player_speed_);
-    anim_sm_.set_bool(param_attacking_, attack_timer_ > 0.0f);
-    anim_sm_.update(anim_player_);
+    // The state machine owns layer 0 only. Locomotion never stops for a swing
+    // any more; that is the whole point of the second layer below.
+    anim_sm_.update(anim_rig_, /*layer=*/0);
 
     Model* model = models().get_model(player_model_);
-    anim_player_.update(model->skeleton, model->animations, dt);
 
-    // Procedural layers on top of the sampled animation, as the engine intends:
+    // Upper body: real gameplay state (attack_timer_) drives a masked layer's
+    // WEIGHT, not a whole-body state transition. The weight is followed rather
+    // than snapped — a binary 0/1 on a masked layer pops the chest, and the
+    // engine deliberately does not smooth this for you (animation/pose.hpp).
+    if (upper_body_layer_ > 0 && attack_clip_ >= 0) {
+        const bool attacking = attack_timer_ > 0.0f;
+        if (attacking && !was_attacking) {
+            // Restart the swing from the top. crossfade 0 because the layer is
+            // faded in by weight instead — crossfading a layer that is at
+            // weight 0 blends two poses nobody can see.
+            anim_rig_.set_layer_time(upper_body_layer_, 0.0f);
+            anim_rig_.set_layer_playing(upper_body_layer_, true);
+        }
+        const float target = attacking ? 1.0f : 0.0f;
+        const float blend = std::min(1.0f, dt * 18.0f);
+        upper_body_weight_ += (target - upper_body_weight_) * blend;
+        anim_rig_.set_layer_weight(upper_body_layer_, upper_body_weight_);
+    }
+
+    // Guarded because evaluate() CONTRACTS on having been bound: a model with
+    // no skeleton never reaches setup_animation_rig, and aborting the game over
+    // it would be a worse answer than leaving the last pose up.
+    if (anim_rig_.is_bound()) {
+        anim_rig_.evaluate(model->skeleton, model->animations, dt, anim_scratch_);
+    }
+
+    // Procedural layers on top of the composed animation, as the engine intends:
     // foot IK pins feet to the terrain, body lean follows speed and turn rate.
+    // These take the same two mat4 spans an AnimationPlayer hands them, so the
+    // rig changed nothing here.
     const auto& ik = model->foot_ik;
     if (ik.valid) {
-        auto world = anim_player_.world_transforms();
+        auto world = anim_rig_.world_transforms();
         auto foot_offset = [&](int joint) {
             glm::vec3 foot = glm::vec3(player_transform_ * world[joint][3]);
             return get_terrain_height(foot.x, foot.z) - player_pos_.y;
         };
         foot_smoother_.update(foot_offset(ik.left_foot), foot_offset(ik.right_foot), dt);
-        anim::apply_foot_ik(anim_player_.mutable_bone_matrices(), anim_player_.mutable_world_transforms(),
+        anim::apply_foot_ik(anim_rig_.mutable_bone_matrices(), anim_rig_.mutable_world_transforms(),
                             model->skeleton, ik, 1.0f, foot_smoother_.smoothed_left_offset,
                             foot_smoother_.smoothed_right_offset);
     }
@@ -2325,7 +2423,7 @@ void PlaygroundGame::update_player(float dt) {
 
     float forward_lean = std::min(player_speed_ * 0.0004f, 0.15f);
     float lateral_lean = std::clamp(-facing_.turn_rate * 0.04f, -0.12f, 0.12f);
-    anim::apply_body_lean(anim_player_.mutable_bone_matrices(), anim_player_.mutable_world_transforms(),
+    anim::apply_body_lean(anim_rig_.mutable_bone_matrices(), anim_rig_.mutable_world_transforms(),
                           model->skeleton, ik.spine, forward_lean, lateral_lean);
 
     // LAST, after every procedural layer. The capsules are supposed to be where
@@ -2451,7 +2549,7 @@ void PlaygroundGame::rebuild_shadow_capsules(const bracken::Model& model) {
     // matrix here would park the whole figure near the origin at a strange
     // angle, which is the classic symptom).
     const auto at = [&](bracken::animation::JointIndex j, const glm::vec3& local = glm::vec3(0.0f)) {
-        return attachment_position(player_transform_, anim_player_, j, local);
+        return attachment_position(player_transform_, anim_rig_.pose(), j, local);
     };
     const auto add = [&](const glm::vec3& a, const glm::vec3& b, float r) {
         shadow_capsules_.push_back(ShadowCapsule{a, r, b, 0.0f});
@@ -2782,14 +2880,14 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
     constexpr uint32_t MOTION_ID_ORB_BASE = 100;
 
     // The player's bone palette is computed into packet memory: no lifetime
-    // contract on anim_player_ storage past this call.
+    // contract on anim_rig_ storage past this call.
     {
         const Model* model = models().get_model(player_model_);
         const auto joints = static_cast<uint32_t>(
             std::clamp<size_t>(model->skeleton.joints.size(), 1, anim::MAX_BONES));
         auto palette = fb.alloc_bone_palette(joints);
         if (palette.valid()) {
-            anim_player_.write_palette(palette.matrices);
+            anim_rig_.write_palette(palette.matrices);
             fb.draw_skinned(player_model_, player_transform_, palette.id, {1.0f, 1.0f, 1.0f, 1.0f},
                             scene::DrawFlags::None, MOTION_ID_PLAYER);
 
@@ -2806,7 +2904,7 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
             // Bone attachment: the lantern follows the hand through every
             // animation with no per-frame math on this side. One call.
             if (lantern_model_ != INVALID_MODEL_HANDLE && lantern_attach_.valid()) {
-                const glm::mat4 held = lantern_attach_.world(player_transform_, anim_player_);
+                const glm::mat4 held = lantern_attach_.world(player_transform_, anim_rig_.pose());
                 fb.draw_model(lantern_model_, held, {1.0f, 0.9f, 0.65f, 1.0f});
             }
         }
@@ -2942,7 +3040,7 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
         }
         // Skeleton overlay: one line per joint to its parent, post-IK.
         const Model* model = models().get_model(player_model_);
-        auto world = anim_player_.world_transforms();
+        auto world = anim_rig_.world_transforms();
         for (size_t i = 0; i < model->skeleton.joints.size(); ++i) {
             int parent = model->skeleton.joints[i].parent_index;
             if (parent < 0) {

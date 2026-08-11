@@ -68,10 +68,20 @@
 #include "bracken/systems/camera_controller.hpp" // CameraController + CameraModeConfig: orbit/follow, shake, focus, fov
 
 // ---------------------------------------------------------------------------
-// Animation — per-instance player + data-driven state machine + foot IK
+// Animation — per-instance player OR layer rig + data-driven state machine + foot IK
+//
+// AnimationPlayer and AnimationRig are both supported and neither deprecates
+// the other: the player is the one-clip fast path with half the memory, the rig
+// is what you reach for when a character needs a second simultaneous animation
+// source. See animation_rig.hpp's header comment before "unifying" them.
 // ---------------------------------------------------------------------------
-#include "bracken/animation/animation_types.hpp"         // Skeleton, AnimationClip, BonePose, MAX_BONES
+#include "bracken/animation/animation_types.hpp"         // Skeleton, AnimationClip, MAX_BONES
 #include "bracken/animation/animation_player.hpp"        // AnimationPlayer: sampling and crossfade
+#include "bracken/animation/pose.hpp"                    // BoneTransform/PoseView/BoneMask + the blend operators
+#include "bracken/animation/clip_sampler.hpp"            // ClipBindings (shared per model) + ClipSampler
+#include "bracken/animation/blend_space.hpp"             // BlendSpace1D/2D: a position in, weighted clips out
+#include "bracken/animation/root_motion.hpp"             // extract locomotion from the clip, strip it from the pose
+#include "bracken/animation/animation_rig.hpp"           // AnimationRig: N masked, weighted, Override/Additive layers
 #include "bracken/animation/animation_state_machine.hpp" // AnimationStateMachine: parameters in, transitions out
 #include "bracken/animation/ik_solver.hpp"               // two-bone IK, applied by the host after the animation update
 

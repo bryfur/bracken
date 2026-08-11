@@ -189,20 +189,8 @@ void AnimationStateMachine::enter_state(int state_index, AnimationPlayer& player
     player.set_speed(state.speed);
 }
 
-void AnimationStateMachine::update(AnimationPlayer& player) {
-    // update() is also the transition-evaluation entry point; one zone covers both.
-    BRACKEN_PROFILE_ZONE_COLOR("AnimationStateMachine::update", 0x8E44AD);
-    if (!bound_ || current_state_ < 0) {
-        return;
-    }
-    if (current_state_ >= static_cast<int>(states_.size())) {
-        return;
-    }
-
-    const auto& state = states_[current_state_];
-
-    bool clip_ended = !state.loop && !player.is_playing();
-
+int AnimationStateMachine::next_transition(const AnimState& state, bool clip_ended,
+                                           float& out_crossfade) const {
     for (const auto& transition : state.transitions) {
         bool passes = clip_ended;
         if (!passes) {
@@ -226,9 +214,113 @@ void AnimationStateMachine::update(AnimationPlayer& player) {
         }
 
         if (passes) {
-            enter_state(transition.target_index, player, transition.crossfade_duration);
-            return;
+            out_crossfade = transition.crossfade_duration;
+            return transition.target_index;
         }
+    }
+    return -1;
+}
+
+void AnimationStateMachine::update(AnimationPlayer& player) {
+    // update() is also the transition-evaluation entry point; one zone covers both.
+    BRACKEN_PROFILE_ZONE_COLOR("AnimationStateMachine::update", 0x8E44AD);
+    if (!bound_ || current_state_ < 0) {
+        return;
+    }
+    if (current_state_ >= static_cast<int>(states_.size())) {
+        return;
+    }
+
+    const auto& state = states_[current_state_];
+
+    bool clip_ended = !state.loop && !player.is_playing();
+
+    float crossfade = 0.0f;
+    const int target = next_transition(state, clip_ended, crossfade);
+    if (target >= 0) {
+        enter_state(target, player, crossfade);
+    }
+}
+
+void AnimationStateMachine::enter_state(int state_index, AnimationRig& rig, int layer, float crossfade) {
+    if (state_index < 0 || state_index >= static_cast<int>(states_.size())) {
+        return;
+    }
+
+    const auto& state = states_[state_index];
+    const int target_layer = (layer >= 0) ? layer : state.layer;
+
+    // A Clip state with no bound clip is refused, exactly as the player overload
+    // refuses it — entering a state that would sample nothing leaves the
+    // character frozen with no diagnostic. A blend-space state has no
+    // clip_index, so the check does not apply to it.
+    if (state.source == LayerSource::Clip && state.clip_index < 0) {
+        return;
+    }
+
+    current_state_ = state_index;
+    switch (state.source) {
+        case LayerSource::Clip:
+            rig.play_clip(target_layer, state.clip_index, crossfade);
+            break;
+        case LayerSource::Blend1D:
+            // Installing a blend space sizes the layer's samplers, so this
+            // ALLOCATES. That is why it happens on state entry and never
+            // per-frame, and why applied_state_ exists.
+            rig.set_blend_space_1d(target_layer, state.blend_space_1d);
+            break;
+        case LayerSource::Blend2D:
+            rig.set_blend_space_2d(target_layer, state.blend_space_2d);
+            break;
+    }
+    rig.set_layer_playing(target_layer, true);
+    rig.set_layer_loop(target_layer, state.loop);
+    rig.set_layer_speed(target_layer, state.speed);
+
+    applied_state_ = state_index;
+    applied_layer_ = target_layer;
+}
+
+void AnimationStateMachine::update(AnimationRig& rig, int layer) {
+    BRACKEN_PROFILE_ZONE_COLOR("AnimationStateMachine::update(rig)", 0x8E44AD);
+    if (!bound_ || current_state_ < 0) {
+        return;
+    }
+    if (current_state_ >= static_cast<int>(states_.size())) {
+        return;
+    }
+
+    const int target_layer = (layer >= 0) ? layer : states_[current_state_].layer;
+
+    // The DEFAULT state is never "entered" — bind_clips just sets it — so
+    // install it the first time we see a rig. The player path gets away without
+    // this because an AnimationPlayer already defaults to clip 0; a layer whose
+    // blend space was never installed would sample nothing at all.
+    if (applied_state_ != current_state_ || applied_layer_ != target_layer) {
+        enter_state(current_state_, rig, layer, 0.0f);
+    }
+
+    const auto& state = states_[current_state_];
+
+    // Blend position is pushed EVERY update, not only on entry: the whole point
+    // of a blend space is that it tracks a continuously-varying parameter.
+    if (state.source != LayerSource::Clip) {
+        glm::vec2 p = rig.blend_position(target_layer);
+        if (state.blend_param_x >= 0) {
+            p.x = get_float(state.blend_param_x);
+        }
+        if (state.blend_param_y >= 0) {
+            p.y = get_float(state.blend_param_y);
+        }
+        rig.set_blend_position(target_layer, p);
+    }
+
+    const bool clip_ended = !state.loop && !rig.layer_playing(target_layer);
+
+    float crossfade = 0.0f;
+    const int target = next_transition(state, clip_ended, crossfade);
+    if (target >= 0) {
+        enter_state(target, rig, layer, crossfade);
     }
 }
 

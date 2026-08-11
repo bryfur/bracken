@@ -1,4 +1,5 @@
 #include "bracken/animation/animation_player.hpp"
+#include "bracken/animation/animation_rig.hpp"
 #include "bracken/animation/animation_state_machine.hpp"
 #include <benchmark/benchmark.h>
 
@@ -6,6 +7,7 @@
 #include <cstddef>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <array>
 #include <random>
 #include <string>
 #include <utility>
@@ -304,3 +306,109 @@ static void BM_StateMachineUpdate(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_StateMachineUpdate);
+
+// ============================================================================
+// AnimationRig::evaluate — the layer stack, 1 / 2 / 4 layers deep
+//
+// The comparison that matters is against BM_AnimationPlayerUpdate at the same
+// joint count: a one-layer rig does the same work the player does, so anything
+// beyond noise there is the layer machinery's overhead and should be reported.
+// Each additional layer is one more full skeleton sample plus one blend pass.
+//
+// Meaningless from a default configure (-O0 with live asserts). Reconfigure
+// with -DCMAKE_BUILD_TYPE=RelWithDebInfo before quoting a number.
+// ============================================================================
+
+namespace {
+
+struct RigBenchFixture {
+    Skeleton skeleton;
+    std::vector<AnimationClip> clips;
+    ClipBindings bindings;
+    AnimationRig rig;
+    PoseScratch scratch;
+
+    RigBenchFixture(int num_joints, int layers) : skeleton(make_bench_skeleton(num_joints)) {
+        clips.push_back(make_bench_clip("walk", num_joints, 0.0f));
+        clips.push_back(make_bench_clip("run", num_joints, 1.7f));
+        clips.push_back(make_bench_clip("aim", num_joints, 0.4f));
+        bindings.build(skeleton, clips);
+        rig.bind(skeleton, clips, bindings);
+
+        for (int i = 0; i < layers; ++i) {
+            LayerDesc d;
+            d.name = "layer" + std::to_string(i);
+            // Alternate the modes so the benchmark exercises both operators
+            // (Additive is the more expensive one — it samples a reference).
+            d.mode = (i % 2 == 1) ? BlendMode::Additive : BlendMode::Override;
+            d.weight = 0.5f;
+            if (i > 0) {
+                // A half-skeleton mask, the realistic upper-body shape.
+                d.mask.set_subtree(skeleton, num_joints / 4);
+            }
+            const int index = rig.add_layer(std::move(d));
+            if (index > 0) {
+                rig.play_clip(index, index % 3, 0.0f);
+            }
+        }
+    }
+};
+
+} // namespace
+
+static void BM_AnimationRigEvaluate(benchmark::State& state) {
+    const int num_joints = static_cast<int>(state.range(0));
+    const int layers = static_cast<int>(state.range(1));
+    RigBenchFixture f(num_joints, layers);
+    f.rig.evaluate(f.skeleton, f.clips, kFrameDt, f.scratch); // prime cursors
+
+    for (auto _ : state) {
+        f.rig.evaluate(f.skeleton, f.clips, kFrameDt, f.scratch);
+        benchmark::DoNotOptimize(f.rig.bone_matrices().data());
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * num_joints * layers);
+}
+BENCHMARK(BM_AnimationRigEvaluate)
+    ->Args({16, 1})
+    ->Args({64, 1})
+    ->Args({128, 1})
+    ->Args({128, 2})
+    ->Args({128, 4});
+
+// ============================================================================
+// BlendSpace2D::resolve — the O(n^2) gradient band
+//
+// 4 samples is 12 pair evaluations, 8 is 56. This is per layer per character
+// per frame, so the shape of this curve is what k_max_blend_samples is set
+// against.
+// ============================================================================
+
+static void BM_BlendSpace2DResolve(benchmark::State& state) {
+    const int samples = static_cast<int>(state.range(0));
+    BlendSpace2D space;
+    (void)space.add_sample(0, glm::vec2(0.0f, 0.0f));
+    for (int k = 1; k < samples; ++k) {
+        const float a = static_cast<float>(k) * 6.2831853f / static_cast<float>(samples - 1);
+        (void)space.add_sample(k, glm::vec2(std::cos(a), std::sin(a)));
+    }
+
+    std::array<WeightedClip, k_max_blend_samples> out{};
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> dist(-1.2f, 1.2f);
+    std::vector<glm::vec2> queries(kNumRandomTimes);
+    for (auto& q : queries) {
+        q = glm::vec2(dist(rng), dist(rng));
+    }
+
+    size_t i = 0;
+    for (auto _ : state) {
+        std::uint32_t n = space.resolve(queries[i & (kNumRandomTimes - 1)], out);
+        ++i;
+        benchmark::DoNotOptimize(n);
+        benchmark::DoNotOptimize(out.data());
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * samples);
+}
+BENCHMARK(BM_BlendSpace2DResolve)->Arg(4)->Arg(8);
