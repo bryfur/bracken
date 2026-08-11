@@ -276,10 +276,11 @@ public:
      * @brief Register a host graphics pipeline and create it now.
      *
      * Main-thread (asserted). Returns an INVALID handle — logging an ERROR and
-     * without bumping creation_count() — when the registry has no device, when
-     * `desc.name` is empty or duplicates a live registration, when either
-     * shader name is empty or resolves against no search root, or when
-     * pipeline creation fails.
+     * without bumping creation_count() — when `desc` is malformed
+     * (`host_pipeline_desc_error`, checked FIRST so the reason does not depend
+     * on whether the registry is up), when the registry has no device, when
+     * `desc.name` duplicates a live registration, when either shader name
+     * resolves against no search root, or when pipeline creation fails.
      *
      * Creation here is deliberately NOT reported as an enumeration gap the way
      * a post-preload catalogue miss is: a host registration is by definition

@@ -102,6 +102,12 @@ chain, whose visibility bitmask and bent cone are R5a of that plan.
   definitions / runtime / rendering split, host responsibilities.
 - [src/bracken/shaders/README.md](src/bracken/shaders/README.md) — shader
   naming, the pipeline→shader map, SDL3 GPU binding order, uniform contract.
+- [docs/gap_pipelines.md](docs/gap_pipelines.md) — **host-extensible rendering**
+  (runtime pipelines, host shader search roots, `bracken_compile_shaders`, the
+  ordered `RenderHookSlot` passes). A STAGING document, deliberately outside
+  `core/docs_coherence.test.cpp`'s `DOCS` list: its four sections are written to
+  be folded into user_guide / technical_spec / architecture / this file, and
+  until they are, it is the only place the feature is described end to end.
 
 Keep these accurate: if a change invalidates a documented fact, update the doc
 in the same change.
@@ -119,7 +125,7 @@ path (`#include "bracken/render/world_renderer.hpp"`). Everything lives under th
 | `core/jobs/` | `core::jobs` | `JobSystem` (**always-on** lock-free work-stealing pool — Chase–Lev deques, `atomic::wait` parking), `TaskGroup`, `parallel_for`, task handles. Worker count via `BRACKEN_WORKERS` (=1 is single-worker debug mode, same code path) |
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload; opt-in via `BRACKEN_HOT_RELOAD=1`) + `AssetRegistry` (host-facing utility — engine systems register on the watcher directly) |
 | `memory/` | `bracken::memory` | arena allocator, frame allocator |
-| `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) over `pipeline_catalog.hpp` (one `constexpr` row per `PipelineType`: shaders, resources, vertex layout, target, depth/blend state), `gpu_uniforms.hpp` (CPU↔GPU contract) |
+| `gpu/` | `bracken::gpu` | SDL3 GPU abstraction — buffers, textures, shaders, graphics + compute pipelines (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) over `pipeline_catalog.hpp` (one `constexpr` row per `PipelineType`: shaders, resources, vertex layout, target, depth/blend state), `gpu_uniforms.hpp` (CPU↔GPU contract). The catalogue is CLOSED (a host cannot add an enumerator), so `host_pipeline.hpp` is its open twin: a game describes a graphics or compute pipeline at RUNTIME and gets an opaque generation-checked handle. Both halves live in one cache keyed by `PipelineCacheKey`, so invalidation, the swapchain-format rebuild, hot reload and shutdown cover host registrations by construction. Shader lookup is a list of search roots with the engine root pinned at element 0 |
 | `render/` | `bracken::render` | sub-renderers: terrain, grass, world/skybox, shadow map (CSM), GTAO (SSILVB visibility bitmask + bent cone), TAA, histogram auto exposure (compute), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI, hierarchical-Z pyramid (`hzb.hpp`); `lighting/` = clustered light binning + budgeted local (point/spot) shadow atlas; `gi/` = the probe-field clipmap and the screen-probe gather |
 | `render/raytracing/` | `render::rt` | software BVH (32-byte nodes, binned SAH, two-level BLAS/TLAS) + `RtScene`; `render/rt_renderer.hpp` drives the traced passes and their denoisers. Local
 (point/spot) light shadows have two traced tiers (`LocalRtShadowMode`): `Ratio`
@@ -144,7 +150,7 @@ evaluate an emissive triangle; under `Ratio` emissive surfaces still glow and
 still feed GI, but cast no direct shadow. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer, **plus the surface's own emission**, which is what makes bounce FROM emissives fall out of the existing probe recursion). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. **Skinned meshes are split by signal (§5.8)**: their BLAS is the bind pose, so the ANY-HIT walks flag and skip them and trace the frame's per-bone `ShadowCapsule` set instead (`contracts/shadow_capsule.hpp`, emitted by the host through `FrameSink::add_shadow_capsules`, intersection mirrored between `render/raytracing/capsule_occluder.hpp` and `shaders/rt_trace.hlsli`), while CLOSEST-HIT walks keep the bind-pose triangles so characters stay in reflections and probes. A skinned draw with no capsules casts NO traced shadow — the bind-pose fallback was removed, not retained. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
 | `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror — addressing, ray directions, the blend curve, and the sampler's cascade/weight math. **Complete as of R1c**: the field traces and accumulates itself, and `shaders/gi_sample.hlsli` replaces the DIFFUSE half of the ambient term in every scene fragment shader (three banded atlases, three sampler slots) plus the volumetric fog's in-scatter. Off by default (`gi_mode`); GI on builds the ray-tracing acceleration structure with attributes |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
-| `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
+| `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator), `RenderHookRegistry` (`render_hook.hpp` — host render passes: ordered, many per slot, at five named points in the frame; replaces the single-slot `set_post_ui_callback`, which `Application::init_dev_ui` already owned) |
 | `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
 | `systems/` | `bracken::systems` | camera controller/system |
 | `effects/` | *(namespaces unchanged)* | the particle-effect triad in one place: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage owned: spawned/updated/snapshotted inside the sim job), `EffectRenderer` (draws the packet snapshot) |
@@ -221,7 +227,7 @@ draws it.
   `RenderStats::diagnostics` (`contracts/render_stats.hpp`) —
   `draws_dropped_unknown_model`, `skinned_dropped_no_skeleton`,
   `palettes_over_budget`, `effect_models_unresolved`, `lights_dropped`,
-  `cluster_lights_dropped`, `camera_missing`. The per-chunk accumulators fold
+  `cluster_lights_dropped`, `render_hooks_skipped`, `camera_missing`. The per-chunk accumulators fold
   in chunk-index order, so the counts are bit-identical at any worker count.
   Per-pass CPU record time is real (`core::PassTimeline` →
   `RenderStats::pass_times_ms`), the GPU half is honestly `nullopt`, and
@@ -833,7 +839,12 @@ quote. Audit reports live in `docs/audits/`.
 ```cmake
 add_subdirectory(path/to/engine)
 target_link_libraries(my_game PRIVATE bracken::bracken)
-bracken_copy_shaders(my_game)   # stages compiled SPIR-V next to the exe
+bracken_copy_shaders(my_game)   # stages the ENGINE's compiled SPIR-V next to the exe
+
+# …and, if the game has HLSL of its own, compile it with the engine's pinned
+# shadercross/DXC and stage it into shaders_my_game/ (never "shaders", which
+# bracken_copy_shaders wipes every build). docs/gap_pipelines.md §1.1.
+bracken_compile_shaders(my_game DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 ```
 
 ```cpp

@@ -146,16 +146,32 @@ TEST(PipelineRegistryHostContract, MalformedDescriptionsAreRefused) {
     core::bind_main_thread();
 
     PipelineRegistry registry;
-    // Empty name, and a name with no shaders. Both refused before the device
-    // check would even matter — asserted here through host_pipeline_count,
-    // which stays zero whatever the refusal reason.
+    // NOTE ON WHAT THIS TEST CAN AND CANNOT SEE. A registry with no device
+    // refuses EVERY registration, so `is_valid() == false` here would also be
+    // true against an implementation that validated nothing at all — which is
+    // exactly what this test used to assert and why the refusal REASONS are
+    // pinned separately against the pure `host_pipeline_desc_error`
+    // (gpu/host_pipeline.test.cpp). What this half adds is that the registry
+    // actually consults it, and that a malformed desc never reaches the slot
+    // table whatever the reason.
+    EXPECT_NE(host_pipeline_desc_error(valid_graphics_desc("")), nullptr) << "an empty name is malformed";
     EXPECT_FALSE(registry.register_graphics_pipeline(valid_graphics_desc("")).is_valid());
+
     HostGraphicsPipelineDesc no_shaders;
     no_shaders.name = "no_shaders";
+    EXPECT_NE(host_pipeline_desc_error(no_shaders), nullptr);
     EXPECT_FALSE(registry.register_graphics_pipeline(std::move(no_shaders)).is_valid());
+
     HostComputePipelineDesc no_shader;
     no_shader.name = "no_shader";
+    EXPECT_NE(host_compute_pipeline_desc_error(no_shader), nullptr);
     EXPECT_FALSE(registry.register_compute_pipeline(std::move(no_shader)).is_valid());
+
+    // …and a WELL-FORMED desc is still refused, by the device check rather than
+    // by validation. Without this line the two refusals are indistinguishable.
+    EXPECT_EQ(host_pipeline_desc_error(valid_graphics_desc("well_formed")), nullptr);
+    EXPECT_FALSE(registry.register_graphics_pipeline(valid_graphics_desc("well_formed")).is_valid());
+
     EXPECT_EQ(registry.host_pipeline_count(), 0u);
     EXPECT_EQ(registry.creation_count(), 0u);
 }

@@ -297,6 +297,7 @@ fails the build rather than waiting for a game to find it.
 | `PipelineCacheKey` | `{Origin origin, uint32_t index}`, `Origin ∈ {Catalog, Host}`; `catalog(PipelineType)`, `catalog(ComputePipelineType)`, `host(uint32_t)`; `std::hash` specialized |
 | `HostGraphicsPipelineDesc` | owning-string mirror of `PipelineDesc` + overrides (below) |
 | `HostComputePipelineDesc` | `{name, shader, entry_point="CSMain", reflect_resources=true, resources}` |
+| `host_pipeline_desc_error(desc)` / `host_compute_pipeline_desc_error(desc)` | pure; the refusal reason as a literal, or nullptr. The registry checks it BEFORE the device check, which is the only reason a device-free test can reach the refusal paths at all |
 | `build_host_pipeline_config(desc, formats) -> PipelineConfig` | pure; no device, no shader loading |
 | `HostPipelineTable<Tag, Desc>` | the slot table: `add`, `remove`, `find`, `has_live_name`, `slots`, `live_count`, `clear` |
 
@@ -341,9 +342,15 @@ void unregister_pipeline(HostComputePipelineHandle);
 ```
 
 Refusal contract for both `register_*`: an **invalid handle**, an ERROR log,
-and `creation_count()` untouched when the registry has no device, the name is
-empty or duplicates a live registration, a shader name is empty, a shader
-resolves against no search root, or creation fails.
+and `creation_count()` untouched when the desc is malformed, the registry has
+no device, the name duplicates a live registration, a shader resolves against
+no search root, or creation fails. **Desc validation runs first**, through the
+pure `host_pipeline_desc_error` / `host_compute_pipeline_desc_error`, so the
+reason a malformed desc is refused does not depend on whether the registry
+happens to be up — and so every reason is reachable from a device-free test.
+Malformed means: empty name, empty shader name, empty entry point, or
+`attributes` without `buffers` (the explicit vertex layout is taken as a pair,
+so those attributes would be silently discarded).
 
 **Keying.** The two caches were `unordered_map<PipelineType, …>` and
 `unordered_map<ComputePipelineType, …>`; they are now keyed on
@@ -358,7 +365,7 @@ resolves against no search root, or creation fails.
 | cache | shared map | one lookup, keyed by origin |
 | `preload_all_pipelines` | yes | walks the host tables **after** `preloaded_ = true`, so a host rebuild is never logged as an enumeration gap |
 | `invalidate_all` | yes, free | `pipelines_.clear()` drops both origins; the host **descs** survive, which is what lets preload rebuild them |
-| `set_swapchain_format` | yes | a **second** loop over host entries with `color == TargetFormat::Swapchain`, deliberately not through `pipeline_targets_swapchain()` |
+| `set_swapchain_format` | yes | a **second** loop over host entries with `TargetFormat::Swapchain` on EITHER colour attachment (`color` or `color2`), deliberately not through `pipeline_targets_swapchain()` |
 | hot reload | yes | `reload_all_pipelines` = `invalidate_all` + `preload_all_pipelines` |
 | `shutdown` | yes | unwatches every root, clears both caches and both host tables |
 
@@ -425,9 +432,24 @@ matrices for any reprojection. `ao` is a 1×1 white dummy when AO is off, not
 null. Every pointer is valid **only for the duration of the call**.
 
 `RenderHookRegistry::Entry` is heap-allocated with a stable address for its
-whole life, because `entry->name.c_str()` is handed to `BRACKEN_GPU_SCOPE` /
-`BRACKEN_GPU_TIMER`, which store the raw pointer and read it later in the
-frame. `EntryNameAddressesAreStableAcrossRegistration` is the direct test.
+whole life, because `entry->name.c_str()` is handed to `BRACKEN_GPU_SCOPE`,
+which reads the label synchronously.
+`EntryNameAddressesAreStableAcrossRegistration` is the direct test.
+
+`BRACKEN_GPU_TIMER` needs MORE than that, and gets `entry->stable_name`
+instead. `GPUTimestampPool::reserve_pair` interns its pass name as a raw
+pointer and `PassTiming::name` is a `std::string_view` over it, still live in
+`RenderStats::pass_times_ms` when the host reads the stats — which is after the
+frame fence, where a host may legally have removed the hook. `stable_name`
+points into a `std::set<std::string>` the registry never erases and
+deduplicates by value, so the pointer outlives the registration and a host that
+adds and removes the same named hook every frame reuses one node forever.
+`TheInternedNameOutLivesTheRegistrationItCameFrom` is the test.
+
+`entries(slot)` and `empty(slot)` bounds-check `slot` with a `BRACKEN_CONTRACT`
+(live in release): the backing store is a fixed array and the enum comes from a
+host, so an out-of-range cast is a named abort rather than an out-of-bounds
+read.
 
 `DispatchScope` is an RAII marker `SceneRenderer` holds around each slot's
 dispatch; while it is alive `add`/`remove`/`clear` trip a `BRACKEN_CONTRACT`
@@ -492,11 +514,13 @@ source tree and `GTEST_SKIP` without `BRACKEN_REPO_ROOT`.
 | `gpu/host_pipeline.test.cpp` | `HostPipeline` | host desc defaults are byte-identical to `PipelineDesc`'s (so reversed-Z is inherited, not rediscovered); every catalogue row rebuilds identically as a host desc; format/vertex overrides win where documented; `depth_target=false` forces test+write off |
 | | `PipelineCacheKeyTest` | catalogue and host ordinals never collide, keys hash distinctly |
 | | `HostPipelineTableTest` | handles survive further registrations, removed handles go stale, slots are reused, walk order is registration order |
-| `gpu/pipeline_registry.test.cpp` | `PipelineRegistryHostContract` | every refusal path (no device / empty name / no shader / duplicate name), search-root ordering + dedup, stale-handle lookups, and that the whole host surface leaves the enumeration's answers unchanged |
+| `gpu/host_pipeline.test.cpp` | `HostPipelineValidation` | every malformed-desc refusal reason, individually, against the pure validator — the registry-level version cannot see them, because a registry with no device refuses everything |
+| `gpu/pipeline_registry.test.cpp` | `PipelineRegistryHostContract` | that the registry consults the validator, the device check refusing a WELL-FORMED desc (so the two refusals are distinguishable), search-root ordering + dedup, stale-handle lookups, and that the whole host surface leaves the enumeration's answers unchanged |
 | | `PipelineRegistryLifecycle` | **the additivity walk** — every lifecycle entry point is inert without a device or a host; shutdown releases registrations and keeps roots; register+unregister leaves the cache counts where it found them; and a source scan that catalogue shader resolution never goes through the host roots |
 | `gpu/pipeline_catalog.test.cpp` | `PipelineCatalog` | the golden is a bijection with the enums, and a host desc mirroring a row renders to the same golden text |
 | `scene/render_hook.test.cpp` | `RenderHookRegistryTest` | order is `(order, sequence)` and total; slots are independent; entry-name addresses are stable across 64 further registrations (the `GPUTimestampPool::reserve_pair` requirement); registering never displaces an existing registration; **the two dev-overlay ownership scans** |
-| | `RenderHookRegistryDeathTest` | mutating the registry from inside a dispatch aborts on a `BRACKEN_CONTRACT` |
+| | `RenderHookRegistryDeathTest` | mutating the registry from inside a dispatch aborts on a `BRACKEN_CONTRACT`; an out-of-range `RenderHookSlot` aborts rather than reading past the slot array |
+| | `RenderHookRegistryTest` | the interned pass name outlives the registration it came from, and re-registering the same name reuses one interned node |
 | `scene/frame_diagnostics.test.cpp` | `FrameDiagnosticsTest` | `render_hooks_skipped` folds in `operator+=` and makes `any()` true on its own |
 
 ---
@@ -526,10 +550,29 @@ source tree and `GTEST_SKIP` without `BRACKEN_REPO_ROOT`.
 With nothing registered the cost is five bool tests and the frame is otherwise
 unchanged — the RT-off smoke baseline is the standing check.
 
+Two details that are easy to get wrong and are pinned in the code rather than
+in prose. (1) `prev_view_projection_unjittered` and `frame_index` are read from
+`hook_prev_view_proj_` / `hook_frame_index_`, captured at the TOP of
+`render_frame`, because the end-of-frame advance overwrites both **before** the
+`AfterUi` slot runs — reading the members there would hand a hook this frame's
+VP as the "previous" one (zero reprojection) and a frame index one past the
+frame it is drawing into. (2) `scene_color` / `scene_depth` are null unless the
+offscreen pair holds THIS frame's image, because on the fallback path and on a
+frame with no 3D content those textures often still exist, holding the last
+frame that did render into them.
+
+Every path on which a slot cannot run counts its hooks in
+`FrameDiagnostics::render_hooks_skipped`: the fallback direct-to-swapchain
+path, a frame with no 3D content or no camera, a minimized window, a failed
+swapchain acquire (which retires `AfterComposite` and `AfterUi` both), and a
+null command buffer. `SceneRenderer::count_skipped_render_hooks` is the single
+helper, and it early-outs on `render_hooks_.empty()` so an engine with no host
+passes pays one bool test on each of those paths too.
+
 `run_render_hooks` builds one `RenderHookContext` per slot from renderer state
 (`post_->offscreen_color()/offscreen_depth()`, `velocity_texture_`,
-`normal_rough_texture_`, `frame_ao_texture_`, `frame_cam_`,
-`prev_view_proj_unjittered_`, `scene_time_`, `frame_index_`), then walks
+`normal_rough_texture_`, `frame_ao_texture_`, `frame_cam_`, `scene_time_`,
+plus `hook_prev_view_proj_` and `hook_frame_index_`), then walks
 `entries(slot)` under a `DispatchScope`, wrapping each entry in its own
 `BRACKEN_PROFILE_ZONE_COLOR`, `BRACKEN_GPU_SCOPE` and `BRACKEN_GPU_TIMER`. Host
 passes therefore appear in the dev overlay's per-pass CPU record table by name.
@@ -588,7 +631,7 @@ stated rather than blurred:
 | `set_swapchain_format` | the enum loop and its `pipeline_targets_swapchain` query are byte-identical; the host walk is a **second, separate** loop, deliberately not a widening of that query (which `pipeline_catalog.test.cpp` pins to exactly four enum values) | by construction + `TheHostSurfaceDoesNotPerturbTheEnumeration` |
 | `enable_hot_reload` | the old global `if (watcher_) return;` latch became per-root. With ONE root the two are identical in all four states: first success, repeat call, second watcher, and the failed-watch retry | by construction; **not** covered by a test, because watching needs a device — see the report |
 | `shutdown` | unwatches every handle and releases every host registration; keeps the search roots | `ShutdownReleasesHostRegistrationsAndKeepsTheSearchRoots` |
-| `render_frame` | five `empty(slot)` bool tests and nothing else | the `--smoke` baseline |
+| `render_frame` | five `empty(slot)` bool tests, plus one `render_hooks_.empty()` test on each path that has to COUNT a skipped slot, and two member stores capturing the hook context's frame index and previous VP | the `--smoke` baseline |
 | `FrameDiagnostics` | one new counter, zero unless a hook is skipped | `SkippedRenderHooksFoldAndCountAsAProblem` |
 
 `pipeline_catalog.{hpp,cpp}` are untouched — not an enumerator, not a row, not a
@@ -603,7 +646,15 @@ hook, so it should be bit-identical; that is an argument, not a measurement.
 
 ## 4. CLAUDE.md delta
 
-### Module table
+**PARTLY APPLIED.** The adversarial review pass applied the module-table rows,
+the documentation-map entry, the `render_hooks_skipped` diagnostics counter and
+the `bracken_compile_shaders` line in "Consuming the engine" to `CLAUDE.md`
+directly, and folded the four false statements listed at the end of this section
+into `docs/architecture.md`, `docs/user_guide.md` and `docs/technical_spec.md`.
+What is left below is the material that is still only here: the "Key patterns"
+bullet, the load-bearing constant, and the two gotchas.
+
+### Module table (APPLIED)
 
 Replace the `gpu/` row's contents with (change in **bold**):
 
@@ -654,7 +705,7 @@ Add two:
 >   host callback. Every `RenderHookSlot` fires with no pass open and must
 >   return that way.
 
-### Doc lines that need rewording (not done here, to avoid merge conflicts)
+### Doc lines that were false (FIXED in the review pass — listed for the reviewer)
 
 - `docs/user_guide.md:1525` — the table row citing
   `PipelineRegistry::shader_path_`. That member is now

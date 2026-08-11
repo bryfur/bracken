@@ -2,6 +2,40 @@
 
 namespace bracken::gpu {
 
+const char* host_pipeline_desc_error(const HostGraphicsPipelineDesc& desc) {
+    if (desc.name.empty()) {
+        return "desc.name must be non-empty";
+    }
+    if (desc.vertex_shader.empty() || desc.fragment_shader.empty()) {
+        return "desc names no vertex and/or fragment shader";
+    }
+    if (desc.vertex_entry.empty() || desc.fragment_entry.empty()) {
+        return "desc names an empty shader entry point";
+    }
+    // An empty attribute list with non-empty buffers is legal (a vertex shader
+    // may read nothing), but attributes without a buffer to bind them to is
+    // not: the named `vertex_layout` is REPLACED only when `buffers` is
+    // non-empty, so these attributes would be silently discarded.
+    if (!desc.attributes.empty() && desc.buffers.empty()) {
+        return "desc.attributes is non-empty but desc.buffers is not; the explicit vertex layout is taken as a "
+               "pair, so these attributes would be silently discarded";
+    }
+    return nullptr;
+}
+
+const char* host_compute_pipeline_desc_error(const HostComputePipelineDesc& desc) {
+    if (desc.name.empty()) {
+        return "desc.name must be non-empty";
+    }
+    if (desc.shader.empty()) {
+        return "desc names no shader";
+    }
+    if (desc.entry_point.empty()) {
+        return "desc names an empty entry point";
+    }
+    return nullptr;
+}
+
 PipelineConfig build_host_pipeline_config(const HostGraphicsPipelineDesc& desc, const PipelineFormats& formats) {
     // Project onto a catalogue row and reuse build_pipeline_config rather than
     // re-deriving the same state here. The whole point is that a host pipeline

@@ -152,6 +152,46 @@ TEST(RenderHookRegistryTest, EntryNameAddressesAreStableAcrossRegistration) {
     EXPECT_EQ(entry->name.c_str(), name_address);
 }
 
+TEST(RenderHookRegistryTest, TheInternedNameOutLivesTheRegistrationItCameFrom) {
+    core::bind_main_thread();
+    RenderHookRegistry registry;
+    // Entry::stable_name exists because GPUTimestampPool::reserve_pair stores
+    // its pass name as a RAW POINTER and RenderStats::pass_times_ms keeps a
+    // string_view over it until the NEXT frame's read_results. A host may
+    // legally remove a hook at the frame fence — after the frame that recorded
+    // the timing and before the read of it — so entry->name.c_str() would be a
+    // use-after-free there. This is the direct statement of the fix.
+    const auto handle = registry.add(RenderHookSlot::AfterOpaque,
+                                     "a_name_far_too_long_for_the_small_string_optimization_to_hide_the_bug", 0,
+                                     noop());
+    ASSERT_TRUE(handle.is_valid());
+    ASSERT_FALSE(registry.entries(RenderHookSlot::AfterOpaque).empty());
+    const char* recorded = registry.entries(RenderHookSlot::AfterOpaque)[0]->stable_name;
+    ASSERT_NE(recorded, nullptr);
+    const std::string expected = recorded;
+
+    ASSERT_TRUE(registry.remove(handle));
+    // The registration is gone; the pointer the timer pool is still holding is
+    // not. (ASan/UBSan is the detector that makes this test load-bearing.)
+    EXPECT_EQ(std::string(recorded), expected);
+
+    // Re-registering the same name reuses the same interned node, which is what
+    // bounds the pool for a host that adds and removes every frame.
+    const auto again = registry.add(RenderHookSlot::BeforeTaa, expected, 0, noop());
+    ASSERT_TRUE(again.is_valid());
+    EXPECT_EQ(registry.entries(RenderHookSlot::BeforeTaa)[0]->stable_name, recorded);
+}
+
+TEST(RenderHookRegistryDeathTest, AnOutOfRangeSlotIsANamedAbortNotAnOutOfBoundsRead) {
+    core::bind_main_thread();
+    RenderHookRegistry registry;
+    // RenderHookSlot is a scoped enum a host supplies, and the backing store is
+    // a fixed array. The contract is live in release; nothing here is a debug
+    // -only check.
+    EXPECT_DEATH((void)registry.entries(static_cast<RenderHookSlot>(k_render_hook_slot_count)), "");
+    EXPECT_DEATH((void)registry.empty(static_cast<RenderHookSlot>(200)), "");
+}
+
 TEST(RenderHookRegistryTest, AnEmptyCallbackIsRefused) {
     core::bind_main_thread();
     RenderHookRegistry registry;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bracken/contracts/camera_state.hpp"
+#include "bracken/core/assert.hpp"
 #include "bracken/core/handle.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 
@@ -11,6 +12,7 @@
 #include <functional>
 #include <glm/glm.hpp>
 #include <memory>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -44,9 +46,14 @@ namespace bracken::scene {
  * offers no way to ask whether a pass is open, so a leaked pass corrupts every
  * later pass in the frame and fails inside the driver, far from the cause.
  *
- * The first four are HDR-PATH ONLY. On the fallback direct-to-swapchain path
- * (no HDR offscreen target) they cannot run, and the frame counts them in
- * `FrameDiagnostics::render_hooks_skipped` rather than dropping them silently.
+ * The first four are HDR-PATH ONLY: they need the offscreen scene targets and a
+ * 3D pass to sit between. They do not run on the fallback direct-to-swapchain
+ * path (no HDR offscreen target), on a frame with no 3D content or no camera
+ * ever set, or on a minimized window; `AfterUi` additionally does not run when
+ * the swapchain image could not be acquired. EVERY one of those cases is
+ * counted in `FrameDiagnostics::render_hooks_skipped` rather than dropped
+ * silently, which is what lets a host tell "my pass never ran" apart from "my
+ * pass ran and drew nothing".
  */
 enum class RenderHookSlot : uint8_t {
     /// After GTAO / GI / ray tracing and BEFORE the forward pass. Scene colour
@@ -99,8 +106,15 @@ struct RenderHookContext {
     /// Which slot is running. Lets one callback serve several slots.
     RenderHookSlot slot = RenderHookSlot::AfterOpaque;
 
-    SDL_GPUTexture* scene_color = nullptr; ///< RGBA16F linear HDR; null in AfterUi on the fallback path
-    SDL_GPUTexture* scene_depth = nullptr; ///< D32_FLOAT, REVERSED-Z (near→1, far→0, clear 0.0)
+    /// RGBA16F linear HDR. Null whenever the offscreen pair does not hold THIS
+    /// frame's image — the fallback direct-to-swapchain path, or a frame with
+    /// no 3D content, both of which can reach `AfterUi`. Null rather than a
+    /// stale texture is deliberate: the textures often still exist there,
+    /// holding the last frame that did render into them.
+    SDL_GPUTexture* scene_color = nullptr;
+    /// D32_FLOAT, REVERSED-Z (near→1, far→0, clear 0.0). Same nulling rule as
+    /// `scene_color`.
+    SDL_GPUTexture* scene_depth = nullptr;
     SDL_GPUTexture* velocity = nullptr;    ///< RG16F motion vectors; null when the prepass did not run
     SDL_GPUTexture* normal_roughness = nullptr; ///< RGBA8 G-buffer; null unless RT / ProbesScreen is on
     /// RGBA8 (AO, bent normal, cone aperture). NOT null when AO is off — it is
@@ -151,9 +165,21 @@ class RenderHookRegistry {
 public:
     /// One registration. Held by pointer with a stable address for its whole
     /// life, because `name.c_str()` is handed to the GPU debug-label API, which
-    /// stores the raw pointer and requires it to outlive the frame.
+    /// stores the raw pointer and requires it to outlive the CALL.
     struct Entry {
         std::string name;
+        /// The same text, interned in a pool this registry NEVER frees, so the
+        /// pointer stays valid after the entry is removed.
+        ///
+        /// That distinction is the whole reason this field exists.
+        /// `GPUTimestampPool::reserve_pair` stores its `pass_name` as a raw
+        /// pointer and `PassTiming::name` is a `std::string_view` over it, and
+        /// that view lives in `RenderStats::pass_times_ms` until the NEXT
+        /// frame's `read_results`. A host may legally `remove()` a hook at the
+        /// frame fence — between the frame that recorded the timing and the
+        /// read of it — so handing `name.c_str()` to the timer pool is a
+        /// use-after-free. Handing `stable_name` is not.
+        const char* stable_name = "";
         int order = 0;
         uint64_t sequence = 0; ///< Registration counter; the tie-break within an `order`
         RenderHookSlot slot = RenderHookSlot::AfterOpaque;
@@ -213,14 +239,23 @@ public:
     /// True when no hook is registered in ANY slot — the frame path's early-out.
     [[nodiscard]] bool empty() const noexcept { return live_ == 0; }
     /// True when no hook is registered in `slot`.
-    [[nodiscard]] bool empty(RenderHookSlot slot) const noexcept { return order_[index_of(slot)].empty(); }
+    ///
+    /// `slot` is bounds-checked with a BRACKEN_CONTRACT (live in release): the
+    /// backing store is a fixed array and `RenderHookSlot` is a host-supplied
+    /// scoped enum, so a bad cast would otherwise be an out-of-bounds read. The
+    /// engine calls this five times per frame, which is a per-frame path, not a
+    /// per-item loop.
+    [[nodiscard]] bool empty(RenderHookSlot slot) const { return entries(slot).empty(); }
     /// Live registrations across all slots.
     [[nodiscard]] size_t size() const noexcept { return live_; }
 
     /// The hooks of `slot`, IN EXECUTION ORDER. The span and the entries it
     /// points at stay valid until the next `add`/`remove`/`clear`.
-    [[nodiscard]] std::span<Entry* const> entries(RenderHookSlot slot) const noexcept {
-        return order_[index_of(slot)];
+    /// Bounds-checked — see `empty(RenderHookSlot)`.
+    [[nodiscard]] std::span<Entry* const> entries(RenderHookSlot slot) const {
+        const size_t slot_index = index_of(slot);
+        BRACKEN_CONTRACT(slot_index < k_render_hook_slot_count, "RenderHookSlot out of range");
+        return order_[slot_index];
     }
 
     /// True while a `DispatchScope` is alive.
@@ -243,6 +278,12 @@ private:
     // this list has single digits of elements and is touched at init, not per
     // frame.
     std::array<std::vector<Entry*>, k_render_hook_slot_count> order_{};
+    // Interned hook names, deduplicated by value and NEVER erased — a node-based
+    // container, so every `c_str()` handed out stays valid for the registry's
+    // lifetime. See Entry::stable_name for why "for the registration's lifetime"
+    // is not long enough. Dedup is what bounds it: a host that adds and removes
+    // the same named hook every frame reuses one node forever.
+    std::set<std::string> name_pool_;
     uint64_t next_sequence_ = 0;
     size_t live_ = 0;
     int dispatch_depth_ = 0;

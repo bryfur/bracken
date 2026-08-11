@@ -104,10 +104,16 @@ struct PipelineCacheKey {
  */
 struct HostGraphicsPipelineDesc {
     /// Debug name. Non-empty and unique among LIVE host registrations
-    /// (duplicates are refused) — it is what shows up in the registry's logs
-    /// and it is a stable `const char*` for the lifetime of the registration,
-    /// so it is safe to hand to `BRACKEN_GPU_SCOPE` / `BRACKEN_GPU_TIMER`,
-    /// which store the label as a raw pointer.
+    /// (duplicates are refused) — it is what shows up in the registry's logs,
+    /// and `host_pipeline_desc(handle)->name.c_str()` is a stable pointer for
+    /// the lifetime of the registration, so it is safe to hand to
+    /// `BRACKEN_GPU_SCOPE`, which reads the label synchronously.
+    ///
+    /// NOT safe to hand to `BRACKEN_GPU_TIMER` unless the registration outlives
+    /// the frame's `RenderStats`: that one interns the pointer and
+    /// `PassTiming::name` is a `std::string_view` over it, still live when the
+    /// host reads the stats. `scene::RenderHookRegistry::Entry::stable_name` is
+    /// what the engine uses for exactly that reason.
     std::string name;
 
     /// SPIR-V FILE NAMES, not paths — resolved against the registry's shader
@@ -181,6 +187,25 @@ struct HostComputePipelineDesc {
 };
 
 /**
+ * @brief Why `desc` cannot be registered, or nullptr when it is well-formed.
+ *
+ * Pure — no device, no registry, no global state — which is the point: these
+ * are the refusal reasons a device-free test can actually exercise. The
+ * registry checks this FIRST, before it looks at whether it has a device, so a
+ * malformed desc is refused for the same stated reason at any point in the
+ * lifecycle.
+ *
+ * The returned string is a literal; it never points into `desc`.
+ *
+ * Uniqueness of `name` among LIVE registrations is deliberately NOT checked
+ * here — it is a property of the registry, not of the desc.
+ */
+[[nodiscard]] const char* host_pipeline_desc_error(const HostGraphicsPipelineDesc& desc);
+
+/// Compute twin of `host_pipeline_desc_error`. Same contract.
+[[nodiscard]] const char* host_compute_pipeline_desc_error(const HostComputePipelineDesc& desc);
+
+/**
  * @brief Turn a host desc + the live formats into a `PipelineConfig`.
  *
  * Pure — no device, no shader loading, no global state — the same contract
@@ -205,11 +230,16 @@ struct HostComputePipelineDesc {
  * makes rebuild order deterministic, which is the same rule the Prepare
  * fan-out's chunk-index merge follows.
  *
- * Entries are heap-allocated (`unique_ptr`), never inline in the vector,
- * because the desc's `name` is handed out as a raw `const char*` to the GPU
- * debug-label API, which stores the pointer and expects it to outlive the
- * frame. A `std::vector<Entry>` would dangle that on the first reallocation —
- * intermittently, in a host's game, never in the suite.
+ * Entries are heap-allocated (`unique_ptr`), never inline in the vector, so
+ * that both the `Entry*` from `find()` and the `const Desc*` from
+ * `PipelineRegistry::host_pipeline_desc` stay valid across further
+ * registrations. That is what makes `desc.name.c_str()` a pointer a host may
+ * hold for the registration's lifetime — see the note on
+ * `HostGraphicsPipelineDesc::name`. A `std::vector<Entry>` would dangle both on
+ * the first reallocation: intermittently, in a host's game, never in the suite.
+ *
+ * The registry itself only ever uses `name` for log lines; the lifetime
+ * guarantee is for the host, and it ends when the registration is released.
  *
  * @tparam Tag  handle tag type
  * @tparam Desc `HostGraphicsPipelineDesc` or `HostComputePipelineDesc`

@@ -47,6 +47,9 @@ RenderHookHandle RenderHookRegistry::add(RenderHookSlot slot, std::string name, 
 
     auto entry = std::make_unique<Entry>();
     entry->name = std::move(name);
+    // Intern before the entry can ever be handed to the GPU timer pool, which
+    // keeps the pointer past this registration's life (Entry::stable_name).
+    entry->stable_name = name_pool_.insert(entry->name).first->c_str();
     entry->order = order;
     entry->sequence = next_sequence_++;
     entry->slot = slot;

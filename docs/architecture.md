@@ -969,10 +969,25 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    composite writes the swapchain directly.
 13. **`UI`** — the packet's `ui_commands()` + 3D billboards, straight to
    swapchain.
-   **`PostUICallback`** — optional host hook that renders into the swapchain
-   after UI (`SceneRenderer::set_post_ui_callback`). There is a single slot:
-   `Application::init_dev_ui()` claims it for the dev overlay's ImGui draw,
-   so a host can't use both the overlay and its own post-UI callback.
+   **`RenderHookSlot::AfterUi`** — host render passes registered through
+   `SceneRenderer::render_hooks()`, whose registry is
+   `RenderHookRegistry` (`scene/render_hook.hpp`), in `(order, sequence)`
+   order. Many per slot, so a host overlay composes with anything else
+   registered.
+   **`PostUICallback`** — the legacy single-assignment hook that renders into
+   the swapchain after UI (`SceneRenderer::set_post_ui_callback`), and the LAST
+   thing recorded. There is exactly one slot and `Application::init_dev_ui()`
+   claims it for the dev overlay's ImGui draw, which is why `AfterUi` runs
+   BEFORE it: a host pass ends up under the developer overlay instead of
+   replacing it. Overwriting an installed callback is still permitted and now
+   logs a WARN naming the overlay; hosts should use `render_hooks()`.
+
+   The other four slots (`PreForward` before step 8's forward pass,
+   `AfterOpaque` after it, `BeforeTaa` before step 10, `AfterComposite` after
+   step 12) are HDR-path only. A slot that cannot run this frame — the fallback
+   path below, a frame with no 3D content, a minimized window, a failed
+   swapchain acquire — counts its hooks in
+   `FrameDiagnostics::render_hooks_skipped` rather than dropping them.
 14. Fallback: if the post stack isn't ready, steps 6–12 collapse to a single
    **`MainScene`** pass direct to swapchain (no depth prepass, no AO — every
    draw keeps its `GREATER_OR_EQUAL` write-on pipeline and samples the white

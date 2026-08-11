@@ -34,6 +34,15 @@ constexpr PipelineFormats k_formats{
     .depth = SDL_GPU_TEXTUREFORMAT_D32_FLOAT,
 };
 
+/// A minimal well-formed host graphics desc.
+HostGraphicsPipelineDesc named(std::string name) {
+    HostGraphicsPipelineDesc desc;
+    desc.name = std::move(name);
+    desc.vertex_shader = "x.vert.spv";
+    desc.fragment_shader = "x.frag.spv";
+    return desc;
+}
+
 /// Project a catalogue row onto the equivalent host desc. Used to prove the two
 /// builders agree; if a field is added to PipelineDesc and not mirrored here,
 /// EveryCatalogueRowRebuildsIdenticallyAsAHostDesc fails on that row.
@@ -221,6 +230,76 @@ TEST(HostPipeline, NoDepthTargetForcesTestAndWriteOff) {
 }
 
 // =============================================================================
+// host_pipeline_desc_error — the refusal reasons, device-free
+//
+// PipelineRegistry checks this BEFORE it checks whether it has a device, which
+// is what makes these reachable at all: a registry with no device refuses
+// everything, so a registry-level "is_valid() == false" cannot tell a malformed
+// desc apart from a missing device.
+// =============================================================================
+
+TEST(HostPipelineValidation, AWellFormedDescHasNoError) {
+    HostGraphicsPipelineDesc desc = named("ok");
+    EXPECT_EQ(host_pipeline_desc_error(desc), nullptr);
+
+    HostComputePipelineDesc compute;
+    compute.name = "ok";
+    compute.shader = "x.comp.spv";
+    EXPECT_EQ(host_compute_pipeline_desc_error(compute), nullptr);
+}
+
+TEST(HostPipelineValidation, EveryMalformedFieldIsNamed) {
+    // Each case is asserted individually, and each starts from a desc that is
+    // otherwise well-formed — so a test that passes because SOMETHING else was
+    // wrong is not possible.
+    HostGraphicsPipelineDesc no_name = named("");
+    EXPECT_NE(host_pipeline_desc_error(no_name), nullptr) << "empty name";
+
+    HostGraphicsPipelineDesc no_vs = named("no_vs");
+    no_vs.vertex_shader.clear();
+    EXPECT_NE(host_pipeline_desc_error(no_vs), nullptr) << "empty vertex shader";
+
+    HostGraphicsPipelineDesc no_fs = named("no_fs");
+    no_fs.fragment_shader.clear();
+    EXPECT_NE(host_pipeline_desc_error(no_fs), nullptr) << "empty fragment shader";
+
+    // An empty entry point is not a default, it is a mistake: SDL would look up
+    // a function called "" and the failure would surface as a shader load
+    // error naming the file rather than the field.
+    HostGraphicsPipelineDesc no_entry = named("no_entry");
+    no_entry.vertex_entry.clear();
+    EXPECT_NE(host_pipeline_desc_error(no_entry), nullptr) << "empty vertex entry point";
+
+    // attributes without buffers: the explicit vertex layout REPLACES the named
+    // one only when `buffers` is non-empty, so these attributes would be
+    // dropped on the floor.
+    HostGraphicsPipelineDesc orphan_attrs = named("orphan_attrs");
+    orphan_attrs.attributes = {SDL_GPUVertexAttribute{
+        .location = 0, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = 0}};
+    EXPECT_NE(host_pipeline_desc_error(orphan_attrs), nullptr) << "attributes with no buffers";
+
+    // …and buffers with no attributes is LEGAL (a vertex shader may read none).
+    HostGraphicsPipelineDesc buffers_only = named("buffers_only");
+    buffers_only.buffers = {SDL_GPUVertexBufferDescription{
+        .slot = 0, .pitch = 12, .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX, .instance_step_rate = 0}};
+    EXPECT_EQ(host_pipeline_desc_error(buffers_only), nullptr) << "buffers without attributes is legal";
+
+    HostComputePipelineDesc compute_no_name;
+    compute_no_name.shader = "x.comp.spv";
+    EXPECT_NE(host_compute_pipeline_desc_error(compute_no_name), nullptr);
+
+    HostComputePipelineDesc compute_no_shader;
+    compute_no_shader.name = "c";
+    EXPECT_NE(host_compute_pipeline_desc_error(compute_no_shader), nullptr);
+
+    HostComputePipelineDesc compute_no_entry;
+    compute_no_entry.name = "c";
+    compute_no_entry.shader = "x.comp.spv";
+    compute_no_entry.entry_point.clear();
+    EXPECT_NE(host_compute_pipeline_desc_error(compute_no_entry), nullptr);
+}
+
+// =============================================================================
 // PipelineCacheKey — the reason the two halves can share one cache
 // =============================================================================
 
@@ -262,14 +341,6 @@ TEST(PipelineCacheKeyTest, CatalogOverloadsCoverBothEnums) {
 // =============================================================================
 
 using Table = HostPipelineTable<HostGraphicsPipelineTag, HostGraphicsPipelineDesc>;
-
-HostGraphicsPipelineDesc named(std::string name) {
-    HostGraphicsPipelineDesc desc;
-    desc.name = std::move(name);
-    desc.vertex_shader = "x.vert.spv";
-    desc.fragment_shader = "x.frag.spv";
-    return desc;
-}
 
 TEST(HostPipelineTableTest, HandlesAreStableAcrossFurtherRegistrations) {
     Table table;

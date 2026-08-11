@@ -338,15 +338,24 @@ void PipelineRegistry::set_swapchain_format(SDL_GPUTextureFormat format) {
     // pinned by gpu/pipeline_catalog.test.cpp to answer for exactly four enum
     // values, and it must keep meaning "a catalogue row targets the swapchain".
     //
-    // Only TargetFormat::Swapchain qualifies. A host that hard-codes the
-    // presentable format through color_format_override has opted out of being
-    // rebuilt, because the registry cannot tell that format apart from any
-    // other one the host chose.
+    // Only TargetFormat::Swapchain qualifies, and it qualifies on EITHER colour
+    // attachment: a host that names it as `color2` is exactly as dependent on
+    // the presentable format as one that names it as `color`. A host that
+    // hard-codes the presentable format through the matching *_format_override
+    // has opted out of being rebuilt, because the registry cannot tell that
+    // format apart from any other one the host chose.
     std::vector<uint32_t> host_swapchain_dependent;
     for (uint32_t slot = 0; slot < static_cast<uint32_t>(host_graphics_.slots().size()); ++slot) {
         const auto& entry = host_graphics_.slots()[slot];
-        if (entry->live && entry->desc.color == TargetFormat::Swapchain &&
-            entry->desc.color_format_override == SDL_GPU_TEXTUREFORMAT_INVALID) {
+        if (!entry->live) {
+            continue;
+        }
+        const HostGraphicsPipelineDesc& desc = entry->desc;
+        const bool color_depends =
+            desc.color == TargetFormat::Swapchain && desc.color_format_override == SDL_GPU_TEXTUREFORMAT_INVALID;
+        const bool color2_depends =
+            desc.color2 == TargetFormat::Swapchain && desc.color2_format_override == SDL_GPU_TEXTUREFORMAT_INVALID;
+        if (color_depends || color2_depends) {
             host_swapchain_dependent.push_back(slot);
         }
     }
@@ -596,18 +605,16 @@ bool PipelineRegistry::create_and_cache_host_compute(uint32_t slot) {
 HostPipelineHandle PipelineRegistry::register_graphics_pipeline(HostGraphicsPipelineDesc desc) {
     BRACKEN_ASSERT_MAIN_THREAD();
     BRACKEN_ASSERT_NOT_SIM_STAGE();
+    // Desc validation FIRST, and deliberately ahead of the device check: it is
+    // pure (gpu/host_pipeline.hpp), so a malformed desc is refused for the same
+    // stated reason whether or not the registry is up — which is also what
+    // makes every refusal reason reachable from a device-free test.
+    if (const char* why = host_pipeline_desc_error(desc); why != nullptr) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry::register_graphics_pipeline('{}'): {}", desc.name, why);
+        return HostPipelineHandle::invalid();
+    }
     if (!device_) {
         BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry::register_graphics_pipeline: registry not initialized");
-        return HostPipelineHandle::invalid();
-    }
-    if (desc.name.empty()) {
-        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry::register_graphics_pipeline: desc.name must be non-empty");
-        return HostPipelineHandle::invalid();
-    }
-    if (desc.vertex_shader.empty() || desc.fragment_shader.empty()) {
-        BRACKEN_LOG_ERROR(LOG_TAG,
-                          "PipelineRegistry::register_graphics_pipeline: '{}' names no vertex and/or fragment shader",
-                          desc.name);
         return HostPipelineHandle::invalid();
     }
     if (host_graphics_.has_live_name(desc.name)) {
@@ -631,16 +638,12 @@ HostPipelineHandle PipelineRegistry::register_graphics_pipeline(HostGraphicsPipe
 HostComputePipelineHandle PipelineRegistry::register_compute_pipeline(HostComputePipelineDesc desc) {
     BRACKEN_ASSERT_MAIN_THREAD();
     BRACKEN_ASSERT_NOT_SIM_STAGE();
+    if (const char* why = host_compute_pipeline_desc_error(desc); why != nullptr) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry::register_compute_pipeline('{}'): {}", desc.name, why);
+        return HostComputePipelineHandle::invalid();
+    }
     if (!device_) {
         BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry::register_compute_pipeline: registry not initialized");
-        return HostComputePipelineHandle::invalid();
-    }
-    if (desc.name.empty()) {
-        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry::register_compute_pipeline: desc.name must be non-empty");
-        return HostComputePipelineHandle::invalid();
-    }
-    if (desc.shader.empty()) {
-        BRACKEN_LOG_ERROR(LOG_TAG, "PipelineRegistry::register_compute_pipeline: '{}' names no shader", desc.name);
         return HostComputePipelineHandle::invalid();
     }
     if (host_compute_.has_live_name(desc.name)) {

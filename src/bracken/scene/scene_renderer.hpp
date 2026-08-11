@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <functional>
 #include <glm/glm.hpp>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <string>
@@ -1020,11 +1021,27 @@ private:
      *
      * Called only behind `render_hooks_.empty(slot)` so an engine with no host
      * passes pays one bool test. `swapchain` is the swapchain texture for the
-     * two slots that have one and null for the rest; every other field of the
-     * context comes from renderer state.
+     * two slots that have one and null for the rest; `scene_targets_valid` says
+     * whether the HDR offscreen pair holds THIS frame's image (false on the
+     * fallback path and on a frame with no 3D content, where the textures can
+     * exist but hold the last frame that did render into them); every other
+     * field of the context comes from renderer state.
      */
     void run_render_hooks(RenderHookSlot slot, SDL_GPUCommandBuffer* cmd, const CameraState& draw_camera, float dt,
-                          SDL_GPUTexture* swapchain);
+                          SDL_GPUTexture* swapchain, bool scene_targets_valid);
+
+    /// Fold every hook registered in `slots` into
+    /// FrameDiagnostics::render_hooks_skipped. The engine does not drop work
+    /// silently, and a slot that could not run this frame is dropped work.
+    void count_skipped_render_hooks(std::initializer_list<RenderHookSlot> slots);
+
+    // Hook-context values captured at the top of render_frame: the end-of-frame
+    // advance overwrites prev_view_proj_unjittered_ and frame_index_ BEFORE the
+    // AfterUi slot runs, so reading the members there would hand a hook this
+    // frame's VP as the "previous" one and a frame index one past the frame it
+    // is drawing into. See run_render_hooks.
+    glm::mat4 hook_prev_view_proj_{1.0f};
+    uint64_t hook_frame_index_ = 0;
 
     // ========== Screenshot ==========
     std::string pending_screenshot_path_; // non-empty = capture next frame
