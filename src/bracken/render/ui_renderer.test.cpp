@@ -227,3 +227,149 @@ TEST(UIRendererMeasurement, ZeroBeforeInit) {
     EXPECT_EQ(ui.text_height(), 0);
     EXPECT_EQ(ui.text_renderer(), nullptr);
 }
+
+// ---------------------------------------------------------------------------
+// Submission-order ops — the z-order fix.
+//
+// The UI pass used to run two hard phases (every primitive, then every queued
+// text), so a panel recorded AFTER a label could never cover it. Recording now
+// appends submission-ordered spans and execute() walks them. These tests pin
+// the RECORDING half; the GPU half is one loop over the same list.
+// ---------------------------------------------------------------------------
+
+TEST(UIRendererOps, RectThenTextThenRectProducesThreeOpsInOrder) {
+    UIRenderer ui;
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    ui.draw_text("label", 1, 1, 0xFFFFFFFF);
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFF000000);
+
+    ASSERT_EQ(ui.ops().size(), 3u);
+    EXPECT_EQ(ui.ops()[0].kind, UIRenderer::Op::Kind::Geometry);
+    EXPECT_EQ(ui.ops()[1].kind, UIRenderer::Op::Kind::Text);
+    EXPECT_EQ(ui.ops()[2].kind, UIRenderer::Op::Kind::Geometry);
+    // The second geometry op opens a NEW range even though the texture did not
+    // change — otherwise it would be merged into the range that precedes the
+    // text and would paint underneath it.
+    EXPECT_EQ(ui.batch_draw_count(), 2u);
+    EXPECT_EQ(ui.ops()[2].first, 1u);
+    EXPECT_EQ(ui.ops()[2].count, 1u);
+}
+
+TEST(UIRendererOps, TheCommonHudShapeIsStillExactlyTwoOps) {
+    // A panel followed by its labels — what every HUD does, and what the smoke
+    // screenshot draws. It must cost exactly the command stream it always did.
+    UIRenderer ui;
+    ui.draw_filled_rect(10, 10, 280, 122, 0xB0101418);
+    for (int i = 0; i < 6; ++i) {
+        ui.draw_text("row", 22, static_cast<float>(20 + i * 20), 0xFFFFFFFF);
+    }
+    ASSERT_EQ(ui.ops().size(), 2u);
+    EXPECT_EQ(ui.ops()[0].kind, UIRenderer::Op::Kind::Geometry);
+    EXPECT_EQ(ui.ops()[0].count, 1u);
+    EXPECT_EQ(ui.ops()[1].kind, UIRenderer::Op::Kind::Text);
+    EXPECT_EQ(ui.ops()[1].count, 6u);
+    EXPECT_EQ(ui.batch_draw_count(), 1u);
+}
+
+TEST(UIRendererOps, ConsecutiveTextsShareOneOp) {
+    UIRenderer ui;
+    ui.draw_text("a", 0, 0, 0xFFFFFFFF);
+    ui.draw_text("b", 0, 10, 0xFFFFFFFF);
+    ui.draw_text("c", 0, 20, 0xFFFFFFFF);
+    ASSERT_EQ(ui.ops().size(), 1u);
+    EXPECT_EQ(ui.ops()[0].kind, UIRenderer::Op::Kind::Text);
+    EXPECT_EQ(ui.ops()[0].count, 3u);
+}
+
+TEST(UIRendererOps, BeginClearsTheOpList) {
+    UIRenderer ui;
+    ui.draw_filled_rect(0, 0, 1, 1, 0xFFFFFFFF);
+    ui.draw_text("x", 0, 0, 0xFFFFFFFF);
+    ASSERT_FALSE(ui.ops().empty());
+    ui.begin(nullptr);
+    EXPECT_TRUE(ui.ops().empty());
+    EXPECT_EQ(ui.batch_draw_count(), 0u);
+    EXPECT_EQ(ui.queued_text_count(), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// Clipping
+// ---------------------------------------------------------------------------
+
+TEST(UIRendererClip, SettingAClipOpensANewDrawRange) {
+    UIRenderer ui;
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    EXPECT_EQ(ui.batch_draw_count(), 1u);
+    ui.set_clip_rect(5, 5, 50, 50);
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    EXPECT_EQ(ui.batch_draw_count(), 2u);
+}
+
+TEST(UIRendererClip, TwoConsecutiveIdenticalClipsDoNotSplit) {
+    UIRenderer ui;
+    ui.set_clip_rect(5, 5, 50, 50);
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    ui.set_clip_rect(5, 5, 50, 50); // same rect
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    EXPECT_EQ(ui.batch_draw_count(), 1u);
+}
+
+TEST(UIRendererClip, ClearingTheClipOpensANewRange) {
+    UIRenderer ui;
+    ui.set_clip_rect(5, 5, 50, 50);
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    ui.clear_clip_rect();
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    EXPECT_EQ(ui.batch_draw_count(), 2u);
+}
+
+TEST(UIRendererClip, NoClipCostsNoExtraRanges) {
+    // The standing gate: an unclipped HUD must batch exactly as it did before
+    // clipping existed.
+    UIRenderer ui;
+    for (int i = 0; i < 20; ++i) {
+        ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    }
+    EXPECT_EQ(ui.batch_draw_count(), 1u);
+}
+
+// ---------------------------------------------------------------------------
+// UI texture registry (the sim stage's only way to name a texture)
+// ---------------------------------------------------------------------------
+
+TEST(UIRendererTextures, RegistrationRoundTripsAndIdsAreNeverRecycled) {
+    UIRenderer ui;
+    const bracken::UiTextureId a = ui.register_texture(fake_texture(0x100));
+    const bracken::UiTextureId b = ui.register_texture(fake_texture(0x200));
+    ASSERT_TRUE(a.valid());
+    ASSERT_TRUE(b.valid());
+    EXPECT_NE(a.value, b.value);
+    EXPECT_EQ(ui.texture_for(a), fake_texture(0x100));
+    EXPECT_EQ(ui.texture_for(b), fake_texture(0x200));
+
+    ui.unregister_texture(a);
+    EXPECT_EQ(ui.texture_for(a), nullptr);
+    // The next registration must NOT reuse a's slot: a stale id has to resolve
+    // to nothing (diagnosable) rather than to somebody else's texture.
+    const bracken::UiTextureId c = ui.register_texture(fake_texture(0x300));
+    EXPECT_NE(c.value, a.value);
+    EXPECT_EQ(ui.texture_for(a), nullptr);
+    EXPECT_EQ(ui.texture_for(c), fake_texture(0x300));
+}
+
+TEST(UIRendererTextures, InvalidAndUnknownIdsResolveToNull) {
+    UIRenderer ui;
+    EXPECT_EQ(ui.texture_for(bracken::UiTextureId{}), nullptr);
+    EXPECT_EQ(ui.texture_for(bracken::UiTextureId{999}), nullptr);
+    EXPECT_FALSE(ui.register_texture(nullptr).valid());
+}
+
+TEST(UIRendererTextures, AnUnresolvedTextureDegradesToASolidTintQuad) {
+    // The consume side counts this in FrameDiagnostics::ui_textures_unresolved
+    // and hands the null through; the renderer must then draw a solid quad
+    // rather than skipping the draw.
+    UIRenderer ui;
+    ui.draw_textured_quad(nullptr, 0, 0, 10, 10, 0xFF804020);
+    EXPECT_EQ(ui.batch_vertex_count(), 6u);
+    ASSERT_EQ(ui.batch_draw_count(), 1u);
+}

@@ -107,15 +107,18 @@ struct FrameAccess {
 class TestFrame {
 public:
     explicit TestFrame(uint32_t lane_count = 1,
-                       std::size_t arena_bytes = scene::FramePacket::k_default_arena_bytes)
+                       std::size_t arena_bytes = scene::FramePacket::k_default_arena_bytes,
+                       const bracken::FontMetrics* font_metrics = nullptr)
         : owned_(std::make_unique<scene::FramePacket>(arena_bytes)), packet_(owned_.get()) {
-        builder_.emplace(*packet_, lane_count);
+        builder_.emplace(*packet_, lane_count, font_metrics);
         sink_.emplace(*builder_);
     }
 
     /** Bind to a caller-owned packet (must be Retired). */
-    explicit TestFrame(scene::FramePacket& packet, uint32_t lane_count = 1) : packet_(&packet) {
-        builder_.emplace(*packet_, lane_count);
+    explicit TestFrame(scene::FramePacket& packet, uint32_t lane_count = 1,
+                       const bracken::FontMetrics* font_metrics = nullptr)
+        : packet_(&packet) {
+        builder_.emplace(*packet_, lane_count, font_metrics);
         sink_.emplace(*builder_);
     }
 
@@ -162,6 +165,29 @@ public:
      *  scene::FrameSink::add_shadow_capsules. */
     [[nodiscard]] std::span<const bracken::render::rt::ShadowCapsule> shadow_capsules() const {
         return packet_->shadow_capsules();
+    }
+
+    /** The frame's UI clip (scissor) commands, in emission order — what a
+     *  scroll view pushed and popped. See scene::UiClipCommand. */
+    [[nodiscard]] std::vector<scene::UiClipCommand> ui_clips() const {
+        std::vector<scene::UiClipCommand> out;
+        for (const scene::UiCommand& cmd : packet_->ui_commands()) {
+            if (cmd.is<scene::UiClipCommand>()) {
+                out.push_back(cmd.get<scene::UiClipCommand>());
+            }
+        }
+        return out;
+    }
+
+    /** The frame's textured-quad UI commands, in emission order. */
+    [[nodiscard]] std::vector<scene::UiTexturedQuadCommand> ui_textured_quads() const {
+        std::vector<scene::UiTexturedQuadCommand> out;
+        for (const scene::UiCommand& cmd : packet_->ui_commands()) {
+            if (cmd.is<scene::UiTexturedQuadCommand>()) {
+                out.push_back(cmd.get<scene::UiTexturedQuadCommand>());
+            }
+        }
+        return out;
     }
 
     /** Every UI text/button string of the frame, in emission order. The views

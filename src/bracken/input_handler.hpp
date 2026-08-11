@@ -41,6 +41,16 @@ struct InputSnapshot {
     bool mouse_left_released = false;
     bool mouse_right_pressed = false;
 
+    /// RAW mouse-wheel delta accumulated since the previous snapshot, in SDL
+    /// wheel units (one notch = 1.0), sign as SDL reports it. Distinct from
+    /// `camera_zoom_delta` on purpose: that one is already COOKED for the
+    /// camera (negated and multiplied by 50), so a scroll view reading it
+    /// would scroll backwards at fifty times the speed. Consumed by whoever
+    /// reads the snapshot; `InputHandler::reset_wheel()` clears the
+    /// accumulator at the top of each event pump.
+    float wheel_x = 0.0f;
+    float wheel_y = 0.0f;
+
     // Camera orbit controls (sensitivity/inversion already applied).
     float camera_yaw = 0.0f;
     float camera_pitch = 20.0f;
@@ -164,6 +174,18 @@ public:
     float get_camera_pitch() const { return camera_pitch_; }
     float get_camera_zoom_delta() const { return camera_zoom_delta_; }
     void reset_camera_deltas() { camera_zoom_delta_ = 0.0f; }
+
+    // Raw wheel accumulator, in SDL wheel units. Kept ALONGSIDE the cooked
+    // camera_zoom_delta_ rather than replacing it: the camera controller
+    // depends on the cook, and a scroll view needs the raw value. Cleared by
+    // reset_wheel(), which Application::pump_events calls beside
+    // reset_camera_deltas() before polling.
+    float wheel_x() const { return wheel_x_; }
+    float wheel_y() const { return wheel_y_; }
+    void reset_wheel() {
+        wheel_x_ = 0.0f;
+        wheel_y_ = 0.0f;
+    }
 
     // Set camera yaw externally (for syncing with renderer)
     void set_camera_yaw(float yaw) { camera_yaw_ = yaw; }
@@ -291,6 +313,8 @@ private:
     float camera_yaw_ = 0.0f;    // Horizontal rotation (degrees)
     float camera_pitch_ = 20.0f; // Vertical angle - lower for over-the-shoulder action view
     float camera_zoom_delta_ = 0.0f;
+    float wheel_x_ = 0.0f;
+    float wheel_y_ = 0.0f;
     bool right_mouse_down_ = false;
 
     // Actual camera forward direction (set by renderer, accounts for shoulder offset)

@@ -109,6 +109,7 @@ void Application::stop() {
 void Application::pump_events() {
     BRACKEN_PROFILE_ZONE("App::poll_events");
     input_.reset_camera_deltas();
+    input_.reset_wheel(); // raw wheel accumulator; see InputSnapshot::wheel_y
     input_.clear_menu_inputs();
     input_.clear_key_edges();
     SDL_Event event;
@@ -167,7 +168,9 @@ void Application::kick_sim() {
 
     // Acquire the fill slot + builder (Retired → Filling) and stamp timing.
     FramePacket& packet = frame_packets().acquire_for_fill();
-    sim_builder_ = std::make_unique<FrameBuilder>(packet, k_sim_lanes);
+    // font_metrics_ is frozen (init_renderer) and outlives every frame, so the
+    // builder holding a pointer to it is safe by construction.
+    sim_builder_ = std::make_unique<FrameBuilder>(packet, k_sim_lanes, &font_metrics_);
     sim_builder_->set_frame_timing(dt, sim_time_, sim_frame_current_);
     sim_packet_ = &packet;
 
@@ -188,7 +191,7 @@ void Application::run_sim_job() {
     {
         BRACKEN_PROFILE_ZONE("App::on_simulate");
         SimFrame sim(fb, sim_input_, sim_dt_, sim_time_, sim_frame_current_, &sim_feedback_, sim_screen_width_,
-                     sim_screen_height_);
+                     sim_screen_height_, &font_metrics_);
         on_simulate(sim);
     }
 
@@ -460,6 +463,16 @@ bool Application::init_renderer(int width, int height, const std::string& title,
     scene_renderer_->models().enable_hot_reload(core::asset::FileWatcher::instance());
 
     camera_ = std::make_unique<CameraSystem>();
+
+    // Freeze the frame's text metrics HERE, on the main thread, before the
+    // loop has ever kicked a sim job — see contracts/font_metrics.hpp for the
+    // publication argument. From this point the table is immutable for the
+    // process's life, so handing const references to pool workers needs no
+    // synchronization beyond the sim job's own submit/execute edge.
+    font_metrics_ = scene_renderer_->font_metrics();
+    if (!font_metrics_.valid()) {
+        BRACKEN_LOG_WARN("app", "No font metrics available; UI text layout will fall back to fixed-width guesses");
+    }
 
     // Auto-load settings from disk, unless the host opted out
     // (set_settings_persistence(false) — regression runs, headless tools).

@@ -8,8 +8,10 @@
 // Needed in full: the inline instance-batch walk dereferences ModelManager/Model.
 #include "bracken/contracts/camera_state.hpp"
 #include "bracken/contracts/environment.hpp"
+#include "bracken/contracts/font_metrics.hpp"
 #include "bracken/contracts/frustum.hpp"
 #include "bracken/contracts/render_stats.hpp"
+#include "bracken/contracts/ui_texture.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
 #include "bracken/render/raytracing/emissive_clusters.hpp"
@@ -181,6 +183,26 @@ public:
      *  hosts laying out UI (e.g. wrapped text emission) query these. */
     int text_width(std::string_view text, float scale = 1.0f) const;
     int text_height(float scale = 1.0f) const;
+
+    /**
+     * Register a UI texture and get back the handle that names it from the
+     * SIM STAGE (contracts/ui_texture.hpp). Tier: `main-thread`; the renderer
+     * neither owns nor retains the texture. Returns an invalid id before
+     * init(). This is the only way a sim job can ask for a textured quad or a
+     * nine-slice panel — `UIRenderer::draw_textured_quad` takes a raw
+     * `SDL_GPUTexture*`, which the packet may not carry.
+     */
+    [[nodiscard]] bracken::UiTextureId register_ui_texture(SDL_GPUTexture* texture);
+    void unregister_ui_texture(bracken::UiTextureId id);
+
+    /**
+     * The frozen glyph-metrics table for sim-stage text layout
+     * (contracts/font_metrics.hpp). Filled once at init(); invalid when no
+     * font could be loaded. `Application` copies this out at init and hands
+     * the copy to every frame — a host normally reads
+     * `SimFrame::font_metrics()`, not this.
+     */
+    [[nodiscard]] const bracken::FontMetrics& font_metrics() const;
 
     /** Live-editable environment (sun/sky/fog — single source of truth).
      *  Mutations take effect next frame: render_frame re-propagates env_ to

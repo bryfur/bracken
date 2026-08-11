@@ -29,6 +29,11 @@ static_assert(k_lane_storable<DebugLineDrawCommand>);
 static_assert(k_lane_storable<EffectSpawnCommand>);
 static_assert(k_lane_storable<bracken::render::rt::ShadowCapsule>);
 static_assert(k_lane_storable<UiCommand>); // variant of trivially copyable alternatives
+// ...and each alternative in its own right, so a future payload that is not
+// trivially destructible fails HERE rather than silently leaking through the
+// variant's own trivially-copyable check.
+static_assert(k_lane_storable<UiTexturedQuadCommand>);
+static_assert(k_lane_storable<UiClipCommand>);
 static_assert(k_lane_storable<BonePalette>);
 
 } // namespace
@@ -41,7 +46,8 @@ static_assert(std::is_trivially_destructible_v<FrameBuilder::Lane>);
 // FrameBuilder
 // ============================================================================
 
-FrameBuilder::FrameBuilder(FramePacket& packet, uint32_t lane_count) : packet_(&packet), lane_count_(lane_count) {
+FrameBuilder::FrameBuilder(FramePacket& packet, uint32_t lane_count, const bracken::FontMetrics* font_metrics)
+    : packet_(&packet), lane_count_(lane_count) {
     BRACKEN_VERIFY(lane_count >= 1 && lane_count <= k_max_lanes, "FrameBuilder: lane_count {} out of range [1, {}]",
                    lane_count, k_max_lanes);
     packet.begin_fill();
@@ -51,6 +57,10 @@ FrameBuilder::FrameBuilder(FramePacket& packet, uint32_t lane_count) : packet_(&
         Lane* lane = new (&lanes_[i]) Lane();
         lane->packet_ = &packet;
         lane->index_ = i;
+        // Copied per lane rather than reached through a builder back-pointer:
+        // a Lane is a self-contained emission stream (it does not know its
+        // builder), and one extra pointer per cache-line-padded lane is free.
+        lane->font_metrics_ = font_metrics;
     }
 }
 
@@ -513,19 +523,43 @@ void FrameBuilder::UiLane::add_text(std::string_view text, float x, float y, flo
     new (lane_->push_slot(lane_->ui_)) UiCommand{UiTextCommand{lane_->store_text(text), x, y, scale, color}};
 }
 
+const bracken::FontMetrics* FrameBuilder::UiLane::font_metrics() const {
+    return lane_->font_metrics_;
+}
+
 float FrameBuilder::UiLane::add_text_wrapped(std::string_view text, float x, float y, float max_width, float scale,
                                              bracken::core::Color color, float line_height) {
-    // Mirrors UIScene::add_text_wrapped (approximate 8px * scale char width).
-    constexpr float CHAR_WIDTH_BASE = 8.0f;
-    const float char_w = CHAR_WIDTH_BASE * scale;
+    const bracken::FontMetrics* fm = lane_->font_metrics_;
+    const bool measured = fm != nullptr && fm->valid();
+
     if (line_height <= 0.0f) {
-        line_height = 18.0f * scale;
+        line_height = measured ? fm->measure_height(scale) : 18.0f * scale;
     }
-    int max_chars = static_cast<int>(max_width / char_w);
-    max_chars = std::max(max_chars, 1);
 
     float cur_y = y;
     std::size_t pos = 0;
+    if (measured) {
+        // The real pen walk. FontMetrics::wrap_point returns (consumed, emit)
+        // and guarantees consumed > 0 for a non-empty remainder, which is what
+        // makes this loop terminate even for a box narrower than one glyph.
+        while (pos < text.size()) {
+            const auto wp = fm->wrap_point(text.substr(pos), max_width, scale);
+            if (wp.emit > 0) {
+                add_text(text.substr(pos, wp.emit), x, cur_y, scale, color);
+            }
+            cur_y += line_height;
+            pos += wp.consumed;
+        }
+        return cur_y - y;
+    }
+
+    // No metrics: the historical 8px-per-character guess. See the header for
+    // why this is a "no answer" path and not a mode.
+    constexpr float CHAR_WIDTH_BASE = 8.0f;
+    const float char_w = CHAR_WIDTH_BASE * scale;
+    int max_chars = static_cast<int>(max_width / char_w);
+    max_chars = std::max(max_chars, 1);
+
     while (pos < text.size()) {
         const std::size_t remaining = text.size() - pos;
         if (static_cast<int>(remaining) <= max_chars) {
@@ -552,6 +586,22 @@ void FrameBuilder::UiLane::add_button(float x, float y, float w, float h, std::s
                                       bracken::core::Color color, bool selected) {
     lane_->assert_filling();
     new (lane_->push_slot(lane_->ui_)) UiCommand{UiButtonCommand{x, y, w, h, lane_->store_text(label), color, selected}};
+}
+
+void FrameBuilder::UiLane::add_textured_quad(bracken::UiTextureId texture, float x, float y, float w, float h,
+                                             bracken::core::Color tint, float u0, float v0, float u1, float v1) {
+    lane_->assert_filling();
+    new (lane_->push_slot(lane_->ui_)) UiCommand{UiTexturedQuadCommand{x, y, w, h, u0, v0, u1, v1, texture, tint}};
+}
+
+void FrameBuilder::UiLane::set_clip(float x, float y, float w, float h) {
+    lane_->assert_filling();
+    new (lane_->push_slot(lane_->ui_)) UiCommand{UiClipCommand{x, y, w, h, 1u}};
+}
+
+void FrameBuilder::UiLane::clear_clip() {
+    lane_->assert_filling();
+    new (lane_->push_slot(lane_->ui_)) UiCommand{UiClipCommand{0.0f, 0.0f, 0.0f, 0.0f, 0u}};
 }
 
 } // namespace bracken::scene

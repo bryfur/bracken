@@ -1373,10 +1373,17 @@ void PlaygroundGame::on_simulate(SimFrame& sim) {
 void PlaygroundGame::handle_input(const SimFrame& sim) {
     const auto& in = sim.input();
 
+    // The UI gets first refusal. `ui_capture_` is what the UI took while
+    // describing the PREVIOUS frame (build_ui runs at the end of the frame,
+    // after this), so masking here is one frame late — see the note at
+    // build_ui, and ui::Context's class comment for why one frame is inherent
+    // to the design rather than a shortcut taken here.
+    const InputSnapshot game_in = ui_capture_.mask(in);
+
     // Evaluate every action once, up front: edges are computed against the
     // previous update(), so it must happen exactly once per sim frame and
     // before any query.
-    actions_.update(in);
+    actions_.update(game_in);
 
     if (in.was_key_just_pressed(SDL_SCANCODE_ESCAPE)) {
         quit();
@@ -2957,30 +2964,132 @@ void PlaygroundGame::build_frame(SimFrame& sim) {
     build_ui(sim, fb);
 }
 
+// The HUD, built through `bracken::ui` — the module's reference client.
+//
+// PORTING NOTE, because the smoke screenshot is a pinned baseline. The stat
+// rows are declared with EXPLICIT fixed heights (24, then 20) rather than
+// content heights, which reproduces the hand-written y offsets 20/44/64/84/
+// 104/124 exactly. That is not a workaround: a fixed-height row is an ordinary
+// thing to want, and doing it this way is what lets the port be checked against
+// the previous frame pixel for pixel instead of "looks about right". The panel
+// border is transparent for the same reason — the old HUD had none, and
+// begin_panel skips a fully transparent border rather than emitting invisible
+// quads.
+//
+// The ONE deliberate visual change is the keybind strip at the bottom, which
+// stays on `UiLane::add_text_wrapped`: that call now measures against the real
+// font instead of guessing 8 px per character, so the strip WRAPS onto a second
+// line where it used to run off the right-hand edge of the screen.
 void PlaygroundGame::build_ui(const SimFrame& sim, scene::FrameSink& fb) {
-    auto ui = fb.ui();
-    ui.add_filled_rect(10, 10, 280, 122, 0xB0101418);
-    ui.add_text("bracken playground", 22, 20, 1.0f, 0xFFFFD080);
+    ui::ContextConfig cfg;
+    cfg.font = &sim.font_metrics();
+    ui_.configure(cfg);
+    ui_.style().panel_bg = 0xB0101418;
+    ui_.style().panel_border = 0x00000000; // transparent -> not drawn at all
+
+    // F9 opens the demo menu. Never during a smoke run: that run has to render
+    // a pure function of the frame index, and an open menu is state.
+    if (smoke_frames_ <= 0 && sim.input().was_key_just_pressed(SDL_SCANCODE_F9)) {
+        ui_menu_open_ = !ui_menu_open_;
+    }
+
+    ui_.begin(fb.ui(), ui::InputFrame::from_snapshot(sim.input()),
+              ui::Rect{0.0f, 0.0f, static_cast<float>(sim.screen_width()),
+                       static_cast<float>(sim.screen_height())});
+
+    ui::BoxStyle margin{};
+    margin.padding = ui::Edges{10.0f, 10.0f, 0.0f, 0.0f};
+    ui_.begin_column(margin);
+
+    ui::BoxStyle panel{};
+    panel.padding = ui::Edges{12.0f, 10.0f, 0.0f, 0.0f};
+    panel.width = ui::Size::px(280.0f);
+    panel.height = ui::Size::px(122.0f);
+    ui_.begin_panel(panel);
+
+    ui_.label("bracken playground", 0xFFFFD080, 1.0f, ui::Size::px(24.0f));
     // The smoke run must render a pure function of the frame index, so the
     // captured screenshot is comparable between runs. A live FPS readout is
     // wall-clock derived, so drawing it would put a run-to-run-varying string
     // on screen. The measured rate is still printed in the "[smoke] OK" line.
     if (smoke_frames_ > 0) {
-        ui.add_text("FPS --", 22, 44, 0.9f, 0xFFB8C4D0);
+        ui_.label("FPS --", 0xFFB8C4D0, 0.9f, ui::Size::px(20.0f));
     } else {
-        ui.add_text(std::format("FPS {:.0f}", fps()), 22, 44, 0.9f, 0xFFB8C4D0);
+        ui_.label(std::format("FPS {:.0f}", fps()), 0xFFB8C4D0, 0.9f, ui::Size::px(20.0f));
     }
-    ui.add_text(std::format("Orbs collected: {}", orbs_collected_), 22, 64, 0.9f, 0xFFFFC040);
-    ui.add_text(std::format("Anim state: {}", anim_sm_.current_state()), 22, 84, 0.9f, 0xFFB8C4D0);
-    ui.add_text(std::format("Pos {:.0f}, {:.0f}", player_pos_.x, player_pos_.z), 22, 104, 0.9f, 0xFF8894A0);
+    ui_.label(std::format("Orbs collected: {}", orbs_collected_), 0xFFFFC040, 0.9f, ui::Size::px(20.0f));
+    ui_.label(std::format("Anim state: {}", anim_sm_.current_state()), 0xFFB8C4D0, 0.9f, ui::Size::px(20.0f));
+    ui_.label(std::format("Pos {:.0f}, {:.0f}", player_pos_.x, player_pos_.z), 0xFF8894A0, 0.9f,
+              ui::Size::px(20.0f));
     if (smoke_frames_ > 0) {
-        ui.add_text(std::format("SMOKE {}/{}", frame_, smoke_frames_), 22, 124, 0.9f, 0xFFFF8060);
+        ui_.label(std::format("SMOKE {}/{}", frame_, smoke_frames_), 0xFFFF8060, 0.9f, ui::Size::px(20.0f));
     }
-    ui.add_text_wrapped("WASD move | Shift run | mouse-drag orbit | wheel zoom | LMB attack | F flashlight | "
-                        "F1 AO | F2 bloom | F4 fog | F5 shadows | F6 AA | F7 IBL | F8 local shadows | F3 debug | "
-                        "F12 screenshot | Esc quit | F10 dev overlay",
-                        10, static_cast<float>(sim.screen_height()) - 56.0f,
-                        static_cast<float>(sim.screen_width()) - 20.0f, 0.9f, 0xFFC8D0DC);
+    ui_.end_panel();
+    ui_.end_box();
+
+    if (ui_menu_open_) {
+        build_demo_menu(sim);
+    }
+
+    ui_.end();
+    // The capture the NEXT frame's input read is gated on. One frame late by
+    // construction — the UI is described at the END of the frame, after the
+    // game logic that would have to be gated — which is the same one-frame
+    // rule ui::Context already documents for its own hit testing.
+    ui_capture_ = ui_.capture();
+
+    fb.ui().add_text_wrapped("WASD move | Shift run | mouse-drag orbit | wheel zoom | LMB attack | F flashlight | "
+                             "F1 AO | F2 bloom | F4 fog | F5 shadows | F6 AA | F7 IBL | F8 local shadows | "
+                             "F3 debug | F9 UI demo | F12 screenshot | Esc quit | F10 dev overlay",
+                             10, static_cast<float>(sim.screen_height()) - 56.0f,
+                             static_cast<float>(sim.screen_width()) - 20.0f, 0.9f, 0xFFC8D0DC);
+}
+
+// The worked example for the widget vocabulary: a menu built from panel +
+// column + label + button + toggle + slider + scroll view, navigable by
+// keyboard and gamepad. Never declared during a smoke run, so it cannot move
+// the pinned screenshot baselines.
+void PlaygroundGame::build_demo_menu(const SimFrame& sim) {
+    ui::BoxStyle place{};
+    place.padding = ui::Edges{static_cast<float>(sim.screen_width()) * 0.5f - 170.0f, 120.0f, 0.0f, 0.0f};
+    ui_.begin_column(place);
+
+    ui::BoxStyle panel{};
+    panel.padding = ui::Edges::all(14.0f);
+    panel.spacing = 8.0f;
+    panel.width = ui::Size::px(340.0f);
+    ui_.style().panel_border = 0xFF303840; // the demo panel DOES want a border
+    ui_.begin_panel(panel);
+    ui_.label("UI demo (F9 to close)", 0xFFFFD080);
+
+    if (ui_.button(ui::id("demo.reset_orbs"), "Reset orb count", ui::Size::flex(1.0f))) {
+        orbs_collected_ = 0;
+    }
+    (void)ui_.toggle(ui::id("demo.debug"), "Debug overlay", debug_draw_, ui::Size::flex(1.0f));
+
+    ui_.label("Master volume", 0xFF8894A0, 0.9f);
+    if (ui_.slider(ui::id("demo.volume"), ui_demo_volume_, 0.0f, 1.0f, ui::Size::flex(1.0f))) {
+        audio().set_master_gain(ui_demo_volume_);
+    }
+
+    // A scrolling list, to exercise the clip command and the wheel.
+    ui_.label("Scroll me", 0xFF8894A0, 0.9f);
+    ui::BoxStyle list{};
+    list.padding = ui::Edges::all(4.0f);
+    list.spacing = 2.0f;
+    list.width = ui::Size::flex(1.0f);
+    list.height = ui::Size::px(90.0f);
+    ui_.begin_scroll(ui::id("demo.list"), list);
+    for (int i = 0; i < 24; ++i) {
+        ui_.label(std::format("row {}", i), 0xFFB8C4D0, 0.9f);
+    }
+    ui_.end_scroll();
+
+    if (ui_.button(ui::id("demo.close"), "Close", ui::Size::flex(1.0f))) {
+        ui_menu_open_ = false;
+    }
+    ui_.end_panel();
+    ui_.end_box();
 }
 
 // ---------------------------------------------------------------------------

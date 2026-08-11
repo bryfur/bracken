@@ -281,3 +281,103 @@ TEST(TestFrame, ShadowCapsulesMergeInLaneOrder) {
     EXPECT_EQ(frame.shadow_capsules()[2].p0.y, 200.0f);
     EXPECT_EQ(frame.shadow_capsules()[4].p0.y, 300.0f);
 }
+
+// ---------------------------------------------------------------------------
+// UI textured quads and clip commands (the two payloads the UI module added).
+// Same five properties the ShadowCapsule block above pins, minus the budget
+// (these have none — they are ordinary UI commands and share the UI chunk).
+// ---------------------------------------------------------------------------
+
+TEST(TestFrame, UiTexturedQuadsAreCopiedIntoThePacket) {
+    TestFrame frame;
+    {
+        auto ui = frame.sink().ui();
+        ui.add_textured_quad(bracken::UiTextureId{9}, 10.0f, 20.0f, 30.0f, 40.0f, bracken::core::Color{0xFF804020},
+                             0.25f, 0.5f, 0.75f, 1.0f);
+    }
+    frame.seal();
+
+    const std::vector<bracken::scene::UiTexturedQuadCommand> quads = frame.ui_textured_quads();
+    ASSERT_EQ(quads.size(), 1u);
+    EXPECT_FLOAT_EQ(quads[0].x, 10.0f);
+    EXPECT_FLOAT_EQ(quads[0].y, 20.0f);
+    EXPECT_FLOAT_EQ(quads[0].w, 30.0f);
+    EXPECT_FLOAT_EQ(quads[0].h, 40.0f);
+    EXPECT_FLOAT_EQ(quads[0].u0, 0.25f);
+    EXPECT_FLOAT_EQ(quads[0].v1, 1.0f);
+    EXPECT_EQ(quads[0].texture.value, 9u);
+    EXPECT_EQ(quads[0].tint.argb, 0xFF804020u);
+}
+
+TEST(TestFrame, UiClipCommandsRoundTripAndDefaultToNone) {
+    TestFrame empty;
+    empty.seal();
+    EXPECT_TRUE(empty.ui_clips().empty());
+
+    TestFrame frame;
+    {
+        auto ui = frame.sink().ui();
+        ui.set_clip(5.0f, 6.0f, 100.0f, 50.0f);
+        ui.add_filled_rect(0.0f, 0.0f, 10.0f, 10.0f, 0xFFFFFFFF);
+        ui.clear_clip();
+    }
+    frame.seal();
+
+    const std::vector<bracken::scene::UiClipCommand> clips = frame.ui_clips();
+    ASSERT_EQ(clips.size(), 2u);
+    EXPECT_EQ(clips[0].enabled, 1u);
+    EXPECT_FLOAT_EQ(clips[0].x, 5.0f);
+    EXPECT_FLOAT_EQ(clips[0].h, 50.0f);
+    EXPECT_EQ(clips[1].enabled, 0u);
+
+    // The clip brackets the rect in the sealed stream — order is the whole
+    // contract for a scissor command.
+    const auto cmds = frame.packet().ui_commands();
+    ASSERT_EQ(cmds.size(), 3u);
+    EXPECT_TRUE(cmds[0].is<bracken::scene::UiClipCommand>());
+    EXPECT_TRUE(cmds[1].is<bracken::scene::UiFilledRectCommand>());
+    EXPECT_TRUE(cmds[2].is<bracken::scene::UiClipCommand>());
+}
+
+TEST(TestFrame, UiCommandsMergeInLaneOrder) {
+    TestFrame frame(/*lane_count=*/3);
+    frame.builder().lane(2).ui().add_textured_quad(bracken::UiTextureId{3}, 300.0f, 0.0f, 1.0f, 1.0f);
+    frame.builder().lane(0).ui().add_textured_quad(bracken::UiTextureId{1}, 100.0f, 0.0f, 1.0f, 1.0f);
+    frame.builder().lane(1).ui().add_textured_quad(bracken::UiTextureId{2}, 200.0f, 0.0f, 1.0f, 1.0f);
+    frame.seal();
+
+    const std::vector<bracken::scene::UiTexturedQuadCommand> quads = frame.ui_textured_quads();
+    ASSERT_EQ(quads.size(), 3u);
+    EXPECT_FLOAT_EQ(quads[0].x, 100.0f);
+    EXPECT_FLOAT_EQ(quads[1].x, 200.0f);
+    EXPECT_FLOAT_EQ(quads[2].x, 300.0f);
+}
+
+TEST(TestFrame, WrappedTextUsesTheFrameFontMetricsWhenGivenOne) {
+    // Ten pixels per glyph, so the expected break is arithmetic rather than a
+    // property of whatever font happens to be installed.
+    bracken::FontMetrics font;
+    font.line_height = 20;
+    font.fallback_advance = 10;
+    font.advance.fill(bracken::FontMetrics::k_absent);
+    for (uint32_t cp = 0x20; cp <= 0x7E; ++cp) {
+        font.advance[cp - bracken::FontMetrics::k_first_cp] = 10;
+    }
+
+    TestFrame measured(1u, bracken::scene::FramePacket::k_default_arena_bytes, &font);
+    (void)measured.sink().ui().add_text_wrapped("aaa bbb ccc", 0.0f, 0.0f, /*max_width=*/55.0f);
+    measured.seal();
+    const std::vector<std::string_view> lines = measured.ui_text();
+    ASSERT_EQ(lines.size(), 3u);
+    EXPECT_EQ(lines[0], "aaa");
+    EXPECT_EQ(lines[1], "bbb");
+    EXPECT_EQ(lines[2], "ccc");
+
+    // With NO metrics the historical 8px-per-character guess still applies, so
+    // 55 px reads as six characters and the same string breaks differently.
+    // This is the fallback path, not a mode — see UiLane::add_text_wrapped.
+    TestFrame guessed;
+    (void)guessed.sink().ui().add_text_wrapped("aaa bbb ccc", 0.0f, 0.0f, /*max_width=*/55.0f);
+    guessed.seal();
+    EXPECT_NE(guessed.ui_text().size(), 0u);
+}

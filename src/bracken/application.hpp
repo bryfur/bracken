@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bracken/contracts/font_metrics.hpp"
 #include "bracken/contracts/graphics_settings.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/input_handler.hpp"
@@ -374,6 +375,21 @@ protected:
         return *scene_renderer_;
     }
 
+    /**
+     * The engine's frozen text-metrics table (contracts/font_metrics.hpp).
+     *
+     * Filled once inside init_renderer(), never mutated afterwards, and handed
+     * to every frame's FrameBuilder so `on_simulate` can measure and wrap text
+     * without touching SDL_ttf or the main thread. Invalid (every measure
+     * returns 0) when no font could be loaded, and empty before
+     * init_renderer() — reading it early is not an error, it simply has no
+     * answers yet, which is why this is not a CONTRACT.
+     *
+     * Sim code reads `SimFrame::font_metrics()`; this is the main-thread
+     * spelling of the same table.
+     */
+    [[nodiscard]] const bracken::FontMetrics& font_metrics() const { return font_metrics_; }
+
     /** The particle system. Tier: sim-stage owned — the engine drives it
      *  from the sim-job tail (spawns from the builder, update, packet
      *  snapshot); hosts normally only spawn via SimFrame::frame()'s
@@ -603,6 +619,14 @@ private:
     // See set_settings_persistence(). Main-thread only; read at init_renderer
     // and shutdown_renderer.
     bool settings_persistence_ = true;
+
+    // The frame's frozen text-metrics table. Written EXACTLY ONCE, on the
+    // main thread inside init_renderer(), before any sim job has been
+    // submitted; read from pool workers thereafter by const reference through
+    // FrameBuilder. Not an atomic and not a mutex: after the freeze it is an
+    // immutable value and the sim job's submit/execute edge is the
+    // happens-before that publishes it (contracts/font_metrics.hpp).
+    bracken::FontMetrics font_metrics_;
 
     // Owned engine subsystems (opaque to subclasses)
     std::unique_ptr<render::RenderContext> context_;

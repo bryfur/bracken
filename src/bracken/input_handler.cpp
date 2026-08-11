@@ -247,9 +247,15 @@ void InputHandler::process_event(const SDL_Event& event) {
             }
         }
 
-        // Mouse wheel for zoom
+        // Mouse wheel: the cooked camera zoom AND the raw delta. Two
+        // accumulators, not one, because they answer different questions —
+        // the camera wants world units per notch (negated, times 50) and a UI
+        // scroll view wants notches. Do not "simplify" by deriving one from
+        // the other: the cook's sign and scale are camera policy.
         if (event.type == SDL_EVENT_MOUSE_WHEEL) {
             camera_zoom_delta_ -= event.wheel.y * 50.0f;
+            wheel_x_ += event.wheel.x;
+            wheel_y_ += event.wheel.y;
         }
 
         // Mouse motion for camera orbit (only when right button held)
@@ -548,6 +554,8 @@ InputSnapshot InputHandler::snapshot() {
     s.camera_yaw = camera_yaw_;
     s.camera_pitch = camera_pitch_;
     s.camera_zoom_delta = camera_zoom_delta_;
+    s.wheel_x = wheel_x_;
+    s.wheel_y = wheel_y_;
 
     s.move_forward = move_forward_;
     s.move_backward = move_backward_;

@@ -1,10 +1,14 @@
 #pragma once
 
+#include "bracken/contracts/font_metrics.hpp"
+#include "bracken/core/utf8.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <memory>
 #include <SDL3/SDL_gpu.h>
+#include <SDL3/SDL_rect.h>
 #include <SDL3/SDL_surface.h>
 #include <SDL3_ttf/SDL_ttf.h>
 #include <string_view>
@@ -24,50 +28,12 @@ namespace bracken::render {
 namespace gpu = bracken::gpu;
 
 /**
- * Decode a single UTF-8 codepoint from `text` starting at byte index `i`.
- * Advances `i` past the decoded sequence. Malformed input yields U+FFFD and
- * advances by one byte so decoding always makes progress.
+ * The engine's one UTF-8 decoder. It moved to `core/utf8.hpp` when
+ * `contracts/font_metrics.hpp` needed it — `contracts/` is a leaf layer and
+ * may not include `render/` — and is re-exported here so every existing
+ * `render::decode_utf8` call site still names the same function.
  */
-inline uint32_t decode_utf8(std::string_view text, size_t& i) {
-    const uint8_t b0 = static_cast<uint8_t>(text[i]);
-    if (b0 < 0x80) {
-        i += 1;
-        return b0;
-    }
-
-    uint32_t cp = 0;
-    size_t len = 0;
-    if ((b0 & 0xE0) == 0xC0) {
-        cp = b0 & 0x1F;
-        len = 2;
-    } else if ((b0 & 0xF0) == 0xE0) {
-        cp = b0 & 0x0F;
-        len = 3;
-    } else if ((b0 & 0xF8) == 0xF0) {
-        cp = b0 & 0x07;
-        len = 4;
-    } else {
-        // Stray continuation byte or invalid lead byte
-        i += 1;
-        return 0xFFFD;
-    }
-
-    if (len > text.size() - i) {
-        // Truncated sequence at end of string
-        i = text.size();
-        return 0xFFFD;
-    }
-    for (size_t k = 1; k < len; ++k) {
-        const uint8_t bk = static_cast<uint8_t>(text[i + k]);
-        if ((bk & 0xC0) != 0x80) {
-            i += 1;
-            return 0xFFFD;
-        }
-        cp = (cp << 6) | (bk & 0x3F);
-    }
-    i += len;
-    return cp;
-}
+using bracken::core::decode_utf8;
 
 /**
  * Left-to-right shelf packer for a fixed-size texture atlas.
@@ -158,7 +124,8 @@ public:
      * (create_pending_textures / upload_queued_text), so new strings render
      * the same frame.
      */
-    void queue_text_draw(std::string_view text, float x, float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f);
+    void queue_text_draw(std::string_view text, float x, float y, uint32_t color = 0xFFFFFFFF, float scale = 1.0f,
+                         const SDL_Rect* clip = nullptr);
 
     /**
      * Upload all queued text vertex data (and any new glyphs) to the GPU.
@@ -171,6 +138,52 @@ public:
      * Binds the atlas once and issues one draw per color change.
      */
     void draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass);
+
+    /**
+     * Runs queued since the last draw. `queue_text_draw` appends AT MOST one
+     * run per call (none when the string produced no visible glyph), which is
+     * what lets UIRenderer map a submission-ordered span of text draws onto a
+     * span of runs.
+     */
+    [[nodiscard]] std::size_t queued_run_count() const { return queued_runs_.size(); }
+
+    /**
+     * Draw runs [first_run, first_run + run_count) only, and DO NOT clear the
+     * queue — the caller is interleaving text with geometry and will come back
+     * (see UIRenderer::execute). `clear_queued_text()` retires the queue when
+     * the walk is done. `default_scissor` is restored after any clipped run so
+     * the pass's scissor state is the caller's again on return.
+     *
+     * draw_queued_text() is exactly draw_run_range(0, all) + clear.
+     */
+    void draw_run_range(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::size_t first_run,
+                        std::size_t run_count, const SDL_Rect& default_scissor);
+
+    /** Drop the queued runs/vertices without drawing them. */
+    void clear_queued_text();
+
+    /**
+     * Fill `out` from the live font: advances, kerning pairs and the vertical
+     * metrics, for [first_cp, last_cp] plus `extra`.
+     *
+     * Does NOT rasterize and does not touch the atlas or the packer — pure
+     * metric queries (TTF_GetGlyphMetrics / TTF_GetGlyphKerning /
+     * TTF_GetFontHeight). Returns false when no font is loaded, in which case
+     * `out` is left in its invalid state and every measure on it returns 0.
+     *
+     * Tier: `main-thread`. Call it ONCE, at init; `out` is frozen afterwards
+     * and read from sim jobs by const reference (see FontMetrics' publication
+     * note).
+     */
+    [[nodiscard]] bool export_metrics(bracken::FontMetrics& out, uint32_t first_cp = bracken::FontMetrics::k_first_cp,
+                                      uint32_t last_cp = bracken::FontMetrics::k_last_cp);
+
+    /**
+     * This renderer's own exported table, filled at init(). Invalid when no
+     * font loaded. It is what the pen walk consumes, so it is also the table
+     * a caller must measure against to agree with what gets drawn.
+     */
+    [[nodiscard]] const bracken::FontMetrics& metrics() const { return metrics_; }
 
     /// Rendered width in pixels of `text` at `scale` (0 when no font is loaded).
     int get_text_width(std::string_view text, float scale = 1.0f) const;
@@ -204,11 +217,16 @@ private:
         bool has_bitmap = false; // false: advance-only (e.g. space)
     };
 
-    // A contiguous range of quads in batch_vertices_ sharing one color.
+    // A contiguous range of quads in batch_vertices_ sharing one color AND
+    // one clip rectangle. The clip splits the same-color run merge for the
+    // same reason a color change does: both are pass state that has to be
+    // re-issued before the draw.
     struct TextRun {
         size_t first_vertex = 0;
         uint32_t vertex_count = 0;
         uint32_t color = 0;
+        SDL_Rect clip{};
+        bool clip_enabled = false;
     };
 
     /// Look up a glyph, rasterizing it into the CPU atlas on first use.
@@ -237,6 +255,12 @@ private:
     TTF_Font* font_ = nullptr;
     int font_size_ = 18;
     bool initialized_ = false;
+
+    // Frozen after init(). Consumed by build_string_quads (so measuring and
+    // drawing cannot disagree) and copied out to the sim stage by
+    // Application. Never mutated after init — see FontMetrics' publication
+    // note in contracts/font_metrics.hpp.
+    bracken::FontMetrics metrics_;
 
     gpu::GPUDevice* device_ = nullptr;
     gpu::PipelineRegistry* pipeline_registry_ = nullptr;
@@ -268,7 +292,19 @@ private:
     std::vector<float> batch_vertices_; // All vertex data for queued texts
     static constexpr size_t VERTICES_PER_QUAD = 6;
     static constexpr size_t FLOATS_PER_VERTEX = 4; // x, y, u, v
-    static constexpr size_t MAX_TEXT_QUADS = 4096; // one quad per visible glyph
+    /// Initial GPU vertex-buffer size, in glyph quads. NOT a cap since the
+    /// scroll-view work: the buffer GROWS in upload_queued_text the way
+    /// UIRenderer's does. It used to be a hard budget that dropped glyphs with
+    /// a throttled warning, which a 150-row scrolling list hits immediately.
+    static constexpr size_t INITIAL_TEXT_QUADS = 4096;
+    /// Absolute ceiling on one frame's CPU-side text batch. A runaway host
+    /// (a label built in a loop with no bound) would otherwise grow the vertex
+    /// vector until the process dies; this fails visibly instead.
+    static constexpr size_t MAX_TEXT_QUADS = 1u << 20;
+
+    /// Grow the GPU vertex buffer to hold the recorded batch. Returns false
+    /// when growth failed, in which case the batch is truncated to what fits.
+    bool reserve_gpu_capacity();
 };
 
 } // namespace bracken::render

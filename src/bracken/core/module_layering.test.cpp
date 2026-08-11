@@ -392,9 +392,13 @@ TEST(ModuleLayering, LowerLayersNeverIncludeUpward) {
     }
 
     const std::set<std::string> lower = {"core", "core/asset", "core/jobs", "memory", "gpu"};
-    const std::set<std::string> upper = {"render", "render/lighting", "scene",       "systems",
-                                         "effects", "dev",            "procedural", "physics",
-                                         "animation", "render_graph"};
+    // `ui` sits ABOVE scene — it emits into a FrameBuilder lane — which is
+    // also why render/ must never include it: render -> ui -> scene -> render
+    // would close a cycle, and HeaderGraphIsAcyclic would be the test that
+    // failed rather than this one.
+    const std::set<std::string> upper = {"render",    "render/lighting", "scene",      "systems",
+                                         "effects",   "dev",             "procedural", "physics",
+                                         "animation", "render_graph",    "ui"};
 
     std::vector<std::string> violations;
     for (const SourceFile& f : scan(src)) {

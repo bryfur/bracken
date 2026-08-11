@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bracken/contracts/font_metrics.hpp"
 #include "bracken/core/jobs/cache_line.hpp"
 #include "bracken/scene/frame_packet.hpp"
 
@@ -280,6 +281,12 @@ public:
         };
 
         FramePacket* packet_ = nullptr;
+        // The frame's frozen font-metrics table, or null when the builder was
+        // constructed without one (hand-built test frames, and any host that
+        // never brought a renderer up). Immutable for the process's life —
+        // see FontMetrics' publication note. Read only by
+        // UiLane::add_text_wrapped.
+        const bracken::FontMetrics* font_metrics_ = nullptr;
         // emitting_ — thread currently inside this lane's chain mutation, or
         // a default-constructed id when nobody is. Relaxed throughout: this is
         // a DETECTOR, not a publish edge; it carries no payload and pairs with
@@ -320,9 +327,26 @@ public:
                       bracken::core::Color color = bracken::core::Color::white());
 
         /**
-         * Word-wrapped text (mirror of UIScene::add_text_wrapped). Returns
-         * the total height consumed. Approximate char width: 8px * scale;
-         * line_height defaults to 18 * scale.
+         * Word-wrapped text. Returns the total height consumed.
+         *
+         * MEASURES AGAINST THE REAL FONT when the frame carries a
+         * `FontMetrics` table (it does under `Application`, which exports one
+         * at renderer init and hands it to every frame's builder). It walks
+         * the same pen — kerning before the glyph, then the advance — that
+         * `render::TextRenderer` walks when it emits the quads, so the wrap
+         * column is where the text actually ends.
+         *
+         * FALLBACK, and why it is still here: with no metrics (a hand-built
+         * test frame, a host with no renderer, a machine with no font) this
+         * keeps the historical "8 px per character" guess. That guess is what
+         * this method used to do UNCONDITIONALLY, and it is wrong for every
+         * proportional font — it over-estimates narrow text and, more visibly,
+         * under-estimates wide text, which is how a HUD strip ends up running
+         * off the right edge of the screen instead of wrapping. Treat the
+         * fallback as "no answer available", not as a mode.
+         *
+         * `line_height` defaults to the font's line height * scale (18 * scale
+         * with no metrics).
          */
         float add_text_wrapped(std::string_view text, float x, float y, float max_width, float scale = 1.0f,
                                bracken::core::Color color = bracken::core::Color::white(),
@@ -330,6 +354,37 @@ public:
 
         void add_button(float x, float y, float w, float h, std::string_view label, bracken::core::Color color,
                         bool selected = false);
+
+        /**
+         * Textured quad by HANDLE (contracts/ui_texture.hpp) — the sim stage
+         * has no way to name an `SDL_GPUTexture*`, so the host registers the
+         * texture on the main thread once and passes the id here. u0/v0..u1/v1
+         * select the sampled sub-rectangle; the defaults cover the whole
+         * texture. An id the renderer cannot resolve draws a solid `tint` quad
+         * and is counted in `FrameDiagnostics::ui_textures_unresolved`.
+         */
+        void add_textured_quad(bracken::UiTextureId texture, float x, float y, float w, float h,
+                               bracken::core::Color tint = bracken::core::Color::white(), float u0 = 0.0f,
+                               float v0 = 0.0f, float u1 = 1.0f, float v1 = 1.0f);
+
+        /**
+         * Clip every SUBSEQUENT UI command of this frame to `(x, y, w, h)` in
+         * screen pixels, until the next set_clip/clear_clip.
+         *
+         * The caller owns the stack: hand in the rectangle already intersected
+         * with any enclosing clip. The lane deliberately keeps no clip state —
+         * see UiClipCommand for why (the merge must stay order-independent).
+         * `ui::Context::begin_scroll` does the intersecting for you.
+         */
+        void set_clip(float x, float y, float w, float h);
+
+        /** Drop back to the full-screen scissor. */
+        void clear_clip();
+
+        /** The frame's font metrics, or null when the builder was not given
+         *  one. This is what a host measures text against from `on_simulate`;
+         *  `SimFrame::font_metrics()` is the usual way to reach it. */
+        [[nodiscard]] const bracken::FontMetrics* font_metrics() const;
 
     private:
         friend class Lane;
@@ -341,8 +396,15 @@ public:
      * Bind a builder to `packet` (performs Retired → Filling) with
      * `lane_count` emission lanes (1..k_max_lanes). Lane storage lives in the
      * packet arena.
+     *
+     * `font_metrics` is the frame's frozen text-metrics table (see
+     * contracts/font_metrics.hpp). `Application` passes the one it exported at
+     * renderer init; a hand-built test frame passes nothing and every
+     * metric-dependent emit falls back visibly. The pointer must outlive the
+     * builder — under `Application` it outlives the process.
      */
-    explicit FrameBuilder(FramePacket& packet, uint32_t lane_count = 1);
+    explicit FrameBuilder(FramePacket& packet, uint32_t lane_count = 1,
+                          const bracken::FontMetrics* font_metrics = nullptr);
     ~FrameBuilder() = default;
 
     FrameBuilder(const FrameBuilder&) = delete;

@@ -1000,10 +1000,33 @@ void SceneRenderer::render_ui_commands(const FramePacket& frame) {
                     // per-button-per-frame and buttons are rare.
                     ui_->draw_button(data.x, data.y, data.w, data.h, std::string(data.label), data.color,
                                      data.selected);
+                } else if constexpr (std::is_same_v<T, UiTexturedQuadCommand>) {
+                    // Resolve the handle HERE, on the main thread, where the
+                    // registry lives — the sim stage only ever named it. An id
+                    // that resolves to nothing is COUNTED and degrades to a
+                    // solid tint quad: the engine does not drop work silently,
+                    // and a flat-colored panel is far easier to diagnose than
+                    // an absent one.
+                    SDL_GPUTexture* tex = ui_->texture_for(data.texture);
+                    if (tex == nullptr && data.texture.valid()) {
+                        ++frame_diagnostics_.ui_textures_unresolved;
+                    }
+                    ui_->draw_textured_quad(tex, data.x, data.y, data.w, data.h, data.tint, data.u0, data.v0,
+                                            data.u1, data.v1);
+                } else if constexpr (std::is_same_v<T, UiClipCommand>) {
+                    if (data.enabled != 0u) {
+                        ui_->set_clip_rect(data.x, data.y, data.w, data.h);
+                    } else {
+                        ui_->clear_clip_rect();
+                    }
                 }
             },
             cmd.data);
     }
+    // A frame that pushed a clip and never popped it must not leak the
+    // scissor into the billboards (recorded after packet UI) or into the next
+    // frame's recording.
+    ui_->clear_clip_rect();
 }
 
 void SceneRenderer::draw_billboard_3d(const BillboardDrawCommand& cmd, const CameraState& camera) {

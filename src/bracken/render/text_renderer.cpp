@@ -64,12 +64,15 @@ bool TextRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeline_
     if (!font_) {
         BRACKEN_LOG_WARN("text", "Could not load any font, text rendering disabled");
         // Continue without font - not fatal
+    } else if (!export_metrics(metrics_)) {
+        BRACKEN_LOG_WARN("text", "Font loaded but metric export failed; layout will fall back to guesses");
     }
 
     // Create dynamic vertex buffer for text quads (batched)
     // Each vertex: x, y, u, v (4 floats), 6 vertices per glyph quad
-    vertex_buffer_ = gpu::GPUBuffer::create_dynamic(
-        device, gpu::GPUBuffer::Type::Vertex, MAX_TEXT_QUADS * VERTICES_PER_QUAD * FLOATS_PER_VERTEX * sizeof(float));
+    vertex_buffer_ =
+        gpu::GPUBuffer::create_dynamic(device, gpu::GPUBuffer::Type::Vertex,
+                                       INITIAL_TEXT_QUADS * VERTICES_PER_QUAD * FLOATS_PER_VERTEX * sizeof(float));
 
     if (!vertex_buffer_) {
         BRACKEN_LOG_ERROR("text", "Failed to create text vertex buffer");
@@ -147,6 +150,7 @@ void TextRenderer::shutdown() {
     packer_.reset();
     queued_runs_.clear();
     batch_vertices_.clear();
+    metrics_ = bracken::FontMetrics{};
 
     vertex_buffer_.reset();
 
@@ -340,17 +344,31 @@ size_t TextRenderer::build_string_quads(std::string_view text, float x, float y,
             continue;
         }
 
+        // The pen consumes the SAME table FontMetrics::measure_width does, so
+        // "how wide will this be" and "where did the glyphs land" cannot
+        // disagree — whatever the table covers or fails to cover, both walks
+        // are wrong in exactly the same way. (Before the mirror existed this
+        // was a live TTF_GetGlyphKerning call and the layout side was an 8 px
+        // guess.) The pre-mirror path survives only for a renderer whose
+        // export failed, which is a machine with no font at all.
         if (prev_cp != 0) {
-            int kerning = 0;
-            if (TTF_GetGlyphKerning(font_, prev_cp, cp, &kerning)) {
-                pen += kerning;
+            if (metrics_.valid()) {
+                pen += metrics_.kerning_of(prev_cp, cp);
+            } else {
+                int kerning = 0;
+                if (TTF_GetGlyphKerning(font_, prev_cp, cp, &kerning)) {
+                    pen += kerning;
+                }
             }
         }
 
         if (glyph->has_bitmap) {
             if (out.size() + VERTICES_PER_QUAD * FLOATS_PER_VERTEX > max_floats) {
+                // The ceiling, not a budget: the GPU buffer grows to fit a
+                // large frame (reserve_gpu_capacity), so reaching this means a
+                // host is emitting a million glyph quads in one frame.
                 BRACKEN_LOG_WARN_THROTTLED(5.0, "text",
-                                           "Text quad budget ({}) exhausted - dropping glyphs this frame",
+                                           "Text quad ceiling ({}) reached - dropping glyphs this frame",
                                            MAX_TEXT_QUADS);
                 break;
             }
@@ -370,7 +388,7 @@ size_t TextRenderer::build_string_quads(std::string_view text, float x, float y,
             ++quads;
         }
 
-        pen += glyph->advance;
+        pen += metrics_.valid() ? metrics_.advance_of(cp) : glyph->advance;
         prev_cp = cp;
     }
     return quads;
@@ -381,15 +399,116 @@ void TextRenderer::create_pending_textures(SDL_GPUCommandBuffer* cmd) {
     flush_atlas(cmd);
 }
 
+bool TextRenderer::export_metrics(bracken::FontMetrics& out, uint32_t first_cp, uint32_t last_cp) {
+    out = bracken::FontMetrics{};
+    if (!font_) {
+        // Not an error: a machine with no installed font runs with text
+        // disabled, and every measure on an invalid table returns 0.
+        BRACKEN_LOG_WARN("text", "export_metrics: no font loaded, layout will have no text metrics");
+        return false;
+    }
+
+    out.line_height = TTF_GetFontHeight(font_);
+    out.line_skip = TTF_GetFontLineSkip(font_);
+    out.ascent = TTF_GetFontAscent(font_);
+    out.descent = TTF_GetFontDescent(font_);
+    out.pixel_size = font_size_;
+    out.advance.fill(bracken::FontMetrics::k_absent);
+
+    const auto glyph_advance = [this](uint32_t cp, int& adv) {
+        int minx = 0;
+        int maxx = 0;
+        int miny = 0;
+        int maxy = 0;
+        return TTF_GetGlyphMetrics(font_, cp, &minx, &maxx, &miny, &maxy, &adv);
+    };
+
+    // The fallback advance is '?' when the font has it, so an unmeasurable
+    // codepoint is charged something typical rather than zero (a zero would
+    // make an unknown-script string measure as empty and overlap everything
+    // after it).
+    int question = 0;
+    out.fallback_advance = glyph_advance('?', question) ? question : out.line_height / 2;
+
+    uint32_t present = 0;
+    for (uint32_t cp = first_cp; cp <= last_cp; ++cp) {
+        int adv = 0;
+        // TTF_GetGlyphMetrics succeeds on a missing glyph by returning
+        // .notdef's box, so the HasGlyph test is what keeps `k_absent` meaning
+        // "the font does not have this" rather than "the box is empty".
+        if (!TTF_FontHasGlyph(font_, cp) || !glyph_advance(cp, adv)) {
+            continue;
+        }
+        ++present;
+        const int16_t stored = static_cast<int16_t>(adv);
+        if (cp >= bracken::FontMetrics::k_first_cp && cp <= bracken::FontMetrics::k_last_cp) {
+            out.advance[cp - bracken::FontMetrics::k_first_cp] = stored;
+        } else {
+            out.sparse_advance.emplace_back(cp, stored);
+        }
+    }
+    // Ascending by construction (the loop is ascending), but sorting makes the
+    // invariant local to the producer rather than a comment on the consumer's
+    // binary search.
+    std::sort(out.sparse_advance.begin(), out.sparse_advance.end());
+
+    // Kerning: NONZERO pairs only, over the PRINTABLE ASCII cross product.
+    //
+    // The range is deliberately narrower than the advance table's, and the
+    // reason is cost, not correctness: kerning is a CROSS PRODUCT, so the
+    // 560-codepoint dense range would be 313 600 FreeType lookups at init
+    // (order of 100 ms), against 9 025 for ASCII. Latin-1 and Latin
+    // Extended-A therefore kern as zero — a sub-pixel error per accented
+    // pair, and the trigger for widening this is a host whose UI is
+    // predominantly non-ASCII.
+    //
+    // This is not a divergence between measuring and drawing:
+    // build_string_quads consumes THIS TABLE, so whatever it covers, the
+    // measured width and the drawn string agree by construction.
+    constexpr uint32_t k_kern_first = 0x20;
+    constexpr uint32_t k_kern_last = 0x7E;
+    const uint32_t kern_lo = std::max(first_cp, k_kern_first);
+    const uint32_t kern_hi = std::min(last_cp, k_kern_last);
+    for (uint32_t a = kern_lo; a <= kern_hi; ++a) {
+        if (!out.has_advance(a)) {
+            continue;
+        }
+        for (uint32_t b = kern_lo; b <= kern_hi; ++b) {
+            if (!out.has_advance(b)) {
+                continue;
+            }
+            int k = 0;
+            if (!TTF_GetGlyphKerning(font_, a, b, &k) || k == 0) {
+                continue;
+            }
+            out.kerning.emplace_back((static_cast<uint64_t>(a) << 32) | static_cast<uint64_t>(b),
+                                     static_cast<int16_t>(k));
+        }
+    }
+    std::sort(out.kerning.begin(), out.kerning.end());
+
+    BRACKEN_LOG_DEBUG("text", "Exported font metrics: {} glyphs in [{:#x}, {:#x}], {} kerning pairs, line height {}",
+                      present, first_cp, last_cp, out.kerning.size(), out.line_height);
+    return out.valid();
+}
+
 int TextRenderer::get_text_width(std::string_view text, float scale) const {
     if (!font_ || text.empty()) {
         return 0;
     }
 
+    // ONE answer in the tree. This used to call TTF_GetStringSize, which is a
+    // measurement of the string as SDL_ttf would SHAPE it — a different
+    // quantity from the pen walk build_string_quads actually performs, and the
+    // two disagreed by a pixel or two on kerned pairs. Buttons centered their
+    // labels with the former and drew them with the latter.
+    if (metrics_.valid()) {
+        return static_cast<int>(metrics_.measure_width(text, scale));
+    }
     int w = 0;
     int h = 0;
     TTF_GetStringSize(font_, text.data(), text.size(), &w, &h);
-    return static_cast<int>(w * scale);
+    return static_cast<int>(static_cast<float>(w) * scale);
 }
 
 int TextRenderer::get_text_height(float scale) const {
@@ -399,7 +518,8 @@ int TextRenderer::get_text_height(float scale) const {
     return static_cast<int>(TTF_GetFontHeight(font_) * scale);
 }
 
-void TextRenderer::queue_text_draw(std::string_view text, float x, float y, uint32_t color, float scale) {
+void TextRenderer::queue_text_draw(std::string_view text, float x, float y, uint32_t color, float scale,
+                                   const SDL_Rect* clip) {
     if (!font_ || text.empty()) {
         return;
     }
@@ -415,7 +535,44 @@ void TextRenderer::queue_text_draw(std::string_view text, float x, float y, uint
     run.first_vertex = first_vertex;
     run.vertex_count = static_cast<uint32_t>(quads * VERTICES_PER_QUAD);
     run.color = color;
+    if (clip != nullptr) {
+        run.clip = *clip;
+        run.clip_enabled = true;
+    }
     queued_runs_.push_back(run);
+}
+
+bool TextRenderer::reserve_gpu_capacity() {
+    const size_t needed_bytes = batch_vertices_.size() * sizeof(float);
+    if (!vertex_buffer_ || needed_bytes <= vertex_buffer_->size()) {
+        return true;
+    }
+    // Geometric growth, mirroring UIRenderer::reserve_gpu_capacity: a
+    // scrolling list is a large frame every frame, and reallocating per frame
+    // would be worse than the drop this replaces.
+    const size_t new_bytes = std::max(vertex_buffer_->size() * 2, needed_bytes);
+    auto grown = gpu::GPUBuffer::create_dynamic(*device_, gpu::GPUBuffer::Type::Vertex, new_bytes);
+    if (grown) {
+        vertex_buffer_ = std::move(grown);
+        BRACKEN_LOG_INFO("text", "Grew text vertex buffer to {} bytes ({} glyph quads)", new_bytes,
+                         new_bytes / (VERTICES_PER_QUAD * FLOATS_PER_VERTEX * sizeof(float)));
+        return true;
+    }
+    const size_t capacity_floats = vertex_buffer_->size() / sizeof(float);
+    BRACKEN_LOG_WARN_THROTTLED(5.0, "text",
+                               "Failed to grow text vertex buffer to {} bytes - truncating {} floats to {}", new_bytes,
+                               batch_vertices_.size(), capacity_floats);
+    // Truncate to whole quads so a partial glyph is never drawn, then drop the
+    // runs that no longer have vertices behind them.
+    const size_t floats_per_quad = VERTICES_PER_QUAD * FLOATS_PER_VERTEX;
+    const size_t keep = (capacity_floats / floats_per_quad) * floats_per_quad;
+    batch_vertices_.resize(keep);
+    const size_t keep_vertices = keep / FLOATS_PER_VERTEX;
+    while (!queued_runs_.empty() &&
+           queued_runs_.back().first_vertex + queued_runs_.back().vertex_count > keep_vertices) {
+        queued_runs_.pop_back();
+    }
+    return false;
 }
 
 void TextRenderer::upload_queued_text(SDL_GPUCommandBuffer* cmd) {
@@ -431,22 +588,31 @@ void TextRenderer::upload_queued_text(SDL_GPUCommandBuffer* cmd) {
         return;
     }
 
+    (void)reserve_gpu_capacity();
+    if (batch_vertices_.empty()) {
+        return;
+    }
+
     // Upload all batched vertex data in one copy pass
     vertex_buffer_->update(cmd, batch_vertices_.data(), batch_vertices_.size() * sizeof(float));
 }
 
-void TextRenderer::draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass) {
-    BRACKEN_PROFILE_ZONE_COLOR("TextRenderer::draw_queued_text", 0xC0392B);
-    if (queued_runs_.empty() || !cmd || !render_pass || !pipeline_registry_ || !atlas_texture_) {
-        queued_runs_.clear();
-        batch_vertices_.clear();
+void TextRenderer::clear_queued_text() {
+    queued_runs_.clear();
+    batch_vertices_.clear();
+}
+
+void TextRenderer::draw_run_range(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass, std::size_t first_run,
+                                  std::size_t run_count, const SDL_Rect& default_scissor) {
+    BRACKEN_PROFILE_ZONE_COLOR("TextRenderer::draw_run_range", 0xC0392B);
+    if (run_count == 0 || first_run >= queued_runs_.size() || !cmd || !render_pass || !pipeline_registry_ ||
+        !atlas_texture_ || !vertex_buffer_) {
         return;
     }
+    const std::size_t last_run = std::min(queued_runs_.size(), first_run + run_count);
 
     auto* text_pipeline = pipeline_registry_->get_pipeline(gpu::PipelineType::Text);
     if (!text_pipeline) {
-        queued_runs_.clear();
-        batch_vertices_.clear();
         return;
     }
     text_pipeline->bind(render_pass);
@@ -466,19 +632,39 @@ void TextRenderer::draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass
 
     // Merge contiguous same-color runs into a single draw; push the color
     // uniform only when it changes (common case: same color for many labels).
+    // A CLIP change breaks the merge for the same reason a color change does:
+    // the scissor is pass state that must be re-issued before the draw.
     const auto push_color = [&](uint32_t color) {
         const glm::vec4 text_color = core::unpack_color(color); // engine-wide ARGB
         SDL_PushGPUFragmentUniformData(cmd, 0, &text_color, sizeof(glm::vec4));
     };
+    const auto same_clip = [](const TextRun& a, const TextRun& b) {
+        if (a.clip_enabled != b.clip_enabled) {
+            return false;
+        }
+        if (!a.clip_enabled) {
+            return true;
+        }
+        return a.clip.x == b.clip.x && a.clip.y == b.clip.y && a.clip.w == b.clip.w && a.clip.h == b.clip.h;
+    };
+    const auto set_clip = [&](const TextRun& run) {
+        SDL_Rect r = run.clip_enabled ? run.clip : default_scissor;
+        SDL_SetGPUScissor(render_pass, &r);
+    };
 
-    size_t draw_first = queued_runs_.front().first_vertex;
+    const TextRun& first = queued_runs_[first_run];
+    size_t draw_first = first.first_vertex;
     uint32_t draw_count = 0;
-    uint32_t draw_color = queued_runs_.front().color;
+    uint32_t draw_color = first.color;
+    TextRun draw_state = first;
     push_color(draw_color);
+    set_clip(first);
+    bool clipped = first.clip_enabled;
 
-    for (const auto& run : queued_runs_) {
+    for (std::size_t i = first_run; i < last_run; ++i) {
+        const TextRun& run = queued_runs_[i];
         const bool contiguous = run.first_vertex == draw_first + draw_count;
-        if (run.color == draw_color && contiguous) {
+        if (run.color == draw_color && contiguous && same_clip(run, draw_state)) {
             draw_count += run.vertex_count;
             continue;
         }
@@ -489,16 +675,31 @@ void TextRenderer::draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass
             push_color(run.color);
             draw_color = run.color;
         }
+        if (!same_clip(run, draw_state)) {
+            set_clip(run);
+            clipped = clipped || run.clip_enabled;
+        }
+        draw_state = run;
         draw_first = run.first_vertex;
         draw_count = run.vertex_count;
     }
     if (draw_count > 0) {
         SDL_DrawGPUPrimitives(render_pass, draw_count, 1, static_cast<Uint32>(draw_first), 0);
     }
+    if (clipped) {
+        // Hand the pass back with the scissor the caller set. Leaking a clip
+        // out of a text span would silently crop whatever geometry follows it.
+        SDL_Rect restore = default_scissor;
+        SDL_SetGPUScissor(render_pass, &restore);
+    }
+}
 
-    // Clear queued data for next frame
-    queued_runs_.clear();
-    batch_vertices_.clear();
+void TextRenderer::draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass) {
+    // Retained as the whole-queue convenience (and for hosts calling it
+    // directly): draw everything, then retire the queue.
+    const SDL_Rect full{0, 0, 1 << 15, 1 << 15};
+    draw_run_range(cmd, render_pass, 0, queued_runs_.size(), full);
+    clear_queued_text();
 }
 
 } // namespace bracken::render

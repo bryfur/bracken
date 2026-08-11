@@ -45,6 +45,17 @@
 #include "bracken/scene/frame_sink.hpp" // FrameSink: the host-writable half of FrameBuilder (draws, lights, UI, effects)
 #include "bracken/contracts/environment.hpp" // EnvironmentState: sun, sky gradient, hemisphere ambient, fog — all linear-space
 #include "bracken/contracts/light.hpp"  // PointLightDesc / SpotLightDesc: host light descriptors, distinct from the GPU PODs
+#include "bracken/contracts/font_metrics.hpp" // FontMetrics: the frozen glyph table sim-stage text layout measures against
+#include "bracken/contracts/ui_texture.hpp"   // UiTextureId: the packet-safe name for a UI texture (register it main-thread)
+
+// ---------------------------------------------------------------------------
+// The UI layer — immediate-mode declarations, solved and emitted from on_simulate
+// ---------------------------------------------------------------------------
+#include "bracken/ui/ui_types.hpp"   // Rect/Edges/Axis/Align/Size/BoxStyle/Style/WidgetId + id()
+#include "bracken/ui/layout.hpp"     // LayoutTree: the pure row/column/grid solver
+#include "bracken/ui/nine_slice.hpp" // build_nine_slice: the nine patches that tile a box
+#include "bracken/ui/ui_input.hpp"   // InputFrame + InputCapture: what the UI reads, and what it took
+#include "bracken/ui/ui_context.hpp" // ui::Context: containers, widgets, focus, scrolling, capture
 
 // ---------------------------------------------------------------------------
 // Assets — models, terrain heightfields
