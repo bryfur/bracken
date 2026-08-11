@@ -13,21 +13,26 @@ InputFrame InputFrame::from_snapshot(const InputSnapshot& in) {
     // backwards at fifty times the speed (see InputSnapshot::wheel_y).
     f.wheel = in.wheel_y;
 
-    f.nav_up = in.menu_up_pressed || in.was_key_just_pressed(SDL_SCANCODE_UP);
-    f.nav_down = in.menu_down_pressed || in.was_key_just_pressed(SDL_SCANCODE_DOWN);
-    f.nav_left = in.menu_left_pressed || in.was_key_just_pressed(SDL_SCANCODE_LEFT);
-    f.nav_right = in.menu_right_pressed || in.was_key_just_pressed(SDL_SCANCODE_RIGHT);
-    f.nav_activate = in.menu_select_pressed || in.text_enter_pressed ||
-                     in.was_key_just_pressed(SDL_SCANCODE_RETURN) || in.was_key_just_pressed(SDL_SCANCODE_SPACE) ||
-                     in.controller_primary;
-    f.nav_cancel =
-        in.text_escape_pressed || in.menu_toggle_pressed || in.was_key_just_pressed(SDL_SCANCODE_ESCAPE) ||
-        in.controller_secondary;
+    f.nav_up = in.menu_up_pressed || in.pad_nav_up || in.was_key_just_pressed(SDL_SCANCODE_UP);
+    f.nav_down = in.menu_down_pressed || in.pad_nav_down || in.was_key_just_pressed(SDL_SCANCODE_DOWN);
+    f.nav_left = in.menu_left_pressed || in.pad_nav_left || in.was_key_just_pressed(SDL_SCANCODE_LEFT);
+    f.nav_right = in.menu_right_pressed || in.pad_nav_right || in.was_key_just_pressed(SDL_SCANCODE_RIGHT);
+    // pad_accept_pressed, NOT controller_primary: the latter is a LEVEL, so a
+    // held A button would re-fire the focused widget on every frame.
+    f.nav_activate = in.menu_select_pressed || in.text_enter_pressed || in.pad_accept_pressed ||
+                     in.was_key_just_pressed(SDL_SCANCODE_RETURN) || in.was_key_just_pressed(SDL_SCANCODE_SPACE);
+    f.nav_cancel = in.text_escape_pressed || in.menu_toggle_pressed || in.pad_cancel_pressed ||
+                   in.was_key_just_pressed(SDL_SCANCODE_ESCAPE);
 
     const bool shift = in.key_held(SDL_SCANCODE_LSHIFT) || in.key_held(SDL_SCANCODE_RSHIFT);
     const bool tab = in.was_key_just_pressed(SDL_SCANCODE_TAB);
-    f.nav_next = tab && !shift;
-    f.nav_prev = tab && shift;
+    f.nav_next = (tab && !shift) || in.pad_next_pressed;
+    f.nav_prev = (tab && shift) || in.pad_prev_pressed;
+
+    // Text entry. A VIEW into the snapshot — see the header's lifetime note.
+    f.text = in.text_input;
+    f.backspace = in.text_backspace_pressed;
+    f.enter = in.text_enter_pressed || in.was_key_just_pressed(SDL_SCANCODE_RETURN);
     return f;
 }
 
@@ -63,6 +68,14 @@ InputSnapshot InputCapture::mask(const InputSnapshot& in) const {
         out.text_escape_pressed = false;
         out.controller_primary = false;
         out.controller_secondary = false;
+        out.pad_nav_up = false;
+        out.pad_nav_down = false;
+        out.pad_nav_left = false;
+        out.pad_nav_right = false;
+        out.pad_accept_pressed = false;
+        out.pad_cancel_pressed = false;
+        out.pad_next_pressed = false;
+        out.pad_prev_pressed = false;
         // Movement is keyboard/pad derived, so a keyboard-capturing UI must
         // stop the character walking while a menu is open. Both the raw flags
         // and the derived camera-relative axes, or a host reading `state`

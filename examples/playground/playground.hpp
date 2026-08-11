@@ -403,6 +403,12 @@ private:
     bracken::ui::InputCapture ui_capture_{};
     bool ui_menu_open_ = false;
     float ui_demo_volume_ = 1.0f;
+    /// The demo menu's radio group. The ordinals ARE `WeatherMode`'s, which is
+    /// what `ui::Context::radio` taking an `int` is for — an engine widget
+    /// cannot know a game's enums.
+    int ui_demo_weather_ = 0;
+    /// The demo menu's text field. Host-owned, like every widget's value.
+    std::string ui_demo_marker_ = "camp";
     std::vector<glm::vec3> pending_pickup_bursts_;
     bool pending_attack_arc_ = false;
 

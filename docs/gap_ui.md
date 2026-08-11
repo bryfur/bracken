@@ -123,6 +123,30 @@ Focus resolves at `end()` — it needs solved rectangles — so a navigation key
 pressed on frame N moves the focus that frame and the newly focused widget can
 be activated from frame N+1.
 
+**The gamepad path, and why it needed engine work.** `InputSnapshot` already
+carried `menu_up_pressed` and friends, and it looked like the answer. It was
+not: `InputHandler` only sets those while `set_game_input_enabled(false)`, so
+they are dead during play, and a HUD is navigable during play. It also carried
+`controller_primary`/`controller_secondary`, which are polled LEVELS — a
+focused button mapped onto them fires once per frame for as long as A is held.
+
+So the second pass added a separate, ungated, EDGE-only channel:
+`pad_nav_up/down/left/right`, `pad_accept_pressed`, `pad_cancel_pressed`,
+`pad_next_pressed`, `pad_prev_pressed`. Sources are the D-pad buttons, the
+SOUTH/EAST face buttons, the shoulder buttons, and the LEFT STICK — the stick
+latches a direction when it crosses magnitude 0.5 and re-arms only below 0.35,
+so a stick resting on the threshold cannot chatter out one edge per frame.
+`InputHandler::update_ui_pad_nav()` polls it every frame regardless of the
+game-input mode; `clear_menu_inputs()` (already called from
+`Application::pump_events`) clears the edges, so no host has to learn about it.
+
+There is deliberately **no hold-to-repeat**: one flick is one step. Repeat rate
+is a policy decision and a menu that wants one owns it.
+
+`InputCapture::mask` treats the pad edges as a keyboard-class channel — a UI
+that took the keyboard took the pad too, or a menu and the game both act on
+one press.
+
 ### 1.5 Scrolling and clipping
 
 ```cpp
@@ -293,8 +317,31 @@ scale down proportionally rather than inverting a quad. UVs come from the
 
 ### 2.6 `ui/ui_input.hpp`
 
-`InputFrame` — mouse position and edges, raw wheel, eight nav verbs.
-`InputFrame::from_snapshot` is the default mapping (arrows/menu edges/pad).
+`InputFrame` — mouse position and edges, raw wheel, eight nav verbs, and a
+text-entry channel (`text` / `backspace` / `enter`) for `text_field`. `text` is
+a **view into the snapshot**, not a copy — the same rule the rest of the frame
+path follows; `InputFrame::from_snapshot(sim.input())` is safe because that
+snapshot outlives the frame.
+
+`InputFrame::from_snapshot` is the default mapping:
+
+| Field | Sources |
+|---|---|
+| `nav_up/down/left/right` | `menu_*_pressed`, the arrow scancodes, `pad_nav_*` |
+| `nav_activate` | `menu_select_pressed`, Return, Space, `pad_accept_pressed` |
+| `nav_cancel` | Escape, `menu_toggle_pressed`, `pad_cancel_pressed` |
+| `nav_next` / `nav_prev` | Tab / Shift+Tab, `pad_next_pressed` / `pad_prev_pressed` |
+| `text` / `backspace` / `enter` | the snapshot's text-input channel |
+
+**The pad mapping uses `pad_*`, not `controller_primary`/`controller_secondary`,
+and the difference is load-bearing.** Those two are LEVELS polled from the
+trigger axes and the face buttons, so a UI driven off them re-activates the
+focused widget on every frame the button is held. They are also only ever
+meaningful to a menu while `set_game_input_enabled(false)` — i.e. while the
+host has paused the whole game — which a navigable HUD is not. The `pad_*`
+channel added in the second pass is a set of one-per-press EDGES that fire
+whatever the game-input mode.
+
 `InputCapture{mouse, keyboard, wheel}` and `mask(snapshot)` returns a copy with
 exactly the captured channels zeroed: mouse capture leaves `keys_held` alone,
 keyboard capture leaves `mouse_x`/`mouse_y` alone (a position is not an event),
@@ -308,8 +355,31 @@ Frame: `configure` / `begin(lane, input, viewport)` / declarations / `end()` /
 Containers: `begin_column` / `begin_row` / `begin_grid` / `end_box`,
 `begin_panel` / `begin_panel_sprite` / `end_panel`,
 `begin_scroll` / `end_scroll`, `push_id` / `pop_id`.
-Widgets: `label`, `label_wrapped`, `button`, `toggle`, `slider`, `image`,
-`spacer`, `rect`.
+Widgets: `label`, `label_wrapped`, `button`, `toggle`, `radio`, `slider`,
+`text_field`, `progress_bar`, `separator`, `image`, `spacer`, `rect`.
+
+Return conventions, which differ per widget deliberately:
+
+| Widget | Returns true when |
+|---|---|
+| `button` | it fired this frame (release inside, or activate while focused) |
+| `toggle` | it fired — `value` has just been flipped |
+| `radio` | the SELECTION CHANGED; re-picking the current option returns false |
+| `slider` | `value` differs from what it was on entry (drag or Left/Right) |
+| `text_field` | ENTER committed it — **not** on every keystroke |
+
+`text_field` is deliberately minimal and its limits ARE the API: append and
+backspace only, no caret movement, no selection, no clipboard, and no blink (a
+blink needs wall-clock time and `begin()` is deliberately not given any — a
+frame's UI must be a pure function of its declarations). Backspace removes a
+whole UTF-8 sequence and an over-budget typed run is refused WHOLE rather than
+truncated mid-character; both exist so a broken byte sequence can never reach
+the packet, where the next `measure_width` would charge `fallback_advance` for
+the wreckage.
+
+`progress_bar` and `separator` take no id and never enter the focus order —
+there is nothing to activate.
+
 Focus: `set_focus`, `focused`, `hot`, `active`, `focus_order`.
 Introspection: `rect_of`, `emitted_command_count`, `diagnostics`, `state`.
 
@@ -377,7 +447,32 @@ every existing call site is untouched.
 | `TextRenderer::export_metrics` | `main-thread` | called once, at renderer init |
 | `UIRenderer::register_texture` / `unregister_texture` | `main-thread` | asserted with `BRACKEN_ASSERT_MAIN_THREAD` |
 | `SceneRenderer::register_ui_texture` | main-thread | asserted with `BRACKEN_ASSERT_NOT_SIM_STAGE` |
+| `SceneRenderer::font_metrics` | main-thread | asserted with `BRACKEN_ASSERT_NOT_SIM_STAGE` — sim code reads its own frozen copy through `SimFrame` |
 | `UiLane::add_textured_quad` / `set_clip` | `sim-stage` | ordinary lane emits, `assert_filling()` contract |
+| `SimFrame::font_metrics` | `worker-safe` | returns the frozen table, or a frozen empty singleton |
+
+**The tier audit is a SOURCE SCAN, not only assertions.** A tier macro is a
+debug-only runtime check on the callee, and it only fires if some test happens
+to execute that call on a bad thread. "The UI module cannot touch the GPU" is
+a stronger claim, and `src/bracken/ui/ui_purity.test.cpp` makes it directly:
+no file under `src/bracken/ui/` may include `bracken/gpu/`, `bracken/render/`,
+`bracken/scene/scene_renderer*`, `SDL3/SDL_gpu.h`, `SDL3/SDL_render.h` or
+SDL_ttf — so the call cannot be written, for every line of the module at once.
+The same file pins the reverse edge (`render/` never includes `ui/`, which
+would close `render → ui → scene → render`) and that `contracts/font_metrics.*`
+never reaches back into the renderer that produces it.
+
+`ui_input.hpp` including `input_handler.hpp` — and through it SDL's scancode
+and event headers — is deliberately allowed. `InputSnapshot` is plain data
+whose key edges are indexed by scancode; naming a scancode is not touching a
+device.
+
+`ui::Context::begin` deliberately carries no `BRACKEN_ASSERT_SIM_STAGE`. A host
+may legitimately drive a Context from a main-thread tool as long as it owns the
+lane, and every test in the module does exactly that. What it does carry is a
+`BRACKEN_CONTRACT` on begin/end pairing — a host mistake, live in release,
+because an unbalanced pair silently discards a frame's declarations and the
+symptom (a UI that intermittently vanishes) points nowhere near the cause.
 
 **How the metrics are published, exactly.** `TextRenderer::init` exports into
 its own frozen table. `Application::init_renderer()` copies that into
@@ -413,6 +508,36 @@ labels produces exactly two ops — one geometry range, one text span — which 
 byte for byte the command stream it always produced. The extra pipeline binds
 are paid only by content that actually interleaves.
 
+#### The invariant `execute()` is built on, and how it is pinned
+
+`execute()` walks `ops_` and, for a Geometry op, draws
+`draw_ranges_[first .. first+count)`; for a Text op it maps
+`queued_text_draws_[first .. first+count)` onto the `TextRenderer` runs those
+draws produced. That is correct **only if the ops exactly partition both
+vectors, contiguously and in order**. A gap silently drops a draw, an overlap
+draws it twice, and a non-monotone `first` reorders the frame — precisely the
+class of bug the two-phase form used to have, and none of it is visible from
+eyeballing the op list.
+
+`UIRendererOps.OpsExactlyPartitionRangesAndTextDraws` asserts the partition
+directly, over a recording containing every transition that can open an op or a
+range: geometry/text alternation, a texture switch, a clip change, and a clip
+change that happens to be a no-op. Four more tests pin the individual rules —
+a later geometry lands in a later range, an empty string opens no op (an op with
+`count == 0` would bind a pipeline for nothing and break the guard), a clip
+change splits a RANGE and not an OP (a clip is scissor state, not pipeline
+state), and `draw_button`'s own internal interleaving does not break it.
+
+The emitting half is pinned separately, in
+`UiContext.APanelDeclaredAfterALabelIsEmittedAfterIt` — the packet order that
+the renderer walk then honours. The two together are the whole claim.
+
+The parts of the walk that a headless test **cannot** reach are the GPU state
+transitions: that `bind_ui_state()` re-pushes the screen uniform and re-binds
+the vertex buffer after a text span has stolen the pipeline, and that
+`draw_run_range` hands the scissor back unchanged so a clip cannot leak out of
+a text span. Those were verified by reading, not by running. See the report.
+
 ### 3.5 Clipping
 
 `DrawRange` and `TextRun` each carry a clip rectangle. `range_for` opens a new
@@ -437,7 +562,7 @@ arena. No new lifetime exception is added to the frame packet.
 
 **Module table** — new row after `dev/`:
 
-> | `ui/` | `bracken::ui` | The immediate-mode UI layer, run entirely in the SIM STAGE: `LayoutTree` (row/column/grid solver, no drift), `ui::Context` (widget identity, hot/active/focus, keyboard+gamepad navigation, scrolling with real clipping, input capture), `widgets.cpp` (button/toggle/slider/label/panel/scroll view), plus `nine_slice.hpp` and `ui_input.hpp`. Touches no GPU and no SDL — it measures text through `contracts/font_metrics.hpp` and emits through `scene::FrameBuilder::UiLane`. Sits ABOVE `scene/`, so `render/` must never include it. See `docs/gap_ui.md` |
+> | `ui/` | `bracken::ui` | The immediate-mode UI layer, run entirely in the SIM STAGE: `LayoutTree` (row/column/grid solver, no drift), `ui::Context` (widget identity, hot/active/focus, keyboard AND gamepad navigation, scrolling with real clipping and scroll-into-view, input capture), `widgets.cpp` (label/wrapped label/button/toggle/radio/slider/text field/progress bar/separator/image/panel/scroll view), plus `nine_slice.hpp` and `ui_input.hpp`. Touches no GPU and no SDL — it measures text through `contracts/font_metrics.hpp` and emits through `scene::FrameBuilder::UiLane`, and `ui/ui_purity.test.cpp` proves it by scanning the module's includes rather than trusting a runtime assert. Sits ABOVE `scene/`, so `render/` must never include it. `src/bracken/ui/README.md` is the module's contract page; `docs/gap_ui.md` is the full write-up |
 
 **`contracts/` row** — append to the list of pure-data types:
 
@@ -494,4 +619,52 @@ explicit fixed row heights that reproduce the previous y offsets 20/44/64/84/
 104/124 exactly, and a transparent panel border (not drawn). The one intended
 visual change is the bottom keybind strip, which now WRAPS to a second line
 instead of running off the right edge. **The RT-off rows were not re-measured —
-see the report's honesty section.**
+no build tree exists in this worktree by design.**
+
+The expected size of that change, worked out from the actual font rather than
+guessed, so the integrator knows what "unchanged" should look like:
+
+* At 1600×900 the strip's box is `screen_width - 20 = 1580` px and the string
+  is 228 characters. Against DejaVuSans at 18 px, scale 0.9, its pen width is
+  **1832 px**.
+* The OLD 8-px-per-character guess allowed `1580 / (8 * 0.9) = 219` characters
+  per line, so the string did **not** wrap — it drew as one 1832 px line
+  starting at x = 10, i.e. the last ~135 px ran past the 1600 px swapchain and
+  were never rasterized.
+* The NEW wrap breaks at 1580 px. Line 1 is therefore very nearly the same
+  pixels as before (the part that overflowed was already invisible); line 2 is
+  **new** — roughly 250 × 21 px of box at the bottom of the frame.
+* Glyph coverage inside a text line is ~20%, and the delta per lit pixel is
+  ~120/255, so the expected `mean_luma` shift is
+  `250 * 21 * 0.2 * 120 / (1600 * 900) ≈ 0.09` — under the tenth the pins are
+  quoted to. `86.3 / 45.6` should therefore still read `86.3 / 45.6`.
+
+If it does move, the one-line revert that restores the previous rendering
+exactly is to draw the strip with `UiLane::add_text` (one line, clipped at the
+screen edge) instead of `add_text_wrapped`. Do not "fix" it by restoring the
+8 px guess: that guess is the bug, and it is engine-wide.
+
+**Second pass, additionally:**
+
+* The widget set is complete: `radio`, `text_field`, `progress_bar` and
+  `separator` joined `label`/`label_wrapped`/`button`/`toggle`/`slider`/
+  `image`/`spacer`/`rect`, and the playground's F9 demo menu declares every one
+  of them. Nothing in that menu is declared during a smoke run.
+* `InputSnapshot` gained the ungated gamepad EDGE channel (`pad_nav_*`,
+  `pad_accept_pressed`, `pad_cancel_pressed`, `pad_next_pressed`,
+  `pad_prev_pressed`) and `InputFrame::from_snapshot` maps it. It **no longer
+  maps `controller_primary`/`controller_secondary`**, which are levels — a
+  gotcha worth carrying into CLAUDE.md:
+
+> - **Do not map a menu onto `InputSnapshot::controller_primary`.** It and
+>   `controller_secondary` are polled LEVELS (trigger axes plus face buttons),
+>   so anything treating them as "the player pressed A" fires once per frame for
+>   as long as the button is held. The `pad_*_pressed` fields beside them are
+>   one-per-press edges, and unlike `menu_*_pressed` they are not gated on
+>   `set_game_input_enabled(false)` — which is what makes a HUD navigable while
+>   the game is running.
+
+* Scroll-into-view now runs for **every enclosing** scroll container, not only
+  the innermost: the search asks `LayoutTree::is_descendant_of` rather than
+  matching a cached parent index. Without it, tabbing into a nested list
+  scrolled the inner window while the outer one still had it off screen.

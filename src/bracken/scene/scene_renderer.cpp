@@ -122,6 +122,13 @@ void SceneRenderer::unregister_ui_texture(bracken::UiTextureId id) {
 }
 
 const bracken::FontMetrics& SceneRenderer::font_metrics() const {
+    // Tier: not sim-stage. This reaches into the LIVE renderer for a table the
+    // sim stage is supposed to read from its own frozen copy
+    // (`SimFrame::font_metrics()`) — which is the entire reason
+    // Application::init_renderer() freezes one. Asserting here is what stops a
+    // host "just asking the renderer" from on_simulate and getting away with
+    // it right up until the renderer is torn down mid-frame.
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     // A single frozen empty table, so a host that asks before init() gets a
     // valid()==false answer rather than a null reference.
     static const bracken::FontMetrics k_empty{};

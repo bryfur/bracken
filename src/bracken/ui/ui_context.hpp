@@ -8,6 +8,7 @@
 #include "bracken/ui/ui_input.hpp"
 #include "bracken/ui/ui_types.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -231,6 +232,43 @@ public:
      *  has focus. */
     [[nodiscard]] bool slider(WidgetId id, float& value, float min, float max, Size width = Size::flex(1.0f));
 
+    /**
+     * One of a set of mutually exclusive options. `value` is the group's
+     * selection and `option` is this button's ordinal; clicking or activating
+     * writes `option` into `value`. Returns true on the frame the selection
+     * CHANGED, so a caller can react without diffing.
+     *
+     * Every member of a group needs its own stable `id` — a radio is an
+     * ordinary focusable widget, not a container.
+     */
+    [[nodiscard]] bool radio(WidgetId id, std::string_view label, int& value, int option,
+                             Size width = Size::content());
+
+    /**
+     * A single-line editable field. Returns true on the frame ENTER committed
+     * it (not on every keystroke — a field that reported per-character would
+     * make "save on commit" impossible to write).
+     *
+     * DELIBERATELY MINIMAL, and the limits are the API: append and backspace
+     * only. There is no caret movement, no selection, no clipboard and no
+     * blink (a blink needs wall-clock time, which `begin()` is not given). The
+     * caret is drawn at the end of the text whenever the field has focus.
+     * `max_length` is in BYTES and is enforced on the UTF-8 sequence boundary,
+     * so a multi-byte character is either fully accepted or not accepted.
+     */
+    [[nodiscard]] bool text_field(WidgetId id, std::string& value, std::size_t max_length = 256,
+                                  Size width = Size::flex(1.0f));
+
+    /**
+     * A non-interactive fill bar. `t` is clamped to [0, 1]; it takes no id and
+     * never takes focus, because there is nothing to activate.
+     */
+    void progress_bar(float t, Size width = Size::flex(1.0f), float height = 0.0f);
+
+    /** A one-line rule across the container's cross axis, with `pad` pixels of
+     *  clearance above and below. Purely decorative. */
+    void separator(float pad = 4.0f);
+
     void image(UiTextureId texture, glm::vec2 size, core::Color tint = core::Color::white());
     void spacer(float pixels);
     void rect(glm::vec2 size, core::Color color);
@@ -284,10 +322,14 @@ private:
         uint32_t clip_slot = 0;
     };
 
+    /// A focusable widget of this frame, in declaration order — the tab order,
+    /// and the candidate set directional navigation searches. No enclosing-
+    /// scroll index is cached: scroll-into-view asks the tree whether the node
+    /// is a DESCENDANT of the container, which is what makes every enclosing
+    /// container scroll rather than only the innermost.
     struct FocusEntry {
         WidgetId id{};
         uint32_t node = LayoutTree::k_invalid;
-        uint32_t scroll_index = 0xFFFFFFFFu; // enclosing scroll container, if any
     };
 
     struct ScrollNode {

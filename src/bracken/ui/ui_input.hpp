@@ -3,6 +3,7 @@
 #include "bracken/input_handler.hpp" // InputSnapshot
 
 #include <glm/glm.hpp>
+#include <string_view>
 
 namespace bracken::ui {
 
@@ -35,16 +36,39 @@ struct InputFrame {
     bool nav_prev = false; // tab order backward
 
     /**
+     * Characters typed since the previous snapshot, for `Context::text_field`.
+     *
+     * LIFETIME: a VIEW into the `InputSnapshot` `from_snapshot` was built from,
+     * not a copy — the same rule every other view in the frame path follows.
+     * The snapshot `Application` hands the sim job outlives the frame, so the
+     * normal call `InputFrame::from_snapshot(sim.input())` is safe; building
+     * one from a temporary snapshot and using it after that temporary dies is
+     * not. A host filling the struct by hand owns the lifetime itself.
+     */
+    std::string_view text;
+    bool backspace = false;
+    bool enter = false;
+
+    /**
      * The default mapping.
      *
      *   mouse/wheel  -> straight through (wheel_y, NOT camera_zoom_delta,
      *                   which is already cooked for the camera)
      *   nav_up/down/ -> menu_{up,down,left,right}_pressed OR the arrow
-     *   left/right      scancodes
+     *   left/right      scancodes OR the pad's D-pad/left-stick EDGES
      *   nav_activate -> menu_select_pressed OR Return OR Space OR the pad's
-     *                   primary
-     *   nav_cancel   -> Escape OR menu_toggle_pressed OR the pad's secondary
-     *   nav_next/prev-> Tab, Shift+Tab
+     *                   SOUTH edge
+     *   nav_cancel   -> Escape OR menu_toggle_pressed OR the pad's EAST edge
+     *   nav_next/prev-> Tab, Shift+Tab, or the pad's shoulder buttons
+     *   text/backspace/enter -> the snapshot's text-input channel
+     *
+     * THE PAD MAPPING USES `pad_*`, NOT `controller_primary/secondary`, and
+     * the difference is not cosmetic: those two are LEVELS polled from the
+     * face buttons and triggers, so a focused button driven off them fires
+     * once per frame for as long as A is held. They are also only ever
+     * meaningful to a menu while `set_game_input_enabled(false)`. The `pad_*`
+     * edges are one-per-press and ungated, which is what a navigable HUD
+     * needs. See InputSnapshot's pad_* block.
      */
     [[nodiscard]] static InputFrame from_snapshot(const InputSnapshot& in);
 };

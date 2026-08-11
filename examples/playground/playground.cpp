@@ -3045,10 +3045,16 @@ void PlaygroundGame::build_ui(const SimFrame& sim, scene::FrameSink& fb) {
                              static_cast<float>(sim.screen_width()) - 20.0f, 0.9f, 0xFFC8D0DC);
 }
 
-// The worked example for the widget vocabulary: a menu built from panel +
-// column + label + button + toggle + slider + scroll view, navigable by
-// keyboard and gamepad. Never declared during a smoke run, so it cannot move
-// the pinned screenshot baselines.
+// The worked example for the widget vocabulary: EVERY shipped widget, in one
+// panel, navigable by keyboard and by gamepad. Never declared during a smoke
+// run, so it cannot move the pinned screenshot baselines — which is also why
+// it can afford to be exhaustive rather than tasteful.
+//
+// The pad path is the one worth calling out: the D-pad and the left stick move
+// the focus, A activates, B closes, and the shoulder buttons walk the tab
+// order — all of it while the game is still running, because those channels
+// (`InputSnapshot::pad_nav_up` and friends) are edges that are NOT gated on
+// set_game_input_enabled(false) the way `menu_*_pressed` is.
 void PlaygroundGame::build_demo_menu(const SimFrame& sim) {
     ui::BoxStyle place{};
     place.padding = ui::Edges{static_cast<float>(sim.screen_width()) * 0.5f - 170.0f, 120.0f, 0.0f, 0.0f};
@@ -3070,6 +3076,38 @@ void PlaygroundGame::build_demo_menu(const SimFrame& sim) {
     ui_.label("Master volume", 0xFF8894A0, 0.9f);
     if (ui_.slider(ui::id("demo.volume"), ui_demo_volume_, 0.0f, 1.0f, ui::Size::flex(1.0f))) {
         audio().set_master_gain(ui_demo_volume_);
+    }
+    // The same value again as a read-only bar, so the two are visibly one
+    // number — a progress bar is not focusable and takes no id.
+    ui_.progress_bar(ui_demo_volume_, ui::Size::flex(1.0f));
+
+    ui_.separator();
+
+    // A radio group: one selection across four widgets, each with its own id.
+    // The ordinals ARE the WeatherMode enumerators, which is the whole reason
+    // radio takes an int rather than owning an enum it cannot know about.
+    ui_.label("Weather", 0xFF8894A0, 0.9f);
+    ui::BoxStyle row{};
+    row.spacing = 6.0f;
+    ui_.begin_row(row);
+    bool weather_changed = ui_.radio(ui::id("demo.wx.auto"), "Auto", ui_demo_weather_, 0);
+    weather_changed = ui_.radio(ui::id("demo.wx.clear"), "Clear", ui_demo_weather_, 1) || weather_changed;
+    weather_changed = ui_.radio(ui::id("demo.wx.cloud"), "Cloud", ui_demo_weather_, 2) || weather_changed;
+    weather_changed = ui_.radio(ui::id("demo.wx.rain"), "Rain", ui_demo_weather_, 3) || weather_changed;
+    ui_.end_box();
+    if (weather_changed) {
+        day_weather_.mode = static_cast<WeatherMode>(std::clamp(ui_demo_weather_, 0, 3));
+    }
+
+    ui_.separator();
+
+    // A text field. It commits on ENTER, and while it has focus the Context
+    // reports keyboard capture, so handle_input's masked snapshot keeps the
+    // character from walking off while the player types.
+    ui_.label("Marker name (Enter to place)", 0xFF8894A0, 0.9f);
+    if (ui_.text_field(ui::id("demo.marker"), ui_demo_marker_, 24, ui::Size::flex(1.0f))) {
+        BRACKEN_LOG_INFO("playground", "UI demo: marker '{}' placed at {:.0f}, {:.0f}", ui_demo_marker_,
+                         player_pos_.x, player_pos_.z);
     }
 
     // A scrolling list, to exercise the clip command and the wheel.

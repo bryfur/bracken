@@ -14,6 +14,8 @@
 #include "bracken/ui/ui_context.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <string>
 
 namespace bracken::ui {
 
@@ -91,7 +93,7 @@ bool Context::button(WidgetId local, std::string_view text, Size width, Size hei
 
     const uint32_t node = tree_.leaf(width, height, content);
     record_rect(id, node);
-    focus_order_.push_back({id, node, scroll_stack_.empty() ? 0xFFFFFFFFu : scroll_stack_.back()});
+    focus_order_.push_back({id, node});
 
     DeferredDraw bg{};
     bg.kind = DeferredDraw::Kind::FilledRect;
@@ -138,7 +140,7 @@ bool Context::toggle(WidgetId local, std::string_view text, bool& value, Size wi
 
     const uint32_t node = tree_.leaf(width, Size::content(), content);
     record_rect(id, node);
-    focus_order_.push_back({id, node, scroll_stack_.empty() ? 0xFFFFFFFFu : scroll_stack_.back()});
+    focus_order_.push_back({id, node});
 
     DeferredDraw bg{};
     bg.kind = DeferredDraw::Kind::FilledRect;
@@ -217,7 +219,7 @@ bool Context::slider(WidgetId local, float& value, float min, float max, Size wi
     const float h = style_.control_height * cfg_.ui_scale;
     const uint32_t node = tree_.leaf(width, Size::px(h), {120.0f * cfg_.ui_scale, h});
     record_rect(id, node);
-    focus_order_.push_back({id, node, scroll_stack_.empty() ? 0xFFFFFFFFu : scroll_stack_.back()});
+    focus_order_.push_back({id, node});
 
     DeferredDraw track{};
     track.kind = DeferredDraw::Kind::FilledRect;
@@ -253,6 +255,195 @@ bool Context::slider(WidgetId local, float& value, float min, float max, Size wi
     }
 
     return value != before;
+}
+
+bool Context::radio(WidgetId local, std::string_view text, int& value, int option, Size width) {
+    const WidgetId id = scoped(local);
+    bool hovered = false;
+    bool held = false;
+    const bool fired = interact(id, hovered, held);
+    const bool changed = fired && value != option;
+    if (fired) {
+        value = option;
+    }
+    const bool on = value == option;
+
+    const float s = resolved_scale(0.0f);
+    const float tw = measure_text(text, 0.0f);
+    const float th = line_height(0.0f);
+    const float dot = std::max(th, 12.0f * cfg_.ui_scale);
+    const Edges pad{style_.control_padding.l * cfg_.ui_scale, style_.control_padding.t * cfg_.ui_scale,
+                    style_.control_padding.r * cfg_.ui_scale, style_.control_padding.b * cfg_.ui_scale};
+    const glm::vec2 content{dot + 6.0f * cfg_.ui_scale + tw + pad.horizontal(),
+                            std::max(th + pad.vertical(), style_.control_height * cfg_.ui_scale)};
+
+    const uint32_t node = tree_.leaf(width, Size::content(), content);
+    record_rect(id, node);
+    focus_order_.push_back({id, node});
+
+    DeferredDraw bg{};
+    bg.kind = DeferredDraw::Kind::FilledRect;
+    bg.node = node;
+    bg.color = hovered || held ? style_.control_bg_hot : style_.control_bg;
+    draws_.push_back(bg);
+
+    // The marker: the same inset square the toggle uses, but drawn only when
+    // this option is the selected one. A radio's OFF state is an empty well —
+    // drawing a grey square would read as a disabled toggle.
+    DeferredDraw well{};
+    well.kind = DeferredDraw::Kind::FilledRect;
+    well.node = node;
+    well.frac = {0.0f, 0.5f, 0.0f, 0.0f};
+    well.pad = {pad.l, -dot * 0.5f, dot, dot};
+    well.color = style_.toggle_off;
+    draws_.push_back(well);
+    if (on) {
+        const float inset = dot * 0.25f;
+        DeferredDraw mark{};
+        mark.kind = DeferredDraw::Kind::FilledRect;
+        mark.node = node;
+        mark.frac = {0.0f, 0.5f, 0.0f, 0.0f};
+        mark.pad = {pad.l + inset, -dot * 0.5f + inset, dot - inset * 2.0f, dot - inset * 2.0f};
+        mark.color = style_.toggle_on;
+        draws_.push_back(mark);
+    }
+
+    DeferredDraw border{};
+    border.kind = DeferredDraw::Kind::RectOutline;
+    border.node = node;
+    border.color = state_.focused == id ? style_.focus_border : style_.control_border;
+    border.scale = style_.border_width * cfg_.ui_scale;
+    draws_.push_back(border);
+
+    DeferredDraw lbl{};
+    lbl.kind = DeferredDraw::Kind::Text;
+    lbl.node = node;
+    lbl.frac = {0.0f, 0.5f, 0.0f, 0.0f};
+    lbl.pad = {pad.l + dot + 6.0f * cfg_.ui_scale, -th * 0.5f, 0.0f, 0.0f};
+    lbl.color = style_.text;
+    lbl.scale = s;
+    lbl.text_offset = store_text(text);
+    lbl.text_length = static_cast<uint32_t>(text.size());
+    draws_.push_back(lbl);
+
+    return changed;
+}
+
+bool Context::text_field(WidgetId local, std::string& value, std::size_t max_length, Size width) {
+    const WidgetId id = scoped(local);
+    bool hovered = false;
+    bool held = false;
+    (void)interact(id, hovered, held); // click-to-focus; the fire itself is not a commit
+
+    bool committed = false;
+    if (state_.focused == id) {
+        if (input_.backspace && !value.empty()) {
+            // Back off a whole UTF-8 sequence, never a continuation byte —
+            // deleting one byte of a 3-byte character leaves the string
+            // undecodable and the next measure charges the fallback advance
+            // for the wreckage.
+            std::size_t n = value.size() - 1;
+            while (n > 0 && (static_cast<unsigned char>(value[n]) & 0xC0u) == 0x80u) {
+                --n;
+            }
+            value.resize(n);
+        }
+        if (!input_.text.empty() && value.size() + input_.text.size() <= max_length) {
+            // All-or-nothing on the whole typed run: the run is already a
+            // sequence of complete characters, and truncating it to fit would
+            // be the byte-splitting bug backspace goes out of its way to avoid.
+            value.append(input_.text);
+        }
+        committed = input_.enter;
+    }
+
+    const float s = resolved_scale(0.0f);
+    const float tw = measure_text(value, 0.0f);
+    const float th = line_height(0.0f);
+    const Edges pad{style_.control_padding.l * cfg_.ui_scale, style_.control_padding.t * cfg_.ui_scale,
+                    style_.control_padding.r * cfg_.ui_scale, style_.control_padding.b * cfg_.ui_scale};
+    const glm::vec2 content{std::max(tw + pad.horizontal(), 120.0f * cfg_.ui_scale),
+                            std::max(th + pad.vertical(), style_.control_height * cfg_.ui_scale)};
+
+    const uint32_t node = tree_.leaf(width, Size::content(), content);
+    record_rect(id, node);
+    focus_order_.push_back({id, node});
+
+    DeferredDraw bg{};
+    bg.kind = DeferredDraw::Kind::FilledRect;
+    bg.node = node;
+    bg.color = style_.field_bg;
+    draws_.push_back(bg);
+
+    DeferredDraw border{};
+    border.kind = DeferredDraw::Kind::RectOutline;
+    border.node = node;
+    border.color = state_.focused == id ? style_.focus_border : style_.control_border;
+    border.scale = style_.border_width * cfg_.ui_scale;
+    draws_.push_back(border);
+
+    DeferredDraw txt{};
+    txt.kind = DeferredDraw::Kind::Text;
+    txt.node = node;
+    txt.frac = {0.0f, 0.5f, 0.0f, 0.0f};
+    txt.pad = {pad.l, -th * 0.5f, 0.0f, 0.0f};
+    txt.color = style_.text;
+    txt.scale = s;
+    txt.text_offset = store_text(value);
+    txt.text_length = static_cast<uint32_t>(value.size());
+    draws_.push_back(txt);
+
+    if (state_.focused == id) {
+        // Solid, not blinking: a blink needs wall-clock time and begin() is
+        // deliberately not given any (a frame's UI must be a pure function of
+        // its declarations). Documented on the method.
+        DeferredDraw car{};
+        car.kind = DeferredDraw::Kind::FilledRect;
+        car.node = node;
+        car.frac = {0.0f, 0.5f, 0.0f, 0.0f};
+        car.pad = {pad.l + tw, -th * 0.5f, std::max(1.0f, cfg_.ui_scale), th};
+        car.color = style_.caret;
+        draws_.push_back(car);
+    }
+
+    return committed;
+}
+
+void Context::progress_bar(float t, Size width, float height) {
+    const float clamped = std::clamp(t, 0.0f, 1.0f);
+    const float h = height > 0.0f ? height * cfg_.ui_scale : 8.0f * cfg_.ui_scale;
+    const uint32_t node = tree_.leaf(width, Size::px(h), {120.0f * cfg_.ui_scale, h});
+
+    DeferredDraw track{};
+    track.kind = DeferredDraw::Kind::FilledRect;
+    track.node = node;
+    track.color = style_.slider_track;
+    draws_.push_back(track);
+
+    if (clamped > 0.0f) {
+        DeferredDraw fill{};
+        fill.kind = DeferredDraw::Kind::FilledRect;
+        fill.node = node;
+        fill.frac = {0.0f, 0.0f, clamped, 1.0f};
+        fill.color = style_.progress_fill;
+        draws_.push_back(fill);
+    }
+}
+
+void Context::separator(float pad) {
+    const float p = pad * cfg_.ui_scale;
+    const float thickness = std::max(1.0f, cfg_.ui_scale);
+    // A flex-width leaf so it spans whatever the container gives it, with the
+    // rule drawn as a thin band centred in a taller leaf — the clearance is
+    // part of the widget rather than something the caller has to add.
+    const uint32_t node = tree_.leaf(Size::flex(1.0f), Size::px(thickness + p * 2.0f), {0.0f, thickness + p * 2.0f});
+    DeferredDraw d{};
+    d.kind = DeferredDraw::Kind::FilledRect;
+    d.node = node;
+    d.frac = {0.0f, 0.5f, 1.0f, 0.0f};
+    d.pad = {0.0f, -thickness * 0.5f, 0.0f, thickness};
+    d.color = style_.separator;
+    draws_.push_back(d);
 }
 
 void Context::image(UiTextureId texture, glm::vec2 size, core::Color tint) {

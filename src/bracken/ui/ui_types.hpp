@@ -145,6 +145,13 @@ struct Style {
     core::Color slider_fill{0xFF5A8CC0};
     core::Color toggle_on{0xFF5AC08C};
     core::Color toggle_off{0xFF404850};
+    /// Filled portion of a progress bar (the empty portion uses slider_track).
+    core::Color progress_fill{0xFF5AC08C};
+    /// Background of an editable text field, and its caret.
+    core::Color field_bg{0xFF14181C};
+    core::Color caret{0xFFE8ECF0};
+    /// A `separator()` rule.
+    core::Color separator{0xFF303840};
 
     float border_width = 2.0f;
     /// Padding inside a button/toggle/slider, before its label.

@@ -1,4 +1,5 @@
 #include "bracken/render/text_renderer.hpp"
+#include "bracken/core/assert.hpp"
 #include "bracken/core/color.hpp"
 #include "bracken/gpu/gpu_buffer.hpp"
 #include "bracken/gpu/gpu_device.hpp"
@@ -400,6 +401,12 @@ void TextRenderer::create_pending_textures(SDL_GPUCommandBuffer* cmd) {
 }
 
 bool TextRenderer::export_metrics(bracken::FontMetrics& out, uint32_t first_cp, uint32_t last_cp) {
+    // Tier: `main-thread`. Every query below goes into SDL_ttf against the
+    // live TTF_Font*, which is the exact thing the sim stage may not do —
+    // and the whole reason this function exists is to produce a table that
+    // CAN cross into it. Asserting here is what keeps a well-meaning caller
+    // from "refreshing the metrics" out of a sim job.
+    BRACKEN_ASSERT_MAIN_THREAD();
     out = bracken::FontMetrics{};
     if (!font_) {
         // Not an error: a machine with no installed font runs with text

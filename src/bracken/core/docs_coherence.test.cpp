@@ -71,6 +71,7 @@ const char* const DOCS[] = {
     "docs/skinned_mesh_format.md",
     "src/bracken/shaders/README.md",
     "src/bracken/contracts/README.md",
+    "src/bracken/ui/README.md",
 };
 
 // Prefixes a citation may be resolved against, in order.

@@ -28,10 +28,19 @@ void Context::configure(const ContextConfig& cfg) {
 }
 
 void Context::begin(scene::FrameBuilder::UiLane lane, const InputFrame& input, const Rect& viewport) {
-    // The UI describes a frame, so it belongs to the sim stage exactly like
-    // every other emit. Asserting it here rather than only at the lane makes
-    // the mistake point at the UI call instead of at frame_builder.cpp.
-    BRACKEN_ASSERT(!in_frame_, "ui::Context::begin called twice without an end()");
+    // A HOST mistake, so a CONTRACT (live in release) rather than an assert:
+    // an unbalanced begin/end silently discards a frame's declarations and the
+    // symptom — a UI that intermittently vanishes — points nowhere near here.
+    BRACKEN_CONTRACT(!in_frame_, "ui::Context::begin called twice without an end()");
+    // TIER. There is deliberately NO stage assertion on this path. The Context
+    // touches nothing tier-bound: it reaches SDL and the GPU through exactly
+    // nothing (pinned by ui/ui_purity.test.cpp, which scans the module's
+    // includes), and its one engine dependency — the UiLane it emits into —
+    // carries its own release-mode contracts (assert_filling, and EmitGuard's
+    // two-threads-in-one-lane abort). Asserting Stage::Sim here would be a lie
+    // in the other direction: a host is free to drive a Context from a
+    // main-thread tool as long as it owns the lane, and every test in this
+    // module does exactly that.
     lane_.emplace(lane);
     input_ = input;
     viewport_ = viewport;
@@ -58,10 +67,7 @@ void Context::begin(scene::FrameBuilder::UiLane lane, const InputFrame& input, c
 }
 
 void Context::end() {
-    BRACKEN_ASSERT(in_frame_, "ui::Context::end called without a begin()");
-    if (!in_frame_) {
-        return;
-    }
+    BRACKEN_CONTRACT(in_frame_, "ui::Context::end called without a begin()");
 
     tree_.solve(viewport_);
     // Focus BEFORE scrolling: directional navigation compares solved rect
@@ -415,11 +421,20 @@ void Context::resolve_scrolling() {
             capture_.mouse = true;
         }
 
-        // Scroll the focused widget into view. Done BEFORE the translation so
-        // the comparison is against untranslated rects.
+        // Scroll the focused widget into view. Done BEFORE this container's
+        // translation so the comparison is against its own untranslated
+        // children — and note the ANCESTOR test rather than an exact
+        // `fe.scroll_index == i`: a widget inside a nested scroll view has to
+        // be brought into view by every container that encloses it, not only
+        // the innermost, or tabbing into a nested list scrolls the inner
+        // window while the outer one still has it off screen. Outer containers
+        // are declared first and are therefore processed first, so by the time
+        // an inner one runs its viewport already reflects the outer scroll;
+        // the offsets it computes are relative and translation-invariant.
         if (state_.focused.valid()) {
             for (const FocusEntry& fe : focus_order_) {
-                if (fe.id != state_.focused || fe.scroll_index != i) {
+                if (fe.id != state_.focused || fe.node == LayoutTree::k_invalid ||
+                    !tree_.is_descendant_of(fe.node, sn.node)) {
                     continue;
                 }
                 const Rect r = tree_.rect_of(fe.node);

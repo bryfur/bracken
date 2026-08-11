@@ -111,6 +111,31 @@ TEST(UiContext, PanelBackgroundIsEmittedBeforeItsChildren) {
     EXPECT_TRUE(cmds[2].is<scene::UiTextCommand>());
 }
 
+TEST(UiContext, APanelDeclaredAfterALabelIsEmittedAfterIt) {
+    // The other half of the z-order contract, and the half that was
+    // STRUCTURALLY IMPOSSIBLE before B3: a panel declared after a label must
+    // reach the packet after it, so the renderer's submission-order walk
+    // paints it OVER the label. The old UI pass drew every primitive and then
+    // every queued text, so this ordering could be emitted and then ignored —
+    // which is why this pairs with
+    // UIRendererOps.GeometryRecordedAfterTextLandsInALaterRange, the consuming
+    // half of the same claim.
+    Harness h;
+    const auto frame = h.run(InputFrame{}, [](Context& ui) {
+        ui.label("underneath");
+        ui.begin_panel({});
+        ui.label("on top");
+        ui.end_panel();
+    });
+
+    const std::span<const scene::UiCommand> cmds = frame->ui_commands();
+    ASSERT_GE(cmds.size(), 4u);
+    EXPECT_TRUE(cmds[0].is<scene::UiTextCommand>());        // the label
+    EXPECT_TRUE(cmds[1].is<scene::UiFilledRectCommand>());  // the panel fill, ON TOP of it
+    EXPECT_TRUE(cmds[2].is<scene::UiRectOutlineCommand>()); // its border
+    EXPECT_TRUE(cmds[3].is<scene::UiTextCommand>());        // the panel's own label
+}
+
 TEST(UiContext, TwoIdenticalFramesEmitAnIdenticalCommandStream) {
     Harness h;
     const InputFrame in{};
@@ -589,6 +614,61 @@ TEST(UiContext, FocusIsScrolledIntoView) {
     EXPECT_GT(h.ui.state().scroll[0].offset.y, 0.0f);
     // Bounded by the content extent.
     EXPECT_LE(h.ui.state().scroll[0].offset.y, 200.0f - 60.0f);
+}
+
+TEST(UiContext, EveryEnclosingScrollContainerBringsTheFocusIntoView) {
+    // A widget inside a NESTED scroll view has to be brought into view by BOTH
+    // containers. Scrolling only the innermost one leaves the inner window
+    // itself off the outer window's screen, and the focused button is invisible
+    // while claiming to be focused — the bug an exact "which container is my
+    // parent" match produces and an ancestor test does not.
+    Harness h;
+    const auto build = [](Context& ui) {
+        BoxStyle outer{};
+        outer.width = Size::px(220.0f);
+        outer.height = Size::px(60.0f);
+        ui.begin_scroll(id("outer"), outer);
+
+        // Filler so the inner list starts well below the outer window.
+        for (int i = 0; i < 6; ++i) {
+            ui.label("filler", 0xFFFFFFFF, 1.0f, Size::px(20.0f));
+        }
+
+        BoxStyle inner{};
+        inner.width = Size::px(200.0f);
+        inner.height = Size::px(40.0f);
+        ui.begin_scroll(id("inner"), inner);
+        for (int i = 0; i < 8; ++i) {
+            (void)ui.button(id(id("row"), static_cast<uint64_t>(i)), "row", Size::px(150.0f), Size::px(20.0f));
+        }
+        ui.end_scroll();
+        ui.end_scroll();
+    };
+
+    (void)h.run(InputFrame{}, build);
+    ASSERT_EQ(h.ui.state().scroll.size(), 2u);
+
+    InputFrame tab{};
+    tab.nav_next = true;
+    for (int i = 0; i < 8; ++i) {
+        (void)h.run(tab, build);
+    }
+    // The scroll store is a SORTED vector keyed by id, so look the entries up
+    // by id rather than assuming an order.
+    float outer_off = -1.0f;
+    float inner_off = -1.0f;
+    for (const auto& e : h.ui.state().scroll) {
+        if (e.id == id("outer").value) {
+            outer_off = e.offset.y;
+        }
+        if (e.id == id("inner").value) {
+            inner_off = e.offset.y;
+        }
+    }
+    ASSERT_GE(outer_off, 0.0f);
+    ASSERT_GE(inner_off, 0.0f);
+    EXPECT_GT(inner_off, 0.0f) << "the inner list did not follow the focus";
+    EXPECT_GT(outer_off, 0.0f) << "the outer container left the inner list off screen";
 }
 
 TEST(UiContext, HitTestingRespectsTheScrollClip) {

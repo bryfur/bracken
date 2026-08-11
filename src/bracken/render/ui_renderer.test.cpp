@@ -281,6 +281,127 @@ TEST(UIRendererOps, ConsecutiveTextsShareOneOp) {
     EXPECT_EQ(ui.ops()[0].count, 3u);
 }
 
+// THE INVARIANT execute() IS BUILT ON, stated once and pinned here.
+//
+// execute() walks ops_ and, for a Geometry op, draws draw_ranges_[first ..
+// first+count); for a Text op it maps queued_text_draws_[first ..
+// first+count) onto the TextRenderer runs those draws produced. That is only
+// correct if the ops EXACTLY PARTITION both vectors, contiguously and in
+// order: a gap silently drops a draw, an overlap draws it twice, and a
+// non-monotone `first` reorders the frame — which is precisely the class of
+// bug the two-phase form used to have. None of those is visible in a headless
+// test of the op list unless the partition itself is asserted.
+namespace {
+
+void expect_ops_partition_recording(const UIRenderer& ui) {
+    size_t next_range = 0;
+    size_t next_text = 0;
+    for (const UIRenderer::Op& op : ui.ops()) {
+        if (op.kind == UIRenderer::Op::Kind::Geometry) {
+            EXPECT_EQ(op.first, next_range) << "geometry op is not contiguous with the previous one";
+            EXPECT_GT(op.count, 0u) << "an empty op would bind a pipeline for nothing";
+            next_range = op.first + op.count;
+        } else {
+            EXPECT_EQ(op.first, next_text) << "text op is not contiguous with the previous one";
+            EXPECT_GT(op.count, 0u) << "an empty op would bind a pipeline for nothing";
+            next_text = op.first + op.count;
+        }
+    }
+    EXPECT_EQ(next_range, ui.batch_draw_count()) << "some draw ranges are not reachable from any op";
+    EXPECT_EQ(next_text, ui.queued_text_count()) << "some queued text is not reachable from any op";
+}
+
+} // namespace
+
+TEST(UIRendererOps, OpsExactlyPartitionRangesAndTextDraws) {
+    UIRenderer ui;
+    // Deliberately awkward: every transition that can open an op or a range
+    // appears at least once — geometry/text alternation, a texture switch, a
+    // clip change, and a clip change that happens to be a no-op.
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    ui.draw_textured_quad(fake_texture(0x1), 0, 0, 10, 10);
+    ui.draw_text("a", 0, 0, 0xFFFFFFFF);
+    ui.draw_text("b", 0, 0, 0xFFFFFFFF);
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    ui.set_clip_rect(1, 1, 20, 20);
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    ui.set_clip_rect(1, 1, 20, 20); // identical: must not split
+    ui.draw_textured_quad(fake_texture(0x2), 0, 0, 10, 10);
+    ui.draw_text("c", 0, 0, 0xFFFFFFFF);
+    ui.clear_clip_rect();
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+
+    expect_ops_partition_recording(ui);
+    // And the shape itself: G T G T G — five ops, alternating.
+    ASSERT_EQ(ui.ops().size(), 5u);
+    EXPECT_EQ(ui.ops()[0].kind, UIRenderer::Op::Kind::Geometry);
+    EXPECT_EQ(ui.ops()[1].kind, UIRenderer::Op::Kind::Text);
+    EXPECT_EQ(ui.ops()[2].kind, UIRenderer::Op::Kind::Geometry);
+    EXPECT_EQ(ui.ops()[3].kind, UIRenderer::Op::Kind::Text);
+    EXPECT_EQ(ui.ops()[4].kind, UIRenderer::Op::Kind::Geometry);
+}
+
+TEST(UIRendererOps, ThePartitionSurvivesTheCommonHudAndAButton) {
+    UIRenderer ui;
+    ui.draw_filled_rect(10, 10, 280, 122, 0xB0101418);
+    ui.draw_text("row", 22, 20, 0xFFFFFFFF);
+    // draw_button records shapes then (when a font exists) a label, so it is
+    // itself an interleaving — the partition has to hold through it.
+    ui.draw_button(0, 200, 100, 30, "OK", 0xFF336699, false);
+    ui.draw_text("after", 0, 300, 0xFFFFFFFF);
+    expect_ops_partition_recording(ui);
+}
+
+TEST(UIRendererOps, GeometryRecordedAfterTextLandsInALaterRange) {
+    // The z-order claim in one assertion: the range holding the covering panel
+    // must sort AFTER the op that holds the label, so the execute() walk
+    // reaches it second and it paints on top. Before the fix both rects shared
+    // range 0 and the text was drawn afterwards unconditionally.
+    UIRenderer ui;
+    ui.draw_text("underneath", 0, 0, 0xFFFFFFFF);
+    ui.draw_filled_rect(0, 0, 100, 100, 0xFF000000);
+
+    ASSERT_EQ(ui.ops().size(), 2u);
+    EXPECT_EQ(ui.ops()[0].kind, UIRenderer::Op::Kind::Text);
+    EXPECT_EQ(ui.ops()[1].kind, UIRenderer::Op::Kind::Geometry);
+    EXPECT_EQ(ui.ops()[1].first, 0u); // its first range
+    EXPECT_EQ(ui.batch_draw_count(), 1u);
+    expect_ops_partition_recording(ui);
+}
+
+TEST(UIRendererOps, EmptyTextDoesNotOpenAnOp) {
+    // An empty string returns before the op is opened; an op with count 0
+    // would bind the text pipeline for nothing and break the partition guard.
+    UIRenderer ui;
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    ui.draw_text("", 0, 0, 0xFFFFFFFF);
+    ui.draw_filled_rect(0, 0, 10, 10, 0xFFFFFFFF);
+    ASSERT_EQ(ui.ops().size(), 1u);
+    EXPECT_EQ(ui.ops()[0].kind, UIRenderer::Op::Kind::Geometry);
+    // Both rects merged: no text intervened, so no new range was needed.
+    EXPECT_EQ(ui.batch_draw_count(), 1u);
+    expect_ops_partition_recording(ui);
+}
+
+TEST(UIRendererOps, ClipChangesSplitRangesWithinOneOpNotIntoNewOps) {
+    // A clip is a RANGE property, not an op property — it changes the scissor,
+    // not the pipeline. Three clips in a row must therefore produce one op
+    // with three ranges, and not three ops.
+    UIRenderer ui;
+    ui.set_clip_rect(0, 0, 10, 10);
+    ui.draw_filled_rect(0, 0, 5, 5, 0xFFFFFFFF);
+    ui.set_clip_rect(0, 0, 20, 20);
+    ui.draw_filled_rect(0, 0, 5, 5, 0xFFFFFFFF);
+    ui.clear_clip_rect();
+    ui.draw_filled_rect(0, 0, 5, 5, 0xFFFFFFFF);
+
+    ASSERT_EQ(ui.ops().size(), 1u);
+    EXPECT_EQ(ui.ops()[0].kind, UIRenderer::Op::Kind::Geometry);
+    EXPECT_EQ(ui.ops()[0].count, 3u);
+    EXPECT_EQ(ui.batch_draw_count(), 3u);
+    expect_ops_partition_recording(ui);
+}
+
 TEST(UIRendererOps, BeginClearsTheOpList) {
     UIRenderer ui;
     ui.draw_filled_rect(0, 0, 1, 1, 0xFFFFFFFF);

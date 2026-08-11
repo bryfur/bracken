@@ -296,4 +296,225 @@ TEST(UiWidgets, WrappedLabelBreaksOnTheRealMetrics) {
     EXPECT_EQ(joined, "aaa bbb ccc") << "wrapping must not lose or duplicate text";
 }
 
+// ---------------------------------------------------------------------------
+// The second-pass widgets: radio, text field, progress bar, separator.
+// ---------------------------------------------------------------------------
+
+/// Click at `p`: a press frame followed by a release frame. Two frames,
+/// because hit testing uses LAST frame's rectangle — a widget declared for the
+/// first time is not clickable until the frame after.
+InputFrame press_at(glm::vec2 p) {
+    InputFrame in{};
+    in.mouse = p;
+    in.mouse_down = true;
+    in.mouse_pressed = true;
+    return in;
+}
+InputFrame release_at(glm::vec2 p) {
+    InputFrame in{};
+    in.mouse = p;
+    in.mouse_released = true;
+    return in;
+}
+
+/// A two-option radio group, declared identically on every frame.
+struct RadioGroup {
+    int choice = 0;
+    bool changed = false;
+
+    void declare(Context& ui) {
+        BoxStyle col{};
+        col.spacing = 4.0f;
+        ui.begin_column(col);
+        const bool a = ui.radio(id("opt.a"), "Low", choice, 0, Size::px(200.0f));
+        const bool b = ui.radio(id("opt.b"), "High", choice, 1, Size::px(200.0f));
+        changed = a || b;
+        ui.end_box();
+    }
+};
+
+TEST(UiWidgets, RadioSelectsExactlyOneOptionAndReportsOnlyTheChange) {
+    Harness h;
+    RadioGroup g;
+    const auto declare = [&g](Context& ui) { g.declare(ui); };
+
+    h.run(InputFrame{}, declare); // frame 1 establishes the rectangles
+    const Rect high = h.ui.rect_of(id("opt.b"));
+    ASSERT_GT(high.w, 0.0f);
+    const glm::vec2 p = high.center();
+
+    h.run(press_at(p), declare);
+    EXPECT_EQ(g.choice, 0) << "a press alone must not select; the release does";
+
+    h.run(release_at(p), declare);
+    EXPECT_EQ(g.choice, 1);
+    EXPECT_TRUE(g.changed);
+
+    // Clicking the SAME option again writes the same value and reports NO
+    // change — that is precisely what separates a radio from a toggle.
+    h.run(press_at(p), declare);
+    h.run(release_at(p), declare);
+    EXPECT_EQ(g.choice, 1);
+    EXPECT_FALSE(g.changed) << "re-selecting the current option is not a change";
+}
+
+TEST(UiWidgets, TextFieldAppendsBackspacesAndCommitsOnEnter) {
+    Harness h;
+    std::string value = "ab";
+    bool committed = false;
+    const auto declare = [&value, &committed](Context& ui) {
+        committed = ui.text_field(id("name"), value, 8, Size::px(200.0f));
+    };
+
+    h.run(InputFrame{}, declare);
+
+    // Nothing has focus yet, so typing goes nowhere.
+    InputFrame typing{};
+    typing.text = "c";
+    h.run(typing, declare);
+    EXPECT_EQ(value, "ab") << "an unfocused field must ignore typing";
+
+    InputFrame tab{};
+    tab.nav_next = true;
+    h.run(tab, declare);
+    ASSERT_EQ(h.ui.focused(), id("name"));
+
+    h.run(typing, declare);
+    EXPECT_EQ(value, "abc");
+    EXPECT_FALSE(committed) << "a keystroke is not a commit";
+
+    InputFrame back{};
+    back.backspace = true;
+    h.run(back, declare);
+    EXPECT_EQ(value, "ab");
+
+    InputFrame enter{};
+    enter.enter = true;
+    h.run(enter, declare);
+    EXPECT_TRUE(committed) << "ENTER commits";
+    EXPECT_EQ(value, "ab");
+}
+
+TEST(UiWidgets, TextFieldBackspaceRemovesAWholeUtf8Sequence) {
+    // "é" is two bytes. Removing one of them leaves an undecodable string,
+    // which the next measure charges the fallback advance for and which
+    // reaches the packet as broken UTF-8.
+    Harness h;
+    std::string value = "a\xC3\xA9"; // "aé"
+    ASSERT_EQ(value.size(), 3u);
+    const auto declare = [&value](Context& ui) { (void)ui.text_field(id("f"), value, 32, Size::px(200.0f)); };
+
+    h.run(InputFrame{}, declare);
+    InputFrame tab{};
+    tab.nav_next = true;
+    h.run(tab, declare);
+    ASSERT_EQ(h.ui.focused(), id("f"));
+
+    InputFrame back{};
+    back.backspace = true;
+    h.run(back, declare);
+    EXPECT_EQ(value, "a") << "backspace must consume the whole two-byte sequence";
+}
+
+TEST(UiWidgets, TextFieldRefusesARunThatWouldOverflowRatherThanSplittingIt) {
+    Harness h;
+    std::string value = "12345";
+    const auto declare = [&value](Context& ui) { (void)ui.text_field(id("f"), value, 6, Size::px(200.0f)); };
+    h.run(InputFrame{}, declare);
+    InputFrame tab{};
+    tab.nav_next = true;
+    h.run(tab, declare);
+
+    InputFrame typing{};
+    typing.text = "ab"; // would reach 7 > 6
+    h.run(typing, declare);
+    EXPECT_EQ(value, "12345") << "an over-budget run is refused whole, not truncated mid-character";
+
+    typing.text = "z"; // reaches exactly 6
+    h.run(typing, declare);
+    EXPECT_EQ(value, "12345z");
+}
+
+TEST(UiWidgets, TextFieldDrawsACaretOnlyWhileFocused) {
+    Harness h;
+    std::string value = "ab";
+    const auto declare = [&value](Context& ui) { (void)ui.text_field(id("f"), value, 32, Size::px(200.0f)); };
+
+    const auto unfocused = h.run(InputFrame{}, declare);
+    EXPECT_EQ(unfocused->ui_commands().size(), 3u) << "background, border, text — and nothing else";
+
+    InputFrame tab{};
+    tab.nav_next = true;
+    const auto focused = h.run(tab, declare);
+    ASSERT_EQ(h.ui.focused(), id("f"));
+    ASSERT_EQ(focused->ui_commands().size(), 4u) << "...plus the caret quad";
+    const auto& caret = focused->ui_commands()[3].get<scene::UiFilledRectCommand>();
+    const Rect box = h.ui.rect_of(id("f"));
+    // Two characters at 10 px each, after the 8 px horizontal control padding.
+    EXPECT_FLOAT_EQ(caret.x, box.x + 8.0f + 20.0f);
+    EXPECT_FLOAT_EQ(caret.h, 20.0f);
+}
+
+TEST(UiWidgets, ProgressBarFillsTheClampedFraction) {
+    Harness h;
+    const auto frame = h.run(InputFrame{}, [](Context& ui) {
+        ui.begin_column({});
+        ui.progress_bar(0.25f, Size::px(200.0f), 10.0f);
+        ui.progress_bar(2.0f, Size::px(200.0f), 10.0f);  // over 1 -> full
+        ui.progress_bar(-1.0f, Size::px(200.0f), 10.0f); // under 0 -> no fill at all
+        ui.end_box();
+    });
+
+    const auto cmds = frame->ui_commands();
+    // track+fill, track+fill, track (a zero fill emits nothing).
+    ASSERT_EQ(cmds.size(), 5u);
+    const auto& quarter = cmds[1].get<scene::UiFilledRectCommand>();
+    EXPECT_FLOAT_EQ(quarter.w, 50.0f);
+    EXPECT_FLOAT_EQ(quarter.h, 10.0f);
+    EXPECT_FLOAT_EQ(cmds[3].get<scene::UiFilledRectCommand>().w, 200.0f);
+    EXPECT_FLOAT_EQ(cmds[4].get<scene::UiFilledRectCommand>().w, 200.0f);
+}
+
+TEST(UiWidgets, SeparatorSpansTheContainerAndTakesNoFocus) {
+    Harness h;
+    const auto frame = h.run(InputFrame{}, [](Context& ui) {
+        BoxStyle panel{};
+        panel.width = Size::px(300.0f);
+        panel.padding = Edges::all(10.0f);
+        ui.begin_column(panel);
+        ui.label("a");
+        ui.separator(4.0f);
+        ui.label("b");
+        ui.end_box();
+    });
+
+    const auto cmds = frame->ui_commands();
+    ASSERT_EQ(cmds.size(), 3u);
+    const auto& rule = cmds[1].get<scene::UiFilledRectCommand>();
+    EXPECT_FLOAT_EQ(rule.w, 300.0f - 20.0f) << "the rule spans the container's content box";
+    EXPECT_FLOAT_EQ(rule.h, 1.0f);
+    EXPECT_TRUE(h.ui.focus_order().empty()) << "decoration is not focusable";
+}
+
+TEST(UiWidgets, NewWidgetsJoinTheTabOrderInDeclarationOrder) {
+    Harness h;
+    int choice = 0;
+    std::string name = "x";
+    h.run(InputFrame{}, [&](Context& ui) {
+        ui.begin_column({});
+        (void)ui.button(id("b"), "B");
+        (void)ui.radio(id("r"), "R", choice, 0);
+        (void)ui.text_field(id("t"), name);
+        ui.progress_bar(0.5f); // not focusable
+        ui.separator();        // not focusable
+        ui.end_box();
+    });
+
+    const std::vector<WidgetId> order = h.ui.focus_order();
+    ASSERT_EQ(order.size(), 3u);
+    EXPECT_EQ(order[0], id("b"));
+    EXPECT_EQ(order[1], id("r"));
+    EXPECT_EQ(order[2], id("t"));
+}
+
 } // namespace
