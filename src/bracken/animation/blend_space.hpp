@@ -45,6 +45,18 @@ inline constexpr float k_blend_weight_epsilon = 1e-4f;
 /// One resolved contribution. `duration` is filled in by the caller (the rig)
 /// from the clip table; `resolve` leaves it at 0 because a blend space does not
 /// own the clips.
+///
+/// WHAT `speed_scale` ACTUALLY REACHES, because it is less than the name
+/// suggests: it is read in exactly one place, `effective_duration`, where it
+/// divides that sample's contribution to the layer's shared clock. So —
+///  * with `LayerDesc::sync_duration` ON it changes how fast the WHOLE LAYER
+///    advances, in proportion to the sample's weight. It cannot make one
+///    sample play faster than another, because phase synchronisation means all
+///    samples are at the same normalized phase by definition;
+///  * with `sync_duration` OFF it does NOTHING AT ALL. The unsynchronised
+///    sample time is `fmod(|clock|, duration_k)`, which never reads it.
+/// Authoring a per-sample playback rate that survives into the sample time
+/// would need a per-sample clock, which the layer does not have.
 struct WeightedClip {
     int clip_index = -1;
     float weight = 0.0f;
@@ -73,13 +85,18 @@ public:
         float speed_scale = 1.0f;
     };
 
-    /// Append a sample. Returns false (and adds nothing) when the space is full
-    /// or the clip index is negative. Call `finalize()` once all samples are in.
+    /// Insert a sample in POSITION ORDER. Returns false (and adds nothing) when
+    /// the space is full or the clip index is negative. Samples may be added in
+    /// any order and the space is resolvable after every call — `finalize()` is
+    /// not a precondition, only a habit.
     [[nodiscard]] bool add_sample(int clip_index, float position, float speed_scale = 1.0f) noexcept;
 
-    /// Stable-sort by position. `resolve` assumes sorted input; calling it on an
-    /// unfinalized space is a `BRACKEN_ASSERT` in debug and produces garbage
-    /// weights in release, so finalize at setup.
+    /// Re-establishes the ascending-position invariant `resolve` needs.
+    /// IDEMPOTENT and, since `add_sample` became a sorted insert, redundant;
+    /// it is kept because it is the documented setup step and because a space
+    /// that was never finalized used to produce garbage weights in release
+    /// rather than a defined answer. Calling it costs a sort of at most
+    /// `k_max_blend_samples` elements.
     void finalize() noexcept;
 
     [[nodiscard]] int sample_count() const noexcept { return count_; }
@@ -205,10 +222,11 @@ private:
  * `dt * speed / effective_duration`, and evaluates sample i at
  * `phase * duration_i` — so every sample is at the same point in its stride.
  *
- * `duration_i` is divided by `speed_scale_i`, which is how an authored clip that
- * plays at 1.5x contributes its EFFECTIVE length. Returns 0 when the weights
- * sum to zero or every duration is zero; the caller must treat 0 as "do not
- * advance".
+ * `duration_i` is divided by `|speed_scale_i|`, which is how an authored clip
+ * that plays at 1.5x contributes its EFFECTIVE length. The magnitude is
+ * deliberate: a negative scale means "backwards", not "negative length".
+ * Returns 0 when the weights sum to zero or every duration is zero; the caller
+ * must treat 0 as "do not advance".
  */
 [[nodiscard]] float effective_duration(std::span<const WeightedClip> active) noexcept;
 

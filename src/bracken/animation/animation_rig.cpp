@@ -260,6 +260,7 @@ void AnimationRig::advance_clock(Layer& l, const std::vector<AnimationClip>& cli
     Clock& c = l.clock;
     c.wrapped = false;
     c.prev_sample_time = c.time;
+    c.advance = 0.0f;
 
     if (clips.empty() || !c.playing) {
         // Frozen: neither the clock nor the crossfade advances. AnimationPlayer
@@ -269,10 +270,12 @@ void AnimationRig::advance_clock(Layer& l, const std::vector<AnimationClip>& cli
         return;
     }
 
+    c.advance = dt * c.speed;
+
     if (l.source != LayerSource::Clip) {
         // Blend-space layers keep one clock; the per-sample times are derived
         // from it (or from the synchronised phase) in evaluate_layer.
-        c.time += dt * c.speed;
+        c.time += c.advance;
         return;
     }
 
@@ -281,7 +284,7 @@ void AnimationRig::advance_clock(Layer& l, const std::vector<AnimationClip>& cli
     }
     const auto& clip = clips[static_cast<std::size_t>(c.current_clip)];
 
-    c.time += dt * c.speed;
+    c.time += c.advance;
     if (clip.duration <= 0.0f) {
         // Zero-duration clip (single keyframe pose); fmod would be UB.
         c.time = 0.0f;
@@ -367,7 +370,10 @@ void AnimationRig::evaluate_layer(Layer& l, const Skeleton& skeleton, const std:
     if (l.desc.sync_duration) {
         const float eff = effective_duration(std::span<const WeightedClip>(active.data(), n));
         if (eff > 0.0f) {
-            const float advanced = l.phase + (l.clock.time - l.clock.prev_sample_time) / eff;
+            // `clock.advance`, not `time - prev_sample_time`: the clock is
+            // unbounded on a blend-space layer and the subtraction loses the
+            // step to rounding after a few hours of play. See Clock::advance.
+            const float advanced = l.phase + l.clock.advance / eff;
             l.phase = advanced - std::floor(advanced);
             l.clock.wrapped = (advanced >= 1.0f) || (advanced < 0.0f);
         }
@@ -433,15 +439,28 @@ void AnimationRig::evaluate(const Skeleton& skeleton, const std::vector<Animatio
     root_delta_ = RootMotionDelta{};
 
     const std::size_t count = std::min(skeleton.joints.size(), static_cast<std::size_t>(MAX_BONES));
-    if (count == 0) {
-        return;
-    }
     // bind() sizes the cursor storage; a rig evaluated against a skeleton it was
     // never bound to would silently sample fewer joints than it writes. That is
     // a HOST mistake and it stays checked in release.
+    //
+    // CHECKED BEFORE the empty-skeleton early-out, not after: a rig bound for a
+    // real skeleton and then evaluated against an empty one is exactly the
+    // mistake this catches, and returning first would have swallowed it.
     BRACKEN_CONTRACT(joint_count_ == count,
                      "AnimationRig::evaluate: bound for {} joints, evaluated against {} — call bind() first",
                      joint_count_, count);
+    if (count == 0) {
+        // Nothing to pose, but the outputs must still describe THAT rather than
+        // the last skeleton this rig held: used_joint_count() is the prefix
+        // write_palette copies and attachments trust, so leaving it stale would
+        // hand out matrices for joints that no longer exist.
+        for (std::size_t i = 0; i < used_joint_count_; ++i) {
+            bone_matrices_[i] = glm::mat4(1.0f);
+            world_transforms_[i] = glm::mat4(1.0f);
+        }
+        used_joint_count_ = 0;
+        return;
+    }
 
     const PoseSpan composed(composed_.data(), count);
 

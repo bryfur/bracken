@@ -44,6 +44,12 @@ void AnimationStateMachine::add_state(AnimState state) {
         state_name_to_index_[name] = index;
         states_.push_back(std::move(state));
     }
+    // Whatever a rig currently has installed was installed from the OLD table.
+    // Replacing a state in place keeps its index, so without this the
+    // "already applied" fast path in update(AnimationRig&) would skip
+    // re-installing it and the layer would keep playing the previous clip or
+    // blend space forever.
+    invalidate_applied();
 }
 
 void AnimationStateMachine::set_default_state(const std::string& name) {
@@ -99,6 +105,11 @@ bool AnimationStateMachine::bind_clips(const std::vector<AnimationClip>& clips) 
     }
 
     bound_ = true;
+    // Clip INDICES just moved. A rig driven by this machine is holding indices
+    // resolved against the previous clip table, so the next update() must
+    // re-install the current state even though its index has not changed —
+    // this is what a model hot-reload looks like from here.
+    invalidate_applied();
 
     if (!default_state_.empty()) {
         auto it = state_name_to_index_.find(default_state_);

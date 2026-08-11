@@ -176,7 +176,9 @@ anim::BlendSpace1D locomotion;
 (void)locomotion.add_sample(anim::find_clip_index(clips, "Idle"),   0.0f);
 (void)locomotion.add_sample(anim::find_clip_index(clips, "Walk"), 150.0f);
 (void)locomotion.add_sample(anim::find_clip_index(clips, "Run"),  400.0f);
-locomotion.finalize();                       // sorts by position — required
+locomotion.finalize();                       // idempotent, and no longer a
+                                             // precondition: add_sample keeps
+                                             // the samples sorted itself
 rig.set_blend_space_1d(0, locomotion);
 rig.set_blend_position(0, measured_speed);   // per frame
 ```
@@ -430,8 +432,13 @@ absolute scale.
 
 **Phase sync**: the layer holds one normalized phase, advanced by
 `dt * speed / effective_duration` where
-`effective_duration = Σ w_i · (duration_i / speed_scale_i) / Σ w_i`, and sample
-`i` is evaluated at `phase * duration_i`.
+`effective_duration = Σ w_i · (duration_i / |speed_scale_i|) / Σ w_i`, and sample
+`i` is evaluated at `phase * duration_i`. The step is read from
+`Clock::advance` — the stored `dt * speed` — rather than reconstructed as
+`time - prev_sample_time`, because a blend-space clock is never wrapped and the
+subtraction loses the step to float rounding after a few hours of play.
+`speed_scale` reaches nothing else: with `sync_duration` off it is not read at
+all.
 
 **Root motion**: `twist_about_y` is a swing-twist decomposition about +Y,
 returning identity (never NaN) when `w² + y² ≈ 0`. Extraction differences the
@@ -859,3 +866,95 @@ pass finished the parts that needed a second look:
 * The bit-identity regression for the single-layer path was **already present**
   from the first pass (`AnimationRig.SingleOverrideLayerMatchesAnimationPlayerBitwise`
   plus its crossfade twin) and was re-read rather than rewritten.
+
+---
+
+## 7. Adversarial review pass (third commit)
+
+An independent review read the whole diff hunting for rule violations, an
+additive claim that is not additive, non-determinism, lifetime holes, real
+mathematical edge cases, tests that pass against a broken implementation, and
+claims in this document that the code does not support. Nine defects were found
+and fixed; the residual risks are restated at the end because they did not
+change.
+
+**Fixed — correctness**
+
+1. **A NaN layer weight poisoned the entire skeleton, permanently.**
+   `pose.cpp`'s `joint_weight` clamped with `std::clamp(w, 0, 1)`, and every
+   comparison against NaN is false, so a NaN fell straight through the clamp
+   into `slerp` and never came back. `AnimationRig::set_layer_weight` takes an
+   unvalidated float from gameplay code, so one bad division there was enough.
+   The clamp is written out now and `!(w > 0)` catches NaN and every negative
+   weight, both of which read as "this layer does not touch this joint".
+   Pinned by `BlendWeights.ANaN*` and `.ANegativeWeightIsZero*` in
+   `pose.test.cpp`, including a NaN in a caller-owned `joint_weights` entry.
+2. **`AnimationStateMachine`'s `applied_state_` cache was never invalidated.**
+   It records what a rig currently holds, keyed by STATE INDEX, and both
+   `bind_clips` (re-resolves every `clip_index`) and `add_state` (overwrites a
+   state in place, keeping its index) rewrite the table underneath it. A model
+   hot-reload therefore left the layer playing a clip index resolved against
+   the old table forever, because the "already applied" fast path skipped the
+   re-install. Both call `invalidate_applied()` now; two tests in
+   `animation_state_machine.test.cpp` fail against the old code.
+3. **`BlendSpace1D::resolve` had a host-boundary precondition with no release
+   answer** — an unfinalized space was a debug `BRACKEN_ASSERT` and, in this
+   file's own words, "garbage weights in release". `add_sample` now does a
+   sorted INSERT, so the invariant `resolve` needs holds after every call and
+   the failure mode does not exist. The insert reproduces what the
+   `std::stable_sort` produced for the same insertion order — coincident
+   positions included, which is what decides which of two equal-position
+   samples wins — and that equivalence is itself pinned.
+   `finalize()` survives, idempotent; the assert became a real ascending-order
+   check on the array rather than a flag test that is now always true.
+4. **`effective_duration` treated a negative `speed_scale` as a negative
+   LENGTH.** One backwards sample could cancel the others, drive the sum
+   non-positive, and return 0 — which the caller reads as "do not advance", so
+   the whole layer froze. It uses the magnitude now.
+5. **The blend-space phase step was reconstructed by subtracting two unbounded
+   floats.** A blend-space layer's clock is never wrapped, so
+   `time - prev_sample_time` loses resolution as the character ages: at ten
+   hours of play `ulp(36000)` is 3.9e-3 against a 1/60 s step, so the
+   reconstructed step quantizes to a quarter of the real one and the blend
+   judders. `Clock::advance` carries `dt * speed` explicitly.
+   `AnimationRig.PhaseAdvancesByTheSameAmountAtAnAgedClock` pins it at
+   t = 36000 s.
+6. **`evaluate()` returned before its `BRACKEN_CONTRACT` on an empty skeleton,
+   and left the outputs stale.** A rig bound for a real skeleton and then
+   evaluated against an empty one — the exact mistake the contract exists to
+   catch — was swallowed, and `used_joint_count()` kept reporting the old
+   prefix, so `write_palette` handed out matrices for joints that no longer
+   existed. The contract runs first and the tail is identity-filled.
+
+**Fixed — documentation of things the code does but did not say**
+
+7. **`speed_scale` reaches far less than its name suggests.** It is read in
+   exactly one place, `effective_duration`. With `sync_duration` ON it scales
+   the whole layer's clock; with it OFF it does nothing at all, because the
+   unsynchronised sample time is `fmod(|clock|, duration_k)`. Stated on
+   `WeightedClip`.
+8. **A blend-space state gets no crossfade and no `clip_ended`.**
+   `crossfade_duration` is forwarded to `play_clip`, which a blend-space layer
+   never reaches, so entering or leaving such a state POPS; and the clip-ended
+   trigger reads `!layer_playing`, which a blend-space clock never sets false.
+   Both are structural, both are now on `update(AnimationRig&, int)`.
+9. **`AnimState` grew ~236 bytes for every host, including hosts that never
+   build a rig**, because the two blend spaces are stored by value. That is the
+   one place this feature is not additive, it is deliberate (a `unique_ptr`
+   would trade the bytes for an allocation on a type copied at setup), and it
+   is now stated on the struct rather than left for someone to measure.
+
+`CLAUDE.md`'s module table, load-bearing constants and umbrella-header count
+were updated in the same pass — the count read "24" and was already wrong by
+thirteen before this feature added five more.
+
+**Residual risks the integrator still owns.** §4.5 and §4.6 are unchanged and
+remain the largest items: the screenshot pins move and were not re-measured,
+and the technical-spec/user-guide passages describing the playground's
+`anim_player_` are now false. Nothing in this feature has been executed — the
+review pass added tests but ran none of them, and `tools/wt_syntax_check.py`
+(243 TUs, 0 failed) is still the only verification. `LayerDesc::joint_weights`
+is a borrowed span with no lifetime check and none is possible; `ClipBindings`
+aliases the model's clip vector and must be rebuilt on reload; and
+`animation_rig_alloc.test.cpp` replacing the global `operator new` is a
+link-level commitment for the whole test binary.

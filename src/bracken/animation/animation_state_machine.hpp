@@ -47,6 +47,17 @@ struct AnimState {
     // position is fed from named parameters. The player overload predates all of
     // this and is untouched by it: a host that never builds a rig sees exactly
     // the state machine it saw before.
+    //
+    // ONE COST IS NOT ZERO, AND IT IS PAID BY HOSTS THAT NEVER TOUCH A RIG:
+    // the two blend spaces are stored BY VALUE, which grows `AnimState` by
+    // ~236 bytes (each space is a fixed `std::array` of `k_max_blend_samples`
+    // samples, sized so a blend space allocates nothing and can be copied into
+    // a layer without touching the heap). A machine with ten states therefore
+    // costs ~2.4 KB more than it did. That is deliberate — a `unique_ptr` here
+    // would trade the bytes for an allocation and an indirection on a type that
+    // is copied at setup and never on the frame path — but it IS a change to an
+    // existing struct's layout, so anything that serialized `sizeof(AnimState)`
+    // (nothing in this tree does) would notice.
 
     /// Which rig layer this state drives. `update(AnimationRig&, int)` uses its
     /// `layer` argument when that argument is >= 0 and this field otherwise, so
@@ -113,6 +124,23 @@ public:
      * `source` is a blend space additionally pushes its blend parameters into
      * the layer every update, which is what makes "states drive a blend space"
      * true rather than aspirational.
+     *
+     * TWO THINGS A BLEND-SPACE STATE DOES NOT GET, both structural rather than
+     * unimplemented, and both worth knowing before you author one:
+     *
+     *  * NO CROSSFADE ON ENTRY. `StateTransition::crossfade_duration` is
+     *    forwarded to `AnimationRig::play_clip`, and a blend-space layer has no
+     *    clip to fade from — installing a space swaps the layer's source
+     *    outright. Transitioning into (or out of) a blend-space state therefore
+     *    POPS. Cross-fading a whole layer source would need a second pose
+     *    buffer and a fade clock per layer; it is not built.
+     *  * NO `clip_ended` TRIGGER. The clip-ended path reads
+     *    `!state.loop && !rig.layer_playing(layer)`, and a blend-space layer's
+     *    clock never stops on its own (it has no single duration to end at), so
+     *    `layer_playing` stays true forever. A non-looping blend-space state
+     *    must be left by a parameter condition, not by "the clip finished".
+     *
+     * `AnimState::loop` and `AnimState::speed` still reach the layer on entry.
      */
     void update(AnimationRig& rig, int layer = -1);
 
@@ -135,8 +163,22 @@ private:
     // blend space every frame. The player path has no equivalent and needs
     // none: a player defaults to clip 0 and a state's clip is applied on the
     // first transition.
+    //
+    // It is a CACHE OF WHAT A RIG HOLDS, keyed by state index, and a state index
+    // is only meaningful against the table that produced it — so anything that
+    // rewrites that table (`add_state`, `bind_clips`) must call
+    // `invalidate_applied()`, or the fast path skips a re-install that was
+    // needed and the layer keeps playing a clip index resolved against the old
+    // table. It also means one machine driving TWO rigs re-installs on every
+    // update once their layers differ: correct, but wasteful. Drive one rig per
+    // machine.
     int applied_state_ = -1;
     int applied_layer_ = -1;
+
+    void invalidate_applied() noexcept {
+        applied_state_ = -1;
+        applied_layer_ = -1;
+    }
 
     int ensure_param(const std::string& name);
     int find_param(const std::string& name) const;

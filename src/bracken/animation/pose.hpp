@@ -235,6 +235,11 @@ void rest_pose(const Skeleton& skeleton, PoseSpan out) noexcept;
  * weight 0 is exactly the base pose" a bitwise statement instead of an
  * approximate one, and it is what lets a single override layer at weight 1
  * reproduce `AnimationPlayer` to the last bit.
+ *
+ * A NaN or negative `weight` (or `joint_weights` entry) reads as ZERO, not as
+ * an interpolation. The weight comes from host gameplay code through
+ * `AnimationRig::set_layer_weight`, which does not validate it, and a NaN that
+ * reached `slerp` would turn the whole skeleton into NaN permanently.
  */
 struct BlendParams {
     float weight = 1.0f;

@@ -15,6 +15,8 @@
 #include <cstring>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <limits>
+#include <span>
 #include <vector>
 
 using namespace bracken::animation;
@@ -543,4 +545,65 @@ TEST(BlendAdditive, AZeroReferenceScaleComponentProducesFiniteOutput) {
     EXPECT_FLOAT_EQ(dst[0].scale.x, 1.0f) << "a zero reference component means 'no additive scale here'";
     EXPECT_FLOAT_EQ(dst[0].scale.y, 3.0f);
     EXPECT_FLOAT_EQ(dst[0].scale.z, 2.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Hostile weights
+//
+// `AnimationRig::set_layer_weight` takes an unvalidated float straight from
+// gameplay code, and one bad division there used to poison the entire skeleton
+// permanently: `std::clamp(NaN, 0, 1)` returns NaN, because every comparison
+// against NaN is false, and a NaN through `slerp` never comes back. Both
+// operators now read a non-positive-or-NaN effective weight as zero.
+// ---------------------------------------------------------------------------
+
+TEST(BlendWeights, ANaNLayerWeightLeavesTheDestinationBITWISEUnchanged) {
+    std::array<BoneTransform, 2> src{}, dst{}, before{};
+    src[0].rotation = glm::angleAxis(0.9f, glm::vec3(0, 1, 0));
+    src[0].translation = glm::vec3(4.0f, 5.0f, 6.0f);
+    dst[0].rotation = glm::angleAxis(0.2f, glm::vec3(1, 0, 0));
+    dst[0].translation = glm::vec3(1.0f, 2.0f, 3.0f);
+    before = dst;
+
+    BlendParams p;
+    p.weight = std::numeric_limits<float>::quiet_NaN();
+    blend_override(PoseSpan(dst.data(), 2), ConstPoseSpan(src.data(), 2), p);
+    EXPECT_TRUE(exact(dst[0], before[0])) << "a NaN weight reached the blend";
+
+    std::array<BoneTransform, 2> ref{};
+    blend_additive(PoseSpan(dst.data(), 2), ConstPoseSpan(src.data(), 2), ConstPoseSpan(ref.data(), 2), p);
+    EXPECT_TRUE(exact(dst[0], before[0])) << "a NaN weight reached the additive blend";
+}
+
+TEST(BlendWeights, ANaNPerJointFeatherEntryLeavesThatJointAlone) {
+    // The other way a NaN gets in: a caller-owned feather array with an
+    // uninitialized or divided-by-zero entry. Joint 0's entry is NaN, joint 1's
+    // is a healthy 1, so the same call must skip one and apply the other.
+    std::array<BoneTransform, 2> src{}, dst{}, before{};
+    for (int i = 0; i < 2; ++i) {
+        src[static_cast<std::size_t>(i)].translation = glm::vec3(9.0f);
+        dst[static_cast<std::size_t>(i)].translation = glm::vec3(1.0f);
+    }
+    before = dst;
+
+    const std::array<float, 2> feather{std::numeric_limits<float>::quiet_NaN(), 1.0f};
+    BlendParams p;
+    p.weight = 1.0f;
+    p.joint_weights = std::span<const float>(feather.data(), feather.size());
+    blend_override(PoseSpan(dst.data(), 2), ConstPoseSpan(src.data(), 2), p);
+
+    EXPECT_TRUE(exact(dst[0], before[0])) << "the NaN feather entry blended";
+    EXPECT_TRUE(exact(dst[1], src[1])) << "the healthy feather entry did not";
+}
+
+TEST(BlendWeights, ANegativeWeightIsZeroRatherThanAnExtrapolation) {
+    std::array<BoneTransform, 1> src{}, dst{}, before{};
+    src[0].translation = glm::vec3(10.0f, 0.0f, 0.0f);
+    dst[0].translation = glm::vec3(1.0f, 0.0f, 0.0f);
+    before = dst;
+
+    BlendParams p;
+    p.weight = -3.0f;
+    blend_override(PoseSpan(dst.data(), 1), ConstPoseSpan(src.data(), 1), p);
+    EXPECT_TRUE(exact(dst[0], before[0]));
 }

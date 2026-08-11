@@ -903,3 +903,83 @@ TEST(StateMachineRig, ABlendSpaceStateInstallsItsSpaceAndTracksItsParameter) {
     sm.update(*rig);
     EXPECT_NEAR(rig->blend_position(0).x, 300.0f, 1e-5f);
 }
+
+TEST(StateMachineRig, ReBindingToANewClipTableReInstallsTheCurrentState) {
+    // `applied_state_` is a cache of what the RIG holds, keyed by state index.
+    // A state index only means something against the table that produced it, so
+    // re-binding (a hot-reloaded model, a swapped clip set) has to invalidate
+    // it. Without that, the index is unchanged, the "already applied" fast path
+    // skips the re-install, and the layer keeps playing a clip index resolved
+    // against the OLD table — here, "walk_anim" where "idle_anim" is meant.
+    const auto skeleton = make_rig_skeleton();
+    const std::vector<AnimationClip> first{make_rig_clip("idle_anim", 1.0f), make_rig_clip("walk_anim", 1.0f)};
+    // The same two clips in the opposite order: every index the machine resolved
+    // against `first` is now wrong.
+    const std::vector<AnimationClip> second{make_rig_clip("walk_anim", 1.0f), make_rig_clip("idle_anim", 1.0f)};
+
+    ClipBindings bindings;
+    bindings.build(skeleton, first);
+    auto rig = std::make_unique<AnimationRig>();
+    rig->bind(skeleton, first, bindings);
+    LayerDesc base;
+    base.name = "base";
+    ASSERT_EQ(rig->add_layer(std::move(base)), 0);
+
+    AnimationStateMachine sm;
+    AnimState idle;
+    idle.name = "idle";
+    idle.clip_name = "idle_anim";
+    sm.add_state(idle);
+    AnimState walk;
+    walk.name = "walk";
+    walk.clip_name = "walk_anim";
+    sm.add_state(walk);
+    sm.set_default_state("walk");
+    ASSERT_TRUE(sm.bind_clips(first));
+
+    sm.update(*rig, 0);
+    ASSERT_EQ(sm.current_state(), "walk");
+    ASSERT_EQ(rig->layer_clip(0), 1) << "walk_anim is index 1 in the first table";
+
+    ClipBindings rebound;
+    rebound.build(skeleton, second);
+    rig->bind(skeleton, second, rebound);
+    ASSERT_TRUE(sm.bind_clips(second));
+
+    sm.update(*rig, 0);
+    EXPECT_EQ(sm.current_state(), "walk");
+    EXPECT_EQ(rig->layer_clip(0), 0) << "walk_anim is index 0 in the second table — the re-install was skipped";
+}
+
+TEST(StateMachineRig, ReplacingAStateInPlaceReInstallsItOnTheNextUpdate) {
+    // add_state() with an existing name overwrites in place and keeps the index,
+    // so the same staleness applies: the rig is holding what the OLD definition
+    // installed.
+    const auto skeleton = make_rig_skeleton();
+    const std::vector<AnimationClip> clips{make_rig_clip("a", 1.0f), make_rig_clip("b", 1.0f)};
+    ClipBindings bindings;
+    bindings.build(skeleton, clips);
+    auto rig = std::make_unique<AnimationRig>();
+    rig->bind(skeleton, clips, bindings);
+    LayerDesc base;
+    base.name = "base";
+    ASSERT_EQ(rig->add_layer(std::move(base)), 0);
+
+    AnimationStateMachine sm;
+    AnimState only;
+    only.name = "only";
+    only.clip_name = "b";
+    sm.add_state(only);
+    sm.set_default_state("only");
+    ASSERT_TRUE(sm.bind_clips(clips));
+    sm.update(*rig, 0);
+    ASSERT_EQ(rig->layer_clip(0), 1);
+
+    AnimState replacement;
+    replacement.name = "only";
+    replacement.clip_name = "a";
+    sm.add_state(replacement);
+    ASSERT_TRUE(sm.bind_clips(clips));
+    sm.update(*rig, 0);
+    EXPECT_EQ(rig->layer_clip(0), 0) << "the replaced state was never installed on the layer";
+}

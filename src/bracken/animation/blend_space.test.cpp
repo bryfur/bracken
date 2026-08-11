@@ -359,3 +359,66 @@ TEST(BlendSpace, FindClipIndexResolvesByNameOrReturnsMinusOne) {
     EXPECT_EQ(find_clip_index(clips, "Run"), 1);
     EXPECT_EQ(find_clip_index(clips, "Sprint"), -1);
 }
+
+// ---------------------------------------------------------------------------
+// The invariant `resolve` needs is now maintained by `add_sample`, not by the
+// host remembering `finalize()`.
+//
+// Before this, a space built out of order and never finalized was a debug-only
+// BRACKEN_ASSERT whose documented release behaviour was "garbage weights" — a
+// host-boundary precondition with no defined answer in a shipped build.
+// ---------------------------------------------------------------------------
+
+TEST(BlendSpace1D, IsResolvableWithoutFinalizeEvenWhenBuiltOutOfOrder) {
+    BlendSpace1D s;
+    ASSERT_TRUE(s.add_sample(2, 400.0f));
+    ASSERT_TRUE(s.add_sample(0, 0.0f));
+    ASSERT_TRUE(s.add_sample(1, 150.0f));
+    // Deliberately NO finalize() call.
+    EXPECT_TRUE(s.finalized()) << "add_sample must leave the space resolvable";
+    EXPECT_EQ(s.sample(0).clip_index, 0);
+    EXPECT_EQ(s.sample(1).clip_index, 1);
+    EXPECT_EQ(s.sample(2).clip_index, 2);
+
+    std::array<WeightedClip, 2> out{};
+    const std::uint32_t n = s.resolve(75.0f, out);
+    ASSERT_EQ(n, 2u);
+    EXPECT_NEAR(weight_of(std::span<const WeightedClip>(out.data(), n), 0), 0.5f, 1e-6f);
+    EXPECT_NEAR(weight_of(std::span<const WeightedClip>(out.data(), n), 1), 0.5f, 1e-6f);
+}
+
+TEST(BlendSpace1D, FinalizeIsIdempotentAndAgreesWithTheSortedInsert) {
+    // The sorted insert has to reproduce what the stable_sort produced for the
+    // same insertion order, coincident positions included — that ordering is
+    // what decides which of two equal-position samples wins a query.
+    BlendSpace1D inserted;
+    ASSERT_TRUE(inserted.add_sample(0, 5.0f));
+    ASSERT_TRUE(inserted.add_sample(1, 5.0f));
+    ASSERT_TRUE(inserted.add_sample(2, 1.0f));
+    ASSERT_TRUE(inserted.add_sample(3, 5.0f));
+
+    BlendSpace1D sorted = inserted;
+    sorted.finalize();
+    ASSERT_EQ(inserted.sample_count(), sorted.sample_count());
+    for (int i = 0; i < inserted.sample_count(); ++i) {
+        EXPECT_EQ(inserted.sample(i).clip_index, sorted.sample(i).clip_index) << "slot " << i;
+        EXPECT_FLOAT_EQ(inserted.sample(i).position, sorted.sample(i).position) << "slot " << i;
+    }
+    // Equal positions keep insertion order: 2 (at 1.0) then 0, 1, 3 (all at 5.0).
+    EXPECT_EQ(inserted.sample(0).clip_index, 2);
+    EXPECT_EQ(inserted.sample(1).clip_index, 0);
+    EXPECT_EQ(inserted.sample(3).clip_index, 3);
+}
+
+TEST(BlendSpace, EffectiveDurationUsesTheMAGNITUDEOfSpeedScale) {
+    // A negative speed_scale means "play this sample backwards", not "negative
+    // length". The signed division let one such sample cancel the others out,
+    // drive the sum to <= 0, and freeze the whole layer — `effective_duration`
+    // returning 0 is the caller's "do not advance" signal.
+    std::array<WeightedClip, 2> a{};
+    a[0] = WeightedClip{0, 0.5f, 1.0f, 2.0f};
+    a[1] = WeightedClip{1, 0.5f, -1.0f, 2.0f};
+    const float d = effective_duration(std::span<const WeightedClip>(a.data(), 2));
+    EXPECT_NEAR(d, 2.0f, 1e-6f) << "a backwards sample must contribute its positive length";
+    EXPECT_GT(d, 0.0f) << "the layer would be frozen";
+}

@@ -145,7 +145,7 @@ still feed GI, but cast no direct shadow. Reflection and probe rays shade their 
 | `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror — addressing, ray directions, the blend curve, and the sampler's cascade/weight math. **Complete as of R1c**: the field traces and accumulates itself, and `shaders/gi_sample.hlsli` replaces the DIFFUSE half of the ambient term in every scene fragment shader (three banded atlases, three sampler slots) plus the volumetric fog's in-scatter. Off by default (`gi_mode`); GI on builds the ray-tracing acceleration structure with attributes |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
 | `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator) |
-| `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK |
+| `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK — **plus a layer stack**: `AnimationRig` composes up to `k_max_animation_layers` weighted, `BoneMask`-masked `Override`/`Additive` layers onto a base pose in local TRS space (`pose.hpp` is the pose value type the engine never had; the three pose buffers a composition needs live in a caller-supplied `PoseScratch`, one per evaluating THREAD, not per character), each layer driven by a clip or by a 1D/2D blend space (`blend_space.hpp`; the 2D one is gradient-band freeform directional, C0 but **not** C1), then run through the same hierarchy walk the player uses. `root_motion.hpp` extracts the root/hips delta for the host to apply and strips it from the pose — **no clip in this tree carries usable root motion**, so it is validated against synthetic data only. `AnimationPlayer` is **not** deprecated: it is the one-clip fast path, and a rig with one full-weight Override layer is **bitwise** identical to it (`animation_rig.test.cpp` memcmps 120 frames — that gate is what keeps the screenshot pins from moving) |
 | `systems/` | `bracken::systems` | camera controller/system |
 | `effects/` | *(namespaces unchanged)* | the particle-effect triad in one place: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage owned: spawned/updated/snapshotted inside the sim job), `EffectRenderer` (draws the packet snapshot) |
 | `procedural/` | `bracken::procedural` | tree + rock generators |
@@ -158,7 +158,7 @@ still feed GI, but cast no direct shadow. Reflection and probe rays shade their 
 | `shaders/` | — | HLSL sources, compiled to SPIR-V at build time |
 
 **Public vs internal.** `src/bracken/bracken.hpp` is the umbrella over the
-supported surface — the 24 headers the playground actually includes, grouped
+supported surface — the 42 headers the playground actually includes, grouped
 and annotated. It is a statement of *what to reach for*, explicitly **not** a
 stability promise (pre-1.0; this refactor broke six of those signatures). A
 header under `<module>/internal/` is outside that surface and may include a
@@ -166,8 +166,10 @@ vendored dependency freely — `physics/internal/jolt_job_system.hpp` is the one
 header in the tree that includes Jolt. `public_headers.test.cpp` enforces both
 halves: nothing outside an `internal/` directory may transitively reach Jolt,
 ImGui, tinygltf or stb_, and `application.hpp` must not drag the `gpu/` layer
-into every host TU. The umbrella's 24 headers are also each compiled
-**standalone** by the generated `bracken_public_headers` target. Adopt
+into every host TU. The umbrella's 42 headers are also each compiled
+**standalone** by the generated `bracken_public_headers` target. (The count
+read "24" until 2026-08-10 and was already wrong by thirteen before the
+animation-layering headers were added — count it, do not copy it.) Adopt
 `<module>/internal/` for any future header that has to include a vendored
 dependency.
 
@@ -296,6 +298,18 @@ draws it.
   a per-frame `StructuredBuffer<float4x4>` of packed palettes indexed by a
   `paletteOffset` uniform, so the GPU side has no compile-time bone count.
   Don't raise it without auditing every `std::array<glm::mat4, MAX_BONES>`.
+  It also sizes `BoneMask` (`std::array<uint64_t, (MAX_BONES + 63) / 64>`) and
+  `PoseScratch` (three `std::array<BoneTransform, MAX_BONES>`) — both track the
+  constant rather than the literal 128, and neither raised it.
+- `k_max_animation_layers = 8` (`animation/animation_rig.hpp`) — layers per
+  `AnimationRig`, and the extent of a fixed array inside every rig, so raising
+  it costs memory in rigs that never use the slots. Layer **0 is the base** and
+  its mode/weight/mask are ignored by design; layers compose in **index order**
+  and that order is a contract.
+- `k_max_blend_samples = 8` (`animation/blend_space.hpp`) — samples per blend
+  space. Bounds `BlendSpace2D::resolve`'s O(n²) inner loop (8 samples → 56 pair
+  evaluations, per layer per character per frame) **and** the array of
+  `ClipSampler`s a layer holds (24 B/joint each with cursors cached).
 - `MAX_BONE_PALETTES = 1024` (`scene/frame_packet.hpp`) — bone palettes per
   frame, enforced at **build time** in `FrameBuilder::alloc_bone_palette`
   (over-budget allocations log an error and return an invalid id; draws

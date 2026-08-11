@@ -9,6 +9,15 @@ namespace {
 
 /// The per-joint effective weight, clamped to [0, 1]. Factored so the two blend
 /// operators cannot disagree about what a mask or a feather means.
+///
+/// THE CLAMP IS WRITTEN OUT RATHER THAN `std::clamp` ON PURPOSE. `std::clamp(v,
+/// 0, 1)` is `v < lo ? lo : (hi < v ? hi : v)`, and every comparison against a
+/// NaN is false — so a NaN weight falls straight through the clamp and into
+/// `slerp`, which turns the WHOLE SKELETON into NaN for the rest of the run.
+/// `set_layer_weight` takes an unvalidated float from the host, so that is one
+/// bad division in gameplay code away. `!(w > 0)` is true for NaN, so NaN and
+/// every negative weight both read as "this layer does not touch this joint",
+/// which is the only answer that degrades instead of corrupting.
 [[nodiscard]] inline float joint_weight(const BlendParams& params, std::size_t j) noexcept {
     float w = params.weight;
     if (params.mask != nullptr && !params.mask->test(static_cast<int>(j))) {
@@ -17,7 +26,10 @@ namespace {
     if (!params.joint_weights.empty()) {
         w *= (j < params.joint_weights.size()) ? params.joint_weights[j] : 0.0f;
     }
-    return std::clamp(w, 0.0f, 1.0f);
+    if (!(w > 0.0f)) {
+        return 0.0f; // NaN, -0, and every negative weight
+    }
+    return (w > 1.0f) ? 1.0f : w;
 }
 
 /// Componentwise src/ref with a zero-reference guard. A reference scale

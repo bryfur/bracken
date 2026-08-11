@@ -619,3 +619,66 @@ TEST(AnimationRig, StripFromPoseOffLeavesTheTravelInThePoseButStillReportsTheDel
     EXPECT_GT(rig.root_motion().translation.z, 0.0f) << "the delta is still reported — this is the "
                                                         "double-application configuration the docs warn about";
 }
+
+// ---------------------------------------------------------------------------
+// Clock hygiene
+// ---------------------------------------------------------------------------
+
+TEST(AnimationRig, PhaseAdvancesByTheSameAmountAtAnAgedClock) {
+    // A blend-space layer's clock is never wrapped — there is no single
+    // duration to wrap it against — so it grows for as long as the character
+    // lives. The phase integrator used to reconstruct its per-frame step as
+    // `time - prev_sample_time`, a difference of two large floats: at ten hours
+    // of play `ulp(36000)` is 3.9e-3 against a 1/60 s step, so the
+    // reconstructed step quantized to a quarter of the real one and the blend
+    // juddered. `Clock::advance` carries the step instead.
+    auto phase_step_at = [](float start_time) {
+        SingleLayerRig f;
+        BlendSpace1D space;
+        EXPECT_TRUE(space.add_sample(0, 0.0f));
+        EXPECT_TRUE(space.add_sample(2, 1.0f));
+        f.rig.set_blend_space_1d(0, space);
+        f.rig.layer(0).sync_duration = true;
+        f.rig.set_blend_position(0, 0.5f);
+        f.rig.set_layer_time(0, start_time);
+        f.step(1.0f / 60.0f);
+        const float a = f.rig.layer_phase(0);
+        f.step(1.0f / 60.0f);
+        const float b = f.rig.layer_phase(0);
+        return b - a;
+    };
+
+    const float fresh = phase_step_at(0.0f);
+    ASSERT_GT(fresh, 0.0f) << "the fixture never advanced";
+    // Ten hours in. `1/60 / 1.75 s` is about 0.0095, and the pre-fix
+    // reconstruction lands on multiples of 3.9e-3/1.75 == 0.0022 here.
+    EXPECT_NEAR(phase_step_at(36000.0f), fresh, 1e-6f)
+        << "the phase step depends on how long the clock has been running";
+}
+
+TEST(AnimationRig, EvaluatingAnEmptySkeletonClearsTheOutputsRatherThanLeavingThemStale) {
+    // used_joint_count() is the prefix write_palette copies and every attachment
+    // trusts. A rig whose skeleton went away must not keep reporting matrices
+    // for joints that no longer exist.
+    SingleLayerRig fixture(6);
+    fixture.step(1.0f / 60.0f);
+    ASSERT_EQ(fixture.rig.used_joint_count(), 6u);
+
+    const Skeleton empty;
+    ClipBindings empty_bindings;
+    empty_bindings.build(empty, fixture.clips);
+    fixture.rig.bind(empty, fixture.clips, empty_bindings);
+    fixture.rig.evaluate(empty, fixture.clips, 1.0f / 60.0f, fixture.scratch);
+
+    EXPECT_EQ(fixture.rig.used_joint_count(), 0u);
+    for (std::size_t i = 0; i < 6; ++i) {
+        EXPECT_TRUE(exact(fixture.rig.bone_matrices()[i], glm::mat4(1.0f))) << "slot " << i;
+        EXPECT_TRUE(exact(fixture.rig.world_transforms()[i], glm::mat4(1.0f))) << "slot " << i;
+    }
+
+    std::vector<glm::mat4> palette(4, glm::mat4(7.0f));
+    fixture.rig.write_palette(palette);
+    for (const glm::mat4& m : palette) {
+        EXPECT_TRUE(exact(m, glm::mat4(1.0f))) << "write_palette handed out a stale matrix";
+    }
+}

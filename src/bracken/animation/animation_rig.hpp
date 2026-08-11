@@ -118,6 +118,13 @@ struct LayerDesc {
 
     /// Phase-synchronise a blend space's samples so a walk/run blend does not
     /// double-step. Ignored by clip layers. See `effective_duration`.
+    ///
+    /// LEAVE IT ON unless you have a reason. With it OFF the per-sample time is
+    /// `fmod(|clock|, duration_k)` taken from the layer's raw clock, and that
+    /// clock is never wrapped — after a few hours of continuous play a `float`
+    /// has too few mantissa bits left to resolve a frame, and the sample time
+    /// quantizes. The synchronised path integrates a normalized phase in [0, 1)
+    /// from `Clock::advance` instead and has no such horizon.
     bool sync_duration = true;
 
     /// Keep per-joint keyframe cursors. Pure speed dial; see the file comment
@@ -214,6 +221,17 @@ public:
     /// Extraction is always from LAYER 0 — the base is the only layer whose clock
     /// unambiguously represents "the character's locomotion". A `joint` of -1
     /// (the default) disables the whole feature and costs nothing.
+    ///
+    /// TWO LIMITS, both structural:
+    ///  * DURING A CROSSFADE the delta comes from the INCOMING clip alone, not
+    ///    from the blend of the two the pose is showing. `play_clip` restarts
+    ///    the incoming clock at 0, so there is no jump — the character simply
+    ///    travels at the new clip's rate from the first frame of the fade
+    ///    instead of easing into it.
+    ///  * FROM A BLEND SPACE, translations sum weighted but the ROTATION comes
+    ///    from the single dominant sample, so it steps when the dominant sample
+    ///    changes. A slerp chain over an unordered active set has no canonical
+    ///    order to compose in.
     void set_root_motion(RootMotionConfig cfg) noexcept { root_motion_ = cfg; }
     [[nodiscard]] const RootMotionConfig& root_motion_config() const noexcept { return root_motion_; }
 
@@ -296,6 +314,19 @@ private:
 
         bool wrapped = false; ///< the clock looped during the last advance (root motion reads it)
         float prev_sample_time = 0.0f; ///< `time` before the last advance
+
+        /// `dt * speed` from the last advance, carried EXPLICITLY rather than
+        /// recovered as `time - prev_sample_time`.
+        ///
+        /// The difference is not cosmetic. A blend-space layer's `time` is
+        /// never wrapped — there is no single duration to wrap it against —
+        /// so it grows for as long as the character lives, and the phase
+        /// integrator used to reconstruct its step by subtracting two such
+        /// values. At an hour of play `ulp(3600)` is 2.4e-4 against a 1/60 s
+        /// step; at ten hours it is 3.9e-3, so the reconstructed step
+        /// quantizes to a quarter of the real one and the blend visibly
+        /// judders. Storing the step keeps it exact forever.
+        float advance = 0.0f;
     };
 
     struct Layer {

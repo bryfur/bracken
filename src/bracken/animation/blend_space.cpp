@@ -42,13 +42,35 @@ bool BlendSpace1D::add_sample(int clip_index, float position, float speed_scale)
     if (clip_index < 0 || count_ >= k_max_blend_samples) {
         return false;
     }
-    samples_[static_cast<std::size_t>(count_)] = Sample{clip_index, position, speed_scale};
+    // SORTED INSERT, not append-then-sort. `resolve` needs ascending positions,
+    // and it used to get them from a `finalize()` the host had to remember —
+    // which made "forgot to finalize" a debug-only assert with documented
+    // garbage weights in release. Inserting in place removes the failure mode
+    // instead of reporting it: the array is ordered after every call, so the
+    // space is resolvable at all times.
+    //
+    // Scanning for the first sample STRICTLY GREATER than `position` puts a new
+    // sample after every equal one, which is exactly what the `std::stable_sort`
+    // this replaces produced for the same insertion order. Coincident samples
+    // therefore still resolve the way `CoincidentSamplesDoNotDivideByZero`
+    // pins.
+    std::size_t at = 0;
+    while (at < static_cast<std::size_t>(count_) && !(position < samples_[at].position)) {
+        ++at;
+    }
+    for (std::size_t i = static_cast<std::size_t>(count_); i > at; --i) {
+        samples_[i] = samples_[i - 1];
+    }
+    samples_[at] = Sample{clip_index, position, speed_scale};
     ++count_;
-    finalized_ = false;
+    finalized_ = true;
     return true;
 }
 
 void BlendSpace1D::finalize() noexcept {
+    // Idempotent since add_sample became a sorted insert; kept because it is
+    // the documented setup step and because it costs nothing to re-establish
+    // the invariant if a future editor ever writes `samples_` another way.
     std::stable_sort(samples_.begin(), samples_.begin() + count_,
                      [](const Sample& a, const Sample& b) { return a.position < b.position; });
     finalized_ = true;
@@ -58,7 +80,13 @@ std::uint32_t BlendSpace1D::resolve(float x, std::span<WeightedClip> out) const 
     if (count_ <= 0 || out.empty()) {
         return 0;
     }
-    BRACKEN_ASSERT(finalized_ || count_ == 1);
+    // The invariant `add_sample` maintains, checked rather than assumed. Debug
+    // only and at most 7 comparisons; it exists to catch a future editor who
+    // writes `samples_` some other way, not to catch a host.
+    for (int k = 1; k < count_; ++k) {
+        BRACKEN_ASSERT(!(samples_[static_cast<std::size_t>(k)].position <
+                         samples_[static_cast<std::size_t>(k - 1)].position));
+    }
 
     if (count_ == 1) {
         out[0] = WeightedClip{samples_[0].clip_index, 1.0f, samples_[0].speed_scale, 0.0f};
@@ -211,7 +239,13 @@ float effective_duration(std::span<const WeightedClip> active) noexcept {
         if (c.weight <= 0.0f || c.duration <= 0.0f) {
             continue;
         }
-        const float scale = (std::abs(c.speed_scale) > 1e-6f) ? c.speed_scale : 1.0f;
+        // MAGNITUDE, not the signed value. A negative speed_scale means "play
+        // this sample backwards"; its effective LENGTH is still positive, and
+        // the signed division used to make one such sample cancel the others
+        // and drive the sum to <= 0, which reads as "do not advance" and
+        // freezes the whole layer.
+        const float mag = std::abs(c.speed_scale);
+        const float scale = (mag > 1e-6f) ? mag : 1.0f;
         sum_d += c.weight * (c.duration / scale);
         sum_w += c.weight;
     }
