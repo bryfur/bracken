@@ -306,10 +306,22 @@ TEST(OcclusionCull, CameraTravelInflationCanOnlyReduceCulling) {
     Field field(32, 18, 3, tight.nearest_depth + 0.0015f, vp);
     OcclusionField f = field.f;
     f.camera_travel = 0.0f;
+    // Take the screen-fraction guard out of the picture: an inflated box fills
+    // the frame long before it wins on depth, and this test is about depth. If
+    // the guard were left at 1.0 the sweep would "defeat" the cull by refusing
+    // to test at all, which proves nothing about the inflation.
+    f.max_tested_screen_fraction = 1e9f;
     ASSERT_TRUE(occlusion_cull_aabb(f, lo, hi)) << "the un-inflated box must be culled for the sweep to mean anything";
 
+    // The sweep has to reach the crossing, and where that is depends on the
+    // depth distribution, not on intuition about world units. Reversed-Z with
+    // near = 0.5 compresses z = -99..-59 into 0.0014 of depth, so this box
+    // needs ~45 units of travel to clear a 0.0015 slack. Sweeping to 40 (the
+    // original bound) stopped one crossing short and read as a failure of the
+    // inflation. The cap stays under 99, past which the inflated box would
+    // swallow the camera and project_aabb would have a different opinion.
     bool still_culled = true;
-    for (float travel = 0.0f; travel <= 40.0f; travel += 0.5f) {
+    for (float travel = 0.0f; travel <= 60.0f; travel += 0.5f) {
         f.camera_travel = travel;
         const bool culled = occlusion_cull_aabb(f, lo, hi);
         if (!culled) {

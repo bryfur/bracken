@@ -778,6 +778,8 @@ HzbCopy
   cs        hzb_copy.comp.spv entry=CSMain samplers=1 ro_textures=0 ro_buffers=0 rw_textures=1 rw_buffers=0 uniform_buffers=1
 HzbReduce
   cs        hzb_reduce.comp.spv entry=CSMain samplers=0 ro_textures=0 ro_buffers=0 rw_textures=2 rw_buffers=0 uniform_buffers=1
+HzbReduceFar
+  cs        hzb_reduce_far.comp.spv entry=CSMain samplers=0 ro_textures=0 ro_buffers=0 rw_textures=2 rw_buffers=0 uniform_buffers=1
 GiScreenProbePlace
   cs        gi_screen_probe_place.comp.spv entry=CSMain samplers=2 ro_textures=0 ro_buffers=0 rw_textures=0 rw_buffers=3 uniform_buffers=1
 GiScreenProbeMarch

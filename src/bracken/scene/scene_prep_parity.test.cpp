@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include "bracken/contracts/frustum.hpp"
 #include "bracken/contracts/occlusion.hpp"
 #include "bracken/contracts/render_stats.hpp"
@@ -456,9 +458,30 @@ TEST(ScenePrepParity, StatsOffParity) {
         ScenePrep::prep_copy_palettes(js4, w.packet.palettes(), off.palette_copy.data());
     }
 
-    // Zeroed counters, identical everything else.
-    EXPECT_TRUE(stats_equal(off.stats, FrameStatsPartial{}));
-    EXPECT_TRUE(stats_equal(off.skinned_stats, FrameStatsPartial{}));
+    // Zeroed COUNTERS, identical everything else — but the diagnostics are a
+    // different kind of number and deliberately survive collect_stats=false.
+    // scene_prep.cpp says it in as many words: "a drop is not opt-in
+    // instrumentation". A host that turns instrumentation off still has to be
+    // told its draws are going nowhere, so `draws_dropped_unknown_model` and
+    // `draws_deferred_not_resident` are counted on both paths. This test read
+    // as "everything is zero" only while stats_equal ignored diagnostics; once
+    // the occlusion work widened stats_equal to compare them, asserting zero
+    // here was asserting the opposite of the documented contract.
+    const auto opt_in_counters_are_zero = [](const FrameStatsPartial& s) {
+        return s.draw_calls == 0 && s.triangle_count == 0 && s.entities_rendered == 0 &&
+               s.entities_distance_culled == 0 && s.entities_frustum_culled == 0 && s.entities_occlusion_culled == 0;
+    };
+    EXPECT_TRUE(opt_in_counters_are_zero(off.stats));
+    EXPECT_TRUE(opt_in_counters_are_zero(off.skinned_stats));
+    // ...and the diagnostics are not merely non-zero, they are UNCHANGED. This
+    // is the stronger statement and the one worth pinning: turning stats off
+    // must not lose a single dropped draw.
+    EXPECT_EQ(off.stats.diagnostics.draws_dropped_unknown_model, on.stats.diagnostics.draws_dropped_unknown_model);
+    EXPECT_EQ(off.stats.diagnostics.draws_deferred_not_resident, on.stats.diagnostics.draws_deferred_not_resident);
+    EXPECT_GT(on.stats.diagnostics.draws_dropped_unknown_model, 0u)
+        << "the fixture stopped exercising the drop path, so this proves nothing";
+    EXPECT_EQ(off.skinned_stats.diagnostics.skinned_dropped_no_skeleton,
+              on.skinned_stats.diagnostics.skinned_dropped_no_skeleton);
     off.stats = on.stats;
     off.skinned_stats = on.skinned_stats;
     expect_runs_identical(on, off, "stats on vs off");
@@ -521,9 +544,41 @@ TEST(ScenePrepParity, OcclusionCullIsBitIdenticalAtAnyWorkerCount) {
     jobs::JobSystem js4;
     js4.init(4);
 
-    // Several depths, so the sweep covers "culls nothing", "culls some" and
-    // "culls a lot" rather than whichever one a single constant happens to hit.
-    const float depths[] = {0.05f, 0.2f, 0.5f, 0.9f};
+    // The sweep depths have to come from the fixture's OWN depth distribution,
+    // not from round numbers. This camera's projection puts every instance past
+    // 0.99, so the original {0.05, 0.2, 0.5, 0.9} sat entirely on one side of
+    // the comparison and culled nothing at all four — the determinism assertions
+    // below then compared two identical empty answers and passed, which is the
+    // failure mode the EXPECT_GT at the end exists to catch. Percentiles of the
+    // real distribution keep the sweep straddling the interesting region even
+    // if the fixture's camera or placements change.
+    std::vector<float> observed;
+    observed.reserve(w.packet.model_commands().size());
+    for (const ModelDrawCommand& c : w.packet.model_commands()) {
+        const Model* m = w.models.get_model(c.model_handle);
+        if (m == nullptr || m->bounding_half_diag <= 0.0f) {
+            continue;
+        }
+        // Same world bound scene_prep uses: the bounding SPHERE's box.
+        float max_scale = 0.0f;
+        for (int col = 0; col < 3; ++col) {
+            max_scale = std::max(max_scale, glm::length(glm::vec3(c.transform[col])));
+        }
+        const glm::vec3 center = glm::vec3(c.transform * glm::vec4(m->bounding_center, 1.0f));
+        const glm::vec3 extent(m->bounding_half_diag * max_scale);
+        const OcclusionBounds b = project_aabb(w.camera.view_projection, center - extent, center + extent);
+        if (b.valid) {
+            observed.push_back(b.nearest_depth);
+        }
+    }
+    ASSERT_GE(observed.size(), 16u) << "the fixture projected almost nothing; the sweep would be meaningless";
+    std::sort(observed.begin(), observed.end());
+    const auto pct = [&observed](double q) {
+        return observed[static_cast<std::size_t>(q * static_cast<double>(observed.size() - 1))];
+    };
+    // Below every instance (culls nothing) through above most of them (culls a
+    // lot). The epsilons push each pick just past the sample it names.
+    const float depths[] = {pct(0.0) - 0.01f, pct(0.25) + 1e-5f, pct(0.5) + 1e-5f, pct(0.95) + 1e-5f};
     uint32_t total_culled = 0;
     for (float depth : depths) {
         SCOPED_TRACE(::testing::Message() << "field depth " << depth);
