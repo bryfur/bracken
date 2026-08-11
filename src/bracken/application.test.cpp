@@ -91,6 +91,40 @@ TEST_F(ApplicationPipelineTest, QuitFromSimJobJoinsAndReturns) {
     EXPECT_GE(app.main_frames, 1);
 }
 
+TEST_F(ApplicationPipelineTest, QuitBeforeRunSimulatesNothingAtAll) {
+    // The one-shot CLI shape: a host does its work in on_init (export a level,
+    // bake an asset pack, validate a file) and asks to quit without ever
+    // showing a frame. run() stores running_ = true at entry, so before quit()
+    // latched, that request was ERASED and the host ran forever — which is
+    // exactly what `playground --export-level` did: it wrote the file, called
+    // quit(), and then sat in the main loop until it was killed.
+    HeadlessApp app;
+    app.quit();
+    app.run();
+    EXPECT_EQ(app.sim_frames, 0) << "a pre-run quit must not simulate a frame";
+    EXPECT_EQ(app.main_frames, 0) << "a pre-run quit must not reach the frame fence";
+}
+
+TEST_F(ApplicationPipelineTest, QuitFromOnInitSimulatesNothingAtAll) {
+    // Same latch, reached the way a real host reaches it. Nothing here depends
+    // on WHEN inside on_init the quit happens, only that it precedes run().
+    class QuitInInit : public HeadlessApp {
+    protected:
+        bool on_init() override {
+            const bool ok = HeadlessApp::on_init();
+            quit();
+            return ok;
+        }
+    };
+    QuitInInit app;
+    ASSERT_TRUE(app.start());
+    app.run();
+    EXPECT_EQ(app.inits, 1);
+    EXPECT_EQ(app.sim_frames, 0);
+    app.stop();
+    EXPECT_EQ(app.shutdowns, 1);
+}
+
 TEST_F(ApplicationPipelineTest, SimExceptionIsRethrownOnTheMainThreadAtJoin) {
     HeadlessApp app;
     app.throw_at_frame = 2;

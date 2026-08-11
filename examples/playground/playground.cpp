@@ -1873,6 +1873,17 @@ void PlaygroundGame::setup_smoke_run() {
         gs->ao_mode = static_cast<AOMode>(ao_env[0] - '0');
         smoke_ao_forced_ = true;
     }
+    // PLAYGROUND_OCCLUSION=1 turns the Hi-Z draw occlusion cull on for the run.
+    // It is off in GraphicsSettings by default and stays off here unless asked
+    // for: a cull driven by the PREVIOUS frame's depth is the one feature in
+    // this tree whose mistakes are invisible in mean_luma (a prop behind a wall
+    // is a handful of pixels), so the pins above must never measure it by
+    // accident. This is the A/B hook, and the way to read it is a pixel diff
+    // plus `entities_occlusion_culled` in the smoke line, not the mean.
+    const char* occl_env = SDL_getenv("PLAYGROUND_OCCLUSION");
+    if (occl_env != nullptr && occl_env[0] == '1') {
+        gs->occlusion_culling = true;
+    }
     // --rt-bench: pin the camera before anything else can move it. A benchmark
     // whose camera orbits measures a different scene on every frame, and the
     // orbit is what the default smoke run does. This vantage is a raised view
@@ -2234,9 +2245,10 @@ void PlaygroundGame::update_smoke_fence(bracken::MainFrame& mf) {
                                              : std::optional<bracken::render::AutoExposure::ExposureState>{};
         std::cout << std::format(
             "[smoke] OK frames={} fps={:.0f} draw_calls={} triangles={} entities={} orbs_collected={} "
-            "village={} ibl_refreshes={} local_tiles={} local_lights={}p+{}s auto_ev={} driver={}\n",
+            "village={} ibl_refreshes={} local_tiles={} local_lights={}p+{}s occl_culled={} auto_ev={} "
+            "driver={}\n",
             frame_, avg_fps, stats.draw_calls, stats.triangle_count, stats.entities_rendered, orbs_collected_,
-            has_village_ ? 1 : 0, ibl_refreshes, local_tiles, ls_points, ls_spots,
+            has_village_ ? 1 : 0, ibl_refreshes, local_tiles, ls_points, ls_spots, stats.entities_occlusion_culled,
             ev_state ? std::format("{:.2f}", ev_state->current_ev) : "n/a", gpu_driver_name());
         {   // The settings the run ACTUALLY rendered with. mean_luma is not a
             // reproducible measurement without this: these knobs used to be

@@ -42,9 +42,19 @@ OcclusionBounds project_aabb(const glm::mat4& view_proj, const glm::vec3& aabb_m
         }
         const float inv_w = 1.0f / clip.w;
         const glm::vec3 ndc(clip.x * inv_w, clip.y * inv_w, clip.z * inv_w);
-        // NDC -> UV with y DOWN: ndc.y == -1 is the top of the frame, which is
-        // texel row 0 of a straight copy of the depth target.
-        const glm::vec2 uv(ndc.x * 0.5f + 0.5f, ndc.y * 0.5f + 0.5f);
+        // NDC -> UV, and the Y term is FLIPPED. The engine's projections come
+        // from glm with GLM_FORCE_DEPTH_ZERO_TO_ONE, which leaves NDC +Y
+        // pointing UP, while texel row 0 of a copied depth target is the TOP of
+        // the frame — so ndc.y == +1 is row 0. render/taa.hpp:51 is the same
+        // mapping and the engine's existing statement of this convention.
+        //
+        // Getting this backwards does not fail loudly: the footprint is simply
+        // MIRRORED about the horizon, so distant geometry near the skyline gets
+        // tested against the near ground at the bottom of the frame, reads as
+        // hopelessly behind it, and is culled. It cost 419 of 464 entities in
+        // the playground's smoke frame, at a mean_luma delta of 0.4 — which is
+        // exactly the class of error CLAUDE.md says the aggregate cannot see.
+        const glm::vec2 uv(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
         lo = glm::min(lo, uv);
         hi = glm::max(hi, uv);
         nearest = std::max(nearest, ndc.z);

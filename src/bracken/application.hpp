@@ -179,7 +179,16 @@ public:
 
     /** Request the main loop to stop. Tier: worker-safe — callable from the
      *  sim job (or any thread); the loop observes it at the next iteration. */
-    void quit() { running_.store(false, std::memory_order_relaxed); }
+    /** Ask the main loop to stop. Safe from any thread, including the in-flight
+     *  sim job, and safe BEFORE the loop starts: a quit() issued from on_init
+     *  (the one-shot CLI shape — export a level, bake a pack, validate an asset
+     *  and exit) is latched, and run() honours it instead of resurrecting the
+     *  flag it stores at entry. Before that latch existed, such a quit() was
+     *  silently erased and the host ran forever. */
+    void quit() {
+        quit_requested_.store(true, std::memory_order_relaxed);
+        running_.store(false, std::memory_order_relaxed);
+    }
 
     /** Frames per second, updated once per second at the frame fence. Safe to
      *  read from the sim job: it is never written while a sim is in flight. */
@@ -586,6 +595,11 @@ private:
     // relaxed loads at the loop head. Publishes nothing — it is a pure flag;
     // all cross-thread data movement rides the sim kick/join edges.
     std::atomic<bool> running_{false};
+
+    // quit_requested_ — latched by quit(), never cleared. Exists only so a
+    // quit() from on_init survives run()'s unconditional running_ = true;
+    // same relaxed protocol as running_, and it publishes nothing either.
+    std::atomic<bool> quit_requested_{false};
 
     // start() succeeded — stop() runs on_shutdown() only then, and only once,
     // so the canonical main() (bail out to shutdown_engine() when start()

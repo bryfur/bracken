@@ -97,6 +97,35 @@ TEST(OcclusionProject, ABoxEntirelyBehindTheCameraIsNeverValid) {
     EXPECT_FALSE(b.valid);
 }
 
+TEST(OcclusionProject, UpInTheWorldIsUpInTheFrame) {
+    // The convention test, and the one whose absence let a mirrored footprint
+    // ship. Every other test in this file is vertically SYMMETRIC about the
+    // view axis, so flipping the Y mapping changes none of their answers — and
+    // the flip is invisible in mean_luma too. It cost 419 of the playground's
+    // 464 entities: distant geometry near the skyline was tested against the
+    // near ground at the bottom of the frame and read as hopelessly behind it.
+    //
+    // glm (GLM_FORCE_DEPTH_ZERO_TO_ONE) leaves NDC +Y pointing UP; texel row 0
+    // of a copied depth target is the TOP of the frame. So a box ABOVE the view
+    // axis must land at SMALL uv.y. render/taa.hpp:51 is the same mapping.
+    const glm::mat4 vp = perspective_vp(); // looks down -Z from the origin
+
+    const OcclusionBounds high = project_aabb(vp, glm::vec3(-1.0f, 20.0f, -101.0f), glm::vec3(1.0f, 22.0f, -99.0f));
+    const OcclusionBounds low = project_aabb(vp, glm::vec3(-1.0f, -22.0f, -101.0f), glm::vec3(1.0f, -20.0f, -99.0f));
+    ASSERT_TRUE(high.valid);
+    ASSERT_TRUE(low.valid);
+
+    EXPECT_LT(high.max_uv.y, 0.5f) << "a box above the view axis must be in the TOP half of the frame";
+    EXPECT_GT(low.min_uv.y, 0.5f) << "a box below the view axis must be in the BOTTOM half of the frame";
+    EXPECT_LT(high.max_uv.y, low.min_uv.y) << "the Y mapping is mirrored";
+
+    // X is not flipped, and pinning it here is what stops a future 'fix' from
+    // flipping the wrong axis.
+    const OcclusionBounds right = project_aabb(vp, glm::vec3(20.0f, -1.0f, -101.0f), glm::vec3(22.0f, 1.0f, -99.0f));
+    ASSERT_TRUE(right.valid);
+    EXPECT_GT(right.min_uv.x, 0.5f) << "+X in the world must be the RIGHT of the frame";
+}
+
 TEST(OcclusionProject, RectContainsEveryInteriorPointsProjection) {
     const glm::mat4 vp = perspective_vp();
     Rng rng;
@@ -114,7 +143,12 @@ TEST(OcclusionProject, RectContainsEveryInteriorPointsProjection) {
             const glm::vec4 clip = vp * glm::vec4(p, 1.0f);
             ASSERT_GT(clip.w, 0.0f);
             const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-            const glm::vec2 uv(ndc.x * 0.5f + 0.5f, ndc.y * 0.5f + 0.5f);
+            // Must mirror project_aabb's mapping, Y flip included — this
+            // duplicate is the reason a mirrored footprint survived the suite:
+            // it agreed with the implementation instead of with the frame.
+            // UpInTheWorldIsUpInTheFrame is what pins the direction; this one
+            // only pins containment.
+            const glm::vec2 uv(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
             constexpr float eps = 1e-5f;
             EXPECT_GE(uv.x, b.min_uv.x - eps);
             EXPECT_LE(uv.x, b.max_uv.x + eps);

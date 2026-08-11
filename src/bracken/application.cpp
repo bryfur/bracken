@@ -373,6 +373,14 @@ void Application::frame_fence(uint64_t joined_frame_index) {
 
 void Application::run() {
     BRACKEN_ASSERT_MAIN_THREAD();
+    // A host that already asked to quit during on_init never enters the loop.
+    // Returning here rather than falling through matters: the loop would
+    // otherwise kick a sim job, render one frame and only then notice, which
+    // for a one-shot CLI task means a window flash and a frame of work nobody
+    // asked for.
+    if (quit_requested_.load(std::memory_order_relaxed)) {
+        return;
+    }
     running_.store(true, std::memory_order_relaxed);
     last_frame_time_ = SDL_GetTicksNS();
     fps_timer_ = last_frame_time_;
