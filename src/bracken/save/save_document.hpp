@@ -133,6 +133,17 @@ public:
 
     [[nodiscard]] std::size_t read_count(std::string_view path) const;
 
+    /** The raw variant at `path`, or null. For code that has to copy records
+     *  it does not understand — a schema layered on top of this container
+     *  (`scene/level.hpp`) partitions a loaded document into "mine" and
+     *  "carry it forward verbatim", and it cannot do that through the typed
+     *  readers without already knowing every type. */
+    [[nodiscard]] const Value* value_at(std::string_view path) const;
+
+    /** Write a raw variant. The other half of value_at(); the typed write()
+     *  overloads are what you want everywhere else. */
+    void write_value(std::string_view path, Value v);
+
     // ---- Files -----------------------------------------------------------
 
     /** Serialize and durably replace `path`: written to `path.tmp` first, then
@@ -140,6 +151,26 @@ public:
     [[nodiscard]] core::Result<void, SaveError> save(const std::string& path) const;
 
     [[nodiscard]] static core::Result<SaveDocument, SaveError> load(const std::string& path);
+
+    // ---- Bytes -----------------------------------------------------------
+    //
+    // The same container, without the filesystem. save() is serialize() plus
+    // the temp-file/rename block and load() is read-file plus parse(), so a
+    // document written to a file and one written to memory are the SAME bytes
+    // — `save_document.test.cpp` pins that, because a second encoder that
+    // drifted from the first would be the worst kind of format bug.
+    //
+    // These exist because content does not always arrive as a path: an asset
+    // pack hands back a byte span (`core::asset::AssetPack::read`), and a
+    // level shipped inside one has to be parseable from it.
+
+    /** The complete file image: magic, versions, payload length, checksum,
+     *  payload. Never fails — encoding a document cannot. */
+    [[nodiscard]] std::vector<std::byte> serialize() const;
+
+    /** Parse a complete file image. Same refusals as load(), minus
+     *  FileNotFound: a span is always "found". Worker-safe. */
+    [[nodiscard]] static core::Result<SaveDocument, SaveError> parse(std::span<const std::byte> bytes);
 
     /** Number of stored records, including ones this build does not read. */
     [[nodiscard]] std::size_t record_count() const noexcept { return records_.size(); }
@@ -156,6 +187,11 @@ private:
     Record* find(std::string_view path);
     [[nodiscard]] const Record* find(std::string_view path) const;
     void set(std::string_view path, Value v);
+
+    /** parse(), with a caller-supplied label for the diagnostics — load()
+     *  passes the path so its messages still name the file. */
+    [[nodiscard]] static core::Result<SaveDocument, SaveError> parse_labelled(std::span<const std::byte> bytes,
+                                                                             std::string_view label);
 
     std::vector<Record> records_;
     uint32_t game_version_ = 0;

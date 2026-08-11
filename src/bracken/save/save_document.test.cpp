@@ -3,9 +3,11 @@
 #include "bracken/save/save_document.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 using namespace bracken::save;
 
@@ -299,4 +301,82 @@ TEST(SaveDocument, EmptyStringAndEmptyBlobRoundTrip) {
     std::vector<std::byte> blob{std::byte{9}};
     EXPECT_TRUE(loaded.value().read_blob("empty_blob", blob));
     EXPECT_TRUE(blob.empty());
+}
+
+// ---------------------------------------------------------------------------
+// serialize() / parse() — the same container, without the filesystem.
+//
+// The risk this pair introduces is a SECOND encoder that drifts from the first,
+// so the first test is that there is only one.
+// ---------------------------------------------------------------------------
+
+TEST(SaveDocument, SerializeProducesExactlyTheFileBytes) {
+    TempFile f("bracken_save_serialize.sav");
+
+    SaveDocument doc;
+    doc.set_game_version(3);
+    doc.write("a/b", int64_t{7});
+    doc.write("a/c", std::string_view("text"));
+    doc.write("v", glm::vec3(1, 2, 3));
+    const std::byte blob[]{std::byte{9}, std::byte{8}};
+    doc.write_blob("blob", blob);
+
+    ASSERT_TRUE(doc.save(f.path));
+    const std::vector<std::byte> bytes = doc.serialize();
+
+    std::ifstream in(f.path, std::ios::binary);
+    ASSERT_TRUE(in);
+    const std::vector<char> on_disk((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_EQ(on_disk.size(), bytes.size());
+    EXPECT_EQ(0, std::memcmp(on_disk.data(), bytes.data(), bytes.size()));
+}
+
+TEST(SaveDocument, ParseAcceptsWhatSerializeProduces) {
+    SaveDocument doc;
+    doc.set_game_version(11);
+    doc.write("i", int64_t{-5});
+    doc.write("s", std::string_view("round trip"));
+    doc.write("m", glm::mat4(3.0f));
+
+    auto parsed = SaveDocument::parse(doc.serialize());
+    ASSERT_TRUE(parsed) << to_string(parsed.error());
+    EXPECT_EQ(parsed.value().game_version(), 11u);
+    EXPECT_EQ(parsed.value().read_or<int64_t>("i", 0), -5);
+    EXPECT_EQ(parsed.value().read_or<std::string>("s", ""), "round trip");
+    EXPECT_EQ(parsed.value().read_or("m", glm::mat4(1.0f)), glm::mat4(3.0f));
+}
+
+TEST(SaveDocument, ParseRefusesGarbageWithoutReadingPastTheSpan) {
+    const std::byte junk[]{std::byte{1}, std::byte{2}, std::byte{3}};
+    auto r = SaveDocument::parse(junk);
+    ASSERT_FALSE(r);
+    EXPECT_EQ(r.error(), SaveError::NotASaveFile);
+
+    // A valid header with a corrupted payload.
+    SaveDocument doc;
+    doc.write("x", int64_t{1});
+    std::vector<std::byte> bytes = doc.serialize();
+    bytes.back() = static_cast<std::byte>(std::to_integer<uint8_t>(bytes.back()) ^ 0xFFu);
+    auto corrupt = SaveDocument::parse(bytes);
+    ASSERT_FALSE(corrupt);
+    EXPECT_EQ(corrupt.error(), SaveError::Corrupt);
+}
+
+TEST(SaveDocument, ValueAtCarriesRecordsAcrossDocumentsWithoutKnowingTheirType) {
+    SaveDocument source;
+    source.write("k/i", int64_t{5});
+    source.write("k/v", glm::vec4(1, 2, 3, 4));
+    source.write("k/s", std::string_view("copy me"));
+
+    SaveDocument sink;
+    for (std::string_view path : source.paths()) {
+        const SaveDocument::Value* v = source.value_at(path);
+        ASSERT_NE(v, nullptr);
+        sink.write_value(path, *v);
+    }
+    EXPECT_EQ(sink.record_count(), source.record_count());
+    EXPECT_EQ(sink.read_or<int64_t>("k/i", 0), 5);
+    EXPECT_EQ(sink.read_or("k/v", glm::vec4(0.0f)), glm::vec4(1, 2, 3, 4));
+    EXPECT_EQ(sink.read_or<std::string>("k/s", ""), "copy me");
+    EXPECT_EQ(source.value_at("nope"), nullptr);
 }

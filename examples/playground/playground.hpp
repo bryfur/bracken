@@ -71,6 +71,30 @@ public:
     /** Where the smoke run saves its screenshot (main() verifies it after). */
     static constexpr const char* SMOKE_SCREENSHOT_PATH = "playground_smoke.png";
 
+    /**
+     * `--export-level <path>`: once on_init has built the whole scene, write it
+     * to a `.level` (plus a `.level.txt` dump beside it) and exit.
+     *
+     * The export runs at the END of on_init rather than at the frame fence
+     * because that is the last moment where every piece is final and nothing
+     * is in flight: props, orb anchors, chimney sites, the heightmap and the
+     * RNG state are all settled and no sim job exists yet.
+     */
+    void set_export_level_path(std::string path) { export_level_path_ = std::move(path); }
+
+    /**
+     * `--level <path>`: fill the prop / marker / collider layer from a level
+     * file instead of running the hand-authored `scatter_wilds()` +
+     * `build_orb_spots()`.
+     *
+     * Everything else — terrain, splatmap, water, the state machine, the
+     * effects — is generated exactly as it is without the flag. The level
+     * carries those sections for other hosts; this demo regenerates them. So a
+     * `--level` run differs from a plain run in precisely the ~2550 rows the
+     * format replaces, which is what the `[level] ... digest=` line measures.
+     */
+    void set_level_path(std::string path) { level_path_ = std::move(path); }
+
 protected:
     bool on_init() override;
     void on_shutdown() override;
@@ -85,6 +109,26 @@ private:
     struct Prop {
         bracken::ModelHandle model;
         glm::mat4 transform;
+    };
+    /**
+     * The AUTHORING triple behind a Prop, captured where the placement is
+     * composed rather than recovered from its matrix afterwards.
+     *
+     * Decomposing a mat4 back into translation/rotation/scale is lossy in the
+     * last ulp, and a level exported that way reloads to a matrix that differs
+     * from the one the hand-authored path produced — a difference invisible on
+     * screen and fatal to a digest comparison. Capturing the inputs costs
+     * ~60 KB once at init and makes the export exact by construction.
+     *
+     * `model` is a ModelManager name and always a string literal (the layout
+     * table and the two ground-cover arrays are the only sources), so the
+     * pointer outlives the run.
+     */
+    struct PropPlacement {
+        const char* model = nullptr;
+        glm::vec3 position{0.0f};
+        float yaw = 0.0f;
+        float scale = 1.0f;
     };
     struct PendingRipple {
         glm::vec3 pos;
@@ -204,9 +248,68 @@ private:
     /** Village metres (layout space) -> world units, terrain height applied. */
     glm::vec3 village_pos(float vx, float vz, float vy = 0.0f);
 
+    // --- Levels (level_export.cpp, except load_level_props) ----------------
+
+    /**
+     * The HOST-EXTRAS record the exporter writes and the loader reads back:
+     * the value of rng_ after the props were scattered.
+     *
+     * The demo's LCG is consumed by the ground-cover fill AND, afterwards, by
+     * the orb spawn picks — so a `--level` run that skips the fill would reach
+     * the orb loop with a different RNG state and place its orbs elsewhere,
+     * for a reason that has nothing to do with the level format. Carrying the
+     * state in the level's unknown-record channel is exactly what that channel
+     * is for: the engine round-trips it and never looks inside.
+     */
+    static constexpr const char* k_level_rng_key = "playground/rng_after_scatter";
+
+    /**
+     * THE single composition site for a placed prop: build the transform,
+     * record it in props_ AND record the authoring triple in
+     * prop_placements_. Returns the transform so the caller can hand it to a
+     * collider.
+     *
+     * It calls bracken::scene::level_instance_transform, which is also what a
+     * loaded level calls — one function, so a reload reproduces the matrix bit
+     * for bit rather than approximately.
+     */
+    glm::mat4 place_prop(const char* model_name, bracken::ModelHandle handle, const glm::vec3& position,
+                         float yaw, float scale);
+
+    /** --export-level: build a scene::Level from the finished scene and write
+     *  it (plus a text dump sidecar). False on any IO failure. */
+    [[nodiscard]] bool export_level_now();
+
+    /** --level: fill props_, pending_colliders_, orb_spots_ and chimney_tops_
+     *  from a level file. Lives in playground.cpp because the collider policy
+     *  (classify_collider) is game code that must not migrate into the
+     *  engine. False if the file could not be read. */
+    [[nodiscard]] bool load_level_props();
+
+    /** FNV-1a over props_ (handle + the 16 matrix floats, in draw order),
+     *  logged as `[level] props=N digest=0x...`. The A/B instrument for the
+     *  round trip: an exported and reloaded village must print the same line
+     *  a hand-authored run does. */
+    void log_prop_digest(const char* label) const;
+
     // World
     bracken::Heightmap heightmap_;
     std::vector<Prop> props_;
+    /// Parallel to props_, same order. Only read by the exporter.
+    std::vector<PropPlacement> prop_placements_;
+    std::string export_level_path_;
+    std::string level_path_;
+    /**
+     * rng_ as it stood the moment the props and orb anchors were finished.
+     *
+     * NOT rng_ at export time: the orb spawn loop that follows in on_init
+     * consumes the stream too, so exporting the end state and restoring it
+     * before that loop would hand the reloaded run a different sequence. This
+     * is the value a --level run has to resume from.
+     */
+    uint32_t rng_after_scatter_ = 0;
+    glm::vec3 level_player_spawn_{0.0f};
+    bool has_level_player_spawn_ = false;
     std::vector<Orb> orbs_;
     uint32_t rng_ = 0x2f6e2b1u;
 

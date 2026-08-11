@@ -4,6 +4,7 @@ add_executable(playground
     main.cpp
     playground.cpp
     scene_layout.cpp
+    level_export.cpp
     character.cpp
     day_weather.cpp
     music.cpp
