@@ -11,6 +11,8 @@
 #include "bracken/effects/effect_system.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
 #include "bracken/heightmap.hpp"
+#include "bracken/heightmap_grid.hpp"
+#include "bracken/residency_manager.hpp"
 #include "bracken/render/render_context.hpp"
 #include "bracken/scene/frame_packet_ring.hpp"
 #include "bracken/audio/audio_engine.hpp"
@@ -301,6 +303,14 @@ void Application::frame_fence(uint64_t joined_frame_index) {
         core::asset::FileWatcher::instance().poll_main_thread();
     }
 
+    // Asset residency applies at the fence for exactly the same reason, and it
+    // is a stronger requirement: pump() can UNLOAD a model, and a packet being
+    // built or rendered against a freed vertex buffer is not a stale image, it
+    // is a crash. Null unless a host installed one.
+    if (residency_ != nullptr) {
+        residency_->pump();
+    }
+
     // Deferred graphics-settings application (request_graphics_settings; the
     // main-thread slot — DevUI — wins over the sim slot when both are set).
     if (has_pending_graphics_settings_ || has_pending_graphics_settings_main_) {
@@ -502,6 +512,16 @@ void Application::shutdown_renderer() {
     }
 
     camera_.reset();
+    // The residency manager is HOST-owned and can outlive this Application, but
+    // the invalidator set_residency() installed captures a raw SceneRenderer*
+    // that is about to be destroyed. Detach it here rather than trusting the
+    // host's destruction order: a pump() after shutdown would otherwise call
+    // through a dangling pointer, and it is the kind of use-after-free that
+    // only fires on the shutdown path of a long run.
+    if (residency_ != nullptr) {
+        residency_->set_geometry_invalidator({});
+        residency_ = nullptr;
+    }
     if (scene_renderer_) {
         scene_renderer_->shutdown();
     }
@@ -546,6 +566,33 @@ void Application::set_heightmap(const Heightmap& heightmap) {
         return;
     }
     scene_renderer_->set_heightmap(heightmap);
+}
+
+void Application::set_heightmap_grid(const HeightmapGrid& grid) {
+    BRACKEN_CONTRACT(scene_renderer_ != nullptr, "set_heightmap_grid() requires init_renderer() first");
+    // Same policy as set_heightmap: reject rather than install. A grid whose
+    // pages disagree about their quantization range renders a step along
+    // every seam and nothing anywhere says so — validate()'s error string
+    // names the page and the disagreement.
+    const core::Result<void, std::string> check = grid.validate();
+    if (!check) {
+        BRACKEN_LOG_ERROR("app", "set_heightmap_grid: ignoring the grid — {}", check.error());
+        return;
+    }
+    scene_renderer_->set_heightmap_grid(grid);
+}
+
+void Application::set_residency(ResidencyManager* residency) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    residency_ = residency;
+    if (residency_ != nullptr && scene_renderer_ != nullptr) {
+        // Wired here rather than left to the host, because forgetting it is not
+        // a degraded feature: an eviction changes neither the instance count
+        // nor the handle sequence, so RtScene's dirty test does not fire and
+        // the BLAS keeps referencing geometry unload_model just freed.
+        scene::SceneRenderer* renderer = scene_renderer_.get();
+        residency_->set_geometry_invalidator([renderer] { renderer->invalidate_raytracing_scene(); });
+    }
 }
 
 void Application::set_graphics_settings(const GraphicsSettings& settings) {

@@ -49,6 +49,11 @@ struct RenderStats {
     uint32_t entities_rendered = 0;
     uint32_t entities_distance_culled = 0;
     uint32_t entities_frustum_culled = 0;
+    /// Draws removed by the Hi-Z occlusion test (GraphicsSettings::
+    /// occlusion_culling). Zero on every frame the feature is off, which is
+    /// also the "is it doing anything?" readout — a conservative culler that
+    /// reports zero in a dense scene is a culler whose depth never arrived.
+    uint32_t entities_occlusion_culled = 0;
     uint32_t jobs_pending = 0;
 
     /// Instances actually written into the main-view instance buffer.
@@ -94,6 +99,20 @@ struct FrameDiagnostics {
     /// Model draw whose ModelHandle resolves to no model (never registered,
     /// or stale across an unload_all()).
     uint32_t draws_dropped_unknown_model = 0;
+    /// Model or SKINNED draw whose ModelHandle resolves to a REGISTERED model
+    /// that is not currently resident — an asset the residency manager has
+    /// evicted or has not finished streaming in (`Model::loaded == false`).
+    /// Both walks count into this one counter, because a host debugging a
+    /// streaming stall wants "how many draws did residency swallow", not a
+    /// split by vertex format.
+    ///
+    /// Deliberately NOT folded into draws_dropped_unknown_model. They are
+    /// opposite diagnoses with opposite fixes: "unknown" means the host is
+    /// drawing a handle nobody registered (a bug, permanent), "not resident"
+    /// means the streaming budget or the load radius is wrong (a tuning
+    /// problem, transient). Conflating them turns a streaming frame into a
+    /// wall of false bug reports.
+    uint32_t draws_deferred_not_resident = 0;
     /// Skinned draw whose model has no skeleton, or whose palette carried
     /// zero joints — not drawable as skinned, and not drawn at all.
     uint32_t skinned_dropped_no_skeleton = 0;
@@ -127,6 +146,7 @@ struct FrameDiagnostics {
     /// Fold another accumulator in (chunk-index order at fan-out joins).
     FrameDiagnostics& operator+=(const FrameDiagnostics& other) {
         draws_dropped_unknown_model += other.draws_dropped_unknown_model;
+        draws_deferred_not_resident += other.draws_deferred_not_resident;
         skinned_dropped_no_skeleton += other.skinned_dropped_no_skeleton;
         palettes_over_budget += other.palettes_over_budget;
         shadow_capsules_over_budget += other.shadow_capsules_over_budget;
@@ -141,7 +161,8 @@ struct FrameDiagnostics {
     /// True when the frame silently lost something a host would want to know
     /// about — the one-line "should I look at the numbers?" predicate.
     [[nodiscard]] bool any() const {
-        return draws_dropped_unknown_model != 0 || skinned_dropped_no_skeleton != 0 || palettes_over_budget != 0 ||
+        return draws_dropped_unknown_model != 0 || draws_deferred_not_resident != 0 ||
+               skinned_dropped_no_skeleton != 0 || palettes_over_budget != 0 ||
                shadow_capsules_over_budget != 0 || effect_models_unresolved != 0 || lights_dropped != 0 ||
                cluster_lights_dropped != 0 || render_hooks_skipped != 0 || camera_missing;
     }
@@ -177,6 +198,7 @@ struct FrameStatsPartial {
     uint32_t entities_rendered = 0;
     uint32_t entities_distance_culled = 0;
     uint32_t entities_frustum_culled = 0;
+    uint32_t entities_occlusion_culled = 0;
     FrameDiagnostics diagnostics;
 
     /// Fold another chunk's partial into this one (chunk-order at joins).
@@ -186,6 +208,7 @@ struct FrameStatsPartial {
         entities_rendered += other.entities_rendered;
         entities_distance_culled += other.entities_distance_culled;
         entities_frustum_culled += other.entities_frustum_culled;
+        entities_occlusion_culled += other.entities_occlusion_culled;
         diagnostics += other.diagnostics;
         return *this;
     }
@@ -198,6 +221,7 @@ struct FrameStatsPartial {
         stats.entities_rendered += entities_rendered;
         stats.entities_distance_culled += entities_distance_culled;
         stats.entities_frustum_culled += entities_frustum_culled;
+        stats.entities_occlusion_culled += entities_occlusion_culled;
         diag += diagnostics;
     }
 };

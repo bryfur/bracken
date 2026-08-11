@@ -61,6 +61,20 @@ static void bin_main_chunk(std::span<const ModelDrawCommand> cmds, size_t begin,
         const Model* model = p.models->get_model(handle);
         if (model == nullptr) {
             stats.diagnostics.draws_dropped_unknown_model++;
+        } else if (!model->loaded) {
+            // Registered but NOT RESIDENT: the residency manager evicted it, or
+            // it has not finished streaming in. Counted apart from
+            // "unknown_model" on purpose — one is a host bug and permanent, the
+            // other is a budget condition and transient, and a streaming frame
+            // that reports them together is a wall of false bug reports.
+            //
+            // Dropped rather than binned: an unloaded model has no vertex or
+            // index buffers, so binning it would fill an instance bin the draw
+            // walk then skips. Unreachable unless something calls
+            // ModelManager::unload_model, which nothing did before residency
+            // existed — `Model::loaded` was set true and never cleared.
+            stats.diagnostics.draws_deferred_not_resident++;
+            continue;
         }
 
         // Main visibility only needs bounds when frustum culling is on; a
@@ -78,6 +92,29 @@ static void bin_main_chunk(std::span<const ModelDrawCommand> cmds, size_t begin,
                 stats.entities_frustum_culled++;
             }
             continue; // shadow binning for main-culled casters is the shadow views' job
+        }
+
+        // Hi-Z occlusion, between the frustum reject and entities_rendered so a
+        // culled draw is counted as culled rather than as rendered. Reuses the
+        // ONE get_model lookup above; needs real bounds, so a boundless command
+        // is never tested (it would project a degenerate point).
+        //
+        // NOT applied in bin_shadow_chunk, and that is a correctness rule, not
+        // an optimization: a camera-occluded object still casts into the view.
+        if (p.occlusion != nullptr && model != nullptr && model->bounding_half_diag > 0.0f) {
+            const glm::vec3 world_center = glm::vec3(t * glm::vec4(model->bounding_center, 1.0f));
+            const float world_radius = model->bounding_half_diag * max_scale_factor(t);
+            // The bounding SPHERE's box, not the oriented local AABB: it is what
+            // the frustum test already uses, it needs no per-corner transform,
+            // and it is a superset of the geometry — which is the direction that
+            // keeps the cull one-sided.
+            const glm::vec3 extent(world_radius);
+            if (occlusion_cull_aabb(*p.occlusion, world_center - extent, world_center + extent)) {
+                if (p.collect_stats) {
+                    stats.entities_occlusion_culled++;
+                }
+                continue;
+            }
         }
 
         if (p.collect_stats) {
@@ -158,6 +195,13 @@ static void bin_shadow_chunk(std::span<const ModelDrawCommand> cmds, size_t begi
         float world_radius = 0.0f;
         bool have_bounds = false;
         if (const Model* model = p.models->get_model(handle)) {
+            if (!model->loaded) {
+                // Not resident: no buffers to rasterize into the cascade. The
+                // main view counts this drop (it owns all model-command stats);
+                // here it is simply not binned. Occlusion is deliberately NOT
+                // tested in this walk — a camera-occluded object still casts.
+                continue;
+            }
             world_center = glm::vec3(t * glm::vec4(model->bounding_center, 1.0f));
             world_radius = model->bounding_half_diag * max_scale_factor(t);
             have_bounds = true;
@@ -365,6 +409,16 @@ static void resolve_skinned_chunk(std::span<const SkinnedDrawCommand> cmds, size
         }
         const BonePalette& rec = palettes[cmd.palette.value];
         Model* model = p.models->get_model(cmd.model_handle);
+        if (model != nullptr && !model->loaded) {
+            // Evicted or not yet streamed in. `unload_model` keeps the skeleton
+            // — only the payload goes — so this command would otherwise resolve
+            // with a full joint count, reach the draw walk, find no vertex
+            // buffer and disappear counted NOWHERE. Same counter as the static
+            // path, and for the same reason: it is a budget condition, not the
+            // host naming a handle nobody registered.
+            stats.diagnostics.draws_deferred_not_resident++;
+            continue;
+        }
         uint32_t joint_count = 0;
         if (model && model->has_skeleton) {
             // Drawn joints clamp to min(model joints, palette joints) — same

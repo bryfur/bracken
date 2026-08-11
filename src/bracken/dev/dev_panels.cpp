@@ -110,8 +110,12 @@ void draw_stats_tab(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
         ImGui::Text("Triangles: %u", stats.triangle_count);
         ImGui::Text("Instances: %u", stats.instances_drawn);
         ImGui::Text("Entities rendered: %u", stats.entities_rendered);
-        ImGui::Text("Entities culled: %u distance, %u frustum", stats.entities_distance_culled,
-                    stats.entities_frustum_culled);
+        // Occlusion is shown unconditionally, including the zero: a conservative
+        // culler reporting 0 in a dense scene is the readout that says its depth
+        // never arrived, and a row that appears only when non-zero cannot say
+        // that.
+        ImGui::Text("Entities culled: %u distance, %u frustum, %u occlusion", stats.entities_distance_culled,
+                    stats.entities_frustum_culled, stats.entities_occlusion_culled);
         ImGui::Text("UI: %u vertices in %u draws", stats.ui_vertices, stats.ui_draws);
         ImGui::Text("Local shadow tiles this frame: %u", stats.local_shadow_tiles_rendered);
         // Render-side snapshot counts (the live EffectSystem is sim-stage-
@@ -131,6 +135,7 @@ void draw_stats_tab(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
         if (diag.any()) {
             ImGui::SeparatorText("Dropped this frame");
             diagnostic_row("Draws with an unknown model handle", diag.draws_dropped_unknown_model);
+            diagnostic_row("Draws deferred (asset not resident)", diag.draws_deferred_not_resident);
             diagnostic_row("Skinned draws with no skeleton", diag.skinned_dropped_no_skeleton);
             diagnostic_row("Bone palettes over budget", diag.palettes_over_budget);
             diagnostic_row("Shadow capsules over budget", diag.shadow_capsules_over_budget);
@@ -478,6 +483,12 @@ void draw_graphics_tab(const DevUI::Bindings& bindings) {
     changed |= ImGui::Checkbox("Trees", &settings.trees_enabled);
     changed |= ImGui::Checkbox("Rocks", &settings.rocks_enabled);
     changed |= ImGui::Checkbox("Frustum culling", &settings.frustum_culling);
+    changed |= ImGui::Checkbox("Occlusion culling (experimental)", &settings.occlusion_culling);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Hi-Z draw culling against a frame-old depth pyramid.\n"
+                          "Conservative for a still camera; a heuristic while it moves.\n"
+                          "Off by default - see docs/gap_streaming.md.");
+    }
     changed |= ImGui::Checkbox("Show FPS", &settings.show_fps);
     changed |= ImGui::Checkbox("Debug HUD", &settings.show_debug_hud);
 

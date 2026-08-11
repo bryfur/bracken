@@ -9,6 +9,7 @@
 #include "bracken/contracts/camera_state.hpp"
 #include "bracken/contracts/environment.hpp"
 #include "bracken/contracts/frustum.hpp"
+#include "bracken/contracts/occlusion.hpp"
 #include "bracken/contracts/render_stats.hpp"
 #include "bracken/model_loader.hpp"
 #include "bracken/render/lighting/light_cluster.hpp"
@@ -67,6 +68,7 @@ class JobSystem;
 namespace bracken {
 class ModelManager;
 struct Heightmap;
+struct HeightmapGrid;
 struct EffectDefinition;
 struct Model;
 struct Mesh;
@@ -125,7 +127,21 @@ public:
 
     // ========== Configuration ==========
 
+    /// The single-map world. Since paged terrain landed this is the 1x1
+    /// adapter over set_heightmap_grid and nothing else.
     void set_heightmap(const Heightmap& heightmap);
+    /**
+     * An N x M grid of heightmap PAGES (docs/gap_streaming.md). Installs the
+     * per-page terrain meshes and rewires the grass height binding — which
+     * for a paged grid is a COARSE world-spanning proxy, so grass follows a
+     * smoothed terrain (a known limitation of this landing, see
+     * TerrainRenderer::heightmap_texture).
+     *
+     * A grid that fails HeightmapGrid::validate() is REFUSED with a logged
+     * error and the previous terrain is kept — see heightmap_grid.hpp for the
+     * seam-quantization trap that check exists for.
+     */
+    void set_heightmap_grid(const HeightmapGrid& grid);
     void set_anisotropic_filter(int level);
     void set_graphics_settings(const GraphicsSettings& settings);
     void set_vsync_mode(int mode);
@@ -201,6 +217,22 @@ public:
      * that still have it (the same constraint load_model_with_lods documents).
      */
     void build_raytracing_scene(const ModelManager& models, bool want_attributes);
+
+    /**
+     * Forget that the acceleration structure was ever built, so the next frame
+     * that needs one rebuilds it from scratch.
+     *
+     * THE ONLY CORRECT ANSWER TO AN EVICTION. `RtScene` rebuilds its TLAS when
+     * the instance SET changes — a hash of the count and the handle sequence —
+     * and unloading a model changes NEITHER, so nothing fires on its own and
+     * the BLAS keeps pointing at the CPU geometry `ModelManager::unload_model`
+     * just freed. `ResidencyManager` calls this through its geometry
+     * invalidator; anything else that unloads or reuploads a model must too.
+     *
+     * Cheap to call when ray tracing is off (it clears a bool); expensive when
+     * it is on (the next frame pays a full BLAS build, ~1 s for a village).
+     */
+    void invalidate_raytracing_scene() { rt_scene_built_ = false; }
 
     /// Per-frame instance list for the TLAS. Static scenes can call this once.
     void set_raytracing_instances(std::span<const std::pair<ModelHandle, glm::mat4>> instances);
@@ -649,6 +681,80 @@ private:
     /// Latched init failure (the device may not support R32_FLOAT with
     /// SIMULTANEOUS read-write) — same one-attempt policy as gi_init_failed_.
     bool hzb_init_failed_ = false;
+
+    // ---- Hi-Z draw occlusion culling (GraphicsSettings::occlusion_culling) --
+    //
+    // A SECOND pyramid, and not an oversight. hzb_ retains the CLOSEST surface
+    // because the screen-probe march needs that; culling needs the FARTHEST
+    // (render/hzb.hpp hzb_reduce_far). They are opposite reductions of the same
+    // buffer, so neither can be recovered from the other and one texture cannot
+    // serve both. Same lazy-create / latched-failure / destroy-on-off policy as
+    // hzb_.
+    std::unique_ptr<render::HzbPyramid> hzb_far_;
+    bool hzb_far_init_failed_ = false;
+    /// Destination of the coarse-mip download, sized to the level.
+    SDL_GPUTransferBuffer* occlusion_transfer_ = nullptr;
+    std::size_t occlusion_transfer_bytes_ = 0;
+    /// Fence of the readback submitted at the END of the previous frame, waited
+    /// on DETERMINISTICALLY at the start of this one. Deterministically, not
+    /// "if it happens to be signalled": a cull whose outcome depended on GPU
+    /// timing would make the frame irreproducible run to run and quietly retire
+    /// every pinned screenshot baseline. It is a full frame old and normally
+    /// already signalled, so the wait is expected to cost nothing.
+    SDL_GPUFence* occlusion_fence_ = nullptr;
+    /// The downloaded level, owned for the whole frame so the span the Prepare
+    /// stage reads cannot dangle.
+    std::vector<float> occlusion_depth_;
+    /// What the Prepare stage sees. Refilled each frame; `usable()` decides
+    /// whether it is consulted at all.
+    OcclusionField occlusion_field_;
+    /// A download has completed at least once since the last resize/enable.
+    bool occlusion_depth_ready_ = false;
+    /// Mip the CPU reads. 4 => 100x57 floats at 1600x900, 23 KB: coarse enough
+    /// that the download and the footprint walk are both trivial, fine enough
+    /// that a prop-sized box still covers a texel or two.
+    static constexpr int k_occlusion_level = 4;
+    /// Camera state at the moment the depth in `occlusion_depth_` was
+    /// rasterized — the inputs to the field's travel/rotation gates.
+    glm::mat4 occlusion_view_proj_{1.0f};
+    glm::vec3 occlusion_camera_position_{0.0f};
+    glm::vec3 occlusion_camera_forward_{0.0f, 0.0f, -1.0f};
+    /// Pending readback's camera state, promoted to the three above when the
+    /// download it belongs to is adopted.
+    glm::mat4 pending_occlusion_view_proj_{1.0f};
+    glm::vec3 pending_occlusion_camera_position_{0.0f};
+    glm::vec3 pending_occlusion_camera_forward_{0.0f, 0.0f, -1.0f};
+    /// Camera of the pyramid build RECORDED this frame, held until the readback
+    /// is submitted after the frame's command buffer (submit_occlusion_readback).
+    glm::mat4 occlusion_build_view_proj_{1.0f};
+    glm::vec3 occlusion_build_camera_position_{0.0f};
+    glm::vec3 occlusion_build_camera_forward_{0.0f, 0.0f, -1.0f};
+    /// A pyramid build was recorded on this frame's command buffer, so a
+    /// download is owed once that buffer has been submitted.
+    bool occlusion_build_recorded_ = false;
+    /// Per-frame answer from RenderPlan::occlusion_active.
+    bool frame_occlusion_active_ = false;
+
+    /// Wait the previous frame's readback, adopt it into occlusion_depth_ and
+    /// refill the geometric half of occlusion_field_. Main-thread.
+    void resolve_occlusion_readback();
+    /// Build the farthest-surface pyramid over this frame's prepass depth.
+    /// RECORDS only; the download is submitted separately. Main-thread; no pass
+    /// may be open on `cmd`.
+    void build_occlusion_pyramid(SDL_GPUCommandBuffer* cmd, const CameraState& camera);
+    /**
+     * Request the coarse-mip download of the pyramid this frame built.
+     *
+     * MUST be called after the frame's command buffer has been submitted. SDL3
+     * GPU executes command buffers in submission order and a readback rides its
+     * OWN buffer, submitted the instant it is recorded — so requesting it beside
+     * the build, which is only RECORDED on the frame's buffer, captures the
+     * PREVIOUS frame's pyramid and pairs two-frame-old depth with a
+     * one-frame-old matrix. Main-thread.
+     */
+    void submit_occlusion_readback();
+    /// Drop the pyramid, the transfer buffer and any in-flight fence.
+    void release_occlusion_resources();
 
     /// The R4b screen-probe gather. Same lazy-create / destroy-on-off policy as
     /// the pyramid it marches, and gated on the same mode: it is the quality

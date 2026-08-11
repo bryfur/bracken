@@ -34,6 +34,37 @@ namespace bracken::render {
 
 namespace {
 constexpr const char* LOG_TAG = "terrain";
+
+/// Union of a page's tile AABBs — the page-level reject box.
+///
+/// An empty tile list yields a degenerate box AT THE ORIGIN, and that box is
+/// NOT self-evidently rejected: a point at the world origin is inside the
+/// frustum whenever the camera is looking at it. What makes an empty page safe
+/// is upstream of the box — a tile is recorded only when its index count is
+/// non-zero, so no tiles means `page.index_count == 0`, and all three draw
+/// sites skip such a page before they ever consult its AABB.
+glm::vec3 tile_bounds_min(const std::vector<TerrainRenderer::TerrainTile>& tiles) {
+    if (tiles.empty()) {
+        return glm::vec3(0.0f);
+    }
+    glm::vec3 lo = tiles.front().aabb_min;
+    for (const TerrainRenderer::TerrainTile& tile : tiles) {
+        lo = glm::min(lo, tile.aabb_min);
+    }
+    return lo;
+}
+
+glm::vec3 tile_bounds_max(const std::vector<TerrainRenderer::TerrainTile>& tiles) {
+    if (tiles.empty()) {
+        return glm::vec3(0.0f);
+    }
+    glm::vec3 hi = tiles.front().aabb_max;
+    for (const TerrainRenderer::TerrainTile& tile : tiles) {
+        hi = glm::max(hi, tile.aabb_max);
+    }
+    return hi;
+}
+
 } // namespace
 
 namespace gpu = bracken::gpu;
@@ -68,7 +99,8 @@ bool TerrainRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeli
 
     load_terrain_textures();
     // Note: terrain mesh will be generated when heightmap is received
-    // For now, generate a flat placeholder
+    // For now, generate a flat placeholder — one page, no height data.
+    rebuild_pages();
     generate_terrain_mesh();
     generate_shadow_terrain_mesh();
 
@@ -76,15 +108,103 @@ bool TerrainRenderer::init(gpu::GPUDevice& device, gpu::PipelineRegistry& pipeli
 }
 
 void TerrainRenderer::set_heightmap(const bracken::Heightmap& heightmap) {
-    // Store CPU-side copy for height queries
-    heightmap_ = std::make_unique<bracken::Heightmap>(heightmap);
+    // The 1x1 adapter. Every pre-paging host call site lands here, and the
+    // grid path below reproduces the old mesh/tile/draw stream exactly for a
+    // single page — see docs/gap_streaming.md.
+    set_heightmap_grid(bracken::HeightmapGrid::from_single(heightmap));
+}
 
-    // Upload to GPU texture
+void TerrainRenderer::set_heightmap_grid(const bracken::HeightmapGrid& grid) {
+    const core::Result<void, std::string> check = grid.validate();
+    if (!check) {
+        // Refusing is the point: an accepted-but-inconsistent grid renders as
+        // a stepped seam with nothing logged anywhere.
+        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::set_heightmap_grid: refusing the grid — {}", check.error());
+        return;
+    }
+    if (grid.page_count() > 1 && grid.page_size < bracken::HeightmapGrid::k_recommended_min_page_size) {
+        // Degradation, not failure: correct but expensive. See
+        // set_heightmap_grid's draw-call arithmetic.
+        BRACKEN_LOG_WARN(LOG_TAG,
+                         "TerrainRenderer::set_heightmap_grid: {}x{} pages of {:.0f} units is below the {:.0f}-unit "
+                         "recommendation — tile runs never merge across pages, so every visible page costs at least "
+                         "6 draws a frame (main + prepass + 4 cascades)",
+                         grid.pages_x, grid.pages_z, grid.page_size,
+                         bracken::HeightmapGrid::k_recommended_min_page_size);
+    }
+
+    grid_ = grid;
+    has_heightmap_ = grid_.resident_pages() > 0;
+
+    rebuild_pages();
+    // Order preserved from the pre-paging path: texture first, then the two
+    // meshes (both of which sample get_height, i.e. the CPU side).
     upload_heightmap_texture();
-
-    // Regenerate terrain mesh using new heightmap (both high and low LOD)
     generate_terrain_mesh();
     generate_shadow_terrain_mesh();
+}
+
+void TerrainRenderer::rebuild_pages() {
+    const uint32_t nx = std::max(grid_.pages_x, 1u);
+    const uint32_t nz = std::max(grid_.pages_z, 1u);
+    pages_.clear();
+    pages_.resize(static_cast<std::size_t>(nx) * nz);
+    for (uint32_t pz = 0; pz < nz; ++pz) {
+        for (uint32_t px = 0; px < nx; ++px) {
+            TerrainPage& page = pages_[static_cast<std::size_t>(pz) * nx + px];
+            page.px = static_cast<int>(px);
+            page.pz = static_cast<int>(pz);
+        }
+    }
+}
+
+TerrainRenderer::PageRect TerrainRenderer::page_mesh_rect(int px, int pz) const {
+    // THE SINGLE-PAGE RULE, and it is a compatibility rule rather than an
+    // aesthetic one: before paging the mesh spanned the renderer's init-time
+    // world rect (world_width_ x world_height_) plus a 500-unit margin, and
+    // that rect has never been derived from the heightmap — a map may be any
+    // size and sampling clamps. A 1x1 grid therefore keeps exactly that rect,
+    // which is what makes the adapter bit-identical. Only a genuinely PAGED
+    // grid switches to grid-derived page rects.
+    if (grid_.pages_x <= 1 && grid_.pages_z <= 1) {
+        return PageRect{-k_page_margin, -k_page_margin, world_width_ + k_page_margin, world_height_ + k_page_margin};
+    }
+    const glm::vec2 lo = grid_.page_min_xz(px, pz);
+    const glm::vec2 hi = grid_.page_max_xz(px, pz);
+    PageRect rect{lo.x, lo.y, hi.x, hi.y};
+    // The margin ring belongs to the OUTSIDE of the world only: adding it at
+    // an interior seam would overlap the neighbour's geometry and z-fight.
+    if (px == 0) {
+        rect.start_x -= k_page_margin;
+    }
+    if (pz == 0) {
+        rect.start_z -= k_page_margin;
+    }
+    if (static_cast<uint32_t>(px) + 1 == grid_.pages_x) {
+        rect.end_x += k_page_margin;
+    }
+    if (static_cast<uint32_t>(pz) + 1 == grid_.pages_z) {
+        rect.end_z += k_page_margin;
+    }
+    return rect;
+}
+
+std::size_t TerrainRenderer::resident_pages() const {
+    std::size_t count = 0;
+    for (const TerrainPage& page : pages_) {
+        if (page.has_buffers()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::size_t TerrainRenderer::page_bytes() const {
+    std::size_t bytes = 0;
+    for (const TerrainPage& page : pages_) {
+        bytes += page.gpu_bytes;
+    }
+    return bytes + grass_proxy_bytes_;
 }
 
 void TerrainRenderer::update_splatmap(const uint8_t* data, uint32_t resolution) {
@@ -103,30 +223,116 @@ void TerrainRenderer::update_splatmap(const uint8_t* data, uint32_t resolution) 
 }
 
 void TerrainRenderer::upload_heightmap_texture() {
-    if (!heightmap_ || !device_) {
+    if (!device_) {
         return;
     }
 
-    // Release old texture if exists
-    heightmap_texture_.reset();
+    for (TerrainPage& page : pages_) {
+        // Release the old texture first: a page being re-uploaded must not
+        // hold two R16 surfaces at once on a streamed world.
+        if (page.heightmap_texture) {
+            page.gpu_bytes -= std::min(page.gpu_bytes, page.heightmap_texture_bytes);
+        }
+        page.heightmap_texture.reset();
+        page.heightmap_texture_bytes = 0;
 
-    // Create R16 texture for heightmap (16-bit unsigned normalized)
-    // This preserves full precision from server-provided height data
-    heightmap_texture_ = gpu::GPUTexture::create_2d(*device_, heightmap_->resolution, heightmap_->resolution,
-                                                    gpu::TextureFormat::R16, heightmap_->height_data.data(),
-                                                    false // No mipmaps for heightmap
-    );
+        const bracken::Heightmap* map = grid_.page(page.px, page.pz);
+        if (map == nullptr) {
+            continue; // page not resident — a flat placeholder mesh is drawn
+        }
 
-    if (!heightmap_texture_) {
-        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::upload_heightmap_texture: Failed to create heightmap texture");
+        // Create R16 texture for heightmap (16-bit unsigned normalized)
+        // This preserves full precision from server-provided height data
+        page.heightmap_texture = gpu::GPUTexture::create_2d(*device_, map->resolution, map->resolution,
+                                                            gpu::TextureFormat::R16, map->height_data.data(),
+                                                            false // No mipmaps for heightmap
+        );
+
+        if (!page.heightmap_texture) {
+            BRACKEN_LOG_ERROR(LOG_TAG,
+                              "TerrainRenderer::upload_heightmap_texture: Failed to create heightmap texture for page "
+                              "({},{})",
+                              page.px, page.pz);
+            continue;
+        }
+        page.heightmap_texture_bytes = static_cast<std::size_t>(map->resolution) * map->resolution * sizeof(uint16_t);
+        page.gpu_bytes += page.heightmap_texture_bytes;
     }
+
+    rebuild_grass_heightmap();
+}
+
+void TerrainRenderer::rebuild_grass_heightmap() {
+    grass_proxy_texture_.reset();
+    grass_proxy_bytes_ = 0;
+    grass_heightmap_texture_ = nullptr;
+    grass_params_ = HeightmapSampleParams{};
+
+    if (pages_.empty() || !device_) {
+        return;
+    }
+
+    // 1x1: hand grass the page's own texture and the map's own five scalars —
+    // byte for byte what SceneRenderer::set_heightmap did before paging.
+    if (grid_.pages_x <= 1 && grid_.pages_z <= 1) {
+        const bracken::Heightmap* map = grid_.page(0, 0);
+        grass_heightmap_texture_ = pages_[0].heightmap_texture.get();
+        if (map != nullptr) {
+            grass_params_ = HeightmapSampleParams{map->world_origin_x, map->world_origin_z, map->world_size,
+                                                  map->min_height, map->max_height};
+        }
+        return;
+    }
+
+    // Paged: grass_blade.hlsli's sampleTerrainHeight hard-codes ONE texture,
+    // ONE origin and ONE square world size, so a paged grid gets a coarse
+    // world-spanning PROXY resampled through the grid sampler. Grass follows
+    // a smoothed terrain — the documented limitation of this landing, not an
+    // accident. Grass only draws inside GrassRenderer's view distance, so the
+    // error that matters is the near-field one, and near-field terrain is
+    // exactly where a per-page texture would have full resolution; revisit
+    // this when GrassVertexUniforms can afford a page index.
+    const uint32_t page_res = grid_.page_resolution();
+    if (page_res < 2) {
+        return;
+    }
+    const uint32_t ideal = page_res * std::max(grid_.pages_x, grid_.pages_z);
+    const uint32_t side = std::max(2u, std::min(ideal, k_grass_proxy_max_resolution));
+    const float span = std::max(grid_.world_size_x(), grid_.world_size_z());
+    const float range_span = grid_.range.max - grid_.range.min;
+
+    std::vector<uint16_t> texels(static_cast<std::size_t>(side) * side);
+    for (uint32_t iz = 0; iz < side; ++iz) {
+        const float wz = grid_.origin_z + (static_cast<float>(iz) / static_cast<float>(side - 1)) * span;
+        for (uint32_t ix = 0; ix < side; ++ix) {
+            const float wx = grid_.origin_x + (static_cast<float>(ix) / static_cast<float>(side - 1)) * span;
+            const float h = grid_.get_height_world(wx, wz, grid_.range.min);
+            // The same packing Heightmap::from_floats uses, because the grass
+            // shader decodes with the same raw*(max-min)+min formula.
+            float normalized = range_span > 0.0f ? (h - grid_.range.min) / range_span : 0.0f;
+            normalized = std::clamp(normalized, 0.0f, 1.0f);
+            texels[static_cast<std::size_t>(iz) * side + ix] = static_cast<uint16_t>(normalized * 65535.0f);
+        }
+    }
+
+    grass_proxy_texture_ =
+        gpu::GPUTexture::create_2d(*device_, side, side, gpu::TextureFormat::R16, texels.data(), false);
+    if (!grass_proxy_texture_) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer: failed to create the {}x{} grass heightmap proxy", side, side);
+        return;
+    }
+    grass_proxy_bytes_ = texels.size() * sizeof(uint16_t);
+    grass_heightmap_texture_ = grass_proxy_texture_.get();
+    grass_params_ = HeightmapSampleParams{grid_.origin_x, grid_.origin_z, span, grid_.range.min, grid_.range.max};
+    BRACKEN_LOG_DEBUG(LOG_TAG, "TerrainRenderer: grass heightmap proxy {}x{} over {:.0f} world units", side, side,
+                      span);
 }
 
 void TerrainRenderer::shutdown() {
-    vertex_buffer_.reset();
-    index_buffer_.reset();
-    shadow_vertex_buffer_.reset();
-    shadow_index_buffer_.reset();
+    pages_.clear();
+    grass_proxy_texture_.reset();
+    grass_proxy_bytes_ = 0;
+    grass_heightmap_texture_ = nullptr;
 
     // Release terrain textures
     material_array_texture_.reset();
@@ -134,11 +340,10 @@ void TerrainRenderer::shutdown() {
 
     material_sampler_.reset();
     splatmap_sampler_.reset();
-    heightmap_texture_.reset();
-    heightmap_.reset();
+    grid_ = bracken::HeightmapGrid{};
+    has_heightmap_ = false;
     device_ = nullptr;
     pipeline_registry_ = nullptr;
-    index_count_ = 0;
 }
 
 void TerrainRenderer::load_terrain_textures() {
@@ -292,17 +497,19 @@ void TerrainRenderer::create_fallback_splatmap() {
 }
 
 float TerrainRenderer::get_height(float x, float z) const {
-    // Sample from CPU-side heightmap if available
-    if (heightmap_) {
-        return heightmap_->get_height_world(x, z);
+    // Sample from the CPU-side page grid if any page is resident. For the 1x1
+    // grid the adapter builds this IS Heightmap::get_height_world, with no
+    // arithmetic in front of it.
+    if (has_heightmap_) {
+        return grid_.get_height_world(x, z);
     }
     // Fallback: return 0 (flat) if no heightmap yet
     return 0.0f;
 }
 
 glm::vec3 TerrainRenderer::get_normal(float x, float z) const {
-    if (heightmap_) {
-        return heightmap_->get_normal_world(x, z);
+    if (has_heightmap_) {
+        return grid_.get_normal_world(x, z);
     }
     // Fallback: return up vector
     return {0.0f, 1.0f, 0.0f};
@@ -313,15 +520,26 @@ void TerrainRenderer::generate_terrain_mesh() {
     if (!device_) {
         return;
     }
+    for (TerrainPage& page : pages_) {
+        generate_page_mesh(page);
+    }
+}
+
+void TerrainRenderer::generate_page_mesh(TerrainPage& page) {
+    if (!device_) {
+        return;
+    }
 
     // Reduced margin: 5000 added 10000 units of terrain ring outside the world
     // (400x wider x 400x taller at cell=25 = huge triangle count). 500 is enough
     // for visual continuity beyond world edge; tile culling hides the rest anyway.
-    float margin = 500.0f;
-    float start_x = -margin;
-    float start_z = -margin;
-    float end_x = world_width_ + margin;
-    float end_z = world_height_ + margin;
+    // Paged: the ring is applied only on the grid's OUTER edges — see
+    // page_mesh_rect.
+    const PageRect rect = page_mesh_rect(page.px, page.pz);
+    float start_x = rect.start_x;
+    float start_z = rect.start_z;
+    float end_x = rect.end_x;
+    float end_z = rect.end_z;
 
     float cell_size = 25.0f;
     int cells_x = static_cast<int>((end_x - start_x) / cell_size);
@@ -402,8 +620,9 @@ void TerrainRenderer::generate_terrain_mesh() {
     }
 
     // Build indices per tile, track index ranges + AABBs for frustum culling.
-    tiles_.clear();
-    tiles_.reserve(tiles_x * tiles_z);
+    std::vector<TerrainTile>& tiles_out = page.tiles;
+    tiles_out.clear();
+    tiles_out.reserve(static_cast<size_t>(tiles_x) * tiles_z);
     for (int tz = 0; tz < tiles_z; ++tz) {
         for (int tx = 0; tx < tiles_x; ++tx) {
             int cell_x_start = tx * TILE_CELLS;
@@ -441,30 +660,33 @@ void TerrainRenderer::generate_terrain_mesh() {
             tile.aabb_min = glm::vec3(start_x + cell_x_start * cell_size, min_y, start_z + cell_z_start * cell_size);
             tile.aabb_max = glm::vec3(start_x + cell_x_end * cell_size, max_y, start_z + cell_z_end * cell_size);
             if (tile.index_count > 0) {
-                tiles_.push_back(tile);
+                tiles_out.push_back(tile);
             }
         }
     }
-    build_tile_rows(core::jobs::JobSystem::instance(), tiles_, tile_rows_);
+    build_tile_rows(core::jobs::JobSystem::instance(), tiles_out, page.rows);
+    page.aabb_min = tile_bounds_min(tiles_out);
+    page.aabb_max = tile_bounds_max(tiles_out);
 
-    index_count_ = static_cast<uint32_t>(index_count);
+    page.index_count = static_cast<uint32_t>(index_count);
 
-    vertex_buffer_ = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Vertex, vertices,
-                                                   vertex_count * sizeof(TerrainVertex));
+    page.vertex_buffer = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Vertex, vertices,
+                                                       vertex_count * sizeof(TerrainVertex));
 
-    if (!vertex_buffer_) {
+    if (!page.vertex_buffer) {
         BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::generate_terrain_mesh: Failed to create vertex buffer");
         return;
     }
 
-    index_buffer_ =
+    page.index_buffer =
         gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Index, indices, index_count * sizeof(uint32_t));
 
-    if (!index_buffer_) {
+    if (!page.index_buffer) {
         BRACKEN_LOG_ERROR(LOG_TAG, "TerrainRenderer::generate_terrain_mesh: Failed to create index buffer");
-        vertex_buffer_.reset();
+        page.vertex_buffer.reset();
         return;
     }
+    page.gpu_bytes += vertex_count * sizeof(TerrainVertex) + index_count * sizeof(uint32_t);
 }
 
 void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const glm::mat4& view,
@@ -479,8 +701,10 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
                              const SDL_GPUTextureSamplerBinding* local_shadow_binding,
                              const gi::GiBindings* gi) {
     BRACKEN_PROFILE_ZONE_COLOR("TerrainRenderer::render", 0xC0392B);
-    // Skip rendering if required resources aren't available
-    if (!pipeline_registry_ || !vertex_buffer_ || !index_buffer_ || !pass || !cmd) {
+    // Skip rendering if required resources aren't available. The per-page
+    // predicate is deliberately the pre-paging one (buffers, not index count)
+    // so a 1x1 grid takes the identical early-out.
+    if (!pipeline_registry_ || !pass || !cmd || !any_page(&TerrainPage::has_buffers)) {
         return;
     }
     if (!material_array_texture_ || !splatmap_texture_ || !material_sampler_) {
@@ -630,24 +854,34 @@ void TerrainRenderer::render(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
         SDL_BindGPUFragmentStorageTextures(pass, 0, di, 3);
     }
 
-    // Bind vertex buffer
-    SDL_GPUBufferBinding vb_binding = {vertex_buffer_->handle(), 0};
-    SDL_BindGPUVertexBuffers(pass, 0, &vb_binding, 1);
+    // Tile-culled draw, per page: the page's own AABB is rejected first (one
+    // test that skips a whole page's buffers and cull), then whole rows are
+    // AABB-rejected, then surviving tiles are tested individually. Visible
+    // tiles with contiguous index ranges (tiles are stored row-major,
+    // back-to-back in the page's index buffer) merge into a single draw —
+    // typically collapsing 90-260 per-tile draws into ~10-30 row runs. Runs
+    // never merge ACROSS pages: different index buffers.
+    // Fallback: if no frustum provided or no tiles, draw the whole page mesh.
+    for (const TerrainPage& page : pages_) {
+        if (!page.has_buffers() || page.index_count == 0) {
+            continue;
+        }
+        const bool cull = (frustum != nullptr) && !page.tiles.empty();
+        if (cull && !frustum->intersects_aabb(page.aabb_min, page.aabb_max)) {
+            continue;
+        }
 
-    // Bind index buffer
-    SDL_GPUBufferBinding ib_binding = {index_buffer_->handle(), 0};
-    SDL_BindGPUIndexBuffer(pass, &ib_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        SDL_GPUBufferBinding vb_binding = {page.vertex_buffer->handle(), 0};
+        SDL_BindGPUVertexBuffers(pass, 0, &vb_binding, 1);
 
-    // Tile-culled draw: whole rows are AABB-rejected first, then surviving
-    // tiles are tested individually. Visible tiles with contiguous index
-    // ranges (tiles are stored row-major, back-to-back in the index buffer)
-    // merge into a single draw — typically collapsing 90-260 per-tile draws
-    // into ~10-30 row runs.
-    // Fallback: if no frustum provided or no tiles, draw the whole mesh.
-    if (frustum && !tiles_.empty()) {
-        draw_culled_tiles(core::jobs::JobSystem::instance(), pass, *frustum, tiles_, tile_rows_);
-    } else {
-        SDL_DrawGPUIndexedPrimitives(pass, index_count_, 1, 0, 0, 0);
+        SDL_GPUBufferBinding ib_binding = {page.index_buffer->handle(), 0};
+        SDL_BindGPUIndexBuffer(pass, &ib_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+
+        if (cull) {
+            draw_culled_tiles(core::jobs::JobSystem::instance(), pass, *frustum, page.tiles, page.rows);
+        } else {
+            SDL_DrawGPUIndexedPrimitives(pass, page.index_count, 1, 0, 0, 0);
+        }
     }
 }
 
@@ -835,7 +1069,7 @@ void TerrainRenderer::render_prepass(SDL_GPURenderPass* pass, SDL_GPUCommandBuff
                                      const gpu::PrepassCameraUniforms& uniforms, gpu::PipelineType pipeline_type,
                                      const scene::Frustum* frustum) {
     BRACKEN_PROFILE_ZONE_COLOR("TerrainRenderer::render_prepass", 0xC0392B);
-    if (!pipeline_registry_ || !vertex_buffer_ || !index_buffer_ || index_count_ == 0 || !pass || !cmd) {
+    if (!pipeline_registry_ || !pass || !cmd || !any_page(&TerrainPage::drawable)) {
         return;
     }
 
@@ -847,35 +1081,37 @@ void TerrainRenderer::render_prepass(SDL_GPURenderPass* pass, SDL_GPUCommandBuff
     pipeline->bind(pass);
     SDL_PushGPUVertexUniformData(cmd, 0, &uniforms, sizeof(uniforms));
 
-    // Full-LOD mesh + the same tile culling as render(): the forward pass
-    // depth-tests EQUAL, so the prepass must cover exactly the same geometry.
-    SDL_GPUBufferBinding vb_binding = {vertex_buffer_->handle(), 0};
-    SDL_BindGPUVertexBuffers(pass, 0, &vb_binding, 1);
+    // Full-LOD mesh + the same page reject and tile culling as render(): the
+    // forward pass depth-tests EQUAL, so the prepass must cover exactly the
+    // same geometry — which is why the page reject has to be the identical
+    // predicate on the identical AABB, not an approximation of it.
+    for (const TerrainPage& page : pages_) {
+        if (!page.drawable()) {
+            continue;
+        }
+        const bool cull = (frustum != nullptr) && !page.tiles.empty();
+        if (cull && !frustum->intersects_aabb(page.aabb_min, page.aabb_max)) {
+            continue;
+        }
 
-    SDL_GPUBufferBinding ib_binding = {index_buffer_->handle(), 0};
-    SDL_BindGPUIndexBuffer(pass, &ib_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        SDL_GPUBufferBinding vb_binding = {page.vertex_buffer->handle(), 0};
+        SDL_BindGPUVertexBuffers(pass, 0, &vb_binding, 1);
 
-    if (frustum && !tiles_.empty()) {
-        draw_culled_tiles(core::jobs::JobSystem::instance(), pass, *frustum, tiles_, tile_rows_);
-    } else {
-        SDL_DrawGPUIndexedPrimitives(pass, index_count_, 1, 0, 0, 0);
+        SDL_GPUBufferBinding ib_binding = {page.index_buffer->handle(), 0};
+        SDL_BindGPUIndexBuffer(pass, &ib_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+
+        if (cull) {
+            draw_culled_tiles(core::jobs::JobSystem::instance(), pass, *frustum, page.tiles, page.rows);
+        } else {
+            SDL_DrawGPUIndexedPrimitives(pass, page.index_count, 1, 0, 0, 0);
+        }
     }
 }
 
 void TerrainRenderer::render_shadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd,
                                     const glm::mat4& light_view_projection, const scene::Frustum* frustum) {
     BRACKEN_PROFILE_ZONE_COLOR("TerrainRenderer::render_shadow", 0xE67E22);
-    if (!pipeline_registry_ || !pass || !cmd) {
-        return;
-    }
-
-    // Prefer the low-LOD shadow mesh (4x coarser -> 16x fewer triangles per cascade).
-    const bool using_shadow_mesh = (shadow_vertex_buffer_ && shadow_index_buffer_ && shadow_index_count_ > 0);
-    gpu::GPUBuffer* vb = using_shadow_mesh ? shadow_vertex_buffer_.get() : vertex_buffer_.get();
-    gpu::GPUBuffer* ib = using_shadow_mesh ? shadow_index_buffer_.get() : index_buffer_.get();
-    uint32_t idx_count = using_shadow_mesh ? shadow_index_count_ : index_count_;
-    const std::vector<TerrainTile>* tile_list = using_shadow_mesh ? &shadow_tiles_ : &tiles_;
-    if (!vb || !ib || idx_count == 0) {
+    if (!pipeline_registry_ || !pass || !cmd || !any_page(&TerrainPage::shadow_drawable)) {
         return;
     }
 
@@ -890,26 +1126,80 @@ void TerrainRenderer::render_shadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffe
     shadow_uniforms.lightViewProjection = light_view_projection;
     SDL_PushGPUVertexUniformData(cmd, 0, &shadow_uniforms, sizeof(shadow_uniforms));
 
-    SDL_GPUBufferBinding vb_binding = {vb->handle(), 0};
-    SDL_BindGPUVertexBuffers(pass, 0, &vb_binding, 1);
+    // Per-page, per-cascade tile culling: cascade 0 (tight near) draws maybe
+    // 2-5 tiles, cascade 3 (far) draws many but still skips half the world.
+    // The page AABB is rejected first, then rows, then tiles; contiguous
+    // visible runs merge into single draws (same as the main pass).
+    for (const TerrainPage& page : pages_) {
+        // Prefer the low-LOD shadow mesh (4x coarser -> 16x fewer triangles
+        // per cascade). Decided per page, which for a 1x1 grid is the same
+        // decision the pre-paging code made once.
+        const bool using_shadow_mesh =
+            (page.shadow_vertex_buffer && page.shadow_index_buffer && page.shadow_index_count > 0);
+        gpu::GPUBuffer* vb = using_shadow_mesh ? page.shadow_vertex_buffer.get() : page.vertex_buffer.get();
+        gpu::GPUBuffer* ib = using_shadow_mesh ? page.shadow_index_buffer.get() : page.index_buffer.get();
+        const uint32_t idx_count = using_shadow_mesh ? page.shadow_index_count : page.index_count;
+        const std::vector<TerrainTile>& tile_list = using_shadow_mesh ? page.shadow_tiles : page.tiles;
+        const std::vector<TileRow>& rows = using_shadow_mesh ? page.shadow_rows : page.rows;
+        if (!vb || !ib || idx_count == 0) {
+            continue;
+        }
 
-    SDL_GPUBufferBinding ib_binding = {ib->handle(), 0};
-    SDL_BindGPUIndexBuffer(pass, &ib_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        const bool cull = (frustum != nullptr) && !tile_list.empty();
+        if (cull) {
+            const glm::vec3& lo = using_shadow_mesh ? page.shadow_aabb_min : page.aabb_min;
+            const glm::vec3& hi = using_shadow_mesh ? page.shadow_aabb_max : page.aabb_max;
+            if (!frustum->intersects_aabb(lo, hi)) {
+                continue;
+            }
+        }
 
-    // Per-cascade tile culling: cascade 0 (tight near) draws maybe 2-5 tiles,
-    // cascade 3 (far) draws many but still skips half the world. Rows are
-    // AABB-rejected before their tiles; contiguous visible runs merge into
-    // single draws (same as the main pass).
-    if (frustum && !tile_list->empty()) {
-        const std::vector<TileRow>& rows = using_shadow_mesh ? shadow_tile_rows_ : tile_rows_;
-        draw_culled_tiles(core::jobs::JobSystem::instance(), pass, *frustum, *tile_list, rows);
-    } else {
-        SDL_DrawGPUIndexedPrimitives(pass, idx_count, 1, 0, 0, 0);
+        SDL_GPUBufferBinding vb_binding = {vb->handle(), 0};
+        SDL_BindGPUVertexBuffers(pass, 0, &vb_binding, 1);
+
+        SDL_GPUBufferBinding ib_binding = {ib->handle(), 0};
+        SDL_BindGPUIndexBuffer(pass, &ib_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+
+        if (cull) {
+            draw_culled_tiles(core::jobs::JobSystem::instance(), pass, *frustum, tile_list, rows);
+        } else {
+            SDL_DrawGPUIndexedPrimitives(pass, idx_count, 1, 0, 0, 0);
+        }
     }
+}
+
+bool TerrainRenderer::any_page(bool (TerrainPage::*predicate)() const) const {
+    for (const TerrainPage& page : pages_) {
+        if ((page.*predicate)()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void TerrainRenderer::generate_shadow_terrain_mesh() {
     BRACKEN_PROFILE_ZONE_COLOR("TerrainRenderer::generate_shadow_terrain_mesh", 0xE67E22);
+    if (!device_) {
+        return;
+    }
+    std::size_t total_shadow_indices = 0;
+    std::size_t total_shadow_tiles = 0;
+    std::size_t total_main_indices = 0;
+    std::size_t total_main_tiles = 0;
+    for (TerrainPage& page : pages_) {
+        generate_page_shadow_mesh(page);
+        total_shadow_indices += page.shadow_index_count;
+        total_shadow_tiles += page.shadow_tiles.size();
+        total_main_indices += page.index_count;
+        total_main_tiles += page.tiles.size();
+    }
+    BRACKEN_LOG_INFO(LOG_TAG,
+                     "TerrainRenderer: {} page(s), shadow {} tiles -> {} triangles (main: {} tris, {} tiles)",
+                     pages_.size(), total_shadow_tiles, total_shadow_indices / 3, total_main_indices / 3,
+                     total_main_tiles);
+}
+
+void TerrainRenderer::generate_page_shadow_mesh(TerrainPage& page) {
     if (!device_) {
         return;
     }
@@ -919,13 +1209,15 @@ void TerrainRenderer::generate_shadow_terrain_mesh() {
     // per-texel shadow resolution at typical camera ranges, so visual impact
     // is imperceptible while triangle count drops 16x.
     constexpr float kShadowCellSize = 100.0f;
-    constexpr float kShadowMargin = 500.0f; // tighter — shadow pass frustum-culls tiles anyway
-    constexpr int TILE_CELLS = 16;          // 16 cells @ 100 units = 1600 world units per tile
+    constexpr int TILE_CELLS = 16; // 16 cells @ 100 units = 1600 world units per tile
 
-    float start_x = -kShadowMargin;
-    float start_z = -kShadowMargin;
-    float end_x = world_width_ + kShadowMargin;
-    float end_z = world_height_ + kShadowMargin;
+    // The same rect as the main mesh — the margin ring is k_page_margin on
+    // both, which is what the two private 500s were before paging.
+    const PageRect rect = page_mesh_rect(page.px, page.pz);
+    float start_x = rect.start_x;
+    float start_z = rect.start_z;
+    float end_x = rect.end_x;
+    float end_z = rect.end_z;
 
     int cells_x = static_cast<int>((end_x - start_x) / kShadowCellSize);
     int cells_z = static_cast<int>((end_z - start_z) / kShadowCellSize);
@@ -982,8 +1274,9 @@ void TerrainRenderer::generate_shadow_terrain_mesh() {
         }
     }
 
-    shadow_tiles_.clear();
-    shadow_tiles_.reserve(static_cast<size_t>(tiles_x) * tiles_z);
+    std::vector<TerrainTile>& shadow_tiles_out = page.shadow_tiles;
+    shadow_tiles_out.clear();
+    shadow_tiles_out.reserve(static_cast<size_t>(tiles_x) * tiles_z);
     for (int tz = 0; tz < tiles_z; ++tz) {
         for (int tx = 0; tx < tiles_x; ++tx) {
             int cx0 = tx * TILE_CELLS;
@@ -1018,20 +1311,20 @@ void TerrainRenderer::generate_shadow_terrain_mesh() {
             tile.aabb_min = glm::vec3(start_x + cx0 * kShadowCellSize, min_y, start_z + cz0 * kShadowCellSize);
             tile.aabb_max = glm::vec3(start_x + cx1 * kShadowCellSize, max_y, start_z + cz1 * kShadowCellSize);
             if (tile.index_count > 0) {
-                shadow_tiles_.push_back(tile);
+                shadow_tiles_out.push_back(tile);
             }
         }
     }
-    build_tile_rows(core::jobs::JobSystem::instance(), shadow_tiles_, shadow_tile_rows_);
+    build_tile_rows(core::jobs::JobSystem::instance(), shadow_tiles_out, page.shadow_rows);
+    page.shadow_aabb_min = tile_bounds_min(shadow_tiles_out);
+    page.shadow_aabb_max = tile_bounds_max(shadow_tiles_out);
 
-    shadow_vertex_buffer_ = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Vertex, vertices.data(),
-                                                          vertices.size() * sizeof(TerrainVertex));
-    shadow_index_buffer_ = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Index, indices.data(),
-                                                         indices.size() * sizeof(uint32_t));
-    shadow_index_count_ = static_cast<uint32_t>(indices.size());
-    BRACKEN_LOG_INFO(LOG_TAG,
-                     "TerrainRenderer: Shadow mesh {} cells / {} tiles -> {} triangles (main: {} tris, {} tiles)",
-                     cells_x * cells_z, shadow_tiles_.size(), shadow_index_count_ / 3, index_count_ / 3, tiles_.size());
+    page.shadow_vertex_buffer = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Vertex, vertices.data(),
+                                                              vertices.size() * sizeof(TerrainVertex));
+    page.shadow_index_buffer = gpu::GPUBuffer::create_static(*device_, gpu::GPUBuffer::Type::Index, indices.data(),
+                                                             indices.size() * sizeof(uint32_t));
+    page.shadow_index_count = static_cast<uint32_t>(indices.size());
+    page.gpu_bytes += vertices.size() * sizeof(TerrainVertex) + indices.size() * sizeof(uint32_t);
 }
 
 } // namespace bracken::render

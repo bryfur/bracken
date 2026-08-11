@@ -1,5 +1,8 @@
 #include "hzb.hpp"
 
+#include "bracken/core/assert.hpp"
+#include "bracken/core/jobs/job_stage.hpp"
+#include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_compute.hpp"
@@ -30,10 +33,11 @@ HzbPyramid::~HzbPyramid() {
     shutdown();
 }
 
-bool HzbPyramid::init(gpu::GPUDevice& device, int width, int height) {
+bool HzbPyramid::init(gpu::GPUDevice& device, int width, int height, HzbReduction reduction) {
     device_ = &device;
     width_ = width;
     height_ = height;
+    reduction_ = reduction;
     mip_count_ = hzb_mip_count(width, height);
 
     if (!device.supports_format(HZB_FORMAT, SDL_GPU_TEXTURETYPE_2D, HZB_USAGE)) {
@@ -65,7 +69,8 @@ bool HzbPyramid::init(gpu::GPUDevice& device, int width, int height) {
         return false;
     }
 
-    BRACKEN_LOG_DEBUG(LOG_TAG, "HzbPyramid: {}x{} R32_FLOAT, {} mips", width_, height_, mip_count_);
+    BRACKEN_LOG_DEBUG(LOG_TAG, "HzbPyramid: {}x{} R32_FLOAT, {} mips, {} surface", width_, height_, mip_count_,
+                      reduction_ == HzbReduction::Farthest ? "farthest" : "closest");
     return true;
 }
 
@@ -154,7 +159,13 @@ void HzbPyramid::build(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelin
     // no intra-pass synchronization, and its documentation is explicit that a
     // dispatch depending on a previous dispatch's output must sit in a new
     // pass. Collapsing these would read half-written mips.
-    gpu::GPUComputePipeline* reduce = pipelines.get_compute_pipeline(gpu::ComputePipelineType::HzbReduce);
+    // The reduction is baked into the level chain, so the pipeline is chosen
+    // once from what this pyramid IS, never per call site. Wiring a culler to
+    // the closest-surface chain is the failure hzb_reduce_far's comment is
+    // about.
+    gpu::GPUComputePipeline* reduce = pipelines.get_compute_pipeline(
+        reduction_ == HzbReduction::Farthest ? gpu::ComputePipelineType::HzbReduceFar
+                                             : gpu::ComputePipelineType::HzbReduce);
     if (reduce == nullptr) {
         return;
     }
@@ -188,6 +199,65 @@ void HzbPyramid::build(SDL_GPUCommandBuffer* cmd, gpu::PipelineRegistry& pipelin
         pass.push_uniforms(0, &u, sizeof(u));
         pass.dispatch_for(*reduce, static_cast<uint32_t>(dst_w), static_cast<uint32_t>(dst_h));
     }
+}
+
+std::size_t HzbPyramid::level_readback_bytes(int level) const {
+    if (level < 0 || level >= mip_count_) {
+        return 0;
+    }
+    const std::size_t w = static_cast<std::size_t>(hzb_mip_size(width_, level));
+    const std::size_t h = static_cast<std::size_t>(hzb_mip_size(height_, level));
+    return w * h * sizeof(float);
+}
+
+SDL_GPUFence* HzbPyramid::request_level_readback(int level, SDL_GPUTransferBuffer* dst) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+    if (device_ == nullptr || !is_ready() || dst == nullptr) {
+        return nullptr;
+    }
+    if (level < 1 || level >= mip_count_) {
+        // Level 0 is refused rather than clamped: it is the whole screen, and a
+        // caller asking for it has almost certainly mixed up "the pyramid" with
+        // "a coarse level of the pyramid".
+        // Throttled: this is a public entry point a caller can reach every
+        // frame, and a per-frame refusal would be a log flood rather than a
+        // diagnostic.
+        BRACKEN_LOG_WARN_ONCE(LOG_TAG, "HzbPyramid::request_level_readback: level {} is out of range [1, {})", level,
+                              mip_count_);
+        return nullptr;
+    }
+
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device_->handle());
+    if (cmd == nullptr) {
+        return nullptr;
+    }
+    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
+    if (copy == nullptr) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return nullptr;
+    }
+
+    SDL_GPUTextureRegion src = {};
+    src.texture = texture_->handle();
+    src.mip_level = static_cast<Uint32>(level);
+    src.layer = 0;
+    src.w = static_cast<Uint32>(hzb_mip_size(width_, level));
+    src.h = static_cast<Uint32>(hzb_mip_size(height_, level));
+    src.d = 1;
+
+    SDL_GPUTextureTransferInfo info = {};
+    info.transfer_buffer = dst;
+    info.offset = 0;
+    // Zero means "tightly packed" per SDL's own documentation; spelling it out
+    // rather than leaving it implicit, because a wrong pitch here reads as a
+    // sheared depth image on the CPU and looks like a projection bug.
+    info.pixels_per_row = src.w;
+    info.rows_per_layer = src.h;
+
+    SDL_DownloadFromGPUTexture(copy, &src, &info);
+    SDL_EndGPUCopyPass(copy);
+    return SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
 }
 
 } // namespace bracken::render

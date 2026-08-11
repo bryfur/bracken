@@ -1030,6 +1030,23 @@ void ModelLoader::free_gpu_resources(Model& model) {
     }
 }
 
+void ModelLoader::free_gpu_resources(TextureCache& textures, Model& model) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+    for (auto& mesh : model.meshes) {
+        // One release per non-null slot, mirroring upload_to_gpu's one acquire
+        // per slot. Two meshes referencing the same image took two references
+        // and give back two; a null slot never took one. Doing this from the
+        // Mesh rather than from a per-model list is what keeps the pairing
+        // impossible to get out of step with the upload.
+        textures.release(mesh.texture);
+        textures.release(mesh.material.normal_texture);
+        textures.release(mesh.material.metallic_roughness_texture);
+        textures.release(mesh.material.emissive_texture);
+    }
+    free_gpu_resources(model);
+}
+
 ModelManager::ModelManager() {
     // Reserve slot 0 as INVALID_MODEL_HANDLE
     models_.push_back(nullptr);
@@ -1346,7 +1363,10 @@ bool ModelManager::reload_model(ModelHandle handle) {
     if (device_) {
         ModelLoader::upload_to_gpu(*device_, textures_, *fresh);
         if (models_[handle]) {
-            ModelLoader::free_gpu_resources(*models_[handle]);
+            // Counted release: the outgoing contents took references at their
+            // own upload, and a hot-reload that never gave them back would
+            // leave every reloaded model's images pinned forever.
+            ModelLoader::free_gpu_resources(textures_, *models_[handle]);
         }
     }
     if (models_[handle]) {
@@ -1397,6 +1417,150 @@ void ModelManager::unload_all() {
     model_paths_.clear();
     model_paths_.emplace_back();
     name_to_handle_.clear();
+}
+
+std::size_t ModelManager::gpu_bytes(ModelHandle handle) const noexcept {
+    if (handle == INVALID_MODEL_HANDLE || handle >= models_.size() || !models_[handle]) {
+        return 0;
+    }
+    const Model& model = *models_[handle];
+    std::size_t total = 0;
+    for (const Mesh& mesh : model.meshes) {
+        if (mesh.vertex_buffer) {
+            total += mesh.vertex_buffer->size();
+        }
+        if (mesh.index_buffer) {
+            total += mesh.index_buffer->size();
+        }
+        total += textures_.texture_bytes(mesh.texture);
+        total += textures_.texture_bytes(mesh.material.normal_texture);
+        total += textures_.texture_bytes(mesh.material.metallic_roughness_texture);
+        total += textures_.texture_bytes(mesh.material.emissive_texture);
+    }
+    return total;
+}
+
+std::size_t ModelManager::unload_model(ModelHandle handle) {
+    // Destroys GPU resources and mutates the model table: main-thread tier.
+    BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+    if (handle == INVALID_MODEL_HANDLE || handle >= models_.size() || !models_[handle]) {
+        return 0;
+    }
+    Model& model = *models_[handle];
+    if (!model.loaded) {
+        return 0;
+    }
+    // Measured BEFORE the free, because afterwards there is nothing to measure.
+    const std::size_t released = gpu_bytes(handle);
+    ModelLoader::free_gpu_resources(textures_, model);
+    // Retained CPU geometry is the other half of an evicted model's footprint
+    // — for a ray-traced scene it is the LARGER half — so it goes too. That is
+    // also precisely why the acceleration structure has to be rebuilt: its
+    // BLAS triangles were copied out of these arrays.
+    for (Mesh& mesh : model.meshes) {
+        mesh.vertices.clear();
+        mesh.vertices.shrink_to_fit();
+        mesh.skinned_vertices.clear();
+        mesh.skinned_vertices.shrink_to_fit();
+        mesh.indices.clear();
+        mesh.indices.shrink_to_fit();
+    }
+    // The slot, the name, the path, the bounds and the LOD links all stay —
+    // only `loaded` flips, which is the single flag every consumer tests.
+    model.loaded = false;
+    return released;
+}
+
+bool ModelManager::reupload_model(ModelHandle handle, std::unique_ptr<Model> decoded) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+    if (handle == INVALID_MODEL_HANDLE || handle >= models_.size() || !models_[handle]) {
+        BRACKEN_LOG_ERROR("model", "reupload_model: handle {} names no slot", handle);
+        return false;
+    }
+    if (!decoded) {
+        BRACKEN_LOG_ERROR("model", "reupload_model: null model for handle {}", handle);
+        return false;
+    }
+    // Refused BEFORE anything is destroyed, exactly as register_model refuses an
+    // empty model: accepting one would leave the slot flagged `loaded` with no
+    // geometry, which every consumer reads as "resident" and draws as nothing.
+    bool any_geometry = false;
+    for (const Mesh& mesh : decoded->meshes) {
+        if (mesh.uploaded || !mesh.vertices.empty() || !mesh.skinned_vertices.empty()) {
+            any_geometry = true;
+            break;
+        }
+    }
+    if (!any_geometry) {
+        BRACKEN_LOG_ERROR("model", "reupload_model: handle {}: {}", handle,
+                          to_string(ModelRegisterError::EmptyModel));
+        return false;
+    }
+
+    // "Replace" as well as "restore": a still-loaded slot gives its resources
+    // back first, so the texture references stay balanced either way.
+    (void)unload_model(handle);
+
+    Model& slot = *models_[handle];
+    // The LOD chain belongs to the SLOT, not to the freshly decoded bytes: a
+    // decode knows nothing about the levels that were generated for this model
+    // and would silently orphan them (they stay registered, unreachable, and
+    // select_lod stops finding them).
+    std::vector<ModelHandle> lod_handles = std::move(slot.lod_handles);
+    std::vector<float> lod_thresholds = std::move(slot.lod_thresholds);
+    // Same for the BOUNDS: unload_model's contract is that the slot's bounds
+    // survive an eviction, and a hand-authored box (a skinned model with
+    // animation headroom) is exactly the kind a decode cannot reproduce.
+    const AABB slot_bounds = slot.bounds;
+
+    // Move-assign into the existing object so raw Model* handed to callers
+    // stay valid — the same contract reload_model keeps.
+    slot = std::move(*decoded);
+    slot.lod_handles = std::move(lod_handles);
+    slot.lod_thresholds = std::move(lod_thresholds);
+    if (slot.bounds.empty()) {
+        slot.bounds = slot_bounds;
+    }
+
+    // BOUNDS BEFORE THE UPLOAD, and this is not a style choice: upload_to_gpu
+    // frees the CPU vertex arrays (unless retention is on), so a scan afterwards
+    // finds nothing, leaves the box empty and gives compute_bounding_sphere a
+    // zero radius — which the Prepare stage reads as "no bounds", silently
+    // changing how a streamed-back model culls and which LOD it picks.
+    // register_model derives them at this same point for the same reason.
+    if (slot.bounds.empty()) {
+        glm::vec3 lo(std::numeric_limits<float>::max());
+        glm::vec3 hi(std::numeric_limits<float>::lowest());
+        for (const Mesh& mesh : slot.meshes) {
+            for (const auto& v : mesh.vertices) {
+                lo = glm::min(lo, v.position);
+                hi = glm::max(hi, v.position);
+            }
+            for (const auto& v : mesh.skinned_vertices) {
+                lo = glm::min(lo, v.position);
+                hi = glm::max(hi, v.position);
+            }
+        }
+        if (lo.x <= hi.x) {
+            slot.bounds = {lo, hi};
+        }
+    }
+    slot.compute_bounding_sphere();
+
+    if (device_ != nullptr) {
+        ModelLoader::upload_to_gpu(*device_, textures_, slot, retain_cpu_geometry_);
+        for (const Mesh& mesh : slot.meshes) {
+            if (!mesh.uploaded) {
+                BRACKEN_LOG_ERROR("model", "reupload_model: handle {}: {}", handle,
+                                  to_string(ModelRegisterError::UploadFailed));
+                return false; // slot stays unloaded — the caller sees the refusal
+            }
+        }
+    }
+    slot.loaded = true;
+    return true;
 }
 
 } // namespace bracken

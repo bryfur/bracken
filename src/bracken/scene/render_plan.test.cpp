@@ -347,3 +347,73 @@ TEST(RenderPlan, FullCapabilityCube) {
     }
     EXPECT_EQ(rows, 2 * 2 * 2 * 2 * 2 * 3 * 3 * 2);
 }
+
+// ===========================================================================
+// Occlusion culling (docs/gap_streaming.md piece c). The gate is pure and
+// headless for the same reason every other pass gate is: the decision must be
+// reproducible run to run, and putting it here rather than in an `if` next to a
+// fence query is what guarantees that.
+// ===========================================================================
+
+TEST(RenderPlan, OcclusionIsOffByDefault) {
+    // The standing additivity gate. If this ever flips, the pinned smoke
+    // baselines are measuring a different renderer.
+    GraphicsSettings gfx;
+    EXPECT_FALSE(gfx.occlusion_culling);
+    RendererCaps caps = all_ready();
+    caps.occlusion_depth_ready = true;
+    EXPECT_FALSE(plan_frame(gfx, content_packet(), caps).occlusion_active);
+}
+
+TEST(RenderPlan, OcclusionNeedsTheSettingTheHdrPathAndACompletedReadback) {
+    for (int setting = 0; setting < 2; ++setting) {
+        for (int post = 0; post < 2; ++post) {
+            for (int depth = 0; depth < 2; ++depth) {
+                GraphicsSettings gfx;
+                gfx.occlusion_culling = setting != 0;
+                RendererCaps caps = all_ready();
+                caps.post_ready = post != 0;
+                caps.occlusion_depth_ready = depth != 0;
+                const RenderPlan p = plan_frame(gfx, content_packet(), caps);
+                EXPECT_EQ(p.occlusion_active, setting && post && depth)
+                    << "setting=" << setting << " post=" << post << " depth=" << depth;
+            }
+        }
+    }
+}
+
+TEST(RenderPlan, OcclusionIsOffOnTheFirstFrameAfterEnabling) {
+    // There is no readback yet, so there is no field — and the first frame with
+    // the setting on must therefore behave exactly like the frame before it.
+    GraphicsSettings gfx;
+    gfx.occlusion_culling = true;
+    RendererCaps caps = all_ready();
+    caps.occlusion_depth_ready = false;
+    EXPECT_FALSE(plan_frame(gfx, content_packet(), caps).occlusion_active);
+    caps.occlusion_depth_ready = true;
+    EXPECT_TRUE(plan_frame(gfx, content_packet(), caps).occlusion_active);
+}
+
+TEST(RenderPlan, OcclusionDoesNotDisturbAnyOtherDecision) {
+    // Additivity, asserted rather than eyeballed: turning the setting on must
+    // change exactly one field of the plan.
+    GraphicsSettings off;
+    GraphicsSettings on;
+    on.occlusion_culling = true;
+    RendererCaps caps = all_ready();
+    caps.occlusion_depth_ready = true;
+    const RenderPlan a = plan_frame(off, content_packet(), caps);
+    const RenderPlan b = plan_frame(on, content_packet(), caps);
+
+    EXPECT_NE(a.occlusion_active, b.occlusion_active);
+    EXPECT_EQ(a.has_content, b.has_content);
+    EXPECT_EQ(a.use_hdr_path, b.use_hdr_path);
+    EXPECT_EQ(a.taa_active, b.taa_active);
+    EXPECT_EQ(a.ibl_active, b.ibl_active);
+    EXPECT_EQ(a.fog_active, b.fog_active);
+    EXPECT_EQ(a.do_frustum_cull, b.do_frustum_cull);
+    EXPECT_FLOAT_EQ(a.draw_dist_sq, b.draw_dist_sq);
+    EXPECT_EQ(a.active_cascades, b.active_cascades);
+    EXPECT_EQ(a.invalidate_taa_history, b.invalidate_taa_history);
+    EXPECT_EQ(a.invalidate_auto_exposure, b.invalidate_auto_exposure);
+}

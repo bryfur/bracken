@@ -41,7 +41,9 @@ class EffectSystem;
 
 class ModelManager;
 class Application;
+class ResidencyManager;
 struct Heightmap;
+struct HeightmapGrid;
 
 /**
  * A scoped edit of the persisted graphics settings, committed on destruction.
@@ -277,6 +279,49 @@ protected:
     scene::PacketRing& frame_packets();
 
     void set_heightmap(const Heightmap& heightmap);
+
+    /**
+     * Install an N x M grid of heightmap PAGES instead of the single map
+     * (docs/gap_streaming.md). `set_heightmap(m)` is exactly
+     * `set_heightmap_grid(HeightmapGrid::from_single(m))`.
+     *
+     * Refuses — logged, previous terrain kept — a grid that fails
+     * `HeightmapGrid::validate()`. The check that matters is that every
+     * resident page shares one quantization range: pages packed
+     * independently disagree about the heights on the line they share and the
+     * seam STEPS, with nothing logged anywhere. Build the grid with
+     * `HeightmapGrid::create` + `set_page` and it cannot happen.
+     *
+     * Main-thread tier, after init_renderer().
+     */
+    void set_heightmap_grid(const HeightmapGrid& grid);
+
+    /**
+     * Install a host-owned residency manager, pumped at the frame fence.
+     *
+     * The fence is the only correct place: it is the pipeline's quiescent
+     * point, so no packet referencing an asset the pump is about to evict is
+     * being built or rendered. Hot-reload applies there for exactly the same
+     * reason. Pass null to detach.
+     *
+     * The manager must outlive the detach (or the Application). Installing one
+     * also wires its geometry invalidator to
+     * `SceneRenderer::invalidate_raytracing_scene()` when the renderer exists,
+     * which is what stops an eviction from leaving the acceleration structure
+     * pointing at freed geometry — call `init_renderer()` first, or install the
+     * invalidator yourself.
+     *
+     * That invalidator captures a RAW pointer to the renderer, so
+     * `shutdown_renderer()` clears it and detaches the manager. A host-owned
+     * manager therefore outlives the Application safely but stops invalidating;
+     * re-install it after any later `init_renderer()`.
+     *
+     * Main-thread tier. Forward-declared deliberately: `residency_manager.hpp`
+     * reaches the `gpu/` layer through ModelManager, and application.hpp is
+     * forbidden from exporting that (public_headers.test.cpp).
+     */
+    void set_residency(ResidencyManager* residency);
+    [[nodiscard]] ResidencyManager* residency() const noexcept { return residency_; }
 
     /**
      * GRAPHICS SETTINGS APPLICATION (window mode, vsync, sampler rebuilds —
@@ -610,6 +655,9 @@ private:
     // packet rendering while the next is being simulated).
     std::unique_ptr<scene::PacketRing> packet_ring_;
     std::unique_ptr<scene::SceneRenderer> scene_renderer_;
+    /// Host-owned; null unless set_residency() installed one. Pumped at the
+    /// frame fence, never anywhere else.
+    ResidencyManager* residency_ = nullptr;
     std::unique_ptr<systems::CameraSystem> camera_;
     std::unique_ptr<systems::EffectSystem> effect_system_; // sim-stage owned (see effect_system())
     std::unique_ptr<audio::AudioEngine> audio_;            // owns the SDL audio device + mixer

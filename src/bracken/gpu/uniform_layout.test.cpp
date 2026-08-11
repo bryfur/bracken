@@ -473,6 +473,10 @@ const UniformRow UNIFORM_TABLE[] = {
     // Hierarchical-Z pyramid (render/hzb.hpp).
     ROW("hzb_copy.comp.spv", 2, 0, gpu::HzbCopyUniforms),
     ROW("hzb_reduce.comp.spv", 2, 0, gpu::HzbReduceUniforms),
+    // The farthest-surface chain (draw occlusion culling) shares the cbuffer
+    // exactly; only its reduction operator differs — render/hzb.hpp's
+    // hzb_reduce_far.
+    ROW("hzb_reduce_far.comp.spv", 2, 0, gpu::HzbReduceUniforms),
     // Screen-probe gather (render/gi/screen_probes.hpp, R4b). Six passes, six
     // cbuffers. GiScreenProbeTraceUniforms's leading 336 bytes are
     // ShadowDataUniforms field for field, for the same reason

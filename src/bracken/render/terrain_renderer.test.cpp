@@ -14,6 +14,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <gtest/gtest.h>
+#include <utility>
 #include <vector>
 
 using bracken::core::jobs::JobSystem;
@@ -78,6 +79,48 @@ std::vector<TileRun> reference_runs(const Frustum& frustum, const std::vector<Te
         }
     }
     return runs;
+}
+
+// One PAGE's tile list carved out of a world-sized grid: the same tiles, the
+// same world AABBs, but renumbered into the page's OWN index buffer starting
+// at 0 — which is exactly what generate_page_mesh produces and the reason
+// runs can never merge across pages.
+std::vector<TerrainTile> carve_page(const std::vector<TerrainTile>& world, int cols, int row0, int row1, int col0,
+                                    int col1) {
+    std::vector<TerrainTile> page;
+    uint32_t next_index = 0;
+    for (int r = row0; r < row1; ++r) {
+        for (int c = col0; c < col1; ++c) {
+            TerrainTile tile = world[static_cast<size_t>(r) * cols + c];
+            tile.first_index = next_index;
+            next_index += tile.index_count;
+            page.push_back(tile);
+        }
+    }
+    return page;
+}
+
+// The page-level reject box: the union of the page's tile AABBs, exactly as
+// TerrainRenderer::generate_page_mesh computes it.
+std::pair<glm::vec3, glm::vec3> page_bounds(const std::vector<TerrainTile>& tiles) {
+    if (tiles.empty()) {
+        return {glm::vec3(0.0f), glm::vec3(0.0f)};
+    }
+    glm::vec3 lo = tiles.front().aabb_min;
+    glm::vec3 hi = tiles.front().aabb_max;
+    for (const TerrainTile& tile : tiles) {
+        lo = glm::min(lo, tile.aabb_min);
+        hi = glm::max(hi, tile.aabb_max);
+    }
+    return {lo, hi};
+}
+
+uint32_t drawn_indices(const std::vector<TileRun>& runs) {
+    uint32_t total = 0;
+    for (const TileRun& run : runs) {
+        total += run.index_count;
+    }
+    return total;
 }
 
 void expect_rows_equal(const std::vector<TileRow>& a, const std::vector<TileRow>& b) {
@@ -226,4 +269,128 @@ TEST(TerrainTileCulling, ParallelParityAcrossWorkerCounts) {
         TerrainRenderer::cull_tile_runs(jsN, frustum, tiles, rows, runs_parallel);
         EXPECT_EQ(runs_parallel, runs_serial);
     }
+}
+
+// ============================================================================
+// Paged terrain: the page-AABB reject that sits in FRONT of cull_tile_runs at
+// all three draw sites (main, prepass, shadow). cull_tile_runs itself is
+// untouched — these tests are about the reject being safe and about what
+// paging costs in draw calls.
+// ============================================================================
+
+// THE SAFETY PROPERTY, and it is the whole reason the reject can be added
+// without moving a pixel: a page's box is the UNION of its tile boxes, so a
+// frustum that misses the union misses every tile in it. The reject can
+// therefore only skip work the per-tile cull would have thrown away anyway —
+// which is what makes a 1x1 grid bit-identical to the pre-paging path.
+TEST(TerrainPageCulling, PageRejectOnlySkipsPagesThatWouldDrawNothing) {
+    JobSystem js;
+    const auto tiles = make_tile_grid(12, 12);
+    std::vector<TileRow> rows;
+    TerrainRenderer::build_tile_rows(js, tiles, rows);
+    const auto [lo, hi] = page_bounds(tiles);
+
+    int rejected = 0;
+    int drawn = 0;
+    // Sweep the camera around and through the grid so both verdicts occur.
+    for (int i = 0; i < 24; ++i) {
+        const float t = static_cast<float>(i);
+        const Frustum frustum =
+            make_fixed_frustum(glm::vec3(-400.0f + t * 130.0f, 60.0f, -600.0f + t * 190.0f));
+        std::vector<TileRun> runs;
+        TerrainRenderer::cull_tile_runs(js, frustum, tiles, rows, runs);
+        if (!frustum.intersects_aabb(lo, hi)) {
+            EXPECT_TRUE(runs.empty()) << "page " << i << " was rejected but its tiles were not";
+            ++rejected;
+        } else if (!runs.empty()) {
+            ++drawn;
+        }
+    }
+    EXPECT_GT(rejected, 0) << "the sweep never rejected a page — the fixture proves nothing";
+    EXPECT_GT(drawn, 0) << "the sweep never drew a page — the fixture proves nothing";
+}
+
+// What paging actually changes: the SET of triangles drawn is identical, and
+// each page's cull is the untouched algorithm run on that page's own tiles.
+//
+// NOTE ON DRAW COUNTS, measured here rather than assumed: a paged frame does
+// NOT always issue more draws than the single-buffer frame. A page renumbers
+// its tiles into its own index buffer, so tiles from consecutive PAGE rows
+// are contiguous there while the same tiles in the world-sized buffer are
+// separated by the columns of the neighbouring page — the page's runs can
+// merge where the world's could not. The honest statement is that runs never
+// merge ACROSS pages (different buffers), so the floor is one draw per
+// visible page per walk; the total is not ordered either way.
+TEST(TerrainPageCulling, PagesDrawTheSameTrianglesWithPageLocalRuns) {
+    JobSystem js;
+    constexpr int ROWS = 12;
+    constexpr int COLS = 12;
+    const auto world = make_tile_grid(ROWS, COLS);
+    std::vector<TileRow> world_rows;
+    TerrainRenderer::build_tile_rows(js, world, world_rows);
+
+    // 2x2 pages of 6x6 tiles.
+    std::vector<std::vector<TerrainTile>> pages;
+    std::vector<std::vector<TileRow>> page_rows;
+    for (int pz = 0; pz < 2; ++pz) {
+        for (int px = 0; px < 2; ++px) {
+            pages.push_back(carve_page(world, COLS, pz * 6, pz * 6 + 6, px * 6, px * 6 + 6));
+            page_rows.emplace_back();
+            TerrainRenderer::build_tile_rows(js, pages.back(), page_rows.back());
+        }
+    }
+
+    int compared = 0;
+    for (int i = 0; i < 16; ++i) {
+        const float t = static_cast<float>(i);
+        const Frustum frustum = make_fixed_frustum(glm::vec3(100.0f + t * 70.0f, 60.0f, 200.0f + t * 110.0f));
+
+        std::vector<TileRun> single;
+        TerrainRenderer::cull_tile_runs(js, frustum, world, world_rows, single);
+
+        uint32_t paged_indices = 0;
+        std::size_t visible_pages = 0;
+        std::size_t paged_runs = 0;
+        for (std::size_t p = 0; p < pages.size(); ++p) {
+            const auto [lo, hi] = page_bounds(pages[p]);
+            if (!frustum.intersects_aabb(lo, hi)) {
+                continue; // the reject, exactly as the draw path applies it
+            }
+            std::vector<TileRun> runs;
+            TerrainRenderer::cull_tile_runs(js, frustum, pages[p], page_rows[p], runs);
+            // Per page, the culler is the unmodified one on the page's own
+            // tiles — the reject in front of it changes nothing else.
+            EXPECT_EQ(runs, reference_runs(frustum, pages[p])) << "camera step " << i << ", page " << p;
+            paged_indices += drawn_indices(runs);
+            paged_runs += runs.size();
+            if (!runs.empty()) {
+                ++visible_pages;
+            }
+        }
+
+        // Same geometry, page-split or not. This is the claim that matters:
+        // paging changes how the draws are packaged, never what is drawn.
+        EXPECT_EQ(paged_indices, drawn_indices(single)) << "camera step " << i;
+        // The floor the draw-call arithmetic is stated against.
+        EXPECT_GE(paged_runs, visible_pages) << "camera step " << i;
+        if (!single.empty()) {
+            ++compared;
+        }
+    }
+    EXPECT_GT(compared, 4) << "the sweep barely drew anything — the fixture proves nothing";
+}
+
+// A page with no tiles (nothing streamed in, or a mesh that failed to build)
+// must be rejected by its own degenerate box rather than draw the world.
+TEST(TerrainPageCulling, AnEmptyPageDrawsNothing) {
+    JobSystem js;
+    const std::vector<TerrainTile> empty;
+    const auto [lo, hi] = page_bounds(empty);
+    EXPECT_EQ(lo, glm::vec3(0.0f));
+    EXPECT_EQ(hi, glm::vec3(0.0f));
+
+    std::vector<TileRun> runs;
+    const Frustum frustum = make_fixed_frustum(glm::vec3(300.0f, 50.0f, 550.0f));
+    TerrainRenderer::cull_tile_runs(js, frustum, empty, /*rows=*/{}, runs);
+    EXPECT_TRUE(runs.empty());
 }

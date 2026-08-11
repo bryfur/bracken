@@ -45,6 +45,22 @@ public:
     struct Request {
         std::string name;        ///< registration name
         std::string source;      ///< pack entry name, or a filesystem path
+        /**
+         * Slot to REUPLOAD into instead of registering a new model.
+         *
+         * INVALID_MODEL_HANDLE (the default) is the original behaviour: the
+         * finished decode goes through `ModelManager::register_model`, which
+         * assigns the next handle in request order.
+         *
+         * A valid handle instead routes the decode to
+         * `ModelManager::reupload_model(handle, ...)`. That exists because
+         * `register_model` REFUSES a name it already knows
+         * (`ModelRegisterError::NameAlreadyRegistered`) — so streaming a model
+         * back in after an eviction has no route through the registering path,
+         * and inventing one would mean either orphaning the old handle or
+         * renumbering, both of which break handle stability.
+         */
+        ModelHandle reupload_into = INVALID_MODEL_HANDLE;
     };
 
     struct Completed {

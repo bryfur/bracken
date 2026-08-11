@@ -38,6 +38,7 @@
 
 #include "bracken/animation/animation_types.hpp"
 #include "bracken/contracts/frustum.hpp"
+#include "bracken/contracts/occlusion.hpp"
 #include "bracken/testing/frame_test.hpp"
 #include "bracken/contracts/render_stats.hpp"
 #include "bracken/core/jobs/job_system.hpp"
@@ -48,8 +49,10 @@
 #include "bracken/scene/scene_prep.hpp"
 #include "bracken/scene/transform_math.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -685,4 +688,270 @@ TEST(ScenePrepGolden, GoldensHoldUnderTheFanOut) {
     ASSERT_EQ(resolved.size(), 3u);
     EXPECT_EQ(stats.diagnostics.skinned_dropped_no_skeleton, 2u);
     EXPECT_EQ(resolved[2].prev_palette_offset, PREV_PALETTE_OFFSET);
+}
+
+// ============================================================================
+// RESIDENCY (docs/gap_streaming.md piece b): a registered-but-EVICTED model is
+// not the same failure as an unregistered handle, and the two counters must
+// never be conflated.
+// ============================================================================
+
+namespace {
+
+/// Binning against caller-supplied params (the fixture's own runner uses
+/// `world.params()` and cannot vary it).
+void run_binning_with(jobs::JobSystem& js, const GoldenWorld& world, const ScenePrep::PrepParams& p,
+                      PrepOutputs& out, ScenePrep::PrepScratch& scratch) {
+    const ScenePrep::InstanceBinOutputs bindings = out.bindings();
+    ScenePrep::prep_instance_batches(js, world.packet.model_commands(), p, scratch, bindings);
+}
+
+} // namespace
+
+TEST(ScenePrepResidency, EvictedModelIsCountedAsNotResidentNotAsUnknown) {
+    GoldenWorld world;
+    // Seven commands name H_CUBE. The residency test sits right after the ONE
+    // model lookup, i.e. after the distance cull but BEFORE the frustum cull —
+    // a draw whose asset is missing is a fact about the asset, not about where
+    // the camera is pointing. So CMD_TOO_FAR (distance-culled) is the only cube
+    // command that does not reach it, and the count is 6.
+    ASSERT_EQ(world.models.unload_model(H_CUBE), 0u) << "no device: nothing was uploaded, so nothing is released";
+    const Model* cube = world.models.get_model(H_CUBE);
+    ASSERT_NE(cube, nullptr) << "unload_model must KEEP the slot";
+    EXPECT_FALSE(cube->loaded);
+
+    jobs::JobSystem js;
+    js.init(0);
+    ScenePrep::PrepScratch scratch;
+    PrepOutputs out;
+    run_binning(js, world, out, scratch);
+
+    // The unknown-handle command is untouched by residency, and vice versa.
+    EXPECT_EQ(out.stats.diagnostics.draws_dropped_unknown_model, 1u);
+    EXPECT_GT(out.stats.diagnostics.draws_deferred_not_resident, 0u);
+    // Distance/frustum culls happen BEFORE the residency test, so exactly the
+    // cube commands that used to be rendered are the ones now deferred.
+    EXPECT_EQ(out.stats.diagnostics.draws_deferred_not_resident, 6u)
+        << "CUBE_NEAR, BEHIND, NON_INSTANCED, CUBE_MOVING, CUBE_NO_FOG, HIGH_ABOVE";
+    // Nothing was binned for the evicted handle.
+    EXPECT_EQ(out.touched, (std::vector<ModelHandle>{H_SLAB, H_UNKNOWN}));
+    for (const auto& cascade : out.shadow_touched) {
+        EXPECT_EQ(std::count(cascade.begin(), cascade.end(), H_CUBE), 0)
+            << "an unloaded model has no buffers to rasterize into a cascade";
+    }
+}
+
+TEST(ScenePrepResidency, AnEvictedSkinnedModelIsCountedToo) {
+    // unload_model keeps the SKELETON — only the payload goes — so an evicted
+    // skinned command still resolves with a full joint count, reaches the draw
+    // walk, finds no vertex buffer and draws nothing. Without this counter that
+    // disappearance is invisible in every diagnostic the engine has, which is
+    // the one thing CLAUDE.md's "does not drop work silently" rule forbids.
+    GoldenWorld world;
+    ASSERT_EQ(world.models.unload_model(H_SKINNED), 0u) << "no device: nothing was uploaded";
+    const Model* skinned = world.models.get_model(H_SKINNED);
+    ASSERT_NE(skinned, nullptr) << "unload_model must KEEP the slot";
+    ASSERT_TRUE(skinned->has_skeleton) << "the skeleton survives an eviction — that is what makes this reachable";
+    EXPECT_FALSE(skinned->loaded);
+
+    jobs::JobSystem js;
+    ScenePrep::PrepScratch scratch;
+    std::vector<ScenePrep::ResolvedSkinnedEntry> resolved;
+    FrameStatsPartial stats;
+    ScenePrep::prep_resolve_skinned(js, world.packet.skinned_commands(), world.packet.palettes(), world.params(),
+                                    scratch.skinned, resolved, stats);
+
+    // The three commands naming H_SKINNED are now deferred instead of resolved.
+    EXPECT_TRUE(resolved.empty());
+    EXPECT_EQ(stats.diagnostics.draws_deferred_not_resident, 3u);
+    // And they are NOT charged to the "no skeleton" counter: that one still
+    // holds exactly the two commands whose model genuinely has none.
+    EXPECT_EQ(stats.diagnostics.skinned_dropped_no_skeleton, 2u);
+    // A deferred draw is not a rendered one either.
+    EXPECT_EQ(stats.entities_rendered, 0u);
+}
+
+TEST(ScenePrepResidency, NotResidentCountIsIdenticalAtAnyWorkerCount) {
+    std::array<uint32_t, 3> counts{};
+    const std::array<int, 3> workers{0, 1, 4};
+    for (std::size_t k = 0; k < workers.size(); ++k) {
+        GoldenWorld world;
+        (void)world.models.unload_model(H_CUBE);
+        jobs::JobSystem js;
+        js.init(workers[k]);
+        ScenePrep::PrepScratch scratch;
+        PrepOutputs out;
+        run_binning(js, world, out, scratch);
+        counts[k] = out.stats.diagnostics.draws_deferred_not_resident;
+    }
+    EXPECT_EQ(counts[0], counts[1]);
+    EXPECT_EQ(counts[1], counts[2]);
+    EXPECT_EQ(counts[0], 6u);
+}
+
+// ============================================================================
+// OCCLUSION CULLING (piece c). The fixture's camera is ORTHOGRAPHIC, so every
+// corner has clip w == 1 and project_aabb is always valid — which is what makes
+// the expectations below arithmetic rather than approximate. Depth values are
+// taken FROM project_aabb rather than assumed, so the test says nothing about
+// which end of [0,1] is near; it only exercises the mechanism.
+// ============================================================================
+
+namespace {
+
+/// A field whose every texel holds `depth`, addressed as an 8x8 level 3 of a
+/// 64x64 screen.
+struct ConstantField {
+    std::vector<float> texels;
+    OcclusionField field;
+
+    explicit ConstantField(float depth, const glm::mat4& vp) : texels(8 * 8, depth) {
+        field.depth = texels;
+        field.mip_w = 8;
+        field.mip_h = 8;
+        field.screen_w = 64;
+        field.screen_h = 64;
+        field.level = 3;
+        field.view_proj = vp;
+        // Everything visible: the fixture's boxes are small on screen, but the
+        // default 0.15 threshold is measured against a 64x64 frame here.
+        field.max_tested_screen_fraction = 1.0f;
+    }
+};
+
+} // namespace
+
+TEST(ScenePrepOcclusion, NullFieldLeavesEveryGoldenUnchanged) {
+    GoldenWorld world;
+    jobs::JobSystem js;
+    js.init(0);
+    ScenePrep::PrepScratch scratch;
+    PrepOutputs out;
+    ScenePrep::PrepParams p = world.params();
+    ASSERT_EQ(p.occlusion, nullptr) << "occlusion must default to off";
+    run_binning_with(js, world, p, out, scratch);
+
+    EXPECT_EQ(out.stats.entities_rendered, 7u);
+    EXPECT_EQ(out.stats.entities_occlusion_culled, 0u);
+    EXPECT_EQ(out.touched, (std::vector<ModelHandle>{H_CUBE, H_SLAB, H_UNKNOWN}));
+}
+
+TEST(ScenePrepOcclusion, AWallInFrontOfEverythingCullsEveryBoundedDraw) {
+    GoldenWorld world;
+    const glm::mat4 vp = ortho_vp(MAIN_HALF_EXTENT, 200.0f);
+    // A depth value strictly closer than anything in the scene, taken from the
+    // projection itself: the largest device depth any command's box reaches,
+    // plus a margin.
+    const OcclusionBounds probe = project_aabb(vp, glm::vec3(-3.0f, -3.0f, -53.0f), glm::vec3(3.0f, 3.0f, -47.0f));
+    ASSERT_TRUE(probe.valid);
+    ConstantField wall(probe.nearest_depth + 0.25f, vp);
+
+    jobs::JobSystem js;
+    js.init(0);
+    ScenePrep::PrepScratch scratch;
+    PrepOutputs out;
+    ScenePrep::PrepParams p = world.params();
+    p.occlusion = &wall.field;
+    run_binning_with(js, world, p, out, scratch);
+
+    // The unresolvable-handle command has no bounds, so it is never TESTED —
+    // that is the "no doubt" rule, not an accident of the fixture.
+    EXPECT_EQ(out.touched, (std::vector<ModelHandle>{H_UNKNOWN}));
+    EXPECT_EQ(out.stats.entities_occlusion_culled, 6u);
+    EXPECT_EQ(out.stats.entities_rendered, 1u) << "only the boundless command survives";
+    EXPECT_TRUE(out.non_instanced.empty()) << "the ForceNonInstanced command was occluded before that branch";
+}
+
+TEST(ScenePrepOcclusion, AnEmptyDepthBufferCullsNothing) {
+    GoldenWorld world;
+    const glm::mat4 vp = ortho_vp(MAIN_HALF_EXTENT, 200.0f);
+    const OcclusionBounds probe = project_aabb(vp, glm::vec3(-1.0f), glm::vec3(1.0f));
+    ASSERT_TRUE(probe.valid);
+    // Farther than anything: nothing is behind it.
+    ConstantField sky(probe.nearest_depth - 1.0f, vp);
+
+    jobs::JobSystem js;
+    js.init(0);
+    ScenePrep::PrepScratch scratch;
+    PrepOutputs out;
+    ScenePrep::PrepParams p = world.params();
+    p.occlusion = &sky.field;
+    run_binning_with(js, world, p, out, scratch);
+
+    EXPECT_EQ(out.stats.entities_occlusion_culled, 0u);
+    EXPECT_EQ(out.stats.entities_rendered, 7u);
+    EXPECT_EQ(out.touched, (std::vector<ModelHandle>{H_CUBE, H_SLAB, H_UNKNOWN}));
+}
+
+TEST(ScenePrepOcclusion, ShadowCascadeBinsAreIdenticalWithAndWithoutTheField) {
+    // THE CASTER RULE. A camera-occluded object still casts into the view, so
+    // occlusion culling must not touch the shadow walks. If it ever does, the
+    // symptom is missing shadows from geometry hidden behind a wall — which
+    // looks like a shadow bug, three subsystems from the cause.
+    GoldenWorld world;
+    const glm::mat4 vp = ortho_vp(MAIN_HALF_EXTENT, 200.0f);
+    const OcclusionBounds probe = project_aabb(vp, glm::vec3(-3.0f, -3.0f, -53.0f), glm::vec3(3.0f, 3.0f, -47.0f));
+    ConstantField wall(probe.nearest_depth + 0.25f, vp);
+
+    jobs::JobSystem js;
+    js.init(0);
+    ScenePrep::PrepScratch scratch_off;
+    ScenePrep::PrepScratch scratch_on;
+    PrepOutputs off;
+    PrepOutputs on;
+    run_binning_with(js, world, world.params(), off, scratch_off);
+    ScenePrep::PrepParams p = world.params();
+    p.occlusion = &wall.field;
+    run_binning_with(js, world, p, on, scratch_on);
+
+    for (int c = 0; c < ScenePrep::MAX_SHADOW_CASCADES; ++c) {
+        EXPECT_EQ(on.shadow_touched[c], off.shadow_touched[c]) << "cascade " << c;
+        ASSERT_EQ(on.shadow_bins[c].size(), off.shadow_bins[c].size()) << "cascade " << c;
+        for (std::size_t h = 0; h < on.shadow_bins[c].size(); ++h) {
+            ASSERT_EQ(on.shadow_bins[c][h].size(), off.shadow_bins[c][h].size());
+            for (std::size_t i = 0; i < on.shadow_bins[c][h].size(); ++i) {
+                EXPECT_EQ(std::memcmp(&on.shadow_bins[c][h][i], &off.shadow_bins[c][h][i],
+                                      sizeof(gpu::ShadowInstanceData)),
+                          0);
+            }
+        }
+    }
+}
+
+TEST(ScenePrepOcclusion, ResultIsBitIdenticalAtAnyWorkerCount) {
+    const glm::mat4 vp = ortho_vp(MAIN_HALF_EXTENT, 200.0f);
+    const OcclusionBounds probe = project_aabb(vp, glm::vec3(-3.0f, -3.0f, -53.0f), glm::vec3(3.0f, 3.0f, -47.0f));
+    ConstantField wall(probe.nearest_depth + 0.25f, vp);
+
+    const std::array<int, 3> workers{0, 1, 4};
+    std::vector<std::vector<gpu::InstanceData>> reference;
+    std::vector<ModelHandle> reference_touched;
+    uint32_t reference_culled = 0;
+    for (std::size_t k = 0; k < workers.size(); ++k) {
+        GoldenWorld world;
+        jobs::JobSystem js;
+        js.init(workers[k]);
+        ScenePrep::PrepScratch scratch;
+        PrepOutputs out;
+        ScenePrep::PrepParams p = world.params();
+        p.occlusion = &wall.field;
+        run_binning_with(js, world, p, out, scratch);
+        if (k == 0) {
+            reference = out.bins;
+            reference_touched = out.touched;
+            reference_culled = out.stats.entities_occlusion_culled;
+            continue;
+        }
+        EXPECT_EQ(out.touched, reference_touched) << "workers=" << workers[k];
+        EXPECT_EQ(out.stats.entities_occlusion_culled, reference_culled) << "workers=" << workers[k];
+        ASSERT_EQ(out.bins.size(), reference.size());
+        for (std::size_t h = 0; h < out.bins.size(); ++h) {
+            ASSERT_EQ(out.bins[h].size(), reference[h].size()) << "handle " << h;
+            if (!out.bins[h].empty()) {
+                EXPECT_EQ(std::memcmp(out.bins[h].data(), reference[h].data(),
+                                      out.bins[h].size() * sizeof(gpu::InstanceData)),
+                          0);
+            }
+        }
+    }
 }

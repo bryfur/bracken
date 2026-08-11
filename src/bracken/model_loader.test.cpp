@@ -765,3 +765,237 @@ TEST(ModelManagerReload, FailedReloadLeavesModelUntouched) {
     EXPECT_EQ(mgr.get_model(handle), before);
     EXPECT_EQ(before->meshes.size(), 1u);
 }
+
+// ===========================================================================
+// RESIDENCY: unload_model / reupload_model / gpu_bytes
+// (docs/gap_streaming.md piece b)
+//
+// Device-free, as everything else in this file is: with no device set,
+// register_model skips the upload, so there are no GPU buffers to free and
+// gpu_bytes is 0 throughout. What that leaves testable is exactly what the
+// residency contract is ABOUT — the slot, the handle, the name mapping and the
+// `loaded` flag, which is the flag every consumer (the Prepare stage, the BLAS
+// walk) tests.
+// ===========================================================================
+
+namespace {
+
+/// register_model refuses a model with no geometry, so give it one triangle.
+std::unique_ptr<bracken::Model> make_residency_model(float half_extent) {
+    auto m = std::make_unique<bracken::Model>();
+    bracken::Mesh mesh;
+    mesh.vertices.resize(3);
+    mesh.indices = {0, 1, 2};
+    m->meshes.push_back(std::move(mesh));
+    m->bounds.min = glm::vec3(-half_extent);
+    m->bounds.max = glm::vec3(half_extent);
+    m->compute_bounding_sphere();
+    return m;
+}
+
+} // namespace
+
+TEST(ModelManagerResidency, UnloadKeepsTheSlotTheNameAndTheHandle) {
+    // THE INVARIANT rt_scene.cpp's all-handles walk depends on: model_count()
+    // is unchanged by an eviction. If a slot were removed or compacted, every
+    // handle after it would silently mean a different model.
+    ModelManager mgr;
+    const auto a = mgr.register_model("a", make_residency_model(1.0f));
+    const auto b = mgr.register_model("b", make_residency_model(2.0f));
+    ASSERT_TRUE(a.is_ok());
+    ASSERT_TRUE(b.is_ok());
+    const std::size_t count_before = mgr.model_count();
+    Model* const b_ptr = mgr.get_model(b.value());
+    ASSERT_NE(b_ptr, nullptr);
+
+    (void)mgr.unload_model(a.value());
+
+    EXPECT_EQ(mgr.model_count(), count_before);
+    EXPECT_EQ(mgr.get_handle("a"), a.value());
+    EXPECT_EQ(mgr.get_handle("b"), b.value());
+    ASSERT_NE(mgr.get_model(a.value()), nullptr);
+    EXPECT_FALSE(mgr.get_model(a.value())->loaded);
+    // The untouched neighbour keeps its handle, its pointer and its payload.
+    EXPECT_EQ(mgr.get_model(b.value()), b_ptr);
+    EXPECT_TRUE(b_ptr->loaded);
+}
+
+TEST(ModelManagerResidency, UnloadDropsRetainedCpuGeometry) {
+    // The other half of an evicted model's footprint, and for a ray-traced
+    // scene the larger half. It is also precisely why the acceleration
+    // structure has to be rebuilt after an eviction: its BLAS triangles were
+    // copied out of these arrays.
+    ModelManager mgr;
+    mgr.set_retain_cpu_geometry(true);
+    const auto h = mgr.register_model("prop", make_residency_model(1.0f));
+    ASSERT_TRUE(h.is_ok());
+    ASSERT_FALSE(mgr.get_model(h.value())->meshes.empty());
+    ASSERT_EQ(mgr.get_model(h.value())->meshes[0].vertices.size(), 3u);
+
+    (void)mgr.unload_model(h.value());
+
+    EXPECT_TRUE(mgr.get_model(h.value())->meshes[0].vertices.empty());
+    EXPECT_TRUE(mgr.get_model(h.value())->meshes[0].indices.empty());
+}
+
+TEST(ModelManagerResidency, UnloadingTwiceIsANoOp) {
+    ModelManager mgr;
+    const auto h = mgr.register_model("prop", make_residency_model(1.0f));
+    ASSERT_TRUE(h.is_ok());
+    (void)mgr.unload_model(h.value());
+    EXPECT_EQ(mgr.unload_model(h.value()), 0u);
+    EXPECT_FALSE(mgr.get_model(h.value())->loaded);
+}
+
+TEST(ModelManagerResidency, UnloadingAnUnknownHandleIsANoOp) {
+    ModelManager mgr;
+    EXPECT_EQ(mgr.unload_model(INVALID_MODEL_HANDLE), 0u);
+    EXPECT_EQ(mgr.unload_model(static_cast<ModelHandle>(999)), 0u);
+}
+
+TEST(ModelManagerResidency, ReuploadRestoresTheSameSlot) {
+    ModelManager mgr;
+    const auto h = mgr.register_model("prop", make_residency_model(1.0f));
+    ASSERT_TRUE(h.is_ok());
+    Model* const before = mgr.get_model(h.value());
+    (void)mgr.unload_model(h.value());
+    ASSERT_FALSE(before->loaded);
+
+    ASSERT_TRUE(mgr.reupload_model(h.value(), make_residency_model(3.0f)));
+
+    EXPECT_TRUE(mgr.get_model(h.value())->loaded);
+    // Same handle, same Model* — the contract every draw command still holding
+    // the old handle depends on.
+    EXPECT_EQ(mgr.get_model(h.value()), before);
+    EXPECT_EQ(mgr.get_handle("prop"), h.value());
+    // The freshly decoded bounds took effect, and the bounding sphere was
+    // recomputed from them (forgetting that culls a model into invisibility
+    // with no message anywhere).
+    EXPECT_FLOAT_EQ(mgr.get_model(h.value())->bounds.max.x, 3.0f);
+    EXPECT_GT(mgr.get_model(h.value())->bounding_half_diag, 0.0f);
+}
+
+TEST(ModelManagerResidency, ReuploadPreservesTheSlotsLodChain) {
+    // A decode knows nothing about levels generated for this model. Letting the
+    // fresh contents overwrite them would leave the level models registered,
+    // unreachable, and select_lod silently returning the base forever.
+    ModelManager mgr;
+    const auto base = mgr.register_model("base", make_residency_model(1.0f));
+    const auto level = mgr.register_model("base_lod1", make_residency_model(1.0f));
+    ASSERT_TRUE(base.is_ok());
+    ASSERT_TRUE(level.is_ok());
+    mgr.get_model(base.value())->lod_handles = {level.value()};
+    mgr.get_model(base.value())->lod_thresholds = {0.05f};
+
+    (void)mgr.unload_model(base.value());
+    ASSERT_TRUE(mgr.reupload_model(base.value(), make_residency_model(1.0f)));
+
+    ASSERT_EQ(mgr.get_model(base.value())->lod_handles.size(), 1u);
+    EXPECT_EQ(mgr.get_model(base.value())->lod_handles[0], level.value());
+    ASSERT_EQ(mgr.get_model(base.value())->lod_thresholds.size(), 1u);
+}
+
+TEST(ModelManagerResidency, ReuploadRefusesAnUnknownHandleOrANullModel) {
+    ModelManager mgr;
+    const auto h = mgr.register_model("prop", make_residency_model(1.0f));
+    ASSERT_TRUE(h.is_ok());
+    EXPECT_FALSE(mgr.reupload_model(static_cast<ModelHandle>(999), make_residency_model(1.0f)));
+    EXPECT_FALSE(mgr.reupload_model(INVALID_MODEL_HANDLE, make_residency_model(1.0f)));
+    EXPECT_FALSE(mgr.reupload_model(h.value(), nullptr));
+    EXPECT_TRUE(mgr.get_model(h.value())->loaded) << "a refused reupload must not have unloaded anything";
+}
+
+TEST(ModelManagerResidency, GpuBytesIsZeroWithoutADeviceAndForUnknownHandles) {
+    // Honest about what this fixture can say: with no device nothing is
+    // uploaded, so the estimate is 0. The number's SHAPE is tested in
+    // texture_cache.test.cpp (texture_bytes_estimate); what is asserted here is
+    // that a missing model answers 0 rather than reading a null slot.
+    ModelManager mgr;
+    const auto h = mgr.register_model("prop", make_residency_model(1.0f));
+    ASSERT_TRUE(h.is_ok());
+    EXPECT_EQ(mgr.gpu_bytes(h.value()), 0u);
+    EXPECT_EQ(mgr.gpu_bytes(INVALID_MODEL_HANDLE), 0u);
+    EXPECT_EQ(mgr.gpu_bytes(static_cast<ModelHandle>(999)), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// The three reupload_model holes closed in review.
+//
+// register_model does three things a bare move-assign does not: it refuses a
+// model with no geometry, it derives bounds off the vertices when the decode
+// left them empty, and it does that BEFORE the upload frees those vertices.
+// A reupload that skipped them left a slot flagged `loaded` whose bounding
+// sphere had radius 0 — which the Prepare stage reads as "cull me" and
+// select_lod reads as "apparent size 0", both silently.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A decode with geometry but NO authored bounds — what load_glb hands back for
+/// a model whose bounds register_model would have scanned.
+std::unique_ptr<bracken::Model> make_boundless_decode(float extent) {
+    auto m = std::make_unique<bracken::Model>();
+    bracken::Mesh mesh;
+    mesh.vertices.resize(3);
+    mesh.vertices[0].position = glm::vec3(-extent, 0.0f, -extent);
+    mesh.vertices[1].position = glm::vec3(extent, extent, 0.0f);
+    mesh.vertices[2].position = glm::vec3(0.0f, -extent, extent);
+    mesh.indices = {0, 1, 2};
+    m->meshes.push_back(std::move(mesh));
+    // bounds deliberately left default-constructed (empty).
+    return m;
+}
+
+} // namespace
+
+TEST(ModelManagerResidency, ReuploadDerivesBoundsWhenTheDecodeHasNone) {
+    ModelManager mgr;
+    const auto h = mgr.register_model("prop", make_residency_model(1.0f));
+    ASSERT_TRUE(h.is_ok());
+    // Wipe the slot's own bounds so the scan is the ONLY source left; otherwise
+    // the preserved-bounds path below would mask a missing scan.
+    mgr.get_model(h.value())->bounds = bracken::AABB{};
+    (void)mgr.unload_model(h.value());
+
+    ASSERT_TRUE(mgr.reupload_model(h.value(), make_boundless_decode(4.0f)));
+
+    const Model* m = mgr.get_model(h.value());
+    ASSERT_NE(m, nullptr);
+    EXPECT_FALSE(m->bounds.empty()) << "bounds were not scanned off the vertices";
+    EXPECT_FLOAT_EQ(m->bounds.min.x, -4.0f);
+    EXPECT_FLOAT_EQ(m->bounds.max.x, 4.0f);
+    EXPECT_GT(m->bounding_half_diag, 0.0f) << "a zero radius culls the model into invisibility";
+}
+
+TEST(ModelManagerResidency, ReuploadKeepsHandAuthoredBoundsTheDecodeCannotKnow) {
+    // unload_model's contract says the slot's bounds survive an eviction, and a
+    // skinned model's box carries animation headroom the vertex scan would
+    // shrink away — so the restore has to honour it.
+    ModelManager mgr;
+    auto authored = make_residency_model(1.0f);
+    authored->bounds.min = glm::vec3(-50.0f);
+    authored->bounds.max = glm::vec3(50.0f);
+    const auto h = mgr.register_model("hero", std::move(authored));
+    ASSERT_TRUE(h.is_ok());
+    (void)mgr.unload_model(h.value());
+
+    ASSERT_TRUE(mgr.reupload_model(h.value(), make_boundless_decode(1.0f)));
+
+    EXPECT_FLOAT_EQ(mgr.get_model(h.value())->bounds.max.x, 50.0f)
+        << "the headroom box was replaced by the vertex AABB";
+}
+
+TEST(ModelManagerResidency, ReuploadRefusesAGeometrylessDecodeWithoutTouchingTheSlot) {
+    // register_model refuses this case; so must the restore. Accepting it flags
+    // the slot `loaded` with nothing in it, which every consumer reads as
+    // "resident" — the residency manager then charges it bytes and stops
+    // retrying, and the model is gone for the rest of the run.
+    ModelManager mgr;
+    const auto h = mgr.register_model("prop", make_residency_model(1.0f));
+    ASSERT_TRUE(h.is_ok());
+    auto empty = std::make_unique<bracken::Model>();
+    empty->meshes.emplace_back(); // a mesh, but no vertices and no indices
+
+    EXPECT_FALSE(mgr.reupload_model(h.value(), std::move(empty)));
+    EXPECT_TRUE(mgr.get_model(h.value())->loaded) << "a refused reupload must not have unloaded the slot";
+}

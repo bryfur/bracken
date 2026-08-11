@@ -14,6 +14,9 @@ namespace {
 struct Job {
     std::string name;
     std::string source;
+    /// Valid => apply with reupload_model into that slot instead of
+    /// register_model (Request::reupload_into).
+    ModelHandle reupload_into = INVALID_MODEL_HANDLE;
     std::unique_ptr<Model> model; // filled by the worker
     bool decoded = false;
     bool failed = false;
@@ -78,6 +81,7 @@ void AsyncModelLoader::request(Request req) {
         auto job = std::make_unique<Job>();
         job->name = std::move(req.name);
         job->source = std::move(req.source);
+        job->reupload_into = req.reupload_into;
         impl->slots.push_back(std::move(job));
     }
 
@@ -166,16 +170,30 @@ std::vector<AsyncModelLoader::Completed> AsyncModelLoader::pump(std::size_t max_
             continue;
         }
 
-        // register_model derives bounds and uploads through the manager, which
-        // is where the main-thread GPU work happens.
-        auto result = impl_->models.register_model(job->name, std::move(job->model));
-        if (result) {
-            done.handle = result.value();
-            done.ok = true;
+        if (job->reupload_into != INVALID_MODEL_HANDLE) {
+            // Streaming a previously evicted model back into ITS OWN slot. No
+            // handle is assigned, so this path cannot perturb the request-order
+            // numbering the block comment above is about.
+            const ModelHandle slot = job->reupload_into;
+            if (impl_->models.reupload_model(slot, std::move(job->model))) {
+                done.handle = slot;
+                done.ok = true;
+            } else {
+                impl_->failures.fetch_add(1, std::memory_order_relaxed);
+                BRACKEN_LOG_ERROR("asset", "async reload '{}': reupload_model refused slot {}", job->name, slot);
+            }
         } else {
-            impl_->failures.fetch_add(1, std::memory_order_relaxed);
-            BRACKEN_LOG_ERROR("asset", "async load '{}': register_model refused it: {}", job->name,
-                              to_string(result.error()));
+            // register_model derives bounds and uploads through the manager, which
+            // is where the main-thread GPU work happens.
+            auto result = impl_->models.register_model(job->name, std::move(job->model));
+            if (result) {
+                done.handle = result.value();
+                done.ok = true;
+            } else {
+                impl_->failures.fetch_add(1, std::memory_order_relaxed);
+                BRACKEN_LOG_ERROR("asset", "async load '{}': register_model refused it: {}", job->name,
+                                  to_string(result.error()));
+            }
         }
         out.push_back(done);
         ++uploaded;

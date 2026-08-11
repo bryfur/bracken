@@ -313,6 +313,22 @@ struct GraphicsSettings {
     // Culling settings
     DrawDistance draw_distance = DrawDistance::D4000;
     bool frustum_culling = true;
+    /**
+     * Hi-Z occlusion culling for model draws (docs/gap_streaming.md).
+     *
+     * OFF by default, and it must stay that way until somebody measures it.
+     * The depth it tests against is a FRAME OLD by construction — the Prepare
+     * stage runs before this frame's depth prepass and SDL3 has no
+     * non-blocking map — so under camera motion the test is a heuristic rather
+     * than a proof, and a false cull is a prop missing behind a wall: a few
+     * hundred pixels, invisible in `mean_luma`, exactly the failure mode
+     * CLAUDE.md warns about twice.
+     *
+     * It also costs a SECOND full mip pyramid — culling needs the opposite
+     * reduction to the screen-probe march — plus one texture readback and one
+     * deterministic fence wait per frame.
+     */
+    bool occlusion_culling = false;
 
     // Quality settings
     AnisotropicFilter anisotropic_filter = AnisotropicFilter::X16;
