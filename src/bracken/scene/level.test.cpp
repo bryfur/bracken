@@ -820,6 +820,59 @@ TEST(Level, ScatterRefusesAnAbsurdGridInsteadOfHanging) {
     EXPECT_TRUE(scatter_ground_cover(rule, models, {}).empty());
 }
 
+// The hole the load-time finiteness sweep cannot see, because it checks every
+// weight ON ITS OWN: two perfectly finite 3e38 weights sum to infinity. Then
+// `pick01 * total` is infinity for every draw (NaN for pick01 == 0), no
+// subtraction in the selection walk ever goes negative, and the walk falls
+// through on EVERY candidate — so the rule ignored its weights entirely and
+// placed one single model for the whole carpet.
+//
+// This is what makes the test worth having rather than restating the code: the
+// level below passes `parse_level` (each weight is finite), which is exactly
+// how such a rule reaches `scatter_ground_cover` in the first place.
+TEST(Level, ScatterWeightsThatSumToInfinityAreRefusedNotCollapsed) {
+    const LevelScatterModel candidates[] = {
+        LevelScatterModel{7u, 3.0e38f, 1.0f, 1.0f},
+        LevelScatterModel{8u, 3.0e38f, 2.0f, 2.0f},
+        LevelScatterModel{9u, 0.0f, 3.0f, 3.0f}, // the row the collapse used to pick
+    };
+    const std::span<const LevelScatterModel> models(candidates, 3);
+
+    LevelScatterRule rule;
+    rule.seed = 12345u;
+    rule.outer_radius = 20.0f;
+    rule.step = 1.0f;
+
+    const auto flat = [](float, float) { return std::optional<float>(0.0f); };
+    EXPECT_TRUE(scatter_ground_cover(rule, models, flat).empty())
+        << "an infinite total weight placed instances anyway; the selection was meaningless";
+
+    // And the level that carries it loads cleanly, which is the point: the
+    // per-weight finiteness check cannot catch a sum.
+    Level level;
+    (void)level.intern_model("a");
+    for (const LevelScatterModel& m : candidates) {
+        level.scatter_models.push_back(m);
+    }
+    level.scatter_rules.push_back(rule);
+    EXPECT_TRUE(parse_level(serialize_level(level)).is_ok())
+        << "the individual weights are finite, so the loader must accept them";
+}
+
+// A slice whose weights are ALL non-positive places nothing at all, rather than
+// falling back to some row of it — the other half of "weight <= 0 is never
+// picked".
+TEST(Level, AnAllZeroWeightScatterSlicePlacesNothing) {
+    const LevelScatterModel candidates[] = {LevelScatterModel{1u, 0.0f, 1.0f, 1.0f},
+                                            LevelScatterModel{2u, -3.0f, 1.0f, 1.0f}};
+    const std::span<const LevelScatterModel> models(candidates, 2);
+    LevelScatterRule rule;
+    rule.outer_radius = 10.0f;
+    rule.step = 1.0f;
+    const auto flat = [](float, float) { return std::optional<float>(0.0f); };
+    EXPECT_TRUE(scatter_ground_cover(rule, models, flat).empty());
+}
+
 TEST(Level, ScatterSliceRefusesAnOutOfRangeRule) {
     Level level;
     level.scatter_models.push_back(LevelScatterModel{});

@@ -164,8 +164,17 @@ public:
     // pack hands back a byte span (`core::asset::AssetPack::read`), and a
     // level shipped inside one has to be parseable from it.
 
-    /** The complete file image: magic, versions, payload length, checksum,
-     *  payload. Never fails — encoding a document cannot. */
+    /**
+     * The complete file image: magic, versions, payload length, checksum,
+     * payload.
+     *
+     * EMPTY on the one failure encoding can have: a payload past the
+     * container's 32-bit length field. Narrowing it silently (what this did
+     * before) produced a file that saved "successfully" and failed every load
+     * with `Corrupt`; this refuses instead and logs which document it refused.
+     * A valid image is never empty — the header alone is 24 bytes — so
+     * `empty()` is the check, and `save()` turns it into `WriteFailed`.
+     */
     [[nodiscard]] std::vector<std::byte> serialize() const;
 
     /** Parse a complete file image. Same refusals as load(), minus
@@ -175,7 +184,17 @@ public:
     /** Number of stored records, including ones this build does not read. */
     [[nodiscard]] std::size_t record_count() const noexcept { return records_.size(); }
 
-    /** Every path present, in write order. For dumping a save to a log. */
+    /**
+     * Every path present, in write order. For dumping a save to a log, and —
+     * with `value_at` — for partitioning a loaded document into "mine" and
+     * "carry this forward verbatim".
+     *
+     * The views point INTO this document's records. Any write that appends a
+     * NEW path (`write`, `write_blob`, `write_value`) may reallocate the record
+     * vector and dangle every one of them, so never write to the same document
+     * while iterating its paths: copy into a second document, which is what
+     * `scene/level.cpp` does in both directions.
+     */
     [[nodiscard]] std::vector<std::string_view> paths() const;
 
 private:

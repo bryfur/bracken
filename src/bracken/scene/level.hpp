@@ -370,7 +370,11 @@ static_assert(sizeof(LevelWater) == 124 && std::is_trivially_copyable_v<LevelWat
 struct LevelScatterModel {
     uint32_t model = 0;      ///< index into Level::models
     float weight = 1.0f;     ///< relative selection weight; <= 0 is never picked
-    float min_scale = 1.0f;  ///< uniform scale range, inclusive of both ends
+    /// Uniform scale range, sampled as `min + (max - min) * u` with
+    /// `u` in **[0, 1)** — so `min_scale` is reachable and `max_scale` is the
+    /// open end, never produced exactly. `max_scale < min_scale` is not
+    /// rejected; it simply runs the range backwards.
+    float min_scale = 1.0f;
     float max_scale = 1.0f;
 };
 static_assert(sizeof(LevelScatterModel) == 16 && std::is_trivially_copyable_v<LevelScatterModel>);
@@ -398,6 +402,12 @@ static_assert(sizeof(LevelScatterModel) == 16 && std::is_trivially_copyable_v<Le
  * `Level::instances` and the rule is provenance, not a build step — a loader
  * must not run it again. That is the honest state for an exporter capturing a
  * host loop it did not generate.
+ *
+ * NOTHING IN THE ENGINE READS `baked`, and nothing in the engine expands a rule
+ * on its own: `load_level` returns the rules as data and the HOST decides which
+ * of them to hand to `scatter_ground_cover`. The flag is the datum that decision
+ * is made from, not an instruction anything obeys — a host that expands a
+ * `baked` rule gets its ground cover twice and no diagnostic.
  */
 struct LevelScatterRule {
     uint32_t name = 0;         ///< index into Level::strings — the layer's role
@@ -706,9 +716,10 @@ public:
     /**
      * Emit every resolved draw into the frame, in file order.
      *
-     * Tier: `sim-stage`. Allocates nothing and touches no shared state — it is
-     * the same loop a host writes over its own prop vector, which is why a
-     * host that already has one should keep it and call `draws()` instead.
+     * Tier: `sim-stage`. It touches no shared state and adds no allocation of
+     * its OWN — the only thing that grows is the frame packet's arena, exactly
+     * as it does for a host's hand-written loop. Which is why a host that
+     * already has such a loop should keep it and read `draws()` instead.
      */
     void emit(FrameSink& sink) const;
 
@@ -729,6 +740,9 @@ private:
  * host that cares about handle stability across a hand-authored and a
  * level-driven run must register in one fixed order and use it for both —
  * handles are registration-order indices.
+ *
+ * Tier: main-thread / loading, the same as `ResolvedLevel::resolve` and for the
+ * same reason — it reads the manager's name table. Asserted.
  */
 [[nodiscard]] std::vector<std::pair<std::string, std::string>>
 missing_models(const Level& level, const bracken::ModelManager& models);

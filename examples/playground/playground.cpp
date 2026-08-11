@@ -1037,6 +1037,13 @@ bool PlaygroundGame::load_level_props() {
     // test, so a reloaded fallback level has no rock colliders. The village
     // scene, which is what the smoke gate measures, is unaffected: every one
     // of its collider decisions is a name match that survives the round trip.
+    //
+    // The drop rule is DUPLICATED here, and the index into resolved.draws() is
+    // therefore checked rather than trusted. Two copies of one policy is the
+    // shape that drifts: the day resolve() grows a third reason to drop a row,
+    // this walk keeps a survivor resolve() discarded and every later draw is
+    // off by one — an unchecked `draws()[i]` would run off the end of the span
+    // at the tail of a 2550-row level. Bail loudly instead.
     std::size_t draw_index = 0;
     for (const bracken::scene::LevelInstance& inst : level.instances) {
         if (inst.model >= level.models.size()) {
@@ -1047,6 +1054,13 @@ bool PlaygroundGame::load_level_props() {
         if (handle == INVALID_MODEL_HANDLE) {
             continue;
         }
+        if (draw_index >= resolved.draws().size()) {
+            BRACKEN_LOG_ERROR("playground",
+                              "--level {}: this walk kept more instances than ResolvedLevel::resolve did "
+                              "({} vs {}); the two drop rules have drifted apart",
+                              level_path_, draw_index + 1, resolved.draws().size());
+            return false;
+        }
         const bracken::scene::ResolvedLevel::Draw& draw = resolved.draws()[draw_index++];
         props_.push_back({draw.model, draw.transform});
         const ColliderKind kind = classify_collider(name);
@@ -1055,6 +1069,15 @@ bool PlaygroundGame::load_level_props() {
             pending_colliders_.push_back(
                 {draw.model, draw.transform, trunk, trunk ? nature_trunk_half(name) : 0.0f});
         }
+    }
+    if (draw_index != resolved.draws().size()) {
+        // The other direction: this walk dropped a row resolve() kept, so the
+        // nth prop is no longer the nth draw. Same defect, same refusal.
+        BRACKEN_LOG_ERROR("playground",
+                          "--level {}: kept {} instances against ResolvedLevel::resolve's {}; the two drop "
+                          "rules have drifted apart",
+                          level_path_, draw_index, resolved.draws().size());
+        return false;
     }
 
     // Markers replace build_orb_spots() and setup_village()'s chimney list —

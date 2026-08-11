@@ -567,13 +567,46 @@ std::vector<LevelInstance> scatter_ground_cover(const LevelScatterRule& rule,
         return out;
     }
 
+    // `last_positive` is the selection walk's fall-through pick, and it must NOT
+    // be `models.size() - 1`. The walk subtracts float weights one at a time, so
+    // accumulated rounding can leave `remaining` at or just above zero after the
+    // last positively weighted entry — and "the last row" as a fallback then
+    // hands that draw to a row of weight <= 0, which LevelScatterModel documents
+    // as never picked.
+    //
+    // Honest scope: an exhaustive sweep of all 2^24 values `next01()` can return
+    // found that branch reachable only for contrived weight sets and only for a
+    // handful of draws in 2^24. This makes the documented contract
+    // unconditional; it is not a bug anyone was hitting. The one that WAS
+    // reachable is the infinite total below.
     float total_weight = 0.0f;
-    for (const LevelScatterModel& m : models) {
-        total_weight += std::max(0.0f, m.weight);
+    std::size_t last_positive = 0;
+    bool any_positive = false;
+    for (std::size_t i = 0; i < models.size(); ++i) {
+        const float w = std::max(0.0f, models[i].weight);
+        total_weight += w;
+        if (w > 0.0f) {
+            last_positive = i;
+            any_positive = true;
+        }
     }
-    if (!(total_weight > 0.0f)) {
+    if (!any_positive || !(total_weight > 0.0f)) {
         BRACKEN_LOG_WARN(LOG_TAG, "scatter rule (seed {}) has no positively weighted model; nothing placed",
                          rule.seed);
+        return out;
+    }
+    // An INFINITE total is the case the load-time finiteness sweep cannot see:
+    // `row_finite(LevelScatterModel)` checks each weight on its own, and two
+    // perfectly finite 3e38 weights sum to infinity. `pick01 * inf` is then inf
+    // for every draw but the zeroth (which is NaN), no subtraction ever goes
+    // negative, and the walk falls through on EVERY candidate — so the rule
+    // silently ignores its weights and places one single model a million times.
+    // That is not a degraded carpet, it is a different level, and it is refused.
+    if (!std::isfinite(total_weight)) {
+        BRACKEN_LOG_ERROR(LOG_TAG,
+                          "scatter rule (seed {}) has {} models whose weights sum to infinity; the "
+                          "selection would be meaningless, so nothing is placed",
+                          rule.seed, models.size());
         return out;
     }
 
@@ -617,7 +650,7 @@ std::vector<LevelInstance> scatter_ground_cover(const LevelScatterRule& rule,
                 continue;
             }
 
-            std::size_t selected = models.size() - 1;
+            std::size_t selected = last_positive;
             float remaining = pick01 * total_weight;
             for (std::size_t i = 0; i < models.size(); ++i) {
                 remaining -= std::max(0.0f, models[i].weight);
@@ -1140,7 +1173,9 @@ struct Fnv1a {
     }
     void text(std::string_view s) noexcept {
         count(s.size());
-        bytes(s.data(), s.size());
+        if (!s.empty()) { // a default-constructed view has a NULL data()
+            bytes(s.data(), s.size());
+        }
     }
     /// Whole-table fold. Legal only for the padding-free row types — their
     /// `sizeof` static_asserts in level.hpp are what make the padding bytes
@@ -1220,10 +1255,14 @@ uint64_t level_digest(const Level& level) noexcept {
         h.bytes(&t.min_height, sizeof(float));
         h.bytes(&t.max_height, sizeof(float));
         h.count(t.samples.size());
-        h.bytes(t.samples.data(), t.samples.size() * sizeof(uint16_t));
+        if (!t.samples.empty()) {
+            h.bytes(t.samples.data(), t.samples.size() * sizeof(uint16_t));
+        }
         h.u32(t.splat_resolution);
         h.count(t.splat.size());
-        h.bytes(t.splat.data(), t.splat.size());
+        if (!t.splat.empty()) {
+            h.bytes(t.splat.data(), t.splat.size());
+        }
         h.rows(t.grass_exclusions);
     }
 
@@ -1367,8 +1406,10 @@ std::string level_dump(const Level& level, std::size_t max_rows) {
         out += std::format("\nscatter rule [{}] '{}': seed {} grid step {:.3f} radius {:.1f}..{:.1f} "
                            "jitter {:.2f} sink {:.2f} models [{}..{}) {}\n",
                            i, level.string_at(r.name), r.seed, r.step, r.inner_radius, r.outer_radius,
-                           r.jitter, r.sink, r.model_first, r.model_first + r.model_count,
-                           r.baked != 0 ? "(BAKED into instances)" : "(expanded at load)");
+                           r.jitter, r.sink, r.model_first,
+                           static_cast<uint64_t>(r.model_first) + r.model_count,
+                           r.baked != 0 ? "(BAKED: its rows are already in instances)"
+                                        : "(NOT baked: the host expands it with scatter_ground_cover)");
     }
 
     if (level.terrain.has_value()) {
@@ -1498,6 +1539,10 @@ void ResolvedLevel::emit(FrameSink& sink) const {
 
 std::vector<std::pair<std::string, std::string>> missing_models(const Level& level,
                                                                 const bracken::ModelManager& models) {
+    // Same tier as ResolvedLevel::resolve, and for the same reason: this reads
+    // the manager's name table, which a concurrent load would be mutating.
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+
     std::vector<std::pair<std::string, std::string>> out;
     for (std::size_t i = 0; i < level.models.size(); ++i) {
         if (models.get_handle(level.models[i]) != bracken::INVALID_MODEL_HANDLE) {

@@ -135,6 +135,22 @@ void PlaygroundGame::log_prop_digest(const char* label) const {
 // ---------------------------------------------------------------------------
 
 bool PlaygroundGame::export_level_now() {
+    // `--export-level` with `--level` is refused rather than half-done.
+    // load_level_props() fills props_ but CANNOT fill prop_placements_ — a
+    // PropPlacement holds a `const char*` model name and a loaded level's names
+    // die with the local Level — so the export would write a level with zero
+    // instances. And because export_level() writes before verify_exported_level
+    // runs, pointing both flags at one path would truncate the very file being
+    // read. Refuse before a byte moves.
+    if (!level_path_.empty()) {
+        BRACKEN_LOG_ERROR(LOG_TAG,
+                          "--export-level cannot be combined with --level: a level loaded from '{}' carries "
+                          "no authoring triples to re-export, and exporting to that same path would destroy "
+                          "it. Run --export-level against a hand-authored scene.",
+                          level_path_);
+        return false;
+    }
+
     level::Level out;
     out.name = has_village_ ? "playground_village" : "playground_procedural";
     out.content_version = 1;
@@ -146,13 +162,6 @@ bool PlaygroundGame::export_level_now() {
     for (const PropPlacement& p : prop_placements_) {
         (void)out.add_instance(p.model, p.position, p.yaw, p.scale);
     }
-    // Every model the level references also gets its source path, so a host
-    // that does not already have them can feed missing_models() straight into
-    // AsyncModelLoader.
-    for (std::size_t i = 0; i < out.models.size(); ++i) {
-        out.model_sources[i] = "assets/models/" + out.models[i] + ".glb";
-    }
-
     (void)out.add_marker("player_spawn", player_pos_);
     for (const glm::vec3& spot : orb_spots_) {
         (void)out.add_marker("orb_spot", spot);
@@ -207,6 +216,15 @@ bool PlaygroundGame::export_level_now() {
         rule.sink = k_flora_sink;
         rule.baked = 1;
         out.scatter_rules.push_back(rule);
+    }
+
+    // Model sources LAST, after every intern_model above — including the
+    // scatter block's, which appends any candidate model the instance table did
+    // not already name. Filling them earlier left those rows with an empty
+    // source, which missing_models() would then hand to a host's loader as
+    // "you register this one yourself".
+    for (std::size_t i = 0; i < out.models.size(); ++i) {
+        out.model_sources[i] = "assets/models/" + out.models[i] + ".glb";
     }
 
     // The demo's own state, in the level's unknown-record channel: the engine

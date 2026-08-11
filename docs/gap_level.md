@@ -823,7 +823,7 @@ Step 6 is pinned by the five digest tests in `frame_test.test.cpp`.
 | `EmptyOptionalsRoundTripAsEmpty` | absent terrain/env/nav come back absent, not defaulted-present |
 | `SerializeParseMatchesTheFileRoundTrip` | bytes path == file path, AND the file's bytes are exactly what `serialize_level` produced (one encoder, not two) |
 | `UnknownRecordsSurviveARoundTrip` | foreign records survive two round trips; schema records do NOT leak into `extras()` |
-| `ShorterStrideLeavesTheTailAtDefaults` | a 24-byte row leaves `scale` at 1.0, not 0.0, and does not shift the next row |
+| `ShorterStrideLeavesTheTailAtDefaults` | a 28-byte row leaves `scale` at 1.0, not 0.0, and does not shift the next row |
 | `LongerStrideIsSkippedNotMisread` | a 60-byte row is read as 52 and stepped over |
 | `MismatchedTableLengthIsBadTableNotACrash` | 10×52 declared against 100 bytes → `BadTable`; stride 0 → `BadTable` |
 | `MissingFileIsFileNotFound` | |
@@ -917,3 +917,112 @@ Also uncovered, deliberately:
 * **concurrent load.** `load_level` is main-thread/loading tier and asserts
   `NOT_SIM_STAGE`; two threads loading into one `ModelManager` is the
   ModelManager's contract, not this format's.
+
+---
+
+## Review pass
+
+An adversarial read of the two implementation commits. What it changed, and
+what it deliberately left standing.
+
+### Fixed
+
+1. **A scatter rule whose weights sum to infinity ignored its weights
+   entirely.** `row_finite(LevelScatterModel)` checks each weight *on its own*,
+   so two finite `3e38` weights pass the loader and sum to `inf`. Then
+   `pick01 * total` is `inf` for every draw (`NaN` for `pick01 == 0`), no
+   subtraction in the selection walk goes negative, the walk falls through on
+   **every** candidate, and the whole carpet becomes one model — chosen by
+   position in the table rather than by weight. Refused now, with a named error.
+   Pinned by `ScatterWeightsThatSumToInfinityAreRefusedNotCollapsed`, which also
+   asserts the level still *loads*, because that is what makes the case
+   reachable.
+2. **The selection walk's fall-through picked a `weight <= 0` row.** Same walk,
+   the rounding case rather than the infinity one: the fallback was "the last
+   model in the slice", which contradicts `LevelScatterModel::weight`'s stated
+   "`<= 0` is never picked" whenever a disabled candidate sits last. Now the
+   fallback is the last *positively weighted* row. Honest scope: an exhaustive
+   sweep of all 2²⁴ `pick01` values found this branch reachable only for
+   contrived weight sets and only for a handful of draws in 2²⁴, so it is a
+   contract made unconditional, not a bug anyone was hitting.
+3. **`SaveDocument::serialize()` narrowed the payload length to `uint32_t`
+   silently.** A document past 4 GiB wrote a file whose declared length
+   disagreed with its own checksummed payload: `save()` returned success and
+   every subsequent `load()` returned `Corrupt`. It now refuses, logs which
+   document it refused, returns an empty image, and `save()` maps that to
+   `WriteFailed`.
+4. **`export_level_now()` filled `model_sources` before the scatter block
+   interned its candidate models**, so any model first named by a scatter rule
+   shipped with an empty source — which `missing_models()` reports to a host's
+   loader as "you register this one yourself". The source loop moved to the end.
+5. **`--export-level` combined with `--level` wrote an empty level, and would
+   destroy the input if both named one path.** A loaded level fills `props_` but
+   cannot fill `prop_placements_` (a `PropPlacement` holds a `const char*` model
+   name and a loaded level's names die with the local `Level`), and
+   `export_level()` writes *before* `verify_exported_level()` runs. Refused in
+   `main()` before a window opens, and again in `export_level_now()` for anyone
+   driving it directly.
+6. **`load_level_props()` indexed `resolved.draws()` unchecked.** It
+   re-implements `ResolvedLevel::resolve`'s drop rule so the *n*th survivor is
+   the *n*th draw; the day those two copies drift, the old code read off the end
+   of the span. Bounds-checked in both directions now, with a diagnostic naming
+   the drift.
+7. **`missing_models()` reads the `ModelManager` name table exactly as
+   `ResolvedLevel::resolve` does** but carried no `BRACKEN_ASSERT_NOT_SIM_STAGE()`
+   and no tier note. Both added.
+8. Doc corrections, each against the code: `LevelScatterModel`'s scale range is
+   `[min, max)` and not "inclusive of both ends" (the RNG is `[0, 1)`);
+   `ResolvedLevel::emit` does not "allocate nothing" — the packet arena grows,
+   as it does for a host's own loop; nothing in the engine reads
+   `LevelScatterRule::baked`, so `level_dump`'s "(expanded at load)" was naming
+   a step that does not exist; `SaveDocument::paths()` hands back views into its
+   own records and must not be iterated while writing to the same document;
+   `ShorterStrideLeavesTheTailAtDefaults` uses a 28-byte row, not 24.
+
+### Checked and clean
+
+* **Determinism.** Nothing here runs in the Prepare stage. Every fold is over a
+  `std::vector` in table order — no `unordered_map`, no pointer values, no
+  thread-count or timing dependence, no floating-point accumulation whose order
+  can vary. `level_digest` folds lights through their on-disk rows precisely
+  because the descs carry padding.
+* **Layering.** `scene/level.cpp` reaches `render/water_renderer.hpp`, and
+  `render/` includes nothing from `scene/`, so the module DAG is intact.
+  `scene/level.hpp` joins the umbrella and reaches only `contracts/`, `core/`,
+  `save/`, `navigation/`, `heightmap.hpp`, glm and `<std>` — no vendored
+  dependency, so `public_headers.test.cpp` holds.
+* **Log discipline.** `LOG_TAG` present in both new `.cpp`s; the `std::cout` /
+  `std::cerr` in `level_export.cpp` and `main.cpp` are in `examples/`, which
+  `logger_discipline.test.cpp` does not scan and where the existing CLI modes
+  already print to the standard streams.
+* **No new cbuffer, no new shader, no new packet command kind**, so none of the
+  checklists those trigger apply. `TestFrame::digest()` covers all nine
+  host-written packet streams; the two engine-stamped effect snapshots are
+  excluded on purpose and said so.
+* **Bounds.** Every table decode divides rather than multiplying, every
+  allocation is bounded by something the file cannot inflate, and
+  `EveryTruncationOfAValidLevelIsRefusedRatherThanCrashing` walks every prefix.
+
+### Still open for the integrator
+
+* **The four playground commands remain unrun** — see above; the fixes here did
+  not change that.
+* **`place_prop` moved matrix composition out of `playground.cpp` and into
+  `level.cpp`.** On this checkout that is bit-safe (baseline x86-64, no
+  `-mfma`, no `-ffast-math`, so no FP contraction is available and both TUs emit
+  identical SSE2). On an FMA-capable target — the Metal machine, or any build
+  with `-march=native` — inlining context can change contraction, so the
+  **first** `--smoke` run after this merge may move the pinned `mean_luma`
+  by a hair. That is a one-time re-baseline, not a regression; out-of-lining is
+  what keeps it from happening a second time.
+* **The `CLAUDE.md` delta above is written but not applied**, and neither are
+  `docs/architecture.md`, `docs/user_guide.md` or `docs/technical_spec.md`.
+  `docs/gap_level.md` is also not in `docs_coherence.test.cpp`'s `DOCS` list, so
+  nothing checks its citations.
+* **`CLAUDE.md`'s "the 24 headers" is stale** — `bracken.hpp` carried 37 before
+  this change and 38 after. Pre-existing drift that this change nudges further;
+  no test enforces the number.
+* **A level's `motion_id`s are unvalidated.** Two million instances with two
+  million distinct ids is a legal file, and motion history is keyed by that id.
+  Bounded by the instance count, so not unbounded — but it is a file's word
+  reaching a renderer-side table.

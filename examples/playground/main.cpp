@@ -198,6 +198,18 @@ int main(int argc, char** argv) {
         }
     }
 
+    // --export-level exports the HAND-AUTHORED scene. A --level run never
+    // builds one (it fills props_ from the file and has no authoring triples to
+    // write back), so the pair would export an empty level — and if both point
+    // at one path, destroy the input on the way. Refused here, before a window
+    // opens; PlaygroundGame::export_level_now() carries the same refusal as the
+    // safety net for anyone driving it directly.
+    if (export_level_path != nullptr && level_path != nullptr) {
+        std::cerr << "--export-level and --level are mutually exclusive: a loaded level cannot be "
+                     "re-exported, and exporting onto the file being read would destroy it\n";
+        return 2;
+    }
+
     playground::PlaygroundGame game(smoke_frames, engine_camera, rt_bench);
     if (export_level_path != nullptr) {
         game.set_export_level_path(export_level_path);

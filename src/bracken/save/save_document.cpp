@@ -3,6 +3,7 @@
 #include "bracken/core/logger.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -304,8 +305,23 @@ std::vector<std::byte> SaveDocument::serialize() const {
             r.value);
     }
 
+    // The container's payload-length field is 32 bits. A document past that is
+    // unrepresentable, and the old code narrowed silently — which produced a
+    // file whose declared length disagreed with its own checksummed payload, so
+    // save() reported success and every later load reported Corrupt. Refusing
+    // here is what makes the failure land where the data still exists.
+    // Reachable only from an in-memory document (a `.level` decode is bounded
+    // well under this by k_max_table_rows and k_max_terrain_resolution), which
+    // is exactly why it needs a check rather than a comment.
+    if (payload.size() > static_cast<std::size_t>(UINT32_MAX)) {
+        BRACKEN_LOG_ERROR("save", "serialize(): {} payload bytes over {} records exceeds the container's "
+                                  "32-bit length field; refusing to emit a file that cannot be read back",
+                          payload.size(), records_.size());
+        return {};
+    }
+
     const uint64_t sum = checksum(payload);
-    const uint32_t payload_bytes = static_cast<uint32_t>(payload.size());
+    const auto payload_bytes = static_cast<uint32_t>(payload.size());
 
     std::vector<std::byte> file;
     file.reserve(sizeof(k_magic) + 4 + 4 + 4 + 8 + payload.size());
@@ -320,6 +336,11 @@ std::vector<std::byte> SaveDocument::serialize() const {
 
 core::Result<void, SaveError> SaveDocument::save(const std::string& path) const {
     const std::vector<std::byte> file = serialize();
+    if (file.empty()) {
+        // serialize() refused (see its length check) and said why. An empty
+        // image is never a valid document — the header alone is 24 bytes.
+        return core::Err(SaveError::WriteFailed);
+    }
 
     // Write to a sibling temp file, then rename. rename() is atomic within a
     // filesystem, so a crash or power loss leaves the OLD save intact rather
