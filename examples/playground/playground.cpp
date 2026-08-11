@@ -276,7 +276,7 @@ bool PlaygroundGame::on_init() {
         // sim state in on_main_frame (dev_ui.hpp "PANEL DATA SAFETY").
         ImGui::Text("Orbs collected: %d", panel_.orbs_collected);
         ImGui::Text("Player pos: %.1f, %.1f, %.1f", panel_.player_pos.x, panel_.player_pos.y, panel_.player_pos.z);
-        ImGui::Text("Anim state: %s", panel_.anim_state.c_str());
+        ImGui::Text("Anim state: %s (upper body %.2f)", panel_.anim_state.c_str(), panel_.anim_upper_weight);
         ImGui::Text("Village: %s",
                     panel_.village_loaded ? "loaded" : "unavailable (run tools/build_medieval_assets.py)");
         ImGui::Text("Ball pos: %.1f, %.1f, %.1f (%s)", panel_.ball_pos.x, panel_.ball_pos.y, panel_.ball_pos.z,
@@ -2369,6 +2369,18 @@ void PlaygroundGame::update_player(float dt) {
         const float target = attacking ? 1.0f : 0.0f;
         const float blend = std::min(1.0f, dt * 18.0f);
         upper_body_weight_ += (target - upper_body_weight_) * blend;
+        // SNAP AT THE ENDS. An exponential follower never actually arrives, and
+        // the two endpoints are the two the rig fast-paths: weight <= 0 skips
+        // the layer outright (no sample, no blend, and the pose is bitwise the
+        // single-layer result), weight >= 1 assigns instead of interpolating.
+        // Without this the villager pays for a second full skeleton sample on
+        // every frame of his life to add a 1e-4 rotation nobody can see.
+        constexpr float SNAP = 1.0f / 512.0f;
+        if (upper_body_weight_ < SNAP) {
+            upper_body_weight_ = 0.0f;
+        } else if (upper_body_weight_ > 1.0f - SNAP) {
+            upper_body_weight_ = 1.0f;
+        }
         anim_rig_.set_layer_weight(upper_body_layer_, upper_body_weight_);
     }
 
@@ -3315,6 +3327,7 @@ void PlaygroundGame::sync_dev_panel() {
     panel_.orbs_collected = orbs_collected_;
     panel_.player_pos = player_pos_;
     panel_.anim_state = anim_sm_.current_state();
+    panel_.anim_upper_weight = upper_body_weight_;
     panel_.village_loaded = has_village_;
     // Ball state comes from the sim-written mirrors, not PhysicsWorld —
     // physics is sim-stage and the fence never calls into it.

@@ -121,6 +121,11 @@ private:
         int orbs_collected = 0;
         glm::vec3 player_pos{0.0f};
         std::string anim_state;
+        /// Upper-body rig layer weight. The state machine used to carry an
+        /// `Attack` state, so "is he swinging" was readable straight off
+        /// `anim_state`; the swing is a masked ADDITIVE LAYER now, and its
+        /// weight is where that information lives.
+        float anim_upper_weight = 0.0f;
         bool village_loaded = false;
         // Chrome-ball physics state (copied from the sim-written mirrors —
         // the fence never calls into PhysicsWorld itself; physics is sim-stage).

@@ -298,8 +298,28 @@ const glm::mat4 held  = lantern_attach_.world(model_transform, rig.pose());
 | `src/bracken/animation/animation_rig.hpp` / `.cpp` | `BlendMode`, `LayerSource`, `k_max_animation_layers`, `LayerDesc`, `AnimationRig` |
 
 Tests: `pose.test.cpp`, `blend_space.test.cpp`, `root_motion.test.cpp`,
-`animation_rig.test.cpp`, `animation_rig_parallel.test.cpp`. Benchmarks appended
-to `animation.bench.cpp`.
+`animation_rig.test.cpp`, `animation_rig_parallel.test.cpp`,
+`animation_rig_alloc.test.cpp`, `animation_rig_character.test.cpp`. Benchmarks
+appended to `animation.bench.cpp`.
+
+The last two are worth naming separately, because neither is a unit test of a
+type:
+
+* **`animation_rig_alloc.test.cpp`** is the allocation audit — see §2.6. It
+  **replaces the global `operator new` / `operator delete` for the whole
+  `bracken_tests` binary**, which is the only way to observe a `std::vector`
+  growth from outside the vector. There must be exactly one such replacement in
+  the binary; a second one is a duplicate-symbol link failure. If another
+  feature ever needs allocation counting, count from here or lift this into a
+  shared header — do not add a second copy.
+* **`animation_rig_character.test.cpp`** reproduces the *playground villager's*
+  rig headlessly — the same 11-joint skeleton, the same locomotion/attack clip
+  shapes, the same masked feathered additive layer — and asserts the four
+  properties the playground port rests on. The playground is not linked into the
+  test binary, so the fixture is a MIRROR, not a share: if
+  `examples/playground/character.cpp` or `PlaygroundGame::setup_animation_rig`
+  changes shape, this fixture must change with it or it will stay green while
+  the game is broken.
 
 ### 2.2 Data structures and sizes (measured, x86-64 / GCC / glm default alignment)
 
@@ -427,6 +447,22 @@ samples and the rotation comes from the **dominant** sample. **That rotation is
 discontinuous when the dominant sample changes** — a documented limitation; a
 slerp chain over an unordered active set has no canonical order.
 
+**Known limitation: a blend-space layer's clock is unbounded.** A `Clip` layer's
+`time` is wrapped into `[0, duration)` every frame, but a blend-space layer's is
+not — the per-sample times are derived from it, so it just accumulates
+`dt * speed`. The phase advance is then `(time - prev_sample_time) / eff`, a
+difference of two floats that both keep growing. At an hour of continuous play
+`time` is ~3,600 and float spacing there is 2.4e-4 against a 16.7 ms frame — a
+1.5% quantisation of the advance; at ten hours the spacing is 3.9e-3, about 23%.
+A non-synced layer (`sync_duration = false`) degrades the same way through its
+`fmod(time, duration)`. Nobody will see it in a session, and nothing in this tree
+runs a blend-space layer at all, but it is a real ceiling. The fix is to store
+the frame's advance on the `Clock` rather than recovering it as a difference, and
+to wrap the blend-space clock; it was **not** made here because it changes the
+numerics of a path that has never been executed (this worktree has no build tree
+— see §5), and an unmeasured numerics change is exactly what the rest of this
+feature was careful to avoid.
+
 ### 2.5 Error handling and diagnostics
 
 * `AnimationRig::add_layer` returns `-1` (and logs a `WARN`) past
@@ -441,6 +477,88 @@ slerp chain over an unordered active set has no canonical order.
   it is live in release.
 * `AnimationRig::bind` logs an `ERROR` when the bindings were built for a
   different clip count and a `WARN` when the skeleton exceeds `MAX_BONES`.
+
+### 2.6 The allocation contract, and its proof
+
+`AnimationRig::evaluate` runs **once per animated character per frame, in the sim
+stage, on a pool worker**. A single heap allocation there is not a
+micro-optimisation problem: it is a lock taken by every character on every worker
+at the same point in the frame. So the contract is flat —
+
+> **After `bind()`, and after any `add_layer` / `set_blend_space_*`,
+> `evaluate()` allocates nothing.**
+
+Where the allocations actually live, and why that is the right seam:
+
+| Call | Allocates | Why there |
+|---|---|---|
+| `ClipBindings::build` | yes, `clips × joints` pointers | once per **model**, shared const by every rig |
+| `AnimationRig::bind` | resizes existing layers' cursor storage | once per character, at load |
+| `AnimationRig::add_layer` | two `ClipSampler` cursor vectors (24 B/joint each when caching) | setup |
+| `set_blend_space_1d/2d` | re-sizes that layer's samplers to the sample count | setup, or a state-machine **entry** — never per frame |
+| `play_clip` | only when the layer was a blend space and is now a clip | a source switch, not a clip switch |
+| `evaluate`, `write_palette` | **nothing** | the audit |
+
+`animation_rig_alloc.test.cpp` proves it by replacing the global `operator new`
+and counting allocations on the calling thread across a 240-frame window, for
+four configurations: a plain clip layer; a clip layer taking a crossfade every
+40 frames (the crossfade is what first brings the second sampler into play, so a
+lazy resize would surface exactly there); a four-layer stack with masks, a
+caller-owned feather span, clip-sourced additive references and root motion
+extracting *and* stripping every frame; and a blend-space layer whose query
+crosses sample boundaries during the window. It also covers `write_palette` and
+the `AnimationStateMachine::update(rig, layer)` + `evaluate` pair across real
+Idle↔Walk transitions, which is the playground's per-frame shape.
+
+Two of the tests exist to keep the audit honest rather than to test the rig:
+`TheCounterActuallySeesAllocations` fails if the replacement is not linked (a
+dead counter would make every other test in the file a false green), and
+`SetupIsWhereTheAllocationsLive` asserts that setup **does** allocate — a
+`bind()`/`add_layer()` pair that allocated nothing would mean the cursor storage
+was never sized and `evaluate` was doing it lazily.
+
+**What the audit does not cover.** `LayerDesc` holds a `std::string name`, so
+constructing one allocates for names past the small-string buffer; that is a
+setup cost and `add_layer` takes the desc by value and moves it. Tracy's
+profiler zones are compiled out unless `BRACKEN_ENABLE_TRACY=ON` and have not
+been audited with it on.
+
+### 2.7 Benchmarks
+
+Appended to `src/bracken/animation/animation.bench.cpp`:
+
+| Benchmark | Arguments | What it answers |
+|---|---|---|
+| `BM_AnimationRigEvaluate` | `{16,1} {64,1} {128,1} {128,2} {128,4} {128,8}` | the per-character per-frame cost of the layer stack |
+| `BM_AnimationRigBlendSpaceLayer` | 2 / 4 / 8 samples, 128 joints | the other shape a base layer takes, and the expensive one |
+| `BM_BlendSpace2DResolve` | 4 / 8 samples | the O(n²) gradient band on its own |
+
+Two comparisons are the point of the first, and neither is the absolute number:
+
+* **`{128,1}` against `BM_AnimationPlayerUpdate/128`.** A one-layer rig is
+  bitwise identical to the player, so the gap between those rows is the layer
+  machinery's fixed overhead and nothing else.
+* **`{128,1} → {128,2} → {128,4} → {128,8}`.** Each extra layer is one more
+  FULL skeleton sample — the mask gates the *blend*, not the *sample* — plus one
+  blend pass, and an additive layer additionally derives its reference pose. The
+  curve should be close to linear; a superlinear knee means something in the
+  layer loop is not O(joints).
+
+`{128,8}` is `k_max_animation_layers`, measured so the budget is a number rather
+than a guess.
+
+**No numbers are quoted here, and that is not modesty.** This worktree has no
+build tree, so nothing in this feature has been executed — see §5. Numbers from a
+default configure are meaningless anyway (`-O0` with live tier assertions);
+reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
+
+The fixture had a real bug on its first outing, worth knowing because it is easy
+to reintroduce: it gave clips only to layers **above** layer 0, so the base layer
+sampled the rest pose and the whole curve read as though layers were nearly free.
+Every layer in the fixture now plays a clip. The masks had the mirror-image
+problem — `LayerDesc::mask` defaults to `BoneMask::all()`, so
+`desc.mask.set_subtree(...)` ORs a subtree into an already-full mask and changes
+nothing. Start from `BoneMask::none()`.
 
 ---
 
@@ -603,6 +721,30 @@ usable answer. Documented on `evaluate()` and asserted by
 >   against the two copies drifting is
 >   `AnimationRig.SingleOverrideLayerMatchesAnimationPlayerBitwise`, which memcmps
 >   120 frames of both. Edit one, edit the other.
+> - **`LayerDesc::mask` defaults to `BoneMask::all()`, so
+>   `desc.mask.set_subtree(root)` is a NO-OP** — `set_subtree` ORs, and ORing into
+>   a full mask changes nothing. Start from `BoneMask::none()` (or a
+>   default-constructed `BoneMask`, which is `none()`). This was shipped as a live
+>   bug in the first version of `BM_AnimationRigEvaluate`, where it silently made
+>   every masked layer a full-body one.
+> - **A layer frozen immediately after `play_clip` wedges at blend factor 0.** A
+>   crossfade only resolves inside `advance_clock`, which returns early for a
+>   layer with `playing == false`; freeze before the first `evaluate()` and the
+>   layer samples its PREVIOUS clip forever. Step once, then freeze. (The
+>   playground is safe: its upper-body layer is created playing and its
+>   zero-duration crossfade resolves on frame 1 at weight 0.)
+> - **`animation_rig_alloc.test.cpp` replaces the global `operator new` /
+>   `operator delete` for the entire `bracken_tests` binary.** That is the only
+>   way to see a `std::vector` growth from outside the vector, and it must stay
+>   the only such replacement in the binary — a second one is a duplicate-symbol
+>   link failure. It routes through `malloc`/`free` so sanitizer builds still
+>   track the memory; what ASan loses is its new/delete type-mismatch check.
+> - **Follow a layer weight, but SNAP the ends.** An exponential follower never
+>   arrives, and weight 0 and weight 1 are the two values the rig fast-paths
+>   (weight ≤ 0 skips the layer's sample and blend entirely and is bitwise the
+>   single-layer result; ≥ 1 assigns instead of interpolating). Without a snap a
+>   character pays for a second full skeleton sample every frame of his life to
+>   add a 1e-4 rotation. The playground snaps at 1/512.
 
 ### 4.5 Screenshot baselines — THE PINS MOVE, AND THEY WERE NOT RE-MEASURED
 
@@ -651,3 +793,69 @@ and can stay.
 None of these fail `core/docs_coherence.test.cpp` — the identifiers it pairs
 with files are unaffected — which is exactly why they need a human to catch
 them.
+
+---
+
+## 5. Verification status — what was actually run
+
+**Nothing in this feature has been executed.** The worktree it was written in has
+no build tree by design (a cold configure would rebuild DXC), so no test, no
+benchmark, no smoke run and no screenshot exists for any of it. The only
+verification performed was `tools/wt_syntax_check.py`: every translation unit in
+the tree through the real compiler with the real project flags
+(`-std=gnu++23 -Wall -Wextra -Wshadow -Werror`) at `-fsyntax-only`, test TUs
+included.
+
+What that means for whoever integrates this, stated plainly:
+
+1. **The tests compile. Whether they pass is unknown.** They were written to be
+   correct and their tolerances were derived by hand from the clip data and the
+   blend algebra, but a tolerance derived by hand is a hypothesis. The ones most
+   likely to need a re-tuned constant rather than a code fix, and why:
+   * `VillagerRig.TheLeftArmKeepsSwingingThroughASwingWhileTheRightArmDoesNot`
+     bounds the right arm's peak deviation at **1.8 rad** against an authored key
+     of 2.2 at t = 0.12 s that a 60 Hz clock straddles (it samples 0.1166 and
+     0.1333, worth about 2.14 rad). If the sampling grid shifts, this is a
+     threshold problem, not a bug.
+   * `VillagerRig.TheFeatherHalvesTheSpineDeltaAndLeavesTheArmsAtFullStrength`
+     asserts a ratio of 0.5 ± 0.02, which follows from slerp's angle being linear
+     in `t` and from the depth ramp landing the spine at exactly 0.5.
+   * `VillagerRig.RampingTheLayerWeightMovesTheArmContinuously` requires the
+     largest single step to be under 2× the mean. That is a real continuity
+     bound, but the constant 2 is a judgement call.
+2. **The screenshot pins move and were not re-measured** — §4.5, unchanged and
+   still the largest outstanding item.
+3. **No benchmark number is quoted anywhere in this document**, for the same
+   reason. §2.7 says what the curves should look like, not what they are.
+4. **The allocation audit is a compile-checked design, not a measurement**, until
+   `bracken_tests` actually links with the replaced `operator new`. The link is
+   the risk: if another feature landing in the same integration also replaces a
+   global allocator function, the two collide.
+
+## 6. Second-pass changes (this commit)
+
+The first commit landed the engine surface and the playground port together. This
+pass finished the parts that needed a second look:
+
+* **The playground port, completed.** The upper-body layer weight now snaps at
+  both ends (see the gotcha above) instead of decaying asymptotically forever,
+  and the dev panel's `Anim state` line carries the layer weight —
+  `Attack` used to be a state name a developer could read there, and after the
+  port that information had nowhere to go.
+* **`animation_rig_character.test.cpp`**, the headless mirror of the playground
+  villager. It is what "confirm the animation still reads correctly" reduces to
+  when the renderer cannot be run: the legs are bitwise untouched by the
+  upper-body layer, an unchanneled masked joint (the left arm) contributes a
+  zero delta, the depth feather halves the spine, the swing fades in and out of
+  the identity, a weight ramp is step-bounded, and the state machine still walks
+  and runs off `speed` alone while the upper-body layer is at full weight. It
+  also carries the negative control — an *Override* upper-body layer really does
+  freeze the left arm, by 0.2+ rad — so the Additive decision is pinned by a
+  failing-if-reverted test rather than by a comment.
+* **`animation_rig_alloc.test.cpp`** — §2.6.
+* **`BM_AnimationRigEvaluate` fixed and extended** — §2.7. As shipped in the
+  first commit it gave no clip to layer 0 and ORed its subtree masks into an
+  already-full mask, so it measured neither the sampler nor a masked blend.
+* The bit-identity regression for the single-layer path was **already present**
+  from the first pass (`AnimationRig.SingleOverrideLayerMatchesAnimationPlayerBitwise`
+  plus its crossfade twin) and was re-read rather than rewritten.
