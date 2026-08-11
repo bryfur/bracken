@@ -28,12 +28,25 @@ Consolidated from the chapters below. Changing any of these requires auditing ev
 | `Arena::k_default_chunk_size` | 64 KiB | `memory/arena.hpp` | Default growable-arena chunk size |
 | `Bloom::MAX_MIPS` | 6 | `render/bloom.hpp` | Bloom mip-chain slots (4–6 active depending on resolution) |
 | `INITIAL_VERTEX_CAPACITY` (UI) | 16384 | `render/ui_renderer.hpp` | Initial GPU vertex-buffer capacity; the buffer grows geometrically when a frame outgrows it (see Text & UI Rendering) |
-| `MAX_TEXT_QUADS` | 4096 | `render/text_renderer.hpp` | Glyph quads per frame across all strings; excess dropped with one warning per frame |
+| `INITIAL_TEXT_QUADS` / `MAX_TEXT_QUADS` | 4096 / `1 << 20` | `render/text_renderer.hpp` | Initial text vertex-buffer capacity in glyph quads, and the runaway ceiling. `INITIAL_TEXT_QUADS` stopped being a *cap* with the scroll-view work — the buffer grows the way `UIRenderer`'s does, because a scrolling list is a large frame every frame |
 | `ATLAS_SIZE` | 512 | `render/text_renderer.hpp` | Glyph atlas dimensions (one atlas, one hardcoded 18 px font size) |
 | `GrassRenderer::MAX_VIEW_DISTANCE` | 1200 | `render/grass_renderer.hpp` | Grass draw-distance clamp; chunks are 32 world units with 144 blades each |
 | `MAX_ACTIVE_SHAKES` | 8 | `systems/camera_system.hpp` | Concurrent camera shakes; the oldest is evicted silently |
 | `TreeParams::MAX_LEVELS` | 4 | `procedural/tree_generator.hpp` | Per-level tree parameter arrays; out-of-range `levels` is clamped with a warning (`sanitize_params`) |
 | `INVALID_MODEL_HANDLE` | 0 | `model_loader.hpp` | Reserved null model handle (slot 0 permanently reserved) |
+| `k_render_hook_slot_count` | 5 | `scene/render_hook.hpp` | Named points in `render_frame` where a host pass may run. **Not a budget** — there is no cap on host pipelines or host hooks; adding a slot means adding a guarded call site |
+| `k_level_format_version` | 1 | `scene/level.hpp` | The level SCHEMA version, distinct from `save::k_save_format_version` (the container's). Bumped only when the record set changes shape in a way an older build cannot ignore; adding a key or growing a stride does **not** bump it |
+| Level row strides | 52 / 20 / 16 / 124 / 16 / 48 | `scene/level.hpp` | `LevelInstance` / `LevelMarker` / `LevelRect` / `LevelWater` / `LevelScatterModel` / `LevelScatterRule`. The `sizeof` **is** the on-disk stride; all `static_assert`ed padding-free and APPEND-ONLY |
+| Level loader ceilings | 65536 / `1<<21` / 8192 / `4<<20` / 8192 / `1<<20` | `scene/level.hpp` | `k_max_name_table_rows`, `k_max_table_rows`, `k_max_terrain_resolution`, `k_max_nav_cells`, `k_max_scatter_cells_per_axis`, `k_max_scatter_instances` — the answer to "what stops a hostile file allocating". Every one is a refusal with a named `LevelError`, never a truncation |
+| `FontMetrics::k_first_cp` / `k_last_cp` | `0x20` / `0x24F` (560 dense advances) | `contracts/font_metrics.hpp` | The exported glyph range. A codepoint outside it MEASURES with `fallback_advance` and DRAWS at its real advance, so text outside the range overruns a box sized from the table. Kerning is exported over printable ASCII only (313 600 FreeType lookups against 9 025), so accented Latin kerns as zero |
+| `LayoutTree::k_max_depth` | 64 | `ui/layout.hpp` | UI container nesting guard. Boxes opened past it are discarded and counted; their `end_box` is absorbed so the tree stays well-formed |
+| `ContextConfig::retain_frames` | 120 | `ui/ui_context.hpp` | Frames a retained UI widget entry survives after it stops being declared — what bounds the unstable-id leak |
+| `k_max_animation_layers` | 8 | `animation/animation_rig.hpp` | Layers per `AnimationRig`; the extent of a fixed array in every rig, so raising it costs memory whether the layers are used or not |
+| `k_max_blend_samples` | 8 | `animation/blend_space.hpp` | Samples per blend space. Bounds the 2D estimator's O(n²) loop (8 → 56 pair evaluations per resolve per layer per character) **and** the `ClipSampler` array a layer holds |
+| `SceneRenderer::k_occlusion_level` | 4 | `scene/scene_renderer.hpp` | Hi-Z mip the CPU occlusion cull downloads: 100×57 floats at 1600×900. `OcclusionField`'s four conservatism knobs (`max_tested_screen_fraction = 0.15`, `max_camera_travel = 250`, `min_camera_rotation_cos = 0.99905`, `depth_slack = 0`) live in `contracts/occlusion.hpp` and are all UNMEASURED guesses |
+| `HeightmapGrid::k_recommended_min_page_size` | 2000.0 | `heightmap_grid.hpp` | Advisory floor on terrain page size — `TerrainRenderer::set_heightmap_grid` warns below it, never refuses. Tile runs never merge across pages, so every frustum-intersecting page costs at least one draw in each of the six terrain walks a frame |
+| `TerrainRenderer::k_page_margin` / `k_grass_proxy_max_resolution` | 500.0 / 1024 | `render/terrain_renderer.hpp` | The terrain skirt, applied only on the grid's OUTER edges; and the cap on the paged-world grass proxy |
+| `ResidencyManager::Config` defaults | 512 MB, 4000 / 6000, 120 frames | `residency_manager.hpp` | Budget, load/evict band and time-domain hysteresis. `evict_radius > load_radius` is REFUSED rather than clamped — a silently-clamped band thrashes anyway. Every one of these is a plausible value, not a measured one |
 
 ## Table of contents
 
@@ -59,6 +72,13 @@ Consolidated from the chapters below. Changing any of these requires auditing ev
 20. [Render Graph (Available, Not Yet Wired)](#render-graph-available-not-yet-wired)
 21. [DevUI Developer Overlay](#devui-developer-overlay)
 22. [Physics (Jolt)](#physics-jolt)
+23. [Host-Extensible Rendering: Runtime Pipelines & Render Hooks](#host-extensible-rendering-runtime-pipelines--render-hooks)
+24. [Levels: `scene::Level`, the Container, and the Frame Digest](#levels-scenelevel-the-container-and-the-frame-digest)
+25. [The UI Module (`bracken::ui`)](#the-ui-module-brackenui)
+26. [Animation Layering: `AnimationRig`, Bone Masks, Blend Spaces, Root Motion](#animation-layering-animationrig-bone-masks-blend-spaces-root-motion)
+27. [Streaming: Paged Terrain, Asset Residency & Hi-Z Occlusion Culling](#streaming-paged-terrain-asset-residency--hi-z-occlusion-culling)
+
+Chapters 23–27 are the five features that landed together in the host-extensibility / streaming pass. Chapter 17 (Text & UI Rendering) is the *renderer* side of UI — the batcher, the glyph atlas and the packet commands; chapter 25 is the sim-stage `bracken::ui` layer above it. Chapter 11 (Skeletal Animation) is `AnimationPlayer`, which chapter 26 does **not** replace.
 
 ---
 
@@ -261,7 +281,7 @@ Threading contract: `init_engine()` calls `core::bind_main_thread()`; `BRACKEN_A
 
 #### Dev UI wiring (`init_dev_ui`, `application.cpp:276–305`)
 
-Always constructs the `DevUI` object first (so `dev_ui()` and event/render calls are safe regardless of outcome), then returns `false` if the renderer isn't up. Bindings passed to `DevUI::init` (`dev::DevUI::Bindings`, non-owning, must outlive the DevUI): `SceneRenderer*`, `CameraController*`, `GraphicsSettings*`, an `apply_settings` callback routed through **`request_graphics_settings`** (the overlay draws DURING rendering, while the next sim runs — the GPU/SDL settings work must land at the frame fence), and `const float* fps`. Panel-data safety in the pipelined loop is documented on `dev::DevUI`: panel bodies run mid-render, concurrent with the next sim — draw render-side data (packet-derived stats, `SceneRenderer` state) or values snapshotted in `on_main_frame`; never read live game state being mutated by `on_simulate` (the built-in Camera tab's live `CameraController` reads are a documented tear-only exception). On success it installs `scene_renderer_->set_post_ui_callback(...)` rendering the overlay — **there is a single post-UI callback slot**; a host using the dev UI cannot install its own. `dev_ui()` asserts `init_dev_ui()` was called. Stub builds (`BRACKEN_ENABLE_DEV_UI=OFF`): `DevUI::init` returns `false`, every other member is a safe no-op; only host code that includes `imgui.h` (panel bodies) needs a `#ifdef BRACKEN_DEV_UI` guard. Key API on `dev::DevUI` (`src/bracken/dev/dev_ui.hpp`): `process_event` (release events never consumed so game edge-state can't wedge), `set_toggle_key(SDL_Scancode)` (default `SDL_SCANCODE_UNKNOWN` = none; handled inside `process_event` so it works while ImGui has keyboard focus), `wants_keyboard()/wants_mouse()`, `render(SDL_GPUCommandBuffer*, SDL_GPUTexture*)`, `set_visible/visible/toggle`, `add_panel(std::string, std::function<void()>)` (safe before init; drawn as its own window between `Begin(name)`/`End`).
+Always constructs the `DevUI` object first (so `dev_ui()` and event/render calls are safe regardless of outcome), then returns `false` if the renderer isn't up. Bindings passed to `DevUI::init` (`dev::DevUI::Bindings`, non-owning, must outlive the DevUI): `SceneRenderer*`, `CameraController*`, `GraphicsSettings*`, an `apply_settings` callback routed through **`request_graphics_settings`** (the overlay draws DURING rendering, while the next sim runs — the GPU/SDL settings work must land at the frame fence), and `const float* fps`. Panel-data safety in the pipelined loop is documented on `dev::DevUI`: panel bodies run mid-render, concurrent with the next sim — draw render-side data (packet-derived stats, `SceneRenderer` state) or values snapshotted in `on_main_frame`; never read live game state being mutated by `on_simulate` (the built-in Camera tab's live `CameraController` reads are a documented tear-only exception). On success it installs `scene_renderer_->set_post_ui_callback(...)` rendering the overlay — **there is a single post-UI callback slot**, and it is the dev overlay's. A host that wants its own pass uses `scene_renderer().render_hooks()` with `RenderHookSlot::AfterUi`, which composes and runs UNDER the overlay instead of replacing it (chapter 23); `set_post_ui_callback` still works, is deprecated for host use, and now logs a WARN naming `init_dev_ui` when it overwrites an installed callback. `dev_ui()` asserts `init_dev_ui()` was called. Stub builds (`BRACKEN_ENABLE_DEV_UI=OFF`): `DevUI::init` returns `false`, every other member is a safe no-op; only host code that includes `imgui.h` (panel bodies) needs a `#ifdef BRACKEN_DEV_UI` guard. Key API on `dev::DevUI` (`src/bracken/dev/dev_ui.hpp`): `process_event` (release events never consumed so game edge-state can't wedge), `set_toggle_key(SDL_Scancode)` (default `SDL_SCANCODE_UNKNOWN` = none; handled inside `process_event` so it works while ImGui has keyboard focus), `wants_keyboard()/wants_mouse()`, `render(SDL_GPUCommandBuffer*, SDL_GPUTexture*)`, `set_visible/visible/toggle`, `add_panel(std::string, std::function<void()>)` (safe before init; drawn as its own window between `Begin(name)`/`End`).
 
 #### Screenshot path (`request_screenshot`)
 
@@ -273,18 +293,20 @@ Always constructs the `DevUI` object first (so `dev_ui()` and event/render calls
 - Benchmarks: `*.bench.cpp` next to their unit, auto-globbed into `bracken_benchmarks` (linked to `benchmark::benchmark_main`, so no `main` needed in bench files). Binary path: `build/src/bracken/bracken_benchmarks`; `--benchmark_filter=<regex>` selects a subset.
 - Integration test: the playground smoke run (below); optionally a ctest named `playground_smoke` (label `integration`, timeout 180 s, working directory = the playground binary dir) when `BRACKEN_PLAYGROUND_SMOKE_TEST=ON`.
 - `RenderStats` (`src/bracken/contracts/render_stats.hpp`), consumed by the smoke summary and dev-UI Stats panel: counters (`draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `entities_occlusion_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`, `ui_draws`, `local_shadow_tiles_rendered`), budgets (`packet_bytes_used/capacity`, `bone_palettes_used/budget`, `lights_submitted/binned`) and `std::vector<PassTiming> pass_times_ms`. Collection is opt-in via `set_collect_render_stats(bool)`; `Application::render_stats()` returns `std::optional<RenderStats>`, `nullopt` while off.
-- `FrameDiagnostics` (same header), via `Application::frame_diagnostics()`: every drop path the frame took (`draws_dropped_unknown_model`, `draws_deferred_not_resident`, `skinned_dropped_no_skeleton`, `palettes_over_budget`, `shadow_capsules_over_budget`, `effect_models_unresolved`, `lights_dropped`, `cluster_lights_dropped`, `camera_missing`). Accumulated unconditionally — not gated on `set_collect_render_stats`.
+- `FrameDiagnostics` (same header), via `Application::frame_diagnostics()`: every drop path the frame took (`draws_dropped_unknown_model`, `draws_deferred_not_resident`, `skinned_dropped_no_skeleton`, `palettes_over_budget`, `shadow_capsules_over_budget`, `effect_models_unresolved`, `lights_dropped`, `cluster_lights_dropped`, `render_hooks_skipped`, `ui_textures_unresolved`, `camera_missing`). Accumulated unconditionally — not gated on `set_collect_render_stats`.
 - `PassTiming { std::string_view name; std::optional<float> cpu_ms, gpu_ms; }`: `cpu_ms` is the real CPU cost of RECORDING the pass (`core::PassTimeline`); `gpu_ms` is `nullopt` — SDL3 exposes no timestamp query API.
 
 ### Playground example — the canonical integration (`examples/playground/`)
 
-Five files: `main.cpp` (entry point + screenshot verification), `playground.hpp/.cpp` (the `PlaygroundGame : public bracken::Application` subclass), `character.hpp/.cpp` (code-built assets). `examples/playground/CMakeLists.txt` is the reference consumer: `add_executable(playground main.cpp playground.cpp character.cpp)`, `target_link_libraries(playground PRIVATE bracken)`, `bracken_copy_shaders(playground)`. Binary: `build/examples/playground/playground`.
+`main.cpp` (entry point + screenshot verification), `playground.hpp/.cpp` (the `PlaygroundGame : public bracken::Application` subclass), `character.hpp/.cpp` (code-built assets), `scene_layout.cpp` (the hand-authored village), `day_weather.cpp`, `music.cpp`, `sfx.cpp`, `custom_pass.cpp` (the host-pipeline worked example, chapter 23) and `level_export.cpp` (the level export/verify/dump modes, chapter 24). `examples/playground/CMakeLists.txt` is the reference consumer: it links the **namespaced** `bracken::bracken` alias deliberately, calls `bracken_copy_shaders(playground)` for the engine's SPIR-V and `bracken_compile_shaders(playground DIRECTORY .../shaders)` for its own HLSL (staged into `shaders_playground/`, a different directory from `shaders/`, which `bracken_copy_shaders` wipes on every build). Binary: `build/examples/playground/playground`.
 
 #### Entry point and argument contract (`main.cpp`)
 
 `playground [--smoke [frames]]`. `--smoke` sets `smoke_frames = 240`; an immediately following argument not starting with `-` is parsed with `std::from_chars` — a non-numeric, partially numeric, or non-positive value prints `invalid --smoke frame count (expected a positive integer)` and **exits 2**. Unknown arguments → stderr + **exit 2**. Sequence: `PlaygroundGame game(smoke_frames); game.init_engine() → game.start() [= on_init] → game.run() → game.stop() [= on_shutdown] → game.shutdown_engine()`; failures exit 1. After a smoke run, `verify_smoke_screenshot(PlaygroundGame::SMOKE_SCREENSHOT_PATH)` must pass or exit 1.
 
 `SMOKE_SCREENSHOT_PATH = "playground_smoke.png"` (`playground.hpp:34`, `static constexpr`), written to the process working directory.
+
+**The three level modes** (chapter 24). `--dump-level FILE` is handled in `main()` *before* `init_engine`, for the same reason `--build-pack` is: inspecting a file must not need a display, a GPU or the 50 MB asset set. `--export-level FILE` and `--level FILE` set paths on the game and are **mutually exclusive** — refused in `main()` with exit 2 before a window opens, and again inside the exporter for anyone driving it directly, because a `--level` run has no authoring triples to write back (so the pair would export an empty level) and the export writes before it verifies (so both naming one path would destroy the input). `--export-level` runs at the tail of `on_init` and then calls `quit()`, which terminates the process **only because `Application::quit()` is latched**: `run()` honours a quit issued before the loop starts instead of resurrecting the flag it stores at entry. Before that latch, a `quit()` from `on_init` was silently erased and the host ran forever.
 
 #### Screenshot verification algorithm (`main.cpp::verify_smoke_screenshot`)
 
@@ -296,11 +318,11 @@ Constants: `WORLD=8000`, `WORLD_MARGIN=250`, `ORB_COUNT=15`, `ORB_PICKUP_RADIUS=
 
 `on_init`: `init_renderer(1600, 900, "bracken playground", WORLD, WORLD)`; `init_dev_ui()` + `dev_ui().set_toggle_key(SDL_SCANCODE_F10)` + one host panel guarded by `#ifdef BRACKEN_DEV_UI`; builds a 257×257 `Heightmap` via `Heightmap::from_floats(heights, 257, {0, 0, 8000}, {-160, 150})` (world-unit samples from layered sines; the range is explicit so the encoding is stable under edits) and `set_heightmap`; registers models by name through `models().register_model(...)`, logging `to_string(error)` on a refusal — `"player"`, `"orb"`, `"orb_shard"` (referenced *by name* from effect definitions), three `procedural::TreeGenerator` species and three `procedural::RockGenerator` shapes with fixed seeds (fallback scene only; with village assets the pack `.glb`s load instead); builds the animation state machine; defines two member `EffectDefinition`s (`pickup_burst_`: BURST of 26 radial shards with gravity/drag and fade curves; `attack_arc_`: BURST of 12 ARC-path particles with `face_velocity`) — members because **definitions must outlive all spawned instances**; applies the hand-authored scene layout (`scene_layout.cpp`: per-area placements for props, flora, rock outcrops, and the grove-stamp forest ring) plus the procedural grass-tuft ground cover — or, in the fallback scene, scatters 70 procedural trees + 25 rocks outside the plateau clearing; places 15 orbs; configures the camera (terrain-height callback, screen size, `distance=380`, `height_offset=120`, target above the player); enables render-stats collection when in smoke mode.
 
-State machine (`setup_state_machine`): states Idle/Walk/Run/Attack bound to same-named clips; transitions on parameters `speed` (float) and `attacking` (bool) — Idle→Walk at `speed GT 20`, Walk→Run at `GT 240`, Run→Walk at `LT 220`, Walk→Idle at `LT 20`, any→Attack on `attacking IS_TRUE` with crossfade 0.08 and priority 10; Attack is non-looping and exits to Idle on `IS_FALSE`. `bind_clips(model->animations)` resolves clip names to indices once (warns on unbound states); `param_index("speed"/"attacking")` resolves parameter names to indices once so per-frame updates (`set_float`/`set_bool` index overloads) hash nothing.
+State machine (`setup_state_machine`): **three** states — Idle/Walk/Run, bound to same-named clips — driven by the single float parameter `speed`: Idle→Walk at `GT 20` (crossfade 0.15), Walk→Run at `GT 240` (0.15), Run→Walk at `LT 220` (0.2), Walk→Idle at `LT 20` (0.2). `bind_clips(model->animations)` resolves clip names to indices once (warns on unbound states) and `param_index("speed")` resolves the parameter name once, so per-frame updates (`set_float`'s index overload) hash nothing. **Attack is no longer a state.** It used to be a whole-body Override state every locomotion state fell into at priority 10, which stopped the legs dead — the villager had to plant his feet to swing. It is now a masked, feathered, **additive** upper-body layer on an `AnimationRig` (`setup_animation_rig`): one `anim::ClipBindings` per model, layer 0 = "locomotion" (the base, driven by the state machine), layer 1 = "upper_body" masked to the `Spine` subtree with a depth-2 `feather_by_depth` ramp rooted at the spine's **parent**, `additive_reference_clip = -1` (the rest pose), playing the non-looping `Attack` clip at weight 0. Additive rather than Override because the Attack clip authors channels for the right arm and the spine and nothing else: as an Override layer every other masked joint would take the sampler's rest-pose fallback and the left arm would stop swinging mid-stride. See chapter 26.
 
-`on_simulate(SimFrame& sim)` — the whole frame, as a sim-stage pool job. Simulation half: smoke driver or input handling off `sim.input()` (the by-value `InputSnapshot`); player kinematics (speed smoothing, facing via `RotationSmoother::smooth_toward`, position clamped to the world margin, `y` from `get_terrain_height` — worker-safe); `anim_sm_.update(anim_player_)` then `anim_player_.update(model->skeleton, model->animations, sim.dt())`; then the host-side procedural layers **after** the animation update: `anim::apply_foot_ik` using a `FootIKSmoother` fed with per-foot terrain offsets from `anim_player_.world_transforms()`, and `anim::apply_body_lean` from speed (forward) and turn rate (lateral); camera AIMING only (`set_target`/`set_target_velocity`, or yaw/pitch from the snapshot) — the engine's sim-stage tail does `set_screen_size`/`update(dt)`/`set_camera` into the packet/camera-forward feedback, unless `--engine-camera=off` puts the demo back in charge of all four. Input handling shows edge-triggered keys (`in.was_key_just_pressed(...)` — the one snapshot member that keeps function form; everything else is a field, e.g. `in.move_forward`, `in.camera_yaw`, `in.mouse_left_pressed`), the graphics-toggle path (**`edit_graphics_settings()`**, a scoped handle that requests its edited copy on scope exit — the sim-safe deferred apply; F1 AO cycle / F2 bloom / F4 fog+god-rays / F5 shadow cycle / F6 AA cycle Off→FXAA→TAA / F7 IBL toggle / F8 local-shadow toggle), and F12 → `request_screenshot("screenshot_NNN.png")` (deferred to the fence).
+`on_simulate(SimFrame& sim)` — the whole frame, as a sim-stage pool job. Simulation half: smoke driver or input handling off `sim.input()` (the by-value `InputSnapshot`); player kinematics (speed smoothing, facing via `RotationSmoother::smooth_toward`, position clamped to the world margin, `y` from `get_terrain_height` — worker-safe); `anim_sm_.set_float(param_speed_, …)` and `anim_sm_.update(anim_rig_, /*layer=*/0)`, the upper-body layer's weight followed toward `attack_timer_ > 0` at `dt * 18` and **snapped** at both ends (`1/512`, so the rig's weight-0 and weight-1 fast paths actually fire), then `anim_rig_.evaluate(model->skeleton, model->animations, dt, anim_scratch_)` guarded by `anim_rig_.is_bound()` (`evaluate` carries a release-live `BRACKEN_CONTRACT`); then the host-side procedural layers **after** the animation update: `anim::apply_foot_ik` using a `FootIKSmoother` fed with per-foot terrain offsets from `anim_rig_.world_transforms()`, and `anim::apply_body_lean` from speed (forward) and turn rate (lateral); camera AIMING only (`set_target`/`set_target_velocity`, or yaw/pitch from the snapshot) — the engine's sim-stage tail does `set_screen_size`/`update(dt)`/`set_camera` into the packet/camera-forward feedback, unless `--engine-camera=off` puts the demo back in charge of all four. Input handling shows edge-triggered keys (`in.was_key_just_pressed(...)` — the one snapshot member that keeps function form; everything else is a field, e.g. `in.move_forward`, `in.camera_yaw`, `in.mouse_left_pressed`), the graphics-toggle path (**`edit_graphics_settings()`**, a scoped handle that requests its edited copy on scope exit — the sim-safe deferred apply; F1 AO cycle / F2 bloom / F4 fog+god-rays / F5 shadow cycle / F6 AA cycle Off→FXAA→TAA / F7 IBL toggle / F8 local-shadow toggle), and F12 → `request_screenshot("screenshot_NNN.png")` (deferred to the fence).
 
-Frame-description half of `on_simulate`: emits into `scene::FrameSink& fb = sim.frame()` — `set_camera(camera().get_camera_state())`, per-frame toggles (`set_draw_skybox(gs.skybox_enabled)`, `set_draw_ground(true)`, `set_draw_grass(gs.grass_enabled)`); for the player: `auto pal = fb.alloc_bone_palette(joint_count)`, copy `anim_player_.bone_matrices()` into `pal.matrices` (packet memory — no lifetime contract), then `fb.draw_skinned(player_model_, player_transform_, pal.id)`; `fb.draw_model` per prop/orb; `fb.add_point_light({pos, 320.0f, {1.0f,0.72f,0.30f}, 12000.0f, /*casts_shadows=*/true})` (a `PointLightDesc`) per orb (radiometric intensity; the orb mesh sets `cast_shadows = false` so the bulb doesn't occlude its own light); `fb.add_billboard_3d` proximity bars; optional `fb.add_spot_light` flashlight; `fb.spawn_effect(&definition, pos, dir)` for queued bursts; optional debug spheres/lines including a post-IK skeleton overlay from `world_transforms()`; UI via `fb.ui().add_filled_rect/add_text/add_text_wrapped`. No `set_frame_timing`, no `seal()`, no `render_frame`, no ring management — the engine does all of that around the hook.
+Frame-description half of `on_simulate`: emits into `scene::FrameSink& fb = sim.frame()` — `set_camera(camera().get_camera_state())`, per-frame toggles (`set_draw_skybox(gs.skybox_enabled)`, `set_draw_ground(true)`, `set_draw_grass(gs.grass_enabled)`); for the player: `auto pal = fb.alloc_bone_palette(joint_count)`, then `anim_rig_.write_palette(pal.matrices)` (packet memory — no lifetime contract; the rig writes the used prefix and identity-fills the rest, so nothing in the palette is left uninitialized), then `fb.draw_skinned(player_model_, player_transform_, pal.id)`; `fb.draw_model` per prop/orb; `fb.add_point_light({pos, 320.0f, {1.0f,0.72f,0.30f}, 12000.0f, /*casts_shadows=*/true})` (a `PointLightDesc`) per orb (radiometric intensity; the orb mesh sets `cast_shadows = false` so the bulb doesn't occlude its own light); `fb.add_billboard_3d` proximity bars; optional `fb.add_spot_light` flashlight; `fb.spawn_effect(&definition, pos, dir)` for queued bursts; optional debug spheres/lines including a post-IK skeleton overlay from `world_transforms()`; UI via `fb.ui().add_filled_rect/add_text/add_text_wrapped`. No `set_frame_timing`, no `seal()`, no `render_frame`, no ring management — the engine does all of that around the hook.
 
 #### Smoke driver schedule (`update_smoke_driver`)
 
@@ -323,7 +345,9 @@ Replaces input handling when `smoke_frames_ > 0`. Per frame: `camera().rotate_ya
 | `max(1, N-20)` | `request_screenshot(SMOKE_SCREENSHOT_PATH)` — late enough that all flips are visible |
 | `>= N` | print summary and `quit()` |
 
-Summary format (exact): `[smoke] OK frames={} fps={:.0f} draw_calls={} triangles={} entities={} orbs_collected={} village={} ibl_refreshes={} local_tiles={} local_lights={}p+{}s auto_ev={} driver={}` sourced from `render_stats()` (requires the `set_collect_render_stats(true)` done in `on_init`), `scene_renderer().ibl()->refresh_count()` (4 on a default run: init build, the frame-1 environment apply, and the two sun swings), `village=` (1 when the generated medieval assets loaded, 0 in the procedural fallback), `scene_renderer().local_shadows()->selector()` (total tiles re-rendered over the run + point/spot lights shadowed on the final frame), `scene_renderer().auto_exposure()->latest_state()` (the adapted EV from the fenced debug readback, `{:.2f}`; `n/a` when auto exposure is off/never read back), and `gpu_driver_name()`.
+Summary format (exact): `[smoke] OK frames={} fps={:.0f} draw_calls={} triangles={} entities={} orbs_collected={} village={} ibl_refreshes={} local_tiles={} local_lights={}p+{}s occl_culled={} auto_ev={} driver={}` sourced from `render_stats()` (requires the `set_collect_render_stats(true)` done in `on_init`), `scene_renderer().ibl()->refresh_count()` (4 on a default run: init build, the frame-1 environment apply, and the two sun swings), `village=` (1 when the generated medieval assets loaded, 0 in the procedural fallback), `scene_renderer().local_shadows()->selector()` (total tiles re-rendered over the run + point/spot lights shadowed on the final frame), `scene_renderer().auto_exposure()->latest_state()` (the adapted EV from the fenced debug readback, `{:.2f}`; `n/a` when auto exposure is off/never read back), `occl_culled=` (`RenderStats::entities_occlusion_culled`, 0 unless `PLAYGROUND_OCCLUSION=1` — with it on the smoke frame culls **105 of 464** entities and the screenshot is bit-identical to the occlusion-off one), and `gpu_driver_name()`.
+
+Three further lines follow it, each of which exists so a number in this document can be believed: `[smoke] settings persist=… shadow_mode=… …` (what the run actually rendered with), `[smoke] custom_pass installed={} ran={}` (`0 0` on a baseline run — `PLAYGROUND_CUSTOM_PASS=1` paints on the frame and would move every pinned `mean_luma`), and, on a `--level` or `--export-level` run, `[level] source={authored|file} props=N digest=0x…` — the digest that must match between the two, and the instrument that sees a single prop shifting by a ulp when `mean_luma` cannot.
 
 #### Code-built assets (`character.cpp`)
 
@@ -544,7 +568,7 @@ The file is a single process-global mutable input: with persistence on, a run's 
 
 - Always constructs `dev::DevUI` first, even when the renderer is down or the overlay is compiled out — so `dev_ui()`, `process_event()`, and `render()` remain safe no-ops afterwards.
 - Returns `false` if `context_`/`scene_renderer_`/`camera_` are missing, if the build is the stub (`BRACKEN_ENABLE_DEV_UI=OFF`), or if backend init fails.
-- On success, builds `dev::DevUI::Bindings{ scene_renderer_.get(), &camera(), &graphics_settings_, apply-callback → apply_all_graphics_settings, &fps_ }` and **claims the `SceneRenderer`'s single post-UI callback slot** via `scene_renderer_->set_post_ui_callback(...)` to draw the overlay into the swapchain after UI. Hosts that call `init_dev_ui()` must not set their own post-UI callback (single slot; last writer wins).
+- On success, builds `dev::DevUI::Bindings{ scene_renderer_.get(), &camera(), &graphics_settings_, apply-callback → apply_all_graphics_settings, &fps_ }` and **claims the `SceneRenderer`'s single post-UI callback slot** via `scene_renderer_->set_post_ui_callback(...)` to draw the overlay into the swapchain after UI. A host must not take that slot back — it is why `RenderHookSlot::AfterUi` exists (chapter 23), and overwriting it now logs a WARN rather than turning F10 off silently.
 - `dev_ui()` asserts `dev_ui_ != nullptr` (`BRACKEN_ASSERT`) — valid after `init_dev_ui()` *including* when it returned `false`.
 
 #### request_screenshot(path)
@@ -685,6 +709,7 @@ enum class GiQuality   : int { Low = 0, Medium = 1, High = 2 };
 | `show_debug_hud` | bool | false | — |
 | `draw_distance` | int | 3 | [0, 6] → {500, 1000, 2000, 4000, 8000, 16000, 32000} |
 | `frustum_culling` | bool | true | — |
+| `occlusion_culling` | bool | **false** | — (Hi-Z draw occlusion culling, chapter 27. Off by default and it must stay off until somebody measures it: the depth it tests is a frame old by construction, so under camera motion it is a heuristic and a false cull is a prop missing behind a wall — a few hundred pixels, invisible in `mean_luma`. It also costs a SECOND full mip pyramid, one texture readback and one deterministic fence wait per frame) |
 | `anisotropic_filter` | int | 4 | [0, 4] (off/2x/4x/8x/16x) |
 | `vsync_mode` | int | 2 | [0, 2]; re-clamped to `max_vsync_mode()` at apply |
 | `shadow_mode` | ShadowMode | PCSS | [Off, PCSS] |
@@ -755,6 +780,7 @@ struct RenderStats {
     uint32_t entities_rendered = 0;
     uint32_t entities_distance_culled = 0;
     uint32_t entities_frustum_culled = 0;
+    uint32_t entities_occlusion_culled = 0;  // Hi-Z cull; 0 on every frame the feature is off
     uint32_t jobs_pending = 0;            // JobSystem::pending_count()
     uint32_t instances_drawn = 0;
     std::size_t packet_bytes_used = 0, packet_bytes_capacity = 0;
@@ -2724,7 +2750,7 @@ struct EffectSpawnCommand   { const bracken::EffectDefinition* definition;
                               glm::vec3 position{0,0,0}, direction{1,0,0}; };
 ```
 
-UI commands: `UiFilledRectCommand`, `UiRectOutlineCommand`, `UiCircleCommand`, `UiCircleOutlineCommand`, `UiLineCommand`, `UiTextCommand`, `UiButtonCommand` — `UiCommandData` is a `std::variant` of those seven (in that order), wrapped in `struct UiCommand { UiCommandData data; is<T>(); get<T>(); }`. `UiTextCommand::text` / `UiButtonCommand::label` are `std::string_view`s over **packet-arena copies** made at emit time — no `std::string`, no heap, valid until the packet retires. All color fields are `core::Color` — the packed-ARGB word of `bracken/core/color.hpp`, implicitly constructible from a `uint32_t` literal.
+UI commands: `UiFilledRectCommand`, `UiRectOutlineCommand`, `UiCircleCommand`, `UiCircleOutlineCommand`, `UiLineCommand`, `UiTextCommand`, `UiButtonCommand`, `UiTexturedQuadCommand`, `UiClipCommand` — `UiCommandData` is a `std::variant` of those nine (in that order), wrapped in `struct UiCommand { UiCommandData data; is<T>(); get<T>(); }`. The last two arrived with the `bracken::ui` module (chapter 25); both are `static_assert`ed padding-free, and the textured quad is additionally pinned at `<= sizeof(UiButtonCommand)`, because `UiCommandData` is sized by its largest alternative and a UI chunk is a fixed 2048-byte payload — a wider one would silently halve the commands per chunk for every host. `UiTextCommand::text` / `UiButtonCommand::label` are `std::string_view`s over **packet-arena copies** made at emit time — no `std::string`, no heap, valid until the packet retires. All color fields are `core::Color` — the packed-ARGB word of `bracken/core/color.hpp`, implicitly constructible from a `uint32_t` literal.
 
 `BonePaletteId` semantics: opaque while the frame is Filling (an internal lane/allocation-order encoding — any lane may use an id allocated on another lane, provided the allocation happened-before the use). At seal every id stored in a command is remapped to a **dense index into `FramePacket::palettes()`**, assigned in deterministic (lane-index, allocation-order) order. **Ids held by the host across `seal()` are stale** — only re-read them from sealed commands.
 
@@ -2840,8 +2866,14 @@ int text_width(std::string_view text, float scale = 1.0f) const;  // UI glyph me
 int text_height(float scale = 1.0f) const;                        // or without a loaded font
 
 using PostUICallback = std::function<void(SDL_GPUCommandBuffer*, SDL_GPUTexture*)>;
-void set_post_ui_callback(PostUICallback cb);                     // single slot; DevUI owns it
-RenderHookRegistry& render_hooks();                               // ordered, many-per-slot host passes
+void set_post_ui_callback(PostUICallback cb);                     // single slot; DevUI owns it. DEPRECATED
+                                                                  // for hosts — use render_hooks(), ch. 23
+RenderHookRegistry& render_hooks();                               // ordered, many-per-slot host passes (ch. 23)
+UiTextureId register_ui_texture(SDL_GPUTexture*);                 // main-thread; ids are never recycled (ch. 25)
+void unregister_ui_texture(UiTextureId);
+const FontMetrics& font_metrics() const;                          // main-thread; sim reads SimFrame's copy
+void set_heightmap_grid(const HeightmapGrid&);                    // set_heightmap is the 1x1 adapter (ch. 27)
+void invalidate_raytracing_scene();                               // wired by Application::set_residency
 ```
 
 #### init() behavior
@@ -2851,6 +2883,8 @@ RenderHookRegistry& render_hooks();                               // ordered, ma
 #### render_frame — exact order
 
 Preconditions: main thread (`BRACKEN_ASSERT_MAIN_THREAD()`); `frame` is a sealed packet, consumed exactly once (the caller retires it afterwards). Camera = `frame.camera()` (when `has_camera()` is false the renderer skips the 3D pass rather than draw with a stale/default camera); when `frame.has_environment()` the packet's environment snapshot is applied, otherwise the renderer keeps its own `env_` (preserving the DevUI live-edit path). Frame-level state cached once: `frame_fog_active_ = gfx.fog_enabled`, `frame_draw_dist_sq_ = draw_distance²`, `frame_do_frustum_cull_ = gfx.frustum_culling`.
+
+Two additions the list below does not repeat. **Five guarded host-pass call sites** (`if (!render_hooks_.empty(slot)) run_render_hooks(...)`) sit at `PreForward`, `AfterOpaque`, `BeforeTaa`, `AfterComposite` and `AfterUi`; chapter 23 has their exact positions, their context contents and the diagnostics counter for a slot that could not run. With nothing registered the cost is five bool tests. And when `GraphicsSettings::occlusion_culling` is on, `resolve_occlusion_readback()` runs at the **top** of `render_frame` (a deterministic fence wait on the previous frame's download, before the plan is made) and `submit_occlusion_readback()` at the very **end**, after the frame's command buffer has been submitted — chapter 27 explains why that ordering is load-bearing rather than incidental.
 
 1. **Clock adoption + environment propagation** — when `frame.has_engine_frame()`: `scene_time_ = frame.scene_time()` and `world_->set_sky_time(frame.sky_time())` — the clocks are **advanced by the sim stage** and adopted here; the renderer no longer integrates dt (hand-built packets without an engine section keep the previous clocks). `frame_effect_count_`/`frame_particle_count_` cached from the packet for the DevUI Stats tab. Then `light_dir_ = env_.sun_dir`; `env_` pushed to world/terrain/grass/water renderers.
 2. **Effect snapshot pre-upload** — `effects_->ensure_models_uploaded(frame.effect_emitters())` GPU-uploads any model referenced by the packet's effect-instance snapshot, **before** any pass (and before the swapchain/minimized early-outs — uploads can't run inside a render pass; the mid-pass path is a logged skip). The snapshot is the render side's **only** view of the particle system: spawns were applied and the live `EffectSystem` updated on the sim side before the packet sealed — there is no renderer-side spawn drain or particle update anymore.
@@ -6687,6 +6721,8 @@ The layer predates the `core::Result` convention and uses `bool` + `BRACKEN_LOG_
 
 ## Text & UI Rendering
 
+This chapter is the **renderer** side: the packet's UI command stream, the primitive batcher, the glyph atlas and the UI pass. The sim-stage widget layer above it — layout, focus, scrolling, nine-slice, input capture — is `bracken::ui`, chapter 25, which emits into exactly the command stream described here and touches nothing in this chapter directly.
+
 ### Component map and data flow
 
 Three layers, strictly host → data → renderer:
@@ -6720,9 +6756,13 @@ struct UiTextCommand         { std::string_view text;   // points into the packe
                                float x{}, y{}; float scale = 1.0f; uint32_t color = 0xFFFFFFFF; };
 struct UiButtonCommand       { float x{}, y{}, w{}, h{}; std::string_view label;  // packet arena
                                uint32_t color{}; bool selected = false; };
+struct UiTexturedQuadCommand { float x, y, w, h; float u0, v0, u1, v1;  // 40 B, == UiButtonCommand's width
+                               bracken::UiTextureId texture; core::Color tint; };
+struct UiClipCommand         { float x, y, w, h; uint32_t enabled; };   // 20 B; uint32, not bool
 
 using UiCommandData = std::variant<UiFilledRectCommand, UiRectOutlineCommand, UiCircleCommand,
-                                   UiCircleOutlineCommand, UiLineCommand, UiTextCommand, UiButtonCommand>;
+                                   UiCircleOutlineCommand, UiLineCommand, UiTextCommand, UiButtonCommand,
+                                   UiTexturedQuadCommand, UiClipCommand>;
 struct UiCommand {
     UiCommandData data;
     template<typename T> bool is() const;      // holds_alternative
@@ -6732,10 +6772,7 @@ struct UiCommand {
 
 Commands are emitted through `FrameBuilder::ui()` (an `UiLane` value handle — see the scene chapter for the full recording API: `add_filled_rect`, `add_rect_outline`, `add_circle`, `add_circle_outline`, `add_line`, `add_text`, `add_text_wrapped`, `add_button`; text parameters are `std::string_view` and are **copied into the packet arena at emit time**, so temporaries are safe). Cross-type submission order is preserved within a lane; multi-lane frames merge in deterministic (lane-index, emission-order) order at `seal()`.
 
-`UiLane::add_text_wrapped` (`src/bracken/scene/frame_builder.cpp`) is a pure layout helper that emits multiple `UiTextCommand`s and returns total height consumed (same algorithm as the retired `UIScene`):
-- `char_w = 8.0f * scale` (constant `CHAR_WIDTH_BASE = 8.0f` — an approximation, not glyph metrics; operates on **bytes**, so multi-byte UTF-8 over-counts width).
-- `line_height <= 0` → `18.0f * scale`.
-- `max_chars = max(1, int(max_width / char_w))`; wrap point = last `' '` at or before `pos + max_chars` (`std::string::rfind`); if none in range, hard break at `max_chars`; the space broken at is skipped.
+`UiLane::add_text_wrapped` (`src/bracken/scene/frame_builder.cpp`) is a pure layout helper that emits multiple `UiTextCommand`s and returns total height consumed. **It now measures the real font** through the frame's `FontMetrics` (chapter 25): `FontMetrics::wrap_point` does the pen walk, breaks at a space when one is in range and hard-breaks on a UTF-8 boundary when none is, and its `consumed` is always positive so the loop terminates; an unspecified `line_height` becomes `FontMetrics::measure_height(scale)`. It falls back to the old approximation — `char_w = 8.0f * scale`, `max_chars = max(1, int(max_width / char_w))`, `rfind(' ')`, hard break otherwise, `line_height <= 0` → `18.0f * scale` — **only** when the frame carries no `FontMetrics` (a hand-built test frame, or a machine with no installed font). That guess under-measures wide proportional text and operates on bytes, so multi-byte UTF-8 over-counts; treat the fallback as "no answer available", not as a mode.
 
 Consumption: `SceneRenderer` maps `frame.ui_commands()` 1:1 onto `UIRenderer` calls. Note the argument reorder for text: `UiTextCommand{text,x,y,scale,color}` → `UIRenderer::draw_text(text, x, y, color, scale)`.
 
@@ -6811,11 +6848,10 @@ Copy passes must precede the render pass (SDL3 GPU forbids nesting), hence the s
 3. Render pass on the swapchain: `load_op = clear_background ? CLEAR : LOAD`, `store_op = STORE`, `clear_color = {0.1f, 0.1f, 0.15f, 1.0f}`; full-screen viewport (depth 0–1) and scissor; no depth-stencil target.
 4. Bind `PipelineRegistry::get_pipeline(PipelineType::UI)` — if unavailable, logs via `SDL_Log`, ends the pass, clears state, returns (frame keeps whatever was on the swapchain).
 5. Push `gpu::UIScreenUniforms{width, height}` (vertex slot 0).
-6. Draw the primitive batch as one `SDL_DrawGPUPrimitives` per **texture-switch range** (`DrawRange`): solid primitives and `draw_textured_quad` ranges interleave in submission order; `UIFragmentUniforms{hasTexture}` is re-pushed and the fragment sampler re-bound only when the range's texture state changes (solid ranges bind the 1×1 white dummy).
-7. `text_renderer_->draw_queued_text(cmd, render_pass)` (binds the Text pipeline internally).
-8. End pass; clear `vertex_batch_`, `draw_ranges_`, `queued_text_draws_`.
+6. **Walk `ops()` in submission order**, alternating the UI and Text pipeline binds. A `Geometry` op draws `draw_ranges_[first, first+count)` — one `SDL_DrawGPUPrimitives` per range, where a range opens on a **texture switch or a clip change**; `UIFragmentUniforms{hasTexture}` is re-pushed and the fragment sampler re-bound only when the texture state changes (solid ranges bind the 1×1 white dummy), and the per-range `SDL_SetGPUScissor` is issued only when the wanted scissor differs from the bound one, so an unclipped frame issues exactly the one call it always did. A `Text` op maps its span onto `TextRenderer::draw_run_range`, which restores the caller's scissor before returning so a clip cannot leak out of a text span.
+7. End pass; clear `vertex_batch_`, `draw_ranges_`, `queued_text_draws_`, `ops_`.
 
-Consequence for z-order: **all primitives (including billboards) draw before all text** — text cannot be occluded by a later-submitted shape.
+**Z-order: the pass paints in strict submission order, text included.** It used to run two hard phases — every primitive, then every queued text — so a panel recorded *after* a label could never cover it, no matter what order the host recorded in. That was structural rather than a call-site mistake, and fixing it is what lets `ui::Context` put a panel background behind its children at all. The common case is unchanged: a HUD that records its panel and then its labels produces exactly two ops — one geometry range, one text span — which is byte for byte the command stream it always produced; the extra pipeline binds are paid only by content that actually interleaves. `execute()` is correct **only if the ops exactly partition both vectors, contiguously and in order** — a gap silently drops a draw, an overlap draws it twice, a non-monotone `first` reorders the frame — and `UIRendererOps.OpsExactlyPartitionRangesAndTextDraws` asserts that partition directly rather than leaving it to inspection. An empty string opens **no** op, because an op with `count == 0` would bind a pipeline for nothing.
 
 `shutdown()` releases the vertex buffer, dummy texture/sampler, and shuts down/destroys the `TextRenderer`; the destructor calls `shutdown()`.
 
@@ -6829,12 +6865,17 @@ Declared in `src/bracken/render/text_renderer.hpp`. Constants:
 | `GLYPH_PADDING` | 1 | gap added to each packed cell (linear-filter bleed guard) |
 | `VERTICES_PER_QUAD` | 6 | non-indexed two-triangle quads |
 | `FLOATS_PER_VERTEX` | 4 | `x, y, u, v` |
-| `MAX_TEXT_QUADS` | 4096 | per-frame glyph-quad budget across all strings |
+| `INITIAL_TEXT_QUADS` | 4096 | **initial** GPU vertex-buffer capacity in glyph quads. No longer a cap: the buffer grows in `upload_queued_text` the way `UIRenderer`'s does. It used to be a hard budget that dropped glyphs with a throttled warning, which a 150-row scrolling list hits immediately |
+| `MAX_TEXT_QUADS` | `1 << 20` | absolute ceiling on one frame's CPU-side text batch — a runaway host (a label built in an unbounded loop) fails visibly instead of growing the vertex vector until the process dies |
 | `font_size_` | 18 | hardcoded member default; no setter |
 
-#### `decode_utf8` (public inline free function, header)
+Additive surface for the sim-stage UI layer: `export_metrics(FontMetrics& out, first_cp, last_cp)` fills the frozen CPU glyph table `Application::init_renderer()` copies and publishes (chapter 25), and `queued_run_count()` / `draw_run_range()` / `clear_queued_text()` let `UIRenderer::execute` draw a *span* of queued text without retiring the whole queue — the mechanism behind the z-order fix above. `get_text_width` is implemented on top of `FontMetrics::measure_width` now, so the tree has one answer to "how wide is this string" instead of two independently drifting ones.
+
+#### `decode_utf8` (declared in `src/bracken/core/utf8.hpp`)
 
 `uint32_t decode_utf8(std::string_view text, size_t& i)` — decodes one codepoint at byte `i`, advancing `i`. Handles 1–4 byte sequences by lead-byte pattern. Malformed input (stray continuation byte, invalid lead, bad continuation) yields U+FFFD and advances exactly one byte (guaranteed progress / resync); a truncated trailing sequence yields U+FFFD and sets `i = text.size()`. No overlong/surrogate/max-codepoint validation. Fully covered by `src/bracken/render/text_renderer.test.cpp` (`DecodeUtf8.*`).
+
+It **moved down to `core/`** when `contracts/font_metrics.hpp` needed it: `contracts/` may include only `core/`, `contracts/`, glm and `<std>`, so a UTF-8 decoder living in `render/` was unreachable from the layer that has to measure text. `render::decode_utf8` is a using-declaration onto `core::decode_utf8`, so every existing call site is untouched and there is still exactly one decoder.
 
 #### `ShelfPacker` (public class, header)
 
@@ -6847,7 +6888,7 @@ Left-to-right shelf packer for a fixed `width × height` area: rects are placed 
 2. Probes a hardcoded font path array in order, `TTF_OpenFont(path, 18)`:
    `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`, `/usr/share/fonts/TTF/DejaVuSans.ttf`, `/usr/share/fonts/dejavu/DejaVuSans.ttf`, `/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf`, `/usr/share/fonts/truetype/freefont/FreeSans.ttf`, `/System/Library/Fonts/Helvetica.ttc`, `C:\Windows\Fonts\arial.ttf`.
    No font found → `BRACKEN_LOG_WARN`, **non-fatal**: init proceeds, `is_ready()` returns false (`initialized_ && font_ != nullptr`), all draw/queue/measure calls no-op.
-3. Dynamic vertex buffer: `MAX_TEXT_QUADS * 6 * 4 * sizeof(float)` = **384 KiB**.
+3. Dynamic vertex buffer: `INITIAL_TEXT_QUADS * VERTICES_PER_QUAD * FLOATS_PER_VERTEX * sizeof(float)` = **384 KiB** — the starting size, not a ceiling; `upload_queued_text` grows it geometrically when a frame's batch outgrows it.
 4. Atlas sampler: LINEAR min/mag, NEAREST mipmap, CLAMP_TO_EDGE ×3.
 5. Atlas texture: 2D, `SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM`, 512×512, 1 level, `SAMPLER` usage. Persistent `UPLOAD` transfer buffer of 512·512·4 = **1 MiB**. CPU mirror `std::vector<uint8_t> atlas_pixels_` (1 MiB) zero-filled; the whole atlas is marked dirty so the first flush uploads defined zeroes everywhere (incl. inter-cell padding).
    GPU-resource failures are fatal (logged, return false).
@@ -6941,19 +6982,19 @@ Billboards therefore batch with — and draw after — the frame's 2D UI primiti
 
 ### Performance characteristics
 
-- All geometry is CPU-generated per frame (no retained widgets); cost is linear in emitted vertices. Uploads: one `SDL_UploadToGPUBuffer` for primitives (≤512 KiB), one for text (≤384 KiB), plus the atlas dirty band only when new glyphs appeared.
+- All geometry is CPU-generated per frame (no retained widgets); cost is linear in emitted vertices. Uploads: one `SDL_UploadToGPUBuffer` for primitives (≤512 KiB), one for text (384 KiB initially, grown geometrically), plus the atlas dirty band only when new glyphs appeared.
 - Draw calls: 1 for all primitives + billboards, plus one per color-change/discontinuity among text runs (contiguous same-color runs merge — common case of many same-color labels is 1–3 draws).
 - Steady-state text is pure vertex generation: glyph rasterization happens once per codepoint, uploads only on atlas changes.
 - Dynamic buffers and the atlas transfer buffer map with `cycle = true`, so per-frame updates don't stall on the previous frame's GPU reads.
 
 ### Known limitations, stubs, and silent behaviors
 
-- **Text quad budget 4096/frame**: excess glyphs dropped with a once-per-frame warning.
-- **Fixed layering**: all text over all primitives; billboards over the frame's 2D UI shapes.
-- **Hardcoded font list, single 18 px size**: no font/size API; `scale` is bitmap magnification; no-font systems silently render no text.
+- **Text quads are no longer capped at 4096.** `INITIAL_TEXT_QUADS` is the starting buffer size and the batch grows; `MAX_TEXT_QUADS = 1 << 20` is a runaway ceiling, not a budget a real frame reaches.
+- **Layering is submission order now**, text included — but **billboards are still recorded after the packet's UI commands** and therefore still paint over the frame's 2D UI, and the single `post_ui_callback` (the dev overlay) still draws after everything. Those two are ordering decisions in `SceneRenderer`, not in this pass.
+- **Hardcoded font list, single 18 px size**: no font/size API; `scale` is bitmap magnification; no-font systems silently render no text (and `FontMetrics::valid()` is false, so every measure returns 0 and `ui::Context::Diagnostics::text_without_font` counts the declarations).
 - **Atlas overflow** evicts everything; earlier-emitted quads keep stale UVs for one frame (logged).
-- **`add_text_wrapped` uses an 8 px/char byte-count approximation**, not glyph metrics.
-- **No per-widget scissor/clipping**: the pass sets one full-screen scissor.
+- **Clipping is per-range now**: `DrawRange` and `TextRun` each carry a clip rectangle, `render_ui_commands` clears the clip at the end of the packet replay (so a host that pushes without popping cannot crop the billboards), and an unclipped frame still issues exactly one `SDL_SetGPUScissor`.
+- **Kerning is exported over printable ASCII only** and a codepoint outside `[FontMetrics::k_first_cp, k_last_cp]` measures with `fallback_advance` while drawing at its real advance — so such a string is drawn correctly and measured wrongly. See chapter 25.
 - `UIRenderer::draw_text`'s `string_view` lifetime contract (valid until `execute()`) is invisible at the packet level (packet text outlives the frame) but binding for direct callers; `draw_textured_quad`'s texture pointer likewise must stay valid until `execute()`.
 
 ---
@@ -8636,3 +8677,1141 @@ behavior, or Jolt versions.
   compound/mesh/convex-hull shapes yet.
 - `cast_ray` is closest-hit only, no layer filtering.
 - Queries return identity values rather than errors for stale/invalid ids.
+
+---
+
+## Host-Extensible Rendering: Runtime Pipelines & Render Hooks
+
+Three things a game could not do before, plus one bug fix. Sources: `src/bracken/gpu/host_pipeline.hpp`, `src/bracken/gpu/host_pipeline.cpp`, `src/bracken/gpu/pipeline_registry.hpp`, `src/bracken/gpu/pipeline_registry.cpp`, `src/bracken/scene/render_hook.hpp`, `src/bracken/scene/render_hook.cpp`, `src/bracken/scene/scene_renderer.cpp`, the `bracken_compile_shaders` function in `src/bracken/CMakeLists.txt`, and the worked example `examples/playground/custom_pass.hpp` / `custom_pass.cpp`.
+
+### Scope: the catalogue stays closed, the host path is a second namespace
+
+`gpu/pipeline_catalog.hpp` is deliberately closed — one `constexpr` row per `PipelineType`, pinned positionally against a checked-in golden — which is exactly what makes it useless to a host, who cannot add an enumerator. So the host surface is a **second** namespace rather than a widening of the first:
+
+- a host pipeline is named by an opaque generation-checked handle, never by a `PipelineType`, and the two are not convertible in either direction;
+- `pipeline_desc()`, `compute_pipeline_desc()`, `pipeline_type_to_string()` and `pipeline_targets_swapchain()` keep their enum-only meaning, so `PipelineCatalog.GoldenParsesIntoOnePerTypeBlock` (`src/bracken/gpu/pipeline_catalog.test.cpp`), which asserts exactly `PipelineType::Count + ComputePipelineType::Count` blocks, cannot see a host registration however many a game makes;
+- what the two paths share is the **lifecycle**, and they share it through one cache key, so "registered pipelines get invalidated / rebuilt / hot-reloaded too" is a property of the data structure rather than a second code path someone has to remember to update.
+
+`pipeline_catalog.hpp` and `pipeline_catalog.cpp` are **unmodified by this feature** — not an enumerator, not a row, not a field. An earlier design added a `TargetFormat::Custom`; the per-desc format overrides below replaced it precisely so that file could stay untouched and the golden stay byte-identical by construction.
+
+### `bracken_compile_shaders(<target> ...)` — compiling a game's own HLSL
+
+Defined in `src/bracken/CMakeLists.txt`, next to `bracken_copy_shaders`. Call it **after** `add_subdirectory(<bracken>)`; it hard-errors otherwise, because the `shadercross` CLI target it drives is built inside the engine's shader subtree.
+
+```cmake
+bracken_compile_shaders(<target>
+    [DIRECTORY    <dir>]            # GLOB_RECURSE *.hlsl + *.hlsli, CONFIGURE_DEPENDS
+    [SOURCES      <a.vert.hlsl> ...]
+    [STAGE_DIR    <name>]           # default "shaders_<target>"; MUST NOT be "shaders"
+    [INCLUDE_DIRS <dir> ...]
+    [WAVE_OPS     <file.hlsl> ...]) # bare file names
+```
+
+It creates `<target>_compile_shaders` and `<target>_stage_shaders`, makes `<target>` depend on both, emits `.spv` into `${CMAKE_CURRENT_BINARY_DIR}/spv_<target>`, and stages them into `$<TARGET_FILE_DIR:<target>>/<STAGE_DIR>`. Stage and entry point come from the file name exactly as the engine's own shader build derives them (`.vert.hlsl`→`VSMain`/`vs_6_0`, `.frag.hlsl`→`PSMain`/`ps_6_0`, `.comp.hlsl`→`CSMain`/`cs_6_0`); any other name is a configure-time `WARNING` and is skipped.
+
+Three hard refusals, each from a real failure mode:
+
+| Refusal | Why |
+|---|---|
+| `STAGE_DIR` equal to `"shaders"` → `FATAL_ERROR` | `bracken_copy_shaders` does `rm -rf` on that directory next to the exe on **every** build, so the host's `.spv` would vanish intermittently |
+| output dir equal to `BRACKEN_SHADER_OUTPUT_DIR` → `FATAL_ERROR` | `EveryShaderBlockIsAccountedFor` (`src/bracken/gpu/uniform_layout.test.cpp`) enumerates every `.spv` in that directory and fails on any uniform block it has no table row for — a host cbuffer landing there fails the *engine's* suite |
+| `WAVE_OPS` non-empty with no `dxc` target → `FATAL_ERROR` | the shadercross CLI never passes `-fspv-target-env`, so DXC defaults to `vulkan1.0` where every `Wave*` intrinsic is a hard compile error |
+
+**`WAVE_OPS` is an explicit list, not a convention**, and that is the point: listing a file routes it through the vendored `dxc` at `vulkan1.1` with byte-identical `-fspv-*` flags, and *raises the Vulkan floor* for every pipeline that uses it. That is a hardware requirement a game's players will feel, so it belongs in a diff.
+
+**Include directories: shadercross accepts exactly ONE.** The CLI answers `ERROR: '-I' can only be used once`, and it does not resolve a quoted `#include` relative to the source file either — it hands the source to DXC as an in-memory buffer named "hlsl.hlsl", so an include outside the single `-I` root is simply not found. The engine's own shader build never hit this because it has one root. Therefore: roots are ordered `DIRECTORY`, then `INCLUDE_DIRS…`, then the engine's `.hlsli` root, deduplicated; the **shadercross** path passes only the first; the **`WAVE_OPS`/dxc** path passes all of them (real DXC accepts repeats); and a `message(STATUS)` at configure names which root shadercross got whenever there is more than one. To use the engine's `.hlsli` from a non-wave shader, pass the engine root as the *only* root (`SOURCES …` plus `INCLUDE_DIRS ${BRACKEN_SHADER_INCLUDE_DIR}`, no `DIRECTORY`).
+
+Editing an engine `.hlsli` does **not** retrigger host compilation: the engine's own glob owns that dependency, and re-running configure is what picks it up.
+
+### `gpu/host_pipeline.hpp` — types
+
+| Symbol | What |
+|---|---|
+| `HostGraphicsPipelineTag` / `HostComputePipelineTag` | handle tag types; distinct so passing a graphics handle to `get_compute_pipeline` is a compile error rather than a silent index into the wrong table |
+| `HostPipelineHandle` = `core::Handle<HostGraphicsPipelineTag>` | opaque, generation-checked, default-constructed == invalid |
+| `HostComputePipelineHandle` | the compute twin |
+| `PipelineCacheKey` | `{Origin origin, uint32_t index}` with `Origin ∈ {Catalog, Host}`; factories `catalog(PipelineType)`, `catalog(ComputePipelineType)`, `host(uint32_t)`; `std::hash` specialized at the bottom of the header (combined in a fixed `uint64_t` — shifting `size_t` by 32 is UB on a 32-bit target) |
+| `HostGraphicsPipelineDesc` | owning-string mirror of `PipelineDesc` plus the overrides below |
+| `HostComputePipelineDesc` | `{name, shader, entry_point = "CSMain", reflect_resources = true, resources}` |
+| `host_pipeline_desc_error(desc)` / `host_compute_pipeline_desc_error(desc)` | pure; the refusal reason as a string literal, or nullptr |
+| `build_host_pipeline_config(desc, formats)` | pure; no device, no shader loading. Returns a `PipelineConfig` with null shader pointers — the registry resolves those |
+| `HostPipelineTable<Tag, Desc>` | the slot table: `add`, `remove`, `find`, `has_live_name`, `slots`, `live_count`, `clear` |
+
+`HostGraphicsPipelineDesc` fields beyond `PipelineDesc`'s:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `vertex_entry` / `fragment_entry` | `"VSMain"` / `"PSMain"` | per-stage entry point |
+| `reflect_resources` | `true` | take the resource counts from SPIR-V reflection; `vs`/`fs` are then ignored |
+| `vs` / `fs` | `{}` | declared counts, used only when `reflect_resources` is false |
+| `color_format_override` | `SDL_GPU_TEXTUREFORMAT_INVALID` | wins over `color` when set |
+| `color2_format_override` | `INVALID` | wins over `color2` |
+| `depth_format_override` | `INVALID` | wins over the engine depth format |
+| `buffers` / `attributes` | empty | when `buffers` is non-empty it **replaces** whatever `vertex_layout` produced, `attributes` taken with it |
+
+The format and vertex-layout escape hatches exist because `TargetFormat` and `VertexLayout` have deliberately exhaustive resolver switches (adding an enumerator is a `-Werror` compile error until every case exists), so a host that needs a format the engine has never named overrides the resolved value instead of growing a closed enum.
+
+Every **shared** fixed-function field defaults byte-identically to `PipelineDesc`'s, pinned field by field by `DefaultsMatchPipelineDescDefaults` (`src/bracken/gpu/host_pipeline.test.cpp`). That is load-bearing rather than tidy: a default-constructed host desc is a back-face-culled, opaque, **reversed-Z** (`GREATER_OR_EQUAL`, clear 0.0) pipeline writing the HDR scene target, so a host inherits the engine's depth convention instead of rediscovering it. `build_host_pipeline_config` is implemented by projecting the host desc onto a `PipelineDesc` and calling `build_pipeline_config`, then applying the four overrides — so the two builders cannot disagree about reversed-Z, the `depth_target == false` force-off, or target-format resolution.
+
+`HostPipelineTable` entries are `unique_ptr`-held, never inline in the vector: `desc.name.c_str()` and the `const Desc*` from `PipelineRegistry::host_pipeline_desc` must stay valid across further registrations, and a `std::vector<Entry>` would dangle both on the first reallocation — intermittently, in a host's game, never in the suite. `remove()` bumps the slot generation, so a stale handle validates false rather than aliasing the next registration.
+
+### `PipelineRegistry` additions
+
+```cpp
+[[nodiscard]] bool add_shader_search_path(std::string dir);
+[[nodiscard]] std::span<const std::string> shader_search_paths() const;
+
+[[nodiscard]] HostPipelineHandle        register_graphics_pipeline(HostGraphicsPipelineDesc desc);
+[[nodiscard]] HostComputePipelineHandle register_compute_pipeline(HostComputePipelineDesc desc);
+
+[[nodiscard]] GPUPipeline*        get_pipeline(HostPipelineHandle);
+[[nodiscard]] GPUComputePipeline* get_compute_pipeline(HostComputePipelineHandle);
+[[nodiscard]] const HostGraphicsPipelineDesc* host_pipeline_desc(HostPipelineHandle) const;
+[[nodiscard]] const HostComputePipelineDesc*  host_compute_pipeline_desc(HostComputePipelineHandle) const;
+
+void unregister_pipeline(HostPipelineHandle);
+void unregister_pipeline(HostComputePipelineHandle);
+[[nodiscard]] size_t host_pipeline_count() const;   // graphics + compute, LIVE
+```
+
+**Refusal contract**, identical for both `register_*`: an invalid handle, one ERROR log line, and `creation_count()` untouched, when the desc is malformed, the registry has no device, `desc.name` duplicates a **live** registration, a shader name resolves against no search root, or creation fails. Desc validation runs **first**, through the pure `host_pipeline_desc_error` / `host_compute_pipeline_desc_error`, so the reason a malformed desc is refused does not depend on whether the registry happens to be up — and so every reason is reachable from a device-free test (a registry with no device otherwise refuses everything for the same reason). Malformed means: empty name, empty shader name, empty entry point, or `attributes` without `buffers` (the explicit vertex layout is taken as a pair, so those attributes would be silently discarded).
+
+Compute registration additionally requires SPIR-V reflection to **succeed**, and that is not a policy choice: the threadgroup size exists only in the module's `[numthreads]` and SDL has no way to take it from the caller.
+
+**Keying and lifecycle.** The two caches were `unordered_map<PipelineType, …>` / `unordered_map<ComputePipelineType, …>` and are now keyed on `PipelineCacheKey`. `catalog(t)` and `host(i)` are never equal even when `t == i`, pinned across the whole ordinal range by `PipelineCacheKeyTest`.
+
+| Lifecycle path | Host coverage | How |
+|---|---|---|
+| cache lookup | shared map | one lookup, keyed by origin |
+| `preload_all_pipelines` | yes | walks the host tables **after** the `preloaded_` latch is set, so a host rebuild is never logged as an enumeration gap |
+| `invalidate_all` | yes, for free | one `clear()` drops both origins; the host **descs** survive, which is what lets preload rebuild them |
+| `set_swapchain_format` | yes | a **second, separate** loop over host entries with `TargetFormat::Swapchain` on *either* colour attachment — deliberately not a widening of `pipeline_targets_swapchain()`, which keeps its enum-only meaning |
+| shader hot reload | yes | `reload_all_pipelines` = `invalidate_all` + `preload_all_pipelines` |
+| `shutdown` | yes | unwatches every root, clears both caches and both host tables, keeps the search roots |
+
+A host desc that sets `color_format_override` to the presentable format has opted **out** of the swapchain rebuild — the registry cannot tell that format apart from any other one the host chose. Use `TargetFormat::Swapchain`.
+
+`get_pipeline(handle)` deliberately does **not** fall back to creation the way the enum overload does: the enum overload's fallback is guarded by a main-thread assert and a WARN meaning "the static enumeration is incomplete", neither of which is meaningful for a registration that is outside the enumeration by construction.
+
+### Shader search roots
+
+`shader_path_roots_` is a `std::vector<std::string>`; element 0 is the engine root (`shader_path()` returns it) and is **rewritten, never appended**, by `init()` — which is what stops a game shipping its own `model.frag.spv` from shadowing `PipelineType::Model`'s. `add_shader_search_path` appends a trailing `/` if missing and returns `false` (a no-op) for an empty or duplicate root; when hot reload is already live it watches the new root immediately.
+
+`resolve_shader_path(file)` returns the first `root + file` that exists and logs an ERROR naming the file and the root count when none does. **Catalogue rows never go through it** — they still concatenate `shader_path()` directly, so engine shader resolution is byte-identical to before, and `CatalogueShaderResolutionNeverConsultsHostRoots` (`src/bracken/gpu/pipeline_registry.test.cpp`) is a source scan that keeps it that way.
+
+`shader_watch_handles_` is kept the same length as `shader_path_roots_`, one handle per root, `FileWatcher::k_invalid_handle` for a root not watched yet. `enable_hot_reload` is idempotent and per-root: an already-watched root is skipped (double-watching means two rebuilds per save) and a root whose watch failed is retried on the next call. If no root takes at all, `watcher_` is cleared again, preserving the old single-root retry behaviour.
+
+### Reflection statics
+
+```cpp
+[[nodiscard]] static bool GPUShader::reflect_spirv_file(const std::string& path, ShaderResources& out);
+[[nodiscard]] static bool GPUComputePipeline::reflect_spirv_file(const std::string& path, ComputeResources& out);
+```
+
+Purely additive, used only by the host registration path, which feeds the reflected counts back in as the *declared* ones so `create_from_spirv`'s declared/reflected cross-check is a no-op rather than an ERROR on every load. The cost is one extra read of the file, at registration time. Nothing in `create_from_spirv` changed.
+
+### `scene/render_hook.hpp` — ordered, many-per-slot host passes
+
+| Symbol | What |
+|---|---|
+| `RenderHookSlot` | `PreForward`, `AfterOpaque`, `BeforeTaa`, `AfterComposite`, `AfterUi` |
+| `k_render_hook_slot_count` | `5`. A free constant, **not** an enumerator, so a `switch` over the enum stays exhaustive under `-Wswitch` |
+| `render_hook_slot_to_string(slot)` | `"Unknown"` out of range |
+| `RenderHookContext` | everything a pass is given (below) |
+| `RenderHookFn` | `std::function<void(const RenderHookContext&)>` |
+| `RenderHookHandle` | `core::Handle<RenderHookTag>` |
+| `RenderHookRegistry` | `add`, `remove`, `clear`, `empty()`, `empty(slot)`, `size`, `entries(slot)`, `is_dispatching`, `DispatchScope` |
+
+This is **not** a render graph: no declared reads or writes, no transient pool, no reordering. Hooks run in the order the host asked for, at the point the host named. `docs/engine_design_notes.md` is explicit that the renderer should not be routed through `render_graph/` without a measured reason, and adding resource declarations here would be that rewrite by the back door.
+
+`RenderHookContext` fields: `cmd`, `pipelines`, `slot`, `scene_color`, `scene_depth`, `velocity`, `normal_roughness`, `ao`, `swapchain`, `scene_color_format`, `depth_format`, `swapchain_format`, `width`, `height`, `camera`, `view_projection_unjittered`, `prev_view_projection_unjittered`, `depth_prepass_active`, `scene_time`, `dt`, `frame_index`. Three contracts worth stating separately:
+
+- `camera.projection` carries this frame's TAA jitter. Use the two unjittered matrices for any reprojection or velocity math.
+- `ao` is the renderer's **1×1 opaque-white dummy** when AO is off, not null — so a host pass can sample it unconditionally and read "fully unoccluded" instead of branching.
+- `scene_color` / `scene_depth` are **null** unless the offscreen pair holds *this* frame's image. Null rather than a stale texture is deliberate: on the fallback path and on a frame with no 3D content those textures often still exist, holding the last frame that did render into them.
+
+Every pointer is valid only for the duration of the call.
+
+#### Slot semantics and where each one fires
+
+| Slot | Position in `render_frame` | `scene_color` | `scene_depth` | `swapchain` |
+|---|---|---|---|---|
+| `PreForward` | after GTAO / GI / ray tracing, before the forward pass | about to be **cleared** | **read-only** | null |
+| `AfterOpaque` | immediately after the forward pass, before the RT reflection resolve | this frame's HDR | this frame's depth | null |
+| `BeforeTaa` | after water, before the TAA resolve | HDR | depth | null |
+| `AfterComposite` | after composite (and FXAA), before the UI pass | **pre-tonemap** HDR | depth | live, LDR |
+| `AfterUi` | after the engine UI pass, before `post_ui_callback_` | HDR | depth | live, LDR |
+
+`PreForward`'s depth is read-only for a specific reason: after a depth prepass the opaque forward draws test `EQUAL` against exactly what the prepass wrote, so writing depth there makes the forward pass drop geometry. `BeforeTaa` content is temporally stabilized along with everything else — right for world-space geometry, wrong for an overlay.
+
+**Every slot fires with a live command buffer and NO pass open, and a callback must leave it that way.** SDL3 GPU offers no way to ask whether a pass is open, so a leaked pass corrupts every later pass in the frame and fails inside the driver, far from the host code that caused it.
+
+The first four are HDR-path only. Every path on which a slot cannot run counts its hooks in `FrameDiagnostics::render_hooks_skipped` rather than dropping them silently: the fallback direct-to-swapchain path, a frame with no 3D content or no camera, a minimized window, a failed swapchain acquire (which retires `AfterComposite` and `AfterUi` both), and a null command buffer. `SceneRenderer::count_skipped_render_hooks` is the single helper and it early-outs on `render_hooks_.empty()`, so an engine with no host passes pays one bool test on each of those paths.
+
+#### Ordering, dispatch and the two name pointers
+
+`add(slot, name, order, fn)` inserts by `upper_bound` on `order` alone, which places a new entry after every entry with the same order — i.e. the tie-break is registration sequence, without a re-sort. The result is a **total** order determined by nothing but what the host asked for: no hash, no pointer values. An empty `fn` returns an invalid handle and logs an ERROR.
+
+`Entry` is heap-allocated with a stable address for its whole life, because `entry->name.c_str()` is handed to `BRACKEN_GPU_SCOPE`, which reads the label synchronously. `BRACKEN_GPU_TIMER` needs *more* than that and gets `entry->stable_name`: `GPUTimestampPool::reserve_pair` interns its pass name as a raw pointer and `PassTiming::name` is a `std::string_view` over it, still live in `RenderStats::pass_times_ms` when the host reads the stats — which is at the frame fence, where a host may legally have removed the hook. `stable_name` points into a `std::set<std::string>` the registry never erases and which deduplicates by value, so the pointer outlives the registration and a host that adds and removes the same named hook every frame reuses one node forever.
+
+`entries(slot)` and `empty(slot)` bounds-check with a `BRACKEN_CONTRACT` (live in release): the backing store is a fixed array and the enum comes from a host, so an out-of-range cast is a named abort rather than an out-of-bounds read. `DispatchScope` is an RAII marker `SceneRenderer` holds around each slot's dispatch; while it is alive `add`/`remove`/`clear` trip a `BRACKEN_CONTRACT` too — a hook registering another hook would reallocate the list being walked.
+
+`run_render_hooks` builds one `RenderHookContext` per non-empty slot and wraps each entry in its own `BRACKEN_PROFILE_ZONE_COLOR`, `BRACKEN_GPU_SCOPE` and `BRACKEN_GPU_TIMER`, so host passes appear in the dev overlay's per-pass CPU record table by name. `prev_view_projection_unjittered` and `frame_index` are read from members captured at the **top** of `render_frame`, because the end-of-frame advance overwrites both before the `AfterUi` slot runs — reading them there would hand a hook this frame's VP as the "previous" one (zero reprojection) and a frame index one past the frame it is drawing into.
+
+#### What replaced `set_post_ui_callback`
+
+`SceneRenderer::set_post_ui_callback` still exists and still works; `Application::init_dev_ui` uses it. It is **deprecated for host use**. The bug it caused is the whole reason this feature exists: it is a single assignable slot the dev overlay already claimed, so a game that called it silently turned F10 off. It is no longer possible to take that slot silently — the setter logs a WARN when it overwrites an already-installed callback and names `init_dev_ui` as the likely victim. It does not refuse (a host may legitimately want the slot, and refusing would break a renderer restart that re-installs), but "F10 stopped working" now has a log line next to it.
+
+`RenderHookSlot::AfterUi` is the many-per-slot replacement and runs **before** `post_ui_callback_`, so a host overlay ends up *under* the developer overlay rather than *instead of* it. Four source-scanning tests in `src/bracken/scene/render_hook.test.cpp` keep that mechanical rather than merely written down: `TheAfterUiSlotRunsUnderTheDeveloperOverlayNotInsteadOfIt` reads `scene_renderer.cpp` and fails if the `AfterUi` dispatch stops preceding the `post_ui_callback_` invocation, if a second dispatch site appears, or if the overwrite WARN is deleted; `TheDeveloperOverlayOwnsADedicatedSlotNotAHookRegistration` fails if `application.cpp` ever moves the overlay *into* the shared registry, where a host's `clear()` could remove it — the original bug with the arrow reversed; and `RegisteringNeverDisplacesAnExistingRegistration` puts 64 registrations with the same order and the same name into one slot and asserts all 64 survive.
+
+### Threading tiers
+
+| Operation | Tier | Enforcement |
+|---|---|---|
+| `add_shader_search_path`, `register_graphics_pipeline`, `register_compute_pipeline`, `unregister_pipeline` | main-thread | `BRACKEN_ASSERT_MAIN_THREAD` + `BRACKEN_ASSERT_NOT_SIM_STAGE` |
+| `RenderHookRegistry::add` / `remove` / `clear` | main-thread | same, plus `BRACKEN_CONTRACT(!is_dispatching())` |
+| `get_pipeline(HostPipelineHandle)` | worker-safe once the pipeline exists | read-only: generation check plus one map lookup, never creates |
+| `run_render_hooks` | main-thread | `BRACKEN_ASSERT_MAIN_THREAD` |
+| the host callback | main-thread | it runs inside `render_frame` |
+
+Register from `on_init` after `init_renderer()`, or from `on_main_frame` at the frame fence. **Never from `on_simulate`** — the sim job overlaps the previous frame's recording.
+
+### Constants and costs
+
+There is **no budget** on host pipelines or host hooks, and that is a decision rather than an omission: both are host-lifetime registrations made at init, not per-frame data, and neither has a fixed-size GPU-side table behind it, so a cap would be a number with nothing to justify it. `k_render_hook_slot_count = 5` (`src/bracken/scene/render_hook.hpp`) is not a budget either — it is the number of guarded call sites in `render_frame`, and adding a slot means adding one.
+
+The steady-state cost with nothing registered: five `empty(slot)` bool tests per frame, plus one `render_hooks_.empty()` test on each path that has to count a skipped slot, plus two member stores capturing the hook context's frame index and previous VP. Per registration: one `unordered_map` entry, shared with the ~100 catalogue entries. Per non-empty slot per frame: one `RenderHookContext` construction.
+
+### The worked example, and why it is off by default
+
+`examples/playground/custom_pass.hpp` / `custom_pass.cpp` is the whole loop as one copy-pasteable class: `examples/playground/shaders/playground_tint.frag.hlsl` compiled by `bracken_compile_shaders(playground DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/shaders)`, staged into `shaders_playground/`, the root and the pipeline registered in `CustomTintPass::install` from `PlaygroundGame::on_init`, drawn from a `RenderHookSlot::AfterOpaque` hook, released in `CustomTintPass::uninstall` from `on_shutdown` **before** `shutdown_renderer()`. Two details in it are worth copying rather than reinventing: the pipeline's **vertex** shader is the engine's own `fullscreen.vert.spv` while its fragment shader is the game's (search roots resolve engine-first, so the ordering that stops a host shadowing an engine shader is the same ordering that makes this work); and the blend mode is `AdditivePreserveAlpha`, not `Alpha`, because the HDR scene target's **destination alpha is metadata later passes read** and a fullscreen resolve must not grow it.
+
+It installs only under `PLAYGROUND_CUSTOM_PASS=1`, and that is load-bearing: `--smoke` is the engine's screenshot regression gate, so a pass that paints on the frame has to be opt-in or every pinned `mean_luma` in CLAUDE.md loses its reference. A baseline run must print `[smoke] custom_pass installed=0 ran=0`. The shader is still **compiled** by every build, so a break in `bracken_compile_shaders` fails the build rather than waiting for a game to find it.
+
+### Known limitations and silent behaviors
+
+- **A host `GPUPipeline*` dies on any shader hot reload.** `invalidate_all()`, `reload_all_pipelines()` and a swapchain-format change destroy every pipeline, host ones included. Re-fetch by handle every frame, exactly as every engine call site re-fetches by enum. Caching the pointer at init works perfectly until somebody saves a `.spv`.
+- **A hook that leaves a pass open corrupts the rest of the frame**, and the failure surfaces inside the driver in a later *engine* pass with nothing pointing at the host callback.
+- `enable_hot_reload`'s per-root behaviour is argued from the code rather than covered by a test: watching needs a device, so the suite cannot reach it. With one root the old global latch and the new per-root one are identical in all four states (first success, repeat call, second watcher, failed-watch retry).
+- Host descs are stored by value, so a large `buffers`/`attributes` vector is duplicated per registration. That copy is what makes rebuild-after-invalidation possible and is why `HostGraphicsPipelineDesc` owns `std::string`s where `PipelineDesc` holds non-owning `const char*`.
+- Nothing here is reachable from the Prepare stage, so the bit-identical-at-any-worker-count rule is not at issue; host tables and hook lists are nevertheless walked in slot order and `(order, sequence)` order respectively — never hash order — so preload, rebuild and dispatch are reproducible.
+
+---
+
+## Levels: `scene::Level`, the Container, and the Frame Digest
+
+A level in this engine used to be C++. Sources: `src/bracken/scene/level.hpp`, `src/bracken/scene/level.cpp`, `src/bracken/save/save_document.hpp`, `src/bracken/testing/frame_test.hpp`, `examples/playground/level_export.cpp`. Tests: `src/bracken/scene/level.test.cpp`, `src/bracken/testing/frame_test.test.cpp`, `src/bracken/save/save_document.test.cpp`.
+
+### Scope and the three decisions behind the shape
+
+A `Level` is an ordered table of placed model instances plus the static things around them: markers, point/spot lights, terrain, water, environment, nav config and procedural ground-cover rules. It is a **description**, not a runtime — nothing in `level.hpp` owns a GPU resource, opens a device or touches a frame. `ResolvedLevel` binds it to a `ModelManager` once and emits the draws into a `FrameSink`; that is the whole runtime surface.
+
+1. **A level stores model NAMES, never handles.** `bracken::ModelHandle` is a dense registration-order index, so a handle written to a file means something different the moment a host registers its models in another order. Names are the stable identity; resolution happens at load and everything it cannot resolve is counted.
+2. **An instance is a uniform TRS with a Y-only rotation, not a `mat4`.** That is a description of the reference scene rather than a simplification of it: every one of the playground's ~2550 placements is `translate → rotate(+Y) → scale(uniform)`. Storing the three inputs and recomposing them through one function is what makes a reload *bit*-identical; 24 bytes where 64 would do is the secondary benefit.
+3. **The container is `save::SaveDocument`, not a new format.** It already has the atomic temp+rename write, the payload checksum, the version refusal and the unknown-record round trip, and it is already tested. A second container would have been those four features with a second set of bugs (`docs/engine_design_notes.md`, decision principle #1).
+
+`scene/level.hpp` reaches only `contracts/`, `core/`, `save/`, `navigation/`, `heightmap.hpp`, glm and `<std>`. `render::WaterRegion` is **mirrored** as `LevelWater` rather than included, and `ModelManager` is forward-declared, because `render/water_renderer.hpp` pulls in `gpu_buffer`, `gpu_texture` and `<SDL3/SDL_gpu.h>` — a level header that dragged the GPU layer into every host TU would be the same mistake `application.hpp` is pinned against. The header is in the `bracken.hpp` umbrella and therefore also compiles standalone in the generated `bracken_public_headers` TU.
+
+### Records and their strides
+
+The `sizeof` **is** the on-disk row stride, and each is `static_assert`ed for size and trivial copyability in the header and again in the test.
+
+| Record | `sizeof` | Fields |
+|---|---|---|
+| `LevelInstance` | 52 | `model`, `motion_id`, `flags` (`DrawFlags`), `lod_hint`, `position` (vec3, RESOLVED world), `yaw` (radians about +Y), `scale` (uniform), `tint` (vec4) |
+| `LevelRect` | 16 | `min_x`, `min_z`, `max_x`, `max_z` |
+| `LevelMarker` | 20 | `name` (index into `Level::strings`), `position`, `yaw` |
+| `LevelWater` | 124 | mirrors `render::WaterRegion` field for field |
+| `LevelScatterModel` | 16 | `model`, `weight`, `min_scale`, `max_scale` |
+| `LevelScatterRule` | 48 | `name`, `model_first`, `model_count`, `seed`, `center_x`, `center_z`, `inner_radius`, `outer_radius`, `step`, `jitter`, `sink`, `baked` |
+
+`LevelTerrain` is not a fixed row (it carries three vectors): `resolution`, `origin_x/z`, `size`, `min_height`, `max_height`, `samples` (`Heightmap::height_data` verbatim — row-major `z * resolution + x`, 16-bit against the explicit range, so a load is a copy rather than a requantization), `splat_resolution`, `splat` (RGBA8), `grass_exclusions`.
+
+`LevelInstance::position` is the **resolved** world position — ground snap, terrain height and any authoring-space sink already applied. Storing authoring coordinates plus "look the height up at load" would make every reload depend on the loader owning the same heightmap sampled the same way; storing the answer makes it depend on nothing. `lod_hint` is an opaque `uint32_t` the engine **never reads**, carried so a streaming or LOD layer has somewhere to put a cell id without a parallel side table.
+
+### `level_instance_transform` — the format's identity argument
+
+```cpp
+glm::mat4 level_instance_transform(const glm::vec3& position, float yaw, float scale) noexcept;
+```
+
+`translate → rotate(yaw, +Y) → scale(uniform)`, those three glm calls, in that order. It exists exactly once and it is deliberately **not `inline`**: an inline definition can be instantiated differently in two translation units (different inlining context, different floating-point contraction), which is precisely the class of difference the function exists to rule out. `LevelInstance::transform()` forwards to it, and a host's own composition site should call it too. Recompose it as three matrices multiplied together, or re-derive the yaw from degrees on the way in, and the products differ in the last ulp while the image does not: the digest breaks and nothing on screen explains why.
+
+Corollary for authoring tools: **do not decompose a matrix to make a level instance.** Capture the translate/yaw/scale inputs at the composition site (`PlaygroundGame::place_prop` is the worked example). Recovering them from the product differs in the last ulp.
+
+### The container and the on-disk record set
+
+A `save::SaveDocument`: magic `BRKSAVE`, format version (`save::k_save_format_version`), host version, payload length, FNV-1a payload checksum, temp-file + rename write. `Level::content_version` rides `SaveDocument::game_version`.
+
+What a level adds on top is **blob tables**. `SaveDocument::find` is a linear scan over a vector and `set` calls it on every write, so path-addressing 2550 instances at five records each is ~81M string comparisons on write; one blob with an explicit stride is three records. That is not an optimization, it is why the schema looks the way it does.
+
+```
+level/version            i64    schema version (k_level_format_version)
+level/name               str
+models/count             i64
+models/<i>/name          str
+models/<i>/source        str
+strings/count            i64
+strings/<i>              str
+instances/{count,stride,data}        stride 52
+markers/{count,stride,data}          stride 20
+water/{count,stride,data}            stride 124
+scatter/models/{count,stride,data}   stride 16
+scatter/rules/{count,stride,data}    stride 48
+lights/point/{count,stride,data}     stride 44   (explicit all-scalar row)
+lights/spot/{count,stride,data}      stride 64   (explicit all-scalar row)
+terrain/present          bool
+terrain/{resolution,origin_x,origin_z,size,min_height,max_height}
+terrain/samples          blob   resolution^2 * 2 bytes
+terrain/splat_resolution i64
+terrain/splat            blob   splat_resolution^2 * 4 bytes
+terrain/grass_exclusions/{count,stride,data}   stride 16
+env/present              bool
+env/<field>              29 records, one per EnvironmentState field
+nav/present              bool
+nav/{origin,cell_size,width,depth,max_slope_degrees,max_step}
+```
+
+Lights get an **explicit row type** rather than a memcpy of `PointLightDesc` / `SpotLightDesc`: those carry a `bool` and therefore padding, and padding bytes are unspecified after a copy, so memcpy'ing them would make two saves of the same level differ in bytes and in checksum for no reason a reader could see. Spot cone half-angles stay in **degrees** on disk, matching `core::Degrees` — the engine takes the cosine, and storing the cosine would make the file unreadable to a human and unrepresentable back to a `Degrees`.
+
+The environment is 29 path-addressed records rather than one blob: it is the one section a human edits in a dump, it gains a field every few releases, and path-addressing is what makes a field added later round-trip by key through an older build.
+
+### Forward compatibility — two mechanisms, and the one that is unavailable
+
+1. **New keys.** An older reader asks for what it knows and ignores the rest.
+2. **Wider table rows.** Every table decode copies `min(stride, sizeof(row))` bytes per row and leaves the remainder at this build's defaults. A newer writer that *appended* a field is readable here; an older file with a shorter stride is readable too. Rows are therefore **append-only** and must stay padding-free.
+
+What is **not** available is a new value TAG: `SaveDocument`'s parser stops dead on an unknown tag because it cannot compute the record's length in order to skip it. So the level schema never introduces one.
+
+`k_level_format_version` (currently `1`) is bumped **only** when the record set changes shape in a way an older build cannot ignore. Adding a key does not bump it; growing a stride does not bump it. A file whose `level/version` is newer than this build's is refused with `LevelError::FutureVersion` rather than guessed at.
+
+### Errors
+
+```cpp
+enum class LevelError : uint8_t {
+    FileNotFound, NotALevelFile, Corrupt, FutureVersion, WriteFailed, BadTable, BadValue
+};
+const char* to_string(LevelError) noexcept;
+```
+
+Every fallible entry point returns `core::Result<T, LevelError>` and is `[[nodiscard]]`.
+
+`NotALevelFile` is a readable container that carries no `level/version` — a plain save file handed to `load_level`. `BadTable` is a **structural contradiction** that survived the checksum: a `count * stride` that disagrees with the blob length, a non-positive stride, a terrain sample blob that is not a whole number of 16-bit samples, a heightmap whose declared resolution does not square to its sample count, a declared name-table length larger than the whole document, an out-of-range terrain resolution or nav grid. The checksum passed in every one of those cases, so it is a writer bug or a hand-edited file, and it is refused rather than half-read.
+
+`BadValue` is the one that surprises people: a number that survives the container and could not survive the renderer — a NaN or an infinity in a position, a scale, a colour, a fog distance, a cell size. It is refused at **load**, because that is the only place it is cheap to refuse. A NaN that reaches a transform poisons the whole matrix, and a NaN matrix in the frame packet propagates into culling (every comparison against it is false), the bounding-sphere merge and the depth pyramid — the symptom is a blank or flickering frame several subsystems away from the file that caused it. Finiteness is checked **per field**, not as a blanket byte scan, because these rows are float/`uint32_t` mixtures: `motion_id = 0x7FC00001` and `lod_hint = 0xFF800000` are NaN and −inf bit patterns and must load unchanged.
+
+### Hardening: what a malformed file may do
+
+A `.level` is untrusted input the moment it can arrive from anywhere but the build that wrote it. The contract, pinned case by case in `level.test.cpp`:
+
+- it never reads outside the bytes it was handed — the container's cursor bounds-checks every take, and every table decode **divides rather than multiplying**, so a `count` can never be trusted into a pointer;
+- it never allocates on a number it read without first bounding that number by something the file cannot inflate: the bulk tables by their blob's actual length, the two path-addressed name tables by the container's own record count (a table of N names occupies 2N records, so a count larger than the whole document is a lie the file's own size disproves), and the rest by the explicit ceilings below;
+- every refusal is a named `LevelError` with one log line saying which record was wrong, and a decode either returns a complete `Level` or an error — never a half-populated one;
+- indices are the format's only pointers and none of them is followed off the end. `Level::model_name`, `Level::string_at` and `Level::scatter_slice` answer empty for an out-of-range index; an instance whose model index is past the table is counted in `LevelResolveReport::instances_dropped_bad_index`.
+
+| Ceiling (`src/bracken/scene/level.hpp`) | Value | What it bounds |
+|---|---|---|
+| `k_max_name_table_rows` | 65536 | rows in the two path-addressed tables (models, strings). The container's own record count is the tighter bound; this is the coarse one that stops a small densely-packed file asking for gigabytes |
+| `k_max_table_rows` | `1 << 21` (2097152) | rows in ANY blob table. The blob's length bounds the count only by `length / stride`, and the stride comes from the file too: a declared stride of 1 turns a 10 MB blob into ten million 52-byte rows. This is what makes the amplification bounded rather than proportional |
+| `k_max_terrain_resolution` | 8192 | heightmap and splatmap resolution, so `resolution * resolution` cannot overflow or allocate on a file's say-so |
+| `k_max_nav_cells` | `4 << 20` (4194304) | `width * depth`, which `nav::NavGrid::build` allocates a cell per. The check is written so `2^40 × 2^40` — where the product overflows — is refused too |
+| `k_max_scatter_cells_per_axis` | 8192 | candidate cells one scatter rule may walk |
+| `k_max_scatter_instances` | `1 << 20` (1048576) | instances one scatter rule may PRODUCE; the cell bound alone still permits 8192² candidates |
+
+What the loader deliberately does **not** validate is gameplay: a level may place a crate under the terrain, aim a spotlight at nothing, or reference a model the host never registers. Those are counted or simply allowed. Structural integrity is the engine's business; whether the level is any good is the game's.
+
+**Two holes, stated rather than discovered.** The container's `game_version` field — which carries `Level::content_version` — sits outside the payload checksum, so a corrupted one loads as a different content version with no error; that is the container's documented behaviour and the level schema inherits it. And a finite-but-absurd number (a scale of `1e30`) is accepted: finiteness is checkable, plausibility is the game's business.
+
+### Scatter rules
+
+```cpp
+using ScatterGroundFn = std::function<std::optional<float>(float x, float z)>;
+[[nodiscard]] std::vector<LevelInstance> scatter_ground_cover(const LevelScatterRule&,
+                                                              std::span<const LevelScatterModel>,
+                                                              const ScatterGroundFn&);
+```
+
+Pure and deterministic: same rule, same models, same callback answers → the same rows, bit for bit, on any thread. The RNG is a named 32-bit LCG written out in `level.cpp` (seed mixed by `seed * 747796405 + 2891336453`, then `state = state * 1664525 + 1013904223` per draw with the top 24 bits taken) rather than anything from `<random>`, because the sequence is part of the file's meaning and a seed is worthless if it produces different rows on a different standard library. `2π` is a float literal for the same reason.
+
+**Five draws per candidate cell — jitter x, jitter z, yaw, model pick, scale — unconditionally, before any rejection.** That is the property that makes a seed worth storing. The playground's hand-written fill draws a variable number (two, then three or four only if the cell survives), so its output cannot be regenerated after any change to its blocking predicate, the terrain under it, or its clearing rects: every later cell shifts. A fixed draw count makes the stream independent of the predicate, and `ScatterStreamDoesNotShiftWhenTheGroundRefusesACell` (`src/bracken/scene/level.test.cpp`) pins it.
+
+Grid order is **x-outer, z-inner** and emission order is draw order, so both are part of the rule's meaning. The grid is `ceil(2 * outer_radius / step)` cells per axis; more than `k_max_scatter_cells_per_axis` is an ERROR and an empty result rather than a two-minute hang. Candidates outside `[inner_radius, outer_radius]` of the centre are dropped, as are cells the ground callback answers `nullopt` for. One callback answers both "is there ground here" and "how high" on purpose: two callbacks would let a host answer them inconsistently, and the engine cannot tell which one is the lie.
+
+Two refusals in the weight walk, both real:
+
+- **weights that sum to infinity are refused, not collapsed.** Per-field finiteness passes two `3e38` weights, but `pick01 * total` is then `inf` for every draw (`NaN` for `pick01 == 0`), no subtraction goes negative, the walk falls through on *every* candidate, and the whole carpet becomes one model chosen by position in the table. That is a different level, not a degraded one.
+- **the walk's fall-through picks the last POSITIVELY weighted row**, not the last row, because `LevelScatterModel::weight` documents `<= 0` as never picked. Honest scope: an exhaustive sweep of all 2²⁴ values the LCG can return found that branch reachable only for contrived weight sets and only for a handful of draws in 2²⁴ — a contract made unconditional, not a bug anyone was hitting.
+
+`LevelScatterModel`'s scale range is sampled as `min + (max - min) * u` with `u ∈ [0, 1)`, so `min_scale` is reachable and `max_scale` is the open end.
+
+`baked != 0` means the rows this rule produced are already in `Level::instances` and the rule is provenance. **Nothing in the engine reads `baked`** and nothing in the engine expands a rule on its own: `load_level` returns the rules as data and the host decides which to hand to `scatter_ground_cover`. The flag is the datum that decision is made from, not an instruction anything obeys — a host that expands a `baked` rule gets its ground cover twice and no diagnostic.
+
+### Resolution against a `ModelManager`
+
+```cpp
+struct LevelResolveReport {
+    uint32_t instances_placed;
+    uint32_t instances_dropped_unknown_model;
+    uint32_t instances_dropped_bad_index;   // model index outside Level::models
+    uint32_t models_unresolved;             // DISTINCT names, each logged once
+    bool any_dropped() const noexcept;
+};
+```
+
+`ResolvedLevel::resolve` looks each distinct **name** up once (47 hash lookups for 2550 instances, none inside the loop), logs one WARN per unresolved name plus one summary line, and returns the counts. It never `continue`s silently — a level whose art did not load is the single most common thing to go wrong here. `ResolvedLevel::Draw` carries `{model, transform, tint, flags, motion_id, lod_hint}` and `ResolvedLevel::emit(FrameSink&)` walks it in file order. `emit` is sim-stage and adds no allocation of its own; the frame packet's arena grows exactly as it does for a host's hand-written loop, which is why a host that already has such a loop should keep it and read `draws()` instead.
+
+`missing_models(level, models)` returns `(name, source)` pairs for everything the manager does not hold, in **level table order** — the shape `AsyncModelLoader::Request` takes. A host that cares about handle stability across a hand-authored and a level-driven run must register in one fixed order and use it for both.
+
+### Inspection, digest, verification, export
+
+| Function | Contract |
+|---|---|
+| `level_dump(level, max_rows = 8)` | human-readable text. `max_rows == 0` means every row. Total — it never fails and never aborts, and every index it prints goes through `model_name` / `string_at`, because dumping is exactly what you do to a file you already suspect |
+| `save_level_dump(level, path)` | the `.level.txt` sidecar; `WriteFailed` if the path cannot be opened |
+| `level_digest(level)` | FNV-1a over the level's canonical content in **table order**, excluding `extras()` |
+| `verify_level_roundtrip(level)` | serialize, parse back, compare `level_digest` and the carried extra-record count |
+| `export_level(level, path, write_dump = true)` | **verify, then write, then drop the sidecar** |
+| `serialize_level` / `parse_level` | the byte-level halves, for a level shipped inside an `AssetPack` |
+
+`level_digest` folds the *data*, not the file bytes: the container preserves the order records were written in, so a level rebuilt with its sections assigned in a different order is the same level with a different file. It excludes `extras()` because those records belong to the host, and a game that writes a frame counter into them must not thereby make every level unequal to itself. Lights are folded through their **on-disk rows** precisely because the descs carry padding.
+
+`export_level`'s order is the policy, and it is why this is a function rather than three lines in each game's tool: verification runs first, before a single byte reaches the disk (it is also the cheap half — pure data, no models, no IO), and only then does `save_level` do its atomic temp+rename. A failed sidecar is a WARN, not an error. The failure this actually catches is `BadValue`: a NaN written by a broken authoring step encodes fine and is refused on the way back in — at export time, in the tool, rather than six weeks later in a player's install.
+
+`Level::extras()` is a `save::SaveDocument` by value. Anything under a prefix the schema does not own round-trips untouched, including through a build that has never heard of it; `level/`, `models/`, `strings/`, `instances/`, `markers/`, `lights/`, `water/`, `terrain/`, `env/`, `nav/` and `scatter/` belong to the schema and are regenerated on every save (a host record under one of those prefixes is **dropped**, not left in the file to override the schema).
+
+`SaveDocument` gained four additive members for this: `serialize()`, `parse(span)`, `value_at(path)` and `write_value(path, Value)`. `save()` is `serialize()` plus the temp-file/rename block and `load()` is read-file plus `parse()`, so there is one encoder and `SerializeProducesExactlyTheFileBytes` (`src/bracken/save/save_document.test.cpp`) is the gate that keeps it that way. `serialize()` also now **refuses** a payload past `UINT32_MAX` instead of narrowing the declared length silently — the old behaviour wrote a file whose declared length disagreed with its own checksummed payload, so `save()` returned success and every later `load()` returned `Corrupt`.
+
+### `testing::TestFrame::digest()`
+
+```cpp
+[[nodiscard]] uint64_t digest() const;   // src/bracken/testing/frame_test.hpp
+```
+
+FNV-1a over everything the **host** described this frame, in packet order: model draws, skinned draws, the bone palettes and their matrices, point and spot lights, billboards, debug lines, effect spawns, shadow capsules, UI commands including the text bytes, the camera, the environment, the three world-element toggles and the build diagnostics. Stream lengths are folded too, so an empty stream and an absent one cannot collide. Floats are folded by **bit pattern**, so `-0.0f` and `0.0f` are different frames and a NaN tint surfaces rather than smoothing away.
+
+Order-sensitive **by design**: packet order is what the renderer consumes, so two frames holding the same three draws in a different order are two different frames. A digest that called them equal would pass for a level loader that shuffled its instance table, which is the one thing it exists to catch.
+
+Deliberately **not** folded: the engine-stamped timing and clock section (`dt`, `time`, `frame_index`, `scene_time`, `sky_time`) and the effect-instance snapshot derived from it — those are functions of wall clock, not of what the host asked for, and folding them would make the digest differ between two runs of the same scene. Also not folded: the *value* of the two host-owned definition pointers the packet carries by documented exception, only their null-ness, because an address is not stable across runs.
+
+**Known blind spot, stated rather than discovered:** it folds the streams that exist today. A feature that adds a new command stream to `FramePacket` and does not extend `digest()` leaves it silently insensitive to that stream. Extend it in the same change that adds the stream.
+
+### Threading tiers
+
+| Entry point | Tier | Why |
+|---|---|---|
+| `Level` construction, mutation, queries | `owned` | plain data; touches no engine global |
+| `save_level` / `load_level` / `export_level` / `save_level_dump` | main-thread / loading | blocking file IO; `BRACKEN_ASSERT_NOT_SIM_STAGE()` |
+| `serialize_level` / `parse_level` / `verify_level_roundtrip` | worker-safe | no filesystem, no shared state |
+| `ResolvedLevel::resolve`, `missing_models` | main-thread / loading | they read the `ModelManager` name table, which a concurrent load mutates; asserted |
+| `ResolvedLevel::emit` | `sim-stage` | one loop of `FrameSink::draw_model` |
+| `scatter_ground_cover` | worker-safe | pure; the only state is a local LCG |
+| `level_dump` / `level_digest` / `to_level_water` / `to_water_region` | `owned` | pure reads |
+
+`Level` owns every byte it holds. `ResolvedLevel` owns its `Draw` vector and holds no pointer into the `Level` it was resolved from, so the level may be destroyed after resolution.
+
+### The playground round trip, and what it proves
+
+```
+playground --export-level village.level      # build the scene, write it, verify, exit
+playground --smoke 30 --level village.level  # rebuild the props from the file
+playground --dump-level village.level        # read it as text; no window, no GPU, no assets
+```
+
+`--export-level` runs at the **tail of `on_init`** — the last moment where every piece is final and no sim job exists yet — and then calls `quit()`. That works only because `Application::quit()` is **latched**: `quit_requested_` is set and never cleared, and `run()` honours it at entry instead of resurrecting the flag it stores there. Before the latch existed a `quit()` from `on_init` was silently erased and the host ran forever, which is what made one-shot CLI hosts impossible.
+
+`--export-level` proves itself rather than claiming success: after writing the file it reads it back **off disk**, resolves it against the same `ModelManager` the live scene used, and compares the result to the live prop list matrix by matrix — `memcmp`'d, not epsilon-compared, because the whole claim of `level_instance_transform` is that both sides ran the same three glm calls on the same three floats. It prints `[level] roundtrip OK: N props reload bit-identical, digest=0x…` and exits 0, or a `roundtrip FAILED` line and exits 1.
+
+`--export-level` and `--level` are **mutually exclusive**, refused in `main()` before a window opens and again in the exporter: a loaded level fills the prop list but cannot fill the authoring-triple list (a placement holds a `const char*` model name and a loaded level's names die with the local `Level`), and the export writes before it verifies — so the combination wrote an empty level and would destroy the input if both named one path.
+
+Both runs print `[level] source=… props=N digest=0x…` at init and **the two digests must match**. The measured value for the shipped village is **`0xc9d841c985f27a13`**, from the authored scene and from the file, and the two runs render bit-identically. That line, not `mean_luma`, is what sees a single prop shifting by a ulp.
+
+The demo's RNG state after the ground-cover scatter rides the level's **host-extras** channel (`playground/rng_after_scatter`). Without it the orb spawn draws that follow in `on_init` would land on different anchors, because a `--level` run skips the fill that consumed the stream. That is what `Level::extras()` is for, and it doubles as the in-tree demonstration that unknown records survive.
+
+### Deliberate omissions and known limitations
+
+- **The playground does not export its splatmap.** The demo's 512² splat is a pure function of the layout header and the river constants, regenerated in ~30 ms; baking it would add 1 MB to a ~130 KB file to store something the host recomputes anyway. `LevelTerrain::splat` exists for hosts whose splat *is* authored.
+- **The playground bakes its ground cover** (`LevelScatterRule::baked = 1`) and writes the rule as provenance, because its own fill draws a variable number of randoms per cell from an LCG shared with the rest of `on_init` — the exact trap the engine's fixed-five-draws contract exists to avoid for rules authored against `scatter_ground_cover`.
+- **Physics colliders are not level data.** The playground's collider classification is a string match on model names, i.e. game policy, and it stays in the host. A level loaded by a *different* host therefore gets no colliders. An explicit per-instance collider field is the fix if this ever needs to be portable; smuggling the string matching into the engine is not.
+- **No editor, no GUI, no runtime streaming, no hot reload.** `core::asset::FileWatcher` could watch a `.level`; nothing needs it yet.
+- **A level's `motion_id`s are unvalidated.** Two million instances with two million distinct ids is a legal file, and motion history is keyed by that id. Bounded by the instance count, so not unbounded — but it is a file's word reaching a renderer-side table.
+- `k_max_name_table_rows`, `k_max_terrain_resolution` and `k_max_nav_cells` are ceilings chosen to sit far past anything this engine renders, **not measured limits**. The property under test is that a file cannot push past them, not that these are the right numbers.
+
+---
+
+## The UI Module (`bracken::ui`)
+
+An immediate-mode UI that runs **entirely in the sim stage**: it touches no GPU, no SDL and no main-thread API, measures text against a frozen CPU glyph table, and emits into the frame packet through `scene::FrameBuilder::UiLane`. Sources: `src/bracken/ui/ui_types.hpp`, `src/bracken/ui/layout.hpp`, `src/bracken/ui/nine_slice.hpp`, `src/bracken/ui/ui_input.hpp`, `src/bracken/ui/ui_context.hpp`, `src/bracken/ui/widgets.cpp`, plus the four engine gaps it had to close: `src/bracken/contracts/font_metrics.hpp`, `src/bracken/contracts/ui_texture.hpp`, `src/bracken/core/utf8.hpp`, and the z-order/clip work in `src/bracken/render/ui_renderer.hpp`. The module's contract page is `src/bracken/ui/README.md`.
+
+### Layering, and why `FontMetrics` is in `contracts/`
+
+`ui/` sits **above** `scene/` — it emits into a `FrameBuilder` lane — so `render/` must never include `ui/`, or `render → ui → scene → render` closes a cycle and `module_layering.test.cpp`'s `HeaderGraphIsAcyclic` fails. That is why `FontMetrics` lives in `contracts/` (so `render/` can *produce* one without `ui/` reaching back), and why `decode_utf8` moved down into `core/utf8.hpp` (so `contracts/`, which may include only `core/`, `contracts/`, glm and `<std>`, can use it). `render::decode_utf8` is now a using-declaration onto `core::decode_utf8`, so every existing call site is untouched.
+
+**The tier audit is a SOURCE SCAN, not only assertions.** A tier macro is a debug-only runtime check on the callee and it fires only if some test happens to execute that call on a bad thread. "The UI module cannot touch the GPU" is a stronger claim, and `src/bracken/ui/ui_purity.test.cpp` makes it directly: no file under `src/bracken/ui/` may include `bracken/gpu/`, `bracken/render/`, `bracken/scene/scene_renderer*`, `SDL3/SDL_gpu.h`, `SDL3/SDL_render.h` or `SDL3_ttf/` — so the call cannot be *written*, for every line of the module at once. The same file pins the reverse edge (`render/` never includes `ui/`) and that `contracts/font_metrics.*` never reaches back into the renderer that produces it.
+
+`ui_input.hpp` including `input_handler.hpp` — and through it SDL's scancode and event headers — is deliberately allowed: `InputSnapshot` is plain data whose key edges are indexed by scancode, and naming a scancode is not touching a device.
+
+### `contracts/font_metrics.hpp` — `bracken::FontMetrics`
+
+The CPU-side mirror of `render::TextRenderer`'s glyph metrics: everything text *layout* needs and nothing that needs SDL_ttf, a GPU or the main thread. Before it existed, the only text-extent query in the engine was `TextRenderer::get_text_width`, which needs the live `TTF_Font*` and is therefore main-thread tier — so `FrameBuilder::UiLane::add_text_wrapped` wrapped proportional text on a hardcoded 8 px per character.
+
+| Member | Meaning |
+|---|---|
+| `line_height`, `line_skip`, `ascent`, `descent` | vertical metrics in font pixels |
+| `pixel_size` | the size the atlas was rasterized at (18 today) |
+| `fallback_advance` | advance charged to a codepoint outside the table |
+| `advance` | dense `std::array<int16_t, k_dense_count>` over U+0020..U+024F; `k_absent` (`INT16_MIN`) where the font has no glyph |
+| `sparse_advance` | `(codepoint, advance)` outside the dense range, **sorted** for binary search — sorted and not hashed because the whole module must be deterministic |
+| `kerning` | `((prev << 32) \| cur, kerning)`, **nonzero pairs only**, sorted |
+
+| Method | Contract |
+|---|---|
+| `valid()` | `line_height > 0`; false until a font was exported, and every measure then returns 0 |
+| `has_advance(cp)` | false when `advance_of` would fall back |
+| `advance_of(cp)` / `kerning_of(prev, cur)` | pen primitives in unscaled font pixels |
+| `measure_width(utf8, scale)` | the authoritative pen walk — kerning before the glyph, then the advance, accumulated as integers and scaled exactly once |
+| `measure_height(scale)` | `line_height * scale`: the glyph CELL, matching the emitted quads, not `line_skip` |
+| `count_fallbacks(utf8)` | how many codepoints would measure wrong |
+| `fit_prefix(utf8, max_width, scale, out_width)` | longest prefix that fits, ending on a UTF-8 boundary; monotone in `max_width` |
+| `wrap_point(utf8, max_width, scale)` | `{consumed, emit}` for word wrapping; `consumed > 0` for a non-empty input, so a wrap loop always terminates |
+
+Constants: `k_first_cp = 0x20`, `k_last_cp = 0x24F`, `k_dense_count = 560`, `k_absent = INT16_MIN`.
+
+**Two stated limits, and neither is a divergence between measuring and drawing.** (a) Kerning is exported over the printable-ASCII cross product only — the dense range's cross product is 313 600 FreeType lookups at init against 9 025 — so Latin-1 and Latin Extended-A kern as zero. (b) A codepoint outside the exported range measures with `fallback_advance` while `build_string_quads` keeps the glyph's *real* advance (driving the pen with `'?'` widths would pile a CJK run on top of itself). So such a string is drawn correctly and **measured wrongly**, and will overrun a box sized from this table; `has_advance()` is the hook that counts it. Everything the table *does* cover, both walks agree on to the pixel, because `TextRenderer::get_text_width` is now implemented on top of `measure_width` — one answer in the tree instead of two independently drifting ones.
+
+**How it is published, exactly.** `TextRenderer::init` exports into its own frozen table. `Application::init_renderer()` copies that into `Application::font_metrics_` — on the main thread, before `run()` has ever kicked a sim job — and never writes it again. `kick_sim` hands `&font_metrics_` to the frame's `FrameBuilder` and to the `SimFrame`, so sim code reads `SimFrame::font_metrics()` (`src/bracken/sim_frame.hpp`), which returns a frozen empty singleton rather than a null reference when there is none. The happens-before edge that makes a worker's read safe is the sim job's own submit/execute edge, the same edge that publishes the input snapshot. There is no atomic and none is needed: after init this is an immutable value, tier `worker-safe`.
+
+### `contracts/ui_texture.hpp` — `bracken::UiTextureId`
+
+A bare `uint32_t` handle, `0` (`UiTextureId::k_invalid`) meaning invalid, `static_assert`ed to stay one word wide. It exists because `render::UIRenderer::draw_textured_quad` takes a raw `SDL_GPUTexture*`, which a sim job may never hold — so before this there was no way to *name* a texture from `on_simulate` and nine-slice sprites were impossible there.
+
+Registered on the main thread (`SceneRenderer::register_ui_texture`, asserted `NOT_SIM_STAGE`), resolved back to the pointer on the main thread at consume. **Ids are never recycled within a process run**: `unregister_ui_texture` clears the slot but does not reuse the value, so a stale id resolves to nothing rather than to somebody else's texture. An id that resolves to nothing is counted in `FrameDiagnostics::ui_textures_unresolved` and degrades to a solid tint quad — never a silently missing panel.
+
+### `ui/ui_types.hpp`
+
+`Rect` (x/y/w/h in screen pixels, origin top-left, +y down — the same space every `scene::Ui*Command` uses) with **half-open** `contains` so two rects sharing an edge never both claim a pixel, and an `intersect` whose empty result keeps the intersection point rather than collapsing to the origin (a clip chain that goes empty stays where it went empty). `Edges` (`all`, `xy`, `horizontal()`, `vertical()`). `Axis` (`Horizontal`/`Vertical`). `Align` (`Start`/`Center`/`End`/`Stretch`). `SizeMode` (`Content`/`Fixed`/`Flex`) and `Size` (`px`, `flex`, `content`). `BoxStyle` (`padding`, `spacing`, `main`, `cross`, `width`, `height`). `WidgetId` (a `uint64_t`, `0` invalid). `Style` — one flat struct of 17 colours plus `border_width`, `control_padding`, `control_height` and `text_scale`; a real theming system (cascading, per-widget overrides, named tokens) is explicitly out of scope.
+
+`id(label)`, `id(parent, index)` and `combine(parent, child)` are **FNV-1a 64**, deliberately not `std::hash`: `std::hash` is not specified to be stable across library versions, and a widget id that moves between compiler releases loses every player's scroll position.
+
+**The id trap, stated once.** An id derived from something that changes every frame (a formatted string containing the frame index, or a live value) resets that widget's state every frame *and* leaks one retained entry per frame. The leak is bounded by `ContextConfig::retain_frames` (default 120) and `Diagnostics::retained_entries` is the instrument, but the widget is still unusable.
+
+### `ui/layout.hpp` — `ui::LayoutTree`
+
+Two passes over a node tree, with no knowledge of the frame packet, input, widgets, fonts or the engine — which is why it is a separate file that `src/bracken/ui/layout.test.cpp` exercises with no GPU and no packet at all.
+
+**Why a tree, given the module is immediate-mode:** an immediate-mode call cannot place a widget when it is declared, because the rectangle depends on siblings that do not exist yet. So declaration builds this tree plus a deferred draw list, and `Context::end()` solves and *then* emits.
+
+**Measure** (bottom-up): a leaf wants its `content` unless a `Fixed` size overrides it; a box wants the sum of its children along the main axis plus spacing, the max along the cross axis, plus padding. **Arrange** (top-down): non-flex children take their measured main size, flex children split the leftover in proportion to their weights, and the cross axis is placed by `BoxStyle::cross`. `Align` on the **main** axis places the leftover when no child is flex (a flex child eats it, so there is then nothing to place); `Stretch` there reads as `Start`.
+
+`Stretch` on the **cross** axis fills — but only for a child that did not ask for a cross size itself. An explicit `Size::px` **wins over** the parent's `Stretch`, exactly the rule flexbox has (`align-items` only stretches an `auto` cross size); a `Size::flex` or `Size::content` child stretches. Without that, a 100 px-wide toggle dropped into a `Stretch` column would be silently widened and there would be no way to say "this one is narrow".
+
+Two properties the tests pin:
+
+- **No drift.** Flex sizes are the difference of two *cumulative* fractions, and positions are an offset from the content origin rather than a running cursor. A twelve-item flex row's last right edge lands on the content edge to the float; a running cursor rounds once per child and ends visibly short.
+- **`content_of` versus `content_extent_of`.** The first is the size after an explicit `Fixed` override; the second is what the children wanted *before* it. A scroll viewport is `Fixed` by definition, so a max-offset computed from `content_of` is always zero — i.e. nothing ever scrolls. Keeping both is the fix.
+
+`set_scroll_free(node, axis)` lets a node size itself to its content along one axis during arrange even when its own rectangle is smaller; `translate_children` applies the scroll offset after the solve; `is_descendant_of` is what scroll-into-view asks (see below).
+
+Constants: `k_invalid = 0xFFFFFFFF`; `k_max_depth = 64` — a guard, not a budget. Containers opened past it are **discarded and counted** in `depth_overflow()`, and their `end_box` is absorbed so the tree stays well-formed rather than corrupting. An unbalanced `end_box` is counted in `unbalanced_end_box()` and otherwise ignored.
+
+### `ui/nine_slice.hpp`
+
+`build_nine_slice(slice, dst, out)` writes up to 9 `NineSliceQuad`s into a `std::span<NineSliceQuad, 9>` and returns how many (9, or 8 with `NineSlice::draw_center` false, 0 for an empty `dst`). The patches **exactly tile** `dst`: destination band widths come from differencing absolute edge positions rather than adding widths, so the seams are shared edges, their areas sum to `dst`'s, and no two overlap — no hairline seam is possible.
+
+Two guards, each against a quad that would render inside out rather than merely wrong: borders wider than `dst` are scaled down **proportionally** (a 16 px border on an 8 px box becomes two 4 px borders with a zero-width middle) instead of inverting; borders wider than the **source** collapse the middle UV band to zero instead of running it backwards, because a quad with `u1 < u0` samples its band mirrored. UVs come from the **source** border, so a corner is still the corner at any box size. Pure math — emitting the quads is the caller's job.
+
+### `ui/ui_input.hpp`
+
+`InputFrame` is a deliberate narrowing of `InputSnapshot`: mouse position and edges, raw `wheel`, eight nav verbs (`nav_up/down/left/right`, `nav_activate`, `nav_cancel`, `nav_next`, `nav_prev`), and a text-entry channel (`text`, `backspace`, `enter`). `text` is a **view into the snapshot**, not a copy — the same rule the rest of the frame path follows; `InputFrame::from_snapshot(sim.input())` is safe because that snapshot outlives the frame.
+
+`from_snapshot` is the default mapping, and it is a free factory rather than a constructor precisely so a host that wants a different one fills the struct by hand:
+
+| Field | Sources |
+|---|---|
+| `mouse`, edges, `wheel` | straight through (`wheel_y`, **not** `camera_zoom_delta`, which is already cooked for the camera) |
+| `nav_up/down/left/right` | `menu_*_pressed`, the arrow scancodes, `pad_nav_*` |
+| `nav_activate` | `menu_select_pressed`, Return, Space, `pad_accept_pressed` |
+| `nav_cancel` | Escape, `menu_toggle_pressed`, `pad_cancel_pressed` |
+| `nav_next` / `nav_prev` | Tab / Shift+Tab, `pad_next_pressed` / `pad_prev_pressed` |
+| `text` / `backspace` / `enter` | the snapshot's text-input channel |
+
+**The pad mapping uses `pad_*`, not `controller_primary`/`controller_secondary`, and the difference is load-bearing.** Those two are polled **levels** (trigger axes plus face buttons), so a focused button driven off them re-fires on every frame the button is held; they are also only meaningful to a menu while `set_game_input_enabled(false)` — i.e. while the whole game is paused — which a navigable HUD is not. `InputSnapshot` therefore gained a separate, ungated, **edge-only** channel: `pad_nav_up/down/left/right`, `pad_accept_pressed`, `pad_cancel_pressed`, `pad_next_pressed`, `pad_prev_pressed`. Sources are the D-pad, the SOUTH/EAST face buttons, the shoulder buttons, and the **left stick**, which latches a direction when an axis crosses `InputHandler::k_pad_nav_enter` (0.5) and re-arms only below `k_pad_nav_leave` (0.35) — so a stick resting on the threshold cannot chatter out one edge per frame. `InputHandler::update_ui_pad_nav()` polls it every frame regardless of the game-input mode, and `clear_menu_inputs()` (already called from `Application::pump_events`) clears the edges, so no host has to learn about it. There is deliberately **no hold-to-repeat**: one flick is one step, and repeat rate is a policy decision a menu that wants it owns.
+
+`InputCapture{mouse, keyboard, wheel}` plus `mask(snapshot)` is the consumption gate. It is a gate and not a consumption because sim-stage input is an immutable by-value snapshot and the live `InputHandler` is main-thread tier, so nothing in `on_simulate` can reach back and clear an edge. (`InputHandler::retain_mouse_edges()` exists for a *main-thread* overlay; a sim-stage UI must never call it, or the edge is delivered to two consecutive snapshots and a button fires twice.) `mask` returns a copy with exactly the captured channels zeroed: mouse capture leaves `keys_held` alone, keyboard capture leaves `mouse_x`/`mouse_y` alone (a position is not an event), and wheel capture also zeroes `camera_zoom_delta` because it is the same physical event. Pad edges are treated as a keyboard-class channel — a UI that took the keyboard took the pad too, or a menu and the game both act on one press.
+
+The gate applies in the same frame only if the UI is declared **before** the game logic. The playground runs its HUD at the end of the frame, which costs one frame of gate latency and is documented at its `build_ui`.
+
+### `ui/ui_context.hpp` — `ui::Context`
+
+Frame shape: `configure(cfg)` → `begin(lane, input, viewport)` → declarations → `end()` → `capture()`. Nothing reaches the packet before `end()` returns.
+
+Containers: `begin_column`, `begin_row`, `begin_grid(columns)`, `end_box`; `begin_panel`, `begin_panel_sprite(texture, slice, style, tint, axis)`, `end_panel`; `begin_scroll(id, style, axis)`, `end_scroll`; `push_id`/`pop_id`.
+Widgets: `label`, `label_wrapped`, `button`, `toggle`, `radio`, `slider`, `text_field`, `progress_bar`, `separator`, `image`, `spacer`, `rect`.
+
+Return conventions differ per widget deliberately:
+
+| Widget | Returns true when |
+|---|---|
+| `button` | it fired this frame (release inside, or activate while focused) |
+| `toggle` | it fired — `value` has just been flipped |
+| `radio` | the SELECTION CHANGED; re-picking the current option returns false |
+| `slider` | `value` differs from what it was on entry (drag, or Left/Right by 5% of the span while focused) |
+| `text_field` | ENTER committed it — **not** on every keystroke |
+
+`progress_bar` and `separator` take no id and never enter the focus order: there is nothing to activate.
+
+`text_field` is deliberately minimal and **its limits are the API**: append and backspace only, no caret movement, no selection, no clipboard, and no blink (a blink needs wall-clock time and `begin()` is deliberately not given any — a frame's UI must be a pure function of its declarations). `max_length` is in **bytes**, enforced on the UTF-8 sequence boundary: backspace removes a whole sequence and an over-budget typed run is refused *whole* rather than truncated mid-character, both so a broken byte sequence can never reach the packet, where the next `measure_width` would charge `fallback_advance` for the wreckage.
+
+**Hit testing uses LAST frame's rectangle**, and it is the one thing to understand before using the API. `button()` has to return its result at the call site, which is before the layout solve, so it tests against the rectangle that widget occupied last frame (stored in `UiState`). Consequences, all intentional: a widget cannot be clicked on the first frame it exists; clicking a widget that moved between frames uses where it *was*; and the effect is one frame of latency on top of the one the render pipeline already has. The alternative — returning results from `end()` — makes the call site unable to branch on a click, which is the entire ergonomic point of immediate mode.
+
+**Focus** resolves at `end()` because it needs solved rectangles, so a navigation key pressed on frame N moves the focus that frame and the newly focused widget can be activated from frame N+1; anything a widget draws *because* it is focused appears from N+1 too, because the draw is appended at declaration time. Tab order is declaration order (`focus_order()` exposes it so a test can assert it without a screen); `nav_next`/`nav_prev` walk it, wrapping unless `ContextConfig::wrap_focus` is false; the directional verbs move focus **geometrically** over the solved rectangles, so a D-pad works on a grid; `nav_activate` fires the focused widget regardless of where the pointer is; a focused slider claims Left/Right for its own value and suppresses the focus move on that press.
+
+**A focus that stops naming a declared widget is dropped, not kept.** That matters more than it sounds: `end()` sets `capture().keyboard` from the focused id, so a ghost focus — a menu closed with a row focused, a list row that scrolled out of existence — would silence the host's entire keyboard channel for the rest of the process, with nothing on screen to explain why the character stopped walking.
+
+**Scrolling.** `begin_scroll` pushes a real scissor into the packet (a `scene::UiClipCommand`, intersected with any enclosing clip) and its own id scope, and `end_scroll` restores the enclosing clip. The wheel scrolls the container while the pointer is inside; focus navigation scrolls the focused child into view — for **every enclosing** scroll container, not only the innermost, because the search asks `LayoutTree::is_descendant_of` rather than matching a cached parent index (without that, tabbing into a nested list scrolled the inner window while the outer one still had it off screen). The offset clamps to `[0, content − viewport]` and does not move at all when the content fits. Hit testing rejects a click landing outside the clip, so a row scrolled out of view cannot be pressed — and the clip a widget was declared under travels through the frame's rect record rather than being written straight into the retained entry, because a widget declared for the *first* time has no retained entry to write it into.
+
+`UiState` (host-owned, one per Context, so two independent UI surfaces get two independent sets of state with no global anywhere) holds `hot`/`active`/`focused`, a sorted scroll table and a sorted last-rect table. **Sorted vectors, never hash maps** — emission order must be a pure function of declaration order for the merged frame to stay byte-identical at any worker count, and an unordered container's iteration order is neither pinned nor stable across standard-library versions. `retire(retain_frames)` drops entries not touched for `ContextConfig::retain_frames`.
+
+`Context::Diagnostics`: `unbalanced_end_box`, `depth_overflow`, `clip_stack_underflow`, `duplicate_widget_id` (two widgets claiming one id in a frame then *share* hot/active state, which reads as one button firing when you click another), `text_without_font`, `text_fallback_advances`, `retained_entries`.
+
+Two small deliberate behaviours: `Context` copies every declared string into its own arena at declaration time, so `label(std::format(...))` — whose temporary dies at the end of the full expression — is safe (`UiLane::add_text` then copies again into the packet arena, so no new lifetime exception is added to the frame packet). And a fully transparent `Style::panel_border` is **not drawn at all** rather than drawn with alpha 0: four invisible quads still cost four quads of vertex batch, and a host porting an existing HUD needs "panel with no border" to be free.
+
+### New packet commands
+
+```cpp
+struct UiTexturedQuadCommand {   // 40 B — exactly UiButtonCommand's width
+    float x, y, w, h;
+    float u0, v0, u1, v1;
+    bracken::UiTextureId texture;
+    bracken::core::Color tint;
+};
+struct UiClipCommand {           // 20 B
+    float x, y, w, h;
+    uint32_t enabled;            // uint32, not bool: padding-free by construction
+};
+```
+
+Emitted by `UiLane::add_textured_quad` / `set_clip` / `clear_clip`, forwarded through `FrameSink::ui()`, merged by the existing `ui_commands_` chain with **no seal change**, read back by `TestFrame::ui_textured_quads()` / `ui_clips()`. `static_assert`s pin both as padding-free and pin the textured quad at `<= sizeof(UiButtonCommand)`: `UiCommandData` is sized by its largest alternative and every UI chunk is a fixed 2048-byte payload, so a wider payload would silently halve the commands per chunk **for every host**, not just for one using sprites.
+
+`UiClipCommand` carries an already-intersected absolute rectangle because the clip stack is owned by the **caller**: a lane that remembered clip depth would make the seal merge order-dependent, and the merge is (lane-index, emission-order) precisely so a frame is byte-identical at any worker count.
+
+### The z-order fix, and the invariant `execute()` rests on
+
+`render::UIRenderer::execute` used to run two hard phases — every primitive, then every queued text — so a panel recorded *after* a label could never cover it, no matter what order the host recorded in. It was structural, not a call-site mistake. Recording now appends to a submission-ordered `ops_` list of `Op{Kind::Geometry|Text, first, count}` and `execute` walks it, alternating the UI and Text pipeline binds; `TextRenderer` grew `queued_run_count()`, `draw_run_range()` and `clear_queued_text()` so a *span* of text draws can be drawn without retiring the whole queue.
+
+**The common case is unchanged.** A HUD that records its panel and then its labels produces exactly two ops — one geometry range, one text span — which is byte for byte the command stream it always produced. The extra pipeline binds are paid only by content that actually interleaves.
+
+`execute()` is correct **only if the ops exactly partition both vectors, contiguously and in order**: a gap silently drops a draw, an overlap draws it twice, and a non-monotone `first` reorders the frame — precisely the class of bug the two-phase form used to have, and none of it visible from eyeballing the op list. `UIRendererOps.OpsExactlyPartitionRangesAndTextDraws` asserts the partition directly over a recording containing every transition that can open an op or a range (geometry/text alternation, a texture switch, a clip change, and a clip change that happens to be a no-op). Four more tests pin the individual rules: a later geometry lands in a later range; an empty string opens **no** op (an op with `count == 0` would bind a pipeline for nothing and break the guard); a clip change splits a **range** and not an **op**, because a clip is scissor state rather than pipeline state; and `draw_button`'s own internal interleaving does not break it. The emitting half is pinned separately by `UiContext.APanelDeclaredAfterALabelIsEmittedAfterIt`.
+
+**Clipping.** `DrawRange` and `TextRun` each carry a clip rectangle, and `range_for` opens a new range when the texture **or** the clip changes. The single full-screen `SDL_SetGPUScissor` became a per-range set inside the walk, issued only when the wanted scissor differs from the bound one — so an unclipped frame issues exactly the one call it always did. `draw_run_range` restores the caller's scissor before returning, so a clip cannot leak out of a text span, and `render_ui_commands` clears the clip at the end of the packet replay so a host that pushes without popping cannot crop the billboards.
+
+`TextRenderer::INITIAL_TEXT_QUADS` (4096) is **no longer a cap**: the text vertex buffer grows the way `UIRenderer`'s does, because a scrolling list is a large frame every frame and the old hard budget dropped glyphs with a throttled warning the moment a 150-row list appeared. `MAX_TEXT_QUADS = 1 << 20` is the runaway ceiling that fails visibly instead.
+
+### Threading tiers
+
+| Thing | Tier | Notes |
+|---|---|---|
+| `ui::Context` | `owned` | one per surface, driven from ONE sim job; it emits into one lane, and a lane aborts if two threads are inside it |
+| `FontMetrics` after export | `worker-safe` | immutable value, read by const reference from any job |
+| `TextRenderer::export_metrics` | main-thread | called once, at renderer init |
+| `UIRenderer::register_texture` / `unregister_texture` | main-thread | `BRACKEN_ASSERT_MAIN_THREAD` |
+| `SceneRenderer::register_ui_texture`, `SceneRenderer::font_metrics` | main-thread | `BRACKEN_ASSERT_NOT_SIM_STAGE`; sim code reads its own frozen copy through `SimFrame` |
+| `UiLane::add_textured_quad` / `set_clip` | `sim-stage` | ordinary lane emits under the lane's `assert_filling()` contract |
+| `SimFrame::font_metrics` | `worker-safe` | the frozen table, or a frozen empty singleton |
+
+`ui::Context::begin` deliberately carries **no** `BRACKEN_ASSERT_SIM_STAGE`: a host may legitimately drive a Context from a main-thread tool as long as it owns the lane, and every test in the module does exactly that. What it does carry is a `BRACKEN_CONTRACT` on begin/end pairing — a host mistake, live in release, because an unbalanced pair silently discards a frame's declarations and the symptom (a UI that intermittently vanishes) points nowhere near the cause.
+
+### Testing a UI headlessly
+
+Everything above works with no GPU and no window: construct a `testing::TestFrame` with a `FontMetrics*`, `begin` the context on `frame.sink().ui()`, declare, `end()`, `seal()`, and read back `ui_text()`, `ui_clips()`, `ui_textured_quads()` and `digest()`. `src/bracken/ui/widgets.test.cpp` is the full worked example: a pause menu built from panel + column + label + button + toggle + slider + scroll view, driven by mouse and by gamepad, with the input-capture gate asserted.
+
+### Constants
+
+| Constant | Value | Where |
+|---|---|---|
+| `FontMetrics::k_first_cp` / `k_last_cp` / `k_dense_count` | `0x20` / `0x24F` / 560 | `src/bracken/contracts/font_metrics.hpp` |
+| `FontMetrics::k_absent` | `INT16_MIN` | `src/bracken/contracts/font_metrics.hpp` |
+| `LayoutTree::k_max_depth` | 64 | `src/bracken/ui/layout.hpp` |
+| `LayoutTree::k_invalid` | `0xFFFFFFFF` | `src/bracken/ui/layout.hpp` |
+| `ContextConfig::retain_frames` | 120 | `src/bracken/ui/ui_context.hpp` |
+| `UiTextureId::k_invalid` | 0 | `src/bracken/contracts/ui_texture.hpp` |
+| `InputHandler::k_pad_nav_enter` / `k_pad_nav_leave` | 0.5 / 0.35 | `src/bracken/input_handler.hpp` |
+| `TextRenderer::INITIAL_TEXT_QUADS` / `MAX_TEXT_QUADS` | 4096 / `1 << 20` | `src/bracken/render/text_renderer.hpp` |
+
+### Known limitations and silent behaviors
+
+- **One font, one size, one bounded codepoint range.** Text outside `[k_first_cp, k_last_cp]` and outside `sparse_advance` draws correctly and measures with `fallback_advance`, so it overruns a box sized from the table. Accented Latin kerns as zero.
+- **`UiLane::add_text_wrapped` falls back to the old 8-px-per-character guess** only when the frame carries no `FontMetrics` (a hand-built test frame, or a machine with no installed font). Treat that fallback as "no answer available", not as a mode.
+- **The one-frame hit-test rule** above is not a bug and has no fix that preserves the call-site return.
+- **No theming beyond `Style`**, no animation, no layout caching across frames, no text selection or clipboard.
+- The GPU state transitions inside the ops walk — that `bind_ui_state()` re-pushes the screen uniform and re-binds the vertex buffer after a text span stole the pipeline, and that `draw_run_range` hands the scissor back unchanged — are the parts a headless test cannot reach. They are verified by reading, not by running.
+
+---
+
+## Animation Layering: `AnimationRig`, Bone Masks, Blend Spaces, Root Motion
+
+Pure CPU animation infrastructure that sits exactly where an `AnimationPlayer` sat. Sources: `src/bracken/animation/pose.hpp`, `src/bracken/animation/clip_sampler.hpp`, `src/bracken/animation/blend_space.hpp`, `src/bracken/animation/root_motion.hpp`, `src/bracken/animation/animation_rig.hpp` and their `.cpp`s, plus the rig overload added to `src/bracken/animation/animation_state_machine.hpp` and the `PoseView` overloads added to `src/bracken/animation/attachment.hpp`. **The frame packet, `ScenePrep`, the renderer and `GraphicsSettings` are untouched by this feature**, and `animation_player.hpp` / `animation_player.cpp` are byte-for-byte unmodified.
+
+### Which one to reach for
+
+`AnimationPlayer` is **not** deprecated and must not be "unified" away. It plays one clip plus one crossfade partner, costs 16,552 bytes per instance, and is what every existing doc describes: use it for anything that only ever plays one thing at a time. `AnimationRig` is for a character that needs a **second simultaneous animation source** — an upper-body action over locomotion, an additive aim offset, a breathing layer, a blend space — and for nothing else. It costs 27,296 bytes per instance plus cursor storage, and it needs a `PoseScratch` (15,360 bytes) per **evaluating thread**.
+
+A rig holding exactly one `Override` layer at weight 1 with a full mask produces **bitwise identical** output to an `AnimationPlayer` playing the same clip, crossfades included. That is not a hope: `SingleOverrideLayerMatchesAnimationPlayerBitwise` and `SingleOverrideLayerReproducesACrossfadeBitwise` (`src/bracken/animation/animation_rig.test.cpp`) `memcmp` 120 frames of both, and `PoseToMatricesReproducesAnimationPlayerBitwise` (`src/bracken/animation/pose.test.cpp`) covers the matrix half the same way. Anything that breaks them has moved the engine's screenshot baselines.
+
+### Sizes (measured, x86-64 / GCC / glm default alignment)
+
+| Type | `sizeof` |
+|---|---|
+| `BoneTransform` | 40 |
+| `BoneMask` | 16 (`(MAX_BONES + 63) / 64` = 2 words) |
+| `WeightedClip` | 16 |
+| `RootMotionConfig` | 8 |
+| `RootMotionDelta` | 28 |
+| `ClipSampler` | 40 (+ heap: 24 B/joint when caching cursors) |
+| `BlendSpace1D` | 104 |
+| `BlendSpace2D` | 132 |
+| `LayerDesc` | 88 |
+| `PoseScratch` | 15,360 (3 × `MAX_BONES` × 40) |
+| `AnimationPlayer` | 16,552 (unchanged) |
+| `AnimationRig` | 27,296 |
+
+`AnimationRig`'s 27,296 bytes are 8,192 (`bone_matrices_`) + 8,192 (`world_transforms_`) + 5,120 (`composed_`, the composed local pose) + the eight-entry fixed layer table and bookkeeping. The layer table is a fixed array, so it is paid whether or not the layers are used.
+
+Heap on top, per rig: a `Clip` layer with `cache_cursors` holds two cursor vectors of 24 B/joint (6,144 B at 128 joints); a blend-space layer holds one per sample (24,576 B for a full eight-sample layer at 128 joints). `cache_cursors = false` reduces both to zero and **changes no float** — the cursor fast path and the binary search select the same keyframe interval.
+
+**`MAX_BONES` was not raised.** Every new fixed-size array is expressed in terms of the constant, never the literal 128.
+
+### `pose.hpp` — the seam the engine did not have
+
+Until this header existed, per-joint TRS lived for four statements as three locals inside `AnimationPlayer::compute_bone_matrices` and was immediately collapsed into a `glm::mat4`, so there was no place a second animation source could be composed. Everything here is that seam and nothing more.
+
+`BoneTransform` is `{translation, rotation (quat), scale}` — blending in TRS rather than in matrices is not a preference: a matrix lerp shears, and a quaternion slerp is the only rotation blend that keeps a limb rigid. `PoseSpan` / `ConstPoseSpan` are spans of it. `PoseView` is the read-only *matrix* side (`world_transforms`, `bone_matrices`, `used_joint_count`) that `attachment.hpp`'s overloads accept, so an `AnimationPlayer` and an `AnimationRig` can be handed to the same helper without either type knowing about the other; both maintain the same contract that slots at or beyond `used_joint_count` hold identity.
+
+`BoneMask` is a bitset over `MAX_BONES` (`k_words = (MAX_BONES + 63) / 64`), cheap enough to store by value in a layer description — which is why it is not the `std::vector<uint8_t>` `apply_body_lean` heap-allocates. `all()` trims the tail word so `count()` and `inverted()` never report joints that cannot exist; `set`/`test` out of range are **no-ops**, never UB, because a mask outliving the skeleton it was built for is a content bug. `set_subtree(skeleton, root)` marks `root` and every descendant in one ascending pass (parents-before-children is a precondition, which every skeleton the model loader produces satisfies) — computing the descendant set into a **local** mask and merging afterwards rather than testing against `*this` as it goes, because testing in place would sweep in the children of any joint that happened to already be set for an unrelated reason.
+
+**A binary mask pops**, and this is inherent rather than a defect: the joint at the boundary jumps between two poses while its parent does not, which reads as a hitch at the waist when a layer fades in. The engine does **not** feather it for you. `LayerDesc::joint_weights` is the hook and `feather_by_depth(skeleton, root, falloff, out)` builds a serviceable ramp — 1 for joints at least `falloff` levels below `root`, 0 outside the subtree, linear in hierarchy depth in between; `falloff == 0` reproduces the binary mask exactly. **Root the ramp at the mask root's PARENT**, not at the mask root: depth 0 gets weight 0, so rooting at the spine gives the spine itself no weight — usually the joint the layer most needs. Depth is a poor proxy for anatomy on a rig where the spine is three joints and an arm is five; this exists so the pop has an answer in the box, not as a rig-authoring tool.
+
+`rest_pose(skeleton, out)` fills the skeleton's rest transforms verbatim — the default additive reference and the pose an unbound layer falls back to.
+
+`BlendParams{weight, mask, joint_weights}` is shared by both operators. The effective weight for joint *j* is `weight * (mask ? mask->test(j) : 1) * (joint_weights.empty() ? 1 : joint_weights[j])`, clamped to [0, 1]. **Both operators special-case the ends**: an effective weight `<= 0` leaves the destination joint *bitwise* untouched and `>= 1` **assigns** rather than interpolating. That is not an optimisation — it is what makes "a layer at weight 0 is exactly the base pose" a bitwise statement, and what lets a single override layer at weight 1 reproduce `AnimationPlayer` to the last bit. A NaN or negative weight (or `joint_weights` entry) reads as **zero**: the weight comes from host gameplay code through `AnimationRig::set_layer_weight`, which does not validate it, and the clamp is written out rather than as `std::clamp` because every comparison against NaN is false and a NaN that reached `slerp` would turn the whole skeleton into NaN permanently.
+
+`blend_override(dst, src, params)` is `mix` / `slerp` / `mix` per joint — deliberately the same three calls in the same order as the player's crossfade, which is what the bit-identity regression depends on. Do not "simplify" it into a matrix blend or reorder the components.
+
+`blend_additive(dst, src, reference, params)` adds `w * (src − reference)`. **The rotation delta is post-multiplied, in the bone's own frame:**
+
+```
+delta  = inverse(reference.rotation) * src.rotation
+result = slerp(base.rotation, base.rotation * delta, w)
+```
+
+The alternative (`src * inverse(reference)` applied on the left) is a delta in the **parent's** frame, and the two differ whenever the base has rotated the joint — which on a running character is always. Post-multiply matches the usual authoring intent: an aim offset authored as a 30-degree lift stays a 30-degree lift of the arm after locomotion has swung the arm elsewhere. Translation is a plain difference; scale is a **ratio** with a zero-reference guard (a reference component below 1e-8 yields a ratio of 1). `src == reference` is the identity for any weight — exactly at weight 0, and to float precision above it, because `inverse(q) * q` is only identity to the precision `q` is normalized to.
+
+Consequences a content author must know:
+
+- a joint with **no channel** in the additive clip contributes a **zero delta** and keeps whatever the base was doing with it. That is why an additive upper-body layer keeps the off-hand swinging and a masked *Override* layer does not — an Override layer's unchannelled joints fall back to the rest pose.
+- the clip should start and end at the reference, so the layer fades in and out of nothing.
+- **non-uniform scale in an additive layer is unsupported**, and wrong rather than approximate: the pipeline bakes scale into the local matrix by scaling columns, so a scaled parent shears a rotated child. Keep additive clips rotation- and translation-only.
+
+`pose_to_matrices(skeleton, pose, world, bones)` is steps (4)(5)(6) of `AnimationPlayer::compute_bone_matrices`, hoisted unchanged: TRS → local matrix (`mat4_cast`, columns 0..2 scaled, column 3 = translation), one ascending `world[i] = world[parent] * local[i]` pass, then `bone[i] = world[i] * inverse_bind_matrix`. The local matrix is built **in place** in `world_transforms` and accumulated over itself, so no scratch buffer is needed — parents-before-children is load-bearing twice over. It writes and returns `min(pose, joints, world, bones, MAX_BONES)` entries and does **not** touch the tail; maintaining "identity past the used count" is the caller's job, and doing it only when the count *shrinks* is the point (a per-update rewrite of both `MAX_BONES` arrays is ~8 KB of dead stores per instance per frame).
+
+`PoseScratch` is three `std::array<BoneTransform, MAX_BONES>` (`layer`, `sample`, `reference`), deliberately **not** owned per instance and deliberately **not** `thread_local`: one per `parallel_for` chunk is the intended shape, so per-character memory stays at the rig's own footprint no matter how many layers it runs, and the engine's stage discipline rides the job node rather than TLS — a thread-local here would be the one place that disagreed. **Two rigs must never share one scratch concurrently.** There is no cheap assert for it; the corruption is silent and looks like an animation glitch. The guard is `src/bracken/animation/animation_rig_parallel.test.cpp`, which evaluates 256 rigs serially and through `parallel_for` and demands bitwise-equal output.
+
+### `clip_sampler.hpp`
+
+`sample_clip_joint_into(...)` samples one joint out of one clip into a TRS triple, defaulting the outputs to the joint's **rest** transform and overwriting only the paths the channel carries — so a rotation-only clip leaves translation and scale at the bind pose, and a null clip, an out-of-range joint or a joint with no channel leaves all three at rest.
+
+**It is a character-for-character copy of the file-static `sample_clip_joint` in `animation_player.cpp`, not a refactor of it**, and that is deliberate. The player's output is pinned by the engine's screenshot baselines: the playground character's final pose feeds `rebuild_shadow_capsules`, which feeds traced sun shadows, so a single differing float moves rows in CLAUDE.md's pin tables. Moving a function out of a translation unit is *almost certainly* value-neutral on x86-64/ARM64 — the body does no arithmetic of its own — but "almost certainly" is what moves a baseline nobody can re-measure cheaply. The anti-drift guard is not the comment; it is the two bit-identity tests above, which go red the moment one copy is edited without the other.
+
+`ClipBindings` is the clip → joint → channel table, built **once per model** and shared const by every instance driven by it. `AnimationPlayer` rebuilds this into a per-instance vector whenever the clip changes, which is fine for one clip and not for a blend space: eight simultaneously-sampled clips would otherwise cost 8 × 8 B per joint per character and rebuild whenever the blend crossed a sample boundary. Resolution matches the player's exactly, tie-break included — channels are walked in `clip.channels` order and the **last** channel naming a joint wins. (That vector's order is unspecified; the loader emits it from an `unordered_map`, so never index it positionally.) The bindings **alias the clip vector**: rebuild them if the model is reloaded, and keep them alive longer than every rig bound to them.
+
+`ClipSampler` is the per-instance mutable cursor state, `bind(joint_count, cache_cursors)`-sized, reset when the sampled clip index changes (mirroring the player, which reassigns its cursor vector on every clip switch). `sample_clip_pose(...)` is the cursorless one-shot for a pose read at a fixed time — an additive layer's reference frame — which allocates nothing and keeps no state.
+
+### `blend_space.hpp`
+
+`find_clip_index(clips, name)` is a linear scan for setup time; blend spaces take clip **indices** precisely so no string work happens anywhere near the sampling path.
+
+`WeightedClip{clip_index, weight, speed_scale, duration}` is one resolved contribution; `duration` is filled in by the rig from the clip table, because a blend space does not own the clips. **`speed_scale` reaches far less than its name suggests**: it is read in exactly one place, `effective_duration`. With `LayerDesc::sync_duration` **on** it scales the whole layer's clock in proportion to the sample's weight; with it **off** it does nothing at all, because the unsynchronised sample time is `fmod(|clock|, duration_k)`, which never reads it.
+
+**`BlendSpace1D`** — samples on a line, `add_sample(clip_index, position, speed_scale)` doing a **sorted insert** (returns false past `k_max_blend_samples` or for a negative clip index). `resolve(x, out)` clamps to `[first, last]`, brackets with a linear scan, and emits at most two entries with weights `1 − t` and `t`, culling either below `k_blend_weight_epsilon`. Exact at every sample, a partition of unity, C0, **clamping rather than extrapolating** outside the authored range — a speed above the fastest sample plays the fastest clip at weight 1 rather than overshooting into a pose no animator authored. Coincident samples produce `t = 0` rather than a divide by zero. `finalize()` survives, idempotent and now redundant: it used to be a precondition whose violation produced garbage weights in release, and making `add_sample` a sorted insert removed the failure mode rather than asserting on it. The insert reproduces what a `std::stable_sort` produced for the same insertion order, coincident positions included, and that equivalence is itself pinned.
+
+**`BlendSpace2D`** is **gradient-band freeform directional** (polar). For each sample *i*, with `r_k = |p_k|` and `signed_angle` measured about the origin:
+
+```
+avg   = (r_i + r_j) / 2
+v_ij  = ( (r_j - r_i) / avg,  signed_angle(p_i, p_j) * k_direction_scale )
+v_ip  = ( (r   - r_i) / avg,  signed_angle(p_i, p)   * k_direction_scale )
+h_ij  = clamp01( 1 - dot(v_ip, v_ij) / dot(v_ij, v_ij) )
+w_i   = min over j != i of h_ij
+```
+
+then cull below `k_blend_weight_epsilon` and normalize. The angle term is **zero** when either operand has ~zero magnitude (a centre sample has no direction), and `dot(v_ij, v_ij) ≈ 0` (coincident samples) yields `h = 1` — a sample cannot constrain itself. Exactness at a sample falls straight out: at `p == p_k`, `v_kp` is the zero vector so every `h_kj` is 1 and `w_k` is 1, while for every other *i* the term `h_ik` evaluates to exactly 0 because `v_ip == v_ik`.
+
+*Why this and not Delaunay/barycentric.* A triangulation needs a triangulation step whose degenerate cases — collinear samples, duplicate points, a query outside the hull — each need a defined answer, which is more code than the estimator itself for the one requirement that mattered. It also behaves badly for the case the feature exists to serve: a centre sample plus a ring of directions triangulates into long thin slivers, and a query near the centre picks whichever sliver it lands in. The polar formulation understands that `(0,0)` means "not moving" and that the angle between two directions matters more than their cartesian distance, which is the semantics of a locomotion blend.
+
+*Known property, not a bug:* the estimator is **C0 but not C1**. `min()` creates a crease wherever the binding constraint changes, so a character crossing one gets a kink rather than a smooth roll. This is inherent to gradient band (Unity ships the same artifact) and it is the price of not maintaining a triangulation. Polar coordinates are additionally singular at the origin — the angular term's gradient goes as `1/|p|` — which is why the continuity test excludes a small disc there.
+
+*Defined degeneracies, all tested:* zero samples → zero entries; one sample → weight 1 everywhere; coincident samples → an even, deterministic split; every sample at the origin → uniform weights; a query so far outside the cover that every weight culls → the single **nearest** sample at weight 1, never an empty result and never a divide by a zero sum.
+
+**Blend-space composition** inside the rig is a normalized incremental blend: start from the first contribution, fold each subsequent one in at `w_k / (accumulated + w_k)`. Exactly the first sample when there is one, and independent of the weights' absolute scale.
+
+**`effective_duration(active)`** is `Σ w_i · (duration_i / |speed_scale_i|) / Σ w_i` — the denominator of the phase-synchronised clock. Without phase sync a walk/run blend double-steps: the two clips have different durations, so their feet drift apart and the character skates. With it, the layer holds ONE normalized phase, advances it by `dt * speed / effective_duration`, and evaluates sample *i* at `phase * duration_i`, so every sample is at the same point in its stride. The **magnitude** of `speed_scale` is deliberate: a negative scale means "backwards", not "negative length", and treating it as a negative length let one backwards sample cancel the others, drive the sum non-positive, and return 0 — which the caller reads as "do not advance", freezing the whole layer. Returns 0 when the weights sum to zero or every duration is zero; the caller must treat 0 as "do not advance".
+
+### `root_motion.hpp`
+
+`RootMotionDelta{translation, rotation}` is one update's locomotion in the character's own (model) frame. **The engine never moves anything** — the delta is returned as a value the host must consume:
+
+```cpp
+const anim::RootMotionDelta d = rig.root_motion();
+character_yaw  = character_yaw * d.rotation;                 // yaw first
+world_position += glm::mat3_cast(character_yaw) * d.translation;
+```
+
+Order matters and there is no universally right one; the engine documents this one and the round-trip test pins it. Ignoring the delta makes the character animate on the spot; leaving `strip_from_pose` off makes it travel at double speed. Those two failure modes are indistinguishable from a gameplay bug, which is why nothing is applied internally.
+
+`RootMotionConfig{joint = -1, translation_xz = true, translation_y = false, rotation_yaw = true, strip_from_pose = true}`. `translation_y` is off by default and that default is the whole point: **a hips bob is a vertical channel on the root joint and it is not locomotion.**
+
+`twist_about_y(q)` is a swing-twist decomposition about +Y that returns identity — never a NaN — when `w² + y² ≈ 0` (a 180-degree rotation about an axis in the XZ plane). It is shared by extraction and stripping so the two halves cannot drift apart.
+
+`extract_root_motion(clips, bindings, clip_index, t_prev, t_now, wrapped, cfg)` differences the root channel between two clip times, masked by the config. On a wrap it composes the pre-wrap part `(duration − t_prev)` with the post-wrap part `(t_now − 0)`, **pre-wrap first** — translations add, rotations compose as `post * pre`. It returns a **zero** delta when the config is disabled, the joint is out of range, the clip index does not resolve, or the joint has no channel: a joint with no position keys reads as no translation rather than as "the rest pose moved", which is the difference between a still character and one that teleports to the origin every frame. The channel is resolved through `ClipBindings`, never by indexing `clip.channels` positionally.
+
+`strip_root_motion(pose, reference, cfg)` resets the root's XZ (and/or Y) to the corresponding component of `reference` and cancels the yaw with `inverse(twist_about_y(q)) * q`, preserving pitch and roll and leaving every other joint bitwise untouched. It is a no-op when the config is disabled or the joint index is out of range, so it is safe to call unconditionally.
+
+**NO ASSET IN THIS REPOSITORY CARRIES USABLE ROOT TRANSLATION, and the shipped character will stop moving if you enable this on it.** The playground's XZ motion comes from the physics character controller and its only position channel is a vertical hips bob. For root motion to work an artist must author (1) the motion on a **joint inside `skin.joints`** — conventionally `Hips` — because `ModelLoader` drops any glTF channel whose target node is outside the skin (counting it in `ModelLoadReport::channels_non_skin_node`) and root motion is conventionally authored on an Armature node *above* the skin; (2) that joint at the **origin in XZ** in the rest pose, because the host applies the delta in the character's frame and a non-zero reference offset gets rotated by the accumulated yaw; and (3) a loop whose start and end positions are compatible, or the wrap seam jumps. Everything here is validated against **synthetic** skeletons and clips built in `src/bracken/animation/root_motion.test.cpp`, not against shipped content.
+
+### `AnimationRig`
+
+`BlendMode` is `Override` (`dst = lerp(dst, layer, w)`) or `Additive` (`dst = dst + w * (layer − reference)`). `LayerSource` is `Clip`, `Blend1D` or `Blend2D`.
+
+`LayerDesc`: `name`, `mode`, `weight`, `mask` (defaults to `BoneMask::all()`), `joint_weights` (a caller-owned **span**, empty for a binary mask), `additive_reference_clip` (−1 = the skeleton's rest pose) and `additive_reference_time`, `sync_duration` (default true), `cache_cursors` (default true).
+
+**Layer 0 is the BASE and its `mode`, `weight` and `mask` are ignored.** The pose has to start somewhere, and a base at weight 0.5 blended against uninitialized memory is not a meaningful thing to express — layer 0 writes the composed pose directly, which is also what removes the `lerp(x, y, 1.0f)` that would spoil bit-identity. **Layers compose in INDEX ORDER and that order is a documented contract**, not an accident: swapping two layers with overlapping masks changes the result, and `LayerCompositionIsIndexOrderDependent` (`src/bracken/animation/animation_rig.test.cpp`) asserts it.
+
+API: `bind(skeleton, clips, bindings)` (safe to call again to rebind a hot-reloaded model; layers and clocks survive, cursor storage is resized), `add_layer(desc)` → index or −1, `layer(index)` (an out-of-range index returns a discard reference whose writes are dropped), `set_layer_weight`, `play_clip(index, clip_index, crossfade = 0.2f)` with `AnimationPlayer::crossfade_to` semantics exactly, `set_blend_space_1d/2d`, `set_blend_position(index, float | vec2)`, the clock setters (`set_layer_time/speed/loop/playing`), `layer_phase(index)` (a blend-space layer's normalized phase, exposed because "did the phase sync actually sync" is otherwise unobservable), `set_root_motion` / `root_motion()`, `evaluate(skeleton, clips, dt, scratch)`, and the output surface `bone_matrices()` / `world_transforms()` / the two mutable spans / `used_joint_count()` / `write_palette(dst)` / `pose()` / `local_pose()`. The output surface is deliberately the same one `AnimationPlayer` exposes, so `ik_solver`, attachments and the bone-palette path need no change.
+
+`AnimationRig` is **move-only**, for the same reason `AnimationPlayer` is: a copied rig would share keyframe cursors with the original, which was a historical source of animation glitches. Its constructor identity-fills both matrix arrays, because glm's matrix types do not self-initialize and the "slots past `used_joint_count()` hold identity" contract would otherwise be a lie on frame 0.
+
+#### Evaluation order inside `evaluate()`
+
+1. `root_delta_` reset to zero, so reading it twice cannot double-apply;
+2. for each layer in **index order**: advance its clock (**even when muted** — a layer faded back in must not resume where it was faded out), then either write the composed pose directly (layer 0) or sample into `scratch.layer` and compose with `blend_override` / `blend_additive`;
+3. root motion extracted from **layer 0** and, when `strip_from_pose`, stripped from the composed pose;
+4. `pose_to_matrices`;
+5. shrink-only tail identity fill — the freed slots are re-identitied **only** when the joint count drops, exactly as `AnimationPlayer` does it.
+
+Root-motion extraction is always from layer 0: the base is the only layer whose clock unambiguously represents the character's locomotion. Two structural limits come with it. **During a crossfade** the delta comes from the incoming clip alone rather than from the blend the pose is showing (`play_clip` restarts the incoming clock at 0, so there is no jump — the character simply travels at the new clip's rate from the first frame of the fade). **From a blend space**, translations sum weighted but the rotation comes from the single **dominant** sample, so it steps when the dominant sample changes; a slerp chain over an unordered active set has no canonical order to compose in.
+
+One deliberate behavioural difference from the player: `AnimationPlayer::update` returns early when the model has no clips, so a never-animated skeleton has no world transforms and every attachment on it reads identity. `AnimationRig::evaluate` produces the **rest pose** instead, which is a usable answer (`ARigWithNoLayersProducesTheRestPose`).
+
+#### The allocation contract, and its proof
+
+`evaluate()` runs once per animated character per frame, in the sim stage, on a pool worker. A single heap allocation there is not a micro-optimisation problem: it is a lock taken by every character on every worker at the same point in the frame. So the contract is flat —
+
+> **After `bind()`, and after any `add_layer` / `set_blend_space_*`, `evaluate()` allocates nothing.**
+
+| Call | Allocates | Why there |
+|---|---|---|
+| `ClipBindings::build` | yes, `clips × joints` pointers | once per **model**, shared const by every rig |
+| `AnimationRig::bind` | resizes existing layers' cursor storage | once per character, at load |
+| `AnimationRig::add_layer` | two `ClipSampler` cursor vectors (24 B/joint each when caching) | setup |
+| `set_blend_space_1d` / `set_blend_space_2d` | re-sizes that layer's samplers to the sample count | setup, or a state-machine **entry** — never per frame |
+| `play_clip` | only when the layer was a blend space and is now a clip | a source switch, not a clip switch |
+| `evaluate`, `write_palette` | **nothing** | the audit |
+
+`src/bracken/animation/animation_rig_alloc.test.cpp` proves it by **replacing the global `operator new` / `operator delete` for the whole `bracken_tests` binary** — the only way to observe a `std::vector` growth from outside the vector — and counting allocations on the calling thread across a 240-frame window for four configurations: a plain clip layer; a clip layer taking a crossfade every 40 frames (the crossfade is what first brings the second sampler into play, so a lazy resize would surface exactly there); a four-layer stack with masks, a caller-owned feather span, clip-sourced additive references and root motion extracting *and* stripping every frame; and a blend-space layer whose query crosses sample boundaries during the window. Two of its tests exist to keep the audit honest rather than to test the rig: `TheCounterActuallySeesAllocations` fails if the replacement is not linked (a dead counter would make every other test in the file a false green), and `SetupIsWhereTheAllocationsLive` asserts that setup **does** allocate — a `bind()`/`add_layer()` pair that allocated nothing would mean the cursor storage was never sized and `evaluate` was doing it lazily.
+
+**There must be exactly one such replacement in the binary**; a second one is a duplicate-symbol link failure. It routes through `malloc`/`free` so sanitizer builds still track the memory; what ASan loses is its new/delete type-mismatch check.
+
+Not covered by the audit: `LayerDesc` holds a `std::string name`, so constructing one allocates for names past the small-string buffer (a setup cost — `add_layer` takes the desc by value and moves it), and Tracy's profiler zones are compiled out unless `BRACKEN_ENABLE_TRACY=ON` and have not been audited with it on.
+
+### State-machine integration
+
+`AnimationStateMachine::update(AnimationRig& rig, int layer = -1)` drives **one** layer. `layer >= 0` overrides every state's own `AnimState::layer`; `layer < 0` uses the state's field, so one machine can own a base layer and another an upper-body layer without either knowing about the other. `AnimState` gained `layer`, `source` (`LayerSource`), `blend_space_1d`, `blend_space_2d`, `blend_param_x` and `blend_param_y`, so a state can install a blend space instead of a clip; the position is fed from named parameters resolved to indices once.
+
+Every existing behaviour is preserved: transition priority, AND/OR conditions and the `!loop && !playing` clip-ended trigger all run through **one** shared evaluator that both `update` overloads call, and the `AnimationPlayer` overload is untouched.
+
+Three things a rig-driving state does **not** get, all structural:
+
+- **no crossfade into or out of a blend-space state.** `crossfade_duration` is forwarded to `play_clip`, which a blend-space layer never reaches; installing a space swaps the layer's source, so entering or leaving such a state **pops**. Cross-fading a whole layer source would need a second pose buffer and a fade clock per layer.
+- **no `clip_ended` trigger on a blend-space state.** That trigger reads `!layer_playing`, and a blend-space clock never sets it false.
+- `bind_clips` returns **false** for a machine whose states are blend spaces — a blend-space state has no `clip_name` to resolve. That is expected, not an error.
+
+`applied_state_` caches what a rig currently holds, keyed by **state index**, so `update` does not re-install the same clip or blend space every frame. Both `bind_clips` (which re-resolves every `clip_index`) and `add_state` (which overwrites a state in place, keeping its index) rewrite the table underneath it, so both call `invalidate_applied()`; without that a model hot-reload left the layer playing a clip index resolved against the old table forever, because the "already applied" fast path skipped the re-install.
+
+`AnimState` grew ~236 bytes for **every** host, including hosts that never build a rig, because the two blend spaces are stored by value. That is the one place this feature is not additive; it is deliberate (a `unique_ptr` would trade the bytes for an allocation on a type copied at setup) and it is stated on the struct rather than left for someone to measure.
+
+### Attachments
+
+`attachment.hpp` gained `PoseView` overloads; `AnimationRig::pose()` produces one, and the `AnimationPlayer` overloads are now one-line forwarders to the same code, so the two can never disagree.
+
+### Constants
+
+| Constant | Value | Where | What it bounds |
+|---|---|---|---|
+| `k_max_animation_layers` | 8 | `src/bracken/animation/animation_rig.hpp` | layers per rig; the extent of a fixed array inside every rig, so raising it costs memory in every rig whether the layers are used or not |
+| `k_max_blend_samples` | 8 | `src/bracken/animation/blend_space.hpp` | samples per blend space. Bounds the 2D estimator's O(n²) inner loop (8 → 56 pair evaluations per resolve, per layer, per character) **and** the array of `ClipSampler`s a layer holds |
+| `k_blend_weight_epsilon` | 1e-4 | `src/bracken/animation/blend_space.hpp` | weights below this are culled rather than sampled |
+| `BlendSpace2D::k_direction_scale` | 2.0 | `src/bracken/animation/blend_space.hpp` | how much an angular difference weighs against a radial one. **A tuned constant with no measurement in this tree** — it is the value the technique is published with, and this tree has no real locomotion set to measure it against |
+| `BoneMask::k_words` | `(MAX_BONES + 63) / 64` = 2 | `src/bracken/animation/pose.hpp` | mask storage; tracks `MAX_BONES` |
+
+### Error handling and diagnostics
+
+- `add_layer` returns −1 and logs a WARN past `k_max_animation_layers`; the rig stays evaluable.
+- `BlendSpace1D::add_sample` / `BlendSpace2D::add_sample` return false past `k_max_blend_samples` or for a negative clip index. Both are `[[nodiscard]]`.
+- Every out-of-range layer index on a setter is a no-op; every getter returns a neutral value.
+- `evaluate` carries one `BRACKEN_CONTRACT` — the rig must have been bound for the skeleton's joint count. It is a per-frame **host** precondition, so it is live in release, and it runs **first**: a rig bound for a real skeleton then evaluated against an empty one used to be swallowed while `used_joint_count()` kept reporting the old prefix, so `write_palette` handed out matrices for joints that no longer existed.
+- `bind` logs an ERROR when the bindings were built for a different clip count and a WARN when the skeleton exceeds `MAX_BONES`.
+
+### Benchmarks
+
+Appended to `src/bracken/animation/animation.bench.cpp`: `BM_AnimationRigEvaluate` over `{16,1} {64,1} {128,1} {128,2} {128,4} {128,8}`, `BM_AnimationRigBlendSpaceLayer` at 2/4/8 samples and 128 joints, and `BM_BlendSpace2DResolve` at 4/8 samples. Two comparisons are the point of the first, and neither is the absolute number: **`{128,1}` against `BM_AnimationPlayerUpdate/128`** is the layer machinery's fixed overhead and nothing else, because a one-layer rig is bitwise identical to the player; and **`{128,1} → {128,2} → {128,4} → {128,8}`** should be close to linear, because each extra layer is one more FULL skeleton sample (the mask gates the *blend*, not the *sample*) plus one blend pass, with an additive layer additionally deriving its reference pose. A superlinear knee means something in the layer loop is not O(joints). `{128,8}` is `k_max_animation_layers`, measured so the budget is a number rather than a guess. No figures are quoted here; a default configure is `-O0` with live tier assertions, so reconfigure with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` before quoting one.
+
+The fixture had two bugs on its first outing, both easy to reintroduce: it gave clips only to layers **above** layer 0, so the base sampled the rest pose and the whole curve read as though layers were nearly free; and it called `desc.mask.set_subtree(...)` on a default `LayerDesc`, whose `mask` is `BoneMask::all()` — `set_subtree` ORs, so ORing a subtree into a full mask changes nothing and every "masked" layer was a full-body one.
+
+### Known limitations and traps
+
+- **`LayerDesc::joint_weights` stores a SPAN, not a copy.** A local feather array dangles the moment the setup function returns, and no lifetime check is possible.
+- **`LayerDesc::mask` defaults to `BoneMask::all()`, so `desc.mask.set_subtree(root)` is a no-op.** Start from `BoneMask::none()` (or a default-constructed `BoneMask`, which *is* `none()`).
+- **A layer frozen immediately after `play_clip` wedges at blend factor 0.** A crossfade only resolves inside the clock advance, which returns early for a layer with `playing == false`; freeze before the first `evaluate()` and the layer samples its *previous* clip forever. Step once, then freeze.
+- **Follow a layer weight, but SNAP the ends.** An exponential follower never arrives, and weight 0 and weight 1 are the two values the rig fast-paths (`<= 0` skips the layer's sample and blend entirely and is bitwise the single-layer result; `>= 1` assigns instead of interpolating). Without a snap a character pays for a second full skeleton sample every frame of his life to add a 1e-4 rotation.
+- **A blend-space layer's clock is unbounded.** A `Clip` layer's `time` is wrapped into `[0, duration)` every frame; a blend-space layer's is not, because the per-sample times are derived from it. `Clock::advance` now carries `dt * speed` **explicitly** rather than reconstructing the step as `time − prev_sample_time`, which closes the practical part of the problem (at ten hours of play `ulp(36000)` is 3.9e-3 against a 1/60 s step, so the reconstructed step quantized to a quarter of the real one and the blend judders; `PhaseAdvancesByTheSameAmountAtAnAgedClock` pins it at t = 36000 s). A **non-synced** layer still degrades the same way through its `fmod(time, duration)`, and the raw clock still grows without bound. Nothing in this tree runs a blend-space layer, so this is a stated ceiling rather than an observed defect.
+- **`BlendSpace2D` is C0, not C1**, and singular at the origin — see above.
+- **Nothing here is wired into the renderer, the frame packet or `GraphicsSettings`.** A rig emits the same palette through the same `alloc_bone_palette`, and `scene_prep.cpp`'s `min(model joints, palette joints, MAX_BONES)` clamp is unaffected.
+
+---
+
+## Streaming: Paged Terrain, Asset Residency & Hi-Z Occlusion Culling
+
+Three landings that share a brief and nothing else. Sources: `src/bracken/heightmap_grid.hpp`, `src/bracken/heightmap_grid.cpp`, `src/bracken/render/terrain_renderer.hpp`; `src/bracken/residency_manager.hpp`, `src/bracken/residency_manager.cpp`, `src/bracken/model_loader.hpp`, `src/bracken/texture_cache.hpp`, `src/bracken/async_model_loader.hpp`; `src/bracken/contracts/occlusion.hpp`, `src/bracken/contracts/occlusion.cpp`, `src/bracken/render/hzb.hpp`, `src/bracken/shaders/hzb_reduce_far.comp.hlsl`, `src/bracken/scene/scene_prep.hpp`, `src/bracken/scene/render_plan.hpp`.
+
+Neither `residency_manager.hpp` nor `contracts/occlusion.hpp` is in the `bracken.hpp` umbrella; `heightmap_grid.hpp` is.
+
+---
+
+### Part 1 — Paged terrain: `HeightmapGrid`
+
+The world was exactly one square heightmap. `Heightmap` was already a *tile* type in shape — it carries its own origin, its own size and its own quantization range — the engine simply never made a second one, and `TerrainRenderer` baked that single map into one vertex buffer, one index buffer, one R16 texture and one tile list.
+
+`HeightmapGrid` (root layer, namespace `bracken`) is an N × M grid of `Heightmap` pages; `set_heightmap(const Heightmap&)` becomes the **1×1 adapter** (`set_heightmap_grid(HeightmapGrid::from_single(map))` and nothing else), so every existing host keeps working untouched and keeps producing the identical frame. Plain data plus const sampling: no GPU, no device, no allocation on the read path.
+
+| Field | Meaning |
+|---|---|
+| `pages_x`, `pages_z` | grid shape, row-major |
+| `page_size` | world units per page side — pages are SQUARE; a non-square *world* is a non-square page *count* |
+| `origin_x`, `origin_z` | world position of page (0,0)'s −x/−z corner |
+| `range` | the `HeightRange` every resident page must be packed against |
+| `pages` | `pages_z * pages_x` `Heightmap`s; invalid entries are absent pages |
+
+**Page coverage.** Page (px,pz) covers the **closed** world square `[origin + px*page_size, origin + (px+1)*page_size]` on both axes, so adjacent pages **share their boundary sample line** — page (0,0)'s last column and page (1,0)'s first column are at the same world x and must hold the same heights. Continuity across a seam is a property of the authored data plus the shared quantization range, **not** of any blending at sample time.
+
+| API | Contract |
+|---|---|
+| `from_single(map)` | the 1×1 grid; carries the map's origin, size and range |
+| `create(pages_x, pages_z, page_size, origin_x, origin_z, range)` | empty grid of the given shape |
+| `set_page(px, pz, heights, resolution)` | packs row-major world-unit heights against the grid's range and the page's DERIVED bounds; `false` + log on a bad index or a sample count that is not `resolution²` |
+| `clear_page(px, pz)` | makes a page absent |
+| `validate()` | `core::Result<void, std::string>`; the error names the page and the disagreement |
+| `valid()` | `validate().is_ok()` |
+| `page_at(x, z)` | page index, or `{-1,-1}` strictly outside the grid (the outer boundary line is inside) |
+| `page(px, pz)` | the resident page, or null (out of range **or** absent) |
+| `page_min_xz` / `page_max_xz` | a page's world XZ corners |
+| `get_height_world(x, z, fallback = 0)` | bilinear; the page index is CLAMPED to the grid, so a query outside the world returns the grid edge height exactly as a single map returns its edge height. `fallback` when the containing page is absent — the one answer a lone `Heightmap` cannot give |
+| `get_normal_world(x, z)` | central differences, `eps = page_size / (resolution - 1)`, taps taken THROUGH `get_height_world` so a seam-straddling stencil reads both pages instead of clamping against a page edge that is not a world edge; `(0,1,0)` when degenerate or nothing is resident |
+| `resident_at(x, z)` | is the containing (clamped) page loaded |
+| `resident_pages()`, `page_resolution()`, `world_size_x()`, `world_size_z()`, `page_count()` | inspection |
+
+**The trap this API exists to close.** `Heightmap::from_floats` has two overloads, and the scanning one derives the 16-bit quantization range **from the data it is handed** — the most precise choice for one map and the wrong choice for a page. Two pages authored independently quantize against different extremes, so the heights they store for the samples on the line they share disagree, and the seam **steps**, with nothing logged anywhere. `validate()` therefore makes it a hard refusal rather than a preference, and `Application::set_heightmap_grid` / `SceneRenderer::set_heightmap_grid` / `TerrainRenderer::set_heightmap_grid` log the offending page and **keep the previous terrain**. Build grids with `create()` + `set_page()` and the question cannot come up: `set_page` derives the page's world bounds from the grid and packs against the grid's range, so a host never computes a page origin and never chooses a range — the two ways to get this wrong.
+
+`validate()` refuses: `pages_x == 0` or `pages_z == 0`, `page_size <= 0`; a `pages` vector that is not `pages_x * pages_z` long; a resident page whose `min_height`/`max_height` is not **exactly** the grid's range (**no tolerance**, deliberately — a range is copied between pages, never recomputed, so any difference at all is an authoring mistake); a resident page whose resolution differs from a sibling's; and a resident page whose world size or origin is off by more than `geometry_tolerance(reference)` = `max(0.01, 1e-5 * |reference|)` world units (geometry gets slack because a host may legitimately compute `origin + px * page_size` by a different but equivalent route; a real mistake is half a page off). **A grid with no resident pages is valid** — that is a streamed world before anything has arrived.
+
+#### `TerrainRenderer` pages
+
+New public surface: `set_heightmap(const Heightmap&)` (the 1×1 adapter), `set_heightmap_grid(const HeightmapGrid&)` (refuses an invalid grid), `heightmap_grid()`, `resident_pages()`, `page_bytes()`, `HeightmapSampleParams` + `heightmap_sample_params()`, and `heightmap_texture()` — the one texture grass samples.
+
+A private `TerrainPage` per grid cell owns its vertex/index buffers, its low-LOD shadow buffers, its R16 heightmap texture, its `tiles`/`rows` and `shadow_tiles`/`shadow_rows`, and the union AABB of each.
+
+**The mesh rect rule.** A **1×1** grid's mesh spans `[-500, world_width + 500] × [-500, world_height + 500]` — the renderer's init-time world rect plus `k_page_margin`, exactly as before paging. That rect has never been derived from the heightmap (a map may be any size; sampling clamps), and keeping it is what makes the adapter bit-identical. A **paged** grid's page spans its own square from the grid, with the margin added **only where the page is on the grid's outer edge**: adding it at an interior seam would overlap the neighbour and z-fight. Everything else in the generators is unchanged — cell size 25 with 32-cell tiles for the main mesh; cell size 100, 16-cell tiles, the conservative 5×5 MIN probe and the 5-unit sink for the shadow mesh; the distance/height vertex tint still measured from the renderer's world centre.
+
+**The page reject.** At each of the three draw sites (`render`, `render_prepass`, `render_shadow`) the loop skips a page with no buffers, skips a page whose union AABB a supplied frustum misses, binds that page's buffers, and then runs the **unchanged** `cull_tile_runs` over that page's own tiles/rows, one draw per run. `cull_tile_runs` and `build_tile_rows` are untouched — still static, still pure, still deterministic at any worker count. The reject is safe because a page's box is the **union** of its tile boxes: a frustum that misses the union misses every tile in it, so the reject can only skip work the per-tile cull would have discarded anyway. That is the property that makes a 1×1 grid produce the identical draw stream. The prepass and the forward pass use the identical predicate on the identical AABB, not an approximation, because the forward pass depth-tests `EQUAL` against the prepass and the two walks must draw the same set.
+
+**Draw-call arithmetic.** Runs are index-buffer ranges and each page owns its own index buffer, so runs never merge across pages: the floor is one draw per visible page in each of the six terrain walks a frame (main, depth prepass, four shadow cascades), i.e. `6 * P`; the ceiling is `6 * Σ(runs per page)`. The total is **not** ordered against the unpaged one — a page renumbers its tiles into its own buffer, so tiles from consecutive page rows are contiguous there while in the world-sized buffer they were separated by the neighbouring page's columns, and a page's runs can merge where the world's could not. That was measured (`TerrainPageCulling` in `src/bracken/render/terrain_renderer.test.cpp`), not assumed. What is guaranteed is the floor and that the same triangles are drawn.
+
+**Known limitation: grass follows a smoothed terrain on a paged world.** `sampleTerrainHeight` (`src/bracken/shaders/grass_blade.hlsli`) hard-codes ONE height texture, ONE origin and ONE square world size, and the offsets of the matching `HeightmapParams` (`src/bracken/render/grass_renderer.hpp`) are static-asserted on the CPU side and SPIR-V-reflected by the uniform-layout test. Rather than move that cbuffer, a **paged** grid gets a coarse world-spanning R16 **proxy** texture resampled through the grid sampler, capped at `k_grass_proxy_max_resolution`. A **1×1** grid does not use the proxy at all — grass gets that page's own texture and the map's own five scalars, i.e. exactly the pre-paging binding. Per-page grass sampling wants a `Texture2DArray` plus a page index in the shader, which is a two-sided cbuffer change and is deliberately not here.
+
+**Two deliberate behaviour changes on degenerate input**, both in the safe direction: `SceneRenderer::set_heightmap` with a map whose `world_size` is 0 is now REFUSED with a logged error instead of installing a heightmap that divides by zero at sample time, and a map with `resolution < 2` installs as a **non-resident** page (a flat placeholder) rather than as a map whose `resolution - 1` underflows an unsigned. `Application::set_heightmap` already rejected both before reaching the renderer.
+
+**What paging is not.** Nothing loads or unloads *pages* by distance — a host builds the whole grid up front, or calls `set_page`/`clear_page` and re-installs. Part 2 is asset residency, not page residency. `splat_params` still spans the renderer's world rect from the origin, unchanged. And `examples/playground/playground.cpp` still builds one 257×257 map, which is what keeps the pinned smoke baselines meaningful for this change — exercising paging end-to-end on the GPU with a 2×2 playground grid has not been done.
+
+---
+
+### Part 2 — Asset residency: `ResidencyManager`
+
+`AsyncModelLoader` already did the hard half of streaming — decode on the job pool, budgeted main-thread upload in `pump()` — but nothing above it ever gave anything back: `TextureCache` had only `clear()`, `ModelManager` had only `unload_all()`, and a draw whose model was missing was counted as `draws_dropped_unknown_model`, which is a *bug* diagnosis for what is really a *budget* condition.
+
+`ResidencyManager` is host-owned and entirely opt-in. Without one, `ModelManager` and `TextureCache` behave exactly as before: nothing is ever unloaded, no texture is ever destroyed, and `draws_deferred_not_resident` is always zero.
+
+| Type | Meaning |
+|---|---|
+| `StreamId` | opaque, stable per-item id; `0` is invalid, items start at 1. Not a `ModelHandle`: an item *has* a handle, and only sometimes |
+| `State` | `Absent`, `Loading`, `Resident`, `Evicted`, `Failed` |
+| `Config` | `budget_bytes`, `load_radius`, `evict_radius`, `min_frames_resident`, `max_uploads_per_pump`, `max_requests_per_pump`, `max_evicts_per_pump` |
+| `Item` | `name` (ModelManager registration name), `source` (pack entry or path), `anchor`, `cull_radius`, `proxy` |
+| `Stats` | `resident_bytes`, `budget_bytes`, the five per-state counts, `loads_started` / `loads_completed` / `evictions` (cumulative), `budget_overruns`, `evictions_blocked_by_hysteresis` (cumulative) |
+
+**A band, not a radius.** One radius is a thrash generator: an item sitting exactly on it loads and evicts on alternate frames forever, and each cycle costs a decode plus an upload. So inside `load_radius` an item is requested, outside `evict_radius` it becomes **eligible**, and in between nothing ever happens. `set_config` **refuses** `evict_radius <= load_radius` rather than clamping, because a silently-clamped band is a band that looks configured and thrashes anyway. **Eligible is not evicted**: eviction fires only while the budget is exceeded, only for items resident at least `min_frames_resident` frames, and at most `max_evicts_per_pump` per call. A budget of 0 means *never evict*.
+
+**The pure decision core**, static and testable with no `ModelManager`, no job system and no GPU:
+
+| Function | Contract |
+|---|---|
+| `wants_load(distance, cull_radius, cfg)` | inside `load_radius + cull_radius`, inclusive |
+| `outside_evict_band(distance, cull_radius, cfg)` | strictly beyond `evict_radius + cull_radius` |
+| `in_hysteresis_band(...)` | neither — the dead zone |
+| `config_is_valid(cfg)` | `load_radius > 0 && evict_radius > load_radius` |
+| `plan_evictions(candidates, resident_bytes, cfg, out, blocked)` | farthest first, ties by ascending index, stops as soon as the projected total is within budget or at `max_evicts_per_pump`, skips candidates younger than `min_frames_resident` (counting them in `blocked`); a zero budget plans nothing |
+
+`plan_evictions` is deterministic regardless of the order candidates are handed in, which is what makes it testable and what stops two runs of the same scene evicting different things.
+
+`pump()`, in order: adopt what the loader finished → age the resident set → request what entered the load band (nearest first, ties by index) → evict while over budget → republish `stats()`. **Main-thread, at the frame fence** — the pipeline's quiescent point, immediately after the hot-reload poll and for a stronger version of the same reason: hot reload replaces a resource's *contents*, and `pump()` can **free** one. A packet being built or rendered against a freed vertex buffer is not a stale image, it is a crash.
+
+`handle(id)` returns the real handle when resident and the item's `proxy` otherwise, so a draw loop needs no branch on residency state; with no proxy it returns `INVALID_MODEL_HANDLE` and the draw is simply not emitted.
+
+**Defaults**: `budget_bytes = 512 MB`, `load_radius = 4000`, `evict_radius = 6000`, `min_frames_resident = 120`, `max_uploads_per_pump = 2`, `max_requests_per_pump = 4`, `max_evicts_per_pump = 4`. Every one of these is a plausible starting value, **not a measured one**.
+
+#### The acceleration structure — the sharp edge of the whole feature
+
+`RtScene` rebuilds its TLAS when the instance **set** changes (a hash of the count and the handle sequence), and an eviction changes **neither**, so nothing fires on its own and the BLAS keeps pointing at the CPU geometry `unload_model` just freed. That is a use-after-free, not a visual glitch. Three things close it: `ResidencyManager` calls a geometry invalidator on every eviction and every completed load, and warns once, loudly, if none is installed; `Application::set_residency` wires that invalidator to `SceneRenderer::invalidate_raytracing_scene()` automatically when the renderer exists, so a host cannot forget; and `RtScene`'s BLAS walk skips a slot whose `Model::loaded` is false — which is also why `unload_model` must leave `model_count()` unchanged, because that walk is indexed from 0 to `model_count()`.
+
+#### `ModelManager`, `TextureCache` and `AsyncModelLoader` additions
+
+| API | Contract |
+|---|---|
+| `ModelManager::unload_model(handle)` | frees buffers, releases texture references, drops retained CPU geometry, clears `Model::loaded`. **KEEPS** the slot, the name mapping, the source path, the bounds and the LOD links. Returns the byte estimate released. Does **not** follow the LOD chain |
+| `ModelManager::reupload_model(handle, decoded)` | move-assigns fresh contents into the same slot, preserving the handle, the `Model*` and the slot's LOD chain; re-uploads and recomputes the bounding sphere |
+| `ModelManager::gpu_bytes(handle)` | buffers exactly, plus the FULL estimated size of every texture slot — deliberately **over**-counting shared atlases, because an upper bound is the safe direction for a budget |
+| `AsyncModelLoader::Request::reupload_into` | defaults to `INVALID_MODEL_HANDLE` (the original behaviour); a valid handle routes the finished decode to `reupload_model` instead of `register_model` |
+
+`reupload_into` exists because `register_model` **refuses** a name it already knows, so streaming a model back in after an eviction has no route through the registering path — and inventing one would mean either orphaning the old handle or renumbering, both of which break handle stability. Handle stability is the load-bearing invariant of the whole feature: a `ModelHandle` is a dense index baked into draw commands and into the ray tracer's instance list, and assigning them out of order once made three smoke runs render three different frames.
+
+`ModelLoader::free_gpu_resources(TextureCache&, Model&)` is the counted form of the existing free — one `release()` per non-null texture slot, mirroring `upload_to_gpu`'s one `acquire()` per slot. `reload_model` uses it too now, so a hot reload no longer pins its outgoing images forever.
+
+`TextureCache::acquire()` keeps its exact signature and now also increments; `release()` decrements; `bytes_resident()`, `refcount()`, `texture_bytes()` and `stats()` report. **Destruction at zero is OFF by default** (`set_destroy_on_release`), and that is the single most important sentence in this section. `Mesh` and `PBRMaterial` hold four non-owning `gpu::GPUTexture*` each and there is no central registry of who borrowed what; one missed pairing with destruction on leaves a live descriptor pointing at a freed texture — a GPU fault or garbage pixels three subsystems away, not an assert. With destruction off the counts are exact and observable, so a project can *verify* its own pairing on its own content before flipping the switch, and leaving it off reproduces today's never-evicted behaviour byte for byte. The only cost is that an eviction returns geometry VRAM and **not** image VRAM. `release()` naming a foreign pointer is counted in `Stats::unknown_releases` with one throttled warning rather than aborting, because `release()` sits on the eviction path, which walks meshes whose textures may have come from anywhere.
+
+`texture_bytes_estimate(w, h, format, mipmapped)` is the size model: the **exact** sum over mip levels, not the 4/3 limit (a 1024×1 strip's chain is nowhere near 4/3 of its base). It is an estimate and says so — SDL3 exposes no allocation size — but it is stable, content-derived and monotone, which is all a budget needs.
+
+#### The two diagnostics are not the same thing
+
+`draws_dropped_unknown_model` means the handle names no model at all: a host bug, permanent, a reason to look at the code. `draws_deferred_not_resident` means the model is registered and its slot is intact but its payload is not here: a budget condition, transient, a reason to look at the config. A streaming frame that conflated them would produce a wall of false bug reports, which is exactly why the counter was added rather than the existing one reused. Both the static walk and `resolve_skinned_chunk` test `Model::loaded` and count into it — leaving the skinned path out meant a skinned draw against an evicted model resolved through its still-present skeleton, reached the draw walk, found no vertex buffer and vanished counted **nowhere**, which is the one thing the engine's diagnostics rule forbids outright.
+
+#### Threading tiers
+
+| Operation | Tier |
+|---|---|
+| `ResidencyManager::add` / `set_config` / `set_geometry_invalidator` / `pump` | **main-thread** (asserted); `pump` additionally requires the frame fence |
+| `ResidencyManager::set_viewer` | **worker-safe** — three relaxed atomic stores; callable from `on_simulate` |
+| `handle` / `model_handle` / `resident` / `state` / `stats` | worker-safe reads of a table only `pump()` and `add()` write |
+| `ModelManager::unload_model` / `reupload_model` | **main-thread** (asserted) — destroys and creates GPU resources |
+| `TextureCache::release` | **main-thread** (asserted) |
+
+The read-side claim is bounded honestly: `add()` can reallocate the item table, so a read concurrent with one is a data race and not a stale answer. In the engine's frame that is not a hazard — `pump()` runs at the fence with no sim in flight and `add()` belongs to load time — but a host that registers items from a background thread while a sim job resolves handles has to serialize that itself. The `ResidencyManager` must outlive the `set_residency` detach, and the `AsyncModelLoader` must outlive the manager (it is held by reference). An evicted model's `Model*` stays valid — that is the point of keeping the slot — but pointers *into* it (meshes, vertices) do not.
+
+---
+
+### Part 3 — Hi-Z draw occlusion culling
+
+**`GraphicsSettings::occlusion_culling`, default OFF.** `Application::render_stats()->entities_occlusion_culled` is the readout; zero in a dense scene means the depth never arrived (the first frame after enabling, after a resize, or a frame whose prepass did not run), not that there was nothing to cull. The playground pins it under `PLAYGROUND_OCCLUSION=1` and reports it as `occl_culled=` in the `[smoke] OK …` line.
+
+#### `contracts/occlusion.hpp` — the pure half
+
+POD plus glm, in the leaf `contracts/` layer, so `ScenePrep` can consume it without gaining a device or a renderer pointer: the download, the fence and the mapping all live on the renderer side and the answer crosses the boundary as POD plus a span over a buffer the renderer owns for the frame.
+
+| `OcclusionField` field | Meaning |
+|---|---|
+| `depth`, `mip_w`, `mip_h` | the downloaded level of the FARTHEST-surface pyramid, row-major device depth, reversed-Z |
+| `screen_w`, `screen_h`, `level` | mip 0's dimensions; footprints are addressed at `screen / 2^level` |
+| `view_proj` | the UNJITTERED matrix the depth was rasterized with |
+| `camera_travel`, `max_camera_travel` | translation since then; past the max the field is unusable |
+| `camera_rotation_cos`, `min_camera_rotation_cos` | rotation since then; below the min the field is unusable |
+| `max_tested_screen_fraction` | never test anything larger — the occluder feedback guard |
+| `depth_slack` | extra device-depth margin; 0 is already conservative |
+
+`usable()` is a pure function of scene state and settings — never of GPU timing — so it is reproducible run to run.
+
+`project_aabb(view_proj, min, max)` returns `OcclusionBounds{min_uv, max_uv, nearest_depth, valid}`: the axis-aligned hull of the eight projected corners, plus the **MAX** device depth over them, with `valid == false` whenever any corner has clip `w <= 1e-4` (at or behind the near plane; a NaN lands here too, which is the answer we want). Such a box is never culled — the perspective divide is meaningless there and a straddling box's projection is not the hull of its projected corners.
+
+**The NDC → UV mapping is `(ndc.x * 0.5 + 0.5, 0.5 − ndc.y * 0.5)` — the Y term is FLIPPED**, and this is the engine's existing convention (`render/taa.hpp` states the same one). The engine's projections come from glm with `GLM_FORCE_DEPTH_ZERO_TO_ONE`, which leaves NDC +Y pointing up, while texel row 0 of a copied depth target is the **top** of the frame, so `ndc.y == +1` is row 0. Getting it backwards does not fail loudly: the footprint is simply **mirrored about the horizon**, so distant geometry near the skyline gets tested against the near ground at the bottom of the frame, reads as hopelessly behind it, and is culled. It cost **419 of 464** entities in the playground's smoke frame at a `mean_luma` delta of 0.4 — exactly the class of error the aggregate cannot see.
+
+`occluded_by_field(field, bounds)` is the footprint walk. `occlusion_cull_aabb(field, min, max)` is inflate → project → test in one call, **so the inflation cannot be forgotten at a call site**.
+
+**One-sidedness, exactly as far as it goes.** For a **static scene under a static camera** with a correct farthest-surface pyramid, a false cull is impossible, and `src/bracken/contracts/occlusion.test.cpp` brute-forces every link:
+
+1. any corner at or behind the near plane ⇒ `valid == false` ⇒ never culled;
+2. the projected rect **contains** the projection of interior points (checked over random interior samples), because with all `w > 0` the projection of a convex hull lies inside the hull of the projected vertices;
+3. `nearest_depth` (the corner maximum) bounds every interior point's device depth, because device depth is monotone in view depth and view depth attains its extremes at a hull's vertices — that is what makes testing **one scalar** sound rather than approximate;
+4. the footprint is **dilated by one texel on every side** and addressed from `screen_w`/`screen_h` divided down by `2^level` rather than scaled by `mip_w`/`mip_h`, so it is a strict superset of the true footprint under any rounding convention, and a superset can only refuse to cull. (The two addressings differ by at most one texel, since `screen < (mip + 1) * 2^level`; the belt-and-braces is deliberate, so tightening the dilation later cannot silently open a hole, and the test says so rather than pretending the distinction is observable today.)
+5. the field texel is the MIN over its whole mip-0 region (pinned in `src/bracken/render/hzb.test.cpp`), so "behind this texel" really means "behind everything in it";
+6. the comparison is **strict**, so coplanar is not behind. A background texel holds the clear value 0.0 (the far plane) and therefore never occludes anything, which is what makes the sky-behind-a-prop case come out right for free;
+7. `camera_travel` inflation, `depth_slack` and a wider footprint are each monotone in the safe direction — **asserted by sweeping them**, not assumed.
+
+**Under camera motion it is a heuristic, not a proof.** The depth is a frame old, so a box the previous view hid may be visible now, and no amount of inflating the box fixes that: the box did not move, the camera did. `camera_travel` inflation, `max_camera_travel` and `min_camera_rotation_cos` bound the error; they do not eliminate it. A moving **occluder** has the same problem in the other direction. That is why the feature ships off and why the acceptance test is a pixel-wise screenshot diff.
+
+#### The second pyramid
+
+`hzb_reduce` keeps the **closest** surface (MAX under reversed-Z) because the screen-probe march needs that. Culling needs the **farthest** — a box is hidden only when its nearest point is behind the farthest occluder *anywhere* in its footprint, or a box peeking between two occluders that share a texel gets culled. `hzb_reduce_far` is that reduction (MIN under reversed-Z), `HzbReduction` selects it at `HzbPyramid::init`, and `src/bracken/shaders/hzb_reduce_far.comp.hlsl` is the GPU half — a copy of `hzb_reduce.comp.hlsl` with one operator flipped, plus its own `ComputePipelineType` row.
+
+They are opposite reductions of the same buffer, so neither can be recovered from the other after the fact: this is a second **texture**, not a flag at read time. The failure modes are asymmetric, which is why each has its own name and its own test: culling against the *closest* pyramid with the natural comparison culls nothing (harmless, and it reads as "occlusion culling does not help in this scene"), while flipping the comparison to make it cull culls **visible** geometry. `render/hzb.test.cpp` pins `far <= near` texel for texel as the cheap guard against wiring the culler to the wrong one.
+
+`HzbPyramid::request_level_readback(level, dst)` downloads one coarse mip on **its own** command buffer and returns a fence the caller owns and must release. `level >= 1` is required: mip 0 is 5.8 MB at 1600×900. The separate command buffer follows the idiom every existing readback in the tree uses — the frame's buffer is submitted at present time, and a fence acquired from it could not be waited on until then.
+
+#### Where it sits in the frame, and why the ordering is load-bearing
+
+```
+frame i:   … depth prepass → [closest HZB] → [FARTHEST HZB recorded] → GTAO → …
+           … end_frame() submits the frame's command buffer …
+           → submit_occlusion_readback()   (its own command buffer, its own fence)
+frame i+1: resolve readback (deterministic fence wait) → plan_frame → Prepare (the cull) → …
+```
+
+The pyramid is built where its only input first exists, and what it produces is consumed a **whole frame later**, because Prepare runs before this frame's prepass and SDL3 has no non-blocking map. That one-frame lag is the source of every conservatism knob above; there is no arrangement of this feature in which a CPU cull reads current depth.
+
+**The download is requested AFTER the frame's command buffer has been submitted, and that ordering is load-bearing.** A readback rides its own command buffer, submitted the instant it is recorded, and SDL3 GPU runs command buffers in submission order. The build above is only *recorded* on the frame's buffer, which is not submitted until `end_frame()` — so a download requested next to the build runs **first** and captures the *previous* frame's pyramid, leaving two-frame-old depth paired with a one-frame-old view-projection. A projection tested against depth rasterized with a different matrix is not conservative at all, which is precisely the false-cull failure this feature exists to avoid. `SceneRenderer::submit_occlusion_readback` therefore runs at the very end of `render_frame` and carries the build's camera across in `occlusion_build_view_proj_`.
+
+**The readback fence is waited on DETERMINISTICALLY**, at the top of `render_frame`, before the plan is made. The alternative — "skip the test if the fence has not signalled" — makes the culled set depend on GPU timing, so two runs of the same scene render different frames and every pinned screenshot baseline stops meaning anything. The fence is a full frame old and normally already signalled; if it ever is not, the cost shows up as render time. `RenderPlan::occlusion_active` is therefore a pure function of the setting, the HDR path and `RendererCaps::occlusion_depth_ready`, and the last of those is false only for reasons that are facts about the renderer — never about timing.
+
+#### Determinism inside the Prepare stage
+
+`ScenePrep::PrepParams::occlusion` is a frame-constant, read-only input exactly like `main_frustum`, so the per-command predicate stays a pure function of (command, params) and the chunked walk still reproduces the serial one byte for byte. The design that would break this is the obvious one — a per-instance "was visible last frame" latch — because chunk order would decide who writes it. There is deliberately no such latch, and `src/bracken/scene/scene_prep_parity.test.cpp` re-runs the whole 0/1/4-worker `memcmp` with a populated field.
+
+The test sits **between the frustum reject and `entities_rendered++`**, reusing the one `get_model` lookup already there, and it is applied to the **main view only**: the shadow-cascade binning never sees it, because a camera-occluded object still casts into the view.
+
+#### The occluder feedback loop
+
+An object culled this frame writes no prepass depth, so it cannot occlude next frame. For a pebble that is free; for a cathedral it means everything behind it pops back in and the scene oscillates. `max_tested_screen_fraction` is the only guard, and `0.15` is a plausible number with no measured knee behind it. Measuring it is the first thing to do before this feature is ever turned on by default.
+
+#### How to evaluate it, and the trap
+
+Turn it on and off and **diff the screenshots pixel-wise**. A correct occlusion cull removes only invisible draws, so the two images must be identical; any pixel difference is a false cull. `mean_luma` is structurally blind to this — a change of a few hundred pixels moves no luma digit, and a missing prop behind a wall is exactly a few hundred pixels. **With `PLAYGROUND_OCCLUSION=1` the playground's smoke frame culls 105 of 464 entities and the rendered image is BIT-IDENTICAL to the occlusion-off image**, which is the standing acceptance result for the static-camera case. For the timing half use `--rt-bench 3000` A/B back to back in a RelWithDebInfo tree; a `--smoke 30` line's fps figure measures GPU clock state, not the renderer.
+
+#### Constants
+
+| Constant | Value | Status |
+|---|---|---|
+| `SceneRenderer::k_occlusion_level` | 4 | 100×57 floats at 1600×900 (23 KB) — coarse enough that the download and the footprint walk are both trivial, fine enough that a prop still covers a texel or two. **Not measured.** |
+| `OcclusionField::max_tested_screen_fraction` | `0.15f` | the occluder-feedback guard. **A guess.** |
+| `OcclusionField::max_camera_travel` | `250.0f` world units | **A guess.** |
+| `OcclusionField::min_camera_rotation_cos` | `0.99905f` (cos 2.5°) | **A guess**, sized as roughly one frame of a fast flick at 60 Hz. |
+| `OcclusionField::depth_slack` | `0.0f` | zero is already conservative; the dial exists for depth precision at range. |
+| `HeightmapGrid::k_recommended_min_page_size` | `2000.0f` | **advisory**, not enforced — `TerrainRenderer::set_heightmap_grid` warns below it. A 2000-unit page is 80×80 cells of the 25-unit terrain grid, large enough that the tile-run merging inside a page still does real work. |
+| `TerrainRenderer::k_page_margin` | `500.0f` | the terrain skirt, applied only on the grid's OUTER edges. The value both mesh generators used privately before paging. |
+| `TerrainRenderer::k_grass_proxy_max_resolution` | `1024` | cap on the paged-world grass proxy's side (2 MB of R16). |
+| `ResidencyManager::Config` defaults | 512 MB / 4000 / 6000 / 120 frames / 2 / 4 / 4 | plausible, **not measured**. `evict_radius > load_radius` is refused rather than clamped. |
+
+#### Known limitations across all three parts
+
+- **Texture destruction is deliberately disabled.** `set_destroy_on_release` defaults to false, so an eviction returns geometry VRAM and **not** image VRAM. Enabling it is a measured step for a project that has verified its own `acquire`/`release` pairing through `TextureCache::stats()`.
+- **`unload_model` does not follow the LOD chain.** Levels are separate models with their own handles; evicting a base leaves its levels resident. A host that wants the chain gone must evict each handle.
+- **The eviction APPLY path is not covered by a test, only the plan.** `plan_evictions` is pure and heavily tested, but the lines in `pump()` that apply a plan never run in the suite: the fixture has no GPU device, so `gpu_bytes` is 0 for every model, `resident_bytes_` never exceeds any budget, and `plan_evictions` returns an empty plan by construction. `EvictionKeepsTheHandleAndTheSlot` (`src/bracken/residency_manager.test.cpp`) says so out loud and drives `unload_model` directly instead.
+- **`TextureCache`'s destroy-at-zero path is not covered either**, for the same reason: `acquire()` needs a device, so the suite can only reach `release()` with foreign and null pointers.
+- **The reload round trip is not covered end to end.** It goes through `AsyncModelLoader`, which needs a real `.glb`; the two halves are covered separately.
+- **A level's or a host's `Config` numbers, and all four occlusion constants, are plausible values rather than measured ones**, and each is labelled as such above.
+- **Occlusion is conservative for a still camera and a heuristic for a moving one** — the depth it tests is a frame old by construction. Default off. Judge it by a pixel-wise screenshot diff, never by `mean_luma`.
+- **Grass follows a smoothed terrain on a paged world** (above); per-page grass sampling moves `GrassVertexUniforms`, which the uniform-layout test pins on both sides.
+- **There is no paged playground scene and no residency-driven playground scene.** `PLAYGROUND_OCCLUSION` is the only end-to-end pin any of the three parts has.

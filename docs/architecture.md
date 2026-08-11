@@ -17,19 +17,19 @@ Root namespace `bracken`, one sub-namespace per module.
 
 | Path | Namespace | Contents |
 |---|---|---|
-| `src/bracken/` (root) | `bracken` | `Application` + `SimFrame`/`MainFrame` (the two per-frame host views it hands the hooks), `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `Heightmap`, and `bracken.hpp` — the umbrella over the public surface |
-| `contracts/` | *(unchanged per type)* | the **leaf layer**: pure-data types two or more layers must agree on — `ModelHandle`, `EnvironmentState`, `CameraState`, `Frustum`, `velocity_math`, the host descriptors `PointLightDesc`/`SpotLightDesc` and the GPU PODs `PointLight`/`SpotLight`/`LightHeader`, `GraphicsSettings` (every mode field a scoped `enum class`), `RenderStats` (+ `FrameDiagnostics`, `PassTiming`). May include `core/`, glm and `<std>` and nothing else; namespaces are those of the owning module, not the directory. See [`contracts/README.md`](../src/bracken/contracts/README.md) |
-| `core/` | `core` | `Logger` (+`BRACKEN_LOG_*`), `assert.hpp`, `Result<T,E>`, `Handle` pools, `hash.hpp` (`StringId`, FNV-1a), `profiler.hpp` (Tracy macros) |
+| `src/bracken/` (root) | `bracken` | `Application` + `SimFrame`/`MainFrame` (the two per-frame host views it hands the hooks), `ModelLoader`/`ModelManager`, `model_utils`, `InputHandler`/`InputState`, `TextureCache`, `Heightmap` **and `HeightmapGrid`** (the N×M page grid the single map is now a 1×1 case of), and `bracken.hpp` — the umbrella over the public surface |
+| `contracts/` | *(unchanged per type)* | the **leaf layer**: pure-data types two or more layers must agree on — `ModelHandle`, `EnvironmentState`, `CameraState`, `Frustum`, `velocity_math`, the host descriptors `PointLightDesc`/`SpotLightDesc` and the GPU PODs `PointLight`/`SpotLight`/`LightHeader`, `GraphicsSettings` (every mode field a scoped `enum class`), `RenderStats` (+ `FrameDiagnostics`, `PassTiming`), `depth_linear`, `ShadowCapsule`, **`FontMetrics`** (the frozen CPU glyph table sim-stage text layout measures against — see "The UI layer"), **`UiTextureId`** (the packet-safe name for a UI texture, because the sim stage may never hold an `SDL_GPUTexture*`) and **`OcclusionField`/`OcclusionBounds`** (the frame-old Hi-Z field and the projected-AABB test, here so `ScenePrep` can consume them without gaining a device). May include `core/`, glm and `<std>` and nothing else; namespaces are those of the owning module, not the directory. See [`contracts/README.md`](../src/bracken/contracts/README.md) |
+| `core/` | `core` | `Logger` (+`BRACKEN_LOG_*`), `assert.hpp`, `Result<T,E>`, `Handle` pools, `hash.hpp` (`StringId`, FNV-1a), `utf8.hpp` (`decode_utf8` — it lives here so `contracts/font_metrics.hpp` can use it; `render::decode_utf8` is a using-declaration onto it), `profiler.hpp` (Tracy macros) |
 | `core/jobs/` | `core::jobs` | `JobSystem` (always-on lock-free work-stealing pool — Chase–Lev deques, MPSC injection, pooled job nodes), `TaskGroup`, `parallel_for`, `TaskHandle` |
 | `core/asset/` | `core::asset` | `FileWatcher` (hot-reload poller); `AssetRegistry` (typed, stable handles — a host-facing utility: no engine system instantiates it); `AssetPack` (read-only bundle: sorted TOC, on-demand entry reads, worker-safe). The pack is generic; the model-aware async loader lives at the root because `core/` may not include upward |
 | `memory/` | `memory` | `Arena` (bump + destructor registration), `FrameAllocator` |
-| `gpu/` | `gpu` | `GPUDevice`, `GPUBuffer`, `GPUTexture`, `ShaderManager`, `GPUPipeline`, `GPUComputePipeline`/`ComputePass` (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) + `pipeline_catalog.hpp` (what each pipeline *is*), `gpu_uniforms.hpp` (CPU↔GPU contract), `gpu_debug.hpp` |
-| `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain, grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI, hierarchical-Z pyramid (`hzb.hpp`, built for `GiMode::ProbesScreen` only); `color_grading.hpp` |
+| `gpu/` | `gpu` | `GPUDevice`, `GPUBuffer`, `GPUTexture`, `ShaderManager`, `GPUPipeline`, `GPUComputePipeline`/`ComputePass` (`gpu_compute.hpp`), `PipelineRegistry` (cache/lifecycle) + `pipeline_catalog.hpp` (what each pipeline *is*) + **`host_pipeline.hpp`** (the catalogue is closed for the engine and open at runtime for a host: `HostGraphicsPipelineDesc`/`HostComputePipelineDesc`, their opaque handles, and the `PipelineCacheKey` that puts host and catalogue pipelines in ONE cache so invalidation / swapchain rebuild / hot reload cover both), `gpu_uniforms.hpp` (CPU↔GPU contract), `gpu_debug.hpp` |
+| `render/` | `render` | `RenderContext`, sub-renderers: world/skybox, terrain (**paged**: one GPU page — vertex/index buffers, low-LOD shadow buffers, R16 texture, tiles and rows — per `HeightmapGrid` cell, with a page-AABB reject in front of the unchanged `cull_tile_runs` at all three draw sites), grass, shadow map (CSM), GTAO, TAA, auto exposure (compute histogram), IBL (sky prefilter chain), bloom, volumetric fog, post-process stack (composite incl. color grading), water (surface + compute wave sim), text, UI, hierarchical-Z pyramid (`hzb.hpp`, in **two reductions**: `HzbReduction::Closest` — MAX under reversed-Z — for `GiMode::ProbesScreen`'s screen-probe march, and `HzbReduction::Farthest` — MIN — for draw occlusion culling. Opposite reductions of one buffer, so they are two textures and not one with a read-time flag); `color_grading.hpp` |
 | `render/lighting/` | `render::lighting` | `ClusterGrid` (CPU light binning), `LocalShadowMap`/`LocalShadowSelector` (budgeted point/spot shadow atlas + tile cache), and the cluster/atlas **budget constants** in `light.hpp` (the light *structs* are `contracts/light.hpp`) |
 | `render/gi/` | `render::gi` | probe-field global illumination: `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three scrolled cascades of octahedral irradiance + visibility atlases, `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror (torus wrap, atlas tiling, octahedral encode/decode + the border wrap, world↔probe mapping, spherical-Fibonacci ray directions and their per-frame rotation, the change-adaptive blend curve), and `probe_schedule.hpp` is the per-frame ray budget and the cascade rota. `gi_bindings.hpp` is the per-frame handoff (three atlas bindings + the cascade window corners) every consumer takes. **After phase R1c the field traces, blends, classifies itself AND lights the frame**: `shaders/gi_sample.hlsli` replaces the diffuse half of the ambient term in every scene fragment shader and modulates the volumetric fog's in-scatter. GI on builds the acceleration structure with attributes even with `rt_shadows`/`rt_reflections` off. See "Probe-field GI" |
 | `render_graph/` | `render_graph` | pass scheduler (topo-sort, transient pool) — **in-tree, tested, not wired into `SceneRenderer`** |
-| `scene/` | `scene` | `FramePacket` (immutable per-frame snapshot) + `FrameBuilder` (lane-based write interface) + `PacketRing` (SPSC handoff ring), `SceneRenderer` (frame orchestrator), `ScenePrep`, `RenderPlan`, `MotionHistory`, `transform_math.hpp` |
-| `animation/` | `animation` | `animation_types.hpp` (skeleton/clips/constants), `AnimationPlayer`, `AnimationStateMachine`, `ik_solver` |
+| `scene/` | `scene` | `FramePacket` (immutable per-frame snapshot) + `FrameBuilder` (lane-based write interface) + `PacketRing` (SPSC handoff ring), `SceneRenderer` (frame orchestrator), `ScenePrep`, `RenderPlan`, `MotionHistory`, `transform_math.hpp`, **`RenderHookRegistry`** (`scene/render_hook.hpp` — ordered, many-per-slot host render passes at five named points in `render_frame`, replacing the single `set_post_ui_callback` slot `init_dev_ui` already owned) and **`Level`** (`scene/level.hpp` — the serializable scene: placed instances, markers, static lights, terrain, water, environment, nav config and ground-cover scatter rules, on top of `save::SaveDocument`. A level stores model **names**, never handles, because `ModelHandle` is a registration-order index; `ResolvedLevel` binds one to a `ModelManager` and emits it into a `FrameSink` in file order) |
+| `animation/` | `animation` | `animation_types.hpp` (skeleton/clips/constants), `AnimationPlayer`, `AnimationStateMachine`, `ik_solver`, **plus the layer stack**: `pose.hpp` (`BoneTransform`/`PoseView`/`BoneMask` + the blend operators — the local-TRS pose type the engine never had), `clip_sampler.hpp` (`ClipBindings`, per MODEL; `ClipSampler`, per instance), `blend_space.hpp` (1D bracket, 2D gradient-band freeform directional), `root_motion.hpp`, and `AnimationRig` (`animation_rig.hpp`) composing up to `k_max_animation_layers` masked, weighted `Override`/`Additive` layers. `AnimationPlayer` is **not** deprecated by it: it is the one-clip path at 16,552 B against the rig's 27,296 B, and a one-layer rig is bitwise identical to it |
 | `systems/` | `systems` | `CameraController` / `CameraSystem` |
 | `effects/` | `bracken` + `systems` + `render` | the particle-effect triad, together at last: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage simulation), `EffectRenderer` + `particle_transform.hpp` (drawing). Namespaces are unchanged — the directory groups the feature, not the namespace |
 | `procedural/` | `procedural` | `tree_generator` (ez-tree algorithm), `rock_generator` (SDF + marching cubes) |
@@ -39,6 +39,7 @@ Root namespace `bracken`, one sub-namespace per module.
 | `audio/music/` | `audio::music` | `Song`/`Track`/`Pattern`/`Step` tracker-style data, and `Sequencer` — sample-accurate playback that splits a buffer at a step boundary rather than rounding to it, so output is bit-identical at any device buffer size |
 | `save/` | `save` | `SaveDocument` — typed values addressed by path, so adding, removing or reordering fields never invalidates an existing save. Unknown records survive a load/re-save, so an older build cannot silently delete a newer one's data. Writes go to a temp file and are renamed over the target, so an interrupted save leaves the previous one intact; every payload carries a checksum |
 | `async_model_loader.hpp` (@root) | `bracken` | decodes models on the job pool and uploads at the frame fence. Registration is in REQUEST order, not completion order — handles end up inside draw commands, so completion-order registration made the frame's content differ per run |
+| `residency_manager.hpp` (@root) | `bracken` | `ResidencyManager` — distance-driven asset residency over `AsyncModelLoader` + `ModelManager`: a byte budget, a load/evict band with dead space between the radii, per-item state, and `pump()` at the frame fence. It knows `ModelManager`, which is why it sits at the root and not in `core/`. **Host-owned and entirely opt-in** — without one, nothing is ever unloaded and `draws_deferred_not_resident` is always zero |
 | `core/random.hpp` | `core` | `Rng` (SplitMix64). Deterministic **by seed**, deliberately not by deriving values from game state — a scatter derived from one coordinate is constant whenever that coordinate is |
 | `mesh_simplify.hpp` (@root) | `bracken` | vertex-clustering mesh simplification, used to generate LOD levels at load time without an asset pipeline. Deterministic; averages each cell rather than picking a member, so the simplified surface stays centred on the original |
 | `render/raytracing/` | `render::rt` | software BVH for compute-shader ray tracing: a binned-SAH builder over 32-byte one-AABB nodes (`bvh.hpp`), converted at upload to the 64-byte both-children traversal node the GPU walks (`bvh_gpu.hpp`), and a two-level BLAS/TLAS split. SDL3 GPU exposes no hardware ray tracing, so the acceleration structure is the engine's own — see "Ray tracing" |
@@ -46,7 +47,7 @@ Root namespace `bracken`, one sub-namespace per module.
 | `physics/` | `physics` | `PhysicsWorld` (glm-only pimpl over vendored **Jolt Physics** — linked PRIVATE, Jolt never in public headers). `physics/internal/` holds the `JoltJobSystem` bridge onto `core::jobs::JobSystem` — the one header in the tree that includes Jolt (see "Physics" below) |
 | `dev/` | `dev` | `DevUI` — the Dear ImGui developer overlay (F10 in the playground) — and `dev_panels` (the built-in Stats / Environment / Graphics / Camera panels). Compiles to a no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`; ImGui appears only in `dev/*.cpp`, never in a header |
 | `ui/` | `ui` | The immediate-mode UI layer, run entirely in the SIM STAGE: `LayoutTree` (row/column/grid solver), `ui::Context` (widget identity, hot/active/focus, keyboard AND gamepad navigation, scrolling with scroll-into-view, input capture), `widgets.cpp` (label/wrapped label/button/toggle/radio/slider/text field/progress bar/separator/image/panel/scroll view), plus `nine_slice.hpp` and `ui_input.hpp`. Touches no GPU and no SDL — it measures text through `contracts/font_metrics.hpp` and emits through `scene::FrameBuilder::UiLane`, and `ui_purity.test.cpp` scans the module's includes to keep it that way. Sits ABOVE `scene/`, so `render/` must never include it (that would close render → ui → scene → render). See [gap_ui.md](gap_ui.md) |
-| `testing/` | `testing` | `frame_test.hpp` — `TestFrame` + `FrameAccess`, the headless frame fixture published **for host games**: build a frame, seal it, read back typed views with no GPU, window or SDL. Header-only; nothing in the engine's production path includes it |
+| `testing/` | `testing` | `frame_test.hpp` — `TestFrame` + `FrameAccess`, the headless frame fixture published **for host games**: build a frame, seal it, read back typed views with no GPU, window or SDL, and fold the whole host-written frame into one `digest()` (FNV-1a in packet order — the equality instrument the level round trip is proved with). Header-only; nothing in the engine's production path includes it |
 | `shaders/` | — | HLSL sources → SPIR-V at build time; see [shaders/README.md](../src/bracken/shaders/README.md) |
 
 ### Module layering
@@ -58,26 +59,39 @@ points from a layer to one below it:
 ```
 core                                          sink: fan-out 0, includes nothing in-tree
   core/jobs, core/asset, memory, contracts    contracts: core + glm + <std> only
-    gpu, animation
-      model_loader.{hpp,cpp}, heightmap.{hpp,cpp}   asset-layer leaves, at the root
+    gpu, animation, save, navigation
+      model_loader.{hpp,cpp}, heightmap{,_grid}.{hpp,cpp}   asset-layer leaves, at the root
         render, render/lighting, procedural, physics
-          scene                               FramePacket / FrameBuilder / PacketRing
-            effects, systems
-              @root                           application.hpp, sim_frame.hpp, input
+          scene                               FramePacket / FrameBuilder / PacketRing,
+                                              Level, RenderHookRegistry
+            effects, systems, ui              ui emits into a FrameBuilder lane
+              @root                           application.hpp, sim_frame.hpp, input,
+                                              residency_manager.hpp
                 dev
                 testing                       frame_test.hpp: host-facing, nothing
                                               in-tree includes it
 ```
 
+**`ui/` is above `scene/`, and that is the direction to remember**, because the
+reverse edge closes a cycle: `render → ui → scene → render`. That is why
+`FontMetrics` lives in `contracts/` (so `render/`'s text renderer can *produce*
+one without `render/` including `ui/`) and why `decode_utf8` moved down into
+`core/utf8.hpp` (so `contracts/` may use it — `contracts/` includes only
+`core/`, `contracts/`, glm and `<std>`). `ui/ui_purity.test.cpp` scans the
+module's includes for both halves of that rule.
+
 Two things this diagram does not hide:
 
 - **The root directory is not a layer.** It holds the top of the stack
-  (`application.hpp`, `sim_frame.hpp`, the input pair) *and* two dependency
-  leaves that `render/` and `scene/` reach up for by path — `model_loader.hpp`
-  and `heightmap.hpp`. That is untidy, and a `model/` directory would tidy it,
-  but no header in the root's top half is included by any header in `render/`,
-  `scene/` or `systems/`, so it closes no cycle. Honest summary: acyclic, with
-  two files filed one directory too high.
+  (`application.hpp`, `sim_frame.hpp`, the input pair, `residency_manager.hpp`)
+  *and* three dependency leaves that `render/`, `scene/` and `ui/` reach up for
+  by path — `model_loader.hpp`, `heightmap.hpp`/`heightmap_grid.hpp`, and
+  `input_handler.hpp` (which `ui/ui_input.hpp` includes for `InputSnapshot`;
+  naming a scancode is not touching a device, and that header includes nothing
+  from `ui/`). That is untidy, and a `model/` directory would tidy it, but
+  nothing in the root's top half is included by any header in `render/`,
+  `scene/`, `systems/` or `ui/`, so it closes no cycle. Honest summary: acyclic,
+  with a handful of files filed one directory too high.
 - **`.cpp` files are excluded**, and only from this claim. `application.cpp`,
   `dev/dev_panels.cpp` and `scene/scene_renderer*.cpp` all reach downward into
   the modules they orchestrate, which produces residual module cycles at *link*
@@ -233,6 +247,16 @@ it:
   `on_init`/`on_shutdown` run on the main thread with the GPU available and
   no sim in flight. `quit()` is worker-safe (`running_` is atomic) and stops
   the loop at the next iteration.
+- **`quit()` is LATCHED**, and the latch is what makes a one-shot CLI host
+  work. `run()` unconditionally stores `running_ = true` at entry, so a
+  `quit()` issued from `on_init` — which is exactly what `playground
+  --export-level` does after it has written and verified the file — used to be
+  erased by the loop it was trying to prevent: the loop kicked a sim job,
+  rendered one frame, and only then noticed. `quit()` therefore sets a second
+  atomic, `quit_requested_`, which is never cleared, and `run()` returns
+  immediately when it is set — no window flash, no simulated frame, no packet.
+  Both flags are relaxed and publish nothing; they are loop control, not a
+  payload edge.
 
 **The frame schedule** (`application.cpp::run()`, plan Phase 4; pipeline
 depth 2 — Simulate(i+1) overlaps Render(i)). Bootstrap: pump events once,
@@ -244,7 +268,12 @@ then kick sim 0 (no overlap for frame 0). Each steady-state iteration i:
    the main thread — host bugs must not vanish into the pool.
 2. **Frame fence** — no sim in flight, the pipeline's quiescent point:
    `FileWatcher::poll_main_thread()` (hot-reload applies here, never while
-   a packet referencing the old resource is in flight); pending
+   a packet referencing the old resource is in flight); then
+   `ResidencyManager::pump()` when a host installed one
+   (`Application::set_residency`) — the same quiescent point for a **stronger**
+   reason, because hot-reload replaces a resource's contents where `pump()` can
+   FREE one, and a packet being built or rendered against a freed vertex buffer
+   is a crash rather than a stale image; pending
    graphics-settings application (`request_graphics_settings`; two
    single-writer slots — sim-phase and main-thread/DevUI — main wins when
    both are set); camera-forward feedback applied to the `InputHandler`;
@@ -297,6 +326,26 @@ Side effects worth knowing:
   before any GPU teardown.
 - `init_renderer` auto-loads `GraphicsSettings` from `settings_file_path()`
   (platform pref path) and `shutdown_renderer` auto-saves them.
+- `init_renderer` also **freezes the font metrics**: `TextRenderer::init`
+  exports a `FontMetrics` (`contracts/font_metrics.hpp`) and `init_renderer`
+  copies it into `Application::font_metrics_` on the main thread, before
+  `run()` has ever kicked a sim job, and never writes it again. `kick_sim`
+  hands `&font_metrics_` to the frame's `FrameBuilder` and to the `SimFrame`,
+  so `sim.font_metrics()` and `UiLane::add_text_wrapped` measure the same table
+  the text renderer draws with. The happens-before edge is the sim job's own
+  submit/execute edge — after init the value is immutable, so no atomic is
+  needed and none exists.
+- `set_residency(ResidencyManager*)` installs a host-owned residency manager,
+  pumped at the fence (schedule step 2), and **wires its geometry invalidator
+  to `SceneRenderer::invalidate_raytracing_scene()`** when a renderer exists.
+  That wiring is not a convenience: `RtScene` rebuilds when the instance SET
+  changes (a hash of count + handle sequence) and an eviction changes neither,
+  so without it the BLAS keeps pointing at CPU geometry `unload_model` just
+  freed — a use-after-free, not a visual glitch.
+- `set_heightmap_grid(const HeightmapGrid&)` is the paged-terrain entry point;
+  `set_heightmap(const Heightmap&)` is now the 1×1 adapter over it. Both
+  validate and refuse with a logged error rather than installing a grid whose
+  pages disagree about their quantization range (see "Terrain paging").
 - If the env var `BRACKEN_HOT_RELOAD=1` is set, `init_engine` starts the global
   `FileWatcher` and `init_renderer` registers model + shader-SPIR-V hot-reload
   callbacks directly on `FileWatcher::instance()` via
@@ -306,7 +355,10 @@ Side effects worth knowing:
 - `init_dev_ui()` (protected; optional, call after `init_renderer`) brings up
   the Dear ImGui developer overlay (`dev::DevUI`, `dev_ui()` accessor): it
   binds the built-in panels, **claims the `SceneRenderer` post-UI callback
-  slot**, and feeds SDL events to the overlay before game input. When
+  slot** (a host wanting its own overlay uses `render_hooks()` with
+  `RenderHookSlot::AfterUi`, which composes; the overlay is deliberately NOT a
+  hook registration, so a host's `render_hooks().clear()` cannot remove it),
+  and feeds SDL events to the overlay before game input. When
   `BRACKEN_ENABLE_DEV_UI=OFF` it returns `false` and every `DevUI` call is a
   safe no-op.
 
@@ -474,13 +526,26 @@ drive the Phase-2 sequential flow directly (acquire → build → seal →
 the authoritative "which passes run this frame" decision point, evaluated
 once at the top of `render_frame` and read by everything downstream:
 `has_content`, `use_hdr_path`, `taa_active`, `ibl_active`, `fog_active`,
-`do_frustum_cull`, `draw_dist_sq` and `active_cascades` (which **is** the
+`do_frustum_cull`, `draw_dist_sq`, `occlusion_active` and `active_cascades`
+(which **is** the
 "shadows on" predicate — `ShadowMap::active_cascades()` is clamped to
 [1, `CSM_MAX_CASCADES`], so a zero means the atlas is unavailable or the
-host set `ShadowMode::Off`). It is **pure**: `RendererCaps` carries the four
-sub-renderer readiness bits plus the sticky "a camera was ever set" flag,
+host set `ShadowMode::Off`). It is **pure**: `RendererCaps` carries the
+sub-renderer readiness bits, `occlusion_depth_ready`, and the sticky "a camera
+was ever set" flag,
 which is why the whole tree is testable headless
 (`scene/render_plan.test.cpp`).
+
+`occlusion_active` is the newest of those and it is the one with a determinism
+argument attached. The previous frame's Hi-Z readback is **adopted before
+`plan_frame` runs**, and its fence is waited on **deterministically** rather
+than polled: "skip the test if the fence has not signalled yet" would make the
+culled set a function of GPU timing, so two runs of the same scene would render
+different frames and every pinned screenshot baseline would stop meaning
+anything. The fence is a full frame old and normally already signalled; when it
+is not, the cost shows up as render time. `occlusion_depth_ready` is therefore
+false only for reasons that are facts about the renderer — the first frame after
+enabling, after a resize, after a frame with no prepass — never about timing.
 
 Two decisions deliberately stay in `render_frame`: the minimized-window
 early-out (it must sit between `begin_frame()` and `end_frame()` so the
@@ -546,6 +611,15 @@ and no host should see (`LOG_TAG`, the `apply_mesh_material` template). It
 does **not** carry the class's private member declarations — C++ requires
 those inside the class definition, so `scene_renderer.hpp` keeps them.
 
+0. **Occlusion readback adoption** (only when
+   `GraphicsSettings::occlusion_culling` is on; **default off**) — before
+   anything else, `resolve_occlusion_readback()` waits the previous frame's
+   fence, maps the downloaded farthest-surface mip into `occlusion_field_`, and
+   pairs it with the view-projection that rasterized it. It is here, above
+   `plan_frame`, because "is a usable field available" is one of the plan's
+   inputs and the plan must stay a pure function of facts already settled. With
+   the setting off, any allocated pyramid / transfer buffer / fence is released
+   on the spot — the same policy `hzb_` and `probe_volume_` follow.
 1. **CPU prep** — capture the frame's unjittered view-projection (and apply
    the TAA sub-pixel Halton(2,3) jitter to the draw projection — applied
    exactly when `aa_mode == AAMode::TAA` and the TAA resolve can run;
@@ -563,10 +637,20 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    updated on the sim side before the packet sealed),
    update CSM cascade matrices, cull + build instance batches
    per cascade and main view (each instance carries its previous-frame model
-   matrix from the `MotionHistory`), resolve skinned commands (model, bounds,
+   matrix from the `MotionHistory`; a draw whose model is registered but not
+   RESIDENT — evicted by a `ResidencyManager` — is counted in
+   `draws_deferred_not_resident` and binned nowhere, which is deliberately a
+   different counter from `draws_dropped_unknown_model`: one is a budget
+   condition, the other is a host bug. **Main-view binning additionally runs
+   the Hi-Z occlusion test** when `plan.occlusion_active`, between the frustum
+   reject and `entities_rendered++`, reusing the `get_model` lookup already
+   there; `bin_shadow_chunk` never sees it, because a camera-occluded object
+   still casts into the light), resolve skinned commands (model, bounds,
    main-view visibility, previous-frame transform/palette offset — the
    palette GPU offset is read straight from the packet's prefix-summed
-   `BonePalette::matrix_offset`), run the
+   `BonePalette::matrix_offset`; the same residency test applies here, since a
+   skinned draw against an evicted model resolves through its still-present
+   skeleton and would otherwise vanish counted nowhere), run the
    local-shadow selection (`render::lighting::LocalShadowSelector`: pick the
    budgeted shadow-casting point/spot lights by score with hysteresis, assign
    atlas tiles, decide which tiles re-render this frame, and write each
@@ -651,6 +735,25 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    and the odd-edge footprint rule — in particular that the last texel of each
    axis has an OVERSIZED footprint, which is why the march addresses the
    pyramid by `screenSize / 2^level` and not by the mip's own dimensions.
+7b. **`HZBFar`** (only when `occlusion_culling` is on and the prepass ran) —
+   the same input, the **opposite** reduction (`HzbReduction::Farthest`,
+   `hzb_reduce_far` = MIN under reversed-Z), into its own texture. Culling
+   needs the FARTHEST surface: a box is hidden only when its nearest point is
+   behind the farthest occluder *anywhere* in its footprint, or a box peeking
+   between two occluders that share a texel gets culled. The two answers cannot
+   be recovered from one another after the fact, which is why this is a second
+   texture and not a flag at read time.
+   It sits here for the same reason the closest pyramid does — earliest point
+   its only input exists — but what it produces is consumed a **whole frame
+   later**, in step 0 above, because Prepare runs before this frame's prepass
+   and SDL3 has no non-blocking map. That one-frame lag is the source of every
+   conservatism knob on `OcclusionField`. The camera recorded beside it is the
+   **unjittered** view-projection even though the prepass rasterized with the
+   jittered one: the discrepancy is at most half a pixel at mip 0, i.e. 1/32 of
+   a texel at level 4, well inside the whole-texel dilation the footprint walk
+   already applies — and using the jittered matrix would make the cull depend on
+   the TAA phase, which is a frame-index input nobody wants in a culling
+   decision.
 8. **`GTAO`** (only when `ao_mode != Off` and the prepass ran this frame) —
    `render::GTAO`, computed from the prepass depth alone BEFORE the forward
    pass; the forward shaders sample the result in their ambient term (screen
@@ -851,6 +954,13 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
      them. The proxy is built only for models whose CPU geometry is retained
      for RT; shadows-only GPU memory remains 48 bytes per triangle and
      reflection attributes are 80 bytes per triangle.
+8c. **`RenderHookSlot::PreForward`** — the first of the five host slots (see
+   "Host render passes" below). Fires here, after GTAO/GI/RT and before the
+   forward pass, with the command buffer live and no pass open. Scene colour is
+   about to be CLEARED, so this slot is for compute writing a host-owned target
+   the forward pass will sample. **Scene depth is read-only**: the opaque
+   forward draws test `EQUAL` against exactly what the prepass wrote, so
+   writing depth here makes the forward pass drop geometry.
 9. **`HDROffscreen`** (the normal path whenever the post stack initialized) —
    the whole 3D scene renders into the linear-HDR offscreen target: terrain,
    grass, static/instanced/skinned models, skybox, sorted transparent
@@ -875,6 +985,10 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    (point lights select a face by the dominant axis of light→fragment; 4
    hardware-PCF taps + world-space normal/slope bias + smooth fade at the
    light radius — `cluster_lighting.hlsli`).
+9b. **`RenderHookSlot::AfterOpaque`** — the forward pass has ended and nothing
+   is bound, so scene colour (RGBA16F linear HDR) and scene depth (D32
+   reversed-Z) are both readable. **The default slot** for "draw something into
+   the world"; it runs before the RT reflection resolve.
 8b. **`RT reflection resolve`** (only when a reflection trace was recorded) —
    a full-resolution fullscreen pass adds the reduced-resolution radiance to
    the HDR target before water and TAA. It re-tests the centre pixel's material
@@ -924,6 +1038,10 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    particles rendered in step 8, so the water overdraws them where they
    overlap on screen. Terrain above the water level hides the plane by the
    depth test, so a region rect can generously cover a carved riverbed.
+10b. **`RenderHookSlot::BeforeTaa`** — after water, before the TAA resolve.
+   Anything drawn here is temporally stabilized along with the rest of the
+   frame, which is what world-space geometry wants and emphatically not what an
+   overlay wants.
 11. **Post chain** (all offscreen, swapchain not yet acquired):
    **`TAA`** (only when `aa_mode == AAMode::TAA`;
    `render::TAA`: resolves the jittered HDR offscreen color against a
@@ -968,13 +1086,15 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    composite goes to an LDR intermediate and **`FXAA`** resolves to the
    swapchain; otherwise (Off and TAA — TAA already resolved pre-bloom)
    composite writes the swapchain directly.
+12b. **`RenderHookSlot::AfterComposite`** — after composite (and FXAA), before
+   the UI pass. The swapchain is live and LDR/gamma-encoded; scene colour still
+   holds the **pre-tonemap** HDR image.
 13. **`UI`** — the packet's `ui_commands()` + 3D billboards, straight to
-   swapchain.
-   **`RenderHookSlot::AfterUi`** — host render passes registered through
-   `SceneRenderer::render_hooks()`, whose registry is
-   `RenderHookRegistry` (`scene/render_hook.hpp`), in `(order, sequence)`
-   order. Many per slot, so a host overlay composes with anything else
-   registered.
+   swapchain. Since the UI module landed, `UIRenderer::execute` replays in
+   strict **submission order**, geometry and text alternating, rather than
+   drawing all primitives then all text — see "The UI layer" below.
+   **`RenderHookSlot::AfterUi`** — the fifth and last host slot, and the only
+   one that also runs on the fallback path.
    **`PostUICallback`** — the legacy single-assignment hook that renders into
    the swapchain after UI (`SceneRenderer::set_post_ui_callback`), and the LAST
    thing recorded. There is exactly one slot and `Application::init_dev_ui()`
@@ -982,13 +1102,6 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    BEFORE it: a host pass ends up under the developer overlay instead of
    replacing it. Overwriting an installed callback is still permitted and now
    logs a WARN naming the overlay; hosts should use `render_hooks()`.
-
-   The other four slots (`PreForward` before step 8's forward pass,
-   `AfterOpaque` after it, `BeforeTaa` before step 10, `AfterComposite` after
-   step 12) are HDR-path only. A slot that cannot run this frame — the fallback
-   path below, a frame with no 3D content, a minimized window, a failed
-   swapchain acquire — counts its hooks in
-   `FrameDiagnostics::render_hooks_skipped` rather than dropping them.
 14. Fallback: if the post stack isn't ready, steps 6–12 collapse to a single
    **`MainScene`** pass direct to swapchain (no depth prepass, no AO — every
    draw keeps its `GREATER_OR_EQUAL` write-on pipeline and samples the white
@@ -1007,12 +1120,104 @@ those inside the class definition, so `scene_renderer.hpp` keeps them.
    `AutoExposure`'s diagnostic 16-byte fenced download of its state buffer
    (own command buffer, polled non-blocking, ~once per second — never a
    stall).
+16. **Occlusion readback submit** (only when step 7b actually recorded a
+   build) — `submit_occlusion_readback()` runs at the very end of
+   `render_frame`, **after the frame's command buffer has been submitted**, and
+   that ordering is load-bearing rather than tidy. A readback rides its own
+   command buffer, submitted the instant it is recorded, and SDL3 GPU executes
+   command buffers in submission order; the build in step 7b is only RECORDED
+   on the frame's buffer, which is not submitted until `end_frame()`. A
+   download requested next to the build therefore runs FIRST and captures the
+   PREVIOUS frame's pyramid, leaving two-frame-old depth paired with a
+   one-frame-old view-projection — and a projection tested against depth
+   rasterized with a different matrix is not conservative at all, which is
+   precisely the false-cull failure the feature exists to avoid. The build's
+   camera is carried across in `occlusion_build_view_proj_` for exactly this
+   reason. One readback is in flight at a time; a resize retires the pending
+   one along with the adopted depth.
 
-### Frustum culling
+### Host render passes — the five `RenderHookSlot`s
+
+`SceneRenderer::render_hooks()` returns a `RenderHookRegistry`
+(`scene/render_hook.hpp`): ordered, **many-per-slot** host passes at the five
+points marked 8c / 9b / 10b / 12b / 13 above. Each call site is guarded
+`if (!render_hooks_.empty(slot))`, so an engine with nothing registered pays
+five bool tests and is otherwise the frame it always was.
+
+- **Ordering is `(order, sequence)`** — lower `order` first, ties broken by
+  registration order. Never hash order, never pointer values, so what runs when
+  is determined by nothing but what the host asked for.
+- **Every slot fires with a live command buffer and no pass open, and the
+  callback must leave it that way.** SDL3 GPU offers no way to ask whether a
+  pass is open, so a leaked pass corrupts every later pass in the frame and
+  fails inside the driver, far from the host code that caused it.
+- **A slot that cannot run is COUNTED, not dropped.** The fallback
+  direct-to-swapchain path, a frame with no 3D content or no camera, a
+  minimized window, a failed swapchain acquire (which retires `AfterComposite`
+  and `AfterUi` both) and a null command buffer all fold their hooks into
+  `FrameDiagnostics::render_hooks_skipped` via one helper,
+  `count_skipped_render_hooks`, which itself early-outs on an empty registry.
+- **`prev_view_projection_unjittered` and `frame_index` are captured at the TOP
+  of `render_frame`** (`hook_prev_view_proj_` / `hook_frame_index_`), because
+  the end-of-frame advance overwrites both members *before* the `AfterUi` slot
+  runs — reading them there would hand a hook this frame's VP as the "previous"
+  one (zero reprojection) and a frame index one past the frame it is drawing
+  into.
+- **`scene_color` / `scene_depth` are null unless the offscreen pair holds THIS
+  frame's image.** On the fallback path and on a frame with no 3D content those
+  textures often still exist, holding the last frame that did render into them;
+  handing a hook a stale texture is worse than handing it nothing. `ao` is the
+  opposite convention and deliberately so: it is the 1×1 white dummy when AO is
+  off, never null, so a host pass can sample it without branching.
+- Each entry runs inside its own `BRACKEN_PROFILE_ZONE_COLOR`,
+  `BRACKEN_GPU_SCOPE` and `BRACKEN_GPU_TIMER`, so host passes appear by name in
+  the dev overlay's per-pass CPU-record table. That is why `Entry` is
+  heap-allocated with a stable address (the scope reads `name.c_str()`
+  synchronously) and why the timer gets a separately **interned** `stable_name`
+  from a `std::set<std::string>` the registry never erases: `PassTiming::name`
+  is a `std::string_view` still live in `RenderStats::pass_times_ms` when the
+  host reads the stats, which is after the fence — where a host may legally
+  have removed the hook.
+- **Mutating the registry from inside a dispatch is a named abort.** A
+  `DispatchScope` is held around each slot's walk and `add`/`remove`/`clear`
+  trip a `BRACKEN_CONTRACT` (live in release) while it is alive: a hook
+  registering another hook would reallocate the list being walked. An
+  out-of-range `RenderHookSlot` cast from a host is refused the same way rather
+  than read past the fixed slot array.
+
+### Frustum culling, page rejects and occlusion
 
 `contracts/frustum.hpp` extracts planes from `view_projection`. Culling runs on
 the CPU for the main view and independently per shadow cascade during
 instance-batch building. Toggle via `GraphicsSettings::frustum_culling`.
+
+Two more rejects sit alongside it, both conservative supersets of work the
+finer test would have discarded anyway:
+
+- **Terrain page reject.** Each of `TerrainRenderer`'s three draw sites
+  (`render`, `render_prepass`, `render_shadow`) walks the `HeightmapGrid`'s
+  pages and skips a page whose union AABB misses the frustum, in front of the
+  unchanged `cull_tile_runs`. It is safe because a page's box is the union of
+  its tile boxes, and it is the **identical** predicate on the identical AABB
+  in the prepass and the forward pass — which it has to be, since the forward
+  opaques depth-test `EQUAL` against what the prepass wrote.
+- **Hi-Z draw occlusion cull** (`GraphicsSettings::occlusion_culling`, default
+  off), main view only. `occlusion_cull_aabb(field, min, max)` inflates,
+  projects and tests in one call so the inflation cannot be forgotten at a call
+  site. For a static scene under a static camera a false cull is impossible and
+  `contracts/occlusion.test.cpp` brute-forces each link: any corner at or
+  behind the near plane invalidates the bounds; the projected rect contains the
+  projection of interior points; the corner-maximum `nearest_depth` bounds
+  every interior point's device depth; the footprint is dilated a texel on
+  every side and addressed at `screen / 2^level` (the pyramid's last texel per
+  axis has an OVERSIZED footprint — same rule the screen-probe march follows);
+  the field texel is the MIN over its whole mip-0 region; and the comparison is
+  strict, so coplanar is not behind. The NDC→UV mapping is
+  `(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5)` — **Y flipped**, matching
+  `render/taa.hpp`'s reprojection helper; getting that one sign wrong mirrors
+  the footprint and turns the whole test into noise.
+  **Under camera motion it is a heuristic, not a proof** — see the known-stubs
+  entry.
 
 ---
 
@@ -1837,9 +2042,23 @@ range enum.
 The screen-space half of the trace ladder starts here: a conservative depth
 pyramid a ray march can step through in log-n texture fetches instead of BVH
 triangle tests. R4a builds it; **R4b's screen-probe gather is the first thing
-that reads it.** Until then it is gated on `gi_mode == GiMode::ProbesScreen`
-(the mode that will consume it, and which otherwise still behaves exactly as
-`Probes`), so no configuration that exists today allocates it.
+that reads it**, and it is gated on `gi_mode == GiMode::ProbesScreen`, the mode
+that consumes it.
+
+**There are now TWO of these, and they are two textures rather than one with a
+read-time flag.** `HzbReduction::Closest` (MAX under reversed-Z, `hzb_reduce`)
+is what the screen march needs; `HzbReduction::Farthest` (MIN,
+`hzb_reduce_far`, `shaders/hzb_reduce_far.comp.hlsl` and its own
+`ComputePipelineType::HzbReduceFar` row) is what **draw occlusion culling**
+needs, because a box is hidden only when its nearest point is behind the
+farthest occluder anywhere in its footprint — reduce the other way and a box
+peeking between two occluders that share a texel gets culled. They are opposite
+reductions of the same buffer, so neither can be recovered from the other after
+the fact. `render/hzb.test.cpp` pins `far <= near` texel for texel, which is
+the cheap guard against wiring the culler to the wrong pyramid.
+`HzbPyramid::request_level_readback(level, dst)` downloads one coarse mip on its
+own command buffer and returns a fence, following the idiom
+`render/auto_exposure.cpp` established. Everything below describes both.
 
 **Structure.** One `R32_FLOAT` texture with a full mip chain at the offscreen
 depth's resolution — 1600×900 ⇒ 11 levels, ~7.7 MB. Usage is
@@ -1851,7 +2070,8 @@ requires exactly that flag (plain `READ | WRITE` means "one shader writes, a
 via `SDL_GPUTextureSupportsFormat` and a device that refuses it gets a warning
 and no pyramid, not a null texture with no explanation.
 
-**Why MAX and not MIN.** The scene depth is reversed-Z zero-to-one, so a
+**Why MAX and not MIN** — for the `Closest` reduction, the one the march uses.
+The scene depth is reversed-Z zero-to-one, so a
 *larger* stored value is a *closer* surface. A screen march may skip a whole
 footprint in one step only when the ray is provably in front of everything
 inside it — closer than the footprint's **closest** surface — so a coarse texel
@@ -2655,7 +2875,7 @@ is the one above.
 - **Registry vs catalogue.** These are two files on purpose.
   **`gpu/pipeline_catalog.hpp`** is the catalogue: one `constexpr`
   `PipelineDesc` row per `PipelineType` (67) and one `ComputePipelineDesc` per
-  `ComputePipelineType` (22), carrying the shader pair, the resource counts
+  `ComputePipelineType` (34), carrying the shader pair, the resource counts
   those shaders declare, the vertex layout (`VertexLayout`), the render target
   (`TargetFormat`) and the fixed-function state — cull, blend, the depth
   triple, depth clip, depth bias. `build_pipeline_config(desc, formats)` turns
@@ -2689,11 +2909,54 @@ is the one above.
   — which `set_swapchain_format` now *asks the catalogue*
   (`pipeline_targets_swapchain`) rather than reading from a hand-kept list.
   The registry also caches one `GPUComputePipeline` per `ComputePipelineType`
-  (3: `ExposureHistogram`/`ExposureAdapt`/`WaterSim`) with the same
+  (exposure, water sim, the whole `Rt*` chain, the GI probe and screen-probe
+  passes, the raster-GI `Voxel*` set, `HzbCopy`/`HzbReduce`/`HzbReduceFar`) with the same
   lazy-create / preload / invalidate / hot-reload lifecycle.
   `preload_all_pipelines()` avoids first-use hitches. Lookups are by
   `get_pipeline(PipelineType)` / `get_compute_pipeline(ComputePipelineType)`;
   there are no per-type convenience accessors.
+- **The catalogue is closed for the engine and open at runtime for a host**
+  (`gpu/host_pipeline.hpp`). `register_graphics_pipeline(HostGraphicsPipelineDesc)`
+  / `register_compute_pipeline(HostComputePipelineDesc)` return an opaque,
+  generation-checked handle and participate in **every** lifecycle path the
+  enum does, because both origins share one cache keyed on `PipelineCacheKey`
+  (`{Origin, index}`; a catalogue key and a host key are never equal even when
+  the ordinals match). `preload_all_pipelines` walks the host tables *after* the
+  `preloaded_` latch, so a host rebuild is never logged as an enumeration gap;
+  `invalidate_all` drops both origins in one `clear()` while the host **descs**
+  survive, which is what lets preload rebuild them; `set_swapchain_format` runs
+  a **second, separate** loop over host entries whose `color` or `color2` is
+  `TargetFormat::Swapchain` — deliberately not a widening of
+  `pipeline_targets_swapchain()`, which keeps its enum-only meaning. A host desc
+  that instead sets `color_format_override` to the presentable format has opted
+  **out** of that rebuild: the registry cannot tell that format from any other
+  one the host chose.
+  `pipeline_catalog.{hpp,cpp}` are untouched by all of this — not an enumerator,
+  not a row, not a field — which is why the golden still passes by construction;
+  `PipelineCatalog.GoldenBlockNamesAreExactlyTheCatalogueNames` and
+  `AHostDescMirroringARowProducesTheSameGoldenText` are the two gates that say
+  so mechanically rather than by argument.
+  Refusal contract for both registrars: an **invalid handle**, an ERROR log, and
+  `creation_count()` untouched. **Desc validation runs first**, through the pure
+  `host_pipeline_desc_error` / `host_compute_pipeline_desc_error`, so the reason
+  a malformed desc is refused does not depend on whether the registry happens to
+  have a device — and so every refusal path is reachable from a device-free
+  test.
+- **Shader search roots.** `shader_path_roots_` is a vector whose element 0 is
+  the engine root, **rewritten and never appended** by `init()`, so a game
+  shipping its own `model.frag.spv` can never shadow the catalogue's. Host descs
+  resolve through `resolve_shader_path` (first root where the file exists, ERROR
+  naming the file and the root count when none does); **catalogue rows do not go
+  through it** — they still concatenate `shader_path()` directly, so engine
+  shader resolution is byte-identical to before. `enable_hot_reload` is
+  per-root and idempotent: an already-watched root is skipped (double-watching
+  means two rebuilds per save) and a root whose watch failed is retried next
+  call. `bracken_compile_shaders(<target> DIRECTORY <dir>)` is the CMake half —
+  it stages a host's `.spv` into `shaders_<target>/` next to the exe, never into
+  the engine's own output directory (`gpu/uniform_layout.test.cpp` enumerates
+  that one and fails on a cbuffer it has no row for) and never into `shaders/`
+  (which `bracken_copy_shaders` wipes on every build; `STAGE_DIR "shaders"` is a
+  hard `FATAL_ERROR`).
 - **Compute** (`gpu/gpu_compute.hpp`): `GPUComputePipeline` compiles a
   `.comp.spv` module straight into an `SDL_GPUComputePipeline` via
   SDL_shadercross (there is no `SDL_GPUShader` for compute) and exposes the
@@ -2829,6 +3092,86 @@ the binner itself calls.
   mat4 with engine conventions), `compute_tangents_from_uvs` (for meshes
   missing tangents).
 
+### Terrain paging — `HeightmapGrid`
+
+The world used to be exactly one square heightmap. `Heightmap` was already a
+*tile* type in shape — its own origin, size and quantization range — the engine
+simply never made a second one. `HeightmapGrid`
+(`src/bracken/heightmap_grid.hpp`) is an N×M grid of those pages sharing **one**
+`HeightRange`, and the single-map world every host in this tree still has is a
+1×1 grid: `set_heightmap(map)` is `set_heightmap_grid(HeightmapGrid::from_single(map))`
+and nothing else, which is what keeps the frame bit-identical.
+
+Page (px,pz) covers the **closed** world square
+`[origin + px·page_size, origin + (px+1)·page_size]` on both axes, so adjacent
+pages SHARE their boundary sample line. Seam continuity is therefore a property
+of the authored data plus the shared quantization range, not of any blending at
+sample time — and that is why `validate()` **refuses** a grid whose resident
+pages were packed against different ranges, with **no tolerance** on the range
+comparison, rather than preferring matched ones. The trap it closes is specific:
+`Heightmap::from_floats`'s scanning overload derives its 16-bit range from the
+data it is handed, so two independently authored pages encode their shared
+samples differently and the seam shows a hard step with nothing logged
+anywhere. Build grids with `create` + `set_page`, which packs against the grid's
+range and derives the page's bounds for you. Page *geometry* gets a small
+tolerance (`max(0.01, 1e-5·|reference|)`) because a host may compute
+`origin + px·page_size` by a different but equivalent route; the range does not.
+
+An **absent** page is not an error — it is what a streamed world looks like most
+of the time. It renders as the flat placeholder and samples as the caller's
+`fallback`, and the grid still `valid()`s. `get_normal_world` takes its central
+differences *through* `get_height_world`, so a stencil straddling a seam reads
+both pages.
+
+Nothing loads or unloads pages by distance: a host builds the whole grid up
+front. Part 2 of docs/gap_streaming.md is *asset* residency, not page residency.
+
+### Asset residency — `ResidencyManager`
+
+`AsyncModelLoader` already did the hard half of streaming — decode on the pool,
+budgeted main-thread upload in `pump()` — but nothing above it ever gave
+anything back: `TextureCache` had only `clear()`, `ModelManager` only
+`unload_all()`, and a draw whose model was missing was counted as
+`draws_dropped_unknown_model`, a *bug* diagnosis for what is really a *budget*
+condition.
+
+`ResidencyManager` (`src/bracken/residency_manager.hpp`) is the other half, and
+it is **host-owned and entirely opt-in**: without one, nothing is ever unloaded
+and `draws_deferred_not_resident` is always zero. It holds a byte budget, a
+load/evict band with dead space between the two radii (`wants_load` inside
+`load_radius + cull_radius` inclusive, `outside_evict_band` strictly beyond
+`evict_radius + cull_radius`, and the gap between them is where nothing ever
+happens), a minimum-frames-resident hysteresis, and per-item state
+`Absent → Loading → Resident → Evicted`/`Failed`. `handle(id)` returns the real
+handle when resident and the item's `proxy` otherwise, so a draw loop needs no
+branch. The decision core (`wants_load`, `outside_evict_band`,
+`in_hysteresis_band`, `config_is_valid`, `plan_evictions`) is static and pure,
+which is what makes the band testable with no ModelManager, no job system and
+no GPU.
+
+`pump()` runs at the frame fence (schedule step 2), in order: adopt what the
+loader finished → age the resident set → request what entered the load band
+(nearest first, ties by index) → evict farthest-first while over budget →
+republish stats.
+
+Three supporting changes are worth knowing because each closes a specific hole:
+
+- **`ModelManager::unload_model` keeps the SLOT.** It frees buffers, releases
+  texture references and drops retained CPU geometry, but the handle, the name
+  mapping, the source path, the bounds and the LOD links all survive, and
+  `model_count()` is unchanged — which it must be, because
+  `RtScene::build_blas_for_models` walks `[0, model_count())` and skips a slot
+  whose `Model::loaded` is false. `reupload_model` move-assigns fresh contents
+  into that same slot, preserving the handle and the `Model*`.
+  `AsyncModelLoader::Request::reupload_into` routes a finished decode there
+  instead of to `register_model`, which refuses a name it already knows.
+- **`TextureCache` counts references but does NOT destroy at zero**
+  (`set_destroy_on_release`, default false — see the known-stubs entry).
+- **Eviction must invalidate the acceleration structure and does not do so on
+  its own.** `Application::set_residency` wires the invalidator to
+  `SceneRenderer::invalidate_raytracing_scene()`; a manager with none installed
+  warns once, loudly.
+
 ---
 
 ## Animation
@@ -2859,6 +3202,65 @@ Per-instance, host-driven. Types and constants in
   dropped at load — counted per model and reported in one `ModelLoadReport`
   warning line; a clip that "doesn't play" usually means its
   channels don't drive skinned joints.
+
+### The layer stack — `AnimationRig`
+
+`AnimationPlayer` plays one clip plus a crossfade partner. `AnimationRig`
+(`animation/animation_rig.hpp`) is for a character that needs a **second
+simultaneous animation source** — an upper-body action over locomotion, an
+additive aim offset, a blend space. It is a **new type beside the player, not a
+replacement**: `animation_player.{hpp,cpp}` are byte-for-byte unmodified, and a
+rig holding exactly one `Override` layer at weight 1 with a full mask is
+**bitwise identical** to the player playing the same clip, crossfades included
+(`AnimationRig.SingleOverrideLayerMatchesAnimationPlayerBitwise`).
+
+**The seam it opens is local TRS space, before the hierarchy walk** — the seam
+the engine did not have, because per-joint TRS lived for four statements as
+locals inside `AnimationPlayer::compute_bone_matrices` and was collapsed
+straight to a `mat4`. `pose.hpp` names that intermediate (`BoneTransform`,
+`PoseSpan`/`PoseView`, `BoneMask`, `blend_override`, `blend_additive`,
+`pose_to_matrices`), and everything else composes onto it.
+
+`evaluate()` runs, in order: reset the root delta (so reading it twice cannot
+double-apply) → for each layer **in index order**, advance its clock even when
+muted (a layer faded back in must not resume where it faded out), with layer 0
+writing the composed pose **directly** (its mode/weight/mask are ignored, which
+is what removes the `lerp(x, y, 1.0f)` that would spoil bit-identity) and every
+other layer sampled into `PoseScratch` and composed → extract root motion from
+layer 0 and, when `strip_from_pose`, strip it → `pose_to_matrices` → a
+**shrink-only** tail identity fill, exactly as the player does it. **Layer order
+is a documented contract**, not an accident: swapping two overlapping layers
+changes the result, and a test says so.
+
+Two allocation-shaped facts drive the API's shape, and both are the reason a
+type exists rather than a parameter:
+
+- **`ClipBindings` is per MODEL**, const-shared by every character. It is the
+  clip→joint→channel table; building one per instance would cost 8 KB of
+  pointers per character for an eight-sample blend space at 128 joints.
+- **`PoseScratch` (15,360 B) is per evaluating THREAD**, not per character —
+  one per `parallel_for` chunk. Two rigs sharing one concurrently corrupt each
+  other silently and there is no cheap assert for it.
+
+The contract that follows is flat: **after `bind()` and after any `add_layer` /
+`set_blend_space_*`, `evaluate()` allocates nothing.** `evaluate` runs once per
+animated character per frame on a pool worker, so one heap allocation there is
+not a micro-optimisation problem — it is a lock taken by every character on
+every worker at the same point in the frame. `animation_rig_alloc.test.cpp`
+proves it by replacing the global `operator new`/`operator delete` **for the
+whole `bracken_tests` binary**; that is a link-level commitment, and a second
+such replacement anywhere in the suite is a duplicate-symbol failure.
+
+`clip_sampler.cpp`'s `sample_clip_joint_into` is a **deliberate
+character-for-character duplicate** of the file-static `sample_clip_joint` in
+`animation_player.cpp`, not a refactor of it: moving a function between
+translation units is almost certainly value-neutral, and "almost certainly" is
+what moves a screenshot baseline nobody can re-measure cheaply. The anti-drift
+guard is the bitwise-identity tests above, which `memcmp` 120 frames of both.
+
+Nothing here reaches the frame packet, `ScenePrep`, the renderer or
+`GraphicsSettings`. A rig sits exactly where a player sat: host sim work inside
+`on_simulate`, before foot IK and body lean, before `alloc_bone_palette`.
 
 ---
 
@@ -2918,6 +3320,77 @@ bit-identical results at any worker count (Jolt guarantee, pinned by
 
 ---
 
+## The UI layer
+
+`src/bracken/ui/` is an immediate-mode UI that runs **entirely in the sim
+stage**. It touches no GPU, no SDL and no main-thread API: it measures text
+against a frozen CPU glyph table and emits through
+`scene::FrameBuilder::UiLane` like any other frame content. See
+[gap_ui.md](gap_ui.md) for the widget-by-widget guide;
+`src/bracken/ui/README.md` is the module's own contract page.
+
+**How that claim is enforced.** A tier macro is a debug-only runtime check on
+the callee, and it fires only if some test happens to execute that call on a bad
+thread. "The UI module cannot touch the GPU" is a stronger claim, so
+`ui/ui_purity.test.cpp` makes it directly, as a **source scan**: no file under
+`src/bracken/ui/` may include `bracken/gpu/`, `bracken/render/`,
+`bracken/scene/scene_renderer*`, `SDL3/SDL_gpu.h`, `SDL3/SDL_render.h` or
+SDL_ttf. The same file pins the reverse edge (`render/` never includes `ui/`)
+and that `contracts/font_metrics.*` never reaches back into the renderer that
+produces it.
+
+**Text metrics.** `FontMetrics` (`contracts/font_metrics.hpp`) is one font at
+one size — advances over a dense U+0020–U+024F range plus a sorted sparse
+table, kerning pairs, vertical metrics — exported once on the main thread at
+`init_renderer()` and immutable for the process's life (publication path under
+"`Application` lifecycle"). `TextRenderer::build_string_quads` consumes the same
+table, so a measured width and a drawn string agree to the pixel. Two stated
+limits, neither of which is a divergence between measuring and drawing: kerning
+is exported over the printable-ASCII cross product only (9,025 FreeType lookups
+at init against 313,600 for the dense range), so accented Latin kerns as zero;
+and a codepoint outside the exported range measures — and draws — with
+`fallback_advance`. Both walks are wrong together, which is the only property
+that matters here.
+
+**Textures.** The sim stage may never hold an `SDL_GPUTexture*`, so a UI sprite
+is a `bracken::UiTextureId` (`contracts/ui_texture.hpp`) registered on the main
+thread through `SceneRenderer::register_ui_texture` and resolved on the main
+thread at consume. Ids are **never recycled**: `unregister_ui_texture` clears
+the slot so a stale id resolves to null rather than to somebody else's texture,
+and an unresolvable id draws a solid tint quad counted in
+`FrameDiagnostics::ui_textures_unresolved` — never a silently missing panel.
+
+**Two new packet command streams**, both padding-free by construction:
+`UiTexturedQuadCommand` (40 B — deliberately no wider than `UiButtonCommand`, or
+it would halve the commands per 2048-byte UI chunk for every host) and
+`UiClipCommand` (20 B, its `enabled` a `uint32_t` rather than a `bool`). They
+merge through the existing `ui_commands_` chain with no change to `seal()`. **The
+clip stack is owned by the caller, not by the lane**: a lane that remembered
+clip depth would make the seal merge order-dependent, and the merge is
+(lane-index, emission-order) precisely so a frame is byte-identical at any
+worker count. For the same reason `ui::UiState` keeps its scroll and last-rect
+tables as **sorted vectors, never hash maps**.
+
+**The z-order invariant on the render side.** `UIRenderer::execute` used to run
+two hard phases — every primitive, then every queued text — so a panel recorded
+*after* a label could never cover it. Recording now appends to a
+submission-ordered `ops_` list of `{Geometry|Text, first, count}` spans and
+`execute` walks it, alternating the UI and Text pipeline binds. That walk is
+correct **only if the ops exactly partition both backing vectors, contiguously
+and in order**: a gap silently drops a draw, an overlap draws it twice, and a
+non-monotone `first` reorders the frame — none of which is visible from
+eyeballing the op list, which is why
+`UIRendererOps.OpsExactlyPartitionRangesAndTextDraws` asserts the partition
+directly. A clip change splits a *range* and not an *op* (scissor is not
+pipeline state), and an empty string opens no op at all (an op with
+`count == 0` would bind a pipeline for nothing). The common case is unchanged:
+a HUD that records its panel and then its labels produces exactly two ops — one
+geometry range, one text span — which is byte for byte the command stream it
+always produced. Interleaved content pays one extra pipeline bind per
+alternation.
+
+---
+
 ## Threading & lifetime contracts
 
 Bracken is a **natively multithreaded engine** —
@@ -2940,7 +3413,10 @@ the sim job for the next frame has been joined and the next one is not yet
 kicked, so *nothing* runs concurrently with the main thread. Everything
 that must observe a quiescent engine happens exactly there: hot-reload
 apply (`FileWatcher::poll_main_thread` — epoch reclamation by construction,
-no reader locks), deferred graphics-settings application
+no reader locks), **`ResidencyManager::pump()`** (same point, stronger reason:
+hot-reload replaces a resource's contents, `pump()` can free one, and a packet
+being built or rendered against a freed vertex buffer is a crash rather than a
+stale image), deferred graphics-settings application
 (`request_graphics_settings` — two single-writer slots, sim-phase and
 main-thread/DevUI, main wins), camera-forward feedback into the
 `InputHandler`, FPS accounting, the `on_main_frame` host hook (the only
@@ -2974,8 +3450,18 @@ so here is the mechanism for each claim:
   cover at all — when `JobSystem::wait`'s helping executes a **sim-stage job
   on the main thread** during `join_sim`. Debug builds only.
   `BRACKEN_ASSERT_NOT_SIM_STAGE()` is applied today to `GPUDevice`
-  create/destroy + swapchain acquire, `PipelineRegistry` creation/reload,
-  `ModelManager` mutation, and every `DevUI` entry point.
+  create/destroy + swapchain acquire, `PipelineRegistry` creation/reload **and
+  every host registration path** (`add_shader_search_path`,
+  `register_*_pipeline`, `unregister_pipeline`), every `RenderHookRegistry`
+  mutator, `ModelManager` mutation (including `unload_model` / `reupload_model`),
+  `TextureCache::acquire`/`release`, `UIRenderer::register_texture` /
+  `SceneRenderer::register_ui_texture`, blocking level IO
+  (`save_level`/`load_level`/`export_level`/`ResolvedLevel::resolve`/
+  `missing_models`), and every `DevUI` entry point.
+- A **source scan** is the stronger form of the same claim where one is
+  available, and `ui/` is where it is: see "The UI layer". A tier macro only
+  fires if a test executes that call on a bad thread; a scan covers every line
+  of a module at once.
 - `worker-safe`: nothing to assert — the tier is the absence of a restriction.
 - `owned`: `Arena`/`FrameAllocator` bind a first-toucher owner thread
   (`Arena::assert_owner`, re-openable via `reset()`/`rebind_owner()`).
@@ -3000,10 +3486,10 @@ so here is the mechanism for each claim:
 
 | Tier | Meaning | Members today |
 |---|---|---|
-| `main-thread` | asserted via `BRACKEN_ASSERT_MAIN_THREAD()`; `on_main_frame`/`on_event` and the fence run here with no sim in flight | swapchain acquire, `render_frame`, command submission, ImGui/DevUI, GPU resource creation/destruction (pipeline/shader/model *mutation* paths), `FileWatcher` entry points, the live `InputHandler`, graphics-settings *application* (`apply_all_graphics_settings`/`set_*`) |
-| `sim-stage` | any job within the Simulate stage — `on_simulate` and everything it fans out to; **live**: this tier now runs concurrently with frame i's rendering | `SimFrame` (its `parallel_for`/`run_async`/`set_camera_forward`), `FrameBuilder` emission (multi-lane: `FramePacket::reserve_block` / `take_palette_slot` are safe from any fill-stage thread; singular setters like `set_camera` are single-writer), `AnimationPlayer`/IK as host sim work, `EffectSystem` (sim-stage **owned**: engine-driven from the sim-job tail), `Application::camera()` under `run()`, `request_graphics_settings` / `edit_graphics_settings` (single writer per phase; do not hold an edit handle across a frame boundary), `request_screenshot` |
-| `worker-safe` | callable from any thread, any time | `Logger`, `JobSystem` submit/wait, `TaskGroup`, `parallel_for`, `Application::quit()`, pipeline/shader/model **lookups** (read-only after init-time pre-creation), `get_terrain_height` (const reads of the immutable heightmap), **`FramePacket` reads after seal** (plain loads, no atomics on the read path) |
-| `owned` | single owner at a time; debug-asserted (owner binding for arenas, overlap detection for lanes — see above) | `Arena`, `FrameAllocator`, per-worker scratch arenas, a `FrameBuilder::Lane` (one thread at a time), a `FramePacket` during fill (per-lane) |
+| `main-thread` | asserted via `BRACKEN_ASSERT_MAIN_THREAD()`; `on_main_frame`/`on_event` and the fence run here with no sim in flight | swapchain acquire, `render_frame`, command submission, ImGui/DevUI, GPU resource creation/destruction (pipeline/shader/model *mutation* paths), `FileWatcher` entry points, the live `InputHandler`, graphics-settings *application* (`apply_all_graphics_settings`/`set_*`); **new**: `PipelineRegistry::add_shader_search_path` / `register_graphics_pipeline` / `register_compute_pipeline` / `unregister_pipeline`, `RenderHookRegistry::add`/`remove`/`clear` (plus a `BRACKEN_CONTRACT(!is_dispatching())`), `run_render_hooks` and every host callback it invokes, `ResidencyManager::add`/`set_config`/`set_geometry_invalidator`/`pump` (`pump` additionally requires the frame fence), `ModelManager::unload_model`/`reupload_model`, `TextureCache::acquire`/`release`, `TerrainRenderer::set_heightmap_grid` and everything it builds, `SceneRenderer::register_ui_texture`/`unregister_ui_texture`/`font_metrics`, `TextRenderer::export_metrics` |
+| `sim-stage` | any job within the Simulate stage — `on_simulate` and everything it fans out to; **live**: this tier now runs concurrently with frame i's rendering | `SimFrame` (its `parallel_for`/`run_async`/`set_camera_forward`), `FrameBuilder` emission (multi-lane: `FramePacket::reserve_block` / `take_palette_slot` are safe from any fill-stage thread; singular setters like `set_camera` are single-writer), `AnimationPlayer`/`AnimationRig`/IK as host sim work, `EffectSystem` (sim-stage **owned**: engine-driven from the sim-job tail), `Application::camera()` under `run()`, `request_graphics_settings` / `edit_graphics_settings` (single writer per phase; do not hold an edit handle across a frame boundary), `request_screenshot`; **new**: `UiLane::add_textured_quad`/`set_clip`, `ResolvedLevel::emit` (one loop of `FrameSink::draw_model`) |
+| `worker-safe` | callable from any thread, any time | `Logger`, `JobSystem` submit/wait, `TaskGroup`, `parallel_for`, `Application::quit()`, pipeline/shader/model **lookups** (read-only after init-time pre-creation — including `get_pipeline(HostPipelineHandle)`, which deliberately does NOT fall back to creation the way the enum overload does), `get_terrain_height` and every `HeightmapGrid` const sampler (`get_height_world`, `get_normal_world`, `page_at`, `resident_at` — const reads of an immutable value, which is what keeps terrain height callable from `on_simulate`), **`FramePacket` reads after seal** (plain loads, no atomics on the read path); **new**: `FontMetrics` after export and `SimFrame::font_metrics()`, `ResidencyManager::set_viewer` (three relaxed atomic stores) and its `handle`/`resident`/`state`/`stats` reads (safe from `on_simulate` because the fence and the sim never overlap), `serialize_level`/`parse_level`/`scatter_ground_cover`/`verify_level_roundtrip` (pure, no filesystem), `ClipBindings` once built, `BlendSpace1D`/`2D::resolve`, `blend_override`/`blend_additive`/`pose_to_matrices`/root-motion extraction |
+| `owned` | single owner at a time; debug-asserted (owner binding for arenas, overlap detection for lanes — see above) | `Arena`, `FrameAllocator`, per-worker scratch arenas, a `FrameBuilder::Lane` (one thread at a time), a `FramePacket` during fill (per-lane); **new**: a `ui::Context` (one per surface, driven from ONE sim job — it emits into one lane, and a lane aborts on overlap), a `Level` under construction, an `AnimationRig`'s setup calls (`bind`, `add_layer`, `set_blend_space_*` — the calls that allocate), a `ClipSampler`, and **`PoseScratch`, which is per evaluating THREAD rather than per character**: two rigs sharing one concurrently corrupt each other silently and there is no cheap assert for it |
 
 Facade members safe to *read* from sim code because they are only written
 at the fence / event pump (never while a sim is in flight): `fps()`,
@@ -3096,6 +3582,18 @@ contract, §6.2 of the plan):
   sites pass `JobSystem::instance()`), so parity tests can construct
   caller-owned pools (`init(1)` vs `init(4)`) and assert bit-identical
   outputs per stage.
+
+**The occlusion field lands on the right side of that rule, and the design that
+would have broken it is the obvious one.** `PrepParams::occlusion` is a
+frame-constant, read-only pointer — exactly like `main_frustum` — so the
+per-command predicate stays a pure function of (command, params) and the chunked
+walk still reproduces the serial one byte for byte. A per-instance "was visible
+last frame" latch is the natural way to write this feature and is deliberately
+**absent**: chunk order would decide who writes it.
+`scene/scene_prep_parity.test.cpp` re-runs the whole 0/1/4-worker memcmp with a
+populated field at four depths, plus an explicit-null run reproducing the
+baseline exactly. The same reasoning is why the readback fence is waited on
+deterministically rather than polled (see "Which passes run this frame").
 
 The renderer's prep cores are covered by two test files with deliberately
 different jobs, and both are needed:
@@ -3208,6 +3706,46 @@ that never brought up a renderer).
   lock-free relaxed load of an atomic level.
 - GPU resource owners (`PipelineRegistry`, buffers, textures) are
   non-copyable/non-movable and must be destroyed before the `GPUDevice`.
+- **A host `GPUPipeline*` from `get_pipeline(HostPipelineHandle)` dies on
+  `invalidate_all()`, `reload_all_pipelines()` (i.e. any shader hot reload) and
+  on a swapchain-format change.** Re-fetch by handle every frame, exactly as
+  every engine call site re-fetches by enum. Caching the pointer at init works
+  perfectly until somebody saves a `.spv`. The registry keeps each host **desc**
+  by value — that copy is what makes rebuild-after-invalidation possible, and it
+  is why `HostGraphicsPipelineDesc` owns `std::string`s where `PipelineDesc`
+  holds non-owning `const char*`. Releasing a registration bumps the slot's
+  generation, so a retained handle validates false rather than aliasing whatever
+  takes the slot next.
+- **Every pointer in a `RenderHookContext` is frame-scoped** and must not be
+  cached: the offscreen targets are recreated on resize and the swapchain
+  texture is a different image every frame. A hook `Entry` itself is
+  heap-allocated with a stable address for its whole life, because
+  `entry->name.c_str()` is handed to `BRACKEN_GPU_SCOPE`, which reads the label
+  synchronously; `BRACKEN_GPU_TIMER` needs more and gets `entry->stable_name`,
+  interned in a set the registry never erases (see "Host render passes").
+- **`ResidencyManager` is host-owned**, must outlive the `set_residency`
+  detach, and holds its `AsyncModelLoader` by reference — so the loader must
+  outlive the manager. An evicted model's `Model*` stays valid (that is the
+  point of keeping the slot); pointers *into* it — meshes, vertices, GPU
+  buffers — do not.
+- **A `HeightmapGrid` is copied into the renderer** by `set_heightmap_grid`;
+  the caller's copy is theirs. `TerrainPage` owns its buffers and texture and
+  `pages_` is rebuilt wholesale on every install, so a page pointer never
+  outlives a grid change; `heightmap_texture()` is NON-owning and is re-fetched
+  after each install.
+- **`Level` owns every byte it holds** and `ResolvedLevel` holds no pointer into
+  the `Level` it was resolved from, so the level may be destroyed after
+  resolution. `Level::extras()` is a `SaveDocument` by value.
+- **`LayerDesc::joint_weights` stores a SPAN, not a copy** — a local feather
+  array dangles the moment the setup function returns, and no lifetime check is
+  possible. `ClipBindings` **aliases the model's clip vector**, so it must be
+  rebuilt if the model is reloaded and must outlive every rig bound to it.
+  `AnimationRig` is move-only for the same reason `AnimationPlayer` is: a copied
+  rig would share keyframe cursors with the original.
+- **`ui::Context` copies every declared string into its own arena at declaration
+  time**, so `label(std::format(...))` — whose temporary dies at the end of the
+  full expression — is safe; `UiLane::add_text` then copies again into the packet
+  arena. No new frame-packet lifetime exception is added by the UI layer.
 
 ### Determinism
 
@@ -3238,6 +3776,18 @@ is a review defect, as is a mutex anywhere in the frame hot path (plan §7).
 | `EXPOSURE_MIN/MAX_LOG2_LUMA` | −10 / +16 | `render/auto_exposure.hpp` | metered luminance range (EV); bin 0 collects everything below |
 | default world size | 32000 × 32000 | `application.hpp::init_renderer` | terrain/grass extent defaults |
 | swapchain / scene / depth formats | RGBA8 / RGBA16F / D32 | `gpu/pipeline_registry.hpp` | see GPU layer above |
+| `k_render_hook_slot_count` | 5 | `scene/render_hook.hpp` | **not a budget** — the number of named points in `render_frame` where a host pass can run. There is no cap on host pipelines or host hooks: both are host-lifetime registrations with no fixed-size GPU table behind them, so a cap would be a number with nothing to justify it. Adding a slot means adding a guarded call site |
+| `k_occlusion_level` | 4 | `scene/scene_renderer.hpp` | the Hi-Z mip the CPU occlusion cull downloads — 100×57 floats (23 KB) at 1600×900, small enough that the download and footprint walk are trivial while a prop still covers a texel or two. **Not measured** |
+| `OcclusionField` conservatism knobs | `max_tested_screen_fraction` 0.15, `max_camera_travel` 250, `min_camera_rotation_cos` 0.99905 (cos 2.5°), `depth_slack` 0 | `contracts/occlusion.hpp` | **all four are unmeasured guesses**, and the first is the occluder-feedback guard (an object culled this frame writes no prepass depth, so it cannot occlude next frame — free for a pebble, an oscillation for a cathedral). Measuring the screen-fraction knee is the first thing to do before this feature is ever defaulted on |
+| `ResidencyManager::Config` defaults | 512 MB budget, load 4000 / evict 6000, 120 frames minimum residency, 2 uploads / 4 requests / 4 evicts per pump | `residency_manager.hpp` | every one a plausible starting value, **none measured**. `evict_radius > load_radius` is required — `set_config` refuses otherwise rather than clamping, because a silently clamped band thrashes anyway |
+| `HeightmapGrid::k_recommended_min_page_size` | 2000.0 | `heightmap_grid.hpp` | advisory, not enforced: `TerrainRenderer::set_heightmap_grid` warns below it. Tile runs never merge across pages (each page owns its index buffer), so every frustum-intersecting page costs at least one draw in each of the six terrain walks a frame (main + prepass + 4 cascades). `TerrainRenderer::k_page_margin = 500` is the terrain skirt, applied only on the grid's OUTER edges; `k_grass_proxy_max_resolution = 1024` caps the paged-world grass proxy |
+| `k_max_animation_layers` | 8 | `animation/animation_rig.hpp` | layers per `AnimationRig`. The extent of a fixed array inside every rig, so raising it costs ~704 B per extra slot in every rig whether the layers are used or not |
+| `k_max_blend_samples` | 8 | `animation/blend_space.hpp` | samples per blend space. Bounds the 2D gradient-band estimator's O(n²) inner loop (8 samples → 56 pair evaluations per resolve, per layer, per character) **and** the `ClipSampler` array a layer holds |
+| `k_level_format_version` | 1 | `scene/level.hpp` | the level SCHEMA version, distinct from `save::k_save_format_version` (the container's). Bump only when the record set changes shape in a way an older build cannot ignore — adding a key does not, growing a table's stride does not. Row strides ARE the format: `LevelInstance` 52 B, `LevelMarker` 20 B, `LevelRect` 16 B, `LevelWater` 124 B, `LevelScatterModel` 16 B, `LevelScatterRule` 48 B, all `static_assert`ed padding-free and **append-only** |
+| level loader ceilings | `k_max_name_table_rows` 65536, `k_max_table_rows` 2²¹, `k_max_terrain_resolution` 8192, `k_max_nav_cells` 4194304, `k_max_scatter_cells_per_axis` 8192, `k_max_scatter_instances` 1048576 | `scene/level.hpp` | all of them the answer to "what stops a hostile file allocating". `k_max_table_rows` is the least obvious and the most necessary: the stride comes from the file too, so a declared stride of 1 would turn a 10 MB blob into ten million 52-byte rows. Every one is a refusal with a named `LevelError`, never a truncation |
+| `FontMetrics::k_first_cp` / `k_last_cp` | 0x20 / 0x24F (560 dense advances) | `contracts/font_metrics.hpp` | the exported glyph range. Outside it a codepoint measures **and draws** with `fallback_advance` — both walks wrong together, which is the only property that matters. Kerning is exported over printable ASCII only (9,025 lookups against 313,600), so accented Latin kerns as zero |
+| `LayoutTree::k_max_depth` | 64 | `ui/layout.hpp` | container nesting. Boxes opened past it are discarded and counted; their `end_box` is absorbed so the tree stays well-formed |
+| `ContextConfig::retain_frames` | 120 | `ui/ui_context.hpp` | how long a retained widget entry survives after it stops being declared — what bounds the unstable-id leak (see the known-stubs entry) |
 
 `shadowEnabled` in `ShadowDataUniforms` is a mode, not a bool: `0` off,
 `1` PCF, `2` PCSS (`gpu/gpu_uniforms.hpp`).
@@ -3337,3 +3887,131 @@ debugging "why is this value zero / where did my draw go":
 - **`render_graph/` is not in the frame path** — `SceneRenderer` issues passes
   directly. The graph is kept (with its tests) for when pass count or
   transient aliasing justifies it.
+- **Hi-Z occlusion culling is conservative for a STILL camera and a HEURISTIC
+  for a moving one**, which is why `GraphicsSettings::occlusion_culling`
+  defaults to **off**. The depth it tests is a frame old by construction —
+  Prepare runs before this frame's prepass and SDL3 has no non-blocking map — so
+  a box the previous view hid may be visible now, and no amount of inflating the
+  box fixes that: the box did not move, the camera did. A moving OCCLUDER has
+  the same problem in the other direction. `camera_travel` inflation,
+  `max_camera_travel` and `min_camera_rotation_cos` bound the error; they do not
+  eliminate it, and all three are unmeasured guesses. **Judge it by a PIXEL-WISE
+  screenshot diff against the off run, never by `mean_luma`** — a correct
+  occlusion cull removes only invisible draws, so any pixel difference is a
+  false cull, and a missing prop behind a wall is a few hundred pixels, which
+  the mean is structurally blind to. On the playground smoke frame,
+  `PLAYGROUND_OCCLUSION=1` culls **105 of 464** entities and produces a
+  bit-identical image. `render_stats()->entities_occlusion_culled` is the
+  readout; zero in a dense scene means the depth never arrived (the first frame
+  after enabling, after a resize, or a frame whose prepass did not run), not
+  that there was nothing to cull.
+- **`TextureCache` counts references but does not destroy at zero.**
+  `set_destroy_on_release` is **off by default**, so an eviction returns
+  geometry VRAM and NOT image VRAM. The reason is not caution for its own sake:
+  `Mesh` and `PBRMaterial` hold four non-owning `gpu::GPUTexture*` each and
+  there is no central registry of who borrowed what, so one missed
+  acquire/release pairing with destruction ON leaves a live descriptor pointing
+  at a freed texture — a GPU fault or garbage pixels three subsystems away, not
+  an assert. With destruction off the counts are exact and observable, so a
+  project can verify its own pairing on its own content before flipping the
+  switch, and leaving it off reproduces the never-evicted behaviour byte for
+  byte.
+- **`ModelManager::unload_model` does not follow the LOD chain.** LOD levels are
+  separate models with their own handles, so evicting a base leaves its levels
+  resident; a host that wants the chain gone must evict each handle. The slot,
+  name, bounds and LOD links survive an unload on purpose — `model_count()` must
+  not change, because `RtScene::build_blas_for_models` is indexed from 0 to it.
+- **Grass follows a SMOOTHED terrain on a paged world.**
+  `shaders/grass_blade.hlsli` hard-codes one height texture, one origin and one
+  square world size, and the matching `HeightmapParams` offsets are
+  static-asserted on the CPU side and SPIR-V-reflected by the uniform-layout
+  test. Rather than move that cbuffer, a paged grid feeds grass a coarse
+  world-spanning R16 **proxy** (≤ 1024², resampled through the grid sampler). A
+  **1×1 grid does not use the proxy at all** and binds the page's own texture
+  with the map's own five scalars — i.e. exactly the pre-paging behaviour.
+  Per-page grass sampling wants a `Texture2DArray` plus a page index, which is a
+  two-sided cbuffer change.
+- **A render hook that leaves a pass open corrupts the rest of the frame.**
+  SDL3 GPU cannot be asked whether a pass is open, so the failure surfaces
+  inside the driver, in a later engine pass, with nothing pointing at the host
+  callback. Every `RenderHookSlot` fires with no pass open and must return that
+  way.
+- **`testing::TestFrame::digest()` folds only the streams that existed when it
+  was written.** It covers draws, skinned draws (palette id plus the palette's
+  own matrices), lights, billboards, debug lines, effect spawns, UI commands
+  including the text bytes, shadow capsules, the camera, the environment, the
+  three world-element toggles and the build diagnostics, all in packet order and
+  with floats folded by **bit pattern** (so `-0.0f` and `0.0f` are different
+  frames and a NaN tint surfaces rather than smoothing away). Deliberately NOT
+  folded: the engine-stamped timing/clock section and the effect-instance
+  snapshot derived from it (functions of wall clock, not of what the host
+  asked for), and the *value* of the two host-owned definition pointers — only
+  their null-ness, because an address is not stable across runs. A feature that
+  adds a new command stream to `FramePacket` and does not extend `digest()`
+  leaves it silently blind to that stream; extend it in the same change.
+- **A level file stores model NAMES, and `LevelError::BadValue` is the refusal
+  that surprises people.** `ModelHandle` is a dense registration-order index, so
+  two runs that register the same models in different orders produce different
+  handles, a different `FramePacket` digest, and a pixel-identical image — if a
+  digest comparison fails and the screenshot does not move, check registration
+  order first. And a NaN encodes perfectly well, so a broken authoring step
+  writes a file that saves cleanly and is refused on the way back IN; that is
+  why `export_level` runs `verify_level_roundtrip` before it writes, and why
+  `playground --export-level` exits non-zero rather than shipping the file.
+  The round trip is proven end to end on the village: `--export-level` writes
+  it, `--level` loads it, both render bit-identically at `FramePacket` digest
+  `0xc9d841c985f27a13`.
+- **The UI hit-tests against LAST frame's rectangle.** `ui::Context::button`
+  returns its result at the call site, which is *before* the layout solve, so a
+  widget cannot be clicked on the first frame it exists and a widget that moved
+  between frames is clicked where it was. One frame, on top of the one the
+  render pipeline already has. Returning results from `end()` instead would make
+  the call site unable to branch on a click, which is the point of immediate
+  mode. Focus resolves at `end()` for the same reason (it needs solved
+  rectangles), so anything a widget draws *because* it is focused appears from
+  the frame after the navigation key.
+- **A widget id that changes every frame leaks — with a ceiling.** An id derived
+  from a formatted string containing the frame index resets that widget's state
+  every frame *and* retains one entry per frame; retention is bounded by
+  `ContextConfig::retain_frames`, so the leak has a ceiling, and
+  `ui::Context::Diagnostics::retained_entries` is the instrument. A focus that
+  stops naming a declared widget is **dropped**, not kept: `end()` sets
+  `capture().keyboard` from the focused id, so a ghost focus would silence the
+  host's entire keyboard channel for the rest of the process with nothing on
+  screen to explain it.
+- **`InputSnapshot::controller_primary`/`controller_secondary` are polled
+  LEVELS, not edges**, and are only meaningful to a menu while
+  `set_game_input_enabled(false)`. Anything treating them as "the player pressed
+  A" fires once per frame for as long as the button is held. The `pad_*_pressed`
+  / `pad_nav_*` fields beside them are one-per-press edges, ungated by the
+  game-input mode — which is what makes a HUD navigable while the game is
+  running — and are what `ui::InputFrame::from_snapshot` maps. There is
+  deliberately no hold-to-repeat: one flick is one step, and repeat rate is a
+  policy a menu owns.
+- **Root motion has no data in this tree, and enabling it on the shipped
+  character will freeze him.** No clip here carries horizontal root
+  translation — the playground's only hips channel is a vertical bob and its XZ
+  motion comes from the physics character controller — and glTF root motion is
+  conventionally authored on an Armature node *above* the skin, where
+  `ModelLoader` drops it (counted in `ModelLoadReport::channels_non_skin_node`).
+  `AnimationRig` never moves anything either: `root_motion()` returns a delta
+  the host must consume, and leaving `strip_from_pose` off makes the character
+  travel at double speed.
+- **A `BlendSpace2D` is exact at its samples and C0 between them, but not C1.**
+  The gradient-band estimator's `min()` over pair constraints creates a crease
+  wherever the binding constraint changes, so a character crossing one gets a
+  kink rather than a smooth roll. Inherent to the technique (Unity ships the
+  same artifact) and the price of not maintaining a triangulation; the polar
+  formulation is additionally singular at the origin. Root rotation for a
+  blend-space base layer comes from the **dominant** sample and is therefore
+  discontinuous when the dominant sample changes — a slerp chain over an
+  unordered active set has no canonical order.
+- **A blend-space layer's clock is unbounded.** A `Clip` layer's `time` is
+  wrapped into `[0, duration)` every frame; a blend-space layer's is not,
+  because the per-sample times are derived from it. The phase advance is read
+  from `Clock::advance` (the stored `dt * speed`) rather than reconstructed as
+  a difference of two growing floats, which is what keeps it correct at an aged
+  clock — but `fmod(time, duration)` on a non-synced layer still degrades: at
+  ten hours of play float spacing at t ≈ 36,000 is 3.9e-3 against a 16.7 ms
+  frame. Nobody will see it in a session and nothing in this tree runs a
+  blend-space layer, but it is a real ceiling.
