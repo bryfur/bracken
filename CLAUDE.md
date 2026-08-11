@@ -150,7 +150,7 @@ evaluate an emissive triangle; under `Ratio` emissive surfaces still glow and
 still feed GI, but cast no direct shadow. Reflection and probe rays shade their hits through ONE shared include, `shaders/rt_hit_shade.hlsli` (CSM-shadowed sun + the frame's local lights + probe-field ambient, hemisphere where the field has no answer, **plus the surface's own emission**, which is what makes bounce FROM emissives fall out of the existing probe recursion). **SDL3 GPU has no hardware ray tracing**, so the acceleration structure is the engine's own. Both signals are **stochastic** — the sun ray is jittered across the solar disk (soft shadows), the reflection ray importance-samples the GGX lobe — at one sample per pixel per frame, so the denoisers (`shaders/rt_shadow_denoise_*.comp.hlsl`, `rt_reflection_denoise_temporal.comp.hlsl`) are load-bearing, not polish. The TLAS is rebuilt only when the instance SET changes (count/handle-sequence hash); an instance that merely moved costs a bottom-up **refit** of the existing tree instead (`refit_tlas`, quality-gated on `sah_cost`), which is what keeps a live scene off the main thread. **Skinned meshes are split by signal (§5.8)**: their BLAS is the bind pose, so the ANY-HIT walks flag and skip them and trace the frame's per-bone `ShadowCapsule` set instead (`contracts/shadow_capsule.hpp`, emitted by the host through `FrameSink::add_shadow_capsules`, intersection mirrored between `render/raytracing/capsule_occluder.hpp` and `shaders/rt_trace.hlsli`), while CLOSEST-HIT walks keep the bind-pose triangles so characters stay in reflections and probes. A skinned draw with no capsules casts NO traced shadow — the bind-pose fallback was removed, not retained. Both features off by default and independently switchable (`rt_shadows`, `rt_reflections`) |
 | `render/gi/` | `render::gi` | probe-field global illumination (phase R1 of `docs/rt_lighting_plan.md`). `ProbeVolume` (`render/gi/probe_volume.hpp`) owns three camera-scrolled cascades of octahedral irradiance + visibility atlases (24x12x24 probes, spacing 150/300/600 world units, ~30 MB); `gi_math.hpp` is the header-only CPU source of truth for everything the GI shaders mirror — addressing, ray directions, the blend curve, and the sampler's cascade/weight math. **Complete as of R1c**: the field traces and accumulates itself, and `shaders/gi_sample.hlsli` replaces the DIFFUSE half of the ambient term in every scene fragment shader (three banded atlases, three sampler slots) plus the volumetric fog's in-scatter. Off by default (`gi_mode`); GI on builds the ray-tracing acceleration structure with attributes |
 | `render_graph/` | `render_graph` | pass scheduling (topo-sort, transient pool). **In-tree + tested but not wired into the renderer** — see design notes |
-| `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator), `RenderHookRegistry` (`render_hook.hpp` — host render passes: ordered, many per slot, at five named points in the frame; replaces the single-slot `set_post_ui_callback`, which `Application::init_dev_ui` already owned) |
+| `scene/` | `bracken::scene` | transforms, motion history, `FramePacket` (immutable per-frame command snapshot) + `FrameBuilder` (the only write interface) + `FrameSink` (its host-facing half, what `SimFrame::frame()` returns) + `DrawFlags` + `PacketRing` (SPSC packet ring), `RenderPlan` (which passes run this frame — pure, tested headless), `ScenePrep` (the Prepare-stage tier boundary as a type: device-free, stateless, cannot reach a main-thread API), `SceneRenderer` (frame orchestrator), `Level` (`scene/level.hpp` — a level as DATA: placed instances, lights, terrain block, water regions, named markers and procedural scatter RULES-plus-seed rather than their 1921 outputs; versioned, checksummed, atomically written, and unknown chunks round-trip. `export_level`/`load_level` and a text dump; the playground's village round-trips to a file and back to a BIT-IDENTICAL FramePacket digest), `RenderHookRegistry` (`render_hook.hpp` — host render passes: ordered, many per slot, at five named points in the frame; replaces the single-slot `set_post_ui_callback`, which `Application::init_dev_ui` already owned) |
 | `animation/` | `bracken::animation` | GLB skeleton, `AnimationPlayer` (crossfade), data-driven state machine, two-bone IK — **plus a layer stack**: `AnimationRig` composes up to `k_max_animation_layers` weighted, `BoneMask`-masked `Override`/`Additive` layers onto a base pose in local TRS space (`pose.hpp` is the pose value type the engine never had; the three pose buffers a composition needs live in a caller-supplied `PoseScratch`, one per evaluating THREAD, not per character), each layer driven by a clip or by a 1D/2D blend space (`blend_space.hpp`; the 2D one is gradient-band freeform directional, C0 but **not** C1), then run through the same hierarchy walk the player uses. `root_motion.hpp` extracts the root/hips delta for the host to apply and strips it from the pose — **no clip in this tree carries usable root motion**, so it is validated against synthetic data only. `AnimationPlayer` is **not** deprecated: it is the one-clip fast path, and a rig with one full-weight Override layer is **bitwise** identical to it (`animation_rig.test.cpp` memcmps 120 frames — that gate is what keeps the screenshot pins from moving) |
 | `systems/` | `bracken::systems` | camera controller/system |
 | `effects/` | *(namespaces unchanged)* | the particle-effect triad in one place: `effect_definition.hpp` (authoring data), `EffectSystem` (sim-stage owned: spawned/updated/snapshotted inside the sim job), `EffectRenderer` (draws the packet snapshot) |
@@ -159,6 +159,7 @@ still feed GI, but cast no direct shadow. Reflection and probe rays shade their 
 | `save/` | `bracken::save` | `SaveDocument` — path-addressed typed records, so schema changes never invalidate old saves; unknown keys round-trip; **atomic** write (temp + rename) + checksum, so an interrupted save cannot corrupt the previous one |
 | `navigation/` | `bracken::nav` | `NavGrid` — walkability from a height function + A* with string-pulled paths. A grid, not a polygon navmesh: built from the height function the engine already has, and honest about its limit (one height per cell, so no bridges over roads) |
 | `physics/` | `bracken::physics` | `PhysicsWorld` — rigid-body physics over vendored **Jolt** (pimpl; Jolt never appears in a public header). Fixed-step accumulator `update()` (tier owned/sim-stage), sphere/box/capsule/heightfield bodies, ray casts; Jolt's step jobs run on the engine `JobSystem` via the `JoltJobSystem` bridge in **`physics/internal/`** — one pool owns the cores |
+| `ui/` | `bracken::ui` | the immediate-mode UI **system** over `render/ui_renderer`'s primitives: a layout solver (row/column/stack/grid; padding, spacing, alignment, fixed/flex/content sizing), stable widget ids with hot/active/focus persisted in a host-owned `UiState`, focus navigation by keyboard AND gamepad, scroll containers with real clipping (a packet clip command honoured by a scissor — there used to be exactly one full-screen scissor per frame), nine-slice sprites, and input routing so the UI consumes an event before the game sees it. Runs in the **sim stage** and touches no GPU or SDL API, which is why content sizing needs `contracts/font_metrics.hpp` — an immutable CPU-side glyph-advance table published at font load, because the real metrics live behind the main-thread `TTF_Font*` and `add_text_wrapped` was guessing at `8px * scale` per character |
 | `dev/` | `bracken::dev` | `DevUI` Dear ImGui developer overlay (F10 in the playground; no-op stub when `BRACKEN_ENABLE_DEV_UI=OFF`) + `dev_panels` (built-in Stats/Environment/Graphics/Camera panels). ImGui appears only in `dev/*.cpp` |
 | `testing/` | `bracken::testing` | `frame_test.hpp` — `TestFrame` + `FrameAccess`, published **for host games** to unit-test their frame code with no GPU/window/SDL. Header-only; nothing in the engine's production path includes it |
 | `shaders/` | — | HLSL sources, compiled to SPIR-V at build time |
@@ -380,6 +381,23 @@ draws it.
   summarized in one `ModelLoadReport` line per model since phase 4) at load.
   (`Mesh::near_only` was deleted in phase 9 — it was a hint the draw walk
   never read.)
+- **`quit()` from `on_init` is honoured** (it is latched, and `run()` returns
+  without simulating a frame). It was silently erased before 2026-08-10 —
+  `run()` stores `running_ = true` at entry — so a one-shot CLI host that did
+  its work in `on_init` and asked to quit ran forever. `playground
+  --export-level` was exactly that host.
+- **A host render pass goes through `scene/render_hook.hpp`, not
+  `set_post_ui_callback`.** That callback is a SINGLE slot and
+  `Application::init_dev_ui` already owns it, so a host that took it silently
+  disabled the dev overlay. The registry is ordered, many-per-slot, and counts
+  what it could not run in `RenderStats::diagnostics.render_hooks_skipped` —
+  the four HDR slots have no targets on the fallback direct-to-swapchain path.
+- **The engine's CPU-side NDC→UV mapping flips Y** (`0.5 - ndc.y * 0.5`;
+  `render/taa.hpp:51`, `contracts/occlusion.cpp`). glm under
+  `GLM_FORCE_DEPTH_ZERO_TO_ONE` leaves NDC +Y up, and texel row 0 of a copied
+  depth target is the TOP of the frame. Getting it backwards mirrors a screen
+  footprint about the horizon and fails silently — see the occlusion note in
+  the baselines section.
 - `render_graph/` is not in the frame path — don't route the renderer through
   it without a measured reason (design notes explain why).
 - A number measured in a default `build/` is not a performance number: no
@@ -442,6 +460,12 @@ to a no-op stub and skips fetching ImGui), `BRACKEN_ENABLE_TRACY`
 `add_subdirectory` — warnings are applied PRIVATE so a consuming game never
 inherits them; see `cmake/BrackenWarnings.cmake`).
 Env: `BRACKEN_HOT_RELOAD=1` enables the file watcher + model/shader hot-reload.
+`PLAYGROUND_OCCLUSION=1` turns the default-off Hi-Z draw occlusion cull on for a
+run (`occl_culled=` in the smoke line); `PLAYGROUND_CUSTOM_PASS=1` installs the
+worked host-pipeline + host-HLSL + render-hook example. `playground
+--export-level <path>` writes the village as a `.level` (plus a readable `.txt`
+dump) and exits; `--level <path>` renders from one; `--dump-level <path>`
+inspects one without a display.
 `BRACKEN_WORKERS=<n>` sets the job-system worker count (unset/0 =
 `hardware_concurrency()-1`, min 1; `=1` is the single-worker debug mode —
 same code path, one worker).
@@ -592,23 +616,54 @@ past `far/2` — is closed. The formula now lives in exactly one place,
 RelWithDebInfo, 3-run identical), and the whole eleven-row matrix is here rather
 than spread over the historical tables above:
 
-| Invocation (`--smoke 30`) | at Q1 | at Q2 (alpha cutout) | **at the lighting pass (2026-08-09)** |
+| Invocation (`--smoke 30`) | at Q2 (alpha cutout) | at the lighting pass (2026-08-09) | **at the gap package (2026-08-10)** |
 |---|---|---|---|
-| RT off | `86.3 / 45.5` | `86.3 / 45.5` | `86.3 / 45.6` |
-| `PLAYGROUND_AO=0` | `87.0 / 44.5` | `87.0 / 44.5` | `86.9 / 44.7` |
-| `PLAYGROUND_AO=2` | `86.0 / 45.7` | `86.0 / 45.7` | `86.0 / 45.8` |
-| `PLAYGROUND_RT=both` | `83.6 / 48.3` | `84.5 / 47.4` | `84.7 / 47.4` |
-| `PLAYGROUND_GI=probes` | `84.6 / 46.8` | `84.6 / 46.8` | `84.9 / 46.8` |
-| `RT=both GI=probes` | `81.8 / 49.9` | `82.7 / 48.9` | `83.2 / 48.8` |
-| `RT=both GI=probes_screen` | `81.6 / 51.1` | `82.6 / 50.1` | `82.8 / 50.1` |
-| `RT=both RT_LOCAL=ratio` | `85.2 / 47.5` | `86.2 / 46.5` | `86.3 / 46.5` |
-| `RT=both RT_LOCAL=full` | `85.5 / 47.2` | `86.5 / 46.2` | `86.7 / 46.2` |
-| `RT=shadows RT_LOCAL=full` | — | — | `86.7 / 46.2` **(new row — see below)** |
-| `PLAYGROUND_GI=voxel` | — | `81.5 / 48.3` | **`84.8 / 46.0`** |
-| night, `TOD_HOUR=1 … ratio` | `35.3 / 56.8` | `35.3 / 56.8` | `38.5 / 59.4` |
-| night, `TOD_HOUR=1 … full` | `35.5 / 53.9` | `35.6 / 53.7` | `38.7 / 56.2` |
-| night, `TOD_HOUR=1 GI=voxel` | — | `50.9 / 71.8` | **`64.2 / 68.6`** |
-| night, `TOD_HOUR=1 GI=off` | — | `35.8 / 59.8` | `38.5 / 62.0` |
+| RT off | `86.3 / 45.5` | `86.3 / 45.6` | `86.4 / 45.7` |
+| `PLAYGROUND_AO=0` | `87.0 / 44.5` | `86.9 / 44.7` | `87.0 / 44.8` |
+| `PLAYGROUND_AO=2` | `86.0 / 45.7` | `86.0 / 45.8` | `86.0 / 45.9` |
+| `PLAYGROUND_RT=both` | `84.5 / 47.4` | `84.7 / 47.4` | `84.8 / 47.5` |
+| `PLAYGROUND_GI=probes` | `84.6 / 46.8` | `84.9 / 46.8` | `85.0 / 46.9` |
+| `RT=both GI=probes` | `82.7 / 48.9` | `83.2 / 48.8` | `83.2 / 48.9` |
+| `RT=both GI=probes_screen` | `82.6 / 50.1` | `82.8 / 50.1` | `82.9 / 50.1` |
+| `RT=both RT_LOCAL=ratio` | `86.2 / 46.5` | `86.3 / 46.5` | `86.4 / 46.6` |
+| `RT=both RT_LOCAL=full` | `86.5 / 46.2` | `86.7 / 46.2` | `86.8 / 46.2` |
+| `RT=shadows RT_LOCAL=full` | — | `86.7 / 46.2` | `86.7 / 46.2` |
+| `PLAYGROUND_GI=voxel` | `81.5 / 48.3` | **`84.8 / 46.0`** | `84.8 / 46.0` |
+| night, `TOD_HOUR=1 … ratio` | `35.3 / 56.8` | `38.5 / 59.4` | `38.6 / 59.5` |
+| night, `TOD_HOUR=1 … full` | `35.6 / 53.7` | `38.7 / 56.2` | `38.8 / 56.3` |
+| night, `TOD_HOUR=1 GI=voxel` | `50.9 / 71.8` | **`64.2 / 68.6`** | `64.3 / 68.7` |
+| night, `TOD_HOUR=1 GI=off` | `35.8 / 59.8` | `38.5 / 62.0` | `38.6 / 62.1` |
+
+**The 2026-08-10 column moved every row by exactly 0.1, and the reason is the
+HUD.** The gap package (host-extensible rendering, the level format, the UI
+system, animation layering, paged terrain + residency + occlusion culling) added
+about 33 000 lines across the renderer, the Prepare stage, the terrain and the
+pipeline registry — and the 3D image is **BIT-IDENTICAL in all seven
+configurations that were diffed pixel-wise**. The only pixels that differ
+anywhere in the matrix are 4 063 of them in the bottom eighth of the frame,
+where the playground's help line was ported to the new UI module, gained an
+`F9 UI demo` entry and now wraps to two rows. Judge a future change against this
+column; if a row moves and a pixel diff shows anything OUTSIDE that bottom band,
+something reached the 3D path.
+
+**`PLAYGROUND_OCCLUSION=1` is not in the table on purpose.** Hi-Z draw occlusion
+culling is `GraphicsSettings::occlusion_culling`, default OFF, and the smoke line
+reports `occl_culled=`. Its specification is that it deletes WORK without moving
+a PIXEL: at this commit it culls 105 of 464 entities in the smoke frame and the
+screenshot is bit-identical to the occlusion-off one. That bit-identity is the
+only acceptable result — do not accept "close".
+
+**The way this feature failed the first time is the standing warning.** Its
+NDC→UV mapping had the Y term unflipped (`ndc.y * 0.5 + 0.5` where the engine's
+convention, stated in `render/taa.hpp:51`, is `0.5 - ndc.y * 0.5`). That mirrors
+the footprint about the horizon, so distant geometry near the skyline was tested
+against the near ground at the bottom of the frame and culled: **419 of 464
+entities gone, 44% of the screen's pixels changed — and `mean_luma` moved from
+86.4 to 86.0.** A 0.4 delta for a fifth of the scene's geometry missing. The
+suite did not catch it either, because every test in `contracts/occlusion.test.cpp`
+was vertically symmetric about the view axis and the one test that projected
+interior points duplicated the implementation's mapping rather than the frame's.
+`OcclusionProject.UpInTheWorldIsUpInTheFrame` is what pins the direction now.
 
 **The RT-off row is no longer bit-identical, and that is the point of the
 column.** The 2026-08-09 pass changed the forward pass deliberately —
