@@ -5,6 +5,7 @@
 #include "bracken/contracts/light.hpp"
 #include "bracken/contracts/model_handle.hpp"
 #include "bracken/contracts/shadow_capsule.hpp"
+#include "bracken/contracts/ui_texture.hpp"
 #include "bracken/core/assert.hpp"
 #include "bracken/core/color.hpp"
 #include "bracken/memory/arena.hpp"
@@ -268,8 +269,45 @@ struct UiButtonCommand {
     uint8_t _pad0[3] = {0, 0, 0};
 };
 
-using UiCommandData = std::variant<UiFilledRectCommand, UiRectOutlineCommand, UiCircleCommand, UiCircleOutlineCommand,
-                                   UiLineCommand, UiTextCommand, UiButtonCommand>;
+/**
+ * Textured-quad command. `texture` is a `bracken::UiTextureId`, never a
+ * pointer: the sim stage cannot hold an `SDL_GPUTexture*` (see
+ * contracts/ui_texture.hpp), and an id that the renderer cannot resolve
+ * degrades to a solid `tint` quad and is COUNTED in
+ * `FrameDiagnostics::ui_textures_unresolved`.
+ *
+ * u0/v0..u1/v1 select the sampled sub-rectangle, which is what makes
+ * nine-slice possible: nine of these with the same texture and nine UV
+ * windows (see `ui/nine_slice.hpp`).
+ */
+struct UiTexturedQuadCommand {
+    float x{}, y{}, w{}, h{};
+    float u0{}, v0{}, u1{}, v1{};
+    bracken::UiTextureId texture{};
+    bracken::core::Color tint = bracken::core::Color::white();
+};
+
+/**
+ * Absolute scissor rectangle for every SUBSEQUENT command of this frame,
+ * until the next UiClipCommand.
+ *
+ * The CALLER owns the clip stack and hands in the already-intersected
+ * rectangle. That keeps the lane stateless — a lane that remembered a clip
+ * depth would make the seal merge order-dependent, and the merge is
+ * (lane-index, emission-order) precisely so a frame is byte-identical at any
+ * worker count.
+ *
+ * `enabled` is a uint32 rather than a bool so the struct is padding-free by
+ * construction (the lane merge is a memcpy over raw bytes).
+ */
+struct UiClipCommand {
+    float x{}, y{}, w{}, h{};
+    uint32_t enabled = 0;
+};
+
+using UiCommandData =
+    std::variant<UiFilledRectCommand, UiRectOutlineCommand, UiCircleCommand, UiCircleOutlineCommand, UiLineCommand,
+                 UiTextCommand, UiButtonCommand, UiTexturedQuadCommand, UiClipCommand>;
 
 struct UiCommand {
     UiCommandData data;
@@ -277,6 +315,18 @@ struct UiCommand {
     template<typename T> [[nodiscard]] bool is() const { return std::holds_alternative<T>(data); }
     template<typename T> [[nodiscard]] const T& get() const { return std::get<T>(data); }
 };
+
+// Padding-free, and no wider than the widest alternative that was already
+// there. UiCommandData is sized by its LARGEST member and every UI chunk is a
+// fixed 2048-byte payload (frame_builder.hpp k_chunk_payload_bytes), so a
+// payload that overflows this silently halves the commands per chunk for
+// every host. UiButtonCommand is the incumbent 40-byte maximum.
+static_assert(sizeof(UiTexturedQuadCommand) == 8 * sizeof(float) + sizeof(bracken::UiTextureId) +
+                                                   sizeof(bracken::core::Color),
+              "UiTexturedQuadCommand grew padding");
+static_assert(sizeof(UiClipCommand) == 4 * sizeof(float) + sizeof(uint32_t), "UiClipCommand grew padding");
+static_assert(sizeof(UiTexturedQuadCommand) <= sizeof(UiButtonCommand),
+              "a UI payload wider than UiButtonCommand shrinks every UI chunk");
 
 // ============================================================================
 // FramePacket

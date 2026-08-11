@@ -53,9 +53,10 @@ public:
     /** Engine-internal constructor (Application's sim job + tests): binds
      *  the frame contexts. Host code never constructs SimFrames. */
     SimFrame(scene::FrameBuilder& builder, const InputSnapshot& input, float dt, double time, uint64_t frame_index,
-             SimFeedback* feedback = nullptr, int screen_width = 0, int screen_height = 0)
-        : sink_(builder), input_(&input), feedback_(feedback), dt_(dt), time_(time), frame_index_(frame_index),
-          screen_width_(screen_width), screen_height_(screen_height) {}
+             SimFeedback* feedback = nullptr, int screen_width = 0, int screen_height = 0,
+             const FontMetrics* font_metrics = nullptr)
+        : sink_(builder), input_(&input), feedback_(feedback), font_metrics_(font_metrics), dt_(dt), time_(time),
+          frame_index_(frame_index), screen_width_(screen_width), screen_height_(screen_height) {}
 
     SimFrame(const SimFrame&) = delete;
     SimFrame& operator=(const SimFrame&) = delete;
@@ -150,6 +151,25 @@ public:
     [[nodiscard]] int screen_height() const { return screen_height_; }
 
     /**
+     * The engine's frozen glyph-metrics table — how sim-stage code measures
+     * and wraps text (contracts/font_metrics.hpp).
+     *
+     * TIER: `worker-safe`. The table is filled once on the main thread in
+     * `Application::init_renderer()` and is immutable afterwards, so reading
+     * it from this job (or any job this job fans out to) needs no
+     * synchronization; the publish edge is this sim job's own submit.
+     *
+     * A hand-built test frame that was given none gets a frozen EMPTY table
+     * whose `valid()` is false and whose every measure returns 0 — never a
+     * null reference, so `sim.font_metrics().measure_width(...)` is always a
+     * legal call.
+     */
+    [[nodiscard]] const FontMetrics& font_metrics() const {
+        static const FontMetrics k_empty{};
+        return font_metrics_ != nullptr ? *font_metrics_ : k_empty;
+    }
+
+    /**
      * OVERRIDE the camera's ground-plane (x, z) forward direction for the
      * input system's camera-relative movement basis.
      *
@@ -175,6 +195,7 @@ private:
     scene::FrameSink sink_;
     const InputSnapshot* input_;
     SimFeedback* feedback_;
+    const FontMetrics* font_metrics_;
     float dt_;
     double time_;
     uint64_t frame_index_;

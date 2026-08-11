@@ -139,6 +139,12 @@ struct FrameDiagnostics {
     /// counted rather than silently dropped, because "my pass never ran" is
     /// otherwise indistinguishable from "my pass drew nothing".
     uint32_t render_hooks_skipped = 0;
+    /// UiTexturedQuadCommands naming a UiTextureId the UI renderer could not
+    /// resolve — never registered, already unregistered, or held across a
+    /// renderer restart. The quad still draws, as a solid tint rectangle, so
+    /// the symptom is a wrong-looking panel rather than a missing one, and
+    /// this counter is what says which.
+    uint32_t ui_textures_unresolved = 0;
     /// The frame had 3D content but no camera had ever been set, so the whole
     /// 3D pass was skipped.
     bool camera_missing = false;
@@ -154,6 +160,7 @@ struct FrameDiagnostics {
         lights_dropped += other.lights_dropped;
         cluster_lights_dropped += other.cluster_lights_dropped;
         render_hooks_skipped += other.render_hooks_skipped;
+        ui_textures_unresolved += other.ui_textures_unresolved;
         camera_missing = camera_missing || other.camera_missing;
         return *this;
     }
@@ -164,7 +171,8 @@ struct FrameDiagnostics {
         return draws_dropped_unknown_model != 0 || draws_deferred_not_resident != 0 ||
                skinned_dropped_no_skeleton != 0 || palettes_over_budget != 0 ||
                shadow_capsules_over_budget != 0 || effect_models_unresolved != 0 || lights_dropped != 0 ||
-               cluster_lights_dropped != 0 || render_hooks_skipped != 0 || camera_missing;
+               cluster_lights_dropped != 0 || render_hooks_skipped != 0 || ui_textures_unresolved != 0 ||
+               camera_missing;
     }
 };
 

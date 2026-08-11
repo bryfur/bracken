@@ -4,6 +4,7 @@
 #include "bracken/gpu/gpu_pipeline.hpp"
 #include "bracken/gpu/gpu_uniforms.hpp"
 #include "bracken/gpu/pipeline_registry.hpp"
+#include "bracken/core/assert.hpp"
 #include "bracken/core/color.hpp"
 #include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
@@ -175,10 +176,18 @@ void UIRenderer::set_screen_size(int width, int height) {
     projection_ = glm::ortho(0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, -1.0f, 1.0f);
 }
 
-void UIRenderer::begin(SDL_GPUCommandBuffer* /*cmd*/) {
+void UIRenderer::clear_recording() {
     vertex_batch_.clear();
     draw_ranges_.clear();
     queued_text_draws_.clear();
+    ops_.clear();
+    text_run_spans_.clear();
+    clip_rect_ = SDL_Rect{};
+    clip_enabled_ = false;
+}
+
+void UIRenderer::begin(SDL_GPUCommandBuffer* /*cmd*/) {
+    clear_recording();
 
     // Release pending GPU resources from previous frame
     if (text_renderer_) {
@@ -194,14 +203,77 @@ void UIRenderer::end() {
     // Recording phase ends - upload and drawing happen in execute()
 }
 
+namespace {
+
+[[nodiscard]] bool same_rect(const SDL_Rect& a, const SDL_Rect& b) noexcept {
+    return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
+}
+
+} // namespace
+
 UIRenderer::DrawRange& UIRenderer::range_for(SDL_GPUTexture* texture) {
+    // A geometry range may only extend a range that belongs to the CURRENT
+    // op: if the last thing recorded was text, this geometry paints over it
+    // and must start a new op (and therefore a new range) so the walk in
+    // execute() emits it after that text.
+    const bool new_op = ops_.empty() || ops_.back().kind != Op::Kind::Geometry;
+    if (new_op) {
+        ops_.push_back({Op::Kind::Geometry, draw_ranges_.size(), 0});
+    }
+
     // Ranges are recorded strictly in submission order, so the last range
-    // always ends at the current batch tail: extend it when the texture
-    // matches, otherwise open a new range.
-    if (draw_ranges_.empty() || draw_ranges_.back().texture != texture) {
-        draw_ranges_.push_back({vertex_batch_.size(), 0, texture});
+    // always ends at the current batch tail: extend it when the texture AND
+    // the clip both match, otherwise open a new range.
+    const bool extend = !new_op && !draw_ranges_.empty() && draw_ranges_.back().texture == texture &&
+                        draw_ranges_.back().clip_enabled == clip_enabled_ &&
+                        (!clip_enabled_ || same_rect(draw_ranges_.back().clip, clip_rect_));
+    if (!extend) {
+        draw_ranges_.push_back({vertex_batch_.size(), 0, texture, clip_rect_, clip_enabled_});
+        ops_.back().count += 1;
     }
     return draw_ranges_.back();
+}
+
+void UIRenderer::set_clip_rect(float x, float y, float w, float h) {
+    clip_rect_ = SDL_Rect{static_cast<int>(x), static_cast<int>(y), static_cast<int>(w < 0.0f ? 0.0f : w),
+                          static_cast<int>(h < 0.0f ? 0.0f : h)};
+    clip_enabled_ = true;
+}
+
+void UIRenderer::clear_clip_rect() {
+    clip_rect_ = SDL_Rect{};
+    clip_enabled_ = false;
+}
+
+UiTextureId UIRenderer::register_texture(SDL_GPUTexture* texture) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    if (texture == nullptr) {
+        BRACKEN_LOG_WARN(LOG_TAG, "register_texture: null texture, returning an invalid id");
+        return {};
+    }
+    textures_.push_back(texture);
+    // id 0 is the invalid sentinel, so slot i is id i + 1.
+    return UiTextureId{static_cast<uint32_t>(textures_.size())};
+}
+
+void UIRenderer::unregister_texture(UiTextureId id) {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    if (!id.valid() || id.value > textures_.size()) {
+        return;
+    }
+    textures_[id.value - 1] = nullptr;
+}
+
+SDL_GPUTexture* UIRenderer::texture_for(UiTextureId id) const {
+    if (!id.valid() || id.value > textures_.size()) {
+        return nullptr;
+    }
+    return textures_[id.value - 1];
+}
+
+const bracken::FontMetrics& UIRenderer::metrics() const {
+    static const bracken::FontMetrics k_empty{};
+    return text_renderer_ ? text_renderer_->metrics() : k_empty;
 }
 
 void UIRenderer::truncate_batch(size_t max_vertices) {
@@ -251,17 +323,25 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
         return;
     }
 
-    // Phase 1: Queue all text draws for batched rendering
+    // Phase 1: Queue all text draws for batched rendering, recording which
+    // TextRenderer runs each one produced so the submission-ordered walk below
+    // can address them. A draw contributes zero runs when every glyph was
+    // invisible, so this must be a span per draw, not an index.
+    text_run_spans_.assign(queued_text_draws_.size(), TextRunSpan{});
     if (text_renderer_ && text_renderer_->is_ready()) {
-        for (const auto& td : queued_text_draws_) {
-            text_renderer_->queue_text_draw(td.text, td.x, td.y, td.color.argb, td.scale);
+        for (size_t i = 0; i < queued_text_draws_.size(); ++i) {
+            const auto& td = queued_text_draws_[i];
+            const size_t before = text_renderer_->queued_run_count();
+            text_renderer_->queue_text_draw(td.text, td.x, td.y, td.color.argb, td.scale,
+                                            td.clip_enabled ? &td.clip : nullptr);
+            text_run_spans_[i] = {before, text_renderer_->queued_run_count() - before};
         }
     }
 
     // Phase 2: Upload all data (copy passes - BEFORE render pass)
     // Upload UI vertex data, growing the GPU buffer if this frame outgrew it
     if (!vertex_batch_.empty() && vertex_buffer_) {
-        reserve_gpu_capacity();
+        reserve_gpu_capacity(); // may truncate the batch (and its ranges)
         if (!vertex_batch_.empty()) {
             vertex_buffer_->update(cmd, vertex_batch_.data(), vertex_batch_.size() * sizeof(UIVertex));
         }
@@ -310,70 +390,116 @@ void UIRenderer::execute(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swapchain, b
         // be missing for every frame of the process's life.
         BRACKEN_LOG_WARN_ONCE(LOG_TAG, "UIRenderer::execute: UI pipeline not available, skipping UI draw");
         SDL_EndGPURenderPass(render_pass);
-        vertex_batch_.clear();
-        draw_ranges_.clear();
-        queued_text_draws_.clear();
+        if (text_renderer_) {
+            text_renderer_->clear_queued_text();
+        }
+        clear_recording();
         return;
     }
 
-    ui_pipeline->bind(render_pass);
+    // Phase 3: one walk over the submission-ordered ops, alternating the UI
+    // and Text pipeline binds. THIS is what lets a panel cover a label; the
+    // old two-phase form (all geometry, then all text) made that impossible
+    // no matter what order the host recorded in. A HUD that records its panel
+    // and then its labels produces exactly two ops, so it pays exactly the
+    // binds it always did.
+    const bool text_ready = text_renderer_ != nullptr && text_renderer_->is_ready();
+    bool ui_state_bound = false;
+    int bound_has_texture = -1;
+    SDL_GPUTexture* bound_texture = nullptr;
+    SDL_Rect bound_scissor = scissor;
 
-    // Push vertex uniform (screen size for 2D transformation)
-    gpu::UIScreenUniforms screen_uniforms = {};
-    screen_uniforms.width = static_cast<float>(width_);
-    screen_uniforms.height = static_cast<float>(height_);
-    SDL_PushGPUVertexUniformData(cmd, 0, &screen_uniforms, sizeof(screen_uniforms));
+    const auto bind_ui_state = [&]() {
+        if (ui_state_bound) {
+            return;
+        }
+        ui_pipeline->bind(render_pass);
+        gpu::UIScreenUniforms screen_uniforms = {};
+        screen_uniforms.width = static_cast<float>(width_);
+        screen_uniforms.height = static_cast<float>(height_);
+        SDL_PushGPUVertexUniformData(cmd, 0, &screen_uniforms, sizeof(screen_uniforms));
+        if (vertex_buffer_) {
+            SDL_GPUBufferBinding vb_binding = {};
+            vb_binding.buffer = vertex_buffer_->handle();
+            vb_binding.offset = 0;
+            SDL_BindGPUVertexBuffers(render_pass, 0, &vb_binding, 1);
+        }
+        // Pipeline/uniform state does not survive the text pipeline's binds,
+        // so a re-entry must re-push both of them.
+        bound_has_texture = -1;
+        bound_texture = nullptr;
+        ui_state_bound = true;
+    };
 
-    // Phase 3a: Draw UI primitives (vertices already uploaded), one draw per
-    // texture-switch range so textured quads interleave with solid primitives
-    // in submission order.
-    if (!vertex_batch_.empty() && vertex_buffer_) {
-        SDL_GPUBufferBinding vb_binding = {};
-        vb_binding.buffer = vertex_buffer_->handle();
-        vb_binding.offset = 0;
-        SDL_BindGPUVertexBuffers(render_pass, 0, &vb_binding, 1);
-
-        // Force uniform push + texture bind on the first range
-        int bound_has_texture = -1;
-        SDL_GPUTexture* bound_texture = nullptr;
-
-        for (const DrawRange& range : draw_ranges_) {
-            if (range.vertex_count == 0) {
+    for (const Op& op : ops_) {
+        if (op.kind == Op::Kind::Geometry) {
+            if (vertex_batch_.empty() || !vertex_buffer_) {
                 continue;
             }
-            const int has_texture = range.texture ? 1 : 0;
-            if (has_texture != bound_has_texture) {
-                gpu::UIFragmentUniforms frag_uniforms = {};
-                frag_uniforms.hasTexture = has_texture;
-                SDL_PushGPUFragmentUniformData(cmd, 0, &frag_uniforms, sizeof(frag_uniforms));
-                bound_has_texture = has_texture;
+            bind_ui_state();
+            const size_t last = std::min(draw_ranges_.size(), op.first + op.count);
+            for (size_t r = op.first; r < last; ++r) {
+                const DrawRange& range = draw_ranges_[r];
+                if (range.vertex_count == 0) {
+                    continue;
+                }
+                const SDL_Rect want = range.clip_enabled ? range.clip : scissor;
+                if (!same_rect(want, bound_scissor)) {
+                    SDL_Rect apply = want;
+                    SDL_SetGPUScissor(render_pass, &apply);
+                    bound_scissor = want;
+                }
+                const int has_texture = range.texture ? 1 : 0;
+                if (has_texture != bound_has_texture) {
+                    gpu::UIFragmentUniforms frag_uniforms = {};
+                    frag_uniforms.hasTexture = has_texture;
+                    SDL_PushGPUFragmentUniformData(cmd, 0, &frag_uniforms, sizeof(frag_uniforms));
+                    bound_has_texture = has_texture;
+                }
+                // The sampler slot must always hold a valid texture; solid
+                // ranges use the 1x1 white dummy.
+                SDL_GPUTexture* texture = range.texture ? range.texture : dummy_texture_;
+                if (texture != bound_texture && texture && sampler_) {
+                    SDL_GPUTextureSamplerBinding sampler_binding = {};
+                    sampler_binding.texture = texture;
+                    sampler_binding.sampler = sampler_;
+                    SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
+                    bound_texture = texture;
+                }
+                SDL_DrawGPUPrimitives(render_pass, range.vertex_count, 1, static_cast<uint32_t>(range.first_vertex),
+                                      0);
             }
-            // The sampler slot must always hold a valid texture; solid ranges
-            // use the 1x1 white dummy.
-            SDL_GPUTexture* texture = range.texture ? range.texture : dummy_texture_;
-            if (texture != bound_texture && texture && sampler_) {
-                SDL_GPUTextureSamplerBinding sampler_binding = {};
-                sampler_binding.texture = texture;
-                sampler_binding.sampler = sampler_;
-                SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
-                bound_texture = texture;
-            }
-            SDL_DrawGPUPrimitives(render_pass, range.vertex_count, 1, static_cast<uint32_t>(range.first_vertex), 0);
+            continue;
         }
+
+        // Text op: map its span of queued draws onto the TextRenderer's runs.
+        if (!text_ready || op.count == 0 || op.first >= text_run_spans_.size()) {
+            continue;
+        }
+        const size_t last_draw = std::min(text_run_spans_.size(), op.first + op.count);
+        const size_t run_lo = text_run_spans_[op.first].first;
+        const size_t run_hi = text_run_spans_[last_draw - 1].first + text_run_spans_[last_draw - 1].count;
+        if (run_hi <= run_lo) {
+            continue; // every string in this span was invisible
+        }
+        // draw_run_range restores `bound_scissor` before returning, and it
+        // rebinds the pipeline, so the UI state must be re-established next
+        // time geometry appears.
+        text_renderer_->draw_run_range(cmd, render_pass, run_lo, run_hi - run_lo, bound_scissor);
+        ui_state_bound = false;
     }
 
-    // Phase 3b: Draw queued text (vertices already uploaded)
-    if (text_renderer_ && text_renderer_->is_ready()) {
-        text_renderer_->draw_queued_text(cmd, render_pass);
+    // Any text the walk did not reach (a host that called draw_text with no
+    // op recorded cannot happen, but a truncated batch can leave runs behind)
+    // is dropped rather than drawn out of order.
+    if (text_renderer_) {
+        text_renderer_->clear_queued_text();
     }
 
     // End render pass
     SDL_EndGPURenderPass(render_pass);
 
-    // Clear for next frame
-    vertex_batch_.clear();
-    draw_ranges_.clear();
-    queued_text_draws_.clear();
+    clear_recording();
 }
 
 void UIRenderer::draw_quad(float x, float y, float w, float h, const glm::vec4& color) {
@@ -544,11 +670,18 @@ void UIRenderer::draw_line(float x1, float y1, float x2, float y2, core::Color c
 }
 
 void UIRenderer::draw_text(std::string_view text, float x, float y, core::Color color, float scale) {
-    if (!text.empty()) {
-        // Queue text draw for later execution (during execute() phase).
-        // Stores a view — the caller keeps the string alive until execute().
-        queued_text_draws_.push_back({text, x, y, color, scale});
+    if (text.empty()) {
+        return;
     }
+    // Queue text draw for later execution (during execute() phase). Stores a
+    // view — the caller keeps the string alive until execute(). The op keeps
+    // it in submission order relative to geometry, which is what makes a later
+    // panel able to cover this label.
+    if (ops_.empty() || ops_.back().kind != Op::Kind::Text) {
+        ops_.push_back({Op::Kind::Text, queued_text_draws_.size(), 0});
+    }
+    queued_text_draws_.push_back({text, x, y, color, scale, clip_rect_, clip_enabled_});
+    ops_.back().count += 1;
 }
 
 void UIRenderer::draw_button(float x, float y, float w, float h, const std::string& label, core::Color color,

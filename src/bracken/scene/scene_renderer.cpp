@@ -110,6 +110,32 @@ int SceneRenderer::text_height(float scale) const {
     return ui_ ? ui_->text_height(scale) : 0;
 }
 
+bracken::UiTextureId SceneRenderer::register_ui_texture(SDL_GPUTexture* texture) {
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+    return ui_ ? ui_->register_texture(texture) : bracken::UiTextureId{};
+}
+
+void SceneRenderer::unregister_ui_texture(bracken::UiTextureId id) {
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+    if (ui_) {
+        ui_->unregister_texture(id);
+    }
+}
+
+const bracken::FontMetrics& SceneRenderer::font_metrics() const {
+    // Tier: not sim-stage. This reaches into the LIVE renderer for a table the
+    // sim stage is supposed to read from its own frozen copy
+    // (`SimFrame::font_metrics()`) — which is the entire reason
+    // Application::init_renderer() freezes one. Asserting here is what stops a
+    // host "just asking the renderer" from on_simulate and getting away with
+    // it right up until the renderer is torn down mid-frame.
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
+    // A single frozen empty table, so a host that asks before init() gets a
+    // valid()==false answer rather than a null reference.
+    static const bracken::FontMetrics k_empty{};
+    return ui_ ? ui_->metrics() : k_empty;
+}
+
 bool SceneRenderer::init(render::RenderContext& context, float world_width, float world_height) {
     // The local mirror exists because scene_renderer.hpp only forward-declares
     // ShadowMap; this TU sees both definitions, so keep them in lockstep here.

@@ -122,36 +122,54 @@ void InputHandler::process_event(const SDL_Event& event) {
         handle_controller_removed(event.gdevice.which);
     }
 
-    // Handle controller button events for menu
+    // Handle controller button events for menu. The `menu_*` half stays gated
+    // on !game_input_enabled_ (that is what it has always meant); the `pad_*`
+    // half is UNGATED, because a HUD is navigable while the game runs and a UI
+    // that only answers the pad once the host has paused everything is not a
+    // pad-navigable UI. See InputSnapshot's pad_* block.
     if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && gamepad_) {
         switch (event.gbutton.button) {
             case SDL_GAMEPAD_BUTTON_START:
                 menu_toggle_pressed_ = true;
                 break;
             case SDL_GAMEPAD_BUTTON_DPAD_UP:
+                pad_nav_up_ = true;
                 if (!game_input_enabled_) {
                     menu_up_pressed_ = true;
                 }
                 break;
             case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
+                pad_nav_down_ = true;
                 if (!game_input_enabled_) {
                     menu_down_pressed_ = true;
                 }
                 break;
             case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+                pad_nav_left_ = true;
                 if (!game_input_enabled_) {
                     menu_left_pressed_ = true;
                 }
                 break;
             case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+                pad_nav_right_ = true;
                 if (!game_input_enabled_) {
                     menu_right_pressed_ = true;
                 }
                 break;
             case SDL_GAMEPAD_BUTTON_SOUTH: // A button
+                pad_accept_pressed_ = true;
                 if (!game_input_enabled_) {
                     menu_select_pressed_ = true;
                 }
+                break;
+            case SDL_GAMEPAD_BUTTON_EAST: // B button
+                pad_cancel_pressed_ = true;
+                break;
+            case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
+                pad_next_pressed_ = true;
+                break;
+            case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
+                pad_prev_pressed_ = true;
                 break;
             default:
                 // Other gamepad buttons are not bound to menu actions.
@@ -247,9 +265,15 @@ void InputHandler::process_event(const SDL_Event& event) {
             }
         }
 
-        // Mouse wheel for zoom
+        // Mouse wheel: the cooked camera zoom AND the raw delta. Two
+        // accumulators, not one, because they answer different questions —
+        // the camera wants world units per notch (negated, times 50) and a UI
+        // scroll view wants notches. Do not "simplify" by deriving one from
+        // the other: the cook's sign and scale are camera policy.
         if (event.type == SDL_EVENT_MOUSE_WHEEL) {
             camera_zoom_delta_ -= event.wheel.y * 50.0f;
+            wheel_x_ += event.wheel.x;
+            wheel_y_ += event.wheel.y;
         }
 
         // Mouse motion for camera orbit (only when right button held)
@@ -287,6 +311,10 @@ void InputHandler::post_process_events() {
     if (gamepad_ && game_input_enabled_) {
         update_input_from_controller();
     }
+    // The UI's pad navigation is polled whatever the game-input mode — a HUD
+    // is navigable during play. Cheap (two axis reads) and edge-latched, so
+    // running it every frame costs nothing when the stick is at rest.
+    update_ui_pad_nav();
 
     // Only update game input if enabled. While chat is capturing text, treat
     // game input as suspended so W/A/S/D in the chat box don't drive movement.
@@ -330,12 +358,19 @@ void InputHandler::post_process_events() {
 bool InputHandler::process_events() {
     // Reset per-frame deltas
     camera_zoom_delta_ = 0.0f;
+    // The RAW wheel accumulator is a per-frame delta too. Application's own
+    // pump_events() calls reset_wheel(); this is the other, self-contained
+    // poll path (a host driving InputHandler directly), and without the reset
+    // here wheel_y_ accumulates for the life of the process — a scroll view
+    // reading it would run away after the first flick.
+    reset_wheel();
     menu_toggle_pressed_ = false;
     menu_up_pressed_ = false;
     menu_down_pressed_ = false;
     menu_left_pressed_ = false;
     menu_right_pressed_ = false;
     menu_select_pressed_ = false;
+    clear_pad_nav_edges();
     clear_key_edges();
 
     SDL_Event event;
@@ -490,6 +525,50 @@ void InputHandler::update_input_from_controller() {
     }
 }
 
+void InputHandler::update_ui_pad_nav() {
+    if (!gamepad_) {
+        pad_stick_dir_x_ = 0;
+        pad_stick_dir_y_ = 0;
+        return;
+    }
+
+    const float lx = SDL_GetGamepadAxis(gamepad_, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f;
+    const float ly = SDL_GetGamepadAxis(gamepad_, SDL_GAMEPAD_AXIS_LEFTY) / 32767.0f;
+
+    // Per axis: latch a direction when the stick crosses k_pad_nav_enter, and
+    // re-arm only once it falls back under k_pad_nav_leave. The EDGE is the
+    // transition into a nonzero latch, so one flick is one navigation step no
+    // matter how long the stick is held — matching the D-pad's button-down.
+    const auto latch = [](float v, int8_t& dir) -> int8_t {
+        const float a = v < 0.0f ? -v : v;
+        if (dir != 0) {
+            if (a < k_pad_nav_leave) {
+                dir = 0;
+            }
+            return 0;
+        }
+        if (a < k_pad_nav_enter) {
+            return 0;
+        }
+        dir = v > 0.0f ? int8_t{1} : int8_t{-1};
+        return dir;
+    };
+
+    const int8_t ex = latch(lx, pad_stick_dir_x_);
+    const int8_t ey = latch(ly, pad_stick_dir_y_);
+    if (ex > 0) {
+        pad_nav_right_ = true;
+    } else if (ex < 0) {
+        pad_nav_left_ = true;
+    }
+    // SDL's Y axis is positive DOWN, which is also the UI's convention.
+    if (ey > 0) {
+        pad_nav_down_ = true;
+    } else if (ey < 0) {
+        pad_nav_up_ = true;
+    }
+}
+
 void InputHandler::handle_controller_added(SDL_JoystickID id) {
     // Only connect one controller at a time
     if (gamepad_) {
@@ -519,6 +598,10 @@ void InputHandler::handle_controller_removed(SDL_JoystickID id) {
         controller_camera_y_ = 0.0f;
         controller_primary_ = false;
         controller_secondary_ = false;
+        // Drop the stick latch too, or a pad unplugged while pushed would arm
+        // a phantom edge the instant the next one is plugged in.
+        pad_stick_dir_x_ = 0;
+        pad_stick_dir_y_ = 0;
 
         // Try to find another controller
         int num_joysticks = 0;
@@ -548,6 +631,8 @@ InputSnapshot InputHandler::snapshot() {
     s.camera_yaw = camera_yaw_;
     s.camera_pitch = camera_pitch_;
     s.camera_zoom_delta = camera_zoom_delta_;
+    s.wheel_x = wheel_x_;
+    s.wheel_y = wheel_y_;
 
     s.move_forward = move_forward_;
     s.move_backward = move_backward_;
@@ -572,6 +657,15 @@ InputSnapshot InputHandler::snapshot() {
     s.has_controller = gamepad_ != nullptr;
     s.controller_primary = controller_primary_;
     s.controller_secondary = controller_secondary_;
+
+    s.pad_nav_up = pad_nav_up_;
+    s.pad_nav_down = pad_nav_down_;
+    s.pad_nav_left = pad_nav_left_;
+    s.pad_nav_right = pad_nav_right_;
+    s.pad_accept_pressed = pad_accept_pressed_;
+    s.pad_cancel_pressed = pad_cancel_pressed_;
+    s.pad_next_pressed = pad_next_pressed_;
+    s.pad_prev_pressed = pad_prev_pressed_;
 
     s.key_just_pressed = key_just_pressed_;
 

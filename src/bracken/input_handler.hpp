@@ -41,6 +41,16 @@ struct InputSnapshot {
     bool mouse_left_released = false;
     bool mouse_right_pressed = false;
 
+    /// RAW mouse-wheel delta accumulated since the previous snapshot, in SDL
+    /// wheel units (one notch = 1.0), sign as SDL reports it. Distinct from
+    /// `camera_zoom_delta` on purpose: that one is already COOKED for the
+    /// camera (negated and multiplied by 50), so a scroll view reading it
+    /// would scroll backwards at fifty times the speed. Consumed by whoever
+    /// reads the snapshot; `InputHandler::reset_wheel()` clears the
+    /// accumulator at the top of each event pump.
+    float wheel_x = 0.0f;
+    float wheel_y = 0.0f;
+
     // Camera orbit controls (sensitivity/inversion already applied).
     float camera_yaw = 0.0f;
     float camera_pitch = 20.0f;
@@ -67,10 +77,42 @@ struct InputSnapshot {
     bool text_enter_pressed = false;
     bool text_escape_pressed = false;
 
-    // Controller.
+    // Controller. NOTE that `controller_primary`/`controller_secondary` are
+    // LEVELS — polled from the trigger axes and the face/shoulder buttons, so
+    // they stay true for as long as the input is held. That is what a game
+    // action wants and exactly what a MENU does not: a UI driven off them
+    // re-activates the focused widget every frame the pad is held down. Use
+    // the `pad_*` edges below for anything menu-shaped.
     bool has_controller = false;
     bool controller_primary = false;
     bool controller_secondary = false;
+
+    /**
+     * Gamepad navigation EDGES for a UI. Two properties separate them from the
+     * `menu_*_pressed` fields above, and both are why a pad-navigable HUD
+     * could not be built on those:
+     *
+     * (1) They are EDGES — one press produces exactly one `true`, and holding
+     *     the stick or the D-pad produces nothing further. There is
+     *     deliberately NO hold-to-repeat: repeat rate is a policy decision and
+     *     a menu that wants one owns it.
+     * (2) They are UNGATED. `menu_*_pressed` is only ever set while the host
+     *     has called `set_game_input_enabled(false)`, i.e. while the whole game
+     *     is paused. A HUD is navigable during play.
+     *
+     * Sources: the D-pad buttons and the LEFT STICK (flicked past magnitude
+     * 0.5, re-armed below 0.35 — hysteresis, so a stick resting on the
+     * threshold cannot chatter) for the four directions; SOUTH for accept,
+     * EAST for cancel; the shoulder buttons for tab order.
+     */
+    bool pad_nav_up = false;
+    bool pad_nav_down = false;
+    bool pad_nav_left = false;
+    bool pad_nav_right = false;
+    bool pad_accept_pressed = false;
+    bool pad_cancel_pressed = false;
+    bool pad_next_pressed = false;
+    bool pad_prev_pressed = false;
 
     /// Per-frame key-press edges by physical scancode
     /// (InputHandler::was_key_just_pressed).
@@ -165,6 +207,18 @@ public:
     float get_camera_zoom_delta() const { return camera_zoom_delta_; }
     void reset_camera_deltas() { camera_zoom_delta_ = 0.0f; }
 
+    // Raw wheel accumulator, in SDL wheel units. Kept ALONGSIDE the cooked
+    // camera_zoom_delta_ rather than replacing it: the camera controller
+    // depends on the cook, and a scroll view needs the raw value. Cleared by
+    // reset_wheel(), which Application::pump_events calls beside
+    // reset_camera_deltas() before polling.
+    float wheel_x() const { return wheel_x_; }
+    float wheel_y() const { return wheel_y_; }
+    void reset_wheel() {
+        wheel_x_ = 0.0f;
+        wheel_y_ = 0.0f;
+    }
+
     // Set camera yaw externally (for syncing with renderer)
     void set_camera_yaw(float yaw) { camera_yaw_ = yaw; }
 
@@ -194,6 +248,33 @@ public:
         menu_left_pressed_ = false;
         menu_right_pressed_ = false;
         menu_select_pressed_ = false;
+        clear_pad_nav_edges();
+    }
+
+    // ---- Gamepad UI navigation (ungated edges; see InputSnapshot) ---------
+    // Kept separate from the menu_* block above because those only fire while
+    // game input is DISABLED, and a HUD has to be navigable during play.
+    bool pad_nav_up() const { return pad_nav_up_; }
+    bool pad_nav_down() const { return pad_nav_down_; }
+    bool pad_nav_left() const { return pad_nav_left_; }
+    bool pad_nav_right() const { return pad_nav_right_; }
+    bool pad_accept_pressed() const { return pad_accept_pressed_; }
+    bool pad_cancel_pressed() const { return pad_cancel_pressed_; }
+    bool pad_next_pressed() const { return pad_next_pressed_; }
+    bool pad_prev_pressed() const { return pad_prev_pressed_; }
+
+    /// Clear the pad edges. Folded into clear_menu_inputs() — which
+    /// Application::pump_events already calls before polling — so no caller
+    /// has to learn about it.
+    void clear_pad_nav_edges() {
+        pad_nav_up_ = false;
+        pad_nav_down_ = false;
+        pad_nav_left_ = false;
+        pad_nav_right_ = false;
+        pad_accept_pressed_ = false;
+        pad_cancel_pressed_ = false;
+        pad_next_pressed_ = false;
+        pad_prev_pressed_ = false;
     }
 
     // Generic one-shot key press detection (true only on the frame the key was first pressed)
@@ -258,6 +339,10 @@ private:
     void update_input_from_keyboard();
     void update_camera_from_mouse();
     void update_input_from_controller();
+    /// Poll the left stick and turn it into the four directional EDGES a UI
+    /// navigates on. Runs whatever the game-input mode (unlike
+    /// update_input_from_controller), because a HUD is navigable during play.
+    void update_ui_pad_nav();
     void handle_controller_added(SDL_JoystickID id);
     void handle_controller_removed(SDL_JoystickID id);
 
@@ -291,6 +376,8 @@ private:
     float camera_yaw_ = 0.0f;    // Horizontal rotation (degrees)
     float camera_pitch_ = 20.0f; // Vertical angle - lower for over-the-shoulder action view
     float camera_zoom_delta_ = 0.0f;
+    float wheel_x_ = 0.0f;
+    float wheel_y_ = 0.0f;
     bool right_mouse_down_ = false;
 
     // Actual camera forward direction (set by renderer, accounts for shoulder offset)
@@ -306,6 +393,26 @@ private:
     bool menu_select_pressed_ = false;
     bool game_input_enabled_ = true;
     bool keyboard_captured_ = false;
+
+    // Gamepad UI navigation edges (see InputSnapshot's pad_* block). Cleared
+    // by clear_pad_nav_edges() at the top of each poll cycle; set from the
+    // D-pad button-down events and from update_ui_pad_nav()'s stick latch.
+    bool pad_nav_up_ = false;
+    bool pad_nav_down_ = false;
+    bool pad_nav_left_ = false;
+    bool pad_nav_right_ = false;
+    bool pad_accept_pressed_ = false;
+    bool pad_cancel_pressed_ = false;
+    bool pad_next_pressed_ = false;
+    bool pad_prev_pressed_ = false;
+    // Latched left-stick direction, -1/0/+1 per axis. The EDGE is the
+    // transition into a nonzero value; the hysteresis band between
+    // k_pad_nav_leave and k_pad_nav_enter is what stops a stick resting on the
+    // threshold from emitting one edge per frame.
+    int8_t pad_stick_dir_x_ = 0;
+    int8_t pad_stick_dir_y_ = 0;
+    static constexpr float k_pad_nav_enter = 0.5f;
+    static constexpr float k_pad_nav_leave = 0.35f;
 
     // Text input (chat)
     bool text_input_enabled_ = false;
