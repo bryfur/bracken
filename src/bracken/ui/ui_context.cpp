@@ -81,15 +81,17 @@ void Context::end() {
     // Record this frame's rectangles for NEXT frame's hit testing (see the
     // class comment: results have to be available at the call site, which is
     // before the solve).
-    for (const auto& [raw_id, node] : frame_rects_) {
-        const Rect r = tree_.rect_of(node);
-        const auto it = std::lower_bound(state_.rects.begin(), state_.rects.end(), raw_id,
+    for (const FrameRect& fr : frame_rects_) {
+        const Rect r = tree_.rect_of(fr.node);
+        const auto it = std::lower_bound(state_.rects.begin(), state_.rects.end(), fr.id,
                                          [](const UiState::RectEntry& e, uint64_t k) { return e.id < k; });
-        if (it != state_.rects.end() && it->id == raw_id) {
+        if (it != state_.rects.end() && it->id == fr.id) {
             it->rect = r;
+            it->clip = fr.clip;
+            it->clipped = fr.clipped;
             it->last_frame = state_.frame;
         } else {
-            state_.rects.insert(it, UiState::RectEntry{raw_id, r, Rect{}, false, state_.frame});
+            state_.rects.insert(it, UiState::RectEntry{fr.id, r, fr.clip, fr.clipped, state_.frame});
         }
     }
     state_.retire(cfg_.retain_frames);
@@ -166,17 +168,12 @@ void Context::record_rect(WidgetId id, uint32_t node) {
     } else {
         seen_ids_.insert(it, id.value);
     }
-    frame_rects_.emplace_back(id.value, node);
     // Remember the clip a widget was declared under so next frame's hit test
-    // can reject a click that landed on a scrolled-away row.
-    const auto rit = std::lower_bound(state_.rects.begin(), state_.rects.end(), id.value,
-                                      [](const UiState::RectEntry& e, uint64_t k) { return e.id < k; });
-    const Rect clip = current_clip();
-    const bool clipped = !clip_stack_.empty();
-    if (rit != state_.rects.end() && rit->id == id.value) {
-        rit->clip = clip;
-        rit->clipped = clipped;
-    }
+    // can reject a click that landed on a scrolled-away row. Carried on the
+    // per-frame record and committed by end(), so a widget being declared for
+    // the FIRST time gets its clip too — writing it only into an already
+    // existing retained entry left a newborn row recorded as unclipped.
+    frame_rects_.push_back(FrameRect{id.value, node, current_clip(), !clip_stack_.empty()});
 }
 
 Rect Context::current_clip() const {
@@ -356,7 +353,15 @@ void Context::end_scroll() {
         id_stack_.pop_back();
     }
     if (sn_index == 0xFFFFFFFFu) {
-        return; // the depth-overflow case; nothing was opened
+        // The depth-overflow case: no ScrollNode, no clip slot and no
+        // ClipPop draw — but `begin_scroll` still went through
+        // `tree_.begin_box`, which counted a SUPPRESSED box that is owed an
+        // `end_box`. Skipping it here leaves `LayoutTree::suppressed_depth_`
+        // permanently positive, so the next legitimate `end_box` in the frame
+        // is absorbed instead and every rectangle after it is solved against
+        // the wrong parent.
+        tree_.end_box();
+        return;
     }
     if (!clip_stack_.empty()) {
         clip_stack_.pop_back();
@@ -473,6 +478,15 @@ void Context::resolve_focus() {
     };
     std::size_t cur = index_of(state_.focused);
     const bool had_focus = cur < focus_order_.size();
+    if (!had_focus) {
+        // Actually DROP it. Leaving the ghost in place is not neutral: end()
+        // sets `capture_.keyboard = state_.focused.valid()`, so a focus that
+        // names a widget nobody declares any more silences the host's entire
+        // keyboard channel for the rest of the process — a menu closed with a
+        // widget focused, or a list row scrolled out of existence, and the
+        // character stops walking with nothing on screen to explain it.
+        state_.focused = {};
+    }
 
     // A focused slider ate Left/Right to tune its value; moving the focus on
     // the same press would make the control impossible to use.
@@ -687,9 +701,9 @@ void Context::emit() {
 }
 
 Rect Context::rect_of(WidgetId id) const {
-    for (const auto& [raw, node] : frame_rects_) {
-        if (raw == id.value) {
-            return tree_.rect_of(node);
+    for (const FrameRect& fr : frame_rects_) {
+        if (fr.id == id.value) {
+            return tree_.rect_of(fr.node);
         }
     }
     return {};

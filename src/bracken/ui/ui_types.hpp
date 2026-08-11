@@ -59,7 +59,20 @@ struct Edges {
 /** Main axis of a container. Grids ignore it (they are row-major 2D). */
 enum class Axis : uint8_t { Horizontal, Vertical };
 
-/** Cross-axis (and leftover-space main-axis) placement. */
+/**
+ * Cross-axis (and leftover-space main-axis) placement.
+ *
+ * `Stretch` gives a child the container's whole cross extent — but only a
+ * child that did not ask for one itself. An explicit `Size::px` on the cross
+ * axis WINS over the parent's Stretch, the same way flexbox only stretches an
+ * `auto` cross size: otherwise a 100 px-wide toggle dropped into a Stretch
+ * column would be silently widened, and there would be no way to say "this one
+ * is narrow" at all. `Size::flex` on the cross axis stretches (there is no
+ * leftover to weight there), and so does `Size::content` under a Stretch
+ * parent.
+ *
+ * On the MAIN axis `Stretch` has no meaning and reads as `Start`.
+ */
 enum class Align : uint8_t { Start, Center, End, Stretch };
 
 /**

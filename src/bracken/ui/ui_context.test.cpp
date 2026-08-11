@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -654,14 +655,20 @@ TEST(UiContext, EveryEnclosingScrollContainerBringsTheFocusIntoView) {
         (void)h.run(tab, build);
     }
     // The scroll store is a SORTED vector keyed by id, so look the entries up
-    // by id rather than assuming an order.
+    // by id rather than assuming an order — and by the SCOPED id. begin_scroll
+    // pushes its own id scope, so the inner container is stored under
+    // combine(outer, inner), never under the bare label; looking it up under
+    // the bare label finds nothing and the ASSERT below then reports it as a
+    // scrolling failure rather than as a test asking the wrong question.
+    const WidgetId outer_id = id("outer");
+    const WidgetId inner_id = combine(outer_id, id("inner"));
     float outer_off = -1.0f;
     float inner_off = -1.0f;
     for (const auto& e : h.ui.state().scroll) {
-        if (e.id == id("outer").value) {
+        if (e.id == outer_id.value) {
             outer_off = e.offset.y;
         }
-        if (e.id == id("inner").value) {
+        if (e.id == inner_id.value) {
             inner_off = e.offset.y;
         }
     }
@@ -819,6 +826,132 @@ TEST(UiContext, StableIdsKeepTheirStateAcrossManyFrames) {
     }
     ASSERT_EQ(h.ui.state().scroll.size(), 1u);
     EXPECT_FLOAT_EQ(h.ui.state().scroll[0].offset.y, scrolled) << "a stable id must not lose its scroll offset";
+}
+
+// ---------------------------------------------------------------------------
+// Regressions found in review
+// ---------------------------------------------------------------------------
+
+TEST(UiContext, FocusThatNoLongerNamesADeclaredWidgetIsDropped) {
+    // The failure this pins is not visual, it is INPUT: end() sets
+    // capture().keyboard from state().focused, so a focus left pointing at a
+    // widget nobody declares any more silences the host's whole keyboard
+    // channel — a menu closed with a row focused and the character stops
+    // walking, with nothing on screen to explain it.
+    Harness h;
+    const auto two = [](Context& ui) {
+        (void)ui.button(id("a"), "A", Size::px(100.0f), Size::px(30.0f));
+        (void)ui.button(id("gone"), "B", Size::px(100.0f), Size::px(30.0f));
+    };
+    const auto one = [](Context& ui) { (void)ui.button(id("a"), "A", Size::px(100.0f), Size::px(30.0f)); };
+
+    InputFrame tab{};
+    tab.nav_next = true;
+    (void)h.run(tab, two); // focus lands on "a"
+    (void)h.run(tab, two); // ...then on "gone"
+    ASSERT_EQ(h.ui.focused(), id("gone"));
+
+    // "gone" stops being declared. The ghost must not survive, and the widget
+    // that is still there must not silently inherit the focus.
+    (void)h.run(InputFrame{}, one);
+    EXPECT_FALSE(h.ui.focused().valid()) << "a focus naming an undeclared widget must be dropped";
+    EXPECT_FALSE(h.ui.capture().keyboard) << "and it must therefore stop capturing the keyboard";
+
+    // The next navigation press starts over at the first focusable widget.
+    (void)h.run(tab, one);
+    EXPECT_EQ(h.ui.focused(), id("a"));
+}
+
+TEST(UiContext, AScrollViewOpenedPastTheDepthLimitStillBalancesTheTree) {
+    // begin_scroll past LayoutTree::k_max_depth records a SUPPRESSED box that
+    // is owed an end_box. When end_scroll returned early without paying it,
+    // the debt was carried forward and the next legitimate end_box in the
+    // frame was absorbed instead — every rectangle after it solved against the
+    // wrong parent, and the symptom surfaced in a completely different widget.
+    Harness h;
+    BoxStyle deep{};
+    deep.width = Size::px(200.0f);
+    deep.height = Size::px(100.0f);
+    // Every nesting level indents by 3 px. That is what makes the debt VISIBLE:
+    // an unpaid end_box leaves one column still open, so the widget declared
+    // afterwards lands inside it and is indented instead of sitting at x = 0.
+    // Without the indent the two outcomes are numerically identical and the
+    // test passes against the bug.
+    BoxStyle level{};
+    level.padding = Edges{3.0f, 0.0f, 0.0f, 0.0f};
+    constexpr uint32_t k_over = LayoutTree::k_max_depth + 4u;
+
+    (void)h.run(InputFrame{}, [&deep, &level](Context& ui) {
+        // Bury a scroll view past the depth limit...
+        for (uint32_t i = 0; i < k_over; ++i) {
+            ui.begin_column(level);
+        }
+        ui.begin_scroll(id("buried"), deep);
+        ui.label("row");
+        ui.end_scroll();
+        for (uint32_t i = 0; i < k_over; ++i) {
+            ui.end_box();
+        }
+        // ...then declare an ordinary widget back at the root. Its rectangle is
+        // the assertion: if the tree still owed an end_box, this lands inside a
+        // container that should already have closed.
+        (void)ui.button(id("after"), "A", Size::px(100.0f), Size::px(30.0f));
+    });
+
+    EXPECT_GT(h.ui.diagnostics().depth_overflow, 0u) << "the overflow itself must still be counted";
+    EXPECT_EQ(h.ui.diagnostics().unbalanced_end_box, 0u)
+        << "a balanced declaration must not report unbalanced end_box calls";
+    const Rect r = h.ui.rect_of(id("after"));
+    EXPECT_FLOAT_EQ(r.x, 0.0f) << "the widget after the buried scroll view must be back at the root";
+    EXPECT_FLOAT_EQ(r.w, 100.0f);
+}
+
+TEST(UiContext, AFreshlyDeclaredScrollRowIsNotClickableOutsideItsViewport) {
+    // The clip used to be written only into an ALREADY EXISTING retained
+    // entry, so a widget declared for the first time was recorded as
+    // unclipped. On the very next frame — the first on which it is clickable
+    // at all — a row scrolled far below the viewport could therefore be
+    // clicked. One frame wide, and exactly the frame a menu opens on.
+    Harness h;
+    const auto build = [](Context& ui) {
+        BoxStyle s{};
+        s.width = Size::px(200.0f);
+        s.height = Size::px(40.0f); // two rows visible out of ten
+        ui.begin_scroll(id("list"), s);
+        for (int i = 0; i < 10; ++i) {
+            (void)ui.button(id(id("row"), static_cast<uint64_t>(i)), "row", Size::px(150.0f), Size::px(20.0f));
+        }
+        ui.end_scroll();
+    };
+
+    (void)h.run(InputFrame{}, build); // frame 1: the list exists for the first time
+    const Rect r9 = h.ui.rect_of(combine(id("list"), id(id("row"), 9u)));
+    ASSERT_GT(r9.y, 40.0f) << "row 9 must be outside the viewport for this test to mean anything";
+
+    InputFrame press{};
+    press.mouse = {r9.x + 5.0f, r9.y + 5.0f};
+    press.mouse_pressed = true;
+    (void)h.run(press, build); // frame 2: the first frame the rects are hit-testable
+    EXPECT_FALSE(h.ui.active().valid()) << "a newborn scroll row outside the viewport must not latch";
+}
+
+TEST(UiContext, SliderSurvivesAnInvertedRangeAndANaN) {
+    // std::clamp(value, min, max) is UNDEFINED BEHAVIOUR when min > max, which
+    // a data-driven settings screen produces the moment two rows swap. The
+    // widget must land on a defined value and must never put a NaN into the
+    // layout.
+    Harness h;
+    float value = 0.5f;
+    (void)h.run(InputFrame{}, [&value](Context& ui) {
+        (void)ui.slider(id("inverted"), value, 1.0f, 0.0f, Size::px(200.0f));
+    });
+    EXPECT_FLOAT_EQ(value, 1.0f) << "min wins on an inverted range";
+
+    float nan_value = std::numeric_limits<float>::quiet_NaN();
+    (void)h.run(InputFrame{}, [&nan_value](Context& ui) {
+        (void)ui.slider(id("nan"), nan_value, 0.0f, 1.0f, Size::px(200.0f));
+    });
+    EXPECT_FLOAT_EQ(nan_value, 0.0f) << "a NaN must not propagate into the layout";
 }
 
 } // namespace

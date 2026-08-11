@@ -96,6 +96,8 @@ TEST(UiLayout, ContentSizingPropagatesThroughTwoNestingLevels) {
 }
 
 TEST(UiLayout, CrossAxisAlignmentPlacesChildren) {
+    // The child has an EXPLICIT cross size (40 px wide in a vertical box), so
+    // the alignment only ever places it.
     const auto solve_with = [](Align cross) {
         LayoutTree t;
         BoxStyle s{};
@@ -112,9 +114,33 @@ TEST(UiLayout, CrossAxisAlignmentPlacesChildren) {
     EXPECT_FLOAT_EQ(solve_with(Align::Start).x, 0.0f);
     EXPECT_FLOAT_EQ(solve_with(Align::Center).x, 80.0f);
     EXPECT_FLOAT_EQ(solve_with(Align::End).x, 160.0f);
+    // Stretch does NOT override an explicit Fixed cross size. The child asked
+    // for exactly 40 px and the parent's alignment is the less specific of the
+    // two — otherwise a 100 px-wide toggle placed in a Stretch column would be
+    // silently widened to the column, and there would be no way to say "this
+    // one is narrow" at all. This is also the flexbox rule (align-items only
+    // stretches an `auto` cross size).
     const Rect stretched = solve_with(Align::Stretch);
     EXPECT_FLOAT_EQ(stretched.x, 0.0f);
-    EXPECT_FLOAT_EQ(stretched.w, 200.0f);
+    EXPECT_FLOAT_EQ(stretched.w, 40.0f) << "an explicit Fixed cross size wins over the parent's Stretch";
+}
+
+TEST(UiLayout, StretchWidensAChildThatDidNotAskForACrossSize) {
+    // The other half of the rule above, and the one that makes Stretch worth
+    // having: a CONTENT-sized child takes the container's cross extent.
+    LayoutTree t;
+    BoxStyle s{};
+    s.cross = Align::Stretch;
+    s.width = Size::px(200.0f);
+    s.height = Size::px(100.0f);
+    t.begin_box(Axis::Vertical, s);
+    const uint32_t child = t.leaf(Size::content(), Size::px(10.0f), {40.0f, 10.0f});
+    t.end_box();
+    t.solve(k_viewport);
+
+    const Rect r = t.rect_of(child);
+    EXPECT_FLOAT_EQ(r.x, 0.0f);
+    EXPECT_FLOAT_EQ(r.w, 200.0f);
 }
 
 TEST(UiLayout, MainAxisAlignmentPlacesTheLeftover) {

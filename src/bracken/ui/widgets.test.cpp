@@ -443,9 +443,18 @@ TEST(UiWidgets, TextFieldDrawsACaretOnlyWhileFocused) {
     const auto unfocused = h.run(InputFrame{}, declare);
     EXPECT_EQ(unfocused->ui_commands().size(), 3u) << "background, border, text — and nothing else";
 
+    // Focus resolves at end() — it needs solved rectangles — so the frame on
+    // which Tab MOVES the focus is not yet the frame that draws the caret: the
+    // caret is appended at DECLARATION time, before end() has run. That is the
+    // same one-frame rule ui::Context documents for hit testing, and pinning it
+    // here is the point of running two frames rather than one.
     InputFrame tab{};
     tab.nav_next = true;
-    const auto focused = h.run(tab, declare);
+    const auto moving = h.run(tab, declare);
+    ASSERT_EQ(h.ui.focused(), id("f")) << "Tab moves the focus on this frame...";
+    EXPECT_EQ(moving->ui_commands().size(), 3u) << "...but the caret only appears from the NEXT one";
+
+    const auto focused = h.run(InputFrame{}, declare);
     ASSERT_EQ(h.ui.focused(), id("f"));
     ASSERT_EQ(focused->ui_commands().size(), 4u) << "...plus the caret quad";
     const auto& caret = focused->ui_commands()[3].get<scene::UiFilledRectCommand>();

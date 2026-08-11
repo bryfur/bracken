@@ -1371,19 +1371,22 @@ void PlaygroundGame::on_simulate(SimFrame& sim) {
 }
 
 void PlaygroundGame::handle_input(const SimFrame& sim) {
-    const auto& in = sim.input();
-
-    // The UI gets first refusal. `ui_capture_` is what the UI took while
-    // describing the PREVIOUS frame (build_ui runs at the end of the frame,
-    // after this), so masking here is one frame late — see the note at
-    // build_ui, and ui::Context's class comment for why one frame is inherent
-    // to the design rather than a shortcut taken here.
-    const InputSnapshot game_in = ui_capture_.mask(in);
+    // The UI gets first refusal, and it gets it for the WHOLE function — the
+    // raw snapshot is deliberately never bound to a name here. Masking only
+    // the ActionMap would leave every `was_key_just_pressed` below reading
+    // straight through the gate: typing "F1" into the demo menu's text field
+    // would toggle AO, and Escape would quit the game instead of leaving the
+    // field. `ui_capture_` is what the UI took while describing the PREVIOUS
+    // frame (build_ui runs at the end of the frame, after this), so the gate
+    // is one frame late — see the note at build_ui, and ui::Context's class
+    // comment for why one frame is inherent to the design rather than a
+    // shortcut taken here.
+    const InputSnapshot in = ui_capture_.mask(sim.input());
 
     // Evaluate every action once, up front: edges are computed against the
     // previous update(), so it must happen exactly once per sim frame and
     // before any query.
-    actions_.update(game_in);
+    actions_.update(in);
 
     if (in.was_key_just_pressed(SDL_SCANCODE_ESCAPE)) {
         quit();
@@ -2987,13 +2990,18 @@ void PlaygroundGame::build_ui(const SimFrame& sim, scene::FrameSink& fb) {
     ui_.style().panel_bg = 0xB0101418;
     ui_.style().panel_border = 0x00000000; // transparent -> not drawn at all
 
+    // Built once and reused, because the demo menu's CANCEL verb is read out of
+    // it below: `from_snapshot` is a pure mapping, but calling it twice would
+    // invite the two copies to drift.
+    const ui::InputFrame ui_input = ui::InputFrame::from_snapshot(sim.input());
+
     // F9 opens the demo menu. Never during a smoke run: that run has to render
     // a pure function of the frame index, and an open menu is state.
     if (smoke_frames_ <= 0 && sim.input().was_key_just_pressed(SDL_SCANCODE_F9)) {
         ui_menu_open_ = !ui_menu_open_;
     }
 
-    ui_.begin(fb.ui(), ui::InputFrame::from_snapshot(sim.input()),
+    ui_.begin(fb.ui(), ui_input,
               ui::Rect{0.0f, 0.0f, static_cast<float>(sim.screen_width()),
                        static_cast<float>(sim.screen_height())});
 
@@ -3032,6 +3040,14 @@ void PlaygroundGame::build_ui(const SimFrame& sim, scene::FrameSink& fb) {
     }
 
     ui_.end();
+    // CANCEL closes the demo menu (pad EAST / Escape / the menu-toggle button).
+    // It is read here rather than inside build_demo_menu because the flag it
+    // writes is checked at the TOP of the next frame — flipping it mid-
+    // declaration would tear the frame currently being described. Without this
+    // the demo's own comment about B closing the menu was simply untrue.
+    if (ui_menu_open_ && ui_input.nav_cancel) {
+        ui_menu_open_ = false;
+    }
     // The capture the NEXT frame's input read is gated on. One frame late by
     // construction — the UI is described at the END of the frame, after the
     // game logic that would have to be gated — which is the same one-frame

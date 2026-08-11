@@ -390,8 +390,21 @@ private:
     bool nav_horizontal_consumed_ = false;
     Diagnostics diag_{};
     std::size_t emitted_ = 0;
-    /// Widgets declared this frame, for rect_of() and the retained store.
-    std::vector<std::pair<uint64_t, uint32_t>> frame_rects_;
+    /// A widget declared this frame: its id, its layout node, and the clip it
+    /// was declared under. Feeds rect_of() and the retained store.
+    ///
+    /// The CLIP travels here rather than being written straight into the
+    /// retained entry, because a widget declared for the FIRST time has no
+    /// retained entry to write it into — and recording it as unclipped meant
+    /// that on the one frame after a scroll list appeared, a row scrolled out
+    /// of view was still clickable.
+    struct FrameRect {
+        uint64_t id = 0;
+        uint32_t node = LayoutTree::k_invalid;
+        Rect clip{};
+        bool clipped = false;
+    };
+    std::vector<FrameRect> frame_rects_;
 };
 
 } // namespace bracken::ui

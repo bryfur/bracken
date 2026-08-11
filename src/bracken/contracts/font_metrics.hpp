@@ -39,8 +39,12 @@ namespace bracken {
  * WHAT IT DELIBERATELY IS NOT. It is a snapshot of ONE font at ONE pixel
  * size, over a bounded codepoint range. A string containing a codepoint
  * outside `[k_first_cp, k_last_cp]` and outside `sparse_advance` measures with
- * `fallback_advance` but DRAWS at its real advance, so it will overrun its
- * box. `has_advance()` is the hook a caller uses to count that (the UI module
+ * `fallback_advance` but still DRAWS at its real advance — `build_string_quads`
+ * asks `has_advance()` first and keeps the glyph's own advance when the answer
+ * is no, because driving the pen with '?' widths would pile a CJK run on top of
+ * itself. So such a string is drawn correctly and MEASURED wrongly, and will
+ * overrun a box sized from this table.
+ * `has_advance()` is the hook a caller uses to count that (the UI module
  * folds it into `ui::Context::Diagnostics::text_fallback_advances`) — this
  * struct itself stays a pure value with no mutable counters, because a
  * measure that is not a pure function of its inputs is not reproducible at a
@@ -94,9 +98,13 @@ struct FontMetrics {
     /**
      * Width of `utf8` at `scale`, in pixels.
      *
-     * This reproduces EXACTLY the pen walk `TextRenderer::build_string_quads`
-     * performs — kerning added before the glyph, then the glyph's advance —
-     * so a measured width and a drawn string agree to the pixel. It is
+     * This reproduces the pen walk `TextRenderer::build_string_quads`
+     * performs — kerning added before the glyph, then the glyph's advance — so
+     * a measured width and a drawn string agree to the pixel FOR EVERY
+     * CODEPOINT THE TABLE COVERS. Outside the exported range the two diverge
+     * by construction: this charges `fallback_advance`, the pen keeps the
+     * glyph's real advance (see the struct comment), and `count_fallbacks`
+     * says how many codepoints that was. It is
      * deliberately not `TTF_GetStringSize`, which is what
      * `TextRenderer::get_text_width` used to use and which is a second,
      * independently drifting answer to the same question. (`get_text_width` is

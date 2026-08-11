@@ -100,6 +100,30 @@ TEST(UiNineSlice, NoCenterYieldsEightQuadsAndLeavesTheHole) {
     EXPECT_FLOAT_EQ(area, dst.w * dst.h - middle);
 }
 
+TEST(UiNineSlice, BordersWiderThanTheSOURCEDoNotInvertTheUvs) {
+    // The destination bands were guarded against inversion from the start; the
+    // UV columns were not. Authored borders whose sum exceeds the SOURCE width
+    // (or a texture_size the caller got wrong) put the third UV column below
+    // the second, and a quad with u1 < u0 samples its band MIRRORED — corner
+    // art drawn inside out, which reads as a texture bug rather than as bad
+    // authoring.
+    NineSlice slice{};
+    slice.texture_size = {32.0f, 32.0f};
+    slice.border = Edges::all(24.0f); // 24 + 24 against a 32 px source
+
+    NineSliceQuad q[9]{};
+    const uint32_t n = build_nine_slice(slice, Rect{0.0f, 0.0f, 200.0f, 200.0f}, std::span<NineSliceQuad, 9>(q));
+    ASSERT_EQ(n, 9u);
+    for (uint32_t i = 0; i < n; ++i) {
+        EXPECT_LE(q[i].u0, q[i].u1) << "quad " << i << " samples u mirrored";
+        EXPECT_LE(q[i].v0, q[i].v1) << "quad " << i << " samples v mirrored";
+    }
+    // The degenerate-but-correct answer: the middle band collapses to zero
+    // width rather than running backwards.
+    EXPECT_FLOAT_EQ(q[4].u0, q[4].u1);
+    EXPECT_FLOAT_EQ(q[4].v0, q[4].v1);
+}
+
 TEST(UiNineSlice, EmptyDestinationYieldsNoQuads) {
     NineSliceQuad q[9]{};
     EXPECT_EQ(build_nine_slice(make_slice(), Rect{0.0f, 0.0f, 0.0f, 50.0f}, std::span<NineSliceQuad, 9>(q)), 0u);

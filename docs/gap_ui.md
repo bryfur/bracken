@@ -121,7 +121,16 @@ suppresses the focus move on that press.
 
 Focus resolves at `end()` — it needs solved rectangles — so a navigation key
 pressed on frame N moves the focus that frame and the newly focused widget can
-be activated from frame N+1.
+be activated from frame N+1. Anything a widget draws *because* it is focused
+(a focus border, a text field's caret) therefore also appears from frame N+1,
+because the draw is appended at declaration time.
+
+A focus that stops naming a declared widget is **dropped**, not kept. That
+matters more than it sounds: `end()` sets `capture().keyboard` from the focused
+id, so a ghost focus — a menu closed with a row focused, a list row that
+scrolled out of existence — would silence the host's entire keyboard channel
+for the rest of the process, with nothing on screen to explain why the
+character stopped walking.
 
 **The gamepad path, and why it needed engine work.** `InputSnapshot` already
 carried `menu_up_pressed` and friends, and it looked like the answer. It was
@@ -287,9 +296,16 @@ wants its `content` unless a `Fixed` size overrides it; a box wants the sum of
 its children along the main axis plus spacing, the max along the cross axis,
 plus padding. **Arrange** (top-down) assigns rectangles: non-flex children take
 their measured main size, flex children split the leftover in proportion to
-their weights, and the cross axis is placed by `BoxStyle::cross`
-(`Stretch` fills). `Align` on the main axis places the leftover when no child
-is flex; `Stretch` there reads as `Start`.
+their weights, and the cross axis is placed by `BoxStyle::cross`.
+`Align` on the main axis places the leftover when no child is flex; `Stretch`
+there reads as `Start`.
+
+`Stretch` on the CROSS axis fills — but only for a child that did not ask for a
+cross size itself. An explicit `Size::px` **wins over** the parent's `Stretch`,
+the same rule flexbox has (`align-items` only stretches an `auto` cross size);
+a `Size::flex` or `Size::content` child stretches. Without that, a 100 px-wide
+toggle dropped into a `Stretch` column would be silently widened to the column
+and there would be no way to say "this one is narrow".
 
 Two properties the tests pin:
 
@@ -312,8 +328,11 @@ well-formed). An unbalanced `end_box` is counted and ignored.
 exactly tile `dst` (8 with `draw_center` false, 0 for an empty `dst`).
 Destination band widths come from differencing absolute edge positions, so the
 patches share edges and cannot open a hairline seam. Borders wider than `dst`
-scale down proportionally rather than inverting a quad. UVs come from the
-**source** border, so the corner is still the corner at any box size.
+scale down proportionally rather than inverting a quad, and borders wider than
+the **source** collapse the middle UV band to zero rather than running it
+backwards (a quad with `u1 < u0` samples its band mirrored — corner art drawn
+inside out). UVs come from the **source** border, so the corner is still the
+corner at any box size.
 
 ### 2.6 `ui/ui_input.hpp`
 

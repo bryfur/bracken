@@ -345,13 +345,12 @@ size_t TextRenderer::build_string_quads(std::string_view text, float x, float y,
             continue;
         }
 
-        // The pen consumes the SAME table FontMetrics::measure_width does, so
-        // "how wide will this be" and "where did the glyphs land" cannot
-        // disagree — whatever the table covers or fails to cover, both walks
-        // are wrong in exactly the same way. (Before the mirror existed this
-        // was a live TTF_GetGlyphKerning call and the layout side was an 8 px
-        // guess.) The pre-mirror path survives only for a renderer whose
-        // export failed, which is a machine with no font at all.
+        // The pen consumes the SAME table FontMetrics::measure_width does
+        // wherever that table HAS an entry, so "how wide will this be" and
+        // "where did the glyphs land" agree over the exported range. (Before
+        // the mirror existed this was a live TTF_GetGlyphKerning call and the
+        // layout side was an 8 px guess.) The pre-mirror path survives for a
+        // renderer whose export failed, which is a machine with no font at all.
         if (prev_cp != 0) {
             if (metrics_.valid()) {
                 pen += metrics_.kerning_of(prev_cp, cp);
@@ -389,7 +388,15 @@ size_t TextRenderer::build_string_quads(std::string_view text, float x, float y,
             ++quads;
         }
 
-        pen += metrics_.valid() ? metrics_.advance_of(cp) : glyph->advance;
+        // Prefer the table so that measuring and drawing cannot disagree — but
+        // ONLY where the table actually has an answer. `advance_of` charges
+        // `fallback_advance` ('?') to any codepoint outside the exported range,
+        // and driving the PEN with that would draw a CJK or Cyrillic run as a
+        // pile of overlapping glyphs. The glyph's own advance is the correct
+        // one to draw with; the residual measure/draw disagreement on those
+        // codepoints is exactly what `count_fallbacks` (and
+        // `ui::Context::Diagnostics::text_fallback_advances`) exists to report.
+        pen += (metrics_.valid() && metrics_.has_advance(cp)) ? metrics_.advance_of(cp) : glyph->advance;
         prev_cp = cp;
     }
     return quads;
@@ -659,13 +666,29 @@ void TextRenderer::draw_run_range(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* 
         SDL_SetGPUScissor(render_pass, &r);
     };
 
+    // Does this span clip AT ALL? If not, the scissor is never touched — not
+    // even to re-assert `default_scissor`. That matters twice over: the
+    // documented claim is that "an unclipped frame issues exactly the one
+    // SDL_SetGPUScissor call it always did", and `draw_queued_text` (the
+    // whole-queue convenience, which has no idea how big the target is) passes
+    // a sentinel rectangle that must never actually reach the driver.
+    bool span_clips = false;
+    for (std::size_t i = first_run; i < last_run; ++i) {
+        if (queued_runs_[i].clip_enabled) {
+            span_clips = true;
+            break;
+        }
+    }
+
     const TextRun& first = queued_runs_[first_run];
     size_t draw_first = first.first_vertex;
     uint32_t draw_count = 0;
     uint32_t draw_color = first.color;
     TextRun draw_state = first;
     push_color(draw_color);
-    set_clip(first);
+    if (span_clips) {
+        set_clip(first);
+    }
     bool clipped = first.clip_enabled;
 
     for (std::size_t i = first_run; i < last_run; ++i) {
@@ -682,7 +705,7 @@ void TextRenderer::draw_run_range(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* 
             push_color(run.color);
             draw_color = run.color;
         }
-        if (!same_clip(run, draw_state)) {
+        if (span_clips && !same_clip(run, draw_state)) {
             set_clip(run);
             clipped = clipped || run.clip_enabled;
         }
@@ -704,6 +727,14 @@ void TextRenderer::draw_run_range(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* 
 void TextRenderer::draw_queued_text(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* render_pass) {
     // Retained as the whole-queue convenience (and for hosts calling it
     // directly): draw everything, then retire the queue.
+    //
+    // The "restore" rectangle is a SENTINEL, not a real target size — this
+    // entry point is not told one. draw_run_range only ever hands it to the
+    // driver when the span actually contains a clipped run, which the queue
+    // this path serves does not (nothing calls queue_text_draw with a clip
+    // except UIRenderer, which uses draw_run_range directly). If a future
+    // caller mixes the two, give this overload a real scissor instead of
+    // widening the sentinel.
     const SDL_Rect full{0, 0, 1 << 15, 1 << 15};
     draw_run_range(cmd, render_pass, 0, queued_runs_.size(), full);
     clear_queued_text();

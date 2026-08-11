@@ -213,7 +213,12 @@ bool Context::slider(WidgetId local, float& value, float min, float max, Size wi
         // impossible to tune with a pad.
         nav_horizontal_consumed_ = true;
     }
-    value = std::clamp(value, min, max);
+    // NOT std::clamp(value, min, max): that is UNDEFINED BEHAVIOUR when
+    // min > max, which a data-driven UI hands in the moment two settings rows
+    // swap. min wins on an inverted range, and NaN falls through to `min`
+    // rather than propagating into the layout as a NaN rectangle.
+    value = value > max ? max : value;
+    value = value < min || !(value == value) ? min : value;
     const float t = span > 0.0f ? (value - min) / span : 0.0f;
 
     const float h = style_.control_height * cfg_.ui_scale;

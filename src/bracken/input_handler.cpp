@@ -358,6 +358,12 @@ void InputHandler::post_process_events() {
 bool InputHandler::process_events() {
     // Reset per-frame deltas
     camera_zoom_delta_ = 0.0f;
+    // The RAW wheel accumulator is a per-frame delta too. Application's own
+    // pump_events() calls reset_wheel(); this is the other, self-contained
+    // poll path (a host driving InputHandler directly), and without the reset
+    // here wheel_y_ accumulates for the life of the process — a scroll view
+    // reading it would run away after the first flick.
+    reset_wheel();
     menu_toggle_pressed_ = false;
     menu_up_pressed_ = false;
     menu_down_pressed_ = false;
