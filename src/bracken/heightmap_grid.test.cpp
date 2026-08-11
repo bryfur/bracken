@@ -20,6 +20,7 @@
 #include "bracken/heightmap.hpp"
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>
 #include <string>
@@ -402,4 +403,36 @@ TEST(HeightmapGrid, SetPageDerivesPageGeometryFromTheGrid) {
     EXPECT_EQ(page->min_height, RANGE.min);
     EXPECT_EQ(page->max_height, RANGE.max);
     EXPECT_TRUE(grid.valid());
+}
+
+// ============================================================================
+// (4) NaN. Every comparison against a NaN is false, so a coordinate that is not
+// a number falls through EVERY range guard by default — and the axis clamp then
+// casts it to uint32_t, which is undefined behaviour and in practice an
+// out-of-range page index into the vector. A NaN reaches this API easily: a
+// physics body that blew up, a division by a zero delta in the host's own
+// height query.
+// ============================================================================
+
+TEST(HeightmapGrid, ANaNCoordinateIsOutsideEveryPage) {
+    const HeightmapGrid grid = make_2x2();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_EQ(grid.page_at(nan, 500.0f), glm::ivec2(-1, -1));
+    EXPECT_EQ(grid.page_at(500.0f, nan), glm::ivec2(-1, -1));
+    EXPECT_EQ(grid.page_at(nan, nan), glm::ivec2(-1, -1));
+    // A finite query still finds its page — the guard must not swallow those.
+    EXPECT_EQ(grid.page_at(500.0f, 500.0f), glm::ivec2(0, 0));
+}
+
+TEST(HeightmapGrid, ANaNCoordinateSamplesTheEdgePageRatherThanUndefinedBehaviour) {
+    // The clamp's answer for a NaN is page 0 — the same answer it gives for
+    // anything off the low edge. What matters is that it is an IN-RANGE page
+    // and a finite height, not that it is any particular one.
+    const HeightmapGrid grid = make_2x2();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_TRUE(std::isfinite(grid.get_height_world(nan, 500.0f)));
+    EXPECT_TRUE(std::isfinite(grid.get_height_world(500.0f, nan)));
+    EXPECT_TRUE(grid.resident_at(nan, nan));
+    const glm::vec3 n = grid.get_normal_world(nan, nan);
+    EXPECT_TRUE(std::isfinite(n.x) && std::isfinite(n.y) && std::isfinite(n.z));
 }

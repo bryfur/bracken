@@ -1,6 +1,8 @@
 #include "hzb.hpp"
 
 #include "bracken/core/assert.hpp"
+#include "bracken/core/jobs/job_stage.hpp"
+#include "bracken/core/log_throttle.hpp"
 #include "bracken/core/logger.hpp"
 #include "bracken/core/profiler.hpp"
 #include "bracken/gpu/gpu_compute.hpp"
@@ -210,6 +212,7 @@ std::size_t HzbPyramid::level_readback_bytes(int level) const {
 
 SDL_GPUFence* HzbPyramid::request_level_readback(int level, SDL_GPUTransferBuffer* dst) {
     BRACKEN_ASSERT_MAIN_THREAD();
+    BRACKEN_ASSERT_NOT_SIM_STAGE();
     if (device_ == nullptr || !is_ready() || dst == nullptr) {
         return nullptr;
     }
@@ -217,8 +220,11 @@ SDL_GPUFence* HzbPyramid::request_level_readback(int level, SDL_GPUTransferBuffe
         // Level 0 is refused rather than clamped: it is the whole screen, and a
         // caller asking for it has almost certainly mixed up "the pyramid" with
         // "a coarse level of the pyramid".
-        BRACKEN_LOG_WARN(LOG_TAG, "HzbPyramid::request_level_readback: level {} is out of range [1, {})", level,
-                         mip_count_);
+        // Throttled: this is a public entry point a caller can reach every
+        // frame, and a per-frame refusal would be a log flood rather than a
+        // diagnostic.
+        BRACKEN_LOG_WARN_ONCE(LOG_TAG, "HzbPyramid::request_level_readback: level {} is out of range [1, {})", level,
+                              mip_count_);
         return nullptr;
     }
 

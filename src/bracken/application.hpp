@@ -311,6 +311,11 @@ protected:
      * pointing at freed geometry — call `init_renderer()` first, or install the
      * invalidator yourself.
      *
+     * That invalidator captures a RAW pointer to the renderer, so
+     * `shutdown_renderer()` clears it and detaches the manager. A host-owned
+     * manager therefore outlives the Application safely but stops invalidating;
+     * re-install it after any later `init_renderer()`.
+     *
      * Main-thread tier. Forward-declared deliberately: `residency_manager.hpp`
      * reaches the `gpu/` layer through ModelManager, and application.hpp is
      * forbidden from exporting that (public_headers.test.cpp).

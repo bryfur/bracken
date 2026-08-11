@@ -744,7 +744,9 @@ on its own command buffer and returns a fence, following the idiom
 ### Where it sits in the frame
 
 ```
-frame i:   ... depth prepass -> [closest HZB] -> [FARTHEST HZB + readback submit] -> GTAO -> ...
+frame i:   ... depth prepass -> [closest HZB] -> [FARTHEST HZB recorded] -> GTAO -> ...
+           ... end_frame() submits the frame's command buffer ...
+           -> submit_occlusion_readback()   (its own command buffer, its own fence)
 frame i+1: resolve readback (deterministic fence wait) -> plan_frame -> Prepare (the cull) -> ...
 ```
 
@@ -753,6 +755,20 @@ consumed a WHOLE FRAME LATER, because Prepare runs before this frame's prepass
 and SDL3 has no non-blocking map. That one-frame lag is the source of every
 conservatism knob above; there is no arrangement of this feature in which a CPU
 cull reads current depth.
+
+**The download is requested AFTER the frame's command buffer has been
+submitted, and that ordering is load-bearing.** A readback rides its own command
+buffer, submitted the instant it is recorded, and SDL3 GPU runs command buffers
+in submission order. The build above is only RECORDED on the frame's buffer,
+which is not submitted until `end_frame()` — so a download requested next to the
+build runs FIRST and captures the PREVIOUS frame's pyramid, leaving
+two-frame-old depth paired with a one-frame-old view-projection. A projection
+tested against depth rasterized with a different matrix is not conservative at
+all, which is precisely the false-cull failure this feature exists to avoid.
+`SceneRenderer::submit_occlusion_readback` therefore runs at the very end of
+`render_frame` and carries the build's camera across in
+`occlusion_build_view_proj_`. (The first landing got this wrong; it was caught
+in review.)
 
 ### The determinism rule, and which side of it this lands on
 
@@ -854,10 +870,26 @@ Read this section before trusting anything above.
 * **`unload_model` does not follow the LOD chain.** Levels are separate models
   with their own handles; evicting a base leaves its levels resident. A host
   that wants the chain gone must evict each handle.
-* **Skinned draws are not residency-aware.** `resolve_skinned_chunk` does not
-  test `Model::loaded`; a skinned draw against an evicted model resolves through
-  its (still-present) skeleton and draws nothing, counted nowhere. Static model
-  draws are handled; skinned ones were left alone to limit the blast radius.
+* ~~**Skinned draws are not residency-aware.**~~ Closed in review:
+  `resolve_skinned_chunk` now tests `Model::loaded` and counts an evicted
+  skinned draw as `draws_deferred_not_resident`, the same counter the static
+  walk uses. Leaving it out meant a skinned draw against an evicted model
+  resolved through its still-present skeleton, reached the draw walk, found no
+  vertex buffer and vanished counted NOWHERE — which is the one thing
+  CLAUDE.md's diagnostics rule forbids outright.
+* **The eviction APPLY path is not covered by a test, only the plan.**
+  `plan_evictions` is pure and heavily tested, but the ten lines in `pump()`
+  that apply a plan — `unload_model`, the `resident_bytes_` decrement, the
+  state transition, the invalidator call, `stats.evictions` — never run in the
+  suite. They cannot: the fixture has no GPU device, so `gpu_bytes` is 0 for
+  every model, `resident_bytes_` never exceeds any budget, and
+  `plan_evictions` returns an empty plan by construction.
+  `ResidencyManager::EvictionKeepsTheHandleAndTheSlot` says so out loud and
+  drives `unload_model` directly instead.
+* **`TextureCache`'s destroy-at-zero path is not covered by a test either**,
+  for the same reason: `acquire()` needs a device, so the suite can only reach
+  `release()` with foreign and null pointers. `set_destroy_on_release(true)` has
+  never run.
 * **The reload round-trip is not covered by a test.** It goes through
   `AsyncModelLoader`, which needs a real `.glb`. The two halves are covered
   separately (`reupload_model` on the ModelManager side, the routing branch in

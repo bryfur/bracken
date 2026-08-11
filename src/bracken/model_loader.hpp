@@ -568,8 +568,18 @@ public:
      * object, exactly as `reload_model` does), so every draw command that
      * survived the eviction resolves again with no host bookkeeping.
      *
-     * Refuses (false, logged) an unknown handle or a null model. A slot that
-     * is still loaded is unloaded first, so this doubles as "replace".
+     * The slot's LOD links and its BOUNDS survive too. The decode knows about
+     * neither, and a hand-authored box (a skinned model with animation
+     * headroom) would be lost otherwise — `unload_model` promises the bounds
+     * survive an eviction, so the restore has to honour that. Bounds the decode
+     * DOES supply win; bounds nobody supplied are scanned off the vertices
+     * BEFORE the upload frees them, which is the same point and the same reason
+     * `register_model` does it.
+     *
+     * Refuses (false, logged) an unknown handle, a null model, a model with no
+     * geometry, or an upload that left a mesh un-uploaded. The last two leave
+     * the slot UNLOADED rather than flagged resident with nothing in it. A slot
+     * that is still loaded is unloaded first, so this doubles as "replace".
      * Main-thread (asserted).
      */
     [[nodiscard]] bool reupload_model(ModelHandle handle, std::unique_ptr<Model> decoded);

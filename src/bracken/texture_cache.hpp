@@ -189,7 +189,9 @@ public:
     [[nodiscard]] std::size_t hits() const noexcept { return hits_; }
 
     /** Estimated bytes of GPU memory the held images occupy, mip chain
-     *  included (the 4/3 series, rounded up). An estimate and labelled as one:
+     *  included as the EXACT per-level sum (`texture_bytes_estimate` — not the
+     *  4/3 limit; a one-pixel-tall strip's chain is nothing like 4/3 of its
+     *  base). An estimate and labelled as one:
      *  SDL3 exposes no allocation size, and a driver's tiling and alignment are
      *  its own business. It is a budget input, not an accounting figure. */
     [[nodiscard]] std::size_t bytes_resident() const noexcept { return bytes_resident_; }

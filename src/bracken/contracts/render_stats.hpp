@@ -99,9 +99,12 @@ struct FrameDiagnostics {
     /// Model draw whose ModelHandle resolves to no model (never registered,
     /// or stale across an unload_all()).
     uint32_t draws_dropped_unknown_model = 0;
-    /// Model draw whose ModelHandle resolves to a REGISTERED model that is not
-    /// currently resident — an asset the residency manager has evicted or has
-    /// not finished streaming in (`Model::loaded == false`).
+    /// Model or SKINNED draw whose ModelHandle resolves to a REGISTERED model
+    /// that is not currently resident — an asset the residency manager has
+    /// evicted or has not finished streaming in (`Model::loaded == false`).
+    /// Both walks count into this one counter, because a host debugging a
+    /// streaming stall wants "how many draws did residency swallow", not a
+    /// split by vertex format.
     ///
     /// Deliberately NOT folded into draws_dropped_unknown_model. They are
     /// opposite diagnoses with opposite fixes: "unknown" means the host is

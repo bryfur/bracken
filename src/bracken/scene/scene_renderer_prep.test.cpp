@@ -741,6 +741,36 @@ TEST(ScenePrepResidency, EvictedModelIsCountedAsNotResidentNotAsUnknown) {
     }
 }
 
+TEST(ScenePrepResidency, AnEvictedSkinnedModelIsCountedToo) {
+    // unload_model keeps the SKELETON — only the payload goes — so an evicted
+    // skinned command still resolves with a full joint count, reaches the draw
+    // walk, finds no vertex buffer and draws nothing. Without this counter that
+    // disappearance is invisible in every diagnostic the engine has, which is
+    // the one thing CLAUDE.md's "does not drop work silently" rule forbids.
+    GoldenWorld world;
+    ASSERT_EQ(world.models.unload_model(H_SKINNED), 0u) << "no device: nothing was uploaded";
+    const Model* skinned = world.models.get_model(H_SKINNED);
+    ASSERT_NE(skinned, nullptr) << "unload_model must KEEP the slot";
+    ASSERT_TRUE(skinned->has_skeleton) << "the skeleton survives an eviction — that is what makes this reachable";
+    EXPECT_FALSE(skinned->loaded);
+
+    jobs::JobSystem js;
+    ScenePrep::PrepScratch scratch;
+    std::vector<ScenePrep::ResolvedSkinnedEntry> resolved;
+    FrameStatsPartial stats;
+    ScenePrep::prep_resolve_skinned(js, world.packet.skinned_commands(), world.packet.palettes(), world.params(),
+                                    scratch.skinned, resolved, stats);
+
+    // The three commands naming H_SKINNED are now deferred instead of resolved.
+    EXPECT_TRUE(resolved.empty());
+    EXPECT_EQ(stats.diagnostics.draws_deferred_not_resident, 3u);
+    // And they are NOT charged to the "no skeleton" counter: that one still
+    // holds exactly the two commands whose model genuinely has none.
+    EXPECT_EQ(stats.diagnostics.skinned_dropped_no_skeleton, 2u);
+    // A deferred draw is not a rendered one either.
+    EXPECT_EQ(stats.entities_rendered, 0u);
+}
+
 TEST(ScenePrepResidency, NotResidentCountIsIdenticalAtAnyWorkerCount) {
     std::array<uint32_t, 3> counts{};
     const std::array<int, 3> workers{0, 1, 4};

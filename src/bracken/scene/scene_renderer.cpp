@@ -2240,6 +2240,13 @@ void SceneRenderer::render_frame(const FramePacket& frame) {
     } else {
         end_frame();
     }
+
+    // AFTER the frame's command buffer is submitted, never before: the readback
+    // rides its own buffer and command buffers execute in submission order, so
+    // requesting it next to the build would download the previous frame's
+    // pyramid while recording this frame's camera. No-op unless a pyramid was
+    // actually built this frame.
+    submit_occlusion_readback();
 }
 
 // ============================================================================
@@ -2357,6 +2364,8 @@ void SceneRenderer::release_occlusion_resources() {
     occlusion_depth_.clear();
     occlusion_depth_ready_ = false;
     occlusion_field_ = OcclusionField{};
+    // A build recorded on a command buffer we are abandoning owes no readback.
+    occlusion_build_recorded_ = false;
     hzb_far_.reset();
 }
 
@@ -2448,6 +2457,44 @@ void SceneRenderer::build_occlusion_pyramid(SDL_GPUCommandBuffer* cmd, const Cam
         hzb_far_->build(cmd, *pipeline_registry_, *post_->offscreen_depth());
     }
 
+    // The download is NOT requested here — see submit_occlusion_readback(). It
+    // has to wait until `cmd` itself has been submitted, because the dispatches
+    // above are only RECORDED at this point. All that is recorded now is which
+    // camera rasterized what the pyramid will hold once `cmd` runs.
+    //
+    // The UNJITTERED matrix, deliberately, even though the prepass rasterized
+    // with the jittered one. The discrepancy is at most half a pixel at mip 0,
+    // i.e. 1/32 of a texel at level 4, and the footprint walk dilates by a
+    // whole texel on every side — so it is inside the conservatism the test
+    // already carries, and using the jittered matrix would make the cull depend
+    // on the TAA phase, which is a frame-index input nobody wants in a culling
+    // decision.
+    occlusion_build_view_proj_ = frame_cam_.view_proj_unjittered;
+    occlusion_build_camera_position_ = camera.position;
+    occlusion_build_camera_forward_ =
+        glm::normalize(-glm::vec3(camera.view[0][2], camera.view[1][2], camera.view[2][2]));
+    occlusion_build_recorded_ = true;
+}
+
+void SceneRenderer::submit_occlusion_readback() {
+    BRACKEN_ASSERT_MAIN_THREAD();
+    // ORDER IS THE WHOLE POINT OF THIS FUNCTION EXISTING. A readback rides its
+    // OWN command buffer, submitted the instant it is recorded, and SDL3 GPU
+    // executes command buffers in submission order — so a download requested
+    // next to the build (which is merely RECORDED on the frame's buffer,
+    // submitted at present) runs BEFORE that build and captures the PREVIOUS
+    // frame's pyramid. The depth would then be two frames old while the camera
+    // matrix stored beside it was one, and a projection tested against depth
+    // rasterized with a different matrix is not conservative at all — which is
+    // exactly the false-cull failure this feature must not have.
+    //
+    // Called after the frame's command buffer has been submitted, so the copy
+    // observes this frame's pyramid and pairs with this frame's camera.
+    const bool recorded = occlusion_build_recorded_;
+    occlusion_build_recorded_ = false;
+    if (!recorded || !hzb_far_ || context_ == nullptr) {
+        return;
+    }
     // One readback in flight at a time. A second request while the first is
     // pending would race two copies into one transfer buffer.
     if (occlusion_fence_ != nullptr) {
@@ -2475,18 +2522,9 @@ void SceneRenderer::build_occlusion_pyramid(SDL_GPUCommandBuffer* cmd, const Cam
     if (occlusion_fence_ != nullptr) {
         // Remember what rasterized it; the next frame's travel/rotation gates
         // are measured against exactly this camera, not against "last frame".
-        //
-        // The UNJITTERED matrix, deliberately, even though the prepass
-        // rasterized with the jittered one. The discrepancy is at most half a
-        // pixel at mip 0, i.e. 1/32 of a texel at level 4, and the footprint
-        // walk dilates by a whole texel on every side — so it is inside the
-        // conservatism the test already carries, and using the jittered matrix
-        // would make the cull depend on the TAA phase, which is a frame-index
-        // input nobody wants in a culling decision.
-        pending_occlusion_view_proj_ = frame_cam_.view_proj_unjittered;
-        pending_occlusion_camera_position_ = camera.position;
-        pending_occlusion_camera_forward_ =
-            glm::normalize(-glm::vec3(camera.view[0][2], camera.view[1][2], camera.view[2][2]));
+        pending_occlusion_view_proj_ = occlusion_build_view_proj_;
+        pending_occlusion_camera_position_ = occlusion_build_camera_position_;
+        pending_occlusion_camera_forward_ = occlusion_build_camera_forward_;
     }
 }
 

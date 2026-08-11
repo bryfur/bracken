@@ -1483,6 +1483,22 @@ bool ModelManager::reupload_model(ModelHandle handle, std::unique_ptr<Model> dec
         BRACKEN_LOG_ERROR("model", "reupload_model: null model for handle {}", handle);
         return false;
     }
+    // Refused BEFORE anything is destroyed, exactly as register_model refuses an
+    // empty model: accepting one would leave the slot flagged `loaded` with no
+    // geometry, which every consumer reads as "resident" and draws as nothing.
+    bool any_geometry = false;
+    for (const Mesh& mesh : decoded->meshes) {
+        if (mesh.uploaded || !mesh.vertices.empty() || !mesh.skinned_vertices.empty()) {
+            any_geometry = true;
+            break;
+        }
+    }
+    if (!any_geometry) {
+        BRACKEN_LOG_ERROR("model", "reupload_model: handle {}: {}", handle,
+                          to_string(ModelRegisterError::EmptyModel));
+        return false;
+    }
+
     // "Replace" as well as "restore": a still-loaded slot gives its resources
     // back first, so the texture references stay balanced either way.
     (void)unload_model(handle);
@@ -1494,17 +1510,55 @@ bool ModelManager::reupload_model(ModelHandle handle, std::unique_ptr<Model> dec
     // select_lod stops finding them).
     std::vector<ModelHandle> lod_handles = std::move(slot.lod_handles);
     std::vector<float> lod_thresholds = std::move(slot.lod_thresholds);
+    // Same for the BOUNDS: unload_model's contract is that the slot's bounds
+    // survive an eviction, and a hand-authored box (a skinned model with
+    // animation headroom) is exactly the kind a decode cannot reproduce.
+    const AABB slot_bounds = slot.bounds;
 
     // Move-assign into the existing object so raw Model* handed to callers
     // stay valid — the same contract reload_model keeps.
     slot = std::move(*decoded);
     slot.lod_handles = std::move(lod_handles);
     slot.lod_thresholds = std::move(lod_thresholds);
+    if (slot.bounds.empty()) {
+        slot.bounds = slot_bounds;
+    }
+
+    // BOUNDS BEFORE THE UPLOAD, and this is not a style choice: upload_to_gpu
+    // frees the CPU vertex arrays (unless retention is on), so a scan afterwards
+    // finds nothing, leaves the box empty and gives compute_bounding_sphere a
+    // zero radius — which the Prepare stage reads as "no bounds", silently
+    // changing how a streamed-back model culls and which LOD it picks.
+    // register_model derives them at this same point for the same reason.
+    if (slot.bounds.empty()) {
+        glm::vec3 lo(std::numeric_limits<float>::max());
+        glm::vec3 hi(std::numeric_limits<float>::lowest());
+        for (const Mesh& mesh : slot.meshes) {
+            for (const auto& v : mesh.vertices) {
+                lo = glm::min(lo, v.position);
+                hi = glm::max(hi, v.position);
+            }
+            for (const auto& v : mesh.skinned_vertices) {
+                lo = glm::min(lo, v.position);
+                hi = glm::max(hi, v.position);
+            }
+        }
+        if (lo.x <= hi.x) {
+            slot.bounds = {lo, hi};
+        }
+    }
+    slot.compute_bounding_sphere();
 
     if (device_ != nullptr) {
         ModelLoader::upload_to_gpu(*device_, textures_, slot, retain_cpu_geometry_);
+        for (const Mesh& mesh : slot.meshes) {
+            if (!mesh.uploaded) {
+                BRACKEN_LOG_ERROR("model", "reupload_model: handle {}: {}", handle,
+                                  to_string(ModelRegisterError::UploadFailed));
+                return false; // slot stays unloaded — the caller sees the refusal
+            }
+        }
     }
-    slot.compute_bounding_sphere();
     slot.loaded = true;
     return true;
 }

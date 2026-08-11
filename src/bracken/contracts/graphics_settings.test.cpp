@@ -67,6 +67,55 @@ TEST_F(GraphicsSettingsTest, DefaultValues) {
     // budget (probe_schedule.hpp's gi_budget()) and is stored regardless.
     EXPECT_EQ(s.gi_mode, GiMode::Off);
     EXPECT_EQ(s.gi_quality, GiQuality::Medium);
+    // Hi-Z draw occlusion culling is OFF by default, and this is the standing
+    // additivity gate for it: the depth it tests is a frame old, so under
+    // camera motion the test is a heuristic and a false cull is a prop missing
+    // behind a wall — a few hundred pixels, structurally invisible in
+    // mean_luma. A defaulted-on value would move every pinned baseline while
+    // reading as if it had not.
+    EXPECT_FALSE(s.occlusion_culling);
+    EXPECT_TRUE(s.frustum_culling);
+}
+
+// The persisted pair, both directions. A field added to save() and forgotten in
+// load() reads as "the player's choice does not stick"; one added to load() and
+// forgotten in save() reads the same way and is the harder of the two to spot,
+// because the in-memory value is right until the process restarts.
+TEST_F(GraphicsSettingsTest, OcclusionCullingRoundTrips) {
+    GraphicsSettings written;
+    written.occlusion_culling = true;
+    ASSERT_TRUE(written.save(TEST_FILE));
+
+    GraphicsSettings read;
+    ASSERT_FALSE(read.occlusion_culling);
+    ASSERT_TRUE(read.load(TEST_FILE));
+    EXPECT_TRUE(read.occlusion_culling);
+
+    written.occlusion_culling = false;
+    ASSERT_TRUE(written.save(TEST_FILE));
+    GraphicsSettings reread;
+    reread.occlusion_culling = true;
+    ASSERT_TRUE(reread.load(TEST_FILE));
+    EXPECT_FALSE(reread.occlusion_culling);
+}
+
+// A settings file written before the key existed must leave the default in
+// place rather than being read as anything. This is the upgrade path every
+// existing player's settings.cfg takes.
+TEST_F(GraphicsSettingsTest, AFileWithNoOcclusionKeyKeepsTheDefault) {
+    {
+        std::ofstream out(TEST_FILE);
+        out << "settings_version=" << GraphicsSettings::CURRENT_SETTINGS_VERSION << "\n";
+        out << "frustum_culling=1\n";
+    }
+    GraphicsSettings loaded;
+    loaded.occlusion_culling = true; // whatever was in memory must be overwritten by nothing
+    ASSERT_TRUE(loaded.load(TEST_FILE));
+    EXPECT_TRUE(loaded.occlusion_culling) << "load() must not invent a value for an absent key";
+
+    GraphicsSettings fresh;
+    ASSERT_TRUE(fresh.load(TEST_FILE));
+    EXPECT_FALSE(fresh.occlusion_culling) << "a fresh struct keeps its OFF default across an old file";
 }
 
 // Every declared GiMode has to survive the file, because the clamp in

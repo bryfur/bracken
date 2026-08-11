@@ -190,6 +190,20 @@ draws it.
   worker count. It must be `load_model_with_lods`, not `load_model` then
   `build_lods`: uploading frees the CPU geometry simplification needs, and
   build_lods logs an error rather than silently doing nothing in that case.
+- **Streaming** (docs/gap_streaming.md) is three opt-in pieces, none of which
+  changes a frame that does not use them. `HeightmapGrid`
+  (`heightmap_grid.hpp`) is an N x M grid of `Heightmap` PAGES against one
+  shared quantization range; the single-map world is a 1x1 grid and
+  `set_heightmap` is now exactly that adapter. `ResidencyManager`
+  (`residency_manager.hpp`) is a byte budget plus a load/evict band over
+  `AsyncModelLoader` and `ModelManager::unload_model`, pumped at the frame
+  fence and host-installed with `Application::set_residency` — evicting a model
+  MUST invalidate the acceleration structure, which is why installing one wires
+  `SceneRenderer::invalidate_raytracing_scene` for you. Hi-Z draw occlusion
+  culling is `GraphicsSettings::occlusion_culling`, **off by default and
+  required to stay so**: it tests a frame-old farthest-surface pyramid
+  (`render/hzb.hpp`'s `hzb_reduce_far`), which is conservative for a still
+  camera and a heuristic while it moves.
 - **Y-up** coordinate system (x,z = ground plane, y = height) and
   **reversed-Z zero-to-one depth** (`GLM_FORCE_DEPTH_ZERO_TO_ONE` is PUBLIC on
   the engine target — all projection math is glm `RH_ZO`, with near/far
@@ -219,10 +233,15 @@ draws it.
 - **Diagnostics: the engine does not drop work silently.** Every budget or
   lookup failure that used to be a `continue` is counted in
   `RenderStats::diagnostics` (`contracts/render_stats.hpp`) —
-  `draws_dropped_unknown_model`, `skinned_dropped_no_skeleton`,
+  `draws_dropped_unknown_model`, `draws_deferred_not_resident`,
+  `skinned_dropped_no_skeleton`,
   `palettes_over_budget`, `effect_models_unresolved`, `lights_dropped`,
   `cluster_lights_dropped`, `camera_missing`. The per-chunk accumulators fold
   in chunk-index order, so the counts are bit-identical at any worker count.
+  `draws_deferred_not_resident` is deliberately NOT folded into
+  `draws_dropped_unknown_model`: "unknown" is a host bug and permanent,
+  "not resident" is a streaming budget condition and transient, and both the
+  static and the skinned Prepare walks count into it.
   Per-pass CPU record time is real (`core::PassTimeline` →
   `RenderStats::pass_times_ms`), the GPU half is honestly `nullopt`, and
   `ModelLoadReport` summarizes what a `.glb` load quietly discarded. Check

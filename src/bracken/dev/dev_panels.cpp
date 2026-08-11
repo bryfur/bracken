@@ -110,8 +110,12 @@ void draw_stats_tab(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
         ImGui::Text("Triangles: %u", stats.triangle_count);
         ImGui::Text("Instances: %u", stats.instances_drawn);
         ImGui::Text("Entities rendered: %u", stats.entities_rendered);
-        ImGui::Text("Entities culled: %u distance, %u frustum", stats.entities_distance_culled,
-                    stats.entities_frustum_culled);
+        // Occlusion is shown unconditionally, including the zero: a conservative
+        // culler reporting 0 in a dense scene is the readout that says its depth
+        // never arrived, and a row that appears only when non-zero cannot say
+        // that.
+        ImGui::Text("Entities culled: %u distance, %u frustum, %u occlusion", stats.entities_distance_culled,
+                    stats.entities_frustum_culled, stats.entities_occlusion_culled);
         ImGui::Text("UI: %u vertices in %u draws", stats.ui_vertices, stats.ui_draws);
         ImGui::Text("Local shadow tiles this frame: %u", stats.local_shadow_tiles_rendered);
         // Render-side snapshot counts (the live EffectSystem is sim-stage-

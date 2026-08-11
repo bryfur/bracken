@@ -512,6 +512,16 @@ void Application::shutdown_renderer() {
     }
 
     camera_.reset();
+    // The residency manager is HOST-owned and can outlive this Application, but
+    // the invalidator set_residency() installed captures a raw SceneRenderer*
+    // that is about to be destroyed. Detach it here rather than trusting the
+    // host's destruction order: a pump() after shutdown would otherwise call
+    // through a dangling pointer, and it is the kind of use-after-free that
+    // only fires on the shutdown path of a long run.
+    if (residency_ != nullptr) {
+        residency_->set_geometry_invalidator({});
+        residency_ = nullptr;
+    }
     if (scene_renderer_) {
         scene_renderer_->shutdown();
     }

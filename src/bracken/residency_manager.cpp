@@ -215,6 +215,13 @@ void ResidencyManager::pump() {
             it->state = State::Failed;
             continue;
         }
+        // Subtract whatever this item was already charged before charging the
+        // new payload. Normally zero (the item was Loading), but a completion
+        // for an item that is already Resident is reachable — the loader is
+        // shared, and a host may have requested the same name through it — and
+        // adding twice would leave the budget permanently over-reporting, which
+        // evicts content that fits.
+        resident_bytes_ = it->bytes >= resident_bytes_ ? 0 : resident_bytes_ - it->bytes;
         it->handle = done.handle;
         it->state = State::Resident;
         it->frames_resident = 0;
@@ -237,7 +244,7 @@ void ResidencyManager::pump() {
     // edge of the radius.
     const bool room_to_load = config_.budget_bytes == 0 || resident_bytes_ < config_.budget_bytes;
     if (room_to_load && config_.max_requests_per_pump > 0) {
-        plan_scratch_.clear();
+        request_scratch_.clear();
         for (uint32_t i = 0; i < items_.size(); ++i) {
             const Entry& e = items_[i];
             if (e.state != State::Absent && e.state != State::Evicted) {
@@ -247,9 +254,9 @@ void ResidencyManager::pump() {
             if (!wants_load(distance, e.item.cull_radius, config_)) {
                 continue;
             }
-            plan_scratch_.push_back(i);
+            request_scratch_.push_back(i);
         }
-        std::sort(plan_scratch_.begin(), plan_scratch_.end(), [&](uint32_t a, uint32_t b) {
+        std::sort(request_scratch_.begin(), request_scratch_.end(), [&](uint32_t a, uint32_t b) {
             const float da = glm::length(items_[a].item.anchor - viewer);
             const float db = glm::length(items_[b].item.anchor - viewer);
             if (da != db) {
@@ -258,7 +265,7 @@ void ResidencyManager::pump() {
             return a < b;
         });
         std::size_t started = 0;
-        for (uint32_t index : plan_scratch_) {
+        for (uint32_t index : request_scratch_) {
             if (started >= config_.max_requests_per_pump) {
                 break;
             }

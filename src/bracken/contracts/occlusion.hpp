@@ -24,9 +24,18 @@ namespace bracken {
  *
  * ADDRESSING. `mip_w`/`mip_h` are the dimensions of the level actually
  * downloaded, but a footprint is computed from `screen_w`/`screen_h` and
- * `level` — the pyramid's last texel on an odd axis is OVERSIZED (see
- * render/hzb.hpp), so `uv * mip_w` under-shoots the rightmost texel a box
- * touches and would silently make the test non-conservative.
+ * `level`, because the pyramid's last texel on an odd axis is OVERSIZED (see
+ * render/hzb.hpp) and `uv * mip_w` therefore under-shoots the rightmost texel a
+ * box touches.
+ *
+ * HONEST BOUND ON THAT, because it is easy to overstate. A source axis
+ * satisfies `screen < (mip + 1) * 2^level`, so the two addressings differ by at
+ * most ONE texel — which the footprint walk's one-texel dilation already
+ * absorbs. Screen-based addressing is therefore not the only thing standing
+ * between this test and a hole; it is what stops the dilation from being the
+ * only thing, and it is what keeps the walk correct if the dilation is ever
+ * tightened. No test can distinguish the two while the dilation is there, and
+ * contracts/occlusion.test.cpp says so rather than pretending otherwise.
  */
 struct OcclusionField {
     /// Row-major `mip_w * mip_h` device-depth values, reversed-Z (larger =

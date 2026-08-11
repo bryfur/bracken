@@ -246,11 +246,17 @@ TEST(OcclusionField, ARectEntirelyOffScreenIsNeverCulled) {
 
 TEST(OcclusionField, TheOversizedLastTexelOfAnOddAxisIsStillRead) {
     // Mip dimensions are NOT screen >> level once an axis is odd: the last
-    // destination texel ABSORBS the trailing source texel (render/hzb.hpp). A
-    // footprint addressed as `uv * mip_w` would stop one texel short at the
-    // right-hand edge, and a box hidden by everything EXCEPT that last texel
-    // would be wrongly culled. Here the field is 5 wide over a 11-wide screen,
-    // i.e. the level-1 shape of an odd axis.
+    // destination texel ABSORBS the trailing source texel (render/hzb.hpp).
+    // Here the field is 5 wide over an 11-wide screen, i.e. the level-1 shape
+    // of an odd axis, and the rect is pinned to the right-hand edge.
+    //
+    // WHAT THIS DOES *NOT* PROVE, stated because the obvious reading is wrong:
+    // it does not discriminate screen-based addressing from `uv * mip_w`. Since
+    // `screen < (mip + 1) * 2^level`, the two differ by at most one texel, and
+    // the footprint walk dilates by a whole texel on every side — so no input
+    // can separate them while that dilation exists. What this case pins is that
+    // the trailing, oversized texel of an odd axis is inside the walked range
+    // at all, i.e. that the clamp does not stop short of it.
     const glm::mat4 vp = perspective_vp();
     Field field(5, 4, 1, 0.0f, vp);
     field.f.screen_w = 11; // odd: 11 -> 5, last texel covers columns 8..10

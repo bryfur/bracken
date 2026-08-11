@@ -26,6 +26,14 @@ uint32_t clamped_page_axis(float coord, float origin, float page_size, uint32_t 
         return 0;
     }
     const float f = std::floor((coord - origin) / page_size);
+    // NaN first, and explicitly: `f <= 0` and `f >= count-1` are BOTH false for
+    // a NaN, so without this the function falls through to a float->uint32_t
+    // cast of a NaN, which is undefined behaviour and in practice an
+    // out-of-range page index. A NaN query has no containing page; page 0 is the
+    // same answer the clamp gives for anything else off the low edge.
+    if (!(f == f)) {
+        return 0;
+    }
     if (f <= 0.0f) {
         return 0;
     }
@@ -168,6 +176,12 @@ uint32_t HeightmapGrid::page_resolution() const {
 
 glm::ivec2 HeightmapGrid::page_at(float world_x, float world_z) const {
     if (pages_x == 0 || pages_z == 0 || !(page_size > 0.0f)) {
+        return {-1, -1};
+    }
+    // A NaN coordinate is outside every page, and it has to be said outright:
+    // every comparison below is false for a NaN, so it would otherwise fall
+    // through to the clamped answer and report page (0,0) as "containing" it.
+    if (!(world_x == world_x) || !(world_z == world_z)) {
         return {-1, -1};
     }
     // Inclusive on the far edge: the grid's outer boundary line belongs to

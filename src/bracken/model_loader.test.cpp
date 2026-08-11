@@ -917,3 +917,85 @@ TEST(ModelManagerResidency, GpuBytesIsZeroWithoutADeviceAndForUnknownHandles) {
     EXPECT_EQ(mgr.gpu_bytes(INVALID_MODEL_HANDLE), 0u);
     EXPECT_EQ(mgr.gpu_bytes(static_cast<ModelHandle>(999)), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// The three reupload_model holes closed in review.
+//
+// register_model does three things a bare move-assign does not: it refuses a
+// model with no geometry, it derives bounds off the vertices when the decode
+// left them empty, and it does that BEFORE the upload frees those vertices.
+// A reupload that skipped them left a slot flagged `loaded` whose bounding
+// sphere had radius 0 — which the Prepare stage reads as "cull me" and
+// select_lod reads as "apparent size 0", both silently.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A decode with geometry but NO authored bounds — what load_glb hands back for
+/// a model whose bounds register_model would have scanned.
+std::unique_ptr<bracken::Model> make_boundless_decode(float extent) {
+    auto m = std::make_unique<bracken::Model>();
+    bracken::Mesh mesh;
+    mesh.vertices.resize(3);
+    mesh.vertices[0].position = glm::vec3(-extent, 0.0f, -extent);
+    mesh.vertices[1].position = glm::vec3(extent, extent, 0.0f);
+    mesh.vertices[2].position = glm::vec3(0.0f, -extent, extent);
+    mesh.indices = {0, 1, 2};
+    m->meshes.push_back(std::move(mesh));
+    // bounds deliberately left default-constructed (empty).
+    return m;
+}
+
+} // namespace
+
+TEST(ModelManagerResidency, ReuploadDerivesBoundsWhenTheDecodeHasNone) {
+    ModelManager mgr;
+    const auto h = mgr.register_model("prop", make_residency_model(1.0f));
+    ASSERT_TRUE(h.is_ok());
+    // Wipe the slot's own bounds so the scan is the ONLY source left; otherwise
+    // the preserved-bounds path below would mask a missing scan.
+    mgr.get_model(h.value())->bounds = bracken::AABB{};
+    (void)mgr.unload_model(h.value());
+
+    ASSERT_TRUE(mgr.reupload_model(h.value(), make_boundless_decode(4.0f)));
+
+    const Model* m = mgr.get_model(h.value());
+    ASSERT_NE(m, nullptr);
+    EXPECT_FALSE(m->bounds.empty()) << "bounds were not scanned off the vertices";
+    EXPECT_FLOAT_EQ(m->bounds.min.x, -4.0f);
+    EXPECT_FLOAT_EQ(m->bounds.max.x, 4.0f);
+    EXPECT_GT(m->bounding_half_diag, 0.0f) << "a zero radius culls the model into invisibility";
+}
+
+TEST(ModelManagerResidency, ReuploadKeepsHandAuthoredBoundsTheDecodeCannotKnow) {
+    // unload_model's contract says the slot's bounds survive an eviction, and a
+    // skinned model's box carries animation headroom the vertex scan would
+    // shrink away — so the restore has to honour it.
+    ModelManager mgr;
+    auto authored = make_residency_model(1.0f);
+    authored->bounds.min = glm::vec3(-50.0f);
+    authored->bounds.max = glm::vec3(50.0f);
+    const auto h = mgr.register_model("hero", std::move(authored));
+    ASSERT_TRUE(h.is_ok());
+    (void)mgr.unload_model(h.value());
+
+    ASSERT_TRUE(mgr.reupload_model(h.value(), make_boundless_decode(1.0f)));
+
+    EXPECT_FLOAT_EQ(mgr.get_model(h.value())->bounds.max.x, 50.0f)
+        << "the headroom box was replaced by the vertex AABB";
+}
+
+TEST(ModelManagerResidency, ReuploadRefusesAGeometrylessDecodeWithoutTouchingTheSlot) {
+    // register_model refuses this case; so must the restore. Accepting it flags
+    // the slot `loaded` with nothing in it, which every consumer reads as
+    // "resident" — the residency manager then charges it bytes and stops
+    // retrying, and the model is gone for the rest of the run.
+    ModelManager mgr;
+    const auto h = mgr.register_model("prop", make_residency_model(1.0f));
+    ASSERT_TRUE(h.is_ok());
+    auto empty = std::make_unique<bracken::Model>();
+    empty->meshes.emplace_back(); // a mesh, but no vertices and no indices
+
+    EXPECT_FALSE(mgr.reupload_model(h.value(), std::move(empty)));
+    EXPECT_TRUE(mgr.get_model(h.value())->loaded) << "a refused reupload must not have unloaded the slot";
+}

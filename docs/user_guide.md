@@ -718,7 +718,7 @@ std::cout << std::format("draw_calls={} triangles={} entities={}\n",
                          stats.draw_calls, stats.triangle_count, stats.entities_rendered);
 ```
 
-Counters: `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`, `ui_draws`, `local_shadow_tiles_rendered` (all `uint32_t`). Budgets, so the caps that actually get hit stop failing silently: `packet_bytes_used`/`packet_bytes_capacity`, `bone_palettes_used`/`bone_palettes_budget`, `lights_submitted`/`lights_binned`. Per-pass timing: `pass_times_ms` is `std::vector<PassTiming>` where `PassTiming` is `{ std::string_view name; std::optional<float> cpu_ms; std::optional<float> gpu_ms; }`.
+Counters: `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distance_culled`, `entities_frustum_culled`, `entities_occlusion_culled`, `jobs_pending`, `instances_drawn`, `ui_vertices`, `ui_draws`, `local_shadow_tiles_rendered` (all `uint32_t`). Budgets, so the caps that actually get hit stop failing silently: `packet_bytes_used`/`packet_bytes_capacity`, `bone_palettes_used`/`bone_palettes_budget`, `lights_submitted`/`lights_binned`. Per-pass timing: `pass_times_ms` is `std::vector<PassTiming>` where `PassTiming` is `{ std::string_view name; std::optional<float> cpu_ms; std::optional<float> gpu_ms; }`.
 
 `render_stats()` returns `std::optional<RenderStats>` — `nullopt` when collection is off, so zeros can no longer be mistaken for "the renderer drew nothing".
 
@@ -726,7 +726,7 @@ Counters: `draw_calls`, `triangle_count`, `entities_rendered`, `entities_distanc
 
 ### What the frame threw away: frame_diagnostics
 
-`Application::frame_diagnostics()` returns a `FrameDiagnostics` covering every silent drop path: `draws_dropped_unknown_model`, `skinned_dropped_no_skeleton`, `palettes_over_budget`, `shadow_capsules_over_budget`, `effect_models_unresolved`, `lights_dropped`, `cluster_lights_dropped`, and `camera_missing`. Unlike `render_stats()` these are accumulated **unconditionally** — a dropped draw is not opt-in instrumentation. `diag.any()` is the one-line "is anything wrong" predicate. If you built a frame and see nothing, read this before reading anything else.
+`Application::frame_diagnostics()` returns a `FrameDiagnostics` covering every silent drop path: `draws_dropped_unknown_model`, `draws_deferred_not_resident`, `skinned_dropped_no_skeleton`, `palettes_over_budget`, `shadow_capsules_over_budget`, `effect_models_unresolved`, `lights_dropped`, `cluster_lights_dropped`, and `camera_missing`. Unlike `render_stats()` these are accumulated **unconditionally** — a dropped draw is not opt-in instrumentation. `diag.any()` is the one-line "is anything wrong" predicate. If you built a frame and see nothing, read this before reading anything else.
 
 ### Where the frame's time went
 

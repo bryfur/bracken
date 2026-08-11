@@ -409,6 +409,16 @@ static void resolve_skinned_chunk(std::span<const SkinnedDrawCommand> cmds, size
         }
         const BonePalette& rec = palettes[cmd.palette.value];
         Model* model = p.models->get_model(cmd.model_handle);
+        if (model != nullptr && !model->loaded) {
+            // Evicted or not yet streamed in. `unload_model` keeps the skeleton
+            // — only the payload goes — so this command would otherwise resolve
+            // with a full joint count, reach the draw walk, find no vertex
+            // buffer and disappear counted NOWHERE. Same counter as the static
+            // path, and for the same reason: it is a budget condition, not the
+            // host naming a handle nobody registered.
+            stats.diagnostics.draws_deferred_not_resident++;
+            continue;
+        }
         uint32_t joint_count = 0;
         if (model && model->has_skeleton) {
             // Drawn joints clamp to min(model joints, palette joints) — same

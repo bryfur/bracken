@@ -697,15 +697,35 @@ private:
     glm::mat4 pending_occlusion_view_proj_{1.0f};
     glm::vec3 pending_occlusion_camera_position_{0.0f};
     glm::vec3 pending_occlusion_camera_forward_{0.0f, 0.0f, -1.0f};
+    /// Camera of the pyramid build RECORDED this frame, held until the readback
+    /// is submitted after the frame's command buffer (submit_occlusion_readback).
+    glm::mat4 occlusion_build_view_proj_{1.0f};
+    glm::vec3 occlusion_build_camera_position_{0.0f};
+    glm::vec3 occlusion_build_camera_forward_{0.0f, 0.0f, -1.0f};
+    /// A pyramid build was recorded on this frame's command buffer, so a
+    /// download is owed once that buffer has been submitted.
+    bool occlusion_build_recorded_ = false;
     /// Per-frame answer from RenderPlan::occlusion_active.
     bool frame_occlusion_active_ = false;
 
     /// Wait the previous frame's readback, adopt it into occlusion_depth_ and
     /// refill the geometric half of occlusion_field_. Main-thread.
     void resolve_occlusion_readback();
-    /// Build the farthest-surface pyramid over this frame's prepass depth and
-    /// submit the next readback. Main-thread; no pass may be open on `cmd`.
+    /// Build the farthest-surface pyramid over this frame's prepass depth.
+    /// RECORDS only; the download is submitted separately. Main-thread; no pass
+    /// may be open on `cmd`.
     void build_occlusion_pyramid(SDL_GPUCommandBuffer* cmd, const CameraState& camera);
+    /**
+     * Request the coarse-mip download of the pyramid this frame built.
+     *
+     * MUST be called after the frame's command buffer has been submitted. SDL3
+     * GPU executes command buffers in submission order and a readback rides its
+     * OWN buffer, submitted the instant it is recorded — so requesting it beside
+     * the build, which is only RECORDED on the frame's buffer, captures the
+     * PREVIOUS frame's pyramid and pairs two-frame-old depth with a
+     * one-frame-old matrix. Main-thread.
+     */
+    void submit_occlusion_readback();
     /// Drop the pyramid, the transfer buffer and any in-flight fence.
     void release_occlusion_resources();
 

@@ -59,8 +59,15 @@ namespace bracken {
  *
  * Tier: main-thread for `add`, `set_config`, `pump`. `set_viewer` is
  * worker-safe (a relaxed store of three floats) so a game can call it straight
- * from `on_simulate`; `handle()` and `resident()` are worker-safe reads of a
- * table only `pump()` writes, i.e. safe anywhere outside the fence.
+ * from `on_simulate`.
+ *
+ * `handle()`, `model_handle()`, `resident()` and `state()` are worker-safe
+ * reads ONLY against the two main-thread writers, `pump()` and `add()` — and
+ * `add()` can reallocate the item table, so a read concurrent with one is a
+ * data race, not a stale answer. In the engine's frame that is not a hazard:
+ * `pump()` runs at the frame fence with no sim in flight, and `add()` belongs
+ * to load time. A host that registers items from a background thread while a
+ * sim job resolves handles has to serialize that itself.
  */
 class ResidencyManager {
 public:
@@ -139,7 +146,9 @@ public:
         /// non-zero value means the budget cannot be met from the items in
         /// range — raise the budget or shrink the load radius.
         uint32_t budget_overruns = 0;
-        /// Evictions the time-domain hysteresis refused this pump.
+        /// Evictions the time-domain hysteresis refused. CUMULATIVE, like
+        /// loads_started/loads_completed/evictions above it — a per-pump figure
+        /// is the difference between two reads.
         uint32_t evictions_blocked_by_hysteresis = 0;
     };
 
@@ -276,6 +285,10 @@ private:
     /// Written by pump()'s adoption step, read by nothing else.
     std::vector<AsyncModelLoader::Completed> completed_scratch_;
     std::vector<EvictCandidate> candidate_scratch_;
+    /// Load-request order for one pump. Kept apart from the eviction plan
+    /// below: one buffer for two plans in the same call is a hazard waiting for
+    /// someone to move the over-budget check that reads it.
+    std::vector<uint32_t> request_scratch_;
     std::vector<uint32_t> plan_scratch_;
     std::function<void()> invalidate_geometry_;
     /// Viewer position. Relaxed on both ends: it is an advisory input to a

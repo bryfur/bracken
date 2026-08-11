@@ -35,9 +35,14 @@ namespace bracken::render {
 namespace {
 constexpr const char* LOG_TAG = "terrain";
 
-/// Union of a page's tile AABBs — the page-level reject box. An empty tile
-/// list yields a degenerate box at the origin, which every frustum test
-/// rejects; that is the right answer for a page with nothing to draw.
+/// Union of a page's tile AABBs — the page-level reject box.
+///
+/// An empty tile list yields a degenerate box AT THE ORIGIN, and that box is
+/// NOT self-evidently rejected: a point at the world origin is inside the
+/// frustum whenever the camera is looking at it. What makes an empty page safe
+/// is upstream of the box — a tile is recorded only when its index count is
+/// non-zero, so no tiles means `page.index_count == 0`, and all three draw
+/// sites skip such a page before they ever consult its AABB.
 glm::vec3 tile_bounds_min(const std::vector<TerrainRenderer::TerrainTile>& tiles) {
     if (tiles.empty()) {
         return glm::vec3(0.0f);

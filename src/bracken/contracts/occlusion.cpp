@@ -66,11 +66,16 @@ bool occluded_by_field(const OcclusionField& field, const OcclusionBounds& bound
     }
 
     // Footprint in MIP-0 columns/rows, then divided down by the level. Doing it
-    // this way rather than as `uv * mip_w` is load-bearing: the pyramid's last
+    // this way rather than as `uv * mip_w` matters because the pyramid's last
     // texel on an odd axis is oversized (render/hzb.hpp), so mip dimensions are
-    // NOT `screen >> level` and scaling by them would address one texel too far
-    // left at the right-hand edge — a hole in the conservatism, invisible in
-    // every screenshot until something pops.
+    // NOT `screen >> level` and scaling by them addresses one texel too far
+    // left near the right-hand edge.
+    //
+    // Precisely one texel, and no more: `screen < (mip + 1) * 2^level`, so the
+    // two addressings can differ by at most 1 — which the dilation below
+    // already covers. This is belt AND braces on purpose: it makes the walk
+    // correct on its own terms rather than correct only because of the
+    // dilation, so tightening the dilation later cannot silently open a hole.
     const int scale = 1 << field.level;
     const auto to_texel = [scale](float uv, int screen_extent, int mip_extent) {
         const float column = uv * static_cast<float>(screen_extent);
