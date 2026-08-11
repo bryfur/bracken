@@ -188,6 +188,11 @@ set(BRACKEN_SHADER_OUTPUT_DIR "${SHADER_OUTPUT_DIR}" CACHE INTERNAL "Path to com
 # binary. The copy_shaders target always runs after compile_shaders; the
 # staging directory is removed and recreated each build so deleted/renamed
 # shaders don't keep shipping as stale .spv files.
+#
+# NOTE, and it is the constraint bracken_compile_shaders below is built around:
+# the `rm -rf` here wipes `<exe dir>/shaders` on EVERY build. Anything a host
+# stages into that same directory races the wipe and disappears intermittently,
+# which is why host shaders get their own STAGE_DIR.
 function(bracken_copy_shaders target)
     add_custom_target(${target}_copy_shaders ALL
         COMMAND ${CMAKE_COMMAND} -E rm -rf
@@ -199,6 +204,220 @@ function(bracken_copy_shaders target)
     )
     add_dependencies(${target}_copy_shaders compile_shaders)
     add_dependencies(${target} ${target}_copy_shaders)
+endfunction()
+
+# ---------------------------------------------------------------------------
+# bracken_compile_shaders(<target> ...) — compile a GAME's own HLSL with the
+# engine's pinned SDL_shadercross/DXC and stage the SPIR-V next to its exe.
+#
+#   bracken_compile_shaders(my_game
+#       DIRECTORY    ${CMAKE_CURRENT_SOURCE_DIR}/shaders
+#       [SOURCES     a.vert.hlsl b.frag.hlsl ...]
+#       [STAGE_DIR   shaders_my_game]      # default: shaders_<target>
+#       [INCLUDE_DIRS <dir> ...]
+#       [WAVE_OPS    c.comp.hlsl ...])     # bare file names, see below
+#
+# At runtime the game points the registry at the staged directory:
+#   registry.add_shader_search_path(std::string(SDL_GetBasePath()) + "shaders_my_game/");
+#
+# Same toolchain as the engine, deliberately: the build-time compiler and the
+# runtime SDL3_shadercross library the engine links must be the same version, so
+# this uses the `shadercross` target built from the pinned FetchContent tree
+# rather than anything found on PATH.
+#
+# TWO DIRECTORIES THAT MUST NOT BE REUSED, both learned from a real failure:
+#  * the .spv output NEVER goes in ${BRACKEN_SHADER_OUTPUT_DIR}. The engine's
+#    own suite (gpu/uniform_layout.test.cpp) enumerates every .spv in there and
+#    fails on any uniform block it has no row for, so a host cbuffer landing
+#    there fails the ENGINE's tests.
+#  * STAGE_DIR must not be "shaders". bracken_copy_shaders rm -rf's that
+#    directory next to the exe on every build.
+#
+# WAVE_OPS is the host equivalent of the engine's SHADER_WAVE_OPS list and
+# carries the same warning: the shadercross CLI never passes -fspv-target-env,
+# so DXC defaults to vulkan1.0 where every Wave* intrinsic is a hard compile
+# error. Listing a file here routes it through the vendored `dxc` at
+# vulkan1.1 with byte-identical -fspv-* flags — and RAISES THE VULKAN FLOOR for
+# your game's pipelines that use it. It is an explicit list, not a convention,
+# so that hardware requirement is visible in a diff.
+function(bracken_compile_shaders target)
+    cmake_parse_arguments(BCS "" "DIRECTORY;STAGE_DIR" "SOURCES;INCLUDE_DIRS;WAVE_OPS" ${ARGN})
+    if(BCS_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "bracken_compile_shaders(${target}): unknown argument(s): ${BCS_UNPARSED_ARGUMENTS}")
+    endif()
+    if(NOT TARGET ${target})
+        message(FATAL_ERROR "bracken_compile_shaders: '${target}' is not a target")
+    endif()
+    if(NOT TARGET shadercross)
+        message(FATAL_ERROR
+            "bracken_compile_shaders(${target}): the `shadercross` CLI target does not exist. It is built "
+            "as part of bracken's shader subtree, so call this AFTER add_subdirectory(<bracken>).")
+    endif()
+
+    if(NOT BCS_STAGE_DIR)
+        set(BCS_STAGE_DIR "shaders_${target}")
+    endif()
+    if(BCS_STAGE_DIR STREQUAL "shaders")
+        message(FATAL_ERROR
+            "bracken_compile_shaders(${target}): STAGE_DIR must not be \"shaders\" — bracken_copy_shaders "
+            "deletes and re-copies that directory on every build, so your .spv would vanish intermittently.")
+    endif()
+
+    # Sources: an explicit list, a globbed directory, or both.
+    set(_bcs_sources ${BCS_SOURCES})
+    set(_bcs_includes "")
+    set(_bcs_header_deps "")
+    if(BCS_DIRECTORY)
+        file(GLOB_RECURSE _bcs_dir_sources CONFIGURE_DEPENDS "${BCS_DIRECTORY}/*.hlsl")
+        file(GLOB_RECURSE _bcs_dir_headers CONFIGURE_DEPENDS "${BCS_DIRECTORY}/*.hlsli")
+        list(APPEND _bcs_sources ${_bcs_dir_sources})
+        list(APPEND _bcs_header_deps ${_bcs_dir_headers})
+        # DIRECTORY goes FIRST — see the one-include-dir note below; it is the
+        # root a host's own .hlsli lives in, so it is the one that must win.
+        list(APPEND _bcs_includes "${BCS_DIRECTORY}")
+    endif()
+    list(APPEND _bcs_includes ${BCS_INCLUDE_DIRS})
+    if(NOT _bcs_sources)
+        message(FATAL_ERROR "bracken_compile_shaders(${target}): no .hlsl sources (pass DIRECTORY and/or SOURCES)")
+    endif()
+
+    # The engine's .hlsli root, last. Note that editing an engine .hlsli does
+    # NOT retrigger host compilation: the engine's own glob owns that
+    # dependency, and re-running the configure step is what picks it up.
+    if(BRACKEN_SHADER_INCLUDE_DIR)
+        list(APPEND _bcs_includes "${BRACKEN_SHADER_INCLUDE_DIR}")
+    endif()
+    list(REMOVE_DUPLICATES _bcs_includes)
+
+    # THE SHADERCROSS CLI ACCEPTS EXACTLY ONE -I ("ERROR: '-I' can only be used
+    # once"), and it does NOT resolve a quoted #include relative to the source
+    # file either — it hands the source to DXC as an in-memory buffer named
+    # hlsl.hlsl, so an include that is not under the single -I root is simply
+    # not found. The engine's own shader build never noticed because it has one
+    # root; a host has at least two the moment the engine's .hlsli root is in
+    # play. So: the shadercross path gets the FIRST root only (the host's own
+    # DIRECTORY by default), and the DXC/WAVE_OPS path — real DXC, which does
+    # accept repeats — gets all of them.
+    set(_bcs_include_flags "")
+    foreach(_dir IN LISTS _bcs_includes)
+        list(APPEND _bcs_include_flags -I "${_dir}")
+    endforeach()
+    set(_bcs_primary_include_flag "")
+    list(LENGTH _bcs_includes _bcs_include_count)
+    if(_bcs_include_count GREATER 0)
+        list(GET _bcs_includes 0 _bcs_primary_include)
+        set(_bcs_primary_include_flag -I "${_bcs_primary_include}")
+    endif()
+    if(_bcs_include_count GREATER 1)
+        message(STATUS "bracken_compile_shaders(${target}): shadercross takes ONE include dir; using "
+                       "${_bcs_primary_include} (the rest apply only to WAVE_OPS shaders, which go through dxc)")
+    endif()
+
+    if(BCS_WAVE_OPS AND NOT TARGET dxc)
+        message(FATAL_ERROR
+            "bracken_compile_shaders(${target}): WAVE_OPS is non-empty but the vendored DXC CLI target `dxc` "
+            "does not exist (SDLSHADERCROSS_DXC=OFF?). Wave-intrinsic shaders cannot be compiled without it.")
+    endif()
+
+    set(_bcs_out_dir "${CMAKE_CURRENT_BINARY_DIR}/spv_${target}")
+    if(_bcs_out_dir STREQUAL "${BRACKEN_SHADER_OUTPUT_DIR}")
+        message(FATAL_ERROR "bracken_compile_shaders(${target}): output dir collides with the engine's own")
+    endif()
+    file(MAKE_DIRECTORY "${_bcs_out_dir}")
+
+    set(_bcs_outputs "")
+    foreach(_src IN LISTS _bcs_sources)
+        cmake_path(GET _src FILENAME _name)
+        # Stage + entry point come from the file name, exactly as the engine's
+        # own shader build derives them.
+        if(_name MATCHES "\\.vert\\.hlsl$")
+            set(_stage "vertex")
+            set(_entry "VSMain")
+            set(_profile "vs_6_0")
+            string(REPLACE ".vert.hlsl" ".vert.spv" _out_name "${_name}")
+        elseif(_name MATCHES "\\.frag\\.hlsl$")
+            set(_stage "fragment")
+            set(_entry "PSMain")
+            set(_profile "ps_6_0")
+            string(REPLACE ".frag.hlsl" ".frag.spv" _out_name "${_name}")
+        elseif(_name MATCHES "\\.comp\\.hlsl$")
+            set(_stage "compute")
+            set(_entry "CSMain")
+            set(_profile "cs_6_0")
+            string(REPLACE ".comp.hlsl" ".comp.spv" _out_name "${_name}")
+        else()
+            message(WARNING "bracken_compile_shaders(${target}): unknown shader type '${_name}', skipping "
+                            "(expected {name}.vert.hlsl / .frag.hlsl / .comp.hlsl)")
+            continue()
+        endif()
+
+        set(_out "${_bcs_out_dir}/${_out_name}")
+        if(_name IN_LIST BCS_WAVE_OPS)
+            add_custom_command(
+                OUTPUT "${_out}"
+                COMMAND "$<TARGET_FILE:dxc>"
+                    -T ${_profile}
+                    -E ${_entry}
+                    -spirv
+                    -fspv-target-env=vulkan1.1
+                    -fspv-flatten-resource-arrays
+                    -fspv-preserve-bindings
+                    -fspv-preserve-interface
+                    ${_bcs_include_flags}
+                    "${_src}"
+                    -Fo "${_out}"
+                DEPENDS "${_src}" ${_bcs_header_deps} dxc
+                COMMENT "Compiling ${_name} for ${target} (wave ops, vulkan1.1)"
+                VERBATIM
+            )
+        else()
+            add_custom_command(
+                OUTPUT "${_out}"
+                COMMAND "$<TARGET_FILE:shadercross>"
+                    "${_src}"
+                    -s HLSL
+                    -d SPIRV
+                    -t ${_stage}
+                    -e ${_entry}
+                    ${_bcs_primary_include_flag}
+                    -o "${_out}"
+                DEPENDS "${_src}" ${_bcs_header_deps} shadercross
+                COMMENT "Compiling ${_name} for ${target}"
+                VERBATIM
+            )
+        endif()
+        list(APPEND _bcs_outputs "${_out}")
+    endforeach()
+
+    if(NOT _bcs_outputs)
+        message(FATAL_ERROR "bracken_compile_shaders(${target}): no shader matched the .vert/.frag/.comp convention")
+    endif()
+
+    # Prune stale outputs at configure time, same reasoning as the engine's:
+    # deleting or renaming a .hlsl re-runs configure (CONFIGURE_DEPENDS), and an
+    # orphaned .spv would otherwise keep shipping.
+    file(GLOB _bcs_stale "${_bcs_out_dir}/*.spv")
+    if(_bcs_stale)
+        list(REMOVE_ITEM _bcs_stale ${_bcs_outputs})
+    endif()
+    if(_bcs_stale)
+        file(REMOVE ${_bcs_stale})
+    endif()
+
+    add_custom_target(${target}_compile_shaders ALL DEPENDS ${_bcs_outputs})
+    add_custom_target(${target}_stage_shaders ALL
+        COMMAND ${CMAKE_COMMAND} -E rm -rf
+            "$<TARGET_FILE_DIR:${target}>/${BCS_STAGE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${_bcs_out_dir}"
+            "$<TARGET_FILE_DIR:${target}>/${BCS_STAGE_DIR}"
+        COMMENT "Staging ${target} host shaders to ${BCS_STAGE_DIR}"
+    )
+    add_dependencies(${target}_stage_shaders ${target}_compile_shaders)
+    add_dependencies(${target} ${target}_stage_shaders)
+
+    list(LENGTH _bcs_outputs _bcs_count)
+    message(STATUS "bracken_compile_shaders(${target}): ${_bcs_count} shader(s) -> ${BCS_STAGE_DIR}/")
 endfunction()
 
 # Every header in the public umbrella must compile STANDALONE — on its own, in

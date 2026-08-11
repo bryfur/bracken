@@ -22,12 +22,14 @@
 #include "bracken/render/lighting/local_shadows.hpp"
 #include "bracken/scene/frame_packet.hpp"
 #include "bracken/scene/motion_history.hpp"
+#include "bracken/scene/render_hook.hpp"
 #include "bracken/scene/scene_prep.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <glm/glm.hpp>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <string>
@@ -318,8 +320,33 @@ public:
 
     // Post-UI callback: called after UI rendering, before end_frame.
     // Receives (command_buffer, swapchain_texture) for additional render passes (e.g. ImGui).
+    //
+    // DEPRECATED for host use — kept because Application::init_dev_ui owns it.
+    // It is a SINGLE slot with no ordering, which is precisely the bug: a game
+    // that called it silently replaced the developer overlay's registration and
+    // turned F10 into a no-op. Use render_hooks() instead; RenderHookSlot::AfterUi
+    // runs BEFORE this callback, so the overlay keeps drawing on top.
+    //
+    // Overwriting a callback that is already installed now logs a WARN naming
+    // the developer overlay. It is not refused — a host that genuinely wants the
+    // slot may still take it, and refusing would break the one caller that
+    // legitimately re-installs after a renderer restart — but it can no longer
+    // happen SILENTLY, which is the half of the bug that made it hard to find.
     using PostUICallback = std::function<void(SDL_GPUCommandBuffer*, SDL_GPUTexture*)>;
-    void set_post_ui_callback(PostUICallback cb) { post_ui_callback_ = std::move(cb); }
+    void set_post_ui_callback(PostUICallback cb);
+
+    /**
+     * @brief Host render passes: ordered, many per slot (`scene/render_hook.hpp`).
+     *
+     * Tier: main-thread. Register from `on_init` after `init_renderer()`, or at
+     * the frame fence in `on_main_frame` — never from `on_simulate`.
+     *
+     * With no hook registered the frame path costs one `empty(slot)` bool test
+     * per slot and is otherwise unchanged; the RT-off smoke baseline is the
+     * standing check that this stayed true.
+     */
+    RenderHookRegistry& render_hooks() { return render_hooks_; }
+    const RenderHookRegistry& render_hooks() const { return render_hooks_; }
 
     // ========== CPU Prepare fan-out (docs/multithreading_plan.md §4.3) ==========
     // The prep cores themselves live in scene/scene_prep.hpp as
@@ -984,6 +1011,37 @@ private:
 
     // ========== Post-UI Callback ==========
     PostUICallback post_ui_callback_;
+
+    // ========== Host render passes (scene/render_hook.hpp) ==========
+    RenderHookRegistry render_hooks_;
+
+    /**
+     * Run every hook registered in `slot`, in order, each inside its own
+     * profiler zone / GPU debug scope / GPU timer.
+     *
+     * Called only behind `render_hooks_.empty(slot)` so an engine with no host
+     * passes pays one bool test. `swapchain` is the swapchain texture for the
+     * two slots that have one and null for the rest; `scene_targets_valid` says
+     * whether the HDR offscreen pair holds THIS frame's image (false on the
+     * fallback path and on a frame with no 3D content, where the textures can
+     * exist but hold the last frame that did render into them); every other
+     * field of the context comes from renderer state.
+     */
+    void run_render_hooks(RenderHookSlot slot, SDL_GPUCommandBuffer* cmd, const CameraState& draw_camera, float dt,
+                          SDL_GPUTexture* swapchain, bool scene_targets_valid);
+
+    /// Fold every hook registered in `slots` into
+    /// FrameDiagnostics::render_hooks_skipped. The engine does not drop work
+    /// silently, and a slot that could not run this frame is dropped work.
+    void count_skipped_render_hooks(std::initializer_list<RenderHookSlot> slots);
+
+    // Hook-context values captured at the top of render_frame: the end-of-frame
+    // advance overwrites prev_view_proj_unjittered_ and frame_index_ BEFORE the
+    // AfterUi slot runs, so reading the members there would hand a hook this
+    // frame's VP as the "previous" one and a frame index one past the frame it
+    // is drawing into. See run_render_hooks.
+    glm::mat4 hook_prev_view_proj_{1.0f};
+    uint64_t hook_frame_index_ = 0;
 
     // ========== Screenshot ==========
     std::string pending_screenshot_path_; // non-empty = capture next frame

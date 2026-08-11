@@ -164,7 +164,7 @@ endfunction()
 
 Properties: ordered after `compile_shaders`; the consumer target depends on the copy, so shaders are staged before the executable is considered built; being a custom target with no stamp file, the remove-and-recopy re-runs on **every** build (cheap, but not a no-op) — the staging directory is deleted first, so deleted/renamed shaders never linger next to the executable.
 
-Runtime lookup contract: `gpu::PipelineRegistry::init` sets `shader_path_ = SDL_GetBasePath() + "shaders/"`, falling back to the relative `"shaders/"` if `SDL_GetBasePath()` fails (`src/bracken/gpu/pipeline_registry.cpp:36–41`). Compiled SPIR-V must therefore sit in a `shaders/` directory next to the executable — exactly what `bracken_copy_shaders` produces. Without it, every pipeline build fails at startup.
+Runtime lookup contract: `gpu::PipelineRegistry::init` sets `shader_path_roots_[0] = SDL_GetBasePath() + "shaders/"` (element 0 is the ENGINE root and is rewritten, never appended, so a root a host added with `add_shader_search_path` can never be searched ahead of it; only HOST descs consult the later roots), falling back to the relative `"shaders/"` if `SDL_GetBasePath()` fails (`src/bracken/gpu/pipeline_registry.cpp:36–41`). Compiled SPIR-V must therefore sit in a `shaders/` directory next to the executable — exactly what `bracken_copy_shaders` produces. Without it, every pipeline build fails at startup.
 
 ### Environment variables — exact semantics
 
@@ -1504,7 +1504,7 @@ void reload_all_pipelines();                                  // force a reload 
 const std::string& shader_path() const;                       // default "shaders/"
 ```
 
-- `enable_hot_reload`: warns and returns if called before `init` (`device_ == nullptr`); idempotent (`watcher_ != nullptr` early-out). Registers `watch_directory(shader_path_, ".spv", cb)` and stores the `uint32_t` handle in `shader_watch_handle_`. By this point `init` has set `shader_path_ = SDL_GetBasePath() + "shaders/"` — **next to the executable** (falling back to the relative `"shaders/"` only if `SDL_GetBasePath()` fails); that is where `bracken_copy_shaders` (`src/bracken/CMakeLists.txt:136`) stages `${BRACKEN_SHADER_OUTPUT_DIR}` as `$<TARGET_FILE_DIR:target>/shaders`.
+- `enable_hot_reload`: warns and returns if called before `init` (`device_ == nullptr`); idempotent PER ROOT (an already-watched root is skipped, an unwatched one is retried, and a second, different `FileWatcher` is refused with a WARN). Registers `watch_directory(root, ".spv", cb)` for every root of `shader_path_roots_` and stores the `uint32_t` handles in `shader_watch_handles_`, parallel to the roots; if no root took at all, `watcher_` is cleared again so the next call is a clean retry. By this point `init` has set `shader_path_roots_[0] = SDL_GetBasePath() + "shaders/"` — **next to the executable** (falling back to the relative `"shaders/"` only if `SDL_GetBasePath()` fails); that is where `bracken_copy_shaders` (`src/bracken/CMakeLists.txt:136`) stages `${BRACKEN_SHADER_OUTPUT_DIR}` as `$<TARGET_FILE_DIR:target>/shaders`.
 - Silent behavior: if the `FileWatcher` is uninitialized, `watch_directory` returns `k_invalid_handle` but the method still sets `watcher_`, stores handle `0`, and logs `PipelineRegistry hot-reload enabled at {}` — the log can claim "enabled" with nothing watched.
 - The callback fires on **any** `.spv` change under the tree and calls `reload_all_pipelines()`: `invalidate_all()` (clears the `unordered_map<PipelineType, unique_ptr<GPUPipeline>>` cache **and** `shader_manager_->clear_cache()`), then `preload_all_pipelines()` (iterates every `PipelineType` through `get_pipeline`, recreating all). Failure of any pipeline logs `PipelineRegistry: one or more pipelines failed to rebuild`; there is no rollback — failed pipelines are simply absent until recreated on next access/reload. Header comment: "Coarse but correct; live pipelines from the previous frame are released by SDL once the in-flight commands finish."
 - N saved `.spv` files can produce up to N events in one tick → up to N full rebuilds drained in a single `poll_main_thread()` call (events are not deduplicated per watch across distinct files).
@@ -1536,7 +1536,7 @@ void enable_hot_reload(core::asset::FileWatcher& watcher);
 | First slot generation in `AssetRegistry` | 1 | `src/bracken/core/asset/asset_registry.hpp` (`next_handle`) |
 | `core::Handle<T>::k_invalid_index` | `0xFFFFFFFF` | `src/bracken/core/handle.hpp` |
 | `INVALID_MODEL_HANDLE` | `0` | `src/bracken/model_loader.hpp` |
-| `PipelineRegistry::shader_path_` default | `"shaders/"` | `src/bracken/gpu/pipeline_registry.hpp` |
+| `PipelineRegistry::shader_path_roots_` element 0 default | `"shaders/"` | `src/bracken/gpu/pipeline_registry.hpp` |
 | Shader watch extension filter | `".spv"` | `src/bracken/gpu/pipeline_registry.cpp` |
 | `BRACKEN_HOT_RELOAD` accepted value | first char `'1'` | `src/bracken/application.cpp` |
 
@@ -2119,7 +2119,7 @@ Shader path resolution (`init()`): `SDL_GetBasePath() + "shaders/"`, fallback `"
 
 `set_swapchain_format(format)`: no-op if unchanged; otherwise erases only the swapchain-dependent pipelines — a `static constexpr` list of `{UI, Text, Composite, Fxaa}`. All other pipelines target fixed offscreen formats and stay cached.
 
-Hot-reload: `enable_hot_reload(watcher)` registers `watcher.watch_directory(shader_path_, ".spv", callback)` once (subsequent calls no-op); the callback runs `reload_all_pipelines()` — coarse (all 53 graphics + 2 compute pipelines rebuilt on any `.spv` change) but correct; previous pipelines are released by SDL after in-flight command buffers finish. Requires `init()` first (warn + no-op otherwise). The engine wires this in `Application` when `BRACKEN_HOT_RELOAD=1`.
+Hot-reload: `enable_hot_reload(watcher)` registers `watcher.watch_directory(root, ".spv", callback)` for every shader search root that is not watched yet (already-watched roots are skipped, so a second call is cheap rather than a no-op behind a latch, and a root added later by `add_shader_search_path` is watched immediately); the callback runs `reload_all_pipelines()` — coarse (all 53 graphics + 2 compute pipelines rebuilt on any `.spv` change) but correct; previous pipelines are released by SDL after in-flight command buffers finish. Requires `init()` first (warn + no-op otherwise). The engine wires this in `Application` when `BRACKEN_HOT_RELOAD=1`.
 
 Per-pipeline configuration summary (from the catalogue rows in `pipeline_catalog.cpp`; shader files relative to `shader_path()`; "resources" = `ShaderResources` as `{uniform_buffers, samplers, storage_buffers}`):
 
@@ -2441,13 +2441,13 @@ Custom layouts are named `gpu::VertexLayout` cases applied in `pipeline_catalog.
 
 #### Lifecycle & state
 
-- `[[nodiscard]] bool init(GPUDevice&)` — rejects double-init (`false`); captures `device.swapchain_format()`; sets `shader_path_ = SDL_GetBasePath() + "shaders/"` (fallback: relative `"shaders/"` + log); constructs the owned `ShaderManager`. `shutdown()` clears pipelines then the shader manager (also run by the destructor). Non-copyable, non-movable.
+- `[[nodiscard]] bool init(GPUDevice&)` — rejects double-init (`false`); captures `device.swapchain_format()`; sets `shader_path_roots_[0] = SDL_GetBasePath() + "shaders/"` (fallback: relative `"shaders/"` + log); constructs the owned `ShaderManager`. `shutdown()` unwatches every shader root, clears both pipeline caches and both host registration tables, then the shader manager (also run by the destructor); the search ROOTS are kept, being configuration rather than a resource. Non-copyable, non-movable.
 - Formats (member defaults): `swapchain_format_ = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM` (overwritten from the device at `init`), `scene_color_format_ = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT` (HDR scene target), `depth_format_ = SDL_GPU_TEXTUREFORMAT_D32_FLOAT`. Accessors: `get_swapchain_format()`, `get_scene_color_format()`, `shader_path()`.
 - `GPUPipeline* get_pipeline(PipelineType)` — `nullptr` + log if uninitialized; cache hit returns; otherwise dispatches a `switch` to the matching `create_*` method, logs success/failure, caches on success. `cached_pipeline_count()` exposes the cache size.
 - `[[nodiscard]] bool preload_all_pipelines()` — iterates `0 .. PipelineType::Count`, returns `false` if **any** failed (but continues through all; each failure logged).
 - `invalidate_all()` — clears the pipeline cache **and** the shader cache.
 - `set_swapchain_format(fmt)` — no-op if unchanged; otherwise erases only the swapchain-dependent pipelines, which it derives from the catalogue (`pipeline_targets_swapchain(type)`, i.e. `desc.color == TargetFormat::Swapchain`) — today `{UI, Text, Composite, Fxaa}`, pinned by `gpu/pipeline_catalog.test.cpp`. Called each frame-ish by `SceneRenderer` (`scene/scene_renderer.cpp:120`). A new swapchain-targeting pipeline type needs no edit here: giving its row `TargetFormat::Swapchain` is enough.
-- `enable_hot_reload(core::asset::FileWatcher&)` — warns if called pre-`init`; idempotent (ignores second watcher); `watch_directory(shader_path_, ".spv", cb)` where the callback logs and calls `reload_all_pipelines()` (= `invalidate_all()` + `preload_all_pipelines()`, warning on partial failure). `reload_all_pipelines()` is public for tests/diagnostics. `Application::init_renderer` wires this (plus model hot-reload) whenever the global `FileWatcher` is running, which `Application::init_engine` starts only when env `BRACKEN_HOT_RELOAD=1` (`src/bracken/application.cpp`). `FileWatcher` marshals callbacks onto the main thread via `poll_main_thread()` (run in `Application::run()`), so pipeline rebuilds safely touch GPU state.
+- `enable_hot_reload(core::asset::FileWatcher&)` — warns if called pre-`init`; idempotent per root (ignores a second, different watcher with a WARN); `watch_directory(root, ".spv", cb)` for each unwatched root of `shader_path_roots_` where the callback logs and calls `reload_all_pipelines()` (= `invalidate_all()` + `preload_all_pipelines()`, warning on partial failure). `reload_all_pipelines()` is public for tests/diagnostics. `Application::init_renderer` wires this (plus model hot-reload) whenever the global `FileWatcher` is running, which `Application::init_engine` starts only when env `BRACKEN_HOT_RELOAD=1` (`src/bracken/application.cpp`). `FileWatcher` marshals callbacks onto the main thread via `poll_main_thread()` (run in `Application::run()`), so pipeline rebuilds safely touch GPU state.
 
 #### `PipelineType` — 56 values
 
@@ -2840,7 +2840,8 @@ int text_width(std::string_view text, float scale = 1.0f) const;  // UI glyph me
 int text_height(float scale = 1.0f) const;                        // or without a loaded font
 
 using PostUICallback = std::function<void(SDL_GPUCommandBuffer*, SDL_GPUTexture*)>;
-void set_post_ui_callback(PostUICallback cb);                     // single slot
+void set_post_ui_callback(PostUICallback cb);                     // single slot; DevUI owns it
+RenderHookRegistry& render_hooks();                               // ordered, many-per-slot host passes
 ```
 
 #### init() behavior
@@ -8174,7 +8175,8 @@ Full-build algorithm:
 
 ```cpp
 using PostUICallback = std::function<void(SDL_GPUCommandBuffer*, SDL_GPUTexture*)>;
-void set_post_ui_callback(PostUICallback cb);   // single slot, last set wins
+void set_post_ui_callback(PostUICallback cb);   // single slot, last set wins (WARNs on replacement)
+RenderHookRegistry& render_hooks();             // scene/render_hook.hpp - the composing alternative
 ```
 
 Invoked in `SceneRenderer::render_frame` (`scene_renderer.cpp`) after the
@@ -8497,7 +8499,7 @@ post-UI callback runs before the screenshot readback.
 ### Known limitations and silent behaviors
 
 - **Single post-UI callback slot** — `init_dev_ui()` claims it; a later
-  `set_post_ui_callback` silently replaces the overlay's draw.
+  `set_post_ui_callback` replaces the overlay's draw (it now WARNs when it does; use `render_hooks()` with `RenderHookSlot::AfterUi`, which composes).
 - **Toggle key does nothing in stub builds** (stub `process_event` returns
   `false` unconditionally) and when `init` failed (`impl_` null).
 - **`init()` on an already-initialized overlay warns and returns `false`**

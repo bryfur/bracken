@@ -87,6 +87,33 @@ bool GPUComputePipeline::reflect_spirv_resources(const std::vector<uint8_t>& spi
     return true;
 }
 
+bool GPUComputePipeline::reflect_spirv_file(const std::string& path, ComputeResources& out) {
+    // Registration-time only (host pipelines); the extra read of a file
+    // load_spirv is about to read again is not worth avoiding.
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::reflect_spirv_file: Failed to open '{}'", path.c_str());
+        return false;
+    }
+    const std::streamsize size = file.tellg();
+    if (size <= 0) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::reflect_spirv_file: Empty file '{}'", path.c_str());
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> bytecode(static_cast<size_t>(size));
+    if (!file.read(reinterpret_cast<char*>(bytecode.data()), size)) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::reflect_spirv_file: Failed to read '{}'", path.c_str());
+        return false;
+    }
+    if (!reflect_spirv_resources(bytecode, out)) {
+        BRACKEN_LOG_ERROR(LOG_TAG, "GPUComputePipeline::reflect_spirv_file: reflection failed for '{}': {}",
+                          path.c_str(), SDL_GetError());
+        return false;
+    }
+    return true;
+}
+
 std::unique_ptr<GPUComputePipeline> GPUComputePipeline::load_spirv(GPUDevice& device, const std::string& path,
                                                                    const std::string& entry_point,
                                                                    const ComputeResources& resources) {

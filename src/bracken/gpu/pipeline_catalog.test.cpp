@@ -20,6 +20,7 @@
 #include "bracken/gpu/pipeline_catalog.hpp"
 
 #include "bracken/gpu/gpu_types.hpp"
+#include "bracken/gpu/host_pipeline.hpp"
 
 #include <format>
 #include <gtest/gtest.h>
@@ -459,6 +460,64 @@ TEST(PipelineCatalog, OutOfRangeYieldsThePlaceholderRow) {
     EXPECT_STREQ(pipeline_desc(PipelineType::Count).vertex_shader, "");
     EXPECT_STREQ(compute_pipeline_desc(ComputePipelineType::Count).name, "Unknown");
     EXPECT_FALSE(pipeline_targets_swapchain(PipelineType::Count));
+}
+
+// =============================================================================
+// The catalogue stayed CLOSED when the host path opened
+// (gpu/host_pipeline.hpp). These two make that a mechanical claim rather than a
+// design intention.
+// =============================================================================
+
+TEST(PipelineCatalog, GoldenBlockNamesAreExactlyTheCatalogueNames) {
+    // GoldenParsesIntoOnePerTypeBlock already pins the block COUNT. This pins
+    // the other half — that every block name is a catalogue row name — so the
+    // golden is a bijection with the two enums. A host registration has a name
+    // and no enumerator, so it cannot appear here however many a game makes;
+    // and an extra block added by hand fails right here.
+    const Golden golden = parse_golden();
+    std::set<std::string> catalogue_names;
+    for (int i = 0; i < static_cast<int>(PipelineType::Count); ++i) {
+        catalogue_names.insert(pipeline_desc(static_cast<PipelineType>(i)).name);
+    }
+    for (int i = 0; i < static_cast<int>(ComputePipelineType::Count); ++i) {
+        catalogue_names.insert(compute_pipeline_desc(static_cast<ComputePipelineType>(i)).name);
+    }
+    for (const std::string& name : golden.order) {
+        EXPECT_TRUE(catalogue_names.contains(name)) << "golden block '" << name << "' is not a catalogue row";
+    }
+    EXPECT_EQ(catalogue_names.size(), golden.order.size());
+}
+
+TEST(PipelineCatalog, AHostDescMirroringARowProducesTheSameGoldenText) {
+    // The open half must not be able to drift from the closed one on
+    // reversed-Z, on the depth-target force-off, or on how a TargetFormat
+    // resolves. Rendering both configs through THIS FILE's formatter — the same
+    // one the golden was captured with — is the strongest form of that
+    // statement available without a device: if the two ever disagree, the
+    // difference is printed in golden syntax and reads like a golden diff.
+    for (int i = 0; i < static_cast<int>(PipelineType::Count); ++i) {
+        const PipelineDesc& row = pipeline_desc(static_cast<PipelineType>(i));
+        HostGraphicsPipelineDesc host;
+        host.name = row.name;
+        host.vertex_shader = row.vertex_shader;
+        host.fragment_shader = row.fragment_shader;
+        host.vertex_layout = row.vertex_layout;
+        host.primitive_type = row.primitive_type;
+        host.cull_mode = row.cull_mode;
+        host.blend_mode = row.blend_mode;
+        host.depth_test = row.depth_test;
+        host.depth_write = row.depth_write;
+        host.depth_compare = row.depth_compare;
+        host.depth_clip = row.depth_clip;
+        host.depth_bias = row.depth_bias;
+        host.color = row.color;
+        host.color2 = row.color2;
+        host.depth_target = row.depth_target;
+
+        EXPECT_EQ(describe(build_pipeline_config(row, k_canonical_formats)),
+                  describe(build_host_pipeline_config(host, k_canonical_formats)))
+            << "row " << i << " (" << row.name << ")";
+    }
 }
 
 } // namespace

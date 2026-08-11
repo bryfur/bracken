@@ -137,6 +137,7 @@ void draw_stats_tab(const DevUI::Bindings& bindings, DevUI::PanelState& state) {
             diagnostic_row("Effect models unresolved", diag.effect_models_unresolved);
             diagnostic_row("Lights past MAX_LIGHTS", diag.lights_dropped);
             diagnostic_row("Cluster light insertions dropped", diag.cluster_lights_dropped);
+            diagnostic_row("Host render hooks skipped", diag.render_hooks_skipped);
             if (diag.camera_missing) {
                 ImGui::TextColored(ImVec4(0.90f, 0.35f, 0.25f, 1.0f),
                                    "3D content but NO CAMERA - call frame().set_camera()");

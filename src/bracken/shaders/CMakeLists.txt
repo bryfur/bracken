@@ -196,3 +196,9 @@ message(STATUS "Configured ${SHADER_COUNT} shaders for compilation")
 # Export paths to parent scope for runtime library linking and shader lookup
 set(SDL_shadercross_SOURCE_DIR ${SDL_shadercross_SOURCE_DIR} PARENT_SCOPE)
 set(SHADER_OUTPUT_DIR "${SHADER_OUTPUT_DIR}" PARENT_SCOPE)
+
+# The engine's .hlsli include root, for bracken_compile_shaders (a consuming
+# game's own HLSL compiled with this same pinned toolchain). Cached rather than
+# PARENT_SCOPE because the consumer's CMakeLists is not this directory's parent.
+set(BRACKEN_SHADER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE INTERNAL
+    "Engine .hlsli include root for bracken_compile_shaders")

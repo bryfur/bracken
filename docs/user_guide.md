@@ -277,7 +277,7 @@ dev_ui().add_panel("My Panel", [this] {
 #endif
 ```
 
-With `BRACKEN_ENABLE_DEV_UI=OFF`, `init_dev_ui()` returns `false` and every `DevUI` call is a harmless no-op — host code needs **no** `#ifdef`s except around panel bodies, which include `imgui.h` directly and therefore need the `BRACKEN_DEV_UI` guard (see `examples/playground/playground.cpp`). Gotcha: `init_dev_ui()` claims the `SceneRenderer`'s **single** post-UI callback slot — a host that uses the dev UI cannot also install its own `set_post_ui_callback`.
+With `BRACKEN_ENABLE_DEV_UI=OFF`, `init_dev_ui()` returns `false` and every `DevUI` call is a harmless no-op — host code needs **no** `#ifdef`s except around panel bodies, which include `imgui.h` directly and therefore need the `BRACKEN_DEV_UI` guard (see `examples/playground/playground.cpp`). Gotcha: `init_dev_ui()` claims the `SceneRenderer`'s **single** post-UI callback slot — a host that uses the dev UI must not install its own `set_post_ui_callback` (doing so now logs a WARN instead of silently turning F10 off). Register a `RenderHookSlot::AfterUi` hook through `scene_renderer().render_hooks()` instead; that surface is many-per-slot and runs under the overlay.
 
 **Panel data safety in the pipelined loop** (documented on `dev::DevUI`): panel bodies draw *during rendering, while the next frame's `on_simulate` runs on the pool*. Never read live game state from a panel — instead, **snapshot it in `on_main_frame`** (which runs with no sim in flight) into plain members the panel reads:
 
@@ -755,7 +755,7 @@ dev_ui().set_toggle_key(SDL_SCANCODE_F10); // safe even when dev_ui_ok == false
 ```
 
 - `init_dev_ui()` returns `false` when the overlay is compiled out (`BRACKEN_ENABLE_DEV_UI=OFF`) or backend init failed — but `dev_ui()` is valid either way (every call becomes a harmless no-op on the stub). You only need `#ifdef BRACKEN_DEV_UI` around panel bodies that call `ImGui::` directly.
-- **It claims the `SceneRenderer`'s single post-UI callback slot** — a host that calls `init_dev_ui()` must not install its own `set_post_ui_callback`.
+- **It claims the `SceneRenderer`'s single post-UI callback slot** — a host that calls `init_dev_ui()` must not install its own `set_post_ui_callback`. Use `scene_renderer().render_hooks()` with `RenderHookSlot::AfterUi` instead: many hooks per slot, and they run before the overlay rather than instead of it.
 - Calling `dev_ui()` without ever calling `init_dev_ui()` trips a debug assert.
 
 ### Common mistakes checklist
@@ -1522,7 +1522,7 @@ Behaviors worth knowing:
 | `BRACKEN_HOT_RELOAD` env var | unset (off) | read in `Application::init_engine` (`src/bracken/application.cpp`); only the value `1` (first char) enables |
 | `FileWatcher::init(poll_interval)` | `1000 ms` | `src/bracken/core/asset/file_watcher.hpp`; `Application` uses the default |
 | Settle window | `100 ms` (fixed, not configurable) | `k_settle_window_ns` in `src/bracken/core/asset/file_watcher.cpp` |
-| Shader watch path | `"shaders/"` relative to the working directory | `PipelineRegistry::shader_path_` (`src/bracken/gpu/pipeline_registry.hpp`) |
+| Shader watch paths | `"shaders/"` relative to the working directory, plus every root a host added with `add_shader_search_path` | `PipelineRegistry::shader_path_roots_` (`src/bracken/gpu/pipeline_registry.hpp`) — a vector whose element 0 is the engine root and is never displaced |
 | Shader watch filter | `".spv"` | `PipelineRegistry::enable_hot_reload` (`src/bracken/gpu/pipeline_registry.cpp`) |
 
 All hot-reload activity logs under the `hot_reload` logger category — filter on that to watch the machinery work.
@@ -7027,7 +7027,11 @@ renders (harmless no-op in stub builds).
 **Gotcha — one post-UI slot:** `SceneRenderer` has exactly one post-UI
 callback slot. If you call `init_dev_ui()`, the overlay owns it; do not call
 `scene_renderer().set_post_ui_callback(...)` yourself afterwards or you will
-silently replace the overlay's draw (and vice versa). You can't have both.
+replace the overlay's draw (and vice versa). The replacement is no longer
+silent — it logs a WARN naming the overlay — but it is still a replacement.
+The composing alternative is `scene_renderer().render_hooks()` with
+`RenderHookSlot::AfterUi`: many hooks per slot, ordered, and dispatched BEFORE
+the post-UI callback so the overlay still draws on top.
 
 ### The built-in panels
 
