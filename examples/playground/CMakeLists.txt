@@ -5,6 +5,7 @@ add_executable(playground
     playground.cpp
     custom_pass.cpp
     scene_layout.cpp
+    level_export.cpp
     character.cpp
     day_weather.cpp
     music.cpp

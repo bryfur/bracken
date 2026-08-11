@@ -20,6 +20,7 @@
 #include "bracken/render/ibl.hpp"
 #include "bracken/render/terrain_renderer.hpp"
 #include "bracken/render/water_renderer.hpp"
+#include "bracken/scene/level.hpp"
 #include "bracken/scene/scene_renderer.hpp"
 #include "bracken/systems/camera_controller.hpp"
 #include <SDL3/SDL_timer.h>
@@ -337,8 +338,16 @@ bool PlaygroundGame::on_init() {
     setup_village();
     setup_state_machine();
     setup_effects();
-    scatter_wilds();
-    build_orb_spots();
+    if (level_path_.empty()) {
+        scatter_wilds();
+        build_orb_spots();
+    } else if (!load_level_props()) {
+        return false;
+    }
+    // Snapshot HERE, not at export time: the orb loop just below draws from
+    // the same stream, so this is the state a --level run must resume from.
+    rng_after_scatter_ = rng_;
+    log_prop_digest(level_path_.empty() ? "authored" : "file");
 
     for (int i = 0; i < ORB_COUNT; ++i) {
         // Orb 0 takes spot 0 (beside the spawn — see build_orb_spots).
@@ -350,6 +359,9 @@ bool PlaygroundGame::on_init() {
     // Spawn on the plaza's brick centrepiece: the middle of the square is the
     // one spot where a ~520-unit orbit camera clears every building.
     player_pos_ = village_pos(0.3f, 0.6f);
+    if (has_level_player_spawn_) {
+        player_pos_ = level_player_spawn_; // the level's "player_spawn" marker
+    }
 
     // Chrome sphere on the plaza — the specular-IBL proof piece: a polished
     // metal ball that mirrors the prefiltered dusk sky and the village.
@@ -527,6 +539,15 @@ bool PlaygroundGame::on_init() {
     if (smoke_frames_ > 0) {
         set_collect_render_stats(true);
         setup_smoke_run();
+    }
+
+    // --export-level: the scene is complete and nothing is in flight (no sim
+    // job exists until run() starts), which is the whole reason the export
+    // lives at the tail of on_init rather than at the frame fence.
+    if (!export_level_path_.empty()) {
+        const bool ok = export_level_now();
+        quit();
+        return ok;
     }
     return true;
 }
@@ -881,7 +902,9 @@ void PlaygroundGame::scatter_wilds() {
                                      mm.get_handle("tree_birch")};
         const ModelHandle rocks[] = {mm.get_handle("rock_boulder"), mm.get_handle("rock_slate"),
                                      mm.get_handle("rock_cluster")};
-        auto place = [this](ModelHandle handle, float scale, float sink, bool trunk) {
+        static constexpr const char* tree_names[] = {"tree_oak", "tree_pine", "tree_birch"};
+        static constexpr const char* rock_names[] = {"rock_boulder", "rock_slate", "rock_cluster"};
+        auto place = [this](const char* name, ModelHandle handle, float scale, float sink, bool trunk) {
             glm::vec3 pos = random_ground_pos(400.0f);
             const float d = glm::distance(glm::vec2(pos.x, pos.z), glm::vec2(VILLAGE_CX, VILLAGE_CZ));
             if (d < PLATEAU_RADIUS + 300.0f) {
@@ -890,18 +913,19 @@ void PlaygroundGame::scatter_wilds() {
             if (pos.y < RIVER_WATER_LEVEL + 15.0f) {
                 return; // nothing grows in the river channel
             }
-            glm::mat4 t = glm::translate(glm::mat4(1.0f), pos - glm::vec3(0, sink, 0));
-            t = glm::rotate(t, rand01() * 6.28f, glm::vec3(0, 1, 0));
-            t = glm::scale(t, glm::vec3(scale));
-            props_.push_back({handle, t});
+            // The yaw draw has to happen in the same place in the RNG stream
+            // as before: rand01() is consumed here, between the two rejections
+            // above and the scale draw at the call site.
+            const float yaw = rand01() * 6.28f;
+            const glm::mat4 t = place_prop(name, handle, pos - glm::vec3(0, sink, 0), yaw, scale);
             pending_colliders_.push_back({handle, t, trunk});
         };
         for (int i = 0; i < 70; ++i) {
-            place(trees[i % 3], 8.0f + rand01() * 5.0f, 3.0f, /*trunk=*/true);
+            place(tree_names[i % 3], trees[i % 3], 8.0f + rand01() * 5.0f, 3.0f, /*trunk=*/true);
         }
         for (int i = 0; i < 25; ++i) {
             float s = 10.0f + rand01() * 16.0f;
-            place(rocks[i % 3], s, s * 0.4f, /*trunk=*/false);
+            place(rock_names[i % 3], rocks[i % 3], s, s * 0.4f, /*trunk=*/false);
         }
         return;
     }
@@ -916,10 +940,8 @@ void PlaygroundGame::scatter_wilds() {
         if (h == INVALID_MODEL_HANDLE) {
             continue;
         }
-        glm::mat4 t = glm::translate(glm::mat4(1.0f), village_pos(p.x, p.z, p.y) - glm::vec3(0, p.sink, 0));
-        t = glm::rotate(t, glm::radians(p.rot_deg), glm::vec3(0, 1, 0));
-        t = glm::scale(t, glm::vec3(p.scale));
-        props_.push_back({h, t});
+        const glm::mat4 t = place_prop(p.model, h, village_pos(p.x, p.z, p.y) - glm::vec3(0, p.sink, 0),
+                                       glm::radians(p.rot_deg), p.scale);
         // Record a physics collider for everything with a real silhouette
         // (setup_physics builds the static boxes once the world is up).
         const ColliderKind kind = classify_collider(p.model);
@@ -943,11 +965,14 @@ void PlaygroundGame::scatter_wilds() {
     // is texture, not composition; every distinct object is in the layout.
     // No wheat here: the golden tufts are reserved for the farm field and
     // cottage garden, where they read as crops instead of stray orange clumps.
+    static constexpr const char* tuft_names[] = {
+        "nature_grass_common_short", "nature_grass_common_tall", "nature_grass_wispy_short",
+        "nature_grass_wispy_tall",   "nature_grass_wide_short",  "nature_grass_wide_tall"};
+    static constexpr const char* clover_names[] = {"nature_clover_1", "nature_clover_2"};
     const ModelHandle tufts[] = {
-        mm.get_handle("nature_grass_common_short"), mm.get_handle("nature_grass_common_tall"),
-        mm.get_handle("nature_grass_wispy_short"), mm.get_handle("nature_grass_wispy_tall"),
-        mm.get_handle("nature_grass_wide_short"), mm.get_handle("nature_grass_wide_tall")};
-    const ModelHandle clover[] = {mm.get_handle("nature_clover_1"), mm.get_handle("nature_clover_2")};
+        mm.get_handle(tuft_names[0]), mm.get_handle(tuft_names[1]), mm.get_handle(tuft_names[2]),
+        mm.get_handle(tuft_names[3]), mm.get_handle(tuft_names[4]), mm.get_handle(tuft_names[5])};
+    const ModelHandle clover[] = {mm.get_handle(clover_names[0]), mm.get_handle(clover_names[1])};
     auto blocked_flora = [&](float vx, float vz) {
         if (in_clearing(vx, vz)) {
             return true;
@@ -985,19 +1010,149 @@ void PlaygroundGame::scatter_wilds() {
             if (rr < FLORA_R0 || rr > FLORA_R1 || blocked_flora(vx, vz)) {
                 continue;
             }
-            glm::mat4 t = glm::translate(glm::mat4(1.0f), village_pos(vx, vz) - glm::vec3(0, 3.0f, 0));
-            t = glm::rotate(t, rand01() * 6.28f, glm::vec3(0, 1, 0));
+            const glm::vec3 pos = village_pos(vx, vz) - glm::vec3(0, 3.0f, 0);
+            const float yaw = rand01() * 6.28f;
             const float roll = rand01();
             if (roll < 0.12f) { // clover patches thread through the tufts
-                t = glm::scale(t, glm::vec3(0.6f + rand01() * 0.3f));
-                props_.push_back({clover[static_cast<int>(rand01() * 1.999f)], t});
+                const float s = 0.6f + rand01() * 0.3f;
+                const int pick = static_cast<int>(rand01() * 1.999f);
+                place_prop(clover_names[pick], clover[pick], pos, yaw, s);
             } else {
-                t = glm::scale(t, glm::vec3(0.45f + rand01() * 0.3f));
-                props_.push_back({tufts[static_cast<int>(rand01() * 5.999f)], t});
+                const float s = 0.45f + rand01() * 0.3f;
+                const int pick = static_cast<int>(rand01() * 5.999f);
+                place_prop(tuft_names[pick], tufts[pick], pos, yaw, s);
             }
         }
     }
 #endif
+}
+
+bool PlaygroundGame::load_level_props() {
+    auto loaded = bracken::scene::load_level(level_path_);
+    if (loaded.is_err()) {
+        BRACKEN_LOG_ERROR("playground", "--level {}: {}", level_path_,
+                          bracken::scene::to_string(loaded.error()));
+        return false;
+    }
+    const bracken::scene::Level& level = loaded.value();
+
+    // Resolve through the engine: it does the name -> handle lookup once per
+    // distinct model and COUNTS what it could not place, which is the thing a
+    // hand-rolled loop here would silently skip.
+    bracken::scene::ResolvedLevel resolved;
+    const bracken::scene::LevelResolveReport report = resolved.resolve(level, models());
+
+    props_.clear();
+    props_.reserve(resolved.size());
+    pending_colliders_.clear();
+
+    // Walk the instances with the SAME drop rule resolve() applied, so the nth
+    // survivor here is the nth resolved draw. The collider policy needs the
+    // model NAME, which the resolved draw no longer carries — and that policy
+    // (classify_collider / nature_trunk_half) is game code that deliberately
+    // does not migrate into the engine, so a level loaded by a different host
+    // gets no colliders at all. Stated rather than hidden.
+    //
+    // KNOWN GAP, in the PROCEDURAL FALLBACK scene only (a sparse checkout with
+    // no village assets): scatter_wilds() gives its generator rocks a box
+    // collider directly, but their names — rock_boulder / rock_slate /
+    // rock_cluster — do not match classify_collider's rock_medium / rock_big
+    // test, so a reloaded fallback level has no rock colliders. The village
+    // scene, which is what the smoke gate measures, is unaffected: every one
+    // of its collider decisions is a name match that survives the round trip.
+    //
+    // The drop rule is DUPLICATED here, and the index into resolved.draws() is
+    // therefore checked rather than trusted. Two copies of one policy is the
+    // shape that drifts: the day resolve() grows a third reason to drop a row,
+    // this walk keeps a survivor resolve() discarded and every later draw is
+    // off by one — an unchecked `draws()[i]` would run off the end of the span
+    // at the tail of a 2550-row level. Bail loudly instead.
+    std::size_t draw_index = 0;
+    for (const bracken::scene::LevelInstance& inst : level.instances) {
+        if (inst.model >= level.models.size()) {
+            continue;
+        }
+        const std::string& name = level.models[inst.model];
+        const ModelHandle handle = models().get_handle(name);
+        if (handle == INVALID_MODEL_HANDLE) {
+            continue;
+        }
+        if (draw_index >= resolved.draws().size()) {
+            BRACKEN_LOG_ERROR("playground",
+                              "--level {}: this walk kept more instances than ResolvedLevel::resolve did "
+                              "({} vs {}); the two drop rules have drifted apart",
+                              level_path_, draw_index + 1, resolved.draws().size());
+            return false;
+        }
+        const bracken::scene::ResolvedLevel::Draw& draw = resolved.draws()[draw_index++];
+        props_.push_back({draw.model, draw.transform});
+        const ColliderKind kind = classify_collider(name);
+        if (kind != ColliderKind::None) {
+            const bool trunk = kind == ColliderKind::Trunk;
+            pending_colliders_.push_back(
+                {draw.model, draw.transform, trunk, trunk ? nature_trunk_half(name) : 0.0f});
+        }
+    }
+    if (draw_index != resolved.draws().size()) {
+        // The other direction: this walk dropped a row resolve() kept, so the
+        // nth prop is no longer the nth draw. Same defect, same refusal.
+        BRACKEN_LOG_ERROR("playground",
+                          "--level {}: kept {} instances against ResolvedLevel::resolve's {}; the two drop "
+                          "rules have drifted apart",
+                          level_path_, draw_index, resolved.draws().size());
+        return false;
+    }
+
+    // Markers replace build_orb_spots() and setup_village()'s chimney list —
+    // both are plain world-space point lists, and reading them back is what
+    // makes the marker table load-bearing rather than decorative.
+    orb_spots_.clear();
+    for (const bracken::scene::LevelMarker& m : level.markers_named("orb_spot")) {
+        orb_spots_.push_back(m.position);
+    }
+    if (orb_spots_.empty()) {
+        BRACKEN_LOG_ERROR("playground", "--level {}: no 'orb_spot' markers; the demo needs at least one",
+                          level_path_);
+        return false;
+    }
+    const auto chimneys = level.markers_named("chimney");
+    if (!chimneys.empty()) {
+        chimney_tops_.clear();
+        for (const bracken::scene::LevelMarker& m : chimneys) {
+            chimney_tops_.push_back(m.position);
+        }
+    }
+    if (const auto spawns = level.markers_named("player_spawn"); !spawns.empty()) {
+        level_player_spawn_ = spawns.front().position;
+        has_level_player_spawn_ = true;
+    }
+
+    // The demo's environment, straight out of the file, replacing what
+    // setup_environment() just wrote. Every value round-trips exactly (floats
+    // ride the container as doubles), so this is a no-op on a level the
+    // playground exported — which is exactly what makes it a test.
+    if (level.environment.has_value()) {
+        env_ = *level.environment;
+        env_dirty_ = true;
+    }
+
+    // The RNG state the hand-authored path had reached by this point, carried
+    // in the level's HOST-EXTRAS channel. Without it the orb spawn draws that
+    // follow in on_init would land on different anchors and the reloaded scene
+    // would differ from the authored one for a reason that has nothing to do
+    // with the format. This is what Level::extras() is for.
+    if (level.extras().has(k_level_rng_key)) {
+        rng_ = static_cast<uint32_t>(level.extras().read_or<int64_t>(k_level_rng_key, rng_));
+    } else {
+        BRACKEN_LOG_WARN("playground", "--level {}: no '{}' record; orb placement will differ from the "
+                                       "hand-authored run",
+                         level_path_, k_level_rng_key);
+    }
+
+    BRACKEN_LOG_INFO("playground", "--level {}: {} props, {} colliders, {} orb spots ({} dropped)",
+                     level_path_, props_.size(), pending_colliders_.size(), orb_spots_.size(),
+                     report.instances_dropped_unknown_model + report.instances_dropped_bad_index);
+    return true;
 }
 
 void PlaygroundGame::build_orb_spots() {

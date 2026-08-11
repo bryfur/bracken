@@ -52,6 +52,7 @@
 #include "bracken/model_loader.hpp"     // Model, Mesh, Material, ModelManager, ModelHandle, ModelLoadReport
 #include "bracken/heightmap.hpp"        // Heightmap, HeightRange, WorldBounds: the quantized terrain heightfield
 #include "bracken/heightmap_grid.hpp"   // HeightmapGrid: N x M heightmap PAGES against one shared quantization range
+#include "bracken/scene/level.hpp"      // Level: placed instances, markers, terrain, water — save, load and resolve a scene
 
 // ---------------------------------------------------------------------------
 // The renderer — the frame orchestrator plus the sub-renderers a host configures

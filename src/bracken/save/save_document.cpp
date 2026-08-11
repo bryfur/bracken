@@ -3,6 +3,7 @@
 #include "bracken/core/logger.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -237,6 +238,13 @@ std::size_t SaveDocument::read_count(std::string_view path) const {
     return n > 0 ? static_cast<std::size_t>(n) : 0;
 }
 
+const SaveDocument::Value* SaveDocument::value_at(std::string_view path) const {
+    const Record* r = find(path);
+    return r == nullptr ? nullptr : &r->value;
+}
+
+void SaveDocument::write_value(std::string_view path, Value v) { set(path, std::move(v)); }
+
 std::vector<std::string_view> SaveDocument::paths() const {
     std::vector<std::string_view> out;
     out.reserve(records_.size());
@@ -248,7 +256,7 @@ std::vector<std::string_view> SaveDocument::paths() const {
 
 // ---- files ----------------------------------------------------------------
 
-core::Result<void, SaveError> SaveDocument::save(const std::string& path) const {
+std::vector<std::byte> SaveDocument::serialize() const {
     std::vector<std::byte> payload;
 
     for (const Record& r : records_) {
@@ -297,7 +305,42 @@ core::Result<void, SaveError> SaveDocument::save(const std::string& path) const 
             r.value);
     }
 
+    // The container's payload-length field is 32 bits. A document past that is
+    // unrepresentable, and the old code narrowed silently — which produced a
+    // file whose declared length disagreed with its own checksummed payload, so
+    // save() reported success and every later load reported Corrupt. Refusing
+    // here is what makes the failure land where the data still exists.
+    // Reachable only from an in-memory document (a `.level` decode is bounded
+    // well under this by k_max_table_rows and k_max_terrain_resolution), which
+    // is exactly why it needs a check rather than a comment.
+    if (payload.size() > static_cast<std::size_t>(UINT32_MAX)) {
+        BRACKEN_LOG_ERROR("save", "serialize(): {} payload bytes over {} records exceeds the container's "
+                                  "32-bit length field; refusing to emit a file that cannot be read back",
+                          payload.size(), records_.size());
+        return {};
+    }
+
     const uint64_t sum = checksum(payload);
+    const auto payload_bytes = static_cast<uint32_t>(payload.size());
+
+    std::vector<std::byte> file;
+    file.reserve(sizeof(k_magic) + 4 + 4 + 4 + 8 + payload.size());
+    put(file, k_magic, sizeof(k_magic));
+    put_pod(file, format_version_);
+    put_pod(file, game_version_);
+    put_pod(file, payload_bytes);
+    put_pod(file, sum);
+    file.insert(file.end(), payload.begin(), payload.end());
+    return file;
+}
+
+core::Result<void, SaveError> SaveDocument::save(const std::string& path) const {
+    const std::vector<std::byte> file = serialize();
+    if (file.empty()) {
+        // serialize() refused (see its length check) and said why. An empty
+        // image is never a valid document — the header alone is 24 bytes.
+        return core::Err(SaveError::WriteFailed);
+    }
 
     // Write to a sibling temp file, then rename. rename() is atomic within a
     // filesystem, so a crash or power loss leaves the OLD save intact rather
@@ -310,14 +353,8 @@ core::Result<void, SaveError> SaveDocument::save(const std::string& path) const 
             BRACKEN_LOG_ERROR("save", "save('{}'): cannot open temp file '{}'", path, tmp);
             return core::Err(SaveError::WriteFailed);
         }
-        const uint32_t payload_bytes = static_cast<uint32_t>(payload.size());
-        out.write(k_magic, sizeof(k_magic));
-        out.write(reinterpret_cast<const char*>(&format_version_), sizeof(format_version_));
-        out.write(reinterpret_cast<const char*>(&game_version_), sizeof(game_version_));
-        out.write(reinterpret_cast<const char*>(&payload_bytes), sizeof(payload_bytes));
-        out.write(reinterpret_cast<const char*>(&sum), sizeof(sum));
-        out.write(reinterpret_cast<const char*>(payload.data()),
-                  static_cast<std::streamsize>(payload.size()));
+        out.write(reinterpret_cast<const char*>(file.data()),
+                  static_cast<std::streamsize>(file.size()));
         out.flush();
         if (!out) {
             BRACKEN_LOG_ERROR("save", "save('{}'): write failed", path);
@@ -336,8 +373,7 @@ core::Result<void, SaveError> SaveDocument::save(const std::string& path) const 
         return core::Err(SaveError::WriteFailed);
     }
 
-    BRACKEN_LOG_INFO("save", "Wrote {} ({} records, {} bytes)", path, records_.size(),
-                     payload.size());
+    BRACKEN_LOG_INFO("save", "Wrote {} ({} records, {} bytes)", path, records_.size(), file.size());
     return {};
 }
 
@@ -348,6 +384,16 @@ core::Result<SaveDocument, SaveError> SaveDocument::load(const std::string& path
     }
 
     std::vector<char> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return parse_labelled(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(file.data()), file.size()), path);
+}
+
+core::Result<SaveDocument, SaveError> SaveDocument::parse(std::span<const std::byte> bytes) {
+    return parse_labelled(bytes, "<memory>");
+}
+
+core::Result<SaveDocument, SaveError> SaveDocument::parse_labelled(std::span<const std::byte> file,
+                                                                   std::string_view path) {
     constexpr std::size_t k_header = sizeof(k_magic) + 4 + 4 + 4 + 8;
     if (file.size() < k_header || std::memcmp(file.data(), k_magic, sizeof(k_magic)) != 0) {
         BRACKEN_LOG_ERROR("save", "load('{}'): not a bracken save file", path);
@@ -377,8 +423,7 @@ core::Result<SaveDocument, SaveError> SaveDocument::load(const std::string& path
         return core::Err(SaveError::Corrupt);
     }
 
-    std::span<const std::byte> payload(reinterpret_cast<const std::byte*>(file.data() + off),
-                                       payload_bytes);
+    std::span<const std::byte> payload = file.subspan(off, payload_bytes);
     if (checksum(payload) != stored_sum) {
         BRACKEN_LOG_ERROR("save", "load('{}'): checksum mismatch; file is corrupt", path);
         return core::Err(SaveError::Corrupt);

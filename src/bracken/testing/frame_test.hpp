@@ -39,6 +39,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
@@ -184,7 +185,264 @@ public:
         return packet_->build_diagnostics();
     }
 
+    // ---- The equality instrument ----
+
+    /**
+     * FNV-1a over everything the HOST described this frame, in packet order.
+     *
+     * WHY IT IS ORDER-SENSITIVE, and why that is the point. Packet order is
+     * what the renderer consumes — `seal()` merges lanes in (lane-index,
+     * emission-order) and the merged frame is byte-identical at any worker
+     * count (`scene/frame_builder.hpp`). So two frames holding the same three
+     * draws in a different order are two DIFFERENT frames, and a digest that
+     * called them equal would be useless as a round-trip proof: it would pass
+     * for a level loader that shuffled its instance table.
+     *
+     * WHAT IS FOLDED, exactly: model draws, skinned draws (palette id and the
+     * palette's own matrices), point and spot lights, billboards, debug lines,
+     * effect spawns, UI commands (including the text bytes), shadow capsules,
+     * the camera, the environment, the three world-element toggles and the
+     * build diagnostics.
+     *
+     * WHAT IS DELIBERATELY NOT FOLDED: the engine-stamped timing and clock
+     * section — `dt`, `time`, `frame_index`, `scene_time`, `sky_time` — and
+     * the effect-instance snapshot derived from them. Those are functions of
+     * wall clock, not of what the host asked for; folding them would make the
+     * digest differ between two runs of the same scene, which is the one thing
+     * it must not do.
+     *
+     * Two POINTER fields ride the packet by documented exception
+     * (`EffectSpawnCommand::definition`, host-owned). A pointer VALUE is not
+     * stable across runs, so only its null-ness is folded — a digest that
+     * hashed the address would be nondeterministic by construction.
+     *
+     * Stable across runs and across `BRACKEN_WORKERS` counts, because every
+     * input to it is. Requires a sealed packet (each accessor asserts).
+     *
+     * BLIND SPOT, stated rather than discovered: this folds the streams that
+     * exist today. A feature that adds a new command stream to FramePacket and
+     * does not extend this function leaves the digest silently insensitive to
+     * it. Extend it in the same change that adds the stream.
+     */
+    [[nodiscard]] uint64_t digest() const {
+        Fnv1a h;
+        const scene::FramePacket& p = *packet_;
+
+        h.count(p.model_commands().size());
+        for (const scene::ModelDrawCommand& c : p.model_commands()) {
+            h.u32(c.model_handle);
+            h.u32(c.motion_id);
+            h.mat4(c.transform);
+            h.vec4(c.tint);
+            h.u32(static_cast<uint32_t>(c.flags));
+        }
+
+        h.count(p.skinned_commands().size());
+        for (const scene::SkinnedDrawCommand& c : p.skinned_commands()) {
+            h.u32(c.model_handle);
+            h.u32(c.motion_id);
+            h.mat4(c.transform);
+            h.vec4(c.tint);
+            h.u32(c.palette.value);
+            h.u32(static_cast<uint32_t>(c.flags));
+        }
+
+        h.count(p.palettes().size());
+        for (const scene::BonePalette& bp : p.palettes()) {
+            h.u32(bp.joint_count);
+            h.u32(bp.matrix_offset);
+            for (uint32_t i = 0; i < bp.joint_count; ++i) {
+                h.mat4(bp.matrices[i]);
+            }
+        }
+
+        h.count(p.point_lights().size());
+        for (const bracken::render::lighting::PointLight& l : p.point_lights()) {
+            h.vec3(l.position);
+            h.f32(l.radius);
+            h.vec3(l.color);
+            h.f32(l.intensity);
+            h.u32(l.casts_shadows ? 1u : 0u);
+            h.u32(static_cast<uint32_t>(l.shadow_slot));
+            h.u32(l.stable_id);
+            h.f32(l.source_radius);
+        }
+
+        h.count(p.spot_lights().size());
+        for (const bracken::render::lighting::SpotLight& l : p.spot_lights()) {
+            h.vec3(l.position);
+            h.f32(l.radius);
+            h.vec3(l.direction);
+            h.f32(l.inner_cos);
+            h.vec3(l.color);
+            h.f32(l.outer_cos);
+            h.f32(l.intensity);
+            h.u32(l.casts_shadows ? 1u : 0u);
+            h.u32(static_cast<uint32_t>(l.shadow_slot));
+            h.u32(l.stable_id);
+            h.f32(l.source_radius);
+        }
+
+        h.count(p.billboards().size());
+        for (const scene::BillboardDrawCommand& b : p.billboards()) {
+            h.f32(b.world_x);
+            h.f32(b.world_y);
+            h.f32(b.world_z);
+            h.f32(b.width);
+            h.f32(b.fill_ratio);
+            h.u32(b.fill_color.argb);
+            h.u32(b.bg_color.argb);
+            h.u32(b.frame_color.argb);
+        }
+
+        h.count(p.debug_lines().size());
+        for (const scene::DebugLineDrawCommand& l : p.debug_lines()) {
+            h.vec3(l.start);
+            h.vec3(l.end);
+            h.u32(l.color.argb);
+        }
+
+        h.count(p.effect_spawns().size());
+        for (const scene::EffectSpawnCommand& e : p.effect_spawns()) {
+            h.u32(e.definition != nullptr ? 1u : 0u);
+            h.vec3(e.position);
+            h.vec3(e.direction);
+        }
+
+        h.count(p.shadow_capsules().size());
+        for (const bracken::render::rt::ShadowCapsule& c : p.shadow_capsules()) {
+            h.vec3(c.p0);
+            h.f32(c.radius);
+            h.vec3(c.p1);
+        }
+
+        h.count(p.ui_commands().size());
+        for (const scene::UiCommand& cmd : p.ui_commands()) {
+            h.u32(static_cast<uint32_t>(cmd.data.index()));
+            digest_ui(h, cmd);
+        }
+
+        h.u32(p.has_camera() ? 1u : 0u);
+        if (p.has_camera()) {
+            const scene::CameraState& cam = p.camera();
+            h.mat4(cam.view);
+            h.mat4(cam.projection);
+            h.mat4(cam.view_projection);
+            h.vec3(cam.position);
+        }
+
+        h.u32(p.has_environment() ? 1u : 0u);
+        if (p.has_environment()) {
+            // EnvironmentState is float-only (every member is a float or a
+            // glm::vec3, all 4-byte aligned), so it has no padding and hashing
+            // it as a run of floats is exact. If a non-float member is ever
+            // added, hash the fields individually instead — padding bytes are
+            // unspecified after a copy and would make this nondeterministic.
+            const bracken::render::EnvironmentState& env = p.environment();
+            static_assert(sizeof(bracken::render::EnvironmentState) % sizeof(float) == 0,
+                          "EnvironmentState is expected to be a run of floats");
+            const auto* words = reinterpret_cast<const unsigned char*>(&env);
+            for (std::size_t i = 0; i < sizeof(env); ++i) {
+                h.byte(words[i]);
+            }
+        }
+
+        h.u32(p.should_draw_skybox() ? 1u : 0u);
+        h.u32(p.should_draw_ground() ? 1u : 0u);
+        h.u32(p.should_draw_grass() ? 1u : 0u);
+
+        const scene::FramePacket::BuildDiagnostics diag = p.build_diagnostics();
+        h.u32(diag.draws_dropped_invalid_handle);
+        h.u32(diag.skinned_dropped_invalid_palette);
+        h.u32(diag.palettes_over_budget);
+        h.u32(diag.shadow_capsules_over_budget);
+
+        return h.value;
+    }
+
 private:
+    /** FNV-1a, byte at a time. Everything is fed through the typed helpers so
+     *  no struct padding is ever hashed. */
+    struct Fnv1a {
+        uint64_t value = 0xcbf29ce484222325ull;
+
+        void byte(unsigned char b) {
+            value ^= static_cast<uint64_t>(b);
+            value *= 0x100000001b3ull;
+        }
+        void u32(uint32_t v) {
+            for (int i = 0; i < 4; ++i) {
+                byte(static_cast<unsigned char>((v >> (i * 8)) & 0xFFu));
+            }
+        }
+        void u64(uint64_t v) {
+            for (int i = 0; i < 8; ++i) {
+                byte(static_cast<unsigned char>((v >> (i * 8)) & 0xFFull));
+            }
+        }
+        /** Bit pattern, not value: -0.0f and 0.0f are different frames, and a
+         *  NaN tint is a bug the digest should surface rather than smooth. */
+        void f32(float v) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &v, sizeof(bits));
+            u32(bits);
+        }
+        void count(std::size_t n) { u64(static_cast<uint64_t>(n)); }
+        void vec3(const glm::vec3& v) {
+            f32(v.x);
+            f32(v.y);
+            f32(v.z);
+        }
+        void vec4(const glm::vec4& v) {
+            f32(v.x);
+            f32(v.y);
+            f32(v.z);
+            f32(v.w);
+        }
+        void mat4(const glm::mat4& m) {
+            for (int c = 0; c < 4; ++c) {
+                vec4(m[c]);
+            }
+        }
+        void text(std::string_view s) {
+            count(s.size());
+            for (char ch : s) {
+                byte(static_cast<unsigned char>(ch));
+            }
+        }
+    };
+
+    static void digest_ui(Fnv1a& h, const scene::UiCommand& cmd) {
+        if (cmd.is<scene::UiFilledRectCommand>()) {
+            const auto& c = cmd.get<scene::UiFilledRectCommand>();
+            h.f32(c.x); h.f32(c.y); h.f32(c.w); h.f32(c.h); h.u32(c.color.argb);
+        } else if (cmd.is<scene::UiRectOutlineCommand>()) {
+            const auto& c = cmd.get<scene::UiRectOutlineCommand>();
+            h.f32(c.x); h.f32(c.y); h.f32(c.w); h.f32(c.h); h.u32(c.color.argb); h.f32(c.line_width);
+        } else if (cmd.is<scene::UiCircleCommand>()) {
+            const auto& c = cmd.get<scene::UiCircleCommand>();
+            h.f32(c.x); h.f32(c.y); h.f32(c.radius); h.u32(c.color.argb);
+            h.u32(static_cast<uint32_t>(c.segments));
+        } else if (cmd.is<scene::UiCircleOutlineCommand>()) {
+            const auto& c = cmd.get<scene::UiCircleOutlineCommand>();
+            h.f32(c.x); h.f32(c.y); h.f32(c.radius); h.u32(c.color.argb); h.f32(c.line_width);
+            h.u32(static_cast<uint32_t>(c.segments));
+        } else if (cmd.is<scene::UiLineCommand>()) {
+            const auto& c = cmd.get<scene::UiLineCommand>();
+            h.f32(c.x1); h.f32(c.y1); h.f32(c.x2); h.f32(c.y2); h.u32(c.color.argb); h.f32(c.line_width);
+        } else if (cmd.is<scene::UiTextCommand>()) {
+            const auto& c = cmd.get<scene::UiTextCommand>();
+            h.text(c.text);
+            h.f32(c.x); h.f32(c.y); h.f32(c.scale); h.u32(c.color.argb);
+        } else if (cmd.is<scene::UiButtonCommand>()) {
+            const auto& c = cmd.get<scene::UiButtonCommand>();
+            h.f32(c.x); h.f32(c.y); h.f32(c.w); h.f32(c.h);
+            h.text(c.label);
+            h.u32(c.color.argb);
+            h.u32(c.selected ? 1u : 0u);
+        }
+    }
+
     std::unique_ptr<scene::FramePacket> owned_; // null when borrowing
     scene::FramePacket* packet_;
     std::optional<scene::FrameBuilder> builder_;

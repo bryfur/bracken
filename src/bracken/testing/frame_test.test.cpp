@@ -15,7 +15,9 @@
 #include <concepts>
 #include <cstdint>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <string_view>
+#include <vector>
 
 using bracken::testing::FrameAccess;
 using bracken::testing::TestFrame;
@@ -280,4 +282,132 @@ TEST(TestFrame, ShadowCapsulesMergeInLaneOrder) {
     EXPECT_EQ(frame.shadow_capsules()[0].p0.y, 100.0f);
     EXPECT_EQ(frame.shadow_capsules()[2].p0.y, 200.0f);
     EXPECT_EQ(frame.shadow_capsules()[4].p0.y, 300.0f);
+}
+
+// ---------------------------------------------------------------------------
+// digest() — the equality instrument
+//
+// A digest that is not order-sensitive and field-sensitive passes vacuously,
+// and everything built on top of it (scene/level.test.cpp's round-trip proof)
+// then proves nothing. These are the tests that make it worth quoting.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One frame description with six knobs, so every sensitivity test below
+// changes EXACTLY ONE THING against the reference. A test that added a draw to
+// prove a flag matters would be proving the count matters.
+struct Variant {
+    glm::vec4 tint{0.5f, 0.25f, 0.75f, 1.0f};
+    DrawFlags second_flags = DrawFlags::None;
+    const char* text = "hello";
+    float camera_z = 3.0f;
+    float fog_start = 123.0f;
+    bool draw_grass = true;
+};
+
+void build_variant(TestFrame& frame, const Variant& v) {
+    frame.sink().draw_model(3, glm::translate(glm::mat4(1.0f), glm::vec3(1.0f, 2.0f, 3.0f)), v.tint,
+                            DrawFlags::NoFog, 11u);
+    frame.sink().draw_model(4, glm::scale(glm::mat4(1.0f), glm::vec3(2.0f)), glm::vec4(1.0f),
+                            v.second_flags);
+    bracken::render::lighting::PointLightDesc light;
+    light.position = {10.0f, 20.0f, 30.0f};
+    light.radius = 500.0f;
+    light.intensity = 4.0f;
+    frame.sink().add_point_light(light);
+    frame.sink().ui().add_text(v.text, 4.0f, 8.0f);
+    CameraState cam{};
+    cam.position = {1.0f, 2.0f, v.camera_z};
+    frame.sink().set_camera(cam);
+    bracken::render::EnvironmentState env;
+    env.fog_start = v.fog_start;
+    frame.sink().set_environment(env);
+    frame.sink().set_draw_grass(v.draw_grass);
+}
+
+uint64_t digest_of(const Variant& v) {
+    TestFrame frame;
+    build_variant(frame, v);
+    frame.seal();
+    return frame.digest();
+}
+
+} // namespace
+
+TEST(TestFrame, DigestIsStableForIdenticalFrames) {
+    EXPECT_EQ(digest_of(Variant{}), digest_of(Variant{}));
+}
+
+TEST(TestFrame, DigestIsOrderSensitive) {
+    TestFrame a;
+    a.sink().draw_model(3, glm::mat4(1.0f));
+    a.sink().draw_model(4, glm::mat4(2.0f));
+    a.seal();
+
+    TestFrame b;
+    b.sink().draw_model(4, glm::mat4(2.0f));
+    b.sink().draw_model(3, glm::mat4(1.0f));
+    b.seal();
+
+    // Same two draws, different packet order. Packet order is what the
+    // renderer consumes, so these are different frames.
+    EXPECT_NE(a.digest(), b.digest());
+}
+
+TEST(TestFrame, DigestIsFieldSensitive) {
+    const uint64_t reference = digest_of(Variant{});
+
+    Variant tint;
+    tint.tint = {0.5f, 0.25f, 0.7500001f, 1.0f};
+    EXPECT_NE(reference, digest_of(tint)) << "one tint component did not move the digest";
+
+    Variant flags;
+    flags.second_flags = DrawFlags::ForceNonInstanced;
+    EXPECT_NE(reference, digest_of(flags)) << "a draw flag bit is not in the fold";
+
+    Variant camera;
+    camera.camera_z = 3.5f;
+    EXPECT_NE(reference, digest_of(camera)) << "the camera is not in the fold";
+
+    Variant environment;
+    environment.fog_start = 124.0f;
+    EXPECT_NE(reference, digest_of(environment)) << "the environment is not in the fold";
+
+    Variant toggle;
+    toggle.draw_grass = false;
+    EXPECT_NE(reference, digest_of(toggle)) << "the draw toggles are not in the fold";
+
+    Variant text;
+    text.text = "hellp";
+    EXPECT_NE(reference, digest_of(text)) << "UI text bytes are not in the fold";
+}
+
+// Lane COUNT must not reach the digest: the merge is (lane, emission), so the
+// same content emitted through a wider builder is the same frame.
+TEST(TestFrame, DigestIsIndependentOfLaneCount) {
+    TestFrame one(/*lane_count=*/1);
+    one.builder().lane(0).draw_model(3, glm::mat4(1.0f));
+    one.builder().lane(0).draw_model(4, glm::mat4(2.0f));
+    one.seal();
+
+    TestFrame four(/*lane_count=*/4);
+    four.builder().lane(0).draw_model(3, glm::mat4(1.0f));
+    four.builder().lane(0).draw_model(4, glm::mat4(2.0f));
+    four.seal();
+
+    EXPECT_EQ(one.digest(), four.digest());
+}
+
+// Stream LENGTHS are folded, so an empty stream and an absent one cannot
+// collide and the empty frame has a digest of its own.
+TEST(TestFrame, DigestDistinguishesAnEmptyFrame) {
+    TestFrame empty;
+    empty.seal();
+
+    TestFrame one;
+    one.sink().draw_model(1, glm::mat4(1.0f));
+    one.seal();
+
+    EXPECT_NE(empty.digest(), one.digest());
 }
